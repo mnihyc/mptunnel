@@ -114,3 +114,12 @@ TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets t
 SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. When several UDP paths are configured, UDP session setup uses the same scheduler inputs, adaptive health records, and active association load, then retries after path-level handshake failures. Closed associations release their scheduler load. The same bounded authenticated probe loop exercises UDP path handshakes and `PING`/`PONG` without opening datagram flows. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
 
 UDP targets can be reached through direct UDP, bind-source-IP direct UDP, or upstream SOCKS5 UDP ASSOCIATE. Plain HTTP CONNECT outbound is TCP-only.
+
+## Scheduler Regression Gates
+
+The deterministic simulator exercises the scheduler against heterogeneous path conditions before runtime changes are made. Current gates cover:
+
+- bulk transfer aggregation efficiency across low-latency and high-bandwidth paths
+- failover gap after path failure and chunk reinjection onto a survivor path
+- interactive p95 latency while a bulk transfer is queued
+- bulk tail penalty for heterogeneous RTT/bandwidth paths

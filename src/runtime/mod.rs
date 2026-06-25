@@ -37,6 +37,8 @@ const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const PATH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const TCP_STREAM_LOAD_BYTES: u64 = 256 * 1024;
 const UDP_SESSION_LOAD_BYTES: u64 = 64 * 1024;
+const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
+const MIN_RATE_SAMPLE_DURATION: Duration = Duration::from_millis(1);
 
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
@@ -323,6 +325,7 @@ struct ClientPathHealthRecord {
     state: SchedulerPathState,
     consecutive_failures: u32,
     measured_srtt_ms: Option<f64>,
+    measured_rate_bps: Option<f64>,
     failed_until: Option<Instant>,
     active_flows: u32,
     load_bytes: u64,
@@ -334,6 +337,7 @@ impl Default for ClientPathHealthRecord {
             state: SchedulerPathState::Active,
             consecutive_failures: 0,
             measured_srtt_ms: None,
+            measured_rate_bps: None,
             failed_until: None,
             active_flows: 0,
             load_bytes: 0,
@@ -345,6 +349,7 @@ impl Default for ClientPathHealthRecord {
 struct ClientPathObservation {
     state: SchedulerPathState,
     measured_srtt_ms: Option<f64>,
+    measured_rate_bps: Option<f64>,
     active_flows: u32,
     load_bytes: u64,
 }
@@ -360,6 +365,7 @@ impl ClientPathHealthRecord {
         ClientPathObservation {
             state: self.state,
             measured_srtt_ms: self.measured_srtt_ms,
+            measured_rate_bps: self.measured_rate_bps,
             active_flows: self.active_flows,
             load_bytes: self.load_bytes,
         }
@@ -387,10 +393,70 @@ impl ClientPathHealthRecord {
         self.load_bytes = self.load_bytes.saturating_sub(load_bytes);
     }
 
+    fn mark_delivery(&mut self, sample: PathRateSample) {
+        self.state = SchedulerPathState::Active;
+        self.consecutive_failures = 0;
+        self.failed_until = None;
+        let sample_bps = sample.rate_bps();
+        self.measured_rate_bps = Some(match self.measured_rate_bps {
+            Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+            None => sample_bps,
+        });
+    }
+
     fn mark_failure(&mut self, now: Instant) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.state = SchedulerPathState::Failed;
         self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathRateSample {
+    bytes: u64,
+    elapsed: Duration,
+}
+
+impl PathRateSample {
+    fn new(bytes: u64, elapsed: Duration) -> Option<Self> {
+        if bytes < MIN_RATE_SAMPLE_BYTES {
+            return None;
+        }
+        Some(Self {
+            bytes,
+            elapsed: elapsed.max(MIN_RATE_SAMPLE_DURATION),
+        })
+    }
+
+    fn rate_bps(self) -> f64 {
+        self.bytes as f64 * 8.0 / self.elapsed.as_secs_f64()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PathDeliveryStats {
+    payload_bytes: u64,
+    first_payload_at: Option<Instant>,
+    last_payload_at: Option<Instant>,
+}
+
+impl PathDeliveryStats {
+    fn record_payload_bytes(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes as u64);
+        if self.first_payload_at.is_none() {
+            self.first_payload_at = Some(now);
+        }
+        self.last_payload_at = Some(now);
+    }
+
+    fn rate_sample(self) -> Option<PathRateSample> {
+        let first = self.first_payload_at?;
+        let last = self.last_payload_at.unwrap_or(first);
+        PathRateSample::new(self.payload_bytes, last.duration_since(first))
     }
 }
 
@@ -493,6 +559,21 @@ impl ClientPathContext {
         }
     }
 
+    fn mark_tcp_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
+        let Some(sample) = stats.rate_sample() else {
+            return;
+        };
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+        {
+            current.mark_delivery(sample);
+        }
+    }
+
     fn mark_tcp_path_failure(&self, index: usize) {
         if let Some(current) = self
             .health
@@ -541,6 +622,21 @@ impl ClientPathContext {
         }
     }
 
+    fn mark_udp_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
+        let Some(sample) = stats.rate_sample() else {
+            return;
+        };
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.mark_delivery(sample);
+        }
+    }
+
     fn mark_udp_path_failure(&self, index: usize) {
         if let Some(current) = self
             .health
@@ -578,6 +674,7 @@ fn ordered_path_indices(
                 .unwrap_or(ClientPathObservation {
                     state: SchedulerPathState::Suspect,
                     measured_srtt_ms: None,
+                    measured_rate_bps: None,
                     active_flows: 0,
                     load_bytes: 0,
                 });
@@ -599,11 +696,15 @@ fn path_snapshot(
     index: usize,
     observation: ClientPathObservation,
 ) -> PathSnapshot {
-    let delivery_rate_bps = match path.metadata.initial_rate {
+    let hinted_delivery_rate_bps = match path.metadata.initial_rate {
         RateHint::Unknown => default_path_rate_bps(path.underlay),
         RateHint::Unlimited => 1_000_000_000_000.0,
         RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     };
+    let delivery_rate_bps = observation
+        .measured_rate_bps
+        .unwrap_or(hinted_delivery_rate_bps)
+        .max(1.0);
     PathSnapshot {
         id: PathId(index as u16),
         underlay: path.underlay,
@@ -702,11 +803,14 @@ where
                 .await
             }
             .await;
+            if let Ok(stats) = &result {
+                context.mark_tcp_path_delivery(path_index, *stats);
+            }
             if relay_error_is_tcp_path_failure(&result) {
                 context.mark_tcp_path_failure(path_index);
             }
             context.release_tcp_path_load(path_index);
-            result
+            result.map(|_| ())
         }
         socks5::Socks5Command::UdpAssociate => {
             handle_socks5_udp_associate(
@@ -754,11 +858,14 @@ where
         .await
     }
     .await;
+    if let Ok(stats) = &result {
+        context.mark_tcp_path_delivery(path_index, *stats);
+    }
     if relay_error_is_tcp_path_failure(&result) {
         context.mark_tcp_path_failure(path_index);
     }
     context.release_tcp_path_load(path_index);
-    result
+    result.map(|_| ())
 }
 
 struct OpenedRemoteStream {
@@ -912,7 +1019,7 @@ fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     )
 }
 
-fn relay_error_is_tcp_path_failure(result: &Result<(), RuntimeError>) -> bool {
+fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError>) -> bool {
     matches!(
         result,
         Err(RuntimeError::PathHeartbeatTimeout)
@@ -1006,6 +1113,7 @@ where
     };
     if let Some(session) = udp_session.as_mut() {
         let close_result = session.close().await;
+        context.mark_udp_path_delivery(session.path_index, session.delivery_stats());
         context.release_udp_path_load(session.path_index);
         if result.is_ok() {
             close_result?;
@@ -1287,6 +1395,7 @@ async fn handle_server_path(
         context.mux_limits.max_stream_window_bytes,
     )
     .await
+    .map(|_| ())
 }
 
 async fn handle_server_tcp_probe(
@@ -1328,7 +1437,7 @@ async fn relay_tcp_stream<S>(
     stream_id: StreamId,
     mux_limits: MuxLimits,
     initial_max_offset: u64,
-) -> Result<(), RuntimeError>
+) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1339,6 +1448,7 @@ where
     let mut buf = vec![0u8; chunk_size];
     let mut local_open = true;
     let mut remote_open = true;
+    let mut stats = PathDeliveryStats::default();
     let mut next_heartbeat_at =
         tokio::time::Instant::now() + mux_limits.tcp_path_heartbeat_interval;
     let mut pending_heartbeat: Option<(u64, tokio::time::Instant)> = None;
@@ -1387,6 +1497,7 @@ where
                     )?;
                     framed.write_frame(&frame).await?;
                     framed.flush().await?;
+                    stats.record_payload_bytes(read);
                 }
             }
             frame = framed.read_frame(), if remote_open || send_stream.repair_bytes() > 0 || pending_heartbeat.is_some() => {
@@ -1399,6 +1510,7 @@ where
                     } if received_stream_id == stream_id && remote_open => {
                         let outcome = recv_stream.receive_data(offset, payload, flags)?;
                         for chunk in outcome.delivered {
+                            stats.record_payload_bytes(chunk.len());
                             local.write_all(&chunk).await?;
                         }
                         framed.write_frame(&recv_stream.ack_frame()).await?;
@@ -1451,7 +1563,7 @@ where
         }
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 fn tcp_relay_can_read(send_stream: &ReliableSendStream, mux_limits: MuxLimits) -> bool {
@@ -1520,6 +1632,7 @@ struct UdpDatagramClientSession {
     next_flow_id: u64,
     mux_limits: MuxLimits,
     path_index: usize,
+    stats: PathDeliveryStats,
 }
 
 struct UdpDatagramClientFlow {
@@ -1581,6 +1694,7 @@ impl UdpDatagramClientSession {
             next_flow_id: 0,
             mux_limits,
             path_index,
+            stats: PathDeliveryStats::default(),
         })
     }
 
@@ -1591,6 +1705,7 @@ impl UdpDatagramClientSession {
         ttl_ms: u32,
     ) -> Result<Bytes, RuntimeError> {
         let flow_id = self.ensure_flow(target).await?;
+        let request_len = payload.len();
         let flow = self
             .flows
             .iter_mut()
@@ -1612,7 +1727,11 @@ impl UdpDatagramClientSession {
                 flow_id: response_flow_id,
                 payload,
                 ..
-            } if response_flow_id == flow_id => Ok(payload),
+            } if response_flow_id == flow_id => {
+                self.stats.record_payload_bytes(request_len);
+                self.stats.record_payload_bytes(payload.len());
+                Ok(payload)
+            }
             Frame::DatagramClose {
                 flow_id: closed_flow_id,
             } if closed_flow_id == flow_id => Err(RuntimeError::Protocol("datagram flow closed")),
@@ -1681,6 +1800,10 @@ impl UdpDatagramClientSession {
             })
             .await?;
         Ok(())
+    }
+
+    fn delivery_stats(&self) -> PathDeliveryStats {
+        self.stats
     }
 }
 
@@ -2581,6 +2704,88 @@ mod tests {
                 .first()
                 .copied(),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn measured_tcp_delivery_rate_updates_next_bulk_order() {
+        let hinted_slow_path = "tcp://127.0.0.1:10013?srtt-ms=20&rate-mbps=10"
+            .parse::<PathSpec>()
+            .expect("hinted slow path");
+        let hinted_fast_path = "tcp://127.0.0.1:10014?srtt-ms=20&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("hinted fast path");
+        let context = ClientPathContext::new(
+            vec![hinted_slow_path, hinted_fast_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Bulk, 4 * 1024 * 1024)
+                .first()
+                .copied(),
+            Some(1)
+        );
+
+        context.mark_tcp_path_delivery(
+            0,
+            PathDeliveryStats {
+                payload_bytes: 4 * 1024 * 1024,
+                first_payload_at: Some(Instant::now()),
+                last_payload_at: Some(Instant::now() + Duration::from_millis(40)),
+            },
+        );
+
+        assert_eq!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Bulk, 4 * 1024 * 1024)
+                .first()
+                .copied(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn measured_udp_delivery_rate_updates_next_datagram_order() {
+        let hinted_slow_path = "udp://127.0.0.1:10015?srtt-ms=20&rate-mbps=10"
+            .parse::<PathSpec>()
+            .expect("hinted slow path");
+        let hinted_fast_path = "udp://127.0.0.1:10016?srtt-ms=20&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("hinted fast path");
+        let context = ClientPathContext::new(
+            vec![hinted_slow_path, hinted_fast_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
+            context
+                .ordered_udp_path_indices(1024 * 1024)
+                .first()
+                .copied(),
+            Some(1)
+        );
+
+        context.mark_udp_path_delivery(
+            0,
+            PathDeliveryStats {
+                payload_bytes: 1024 * 1024,
+                first_payload_at: Some(Instant::now()),
+                last_payload_at: Some(Instant::now() + Duration::from_millis(10)),
+            },
+        );
+
+        assert_eq!(
+            context
+                .ordered_udp_path_indices(1024 * 1024)
+                .first()
+                .copied(),
+            Some(0)
         );
     }
 

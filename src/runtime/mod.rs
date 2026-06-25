@@ -19,12 +19,14 @@ use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
 use crate::transport::udp::{self, UdpTransportError};
 use crate::transport::{PathSpec, PathSpecParseError};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 
 const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 
@@ -91,6 +93,8 @@ async fn run_server(
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,
+        max_udp_sessions: resources.max_streams,
+        max_udp_flows_per_session: resources.max_streams,
     };
     for path in bind_paths {
         match path.underlay {
@@ -138,13 +142,88 @@ async fn run_server_udp_listener(
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
     let socket = Arc::new(socket);
+    let probe = EncryptedUdpSocket::from_shared(
+        socket.clone(),
+        context.security.secret.as_bytes(),
+        PeerRole::Server,
+        context.codec_limits,
+    );
+    let mut buffer = vec![0u8; probe.max_datagram_bytes()?];
+    let mut sessions: HashMap<SocketAddr, mpsc::Sender<Bytes>> = HashMap::new();
+    let (done_tx, mut done_rx) = mpsc::channel::<SocketAddr>(udp_session_done_queue(&context));
     loop {
-        if let Err(err) =
-            handle_server_udp_datagram_shared_path_session(socket.clone(), context.clone()).await
-        {
-            eprintln!("warning: UDP server path session failed: {err}");
+        tokio::select! {
+            received = socket.recv_from(&mut buffer) => {
+                let (len, peer) = received?;
+                if !sessions.contains_key(&peer) {
+                    if sessions.len() >= context.max_udp_sessions {
+                        eprintln!(
+                            "warning: UDP server session limit reached; dropping datagram from {peer}"
+                        );
+                        continue;
+                    }
+                    let (tx, rx) = mpsc::channel(udp_session_datagram_queue(&context));
+                    let session_socket = socket.clone();
+                    let session_context = context.clone();
+                    let session_done = done_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            run_server_udp_peer_session(session_socket, peer, session_context, rx).await
+                        {
+                            eprintln!("warning: UDP server path session for {peer} failed: {err}");
+                        }
+                        let _ = session_done.send(peer).await;
+                    });
+                    sessions.insert(peer, tx);
+                }
+                let datagram = Bytes::copy_from_slice(&buffer[..len]);
+                let send_result = sessions
+                    .get(&peer)
+                    .ok_or(RuntimeError::Protocol("missing UDP peer session"))?
+                    .try_send(datagram);
+                match send_result {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        eprintln!("warning: UDP server peer queue full; dropping datagram from {peer}");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        sessions.remove(&peer);
+                    }
+                }
+            }
+            completed = done_rx.recv() => {
+                if let Some(peer) = completed {
+                    sessions.remove(&peer);
+                }
+            }
         }
     }
+}
+
+async fn run_server_udp_peer_session(
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    context: ServerPathContext,
+    mut datagrams: mpsc::Receiver<Bytes>,
+) -> Result<(), RuntimeError> {
+    let mut session = ServerUdpPathSession::new(socket, peer, context)?;
+    while let Some(datagram) = datagrams.recv().await {
+        let frame = session.open_frame(&datagram)?;
+        match session.handle_frame(frame).await? {
+            ServerUdpSessionOutcome::Active => {}
+            ServerUdpSessionOutcome::Closed => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+fn udp_session_datagram_queue(context: &ServerPathContext) -> usize {
+    let payload = context.mux_limits.max_payload_bytes.max(1);
+    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 1024)
+}
+
+fn udp_session_done_queue(context: &ServerPathContext) -> usize {
+    context.max_udp_sessions.clamp(1, 1024)
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +257,8 @@ pub struct ServerPathContext {
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     security: SecurityConfig,
+    max_udp_sessions: usize,
+    max_udp_flows_per_session: usize,
 }
 
 pub async fn handle_socks5_client_stream<S>(
@@ -849,26 +930,38 @@ pub async fn handle_server_udp_datagram_path_session(
     socket: UdpSocket,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
-    let encrypted = EncryptedUdpSocket::new(
-        socket,
+    let socket = Arc::new(socket);
+    let probe = EncryptedUdpSocket::from_shared(
+        socket.clone(),
         context.security.secret.as_bytes(),
         PeerRole::Server,
         context.codec_limits,
     );
-    handle_server_udp_datagram_path(encrypted, context).await
-}
-
-async fn handle_server_udp_datagram_shared_path_session(
-    socket: Arc<UdpSocket>,
-    context: ServerPathContext,
-) -> Result<(), RuntimeError> {
-    let encrypted = EncryptedUdpSocket::from_shared(
-        socket,
-        context.security.secret.as_bytes(),
-        PeerRole::Server,
-        context.codec_limits,
-    );
-    handle_server_udp_datagram_path(encrypted, context).await
+    let mut buffer = vec![0u8; probe.max_datagram_bytes()?];
+    let mut session = None;
+    loop {
+        let (len, peer) = socket.recv_from(&mut buffer).await?;
+        if session.is_none() {
+            session = Some(ServerUdpPathSession::new(
+                socket.clone(),
+                peer,
+                context.clone(),
+            )?);
+        }
+        let session_ref = session
+            .as_mut()
+            .ok_or(RuntimeError::Protocol("missing UDP path session"))?;
+        if session_ref.peer != peer {
+            return Err(RuntimeError::Protocol(
+                "UDP datagram arrived from unexpected peer",
+            ));
+        }
+        let frame = session_ref.open_frame(&buffer[..len])?;
+        match session_ref.handle_frame(frame).await? {
+            ServerUdpSessionOutcome::Active => {}
+            ServerUdpSessionOutcome::Closed => return Ok(()),
+        }
+    }
 }
 
 struct ServerUdpDatagramFlow {
@@ -876,73 +969,136 @@ struct ServerUdpDatagramFlow {
     outbound_socket: UdpSocket,
 }
 
-async fn handle_server_udp_datagram_path(
-    mut encrypted: EncryptedUdpSocket,
+struct ServerUdpPathSession {
+    peer: SocketAddr,
+    encrypted: EncryptedUdpSocket,
     context: ServerPathContext,
-) -> Result<(), RuntimeError> {
-    let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
-    let (session_id, peer) = match encrypted.recv_frame_from(&mut buffer).await? {
-        (Frame::SessionHello { session_id }, peer) => (session_id, peer),
-        _ => return Err(RuntimeError::Protocol("expected UDP SESSION_HELLO")),
-    };
-    let authenticator = SessionAuthenticator::new(context.security.secret.as_bytes())?;
-    match recv_udp_frame_from_peer(&mut encrypted, &mut buffer, peer).await? {
-        Frame::SessionAuth {
-            session_id: auth_session_id,
-            nonce,
-            auth_tag,
-        } if auth_session_id == session_id
-            && authenticator.verify_session_auth(session_id, nonce, auth_tag) => {}
-        _ => return Err(RuntimeError::Protocol("invalid UDP SESSION_AUTH")),
-    }
-    let path_id = match recv_udp_frame_from_peer(&mut encrypted, &mut buffer, peer).await? {
-        Frame::PathJoin {
-            session_id: join_session_id,
-            path_id,
-            underlay,
-            nonce,
-            capabilities,
-            auth_tag,
-        } if join_session_id == session_id
-            && underlay == UnderlayProtocol::Udp
-            && authenticator.verify_path_join(
-                session_id,
-                path_id,
-                underlay,
-                nonce,
-                capabilities,
-                auth_tag,
-            ) =>
-        {
-            path_id
-        }
-        _ => return Err(RuntimeError::Protocol("invalid UDP PATH_JOIN")),
-    };
-    encrypted.send_frame_to(&Frame::SessionReady, peer).await?;
-    encrypted
-        .send_frame_to(
-            &Frame::PathStatus {
-                path_id,
-                status: crate::protocol::PathStatus::Active,
-                capabilities: PathCapabilities::default(),
-            },
-            peer,
-        )
-        .await?;
+    authenticator: SessionAuthenticator,
+    state: ServerUdpPathState,
+    flows: Vec<ServerUdpDatagramFlow>,
+}
 
-    let mut flows: Vec<ServerUdpDatagramFlow> = Vec::new();
-    loop {
-        match recv_udp_frame_from_peer(&mut encrypted, &mut buffer, peer).await? {
-            Frame::OpenDatagramFlow {
-                flow_id, target, ..
-            } => {
-                if flows.iter().any(|flow| flow.flow_id == flow_id) {
+enum ServerUdpPathState {
+    AwaitSessionHello,
+    AwaitSessionAuth { session_id: SessionId },
+    AwaitPathJoin { session_id: SessionId },
+    Established,
+}
+
+enum ServerUdpSessionOutcome {
+    Active,
+    Closed,
+}
+
+impl ServerUdpPathSession {
+    fn new(
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        context: ServerPathContext,
+    ) -> Result<Self, RuntimeError> {
+        let authenticator = SessionAuthenticator::new(context.security.secret.as_bytes())?;
+        let encrypted = EncryptedUdpSocket::from_shared(
+            socket,
+            context.security.secret.as_bytes(),
+            PeerRole::Server,
+            context.codec_limits,
+        );
+        Ok(Self {
+            peer,
+            encrypted,
+            context,
+            authenticator,
+            state: ServerUdpPathState::AwaitSessionHello,
+            flows: Vec::new(),
+        })
+    }
+
+    fn open_frame(&mut self, datagram: &[u8]) -> Result<Frame, RuntimeError> {
+        Ok(self.encrypted.open_frame_datagram(datagram)?)
+    }
+
+    async fn handle_frame(
+        &mut self,
+        frame: Frame,
+    ) -> Result<ServerUdpSessionOutcome, RuntimeError> {
+        match (&self.state, frame) {
+            (ServerUdpPathState::AwaitSessionHello, Frame::SessionHello { session_id }) => {
+                self.state = ServerUdpPathState::AwaitSessionAuth { session_id };
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (
+                ServerUdpPathState::AwaitSessionAuth { session_id },
+                Frame::SessionAuth {
+                    session_id: auth_session_id,
+                    nonce,
+                    auth_tag,
+                },
+            ) if auth_session_id == *session_id
+                && self
+                    .authenticator
+                    .verify_session_auth(*session_id, nonce, auth_tag) =>
+            {
+                self.state = ServerUdpPathState::AwaitPathJoin {
+                    session_id: *session_id,
+                };
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (
+                ServerUdpPathState::AwaitPathJoin { session_id },
+                Frame::PathJoin {
+                    session_id: join_session_id,
+                    path_id,
+                    underlay,
+                    nonce,
+                    capabilities,
+                    auth_tag,
+                },
+            ) if join_session_id == *session_id
+                && underlay == UnderlayProtocol::Udp
+                && self.authenticator.verify_path_join(
+                    *session_id,
+                    path_id,
+                    underlay,
+                    nonce,
+                    capabilities,
+                    auth_tag,
+                ) =>
+            {
+                self.encrypted
+                    .send_frame_to(&Frame::SessionReady, self.peer)
+                    .await?;
+                self.encrypted
+                    .send_frame_to(
+                        &Frame::PathStatus {
+                            path_id,
+                            status: crate::protocol::PathStatus::Active,
+                            capabilities: PathCapabilities::default(),
+                        },
+                        self.peer,
+                    )
+                    .await?;
+                self.state = ServerUdpPathState::Established;
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (
+                ServerUdpPathState::Established,
+                Frame::OpenDatagramFlow {
+                    flow_id, target, ..
+                },
+            ) => {
+                if self.flows.iter().any(|flow| flow.flow_id == flow_id) {
                     return Err(RuntimeError::Protocol("duplicate UDP datagram flow"));
                 }
+                if self.flows.len() >= self.context.max_udp_flows_per_session {
+                    self.encrypted
+                        .send_frame_to(&Frame::DatagramClose { flow_id }, self.peer)
+                        .await?;
+                    return Ok(ServerUdpSessionOutcome::Active);
+                }
                 outbound::validate_target(&target)?;
-                context.outbound.ensure_supports(TargetProtocol::Udp)?;
+                self.context.outbound.ensure_supports(TargetProtocol::Udp)?;
                 let outbound_socket = match outbound::connect_udp(
-                    &context.outbound,
+                    &self.context.outbound,
                     &target,
                     Duration::from_secs(10),
                 )
@@ -950,32 +1106,38 @@ async fn handle_server_udp_datagram_path(
                 {
                     Ok(socket) => socket,
                     Err(err) => {
-                        encrypted
-                            .send_frame_to(&Frame::DatagramClose { flow_id }, peer)
+                        self.encrypted
+                            .send_frame_to(&Frame::DatagramClose { flow_id }, self.peer)
                             .await?;
                         return Err(RuntimeError::OutboundConnect(err));
                     }
                 };
-                flows.push(ServerUdpDatagramFlow {
+                self.flows.push(ServerUdpDatagramFlow {
                     flow_id,
                     outbound_socket,
                 });
+                Ok(ServerUdpSessionOutcome::Active)
             }
-            Frame::DatagramData {
-                flow_id,
-                ttl_ms,
-                payload,
-                ..
-            } => {
+            (
+                ServerUdpPathState::Established,
+                Frame::DatagramData {
+                    flow_id,
+                    ttl_ms,
+                    payload,
+                    ..
+                },
+            ) => {
                 if ttl_ms == 0 {
                     return Err(RuntimeError::Protocol("expired datagram received"));
                 }
-                let flow = flows
+                let flow = self
+                    .flows
                     .iter_mut()
                     .find(|flow| flow.flow_id == flow_id)
                     .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?;
                 flow.outbound_socket.send(&payload).await?;
-                let mut response = vec![0u8; context.mux_limits.max_payload_bytes.min(64 * 1024)];
+                let mut response =
+                    vec![0u8; self.context.mux_limits.max_payload_bytes.min(64 * 1024)];
                 let len = tokio::time::timeout(
                     Duration::from_secs(1),
                     flow.outbound_socket.recv(&mut response),
@@ -983,37 +1145,26 @@ async fn handle_server_udp_datagram_path(
                 .await
                 .map_err(|_| RuntimeError::Protocol("UDP outbound response timed out"))??;
                 response.truncate(len);
-                let mut response_flow = DatagramFlow::new(flow_id, context.mux_limits);
+                let mut response_flow = DatagramFlow::new(flow_id, self.context.mux_limits);
                 response_flow.enqueue(0, ttl_ms, Bytes::from(response))?;
                 let frame = response_flow
                     .pop_frame(0)
                     .ok_or(RuntimeError::Protocol("UDP response expired before send"))?;
-                encrypted.send_frame_to(&frame, peer).await?;
+                self.encrypted.send_frame_to(&frame, self.peer).await?;
+                Ok(ServerUdpSessionOutcome::Active)
             }
-            Frame::DatagramClose { flow_id } => {
-                flows.retain(|flow| flow.flow_id != flow_id);
-                if flows.is_empty() {
-                    return Ok(());
+            (ServerUdpPathState::Established, Frame::DatagramClose { flow_id }) => {
+                self.flows.retain(|flow| flow.flow_id != flow_id);
+                if self.flows.is_empty() {
+                    Ok(ServerUdpSessionOutcome::Closed)
+                } else {
+                    Ok(ServerUdpSessionOutcome::Active)
                 }
             }
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-            _ => return Err(RuntimeError::Protocol("unexpected UDP datagram path frame")),
+            (_, Frame::SessionClose { .. }) => Ok(ServerUdpSessionOutcome::Closed),
+            _ => Err(RuntimeError::Protocol("unexpected UDP datagram path frame")),
         }
     }
-}
-
-async fn recv_udp_frame_from_peer(
-    encrypted: &mut EncryptedUdpSocket,
-    buffer: &mut [u8],
-    expected_peer: SocketAddr,
-) -> Result<Frame, RuntimeError> {
-    let (frame, peer) = encrypted.recv_frame_from(buffer).await?;
-    if peer != expected_peer {
-        return Err(RuntimeError::Protocol(
-            "UDP frame arrived from unexpected peer",
-        ));
-    }
-    Ok(frame)
 }
 
 async fn read_socks5_auth<S>(stream: &mut S) -> Result<socks5::AuthRequest, RuntimeError>
@@ -1287,6 +1438,18 @@ mod tests {
         SecurityConfig::encrypted(SharedSecret::new(b"0123456789abcdef".to_vec()).expect("secret"))
     }
 
+    fn server_context(outbound: OutboundConfig) -> ServerPathContext {
+        let resources = ResourceLimits::default();
+        ServerPathContext {
+            outbound,
+            codec_limits: resources.into(),
+            mux_limits: resources.into(),
+            security: security(),
+            max_udp_sessions: resources.max_streams,
+            max_udp_flows_per_session: resources.max_streams,
+        }
+    }
+
     async fn reserve_tcp_path() -> PathSpec {
         let probe = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1337,16 +1500,7 @@ mod tests {
         let listener = bind_listener(&path).await.expect("bind");
         let handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_server_path(
-                stream,
-                ServerPathContext {
-                    outbound,
-                    codec_limits: CodecLimits::default(),
-                    mux_limits: ResourceLimits::default().into(),
-                    security: security(),
-                },
-            )
-            .await
+            handle_server_path(stream, server_context(outbound)).await
         });
         (path, handle)
     }
@@ -1446,12 +1600,7 @@ mod tests {
         let socket = udp::bind_socket(&path).await.expect("bind udp path");
         let server = tokio::spawn(handle_server_udp_datagram_path_session(
             socket,
-            ServerPathContext {
-                outbound: OutboundConfig::Direct,
-                codec_limits: CodecLimits::default(),
-                mux_limits: ResourceLimits::default().into(),
-                security: security(),
-            },
+            server_context(OutboundConfig::Direct),
         ));
 
         let response = client_udp_datagram_round_trip(
@@ -1500,18 +1649,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
+        let (first_target_addr, first_target) = spawn_udp_echo_target().await;
+        let (second_target_addr, second_target) = spawn_udp_echo_target().await;
+        let path = reserve_udp_path().await;
+        let server = tokio::spawn(run_server(
+            vec![path.clone()],
+            OutboundConfig::Direct,
+            security(),
+            ResourceLimits::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let first = client_udp_datagram_round_trip(
+            &path,
+            security(),
+            ResourceLimits::default(),
+            TargetAddr::Ip(first_target_addr),
+            Bytes::from_static(b"ping"),
+            1000,
+        );
+        let second = client_udp_datagram_round_trip(
+            &path,
+            security(),
+            ResourceLimits::default(),
+            TargetAddr::Ip(second_target_addr),
+            Bytes::from_static(b"ping"),
+            1000,
+        );
+        let (first_response, second_response) = tokio::join!(first, second);
+
+        assert_eq!(
+            first_response.expect("first response"),
+            Bytes::from_static(b"pong")
+        );
+        assert_eq!(
+            second_response.expect("second response"),
+            Bytes::from_static(b"pong")
+        );
+        server.abort();
+        let _ = server.await;
+        first_target.await.expect("first target join");
+        second_target.await.expect("second target join");
+    }
+
+    #[tokio::test]
     async fn socks5_udp_associate_relays_datagram_over_encrypted_udp_path() {
         let (target_addr, target) = spawn_udp_echo_target_count(2).await;
         let path = reserve_udp_path().await;
         let socket = udp::bind_socket(&path).await.expect("bind udp path");
         let server = tokio::spawn(handle_server_udp_datagram_path_session(
             socket,
-            ServerPathContext {
-                outbound: OutboundConfig::Direct,
-                codec_limits: CodecLimits::default(),
-                mux_limits: ResourceLimits::default().into(),
-                security: security(),
-            },
+            server_context(OutboundConfig::Direct),
         ));
         let context =
             ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
@@ -1594,6 +1783,8 @@ mod tests {
                     security: SecurityConfig::encrypted(
                         SharedSecret::new(b"fedcba9876543210".to_vec()).expect("secret"),
                     ),
+                    max_udp_sessions: ResourceLimits::default().max_streams,
+                    max_udp_flows_per_session: ResourceLimits::default().max_streams,
                 },
             )
             .await

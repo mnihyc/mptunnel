@@ -106,6 +106,13 @@ impl EncryptedUdpSocket {
         Ok((frame, peer))
     }
 
+    pub(crate) fn open_frame_datagram(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<Frame, EncryptedUdpTransportError> {
+        self.open_datagram(datagram)
+    }
+
     fn seal_frame(&mut self, frame: &Frame) -> Result<Vec<u8>, EncryptedUdpTransportError> {
         let mut payload = encode_frame(frame, self.limits)?;
         let ciphertext_len = payload

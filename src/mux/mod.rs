@@ -11,6 +11,7 @@ pub struct MuxLimits {
     pub max_repair_bytes: usize,
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
+    pub max_tcp_path_inflight_bytes: usize,
 }
 
 impl Default for MuxLimits {
@@ -22,6 +23,7 @@ impl Default for MuxLimits {
             max_repair_bytes: 16 * 1024 * 1024,
             max_reorder_bytes: 16 * 1024 * 1024,
             max_datagram_queue_bytes: 4 * 1024 * 1024,
+            max_tcp_path_inflight_bytes: crate::config::DEFAULT_TCP_PATH_INFLIGHT_BYTES,
         }
     }
 }
@@ -35,6 +37,7 @@ impl From<ResourceLimits> for MuxLimits {
             max_repair_bytes: value.max_repair_bytes,
             max_reorder_bytes: value.max_reorder_bytes,
             max_datagram_queue_bytes: value.max_datagram_queue_bytes,
+            max_tcp_path_inflight_bytes: value.max_tcp_path_inflight_bytes,
         }
     }
 }

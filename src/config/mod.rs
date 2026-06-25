@@ -18,6 +18,8 @@ pub const DEFAULT_PATH_PROBE_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_INTERVAL_MS);
 pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
+pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
+const RELAY_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -83,6 +85,7 @@ pub struct ResourceLimits {
     pub max_repair_bytes: usize,
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
+    pub max_tcp_path_inflight_bytes: usize,
 }
 
 impl Default for ResourceLimits {
@@ -97,6 +100,7 @@ impl Default for ResourceLimits {
             max_repair_bytes: 16 * 1024 * 1024,
             max_reorder_bytes: 16 * 1024 * 1024,
             max_datagram_queue_bytes: 4 * 1024 * 1024,
+            max_tcp_path_inflight_bytes: DEFAULT_TCP_PATH_INFLIGHT_BYTES,
         }
     }
 }
@@ -132,6 +136,12 @@ impl ResourceLimits {
         }
         if self.max_datagram_queue_bytes < self.max_payload_bytes {
             return Err(ConfigError::DatagramQueueLimitTooSmall);
+        }
+        if self.max_tcp_path_inflight_bytes < self.max_payload_bytes.min(RELAY_CHUNK_BYTES) {
+            return Err(ConfigError::TcpPathInflightLimitTooSmall);
+        }
+        if self.max_tcp_path_inflight_bytes > self.max_repair_bytes {
+            return Err(ConfigError::TcpPathInflightLimitExceedsRepairLimit);
         }
         Ok(())
     }
@@ -269,6 +279,8 @@ pub enum ConfigError {
     RepairLimitTooSmall,
     ReorderLimitTooSmall,
     DatagramQueueLimitTooSmall,
+    TcpPathInflightLimitTooSmall,
+    TcpPathInflightLimitExceedsRepairLimit,
     TooManyPaths { actual: usize, limit: usize },
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
@@ -309,6 +321,18 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "max datagram queue bytes must be at least max payload bytes"
+                )
+            }
+            Self::TcpPathInflightLimitTooSmall => {
+                write!(
+                    f,
+                    "max TCP path inflight bytes must be at least one relay chunk"
+                )
+            }
+            Self::TcpPathInflightLimitExceedsRepairLimit => {
+                write!(
+                    f,
+                    "max TCP path inflight bytes must be no greater than max repair bytes"
                 )
             }
             Self::TooManyPaths { actual, limit } => {

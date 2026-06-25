@@ -1,7 +1,7 @@
 use crate::config::{
     AppConfig, ClientConfig, CommandConfig, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, ResourceLimits, SecurityConfig, ServerConfig, SharedSecret,
-    TcpPortClassRule, TrafficPolicy,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits, SecurityConfig,
+    ServerConfig, SharedSecret, TcpPortClassRule, TrafficPolicy,
 };
 use crate::ingress::IngressConfig;
 use crate::outbound::OutboundConfig;
@@ -144,6 +144,14 @@ pub struct ResourceArgs {
         default_value_t = 4 * 1024 * 1024
     )]
     pub max_datagram_queue_bytes: usize,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES",
+        default_value_t = DEFAULT_TCP_PATH_INFLIGHT_BYTES
+    )]
+    pub max_tcp_path_inflight_bytes: usize,
 }
 
 impl ResourceArgs {
@@ -158,6 +166,7 @@ impl ResourceArgs {
             max_repair_bytes: self.max_repair_bytes,
             max_reorder_bytes: self.max_reorder_bytes,
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
+            max_tcp_path_inflight_bytes: self.max_tcp_path_inflight_bytes,
         }
     }
 }
@@ -599,6 +608,52 @@ mod tests {
             cli.into_config(),
             Err(CliConfigError::Config(
                 crate::config::ConfigError::RepairLimitTooSmall
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--max-payload-bytes",
+            "1024",
+            "--max-repair-bytes",
+            "4096",
+            "--max-tcp-path-inflight-bytes",
+            "512",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TcpPathInflightLimitTooSmall
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--max-payload-bytes",
+            "1024",
+            "--max-repair-bytes",
+            "4096",
+            "--max-tcp-path-inflight-bytes",
+            "8192",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TcpPathInflightLimitExceedsRepairLimit
             ))
         ));
     }

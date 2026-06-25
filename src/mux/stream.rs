@@ -395,6 +395,7 @@ mod tests {
             max_repair_bytes: 2048,
             max_reorder_bytes: 2048,
             max_datagram_queue_bytes: 2048,
+            max_tcp_path_inflight_bytes: 2048,
         }
     }
 

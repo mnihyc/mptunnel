@@ -1329,7 +1329,10 @@ where
         }
 
         tokio::select! {
-            read = local.read(&mut buf), if local_open => {
+            read = async {
+                let read_budget = tcp_relay_read_budget(&send_stream, mux_limits, buf.len());
+                local.read(&mut buf[..read_budget]).await
+            }, if local_open && tcp_relay_can_read(&send_stream, mux_limits) => {
                 let read = read?;
                 if read == 0 {
                     framed.write_frame(&Frame::StreamFin { stream_id }).await?;
@@ -1392,6 +1395,21 @@ where
     }
 
     Ok(())
+}
+
+fn tcp_relay_can_read(send_stream: &ReliableSendStream, mux_limits: MuxLimits) -> bool {
+    send_stream.repair_bytes() < mux_limits.max_tcp_path_inflight_bytes
+}
+
+fn tcp_relay_read_budget(
+    send_stream: &ReliableSendStream,
+    mux_limits: MuxLimits,
+    buffer_len: usize,
+) -> usize {
+    mux_limits
+        .max_tcp_path_inflight_bytes
+        .saturating_sub(send_stream.repair_bytes())
+        .min(buffer_len)
 }
 
 pub async fn client_udp_datagram_round_trip(
@@ -2290,6 +2308,59 @@ mod tests {
         let port = probe.local_addr().expect("reserved addr").port();
         drop(probe);
         format!("udp://127.0.0.1:{port}").parse().expect("path")
+    }
+
+    #[test]
+    fn tcp_relay_read_budget_is_ack_gated() {
+        let mut mux_limits = MuxLimits {
+            max_payload_bytes: 64 * 1024,
+            max_ack_ranges: 256,
+            max_stream_window_bytes: 1024 * 1024,
+            max_repair_bytes: 1024 * 1024,
+            max_reorder_bytes: 1024 * 1024,
+            max_datagram_queue_bytes: 1024 * 1024,
+            max_tcp_path_inflight_bytes: 32 * 1024,
+        };
+        let mut send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
+
+        assert!(tcp_relay_can_read(&send_stream, mux_limits));
+        assert_eq!(
+            tcp_relay_read_budget(&send_stream, mux_limits, 64 * 1024),
+            32 * 1024
+        );
+
+        send_stream
+            .send_data(Bytes::from(vec![0u8; 8 * 1024]), StreamFlags::NONE)
+            .expect("first send");
+        assert_eq!(
+            tcp_relay_read_budget(&send_stream, mux_limits, 64 * 1024),
+            24 * 1024
+        );
+
+        send_stream
+            .send_data(Bytes::from(vec![0u8; 24 * 1024]), StreamFlags::NONE)
+            .expect("second send");
+        assert!(!tcp_relay_can_read(&send_stream, mux_limits));
+        assert_eq!(
+            tcp_relay_read_budget(&send_stream, mux_limits, 64 * 1024),
+            0
+        );
+
+        send_stream.apply_ack(&[crate::protocol::OffsetRange {
+            start: 0,
+            end: 8 * 1024,
+        }]);
+        assert!(tcp_relay_can_read(&send_stream, mux_limits));
+        assert_eq!(
+            tcp_relay_read_budget(&send_stream, mux_limits, 64 * 1024),
+            8 * 1024
+        );
+
+        mux_limits.max_tcp_path_inflight_bytes = 64 * 1024;
+        assert_eq!(
+            tcp_relay_read_budget(&send_stream, mux_limits, 16 * 1024),
+            16 * 1024
+        );
     }
 
     #[test]

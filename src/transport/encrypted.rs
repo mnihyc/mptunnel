@@ -3,7 +3,7 @@ use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 const MAGIC: &[u8; 4] = b"MPTE";
 const VERSION: u8 = 1;
@@ -44,6 +44,22 @@ pub struct EncryptedFramedStream<S> {
     recv_counter: u64,
 }
 
+pub struct EncryptedFramedReader<R> {
+    stream: R,
+    cipher: ChaCha20Poly1305,
+    limits: CodecLimits,
+    recv_direction: u8,
+    recv_counter: u64,
+}
+
+pub struct EncryptedFramedWriter<W> {
+    stream: W,
+    cipher: ChaCha20Poly1305,
+    limits: CodecLimits,
+    send_direction: u8,
+    send_counter: u64,
+}
+
 impl<S: std::fmt::Debug> std::fmt::Debug for EncryptedFramedStream<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncryptedFramedStream")
@@ -78,6 +94,43 @@ impl<S> EncryptedFramedStream<S> {
     pub fn into_inner(self) -> S {
         self.stream
     }
+
+    pub fn split(
+        self,
+    ) -> (
+        EncryptedFramedReader<ReadHalf<S>>,
+        EncryptedFramedWriter<WriteHalf<S>>,
+    )
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Self {
+            stream,
+            cipher,
+            limits,
+            send_direction,
+            recv_direction,
+            send_counter,
+            recv_counter,
+        } = self;
+        let (read_half, write_half) = tokio::io::split(stream);
+        (
+            EncryptedFramedReader {
+                stream: read_half,
+                cipher: cipher.clone(),
+                limits,
+                recv_direction,
+                recv_counter,
+            },
+            EncryptedFramedWriter {
+                stream: write_half,
+                cipher,
+                limits,
+                send_direction,
+                send_counter,
+            },
+        )
+    }
 }
 
 impl<S> EncryptedFramedStream<S>
@@ -85,80 +138,160 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
-        let mut header = [0u8; HEADER_LEN];
-        self.stream.read_exact(&mut header).await?;
-        let Header {
-            direction,
-            counter,
-            ciphertext_len,
-        } = decode_header(&header, self.limits)?;
-        if direction != self.recv_direction {
-            return Err(EncryptedFramedTransportError::WrongDirection {
-                expected: self.recv_direction,
-                actual: direction,
-            });
-        }
-        if counter != self.recv_counter {
-            return Err(EncryptedFramedTransportError::UnexpectedCounter {
-                expected: self.recv_counter,
-                actual: counter,
-            });
-        }
-
-        let mut encrypted = vec![0u8; ciphertext_len];
-        self.stream.read_exact(&mut encrypted).await?;
-        let tag_start = encrypted
-            .len()
-            .checked_sub(TAG_LEN)
-            .ok_or(EncryptedFramedTransportError::Crypto)?;
-        let tag_bytes: [u8; TAG_LEN] = encrypted[tag_start..].try_into().expect("tag slice length");
-        encrypted.truncate(tag_start);
-        let nonce = build_nonce(direction, counter);
-        self.cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &header,
-                &mut encrypted,
-                Tag::from_slice(&tag_bytes),
-            )
-            .map_err(|_| EncryptedFramedTransportError::Crypto)?;
-        self.recv_counter = self
-            .recv_counter
-            .checked_add(1)
-            .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
-        Ok(decode_frame(&encrypted, self.limits)?)
+        read_frame_from(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.recv_direction,
+            &mut self.recv_counter,
+        )
+        .await
     }
 
     pub async fn write_frame(
         &mut self,
         frame: &Frame,
     ) -> Result<(), EncryptedFramedTransportError> {
-        let mut payload = encode_frame(frame, self.limits)?;
-        let ciphertext_len = payload
-            .len()
-            .checked_add(TAG_LEN)
-            .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
-        validate_encrypted_len(ciphertext_len, self.limits)?;
-        let header = encode_header(self.send_direction, self.send_counter, ciphertext_len)?;
-        let nonce = build_nonce(self.send_direction, self.send_counter);
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut payload)
-            .map_err(|_| EncryptedFramedTransportError::Crypto)?;
-        self.stream.write_all(&header).await?;
-        self.stream.write_all(&payload).await?;
-        self.stream.write_all(&tag).await?;
-        self.send_counter = self
-            .send_counter
-            .checked_add(1)
-            .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
-        Ok(())
+        write_frame_to(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.send_direction,
+            &mut self.send_counter,
+            frame,
+        )
+        .await
     }
 
     pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
         self.stream.flush().await?;
         Ok(())
     }
+}
+
+impl<R> EncryptedFramedReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
+        read_frame_from(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.recv_direction,
+            &mut self.recv_counter,
+        )
+        .await
+    }
+}
+
+impl<W> EncryptedFramedWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    pub async fn write_frame(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<(), EncryptedFramedTransportError> {
+        write_frame_to(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.send_direction,
+            &mut self.send_counter,
+            frame,
+        )
+        .await
+    }
+
+    pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
+        self.stream.flush().await?;
+        Ok(())
+    }
+}
+
+async fn read_frame_from<R>(
+    stream: &mut R,
+    cipher: &ChaCha20Poly1305,
+    limits: CodecLimits,
+    recv_direction: u8,
+    recv_counter: &mut u64,
+) -> Result<Frame, EncryptedFramedTransportError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    let Header {
+        direction,
+        counter,
+        ciphertext_len,
+    } = decode_header(&header, limits)?;
+    if direction != recv_direction {
+        return Err(EncryptedFramedTransportError::WrongDirection {
+            expected: recv_direction,
+            actual: direction,
+        });
+    }
+    if counter != *recv_counter {
+        return Err(EncryptedFramedTransportError::UnexpectedCounter {
+            expected: *recv_counter,
+            actual: counter,
+        });
+    }
+
+    let mut encrypted = vec![0u8; ciphertext_len];
+    stream.read_exact(&mut encrypted).await?;
+    let tag_start = encrypted
+        .len()
+        .checked_sub(TAG_LEN)
+        .ok_or(EncryptedFramedTransportError::Crypto)?;
+    let tag_bytes: [u8; TAG_LEN] = encrypted[tag_start..].try_into().expect("tag slice length");
+    encrypted.truncate(tag_start);
+    let nonce = build_nonce(direction, counter);
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            &header,
+            &mut encrypted,
+            Tag::from_slice(&tag_bytes),
+        )
+        .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+    *recv_counter = recv_counter
+        .checked_add(1)
+        .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
+    Ok(decode_frame(&encrypted, limits)?)
+}
+
+async fn write_frame_to<W>(
+    stream: &mut W,
+    cipher: &ChaCha20Poly1305,
+    limits: CodecLimits,
+    send_direction: u8,
+    send_counter: &mut u64,
+    frame: &Frame,
+) -> Result<(), EncryptedFramedTransportError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut payload = encode_frame(frame, limits)?;
+    let ciphertext_len = payload
+        .len()
+        .checked_add(TAG_LEN)
+        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
+    validate_encrypted_len(ciphertext_len, limits)?;
+    let header = encode_header(send_direction, *send_counter, ciphertext_len)?;
+    let nonce = build_nonce(send_direction, *send_counter);
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut payload)
+        .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+    stream.write_all(&header).await?;
+    stream.write_all(&payload).await?;
+    stream.write_all(&tag).await?;
+    *send_counter = send_counter
+        .checked_add(1)
+        .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

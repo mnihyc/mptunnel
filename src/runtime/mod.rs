@@ -16,7 +16,10 @@ use crate::protocol::{
     ResetReason, SessionId, StreamFlags, StreamId, TargetAddr, TrafficClass, UnderlayProtocol,
 };
 use crate::scheduler::{self, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy};
-use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
+use crate::transport::encrypted::{
+    EncryptedFramedReader, EncryptedFramedStream, EncryptedFramedTransportError,
+    EncryptedFramedWriter, PeerRole,
+};
 use crate::transport::encrypted_udp::{EncryptedUdpSocket, EncryptedUdpTransportError};
 use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
 use crate::transport::udp::{self, UdpTransportError};
@@ -29,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
@@ -170,6 +173,7 @@ async fn run_server(
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,
+        max_tcp_streams: resources.max_streams,
         max_udp_sessions: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
     };
@@ -307,6 +311,7 @@ fn udp_session_done_queue(context: &ServerPathContext) -> usize {
 pub struct ClientPathContext {
     tcp_paths: Arc<Vec<PathSpec>>,
     udp_paths: Arc<Vec<PathSpec>>,
+    tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     health: Arc<Mutex<ClientPathHealth>>,
     traffic_policy: TrafficPolicy,
     codec_limits: CodecLimits,
@@ -460,6 +465,754 @@ impl PathDeliveryStats {
     }
 }
 
+struct TcpPathStream {
+    stream_id: StreamId,
+    max_offset: u64,
+    commands: mpsc::Sender<TcpPathSessionCommand>,
+    frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+}
+
+impl TcpPathStream {
+    async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
+        self.commands
+            .send(TcpPathSessionCommand::SendFrame(frame))
+            .await
+            .map_err(|_| RuntimeError::TcpPathSessionClosed)
+    }
+
+    async fn recv_frame(&mut self) -> Result<Frame, RuntimeError> {
+        match self.frames.recv().await {
+            Some(Ok(frame)) => Ok(frame),
+            Some(Err(err)) => Err(err),
+            None => Err(RuntimeError::TcpPathSessionClosed),
+        }
+    }
+
+    async fn close(&self) {
+        let _ = self
+            .commands
+            .send(TcpPathSessionCommand::CloseStream(self.stream_id))
+            .await;
+    }
+}
+
+struct ClientTcpPathSessionHandle {
+    path: PathSpec,
+    path_index: usize,
+    security: SecurityConfig,
+    codec_limits: CodecLimits,
+    mux_limits: MuxLimits,
+    command_queue: usize,
+    stream_frame_queue: usize,
+    commands: Arc<Mutex<Option<mpsc::Sender<TcpPathSessionCommand>>>>,
+}
+
+impl std::fmt::Debug for ClientTcpPathSessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientTcpPathSessionHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for ClientTcpPathSessionHandle {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            path_index: self.path_index,
+            security: self.security.clone(),
+            codec_limits: self.codec_limits,
+            mux_limits: self.mux_limits,
+            command_queue: self.command_queue,
+            stream_frame_queue: self.stream_frame_queue,
+            commands: self.commands.clone(),
+        }
+    }
+}
+
+impl ClientTcpPathSessionHandle {
+    fn new(
+        path: PathSpec,
+        path_index: usize,
+        security: SecurityConfig,
+        codec_limits: CodecLimits,
+        mux_limits: MuxLimits,
+        command_queue: usize,
+        stream_frame_queue: usize,
+    ) -> Self {
+        Self {
+            path,
+            path_index,
+            security,
+            codec_limits,
+            mux_limits,
+            command_queue,
+            stream_frame_queue,
+            commands: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn open_stream(
+        &self,
+        target: TargetAddr,
+        ingress: IngressKind,
+        class: TrafficClass,
+    ) -> Result<TcpPathStream, RuntimeError> {
+        let commands = self.ensure_session();
+        let (response_tx, response_rx) = oneshot::channel();
+        commands
+            .send(TcpPathSessionCommand::OpenStream {
+                target,
+                ingress,
+                class,
+                session_commands: commands.clone(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| RuntimeError::TcpPathSessionClosed)?;
+        response_rx
+            .await
+            .map_err(|_| RuntimeError::TcpPathSessionClosed)?
+    }
+
+    fn ensure_session(&self) -> mpsc::Sender<TcpPathSessionCommand> {
+        let mut current = self.commands.lock().expect("TCP path session lock");
+        if let Some(commands) = current.as_ref()
+            && !commands.is_closed()
+        {
+            return commands.clone();
+        }
+
+        let (commands, receiver) = mpsc::channel(self.command_queue);
+        tokio::spawn(run_client_tcp_path_session(
+            self.path.clone(),
+            self.path_index,
+            self.security.clone(),
+            self.codec_limits,
+            self.mux_limits,
+            receiver,
+            self.stream_frame_queue,
+        ));
+        *current = Some(commands.clone());
+        commands
+    }
+}
+
+enum TcpPathSessionCommand {
+    OpenStream {
+        target: TargetAddr,
+        ingress: IngressKind,
+        class: TrafficClass,
+        session_commands: mpsc::Sender<TcpPathSessionCommand>,
+        response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
+    },
+    SendFrame(Frame),
+    CloseStream(StreamId),
+}
+
+struct ClientTcpPathConnection {
+    writer: EncryptedTcpWriter,
+    frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    heartbeat_interval: Duration,
+    next_heartbeat_at: tokio::time::Instant,
+    pending_heartbeat: Option<(u64, tokio::time::Instant)>,
+}
+
+type EncryptedTcpReader = EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
+type EncryptedTcpWriter = EncryptedFramedWriter<tokio::io::WriteHalf<TcpStream>>;
+
+struct ClientTcpPathStreamState {
+    frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+    pending_open: Option<ClientTcpPendingOpen>,
+}
+
+struct ClientTcpPendingOpen {
+    response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
+    frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
+    session_commands: mpsc::Sender<TcpPathSessionCommand>,
+}
+
+struct ClientTcpPathSessionRuntime {
+    path: PathSpec,
+    path_index: usize,
+    security: SecurityConfig,
+    codec_limits: CodecLimits,
+    mux_limits: MuxLimits,
+    stream_frame_queue: usize,
+}
+
+struct ClientTcpPathSessionState {
+    connection: Option<ClientTcpPathConnection>,
+    streams: HashMap<StreamId, ClientTcpPathStreamState>,
+    next_stream_id: u64,
+}
+
+struct ClientTcpOpenStreamRequest {
+    target: TargetAddr,
+    ingress: IngressKind,
+    class: TrafficClass,
+    session_commands: mpsc::Sender<TcpPathSessionCommand>,
+    response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
+}
+
+async fn run_client_tcp_path_session(
+    path: PathSpec,
+    path_index: usize,
+    security: SecurityConfig,
+    codec_limits: CodecLimits,
+    mux_limits: MuxLimits,
+    mut commands: mpsc::Receiver<TcpPathSessionCommand>,
+    stream_frame_queue: usize,
+) {
+    let runtime = ClientTcpPathSessionRuntime {
+        path,
+        path_index,
+        security,
+        codec_limits,
+        mux_limits,
+        stream_frame_queue,
+    };
+    let mut state = ClientTcpPathSessionState {
+        connection: None,
+        streams: HashMap::new(),
+        next_stream_id: 0,
+    };
+
+    loop {
+        if state.connection.is_none() {
+            match commands.recv().await {
+                Some(command) => {
+                    handle_disconnected_client_tcp_command(command, &runtime, &mut state).await;
+                }
+                None => return,
+            }
+            continue;
+        }
+
+        let heartbeat_at = {
+            let connection_ref = state
+                .connection
+                .as_ref()
+                .expect("checked connected TCP path session");
+            connection_ref
+                .pending_heartbeat
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .unwrap_or(connection_ref.next_heartbeat_at)
+        };
+        let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
+        tokio::pin!(heartbeat_timer);
+
+        let mut drop_connection = false;
+        tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    Some(command) => {
+                        if let Err(err) = handle_connected_client_tcp_command(
+                            command,
+                            state.connection.as_mut().expect("checked connected TCP path session"),
+                            &mut state.streams,
+                            &mut state.next_stream_id,
+                            runtime.stream_frame_queue,
+                        )
+                        .await
+                        {
+                            fail_client_tcp_streams(&mut state.streams, &err);
+                            eprintln!("warning: TCP path session command failed: {err}");
+                            drop_connection = true;
+                        }
+                    }
+                    None => {
+                        if let Some(connection_ref) = state.connection.as_mut() {
+                            let _ = close_client_tcp_path(
+                                connection_ref,
+                                PathId(runtime.path_index as u16),
+                                !state.streams.is_empty(),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                }
+            }
+            frame = state.connection.as_mut().expect("checked connected TCP path session").frames.recv() => {
+                match frame {
+                    Some(Ok(frame)) => {
+                        if let Err(err) = handle_client_tcp_path_frame(
+                            frame,
+                            state.connection.as_mut().expect("checked connected TCP path session"),
+                            &mut state.streams,
+                        )
+                        .await
+                        {
+                            fail_client_tcp_streams(&mut state.streams, &err);
+                            eprintln!("warning: TCP path session frame handling failed: {err}");
+                            drop_connection = true;
+                        }
+                    }
+                    Some(Err(err)) => {
+                        let err = RuntimeError::Encrypted(err);
+                        fail_client_tcp_streams(&mut state.streams, &err);
+                        eprintln!("warning: TCP path session read failed: {err}");
+                        drop_connection = true;
+                    }
+                    None => {
+                        let err = RuntimeError::TcpPathSessionClosed;
+                        fail_client_tcp_streams(&mut state.streams, &err);
+                        drop_connection = true;
+                    }
+                }
+            }
+            _ = &mut heartbeat_timer => {
+                if let Err(err) = tick_client_tcp_path_heartbeat(
+                    state.connection.as_mut().expect("checked connected TCP path session"),
+                    runtime.mux_limits,
+                )
+                .await
+                {
+                    fail_client_tcp_streams(&mut state.streams, &err);
+                    eprintln!("warning: TCP path heartbeat failed: {err}");
+                    drop_connection = true;
+                }
+            }
+        }
+
+        if drop_connection {
+            state.connection = None;
+        }
+    }
+}
+
+async fn handle_disconnected_client_tcp_command(
+    command: TcpPathSessionCommand,
+    runtime: &ClientTcpPathSessionRuntime,
+    state: &mut ClientTcpPathSessionState,
+) {
+    match command {
+        TcpPathSessionCommand::OpenStream {
+            target,
+            ingress,
+            class,
+            session_commands,
+            response,
+        } => match connect_client_tcp_path(
+            &runtime.path,
+            runtime.path_index,
+            &runtime.security,
+            runtime.codec_limits,
+            runtime.mux_limits,
+        )
+        .await
+        {
+            Ok(mut connected) => {
+                let open = ClientTcpOpenStreamRequest {
+                    target,
+                    ingress,
+                    class,
+                    session_commands,
+                    response,
+                };
+                let result = open_client_tcp_stream_on_connection(
+                    &mut connected,
+                    open,
+                    &mut state.streams,
+                    &mut state.next_stream_id,
+                    runtime.stream_frame_queue,
+                )
+                .await;
+                if result.is_ok() {
+                    state.connection = Some(connected);
+                } else if let Err(err) = result {
+                    eprintln!("warning: TCP stream open on new path session failed: {err}");
+                    fail_client_tcp_streams(&mut state.streams, &err);
+                }
+            }
+            Err(err) => {
+                let _ = response.send(Err(err));
+            }
+        },
+        TcpPathSessionCommand::SendFrame(_) | TcpPathSessionCommand::CloseStream(_) => {}
+    }
+}
+
+async fn handle_connected_client_tcp_command(
+    command: TcpPathSessionCommand,
+    connection: &mut ClientTcpPathConnection,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    next_stream_id: &mut u64,
+    stream_frame_queue: usize,
+) -> Result<(), RuntimeError> {
+    match command {
+        TcpPathSessionCommand::OpenStream {
+            target,
+            ingress,
+            class,
+            session_commands,
+            response,
+        } => {
+            let open = ClientTcpOpenStreamRequest {
+                target,
+                ingress,
+                class,
+                session_commands,
+                response,
+            };
+            open_client_tcp_stream_on_connection(
+                connection,
+                open,
+                streams,
+                next_stream_id,
+                stream_frame_queue,
+            )
+            .await
+        }
+        TcpPathSessionCommand::SendFrame(frame) => {
+            connection.writer.write_frame(&frame).await?;
+            connection.writer.flush().await?;
+            Ok(())
+        }
+        TcpPathSessionCommand::CloseStream(stream_id) => {
+            streams.remove(&stream_id);
+            Ok(())
+        }
+    }
+}
+
+async fn connect_client_tcp_path(
+    path: &PathSpec,
+    path_index: usize,
+    security: &SecurityConfig,
+    codec_limits: CodecLimits,
+    mux_limits: MuxLimits,
+) -> Result<ClientTcpPathConnection, RuntimeError> {
+    let tcp_stream = tcp::connect_path(path, TcpConnectOptions::default()).await?;
+    let mut framed = EncryptedFramedStream::new(
+        tcp_stream,
+        security.secret.as_bytes(),
+        PeerRole::Client,
+        codec_limits,
+    );
+    let path_id = PathId(path_index as u16);
+    let (session_hello, session_auth, path_join) =
+        authenticated_path_join_frames(security, path, path_id, UnderlayProtocol::Tcp)?;
+
+    framed.write_frame(&session_hello).await?;
+    framed.write_frame(&session_auth).await?;
+    framed.write_frame(&path_join).await?;
+    framed.flush().await?;
+
+    let mut session_ready = false;
+    let mut path_active = false;
+    while !session_ready || !path_active {
+        match framed.read_frame().await? {
+            Frame::SessionReady => session_ready = true,
+            Frame::PathStatus {
+                status: crate::protocol::PathStatus::Active,
+                ..
+            } => path_active = true,
+            Frame::PathStatus { .. } => {
+                return Err(RuntimeError::Protocol(
+                    "TCP path session did not become active",
+                ));
+            }
+            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "unexpected TCP path handshake frame",
+                ));
+            }
+        }
+    }
+
+    let (reader, writer) = framed.split();
+    Ok(ClientTcpPathConnection {
+        writer,
+        frames: spawn_encrypted_tcp_reader(reader, tcp_path_session_frame_queue(mux_limits)),
+        heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
+        next_heartbeat_at: tokio::time::Instant::now() + mux_limits.tcp_path_heartbeat_interval,
+        pending_heartbeat: None,
+    })
+}
+
+async fn open_client_tcp_stream_on_connection(
+    connection: &mut ClientTcpPathConnection,
+    open: ClientTcpOpenStreamRequest,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    next_stream_id: &mut u64,
+    stream_frame_queue: usize,
+) -> Result<(), RuntimeError> {
+    let stream_id = StreamId(*next_stream_id);
+    *next_stream_id = next_stream_id
+        .checked_add(1)
+        .ok_or(RuntimeError::Protocol("TCP stream ID overflow"))?;
+    let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
+    streams.insert(
+        stream_id,
+        ClientTcpPathStreamState {
+            frames: frames_tx,
+            pending_open: Some(ClientTcpPendingOpen {
+                response: open.response,
+                frames: Some(frames_rx),
+                session_commands: open.session_commands,
+            }),
+        },
+    );
+    connection
+        .writer
+        .write_frame(&Frame::OpenStream {
+            stream_id,
+            target: open.target,
+            ingress: open.ingress,
+            outbound: OutboundPolicy::Direct,
+            class: open.class,
+        })
+        .await?;
+    connection.writer.flush().await?;
+    connection.next_heartbeat_at = tokio::time::Instant::now() + connection.heartbeat_interval;
+    Ok(())
+}
+
+async fn handle_client_tcp_path_frame(
+    frame: Frame,
+    connection: &mut ClientTcpPathConnection,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+) -> Result<(), RuntimeError> {
+    connection.next_heartbeat_at = tokio::time::Instant::now() + connection.heartbeat_interval;
+    match frame {
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset,
+        } => {
+            if let Some(state) = streams.get_mut(&stream_id)
+                && let Some(mut pending) = state.pending_open.take()
+            {
+                let frames = pending
+                    .frames
+                    .take()
+                    .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
+                let stream = TcpPathStream {
+                    stream_id,
+                    max_offset,
+                    commands: pending.session_commands,
+                    frames,
+                };
+                let _ = pending.response.send(Ok(stream));
+                return Ok(());
+            }
+            route_client_tcp_stream_frame(
+                streams,
+                stream_id,
+                Frame::StreamMaxData {
+                    stream_id,
+                    max_offset,
+                },
+            )
+            .await
+        }
+        Frame::StreamReset { stream_id, reason } => {
+            if let Some(mut state) = streams.remove(&stream_id)
+                && let Some(pending) = state.pending_open.take()
+            {
+                let _ = pending
+                    .response
+                    .send(Err(RuntimeError::RemoteReset(reason)));
+                return Ok(());
+            }
+            route_client_tcp_stream_frame(
+                streams,
+                stream_id,
+                Frame::StreamReset { stream_id, reason },
+            )
+            .await
+        }
+        Frame::StreamData {
+            stream_id,
+            offset,
+            flags,
+            payload,
+        } => {
+            route_client_tcp_stream_frame(
+                streams,
+                stream_id,
+                Frame::StreamData {
+                    stream_id,
+                    offset,
+                    flags,
+                    payload,
+                },
+            )
+            .await
+        }
+        Frame::StreamAck { stream_id, ranges } => {
+            route_client_tcp_stream_frame(
+                streams,
+                stream_id,
+                Frame::StreamAck { stream_id, ranges },
+            )
+            .await
+        }
+        Frame::StreamFin { stream_id } => {
+            route_client_tcp_stream_frame(streams, stream_id, Frame::StreamFin { stream_id }).await
+        }
+        Frame::Ping { nonce } => {
+            connection
+                .writer
+                .write_frame(&Frame::Pong { nonce })
+                .await?;
+            connection.writer.flush().await?;
+            Ok(())
+        }
+        Frame::Pong { nonce } => {
+            let Some((pending_nonce, _)) = connection.pending_heartbeat.as_ref() else {
+                return Err(RuntimeError::Protocol(
+                    "unexpected TCP path heartbeat response",
+                ));
+            };
+            if *pending_nonce != nonce {
+                return Err(RuntimeError::Protocol(
+                    "unexpected TCP path heartbeat response",
+                ));
+            }
+            connection.pending_heartbeat = None;
+            connection.next_heartbeat_at =
+                tokio::time::Instant::now() + connection.heartbeat_interval;
+            Ok(())
+        }
+        Frame::PathStatus {
+            status: crate::protocol::PathStatus::Draining | crate::protocol::PathStatus::Failed,
+            ..
+        } => Err(RuntimeError::TcpPathSessionClosed),
+        Frame::PathStatus { .. } => Ok(()),
+        Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
+        Frame::PathDrain { .. } | Frame::PathClose { .. } => {
+            Err(RuntimeError::TcpPathSessionClosed)
+        }
+        _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
+    }
+}
+
+async fn route_client_tcp_stream_frame(
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    stream_id: StreamId,
+    frame: Frame,
+) -> Result<(), RuntimeError> {
+    let Some(state) = streams.get_mut(&stream_id) else {
+        return Err(RuntimeError::Protocol("frame for unknown TCP stream"));
+    };
+    state
+        .frames
+        .send(Ok(frame))
+        .await
+        .map_err(|_| RuntimeError::TcpPathSessionClosed)
+}
+
+async fn tick_client_tcp_path_heartbeat(
+    connection: &mut ClientTcpPathConnection,
+    mux_limits: MuxLimits,
+) -> Result<(), RuntimeError> {
+    let now = tokio::time::Instant::now();
+    if let Some((_, deadline)) = connection.pending_heartbeat.as_ref()
+        && now >= *deadline
+    {
+        return Err(RuntimeError::PathHeartbeatTimeout);
+    }
+    if connection.pending_heartbeat.is_none() && now >= connection.next_heartbeat_at {
+        let nonce = random_u64()?;
+        connection
+            .writer
+            .write_frame(&Frame::Ping { nonce })
+            .await?;
+        connection.writer.flush().await?;
+        connection.pending_heartbeat = Some((nonce, now + mux_limits.tcp_path_heartbeat_timeout));
+    }
+    Ok(())
+}
+
+async fn close_client_tcp_path(
+    connection: &mut ClientTcpPathConnection,
+    path_id: PathId,
+    drain: bool,
+) -> Result<(), RuntimeError> {
+    if drain {
+        connection
+            .writer
+            .write_frame(&Frame::PathDrain { path_id })
+            .await?;
+    }
+    connection
+        .writer
+        .write_frame(&Frame::PathClose {
+            path_id,
+            reason: CloseReason::Normal,
+        })
+        .await?;
+    connection
+        .writer
+        .write_frame(&Frame::SessionClose {
+            reason: CloseReason::Normal,
+        })
+        .await?;
+    connection.writer.flush().await?;
+    Ok(())
+}
+
+fn fail_client_tcp_streams(
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    reason: &RuntimeError,
+) {
+    for (_, mut state) in streams.drain() {
+        if let Some(pending) = state.pending_open.take() {
+            let _ = pending.response.send(Err(tcp_path_stream_error(reason)));
+        } else {
+            let _ = state.frames.try_send(Err(tcp_path_stream_error(reason)));
+        }
+    }
+}
+
+fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
+    match reason {
+        RuntimeError::PathHeartbeatTimeout => RuntimeError::PathHeartbeatTimeout,
+        RuntimeError::TcpPathSessionClosed => RuntimeError::TcpPathSessionClosed,
+        RuntimeError::RemoteReset(reason) => RuntimeError::RemoteReset(*reason),
+        RuntimeError::RemoteClosed(reason) => RuntimeError::RemoteClosed(*reason),
+        RuntimeError::Protocol(message) => RuntimeError::Protocol(message),
+        _ => RuntimeError::TcpPathSessionClosed,
+    }
+}
+
+fn spawn_encrypted_tcp_reader(
+    mut reader: EncryptedTcpReader,
+    queue_size: usize,
+) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>> {
+    let (frames_tx, frames_rx) = mpsc::channel(queue_size);
+    tokio::spawn(async move {
+        loop {
+            let frame = reader.read_frame().await;
+            let done = frame.is_err();
+            if frames_tx.send(frame).await.is_err() || done {
+                break;
+            }
+        }
+    });
+    frames_rx
+}
+
+fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
+    resources.max_streams.clamp(1, 1024)
+}
+
+fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
+    tcp_stream_frame_queue(mux_limits)
+        .saturating_mul(4)
+        .clamp(16, 4096)
+}
+
+fn tcp_stream_frame_queue(mux_limits: MuxLimits) -> usize {
+    let payload = mux_limits.max_payload_bytes.max(1);
+    (mux_limits.max_reorder_bytes / payload)
+        .saturating_add(4)
+        .clamp(4, 1024)
+}
+
 impl ClientPathContext {
     pub fn new(
         paths: Vec<PathSpec>,
@@ -491,13 +1244,32 @@ impl ClientPathContext {
             tcp: vec![ClientPathHealthRecord::default(); tcp_paths.len()],
             udp: vec![ClientPathHealthRecord::default(); udp_paths.len()],
         };
+        let codec_limits = resources.into();
+        let mux_limits = resources.into();
+        let tcp_sessions = tcp_paths
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(path_index, path)| {
+                ClientTcpPathSessionHandle::new(
+                    path,
+                    path_index,
+                    security.clone(),
+                    codec_limits,
+                    mux_limits,
+                    tcp_session_command_queue(resources),
+                    tcp_stream_frame_queue(mux_limits),
+                )
+            })
+            .collect::<Vec<_>>();
         Ok(Self {
             tcp_paths: Arc::new(tcp_paths),
             udp_paths: Arc::new(udp_paths),
+            tcp_sessions: Arc::new(tcp_sessions),
             health: Arc::new(Mutex::new(health)),
             traffic_policy,
-            codec_limits: resources.into(),
-            mux_limits: resources.into(),
+            codec_limits,
+            mux_limits,
             security,
         })
     }
@@ -742,6 +1514,7 @@ pub struct ServerPathContext {
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     security: SecurityConfig,
+    max_tcp_streams: usize,
     max_udp_sessions: usize,
     max_udp_flows_per_session: usize,
 }
@@ -793,14 +1566,7 @@ where
                     ))
                     .await?;
                 stream.flush().await?;
-                relay_tcp_stream(
-                    stream,
-                    remote.framed,
-                    remote.stream_id,
-                    context.mux_limits,
-                    remote.max_offset,
-                )
-                .await
+                relay_tcp_stream(stream, remote.stream, context.mux_limits).await
             }
             .await;
             if let Ok(stats) = &result {
@@ -848,14 +1614,7 @@ where
     let result = async {
         stream.write_all(http_connect::success_response()).await?;
         stream.flush().await?;
-        relay_tcp_stream(
-            stream,
-            remote.framed,
-            remote.stream_id,
-            context.mux_limits,
-            remote.max_offset,
-        )
-        .await
+        relay_tcp_stream(stream, remote.stream, context.mux_limits).await
     }
     .await;
     if let Ok(stats) = &result {
@@ -869,9 +1628,7 @@ where
 }
 
 struct OpenedRemoteStream {
-    framed: EncryptedFramedStream<TcpStream>,
-    stream_id: StreamId,
-    max_offset: u64,
+    stream: TcpPathStream,
     path_index: usize,
 }
 
@@ -891,11 +1648,16 @@ async fn open_remote_stream(
     let mut last_retryable_error = None;
     for path_index in candidates {
         let started_at = Instant::now();
-        match open_remote_stream_on_path(context, path_index, target.clone(), ingress, class).await
+        match context
+            .tcp_sessions
+            .get(path_index)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?
+            .open_stream(target.clone(), ingress, class)
+            .await
         {
-            Ok(opened) => {
+            Ok(stream) => {
                 context.mark_tcp_path_open_success(path_index, started_at.elapsed());
-                return Ok(opened);
+                return Ok(OpenedRemoteStream { stream, path_index });
             }
             Err(err) if stream_open_error_is_path_retryable(&err) => {
                 context.mark_tcp_path_failure(path_index);
@@ -939,74 +1701,6 @@ fn authenticated_path_join_frames(
     ))
 }
 
-async fn open_remote_stream_on_path(
-    context: &ClientPathContext,
-    path_index: usize,
-    target: TargetAddr,
-    ingress: IngressKind,
-    class: TrafficClass,
-) -> Result<OpenedRemoteStream, RuntimeError> {
-    let path = context
-        .tcp_paths
-        .get(path_index)
-        .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-    let tcp_stream = tcp::connect_path(path, TcpConnectOptions::default()).await?;
-    let mut framed = EncryptedFramedStream::new(
-        tcp_stream,
-        context.security.secret.as_bytes(),
-        PeerRole::Client,
-        context.codec_limits,
-    );
-    let path_id = PathId(path_index as u16);
-    let (session_hello, session_auth, path_join) =
-        authenticated_path_join_frames(&context.security, path, path_id, UnderlayProtocol::Tcp)?;
-
-    framed.write_frame(&session_hello).await?;
-    framed.write_frame(&session_auth).await?;
-    framed.write_frame(&path_join).await?;
-    let stream_id = StreamId(0);
-    framed
-        .write_frame(&Frame::OpenStream {
-            stream_id,
-            target,
-            ingress,
-            outbound: OutboundPolicy::Direct,
-            class,
-        })
-        .await?;
-    framed.flush().await?;
-    let mut session_ready = false;
-    loop {
-        match framed.read_frame().await? {
-            Frame::SessionReady => session_ready = true,
-            Frame::PathStatus { .. } => {}
-            Frame::StreamMaxData {
-                stream_id: accepted_stream_id,
-                max_offset,
-            } if accepted_stream_id == stream_id && session_ready => {
-                return Ok(OpenedRemoteStream {
-                    framed,
-                    stream_id,
-                    max_offset,
-                    path_index,
-                });
-            }
-            Frame::StreamReset {
-                stream_id: reset_stream_id,
-                reason,
-            } if reset_stream_id == stream_id => {
-                return Err(RuntimeError::RemoteReset(reason));
-            }
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-            _ => {
-                return Err(RuntimeError::Protocol(
-                    "unexpected frame while opening stream",
-                ));
-            }
-        }
-    }
-}
-
 fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,
@@ -1015,6 +1709,8 @@ fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::Encrypted(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
+            | RuntimeError::TcpPathSessionClosed
+            | RuntimeError::PathHeartbeatTimeout
             | RuntimeError::Protocol(_)
     )
 }
@@ -1023,6 +1719,7 @@ fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError>) -> bool 
     matches!(
         result,
         Err(RuntimeError::PathHeartbeatTimeout)
+            | Err(RuntimeError::TcpPathSessionClosed)
             | Err(RuntimeError::Tcp(_))
             | Err(RuntimeError::Encrypted(_))
             | Err(RuntimeError::RemoteClosed(_))
@@ -1344,34 +2041,6 @@ async fn handle_server_path(
         }
         _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
     };
-    let (stream_id, target) = match framed.read_frame().await? {
-        Frame::OpenStream {
-            stream_id, target, ..
-        } => {
-            outbound::validate_target(&target)?;
-            context.outbound.ensure_supports(TargetProtocol::Tcp)?;
-            (stream_id, target)
-        }
-        Frame::Ping { nonce } => {
-            return handle_server_tcp_probe(framed, path_id, path_capabilities, nonce).await;
-        }
-        Frame::SessionClose { .. } => return Ok(()),
-        _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM or PING")),
-    };
-    let outbound_stream =
-        match outbound::connect_tcp(&context.outbound, &target, Duration::from_secs(10)).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                framed
-                    .write_frame(&Frame::StreamReset {
-                        stream_id,
-                        reason: ResetReason::Refused,
-                    })
-                    .await?;
-                framed.flush().await?;
-                return Err(RuntimeError::OutboundConnect(err));
-            }
-        };
     framed.write_frame(&Frame::SessionReady).await?;
     framed
         .write_frame(&Frame::PathStatus {
@@ -1380,127 +2049,331 @@ async fn handle_server_path(
             capabilities: path_capabilities,
         })
         .await?;
-    framed
-        .write_frame(&Frame::StreamMaxData {
-            stream_id,
-            max_offset: context.mux_limits.max_stream_window_bytes,
-        })
-        .await?;
-    framed.flush().await?;
-    relay_tcp_stream(
-        outbound_stream,
-        framed,
-        stream_id,
-        context.mux_limits,
-        context.mux_limits.max_stream_window_bytes,
-    )
-    .await
-    .map(|_| ())
-}
+    if let Err(err) = framed.flush().await {
+        if encrypted_framed_peer_closed(&err) {
+            return Ok(());
+        }
+        return Err(RuntimeError::Encrypted(err));
+    }
 
-async fn handle_server_tcp_probe(
-    mut framed: EncryptedFramedStream<TcpStream>,
-    path_id: PathId,
-    path_capabilities: crate::protocol::PathCapabilities,
-    nonce: u64,
-) -> Result<(), RuntimeError> {
-    framed.write_frame(&Frame::SessionReady).await?;
-    framed
-        .write_frame(&Frame::PathStatus {
-            path_id,
-            status: crate::protocol::PathStatus::Active,
-            capabilities: path_capabilities,
-        })
-        .await?;
-    framed.write_frame(&Frame::Pong { nonce }).await?;
-    framed.flush().await?;
+    let (reader, mut writer) = framed.split();
+    let mut path_frames =
+        spawn_encrypted_tcp_reader(reader, tcp_path_session_frame_queue(context.mux_limits));
+    let (commands_tx, mut commands_rx) =
+        mpsc::channel::<TcpPathSessionCommand>(tcp_server_session_command_queue(&context));
+    let mut streams: HashMap<StreamId, mpsc::Sender<Result<Frame, RuntimeError>>> = HashMap::new();
+    let mut draining = false;
 
     loop {
-        match framed.read_frame().await? {
-            Frame::Ping { nonce } => {
-                framed.write_frame(&Frame::Pong { nonce }).await?;
-                framed.flush().await?;
+        tokio::select! {
+            command = commands_rx.recv() => {
+                match command {
+                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
+                        if !server_write_tcp_path_frame(&mut writer, &frame).await? {
+                            return Ok(());
+                        }
+                    }
+                    Some(TcpPathSessionCommand::CloseStream(stream_id)) => {
+                        streams.remove(&stream_id);
+                        if draining && streams.is_empty() {
+                            if !server_write_tcp_path_frame(
+                                &mut writer,
+                                &Frame::PathClose {
+                                    path_id,
+                                    reason: CloseReason::Normal,
+                                },
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                            return Ok(());
+                        }
+                    }
+                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
+                        return Err(RuntimeError::Protocol("server TCP path received client open command"));
+                    }
+                    None => return Ok(()),
+                }
             }
-            Frame::SessionClose { .. } => return Ok(()),
-            Frame::PathClose {
-                path_id: close_path_id,
-                ..
-            } if close_path_id == path_id => return Ok(()),
-            _ => return Err(RuntimeError::Protocol("unexpected TCP path probe frame")),
+            frame = path_frames.recv() => {
+                match frame.ok_or(RuntimeError::TcpPathSessionClosed)?? {
+                    Frame::OpenStream {
+                        stream_id,
+                        target,
+                        ..
+                    } if !draining => {
+                        if streams.len() >= context.max_tcp_streams {
+                            if !server_write_tcp_path_frame(
+                                &mut writer,
+                                &Frame::StreamReset {
+                                    stream_id,
+                                    reason: ResetReason::Refused,
+                                },
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        outbound::validate_target(&target)?;
+                        context.outbound.ensure_supports(TargetProtocol::Tcp)?;
+                        if streams.contains_key(&stream_id) {
+                            if !server_write_tcp_path_frame(
+                                &mut writer,
+                                &Frame::StreamMaxData {
+                                    stream_id,
+                                    max_offset: context.mux_limits.max_stream_window_bytes,
+                                },
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        let (stream_tx, stream_rx) =
+                            mpsc::channel(tcp_stream_frame_queue(context.mux_limits));
+                        streams.insert(stream_id, stream_tx);
+                        let stream = TcpPathStream {
+                            stream_id,
+                            max_offset: context.mux_limits.max_stream_window_bytes,
+                            commands: commands_tx.clone(),
+                            frames: stream_rx,
+                        };
+                        let stream_context = context.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) =
+                                run_server_tcp_stream(stream_context, stream, target).await
+                            {
+                                eprintln!("warning: server TCP stream failed: {err}");
+                            }
+                        });
+                    }
+                    Frame::OpenStream { stream_id, .. } => {
+                        if !server_write_tcp_path_frame(
+                            &mut writer,
+                            &Frame::StreamReset {
+                                stream_id,
+                                reason: ResetReason::Refused,
+                            },
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Frame::StreamData { stream_id, offset, flags, payload } => {
+                        route_server_tcp_stream_frame(
+                            &mut streams,
+                            stream_id,
+                            Frame::StreamData {
+                                stream_id,
+                                offset,
+                                flags,
+                                payload,
+                            },
+                        )
+                        .await?;
+                    }
+                    Frame::StreamAck { stream_id, ranges } => {
+                        route_server_tcp_stream_frame(
+                            &mut streams,
+                            stream_id,
+                            Frame::StreamAck { stream_id, ranges },
+                        )
+                        .await?;
+                    }
+                    Frame::StreamMaxData {
+                        stream_id,
+                        max_offset,
+                    } => {
+                        route_server_tcp_stream_frame(
+                            &mut streams,
+                            stream_id,
+                            Frame::StreamMaxData {
+                                stream_id,
+                                max_offset,
+                            },
+                        )
+                        .await?;
+                    }
+                    Frame::StreamFin { stream_id } => {
+                        route_server_tcp_stream_frame(
+                            &mut streams,
+                            stream_id,
+                            Frame::StreamFin { stream_id },
+                        )
+                        .await?;
+                    }
+                    Frame::StreamReset { stream_id, reason } => {
+                        route_server_tcp_stream_frame(
+                            &mut streams,
+                            stream_id,
+                            Frame::StreamReset { stream_id, reason },
+                        )
+                        .await?;
+                    }
+                    Frame::Ping { nonce } => {
+                        if !server_write_tcp_path_frame(&mut writer, &Frame::Pong { nonce }).await? {
+                            return Ok(());
+                        }
+                    }
+                    Frame::PathDrain { path_id: drain_path_id } if drain_path_id == path_id => {
+                        draining = true;
+                        if !server_write_tcp_path_frame(
+                            &mut writer,
+                            &Frame::PathStatus {
+                                path_id,
+                                status: crate::protocol::PathStatus::Draining,
+                                capabilities: path_capabilities,
+                            },
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        if streams.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    Frame::PathClose {
+                        path_id: close_path_id,
+                        ..
+                    } if close_path_id == path_id => return Ok(()),
+                    Frame::SessionClose { .. } => return Ok(()),
+                    _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
+                }
+            }
         }
     }
 }
 
+async fn server_write_tcp_path_frame(
+    framed: &mut EncryptedTcpWriter,
+    frame: &Frame,
+) -> Result<bool, RuntimeError> {
+    match framed.write_frame(frame).await {
+        Ok(()) => {}
+        Err(err) if encrypted_framed_peer_closed(&err) => return Ok(false),
+        Err(err) => return Err(RuntimeError::Encrypted(err)),
+    }
+    match framed.flush().await {
+        Ok(()) => Ok(true),
+        Err(err) if encrypted_framed_peer_closed(&err) => Ok(false),
+        Err(err) => Err(RuntimeError::Encrypted(err)),
+    }
+}
+
+fn encrypted_framed_peer_closed(err: &EncryptedFramedTransportError) -> bool {
+    matches!(
+        err,
+        EncryptedFramedTransportError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+    )
+}
+
+async fn route_server_tcp_stream_frame(
+    streams: &mut HashMap<StreamId, mpsc::Sender<Result<Frame, RuntimeError>>>,
+    stream_id: StreamId,
+    frame: Frame,
+) -> Result<(), RuntimeError> {
+    let Some(stream) = streams.get_mut(&stream_id) else {
+        return Err(RuntimeError::Protocol(
+            "frame for unknown server TCP stream",
+        ));
+    };
+    stream
+        .send(Ok(frame))
+        .await
+        .map_err(|_| RuntimeError::TcpPathSessionClosed)
+}
+
+async fn run_server_tcp_stream(
+    context: ServerPathContext,
+    stream: TcpPathStream,
+    target: TargetAddr,
+) -> Result<(), RuntimeError> {
+    let stream_id = stream.stream_id;
+    let outbound_stream =
+        match outbound::connect_tcp(&context.outbound, &target, Duration::from_secs(10)).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                stream
+                    .send_frame(Frame::StreamReset {
+                        stream_id,
+                        reason: ResetReason::Refused,
+                    })
+                    .await?;
+                stream.close().await;
+                return Err(RuntimeError::OutboundConnect(err));
+            }
+        };
+    stream
+        .send_frame(Frame::StreamMaxData {
+            stream_id,
+            max_offset: context.mux_limits.max_stream_window_bytes,
+        })
+        .await?;
+    let result = relay_tcp_stream(outbound_stream, stream, context.mux_limits).await;
+    result.map(|_| ())
+}
+
+fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
+    context.max_tcp_streams.clamp(1, 1024)
+}
+
 async fn relay_tcp_stream<S>(
     mut local: S,
-    mut framed: EncryptedFramedStream<TcpStream>,
-    stream_id: StreamId,
+    mut path_stream: TcpPathStream,
     mux_limits: MuxLimits,
-    initial_max_offset: u64,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let stream_id = path_stream.stream_id;
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
-    send_stream.update_max_offset(initial_max_offset);
+    send_stream.update_max_offset(path_stream.max_offset);
     let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
     let chunk_size = mux_limits.max_payload_bytes.clamp(1, 16 * 1024);
     let mut buf = vec![0u8; chunk_size];
     let mut local_open = true;
     let mut remote_open = true;
     let mut stats = PathDeliveryStats::default();
-    let mut next_heartbeat_at =
-        tokio::time::Instant::now() + mux_limits.tcp_path_heartbeat_interval;
-    let mut pending_heartbeat: Option<(u64, tokio::time::Instant)> = None;
+    let mut close_sent = false;
 
-    loop {
+    let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
-            break;
+            break Ok(stats);
         }
 
-        let heartbeat_at = pending_heartbeat
-            .as_ref()
-            .map(|(_, deadline)| *deadline)
-            .unwrap_or(next_heartbeat_at);
-        let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
-        tokio::pin!(heartbeat_timer);
-
         tokio::select! {
-            _ = &mut heartbeat_timer => {
-                let now = tokio::time::Instant::now();
-                if let Some((_, deadline)) = pending_heartbeat.as_ref()
-                    && now >= *deadline
-                {
-                    return Err(RuntimeError::PathHeartbeatTimeout);
-                }
-                if pending_heartbeat.is_none() && now >= next_heartbeat_at {
-                    let nonce = random_u64()?;
-                    framed.write_frame(&Frame::Ping { nonce }).await?;
-                    framed.flush().await?;
-                    pending_heartbeat =
-                        Some((nonce, now + mux_limits.tcp_path_heartbeat_timeout));
-                }
-            }
             read = async {
                 let read_budget = tcp_relay_read_budget(&send_stream, mux_limits, buf.len());
                 local.read(&mut buf[..read_budget]).await
             }, if local_open && tcp_relay_can_read(&send_stream, mux_limits) => {
                 let read = read?;
                 if read == 0 {
-                    framed.write_frame(&Frame::StreamFin { stream_id }).await?;
-                    framed.flush().await?;
+                    path_stream.send_frame(Frame::StreamFin { stream_id }).await?;
+                    close_sent = true;
                     local_open = false;
                 } else {
                     let frame = send_stream.send_data(
                         Bytes::copy_from_slice(&buf[..read]),
                         StreamFlags::NONE,
                     )?;
-                    framed.write_frame(&frame).await?;
-                    framed.flush().await?;
+                    path_stream.send_frame(frame).await?;
                     stats.record_payload_bytes(read);
                 }
             }
-            frame = framed.read_frame(), if remote_open || send_stream.repair_bytes() > 0 || pending_heartbeat.is_some() => {
+            frame = path_stream.recv_frame(), if remote_open || send_stream.repair_bytes() > 0 => {
                 match frame? {
                     Frame::StreamData {
                         stream_id: received_stream_id,
@@ -1513,8 +2386,7 @@ where
                             stats.record_payload_bytes(chunk.len());
                             local.write_all(&chunk).await?;
                         }
-                        framed.write_frame(&recv_stream.ack_frame()).await?;
-                        framed.flush().await?;
+                        path_stream.send_frame(recv_stream.ack_frame()).await?;
                         if outcome.fin {
                             local.shutdown().await?;
                             remote_open = false;
@@ -1540,30 +2412,17 @@ where
                         stream_id: reset_stream_id,
                         reason,
                     } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
-                    Frame::Ping { nonce } => {
-                        framed.write_frame(&Frame::Pong { nonce }).await?;
-                        framed.flush().await?;
-                    }
-                    Frame::Pong { nonce } => {
-                        let Some((pending_nonce, _)) = pending_heartbeat.as_ref() else {
-                            return Err(RuntimeError::Protocol("unexpected TCP path heartbeat response"));
-                        };
-                        if *pending_nonce != nonce {
-                            return Err(RuntimeError::Protocol("unexpected TCP path heartbeat response"));
-                        }
-                        pending_heartbeat = None;
-                        next_heartbeat_at =
-                            tokio::time::Instant::now() + mux_limits.tcp_path_heartbeat_interval;
-                    }
-                    Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
                     _ => return Err(RuntimeError::Protocol("unexpected stream relay frame")),
                 }
             }
-            else => break,
+            else => break Ok(stats),
         }
-    }
+    };
 
-    Ok(stats)
+    if !close_sent {
+        path_stream.close().await;
+    }
+    result
 }
 
 fn tcp_relay_can_read(send_stream: &ReliableSendStream, mux_limits: MuxLimits) -> bool {
@@ -2169,6 +3028,7 @@ pub enum RuntimeError {
     NoSchedulableUdpPath,
     PathIdOverflow,
     PathHeartbeatTimeout,
+    TcpPathSessionClosed,
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
     Protocol(&'static str),
@@ -2282,6 +3142,7 @@ impl std::fmt::Display for RuntimeError {
             }
             Self::PathIdOverflow => write!(f, "configured paths exceed protocol path ID space"),
             Self::PathHeartbeatTimeout => write!(f, "TCP path heartbeat timed out"),
+            Self::TcpPathSessionClosed => write!(f, "TCP path session closed"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
@@ -2312,6 +3173,7 @@ impl std::error::Error for RuntimeError {
             | Self::NoSchedulableUdpPath
             | Self::PathIdOverflow
             | Self::PathHeartbeatTimeout
+            | Self::TcpPathSessionClosed
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)
             | Self::Protocol(_) => None,
@@ -2338,6 +3200,7 @@ mod tests {
             codec_limits: resources.into(),
             mux_limits: resources.into(),
             security: security(),
+            max_tcp_streams: resources.max_streams,
             max_udp_sessions: resources.max_streams,
             max_udp_flows_per_session: resources.max_streams,
         }
@@ -2364,15 +3227,27 @@ mod tests {
     }
 
     async fn spawn_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_echo_target_count(1).await
+    }
+
+    async fn spawn_echo_target_count(count: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         let addr = listener.local_addr().expect("target addr");
         let handle = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("target accept");
-            let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.expect("target read");
-            assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").await.expect("target write");
-            stream.shutdown().await.expect("target shutdown");
+            let mut connections = tokio::task::JoinSet::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.expect("target accept");
+                connections.spawn(async move {
+                    let mut buf = [0u8; 4];
+                    stream.read_exact(&mut buf).await.expect("target read");
+                    assert_eq!(&buf, b"ping");
+                    stream.write_all(b"pong").await.expect("target write");
+                    stream.shutdown().await.expect("target shutdown");
+                });
+            }
+            while let Some(connection) = connections.join_next().await {
+                connection.expect("target connection");
+            }
         });
         (addr, handle)
     }
@@ -2523,11 +3398,6 @@ mod tests {
                 }
                 _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
             };
-            let stream_id = match framed.read_frame().await? {
-                Frame::OpenStream { stream_id, .. } => stream_id,
-                _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
-            };
-
             let resources = ResourceLimits::default();
             framed.write_frame(&Frame::SessionReady).await?;
             framed
@@ -2537,6 +3407,13 @@ mod tests {
                     capabilities,
                 })
                 .await?;
+            framed.flush().await?;
+
+            let stream_id = match framed.read_frame().await? {
+                Frame::OpenStream { stream_id, .. } => stream_id,
+                _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+            };
+
             framed
                 .write_frame(&Frame::StreamMaxData {
                     stream_id,
@@ -2589,6 +3466,42 @@ mod tests {
         let port = probe.local_addr().expect("reserved addr").port();
         drop(probe);
         format!("udp://127.0.0.1:{port}").parse().expect("path")
+    }
+
+    async fn drive_socks5_echo_client<S>(client: &mut S, target_addr: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        client
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("auth request");
+        let mut auth_response = [0u8; 2];
+        client
+            .read_exact(&mut auth_response)
+            .await
+            .expect("auth response");
+        assert_eq!(auth_response, [0x05, 0x00]);
+
+        let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+        match target_addr {
+            SocketAddr::V4(addr) => {
+                connect.extend_from_slice(&addr.ip().octets());
+                connect.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            SocketAddr::V6(_) => panic!("expected IPv4 test target"),
+        }
+        client.write_all(&connect).await.expect("connect");
+
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.expect("reply");
+        assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+
+        client.write_all(b"ping").await.expect("payload write");
+        client.shutdown().await.expect("client shutdown");
+        let mut payload = [0u8; 4];
+        client.read_exact(&mut payload).await.expect("payload read");
+        assert_eq!(&payload, b"pong");
     }
 
     #[test]
@@ -2955,6 +3868,42 @@ mod tests {
         assert_eq!(&payload, b"pong");
 
         handler.await.expect("join").expect("handler");
+        server_path
+            .await
+            .expect("server join")
+            .expect("server path");
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn tcp_path_session_multiplexes_multiple_ingress_streams() {
+        let (target_addr, target) = spawn_echo_target_count(2).await;
+        let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let (mut first_client, first_server) = duplex(4096);
+        let (mut second_client, second_server) = duplex(4096);
+        let first_handler =
+            tokio::spawn(handle_socks5_client_stream(first_server, context.clone()));
+        let second_handler = tokio::spawn(handle_socks5_client_stream(second_server, context));
+
+        let first_client_task = tokio::spawn(async move {
+            drive_socks5_echo_client(&mut first_client, target_addr).await;
+        });
+        let second_client_task = tokio::spawn(async move {
+            drive_socks5_echo_client(&mut second_client, target_addr).await;
+        });
+
+        first_client_task.await.expect("first client");
+        second_client_task.await.expect("second client");
+        first_handler
+            .await
+            .expect("first join")
+            .expect("first handler");
+        second_handler
+            .await
+            .expect("second join")
+            .expect("second handler");
         server_path
             .await
             .expect("server join")
@@ -3464,6 +4413,7 @@ mod tests {
                     security: SecurityConfig::encrypted(
                         SharedSecret::new(b"fedcba9876543210".to_vec()).expect("secret"),
                     ),
+                    max_tcp_streams: ResourceLimits::default().max_streams,
                     max_udp_sessions: ResourceLimits::default().max_streams,
                     max_udp_flows_per_session: ResourceLimits::default().max_streams,
                 },

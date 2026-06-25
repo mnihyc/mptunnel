@@ -12,8 +12,9 @@ use crate::protocol::RateHint;
 use crate::protocol::auth::{AuthError, SessionAuthenticator};
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    AuthNonce, CloseReason, DatagramFlowId, Frame, IngressKind, OutboundPolicy, PathId,
-    ResetReason, SessionId, StreamFlags, StreamId, TargetAddr, TrafficClass, UnderlayProtocol,
+    AuthNonce, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
+    OutboundPolicy, PathId, ResetReason, SessionId, StreamFlags, StreamId, TargetAddr,
+    TrafficClass, UnderlayProtocol,
 };
 use crate::scheduler::{self, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy};
 use crate::transport::encrypted::{
@@ -42,6 +43,7 @@ const TCP_STREAM_LOAD_BYTES: u64 = 256 * 1024;
 const UDP_SESSION_LOAD_BYTES: u64 = 64 * 1024;
 const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 const MIN_RATE_SAMPLE_DURATION: Duration = Duration::from_millis(1);
+const UDP_DATAGRAM_MIN_TTL_FIT_RATIO: f64 = 0.9;
 
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
@@ -332,7 +334,9 @@ struct ClientPathHealthRecord {
     state: SchedulerPathState,
     consecutive_failures: u32,
     measured_srtt_ms: Option<f64>,
+    measured_jitter_ms: Option<f64>,
     measured_rate_bps: Option<f64>,
+    measured_loss_rate: Option<f64>,
     failed_until: Option<Instant>,
     active_flows: u32,
     load_bytes: u64,
@@ -344,7 +348,9 @@ impl Default for ClientPathHealthRecord {
             state: SchedulerPathState::Active,
             consecutive_failures: 0,
             measured_srtt_ms: None,
+            measured_jitter_ms: None,
             measured_rate_bps: None,
+            measured_loss_rate: None,
             failed_until: None,
             active_flows: 0,
             load_bytes: 0,
@@ -356,7 +362,9 @@ impl Default for ClientPathHealthRecord {
 struct ClientPathObservation {
     state: SchedulerPathState,
     measured_srtt_ms: Option<f64>,
+    measured_jitter_ms: Option<f64>,
     measured_rate_bps: Option<f64>,
+    measured_loss_rate: Option<f64>,
     active_flows: u32,
     load_bytes: u64,
 }
@@ -372,7 +380,9 @@ impl ClientPathHealthRecord {
         ClientPathObservation {
             state: self.state,
             measured_srtt_ms: self.measured_srtt_ms,
+            measured_jitter_ms: self.measured_jitter_ms,
             measured_rate_bps: self.measured_rate_bps,
+            measured_loss_rate: self.measured_loss_rate,
             active_flows: self.active_flows,
             load_bytes: self.load_bytes,
         }
@@ -411,6 +421,22 @@ impl ClientPathHealthRecord {
         });
     }
 
+    fn mark_udp_datagram_feedback(&mut self, observation: UdpDatagramPathObservation) {
+        self.mark_success(observation.rtt);
+        if let Some(sample) = observation.rate_sample {
+            self.mark_delivery(sample);
+        }
+        let sample_jitter_ms = observation.jitter.as_secs_f64() * 1000.0;
+        self.measured_jitter_ms = Some(match self.measured_jitter_ms {
+            Some(previous) => previous.mul_add(0.875, sample_jitter_ms * 0.125),
+            None => sample_jitter_ms,
+        });
+        self.measured_loss_rate = Some(match self.measured_loss_rate {
+            Some(previous) => previous.mul_add(0.875, observation.loss_rate * 0.125),
+            None => observation.loss_rate,
+        });
+    }
+
     fn mark_failure(&mut self, now: Instant) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.state = SchedulerPathState::Failed;
@@ -438,6 +464,14 @@ impl PathRateSample {
     fn rate_bps(self) -> f64 {
         self.bytes as f64 * 8.0 / self.elapsed.as_secs_f64()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpDatagramPathObservation {
+    rtt: Duration,
+    jitter: Duration,
+    loss_rate: f64,
+    rate_sample: Option<PathRateSample>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1464,14 +1498,18 @@ impl ClientPathContext {
         ordered_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
     }
 
-    fn ordered_udp_path_indices(&self, payload_bytes: usize) -> Vec<usize> {
+    fn ordered_udp_path_indices_for_ttl(&self, payload_bytes: usize, ttl_ms: u32) -> Vec<usize> {
+        if ttl_ms == 0 {
+            return Vec::new();
+        }
         let observations =
             health_observations(&mut self.health.lock().expect("client path health lock").udp);
-        ordered_path_indices(
+        ordered_path_indices_for_ttl(
             &self.udp_paths,
             &observations,
             TrafficClass::RealtimeDatagram,
             payload_bytes,
+            ttl_ms,
         )
     }
 
@@ -1589,6 +1627,18 @@ impl ClientPathContext {
         }
     }
 
+    fn mark_udp_path_feedback(&self, index: usize, observation: UdpDatagramPathObservation) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.mark_udp_datagram_feedback(observation);
+        }
+    }
+
     fn mark_udp_path_failure(&self, index: usize) {
         if let Some(current) = self
             .health
@@ -1616,6 +1666,35 @@ fn ordered_path_indices(
     class: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<usize> {
+    ordered_path_scores(paths, observations, class, payload_bytes)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn ordered_path_indices_for_ttl(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    class: TrafficClass,
+    payload_bytes: usize,
+    ttl_ms: u32,
+) -> Vec<usize> {
+    let scores = ordered_path_scores(paths, observations, class, payload_bytes);
+    let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
+    scores
+        .iter()
+        .copied()
+        .filter(|(_, eta_ms)| *eta_ms <= freshness_budget_ms)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>()
+}
+
+fn ordered_path_scores(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    class: TrafficClass,
+    payload_bytes: usize,
+) -> Vec<(usize, f64)> {
     let mut scores = paths
         .iter()
         .enumerate()
@@ -1626,7 +1705,9 @@ fn ordered_path_indices(
                 .unwrap_or(ClientPathObservation {
                     state: SchedulerPathState::Suspect,
                     measured_srtt_ms: None,
+                    measured_jitter_ms: None,
                     measured_rate_bps: None,
+                    measured_loss_rate: None,
                     active_flows: 0,
                     load_bytes: 0,
                 });
@@ -1640,7 +1721,7 @@ fn ordered_path_indices(
         })
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| left.1.total_cmp(&right.1));
-    scores.into_iter().map(|(index, _)| index).collect()
+    scores
 }
 
 fn path_snapshot(
@@ -1667,9 +1748,11 @@ fn path_snapshot(
                 .initial_srtt_ms
                 .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
         }),
-        jitter_ms: f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)),
+        jitter_ms: observation
+            .measured_jitter_ms
+            .unwrap_or_else(|| f64::from(path.metadata.initial_jitter_ms.unwrap_or(0))),
         delivery_rate_bps,
-        loss_rate: 0.0,
+        loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
         queue_bytes: observation.load_bytes,
         bytes_in_flight: u64::from(observation.active_flows) * PATH_OPEN_SCORE_BYTES as u64,
     }
@@ -2013,24 +2096,28 @@ where
                 }
                 let target = datagram.target.clone();
                 if udp_session.is_none() {
-                    match open_udp_datagram_session(&context).await {
+                    match open_udp_datagram_session(&context, DEFAULT_SOCKS5_UDP_TTL_MS).await {
                         Ok(session) => udp_session = Some(session),
                         Err(err) => break Err(err),
                     }
                 }
-                let response = match udp_session
+                let session = match udp_session
                     .as_mut()
                     .ok_or(RuntimeError::Protocol("missing UDP datagram session"))
                 {
                     Ok(session) => session,
                     Err(err) => break Err(err),
-                }
+                };
+                let response = session
                     .send_to(target.clone(), datagram.payload, DEFAULT_SOCKS5_UDP_TTL_MS)
                     .await;
                 let response = match response {
                     Ok(response) => response,
                     Err(err) => break Err(err),
                 };
+                if let Some(observation) = session.take_feedback_observation() {
+                    context.mark_udp_path_feedback(session.path_index, observation);
+                }
                 let response_packet = match socks5::udp_datagram(&target, &response) {
                     Ok(packet) => packet,
                     Err(err) => break Err(RuntimeError::Socks5(err)),
@@ -2072,8 +2159,9 @@ fn socks5_udp_peer_allowed(client_endpoint: &TargetAddr, peer: SocketAddr) -> bo
 
 async fn open_udp_datagram_session(
     context: &ClientPathContext,
+    ttl_ms: u32,
 ) -> Result<UdpDatagramClientSession, RuntimeError> {
-    let candidates = context.ordered_udp_path_indices(PATH_OPEN_SCORE_BYTES);
+    let candidates = context.ordered_udp_path_indices_for_ttl(PATH_OPEN_SCORE_BYTES, ttl_ms);
     if candidates.is_empty() {
         return Err(RuntimeError::NoSchedulableUdpPath);
     }
@@ -3052,13 +3140,24 @@ struct UdpDatagramClientSession {
     next_flow_id: u64,
     mux_limits: MuxLimits,
     path_index: usize,
+    path_id: PathId,
     stats: PathDeliveryStats,
+    sent_datagrams: HashMap<(DatagramFlowId, DatagramId), UdpSentDatagram>,
+    last_datagram_rtt: Option<Duration>,
+    last_feedback_observation: Option<UdpDatagramPathObservation>,
 }
 
 struct UdpDatagramClientFlow {
     target: TargetAddr,
     flow: DatagramFlow,
     flow_id: DatagramFlowId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpSentDatagram {
+    sent_at: Instant,
+    bytes: usize,
+    ttl: Duration,
 }
 
 impl UdpDatagramClientSession {
@@ -3114,7 +3213,11 @@ impl UdpDatagramClientSession {
             next_flow_id: 0,
             mux_limits,
             path_index,
+            path_id,
             stats: PathDeliveryStats::default(),
+            sent_datagrams: HashMap::new(),
+            last_datagram_rtt: None,
+            last_feedback_observation: None,
         })
     }
 
@@ -3125,38 +3228,70 @@ impl UdpDatagramClientSession {
         ttl_ms: u32,
     ) -> Result<Bytes, RuntimeError> {
         let flow_id = self.ensure_flow(target).await?;
-        let request_len = payload.len();
-        let flow = self
-            .flows
-            .iter_mut()
-            .find(|flow| flow.flow_id == flow_id)
-            .ok_or(RuntimeError::Protocol("missing UDP datagram flow"))?;
-        flow.flow.enqueue(0, ttl_ms, payload)?;
-        let frame = self
-            .flows
-            .iter_mut()
-            .find(|flow| flow.flow_id == flow_id)
-            .ok_or(RuntimeError::Protocol("missing UDP datagram flow"))?
-            .flow
-            .pop_frame(0)
-            .ok_or(RuntimeError::Protocol("datagram expired before send"))?;
-        self.encrypted.send_frame(&frame).await?;
-
-        match self.encrypted.recv_frame(&mut self.buffer).await? {
+        let frame = {
+            let flow = self
+                .flows
+                .iter_mut()
+                .find(|flow| flow.flow_id == flow_id)
+                .ok_or(RuntimeError::Protocol("missing UDP datagram flow"))?;
+            flow.flow.enqueue(0, ttl_ms, payload)?;
+            flow.flow
+                .pop_frame(0)
+                .ok_or(RuntimeError::Protocol("datagram expired before send"))?
+        };
+        let (request_datagram_id, request_len) = match &frame {
             Frame::DatagramData {
-                flow_id: response_flow_id,
+                datagram_id,
                 payload,
                 ..
-            } if response_flow_id == flow_id => {
-                self.stats.record_payload_bytes(request_len);
-                self.stats.record_payload_bytes(payload.len());
-                Ok(payload)
+            } => (*datagram_id, payload.len()),
+            _ => return Err(RuntimeError::Protocol("unexpected queued datagram frame")),
+        };
+        self.sent_datagrams.insert(
+            (flow_id, request_datagram_id),
+            UdpSentDatagram {
+                sent_at: Instant::now(),
+                bytes: request_len,
+                ttl: Duration::from_millis(u64::from(ttl_ms)),
+            },
+        );
+        self.encrypted.send_frame(&frame).await?;
+
+        loop {
+            match self.encrypted.recv_frame(&mut self.buffer).await? {
+                Frame::DatagramFeedback { flow_id, received } => {
+                    self.handle_datagram_feedback(flow_id, &received)?;
+                }
+                Frame::DatagramData {
+                    flow_id: response_flow_id,
+                    datagram_id,
+                    payload,
+                    ..
+                } if response_flow_id == flow_id => {
+                    let request_ack = datagram_ack_range(request_datagram_id)?;
+                    self.handle_datagram_feedback(flow_id, &[request_ack])?;
+                    self.encrypted
+                        .send_frame(&Frame::DatagramFeedback {
+                            flow_id,
+                            received: vec![datagram_ack_range(datagram_id)?],
+                        })
+                        .await?;
+                    self.stats.record_payload_bytes(request_len);
+                    self.stats.record_payload_bytes(payload.len());
+                    return Ok(payload);
+                }
+                Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
+                    self.observe_remote_path_metrics(metrics);
+                }
+                Frame::RxRateHint { path_id, .. } if path_id == self.path_id => {}
+                Frame::DatagramClose {
+                    flow_id: closed_flow_id,
+                } if closed_flow_id == flow_id => {
+                    return Err(RuntimeError::Protocol("datagram flow closed"));
+                }
+                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+                _ => return Err(RuntimeError::Protocol("unexpected UDP datagram frame")),
             }
-            Frame::DatagramClose {
-                flow_id: closed_flow_id,
-            } if closed_flow_id == flow_id => Err(RuntimeError::Protocol("datagram flow closed")),
-            Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
-            _ => Err(RuntimeError::Protocol("unexpected UDP datagram frame")),
         }
     }
 
@@ -3225,6 +3360,94 @@ impl UdpDatagramClientSession {
     fn delivery_stats(&self) -> PathDeliveryStats {
         self.stats
     }
+
+    fn take_feedback_observation(&mut self) -> Option<UdpDatagramPathObservation> {
+        self.last_feedback_observation.take()
+    }
+
+    fn handle_datagram_feedback(
+        &mut self,
+        flow_id: DatagramFlowId,
+        ranges: &[OffsetRange],
+    ) -> Result<(), RuntimeError> {
+        let now = Instant::now();
+        let lost = self.expire_unacked_datagrams(now);
+        let acked_keys = self
+            .sent_datagrams
+            .keys()
+            .copied()
+            .filter(|(pending_flow_id, datagram_id)| {
+                *pending_flow_id == flow_id && datagram_id_is_in_ranges(*datagram_id, ranges)
+            })
+            .collect::<Vec<_>>();
+
+        for key in acked_keys {
+            if let Some(sent) = self.sent_datagrams.remove(&key) {
+                self.observe_datagram_ack(sent, now, lost);
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_remote_path_metrics(&mut self, metrics: crate::protocol::PathMetrics) {
+        self.last_feedback_observation = Some(UdpDatagramPathObservation {
+            rtt: Duration::from_micros(u64::from(metrics.srtt_us)),
+            jitter: Duration::from_micros(u64::from(metrics.jitter_us)),
+            loss_rate: (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0),
+            rate_sample: PathRateSample::new(
+                metrics.delivery_rate_bps.max(8) / 8,
+                Duration::from_secs(1),
+            ),
+        });
+    }
+
+    fn expire_unacked_datagrams(&mut self, now: Instant) -> u64 {
+        let expired = self
+            .sent_datagrams
+            .iter()
+            .filter_map(|(key, sent)| {
+                (now.duration_since(sent.sent_at) >= sent.ttl).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        let lost = expired.len() as u64;
+        for key in expired {
+            self.sent_datagrams.remove(&key);
+        }
+        lost
+    }
+
+    fn observe_datagram_ack(&mut self, sent: UdpSentDatagram, now: Instant, lost: u64) {
+        let rtt = now
+            .duration_since(sent.sent_at)
+            .max(MIN_RATE_SAMPLE_DURATION);
+        let jitter = self
+            .last_datagram_rtt
+            .map(|previous| previous.abs_diff(rtt))
+            .unwrap_or(Duration::ZERO);
+        self.last_datagram_rtt = Some(rtt);
+        let delivered = 1_u64;
+        let total = delivered.saturating_add(lost).max(1);
+        self.last_feedback_observation = Some(UdpDatagramPathObservation {
+            rtt,
+            jitter,
+            loss_rate: lost as f64 / total as f64,
+            rate_sample: PathRateSample::new(sent.bytes as u64, rtt),
+        });
+    }
+}
+
+fn datagram_ack_range(datagram_id: DatagramId) -> Result<OffsetRange, RuntimeError> {
+    let end = datagram_id
+        .0
+        .checked_add(1)
+        .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))?;
+    OffsetRange::new(datagram_id.0, end).ok_or(RuntimeError::Protocol("invalid datagram ACK range"))
+}
+
+fn datagram_id_is_in_ranges(datagram_id: DatagramId, ranges: &[OffsetRange]) -> bool {
+    ranges
+        .iter()
+        .any(|range| datagram_id.0 >= range.start && datagram_id.0 < range.end)
 }
 
 pub async fn handle_server_udp_datagram_path_session(
@@ -3268,6 +3491,7 @@ pub async fn handle_server_udp_datagram_path_session(
 struct ServerUdpDatagramFlow {
     flow_id: DatagramFlowId,
     outbound_socket: outbound::OutboundUdpSocket,
+    response_flow: DatagramFlow,
 }
 
 struct ServerUdpPathSession {
@@ -3422,6 +3646,7 @@ impl ServerUdpPathSession {
                 self.flows.push(ServerUdpDatagramFlow {
                     flow_id,
                     outbound_socket,
+                    response_flow: DatagramFlow::new(flow_id, self.context.mux_limits),
                 });
                 Ok(ServerUdpSessionOutcome::Active)
             }
@@ -3429,18 +3654,31 @@ impl ServerUdpPathSession {
                 ServerUdpPathState::Established,
                 Frame::DatagramData {
                     flow_id,
+                    datagram_id,
                     ttl_ms,
                     payload,
-                    ..
                 },
             ) => {
                 if ttl_ms == 0 {
                     return Err(RuntimeError::Protocol("expired datagram received"));
                 }
+                let flow_index = self
+                    .flows
+                    .iter()
+                    .position(|flow| flow.flow_id == flow_id)
+                    .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?;
+                self.encrypted
+                    .send_frame_to(
+                        &Frame::DatagramFeedback {
+                            flow_id,
+                            received: vec![datagram_ack_range(datagram_id)?],
+                        },
+                        self.peer,
+                    )
+                    .await?;
                 let flow = self
                     .flows
-                    .iter_mut()
-                    .find(|flow| flow.flow_id == flow_id)
+                    .get_mut(flow_index)
                     .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?;
                 flow.outbound_socket.send(&payload).await?;
                 let mut response =
@@ -3452,12 +3690,16 @@ impl ServerUdpPathSession {
                 .await
                 .map_err(|_| RuntimeError::Protocol("UDP outbound response timed out"))??;
                 response.truncate(len);
-                let mut response_flow = DatagramFlow::new(flow_id, self.context.mux_limits);
-                response_flow.enqueue(0, ttl_ms, Bytes::from(response))?;
-                let frame = response_flow
+                flow.response_flow
+                    .enqueue(0, ttl_ms, Bytes::from(response))?;
+                let frame = flow
+                    .response_flow
                     .pop_frame(0)
                     .ok_or(RuntimeError::Protocol("UDP response expired before send"))?;
                 self.encrypted.send_frame_to(&frame, self.peer).await?;
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (ServerUdpPathState::Established, Frame::DatagramFeedback { .. }) => {
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (ServerUdpPathState::Established, Frame::DatagramClose { flow_id }) => {
@@ -4240,7 +4482,7 @@ mod tests {
 
         assert_eq!(
             context
-                .ordered_udp_path_indices(1024 * 1024)
+                .ordered_udp_path_indices_for_ttl(1024 * 1024, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(1)
@@ -4257,10 +4499,69 @@ mod tests {
 
         assert_eq!(
             context
-                .ordered_udp_path_indices(1024 * 1024)
+                .ordered_udp_path_indices_for_ttl(1024 * 1024, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn udp_datagram_feedback_updates_scheduler_health() {
+        let stale_path = "udp://127.0.0.1:10017?srtt-ms=250&rate-mbps=1"
+            .parse::<PathSpec>()
+            .expect("stale path");
+        let observed_path = "udp://127.0.0.1:10018?srtt-ms=250&rate-mbps=1"
+            .parse::<PathSpec>()
+            .expect("observed path");
+        let context = ClientPathContext::new(
+            vec![stale_path, observed_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_udp_path_feedback(
+            1,
+            UdpDatagramPathObservation {
+                rtt: Duration::from_millis(8),
+                jitter: Duration::from_millis(1),
+                loss_rate: 0.02,
+                rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(20)),
+            },
+        );
+
+        assert_eq!(
+            context
+                .ordered_udp_path_indices_for_ttl(4096, DEFAULT_SOCKS5_UDP_TTL_MS)
+                .first()
+                .copied(),
+            Some(1)
+        );
+        let health = context.health.lock().expect("health lock");
+        assert_eq!(health.udp[1].state, SchedulerPathState::Active);
+        assert!(health.udp[1].measured_srtt_ms.is_some());
+        assert!(health.udp[1].measured_jitter_ms.is_some());
+        assert!(health.udp[1].measured_rate_bps.is_some());
+        assert_eq!(health.udp[1].measured_loss_rate, Some(0.02));
+    }
+
+    #[test]
+    fn udp_freshness_filter_rejects_paths_that_cannot_fit_ttl() {
+        let high_latency_path = "udp://127.0.0.1:10019?srtt-ms=1000&rate-mbps=1"
+            .parse::<PathSpec>()
+            .expect("high latency path");
+        let context = ClientPathContext::new(
+            vec![high_latency_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert!(
+            context
+                .ordered_udp_path_indices_for_ttl(1024, 10)
+                .is_empty()
         );
     }
 
@@ -4318,13 +4619,19 @@ mod tests {
 
         context.mark_udp_path_open_success(0, Duration::from_millis(1));
         assert_eq!(
-            context.ordered_udp_path_indices(512).first().copied(),
+            context
+                .ordered_udp_path_indices_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS)
+                .first()
+                .copied(),
             Some(1)
         );
 
         context.release_udp_path_load(0);
         assert_eq!(
-            context.ordered_udp_path_indices(512).first().copied(),
+            context
+                .ordered_udp_path_indices_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS)
+                .first()
+                .copied(),
             Some(0)
         );
         let health = context.health.lock().expect("health lock");
@@ -5005,6 +5312,7 @@ mod tests {
         ));
         let context =
             ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let health_context = context.clone();
         let (mut control_client, control_server) = duplex(4096);
         let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
 
@@ -5065,6 +5373,13 @@ mod tests {
         control_client.shutdown().await.expect("control shutdown");
 
         handler.await.expect("handler join").expect("handler");
+        {
+            let health = health_context.health.lock().expect("health lock");
+            assert_eq!(health.udp[0].state, SchedulerPathState::Active);
+            assert!(health.udp[0].measured_srtt_ms.is_some());
+            assert!(health.udp[0].measured_jitter_ms.is_some());
+            assert_eq!(health.udp[0].measured_loss_rate, Some(0.0));
+        }
         server.await.expect("server join").expect("server");
         target.await.expect("target join");
     }

@@ -77,7 +77,10 @@ impl DatagramFlow {
         }
 
         let datagram_id = DatagramId(self.next_datagram_id);
-        self.next_datagram_id = self.next_datagram_id.saturating_add(1);
+        self.next_datagram_id = self
+            .next_datagram_id
+            .checked_add(1)
+            .ok_or(DatagramError::DatagramIdOverflow)?;
         self.queued_bytes = new_queued;
         self.queue.push_back(QueuedDatagram {
             datagram_id,
@@ -135,6 +138,7 @@ pub enum DatagramError {
     EmptyPayload,
     PayloadTooLarge { actual: usize, limit: usize },
     QueueFull { actual: usize, limit: usize },
+    DatagramIdOverflow,
 }
 
 impl std::fmt::Display for DatagramError {
@@ -150,6 +154,7 @@ impl std::fmt::Display for DatagramError {
                     "datagram queue would hold {actual} bytes, limit is {limit}"
                 )
             }
+            Self::DatagramIdOverflow => write!(f, "datagram id space is exhausted"),
         }
     }
 }

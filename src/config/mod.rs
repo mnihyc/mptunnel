@@ -1,0 +1,237 @@
+pub mod security;
+
+use crate::ingress::IngressConfig;
+use crate::outbound::OutboundConfig;
+use crate::protocol::codec::CodecLimits;
+use crate::transport::PathSpec;
+use security::validate_transport_security;
+pub use security::{
+    EncryptionMode, SecurityPolicyError, SharedSecret, TransportIntegrity, TransportSecurity,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppConfig {
+    pub log_level: String,
+    pub check_config: bool,
+    pub resources: ResourceLimits,
+    pub security: SecurityConfig,
+    pub command: CommandConfig,
+}
+
+impl AppConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_transport_security(
+            self.security.mode,
+            self.security.transport,
+            self.security.integrity,
+            &self.security.secret,
+        )?;
+        self.resources.validate()?;
+        match &self.command {
+            CommandConfig::Client(client) => {
+                if client.paths.is_empty() {
+                    return Err(ConfigError::NoPaths);
+                }
+                if client.paths.len() > self.resources.max_paths {
+                    return Err(ConfigError::TooManyPaths {
+                        actual: client.paths.len(),
+                        limit: self.resources.max_paths,
+                    });
+                }
+            }
+            CommandConfig::Server(server) => {
+                if server.bind_paths.is_empty() {
+                    return Err(ConfigError::NoPaths);
+                }
+                if server.bind_paths.len() > self.resources.max_paths {
+                    return Err(ConfigError::TooManyPaths {
+                        actual: server.bind_paths.len(),
+                        limit: self.resources.max_paths,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub max_frame_bytes: usize,
+    pub max_payload_bytes: usize,
+    pub max_ack_ranges: usize,
+    pub max_paths: usize,
+    pub max_streams: usize,
+    pub max_stream_window_bytes: u64,
+    pub max_repair_bytes: usize,
+    pub max_reorder_bytes: usize,
+    pub max_datagram_queue_bytes: usize,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 1_048_576,
+            max_payload_bytes: 1_048_512,
+            max_ack_ranges: 256,
+            max_paths: 64,
+            max_streams: 65_536,
+            max_stream_window_bytes: 16 * 1024 * 1024,
+            max_repair_bytes: 16 * 1024 * 1024,
+            max_reorder_bytes: 16 * 1024 * 1024,
+            max_datagram_queue_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+impl ResourceLimits {
+    pub fn validate(self) -> Result<(), ConfigError> {
+        if self.max_frame_bytes < 64 {
+            return Err(ConfigError::FrameLimitTooSmall);
+        }
+        if self.max_payload_bytes > self.max_frame_bytes.saturating_sub(16) {
+            return Err(ConfigError::PayloadLimitExceedsFrameLimit);
+        }
+        if self.max_ack_ranges == 0 {
+            return Err(ConfigError::AckRangeLimitZero);
+        }
+        if self.max_paths == 0 {
+            return Err(ConfigError::PathLimitZero);
+        }
+        if self.max_streams == 0 {
+            return Err(ConfigError::StreamLimitZero);
+        }
+        if self.max_stream_window_bytes == 0 {
+            return Err(ConfigError::StreamWindowLimitZero);
+        }
+        if self.max_repair_bytes < self.max_payload_bytes {
+            return Err(ConfigError::RepairLimitTooSmall);
+        }
+        if self.max_reorder_bytes < self.max_payload_bytes {
+            return Err(ConfigError::ReorderLimitTooSmall);
+        }
+        if self.max_datagram_queue_bytes < self.max_payload_bytes {
+            return Err(ConfigError::DatagramQueueLimitTooSmall);
+        }
+        Ok(())
+    }
+}
+
+impl From<ResourceLimits> for CodecLimits {
+    fn from(value: ResourceLimits) -> Self {
+        Self {
+            max_frame_bytes: value.max_frame_bytes,
+            max_payload_bytes: value.max_payload_bytes,
+            max_ack_ranges: value.max_ack_ranges,
+            max_host_bytes: 255,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityConfig {
+    pub mode: EncryptionMode,
+    pub transport: TransportSecurity,
+    pub integrity: TransportIntegrity,
+    pub secret: SharedSecret,
+}
+
+impl SecurityConfig {
+    pub fn encrypted(secret: SharedSecret) -> Self {
+        Self {
+            mode: EncryptionMode::Required,
+            transport: TransportSecurity::Encrypted,
+            integrity: TransportIntegrity::Authenticated,
+            secret,
+        }
+    }
+
+    pub fn plaintext_lab(secret: SharedSecret) -> Self {
+        Self {
+            mode: EncryptionMode::AllowPlaintextLab,
+            transport: TransportSecurity::Plaintext,
+            integrity: TransportIntegrity::Authenticated,
+            secret,
+        }
+    }
+
+    pub fn warning(&self) -> Option<&'static str> {
+        self.mode.plaintext_warning()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandConfig {
+    Client(ClientConfig),
+    Server(ServerConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConfig {
+    pub ingress: IngressConfig,
+    pub paths: Vec<PathSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub bind_paths: Vec<PathSpec>,
+    pub outbound: OutboundConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    Security(SecurityPolicyError),
+    NoPaths,
+    FrameLimitTooSmall,
+    PayloadLimitExceedsFrameLimit,
+    AckRangeLimitZero,
+    PathLimitZero,
+    StreamLimitZero,
+    StreamWindowLimitZero,
+    RepairLimitTooSmall,
+    ReorderLimitTooSmall,
+    DatagramQueueLimitTooSmall,
+    TooManyPaths { actual: usize, limit: usize },
+}
+
+impl From<SecurityPolicyError> for ConfigError {
+    fn from(value: SecurityPolicyError) -> Self {
+        Self::Security(value)
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Security(err) => write!(f, "{err}"),
+            Self::NoPaths => write!(f, "at least one TCP or UDP path is required"),
+            Self::FrameLimitTooSmall => write!(f, "max frame bytes must be at least 64"),
+            Self::PayloadLimitExceedsFrameLimit => {
+                write!(f, "max payload bytes must fit inside max frame bytes")
+            }
+            Self::AckRangeLimitZero => write!(f, "max ack ranges must be greater than zero"),
+            Self::PathLimitZero => write!(f, "max paths must be greater than zero"),
+            Self::StreamLimitZero => write!(f, "max streams must be greater than zero"),
+            Self::StreamWindowLimitZero => {
+                write!(f, "max stream window bytes must be greater than zero")
+            }
+            Self::RepairLimitTooSmall => {
+                write!(f, "max repair bytes must be at least max payload bytes")
+            }
+            Self::ReorderLimitTooSmall => {
+                write!(f, "max reorder bytes must be at least max payload bytes")
+            }
+            Self::DatagramQueueLimitTooSmall => {
+                write!(
+                    f,
+                    "max datagram queue bytes must be at least max payload bytes"
+                )
+            }
+            Self::TooManyPaths { actual, limit } => {
+                write!(f, "{actual} paths configured, limit is {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}

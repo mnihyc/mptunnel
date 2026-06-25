@@ -1,0 +1,498 @@
+use crate::mux::MuxLimits;
+use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId};
+use bytes::Bytes;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReliableSendStream {
+    stream_id: StreamId,
+    next_offset: u64,
+    max_offset: u64,
+    repair_bytes: usize,
+    repair_cache: BTreeMap<u64, SentChunk>,
+    limits: MuxLimits,
+}
+
+impl ReliableSendStream {
+    pub fn new(stream_id: StreamId, limits: MuxLimits) -> Self {
+        Self {
+            stream_id,
+            next_offset: 0,
+            max_offset: limits.max_stream_window_bytes,
+            repair_bytes: 0,
+            repair_cache: BTreeMap::new(),
+            limits,
+        }
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    pub fn repair_bytes(&self) -> usize {
+        self.repair_bytes
+    }
+
+    pub fn update_max_offset(&mut self, max_offset: u64) {
+        self.max_offset = self.max_offset.max(max_offset);
+    }
+
+    pub fn send_data(&mut self, payload: Bytes, flags: StreamFlags) -> Result<Frame, StreamError> {
+        if payload.is_empty() {
+            return Err(StreamError::EmptyPayload);
+        }
+        if payload.len() > self.limits.max_payload_bytes {
+            return Err(StreamError::PayloadTooLarge {
+                actual: payload.len(),
+                limit: self.limits.max_payload_bytes,
+            });
+        }
+        let end = self
+            .next_offset
+            .checked_add(payload.len() as u64)
+            .ok_or(StreamError::OffsetOverflow)?;
+        if end > self.max_offset {
+            return Err(StreamError::FlowControlBlocked {
+                end,
+                max: self.max_offset,
+            });
+        }
+        let new_repair_bytes =
+            self.repair_bytes
+                .checked_add(payload.len())
+                .ok_or(StreamError::RepairCacheFull {
+                    actual: usize::MAX,
+                    limit: self.limits.max_repair_bytes,
+                })?;
+        if new_repair_bytes > self.limits.max_repair_bytes {
+            return Err(StreamError::RepairCacheFull {
+                actual: new_repair_bytes,
+                limit: self.limits.max_repair_bytes,
+            });
+        }
+
+        let offset = self.next_offset;
+        self.next_offset = end;
+        self.repair_bytes = new_repair_bytes;
+        self.repair_cache.insert(
+            offset,
+            SentChunk {
+                offset,
+                payload: payload.clone(),
+                flags,
+            },
+        );
+
+        Ok(Frame::StreamData {
+            stream_id: self.stream_id,
+            offset,
+            flags,
+            payload,
+        })
+    }
+
+    pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
+        let mut released_bytes = 0usize;
+        let mut released_chunks = 0usize;
+        let acked_offsets = self
+            .repair_cache
+            .iter()
+            .filter_map(|(offset, chunk)| {
+                ranges
+                    .iter()
+                    .any(|range| range_covers_chunk(*range, chunk))
+                    .then_some(*offset)
+            })
+            .collect::<Vec<_>>();
+
+        for offset in acked_offsets {
+            if let Some(chunk) = self.repair_cache.remove(&offset) {
+                released_bytes = released_bytes.saturating_add(chunk.payload.len());
+                released_chunks += 1;
+            }
+        }
+        self.repair_bytes = self.repair_bytes.saturating_sub(released_bytes);
+        AckOutcome {
+            released_bytes,
+            released_chunks,
+            remaining_repair_bytes: self.repair_bytes,
+        }
+    }
+
+    pub fn retransmission_frames(&self) -> Vec<Frame> {
+        self.repair_cache
+            .values()
+            .map(|chunk| Frame::StreamData {
+                stream_id: self.stream_id,
+                offset: chunk.offset,
+                flags: chunk.flags,
+                payload: chunk.payload.clone(),
+            })
+            .collect()
+    }
+}
+
+fn range_covers_chunk(range: OffsetRange, chunk: &SentChunk) -> bool {
+    let end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+    range.start <= chunk.offset && range.end >= end
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SentChunk {
+    offset: u64,
+    payload: Bytes,
+    flags: StreamFlags,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckOutcome {
+    pub released_bytes: usize,
+    pub released_chunks: usize,
+    pub remaining_repair_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReliableRecvStream {
+    stream_id: StreamId,
+    next_offset: u64,
+    reorder_bytes: usize,
+    buffered: BTreeMap<u64, RecvChunk>,
+    received_ranges: RangeSet,
+    limits: MuxLimits,
+}
+
+impl ReliableRecvStream {
+    pub fn new(stream_id: StreamId, limits: MuxLimits) -> Self {
+        Self {
+            stream_id,
+            next_offset: 0,
+            reorder_bytes: 0,
+            buffered: BTreeMap::new(),
+            received_ranges: RangeSet::default(),
+            limits,
+        }
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    pub fn reorder_bytes(&self) -> usize {
+        self.reorder_bytes
+    }
+
+    pub fn receive_data(
+        &mut self,
+        offset: u64,
+        payload: Bytes,
+        flags: StreamFlags,
+    ) -> Result<ReceiveOutcome, StreamError> {
+        if payload.is_empty() {
+            return Err(StreamError::EmptyPayload);
+        }
+        if payload.len() > self.limits.max_payload_bytes {
+            return Err(StreamError::PayloadTooLarge {
+                actual: payload.len(),
+                limit: self.limits.max_payload_bytes,
+            });
+        }
+        let end = offset
+            .checked_add(payload.len() as u64)
+            .ok_or(StreamError::OffsetOverflow)?;
+        if self.received_ranges.covers(offset, end) {
+            return Ok(ReceiveOutcome::default());
+        }
+        if self.overlaps_existing(offset, end) {
+            return Err(StreamError::OverlappingData);
+        }
+        let new_reorder_bytes = self.reorder_bytes.checked_add(payload.len()).ok_or(
+            StreamError::ReorderBufferFull {
+                actual: usize::MAX,
+                limit: self.limits.max_reorder_bytes,
+            },
+        )?;
+        if new_reorder_bytes > self.limits.max_reorder_bytes {
+            return Err(StreamError::ReorderBufferFull {
+                actual: new_reorder_bytes,
+                limit: self.limits.max_reorder_bytes,
+            });
+        }
+
+        let mut received_ranges = self.received_ranges.clone();
+        received_ranges.insert(offset, end);
+        received_ranges.ensure_range_limit(self.limits.max_ack_ranges)?;
+        self.reorder_bytes = new_reorder_bytes;
+        self.received_ranges = received_ranges;
+        self.buffered.insert(offset, RecvChunk { payload, flags });
+
+        let mut delivered = Vec::new();
+        let mut fin = false;
+        while let Some(chunk) = self.buffered.remove(&self.next_offset) {
+            self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
+            self.next_offset = self.next_offset.saturating_add(chunk.payload.len() as u64);
+            fin |= chunk.flags.fin;
+            delivered.push(chunk.payload);
+        }
+
+        Ok(ReceiveOutcome { delivered, fin })
+    }
+
+    pub fn ack_ranges(&self) -> Vec<OffsetRange> {
+        self.received_ranges.ranges()
+    }
+
+    pub fn ack_frame(&self) -> Frame {
+        Frame::StreamAck {
+            stream_id: self.stream_id,
+            ranges: self.ack_ranges(),
+        }
+    }
+
+    fn overlaps_existing(&self, start: u64, end: u64) -> bool {
+        if end <= self.next_offset {
+            return false;
+        }
+        self.received_ranges
+            .ranges
+            .iter()
+            .any(|(range_start, range_end)| start < *range_end && end > *range_start)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecvChunk {
+    payload: Bytes,
+    flags: StreamFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReceiveOutcome {
+    pub delivered: Vec<Bytes>,
+    pub fin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RangeSet {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl RangeSet {
+    fn insert(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+
+        let mut merged_start = start;
+        let mut merged_end = end;
+
+        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
+            && prev_end >= start
+        {
+            merged_start = prev_start;
+            merged_end = merged_end.max(prev_end);
+            self.ranges.remove(&prev_start);
+        }
+
+        let overlapping = self
+            .ranges
+            .range(start..)
+            .map(|(&range_start, &range_end)| (range_start, range_end))
+            .take_while(|(range_start, _)| *range_start <= merged_end)
+            .collect::<Vec<_>>();
+
+        for (range_start, range_end) in overlapping {
+            merged_end = merged_end.max(range_end);
+            self.ranges.remove(&range_start);
+        }
+
+        self.ranges.insert(merged_start, merged_end);
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, range_end)| *range_end >= end)
+    }
+
+    fn ranges(&self) -> Vec<OffsetRange> {
+        self.ranges
+            .iter()
+            .filter_map(|(&start, &end)| OffsetRange::new(start, end))
+            .collect()
+    }
+
+    fn ensure_range_limit(&self, limit: usize) -> Result<(), StreamError> {
+        if self.ranges.len() > limit {
+            Err(StreamError::TooManyAckRanges {
+                actual: self.ranges.len(),
+                limit,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamError {
+    EmptyPayload,
+    PayloadTooLarge { actual: usize, limit: usize },
+    FlowControlBlocked { end: u64, max: u64 },
+    RepairCacheFull { actual: usize, limit: usize },
+    ReorderBufferFull { actual: usize, limit: usize },
+    TooManyAckRanges { actual: usize, limit: usize },
+    OverlappingData,
+    OffsetOverflow,
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPayload => write!(f, "stream data payload must not be empty"),
+            Self::PayloadTooLarge { actual, limit } => {
+                write!(f, "stream payload is {actual} bytes, limit is {limit}")
+            }
+            Self::FlowControlBlocked { end, max } => {
+                write!(f, "stream offset {end} exceeds max data {max}")
+            }
+            Self::RepairCacheFull { actual, limit } => {
+                write!(
+                    f,
+                    "repair cache would hold {actual} bytes, limit is {limit}"
+                )
+            }
+            Self::ReorderBufferFull { actual, limit } => {
+                write!(
+                    f,
+                    "reorder buffer would hold {actual} bytes, limit is {limit}"
+                )
+            }
+            Self::TooManyAckRanges { actual, limit } => {
+                write!(f, "stream has {actual} ACK ranges, limit is {limit}")
+            }
+            Self::OverlappingData => write!(f, "stream data overlaps an existing range"),
+            Self::OffsetOverflow => write!(f, "stream offset overflow"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> MuxLimits {
+        MuxLimits {
+            max_payload_bytes: 1024,
+            max_ack_ranges: 8,
+            max_stream_window_bytes: 4096,
+            max_repair_bytes: 2048,
+            max_reorder_bytes: 2048,
+            max_datagram_queue_bytes: 2048,
+        }
+    }
+
+    #[test]
+    fn send_stream_keeps_data_until_tunnel_ack() {
+        let mut stream = ReliableSendStream::new(StreamId(1), limits());
+        let frame = stream
+            .send_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
+            .expect("send");
+
+        assert_eq!(stream.repair_bytes(), 5);
+        assert_eq!(stream.retransmission_frames(), vec![frame]);
+
+        let outcome = stream.apply_ack(&[OffsetRange::new(0, 5).expect("range")]);
+        assert_eq!(
+            outcome,
+            AckOutcome {
+                released_bytes: 5,
+                released_chunks: 1,
+                remaining_repair_bytes: 0
+            }
+        );
+        assert!(stream.retransmission_frames().is_empty());
+    }
+
+    #[test]
+    fn send_stream_enforces_flow_control_and_repair_limit() {
+        let mut limit = limits();
+        limit.max_stream_window_bytes = 4;
+        let mut stream = ReliableSendStream::new(StreamId(1), limit);
+
+        assert!(matches!(
+            stream.send_data(Bytes::from_static(b"hello"), StreamFlags::NONE),
+            Err(StreamError::FlowControlBlocked { .. })
+        ));
+
+        let mut limit = limits();
+        limit.max_repair_bytes = 4;
+        let mut stream = ReliableSendStream::new(StreamId(1), limit);
+        assert!(matches!(
+            stream.send_data(Bytes::from_static(b"hello"), StreamFlags::NONE),
+            Err(StreamError::RepairCacheFull { .. })
+        ));
+    }
+
+    #[test]
+    fn recv_stream_reassembles_out_of_order_data_and_builds_ack_ranges() {
+        let mut stream = ReliableRecvStream::new(StreamId(7), limits());
+        let first = stream
+            .receive_data(
+                5,
+                Bytes::from_static(b" world"),
+                StreamFlags {
+                    fin: true,
+                    early_data: false,
+                },
+            )
+            .expect("second chunk");
+        assert!(first.delivered.is_empty());
+        assert_eq!(
+            stream.ack_ranges(),
+            vec![OffsetRange::new(5, 11).expect("range")]
+        );
+
+        let second = stream
+            .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+            .expect("first chunk");
+
+        assert_eq!(
+            second.delivered,
+            vec![Bytes::from_static(b"hello"), Bytes::from_static(b" world")]
+        );
+        assert!(second.fin);
+        assert_eq!(stream.next_offset(), 11);
+        assert_eq!(stream.reorder_bytes(), 0);
+        assert_eq!(
+            stream.ack_ranges(),
+            vec![OffsetRange::new(0, 11).expect("range")]
+        );
+    }
+
+    #[test]
+    fn recv_stream_rejects_overlap_and_reorder_pressure() {
+        let mut stream = ReliableRecvStream::new(StreamId(7), limits());
+        stream
+            .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+            .expect("first");
+        assert_eq!(
+            stream.receive_data(2, Bytes::from_static(b"xx"), StreamFlags::NONE),
+            Ok(ReceiveOutcome::default())
+        );
+
+        let mut limit = limits();
+        limit.max_reorder_bytes = 4;
+        let mut stream = ReliableRecvStream::new(StreamId(9), limit);
+        assert!(matches!(
+            stream.receive_data(10, Bytes::from_static(b"hello"), StreamFlags::NONE),
+            Err(StreamError::ReorderBufferFull { .. })
+        ));
+    }
+}

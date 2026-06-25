@@ -1,0 +1,387 @@
+use crate::protocol::Frame;
+use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+const MAGIC: &[u8; 4] = b"MPTE";
+const VERSION: u8 = 1;
+const HEADER_LEN: usize = 18;
+const TAG_LEN: usize = 16;
+const DIR_CLIENT_TO_SERVER: u8 = 1;
+const DIR_SERVER_TO_CLIENT: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    Client,
+    Server,
+}
+
+impl PeerRole {
+    fn send_direction(self) -> u8 {
+        match self {
+            Self::Client => DIR_CLIENT_TO_SERVER,
+            Self::Server => DIR_SERVER_TO_CLIENT,
+        }
+    }
+
+    fn recv_direction(self) -> u8 {
+        match self {
+            Self::Client => DIR_SERVER_TO_CLIENT,
+            Self::Server => DIR_CLIENT_TO_SERVER,
+        }
+    }
+}
+
+pub struct EncryptedFramedStream<S> {
+    stream: S,
+    cipher: ChaCha20Poly1305,
+    limits: CodecLimits,
+    send_direction: u8,
+    recv_direction: u8,
+    send_counter: u64,
+    recv_counter: u64,
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for EncryptedFramedStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedFramedStream")
+            .field("stream", &self.stream)
+            .field("limits", &self.limits)
+            .field("send_direction", &self.send_direction)
+            .field("recv_direction", &self.recv_direction)
+            .field("send_counter", &self.send_counter)
+            .field("recv_counter", &self.recv_counter)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> EncryptedFramedStream<S> {
+    pub fn new(stream: S, secret: &[u8], role: PeerRole, limits: CodecLimits) -> Self {
+        let key = derive_key(secret);
+        Self {
+            stream,
+            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            limits,
+            send_direction: role.send_direction(),
+            recv_direction: role.recv_direction(),
+            send_counter: 0,
+            recv_counter: 0,
+        }
+    }
+
+    pub fn limits(&self) -> CodecLimits {
+        self.limits
+    }
+
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
+impl<S> EncryptedFramedStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
+        let mut header = [0u8; HEADER_LEN];
+        self.stream.read_exact(&mut header).await?;
+        let Header {
+            direction,
+            counter,
+            ciphertext_len,
+        } = decode_header(&header, self.limits)?;
+        if direction != self.recv_direction {
+            return Err(EncryptedFramedTransportError::WrongDirection {
+                expected: self.recv_direction,
+                actual: direction,
+            });
+        }
+        if counter != self.recv_counter {
+            return Err(EncryptedFramedTransportError::UnexpectedCounter {
+                expected: self.recv_counter,
+                actual: counter,
+            });
+        }
+
+        let mut encrypted = vec![0u8; ciphertext_len];
+        self.stream.read_exact(&mut encrypted).await?;
+        let tag_start = encrypted
+            .len()
+            .checked_sub(TAG_LEN)
+            .ok_or(EncryptedFramedTransportError::Crypto)?;
+        let tag_bytes: [u8; TAG_LEN] = encrypted[tag_start..].try_into().expect("tag slice length");
+        encrypted.truncate(tag_start);
+        let nonce = build_nonce(direction, counter);
+        self.cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                &header,
+                &mut encrypted,
+                Tag::from_slice(&tag_bytes),
+            )
+            .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+        self.recv_counter = self
+            .recv_counter
+            .checked_add(1)
+            .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
+        Ok(decode_frame(&encrypted, self.limits)?)
+    }
+
+    pub async fn write_frame(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<(), EncryptedFramedTransportError> {
+        let mut payload = encode_frame(frame, self.limits)?;
+        let ciphertext_len = payload
+            .len()
+            .checked_add(TAG_LEN)
+            .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
+        validate_encrypted_len(ciphertext_len, self.limits)?;
+        let header = encode_header(self.send_direction, self.send_counter, ciphertext_len)?;
+        let nonce = build_nonce(self.send_direction, self.send_counter);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut payload)
+            .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+        self.stream.write_all(&header).await?;
+        self.stream.write_all(&payload).await?;
+        self.stream.write_all(&tag).await?;
+        self.send_counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
+        self.stream.flush().await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Header {
+    direction: u8,
+    counter: u64,
+    ciphertext_len: usize,
+}
+
+fn encode_header(
+    direction: u8,
+    counter: u64,
+    ciphertext_len: usize,
+) -> Result<[u8; HEADER_LEN], EncryptedFramedTransportError> {
+    if ciphertext_len > u32::MAX as usize {
+        return Err(EncryptedFramedTransportError::LengthOverflow);
+    }
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(MAGIC);
+    header[4] = VERSION;
+    header[5] = direction;
+    header[6..14].copy_from_slice(&counter.to_be_bytes());
+    header[14..18].copy_from_slice(&(ciphertext_len as u32).to_be_bytes());
+    Ok(header)
+}
+
+fn decode_header(
+    header: &[u8; HEADER_LEN],
+    limits: CodecLimits,
+) -> Result<Header, EncryptedFramedTransportError> {
+    if &header[0..4] != MAGIC {
+        return Err(EncryptedFramedTransportError::InvalidMagic);
+    }
+    if header[4] != VERSION {
+        return Err(EncryptedFramedTransportError::UnsupportedVersion(header[4]));
+    }
+    let direction = header[5];
+    if !matches!(direction, DIR_CLIENT_TO_SERVER | DIR_SERVER_TO_CLIENT) {
+        return Err(EncryptedFramedTransportError::InvalidDirection(direction));
+    }
+    let counter = u64::from_be_bytes(header[6..14].try_into().expect("counter slice"));
+    let ciphertext_len =
+        u32::from_be_bytes(header[14..18].try_into().expect("length slice")) as usize;
+    validate_encrypted_len(ciphertext_len, limits)?;
+    Ok(Header {
+        direction,
+        counter,
+        ciphertext_len,
+    })
+}
+
+fn validate_encrypted_len(
+    ciphertext_len: usize,
+    limits: CodecLimits,
+) -> Result<(), EncryptedFramedTransportError> {
+    if ciphertext_len < TAG_LEN {
+        return Err(EncryptedFramedTransportError::Crypto);
+    }
+    let max_encrypted_len = limits
+        .max_frame_bytes
+        .checked_add(TAG_LEN)
+        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
+    if ciphertext_len > max_encrypted_len {
+        return Err(EncryptedFramedTransportError::FrameTooLarge {
+            actual: ciphertext_len,
+            limit: max_encrypted_len,
+        });
+    }
+    Ok(())
+}
+
+fn derive_key(secret: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mptunnel encrypted framed v1");
+    hasher.update(secret);
+    hasher.finalize().into()
+}
+
+fn build_nonce(direction: u8, counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[0] = direction;
+    nonce[4..12].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+#[derive(Debug)]
+pub enum EncryptedFramedTransportError {
+    Io(std::io::Error),
+    Codec(CodecError),
+    Crypto,
+    InvalidMagic,
+    UnsupportedVersion(u8),
+    InvalidDirection(u8),
+    WrongDirection { expected: u8, actual: u8 },
+    UnexpectedCounter { expected: u64, actual: u64 },
+    CounterOverflow,
+    LengthOverflow,
+    FrameTooLarge { actual: usize, limit: usize },
+}
+
+impl From<std::io::Error> for EncryptedFramedTransportError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<CodecError> for EncryptedFramedTransportError {
+    fn from(value: CodecError) -> Self {
+        Self::Codec(value)
+    }
+}
+
+impl std::fmt::Display for EncryptedFramedTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "{err}"),
+            Self::Codec(err) => write!(f, "{err}"),
+            Self::Crypto => write!(f, "encrypted frame authentication failed"),
+            Self::InvalidMagic => write!(f, "invalid encrypted frame magic"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported encrypted frame version {version}")
+            }
+            Self::InvalidDirection(direction) => {
+                write!(f, "invalid encrypted frame direction {direction}")
+            }
+            Self::WrongDirection { expected, actual } => {
+                write!(
+                    f,
+                    "encrypted frame direction {actual} does not match expected {expected}"
+                )
+            }
+            Self::UnexpectedCounter { expected, actual } => {
+                write!(
+                    f,
+                    "encrypted frame counter {actual} does not match expected {expected}"
+                )
+            }
+            Self::CounterOverflow => write!(f, "encrypted frame counter overflow"),
+            Self::LengthOverflow => write!(f, "encrypted frame length overflow"),
+            Self::FrameTooLarge { actual, limit } => {
+                write!(f, "encrypted frame is {actual} bytes, limit is {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EncryptedFramedTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Codec(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Frame, SessionId};
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn encrypted_stream_round_trips_frames_and_hides_plaintext() {
+        let (client, server) = duplex(2048);
+        let limits = CodecLimits::default();
+        let mut client =
+            EncryptedFramedStream::new(client, b"0123456789abcdef", PeerRole::Client, limits);
+        let mut server =
+            EncryptedFramedStream::new(server, b"0123456789abcdef", PeerRole::Server, limits);
+        let frame = Frame::SessionHello {
+            session_id: SessionId(42),
+        };
+
+        client.write_frame(&frame).await.expect("write");
+        client.flush().await.expect("flush");
+
+        assert_eq!(server.read_frame().await.expect("read"), frame);
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_rejects_wrong_secret() {
+        let (client, server) = duplex(2048);
+        let limits = CodecLimits::default();
+        let mut client =
+            EncryptedFramedStream::new(client, b"0123456789abcdef", PeerRole::Client, limits);
+        let mut server =
+            EncryptedFramedStream::new(server, b"fedcba9876543210", PeerRole::Server, limits);
+
+        client
+            .write_frame(&Frame::SessionHello {
+                session_id: SessionId(7),
+            })
+            .await
+            .expect("write");
+
+        assert!(matches!(
+            server.read_frame().await,
+            Err(EncryptedFramedTransportError::Crypto)
+        ));
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_rejects_oversize_before_ciphertext_allocation() {
+        let (mut writer, reader) = duplex(1024);
+        let limits = CodecLimits {
+            max_frame_bytes: 32,
+            ..CodecLimits::default()
+        };
+        let mut reader =
+            EncryptedFramedStream::new(reader, b"0123456789abcdef", PeerRole::Server, limits);
+        let header = encode_header(
+            DIR_CLIENT_TO_SERVER,
+            0,
+            limits.max_frame_bytes + TAG_LEN + 1,
+        )
+        .expect("header");
+
+        writer.write_all(&header).await.expect("write header");
+
+        assert!(matches!(
+            reader.read_frame().await,
+            Err(EncryptedFramedTransportError::FrameTooLarge { .. })
+        ));
+    }
+}

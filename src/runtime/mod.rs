@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
 const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const PATH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
@@ -240,8 +241,65 @@ pub struct ClientPathContext {
 
 #[derive(Debug)]
 struct ClientPathHealth {
-    tcp_states: Vec<SchedulerPathState>,
-    udp_states: Vec<SchedulerPathState>,
+    tcp: Vec<ClientPathHealthRecord>,
+    udp: Vec<ClientPathHealthRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientPathHealthRecord {
+    state: SchedulerPathState,
+    consecutive_failures: u32,
+    measured_srtt_ms: Option<f64>,
+    failed_until: Option<Instant>,
+}
+
+impl Default for ClientPathHealthRecord {
+    fn default() -> Self {
+        Self {
+            state: SchedulerPathState::Active,
+            consecutive_failures: 0,
+            measured_srtt_ms: None,
+            failed_until: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientPathObservation {
+    state: SchedulerPathState,
+    measured_srtt_ms: Option<f64>,
+}
+
+impl ClientPathHealthRecord {
+    fn observe(&mut self, now: Instant) -> ClientPathObservation {
+        if self.state == SchedulerPathState::Failed
+            && self.failed_until.is_some_and(|deadline| now >= deadline)
+        {
+            self.state = SchedulerPathState::Suspect;
+            self.failed_until = None;
+        }
+        ClientPathObservation {
+            state: self.state,
+            measured_srtt_ms: self.measured_srtt_ms,
+        }
+    }
+
+    fn mark_success(&mut self, elapsed: Duration) {
+        self.state = SchedulerPathState::Active;
+        self.consecutive_failures = 0;
+        self.failed_until = None;
+        let sample_ms = elapsed.as_secs_f64() * 1000.0;
+        self.measured_srtt_ms = Some(match self.measured_srtt_ms {
+            Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
+            None => sample_ms,
+        });
+    }
+
+    fn mark_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.state = SchedulerPathState::Failed;
+        self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
+    }
 }
 
 impl ClientPathContext {
@@ -263,8 +321,8 @@ impl ClientPathContext {
             .filter(|path| path.underlay == UnderlayProtocol::Udp)
             .collect::<Vec<_>>();
         let health = ClientPathHealth {
-            tcp_states: vec![SchedulerPathState::Active; tcp_paths.len()],
-            udp_states: vec![SchedulerPathState::Active; udp_paths.len()],
+            tcp: vec![ClientPathHealthRecord::default(); tcp_paths.len()],
+            udp: vec![ClientPathHealthRecord::default(); udp_paths.len()],
         };
         Ok(Self {
             tcp_paths: Arc::new(tcp_paths),
@@ -277,58 +335,82 @@ impl ClientPathContext {
     }
 
     fn ordered_tcp_path_indices(&self, class: TrafficClass, payload_bytes: usize) -> Vec<usize> {
-        let states = self
-            .health
-            .lock()
-            .expect("client path health lock")
-            .tcp_states
-            .clone();
-        ordered_path_indices(&self.tcp_paths, &states, class, payload_bytes)
+        let observations =
+            health_observations(&mut self.health.lock().expect("client path health lock").tcp);
+        ordered_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
     }
 
     fn ordered_udp_path_indices(&self, payload_bytes: usize) -> Vec<usize> {
-        let states = self
-            .health
-            .lock()
-            .expect("client path health lock")
-            .udp_states
-            .clone();
+        let observations =
+            health_observations(&mut self.health.lock().expect("client path health lock").udp);
         ordered_path_indices(
             &self.udp_paths,
-            &states,
+            &observations,
             TrafficClass::RealtimeDatagram,
             payload_bytes,
         )
     }
 
-    fn mark_tcp_path_state(&self, index: usize, state: SchedulerPathState) {
+    fn mark_tcp_path_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .health
             .lock()
             .expect("client path health lock")
-            .tcp_states
+            .tcp
             .get_mut(index)
         {
-            *current = state;
+            current.mark_success(elapsed);
         }
     }
 
-    fn mark_udp_path_state(&self, index: usize, state: SchedulerPathState) {
+    fn mark_tcp_path_failure(&self, index: usize) {
         if let Some(current) = self
             .health
             .lock()
             .expect("client path health lock")
-            .udp_states
+            .tcp
             .get_mut(index)
         {
-            *current = state;
+            current.mark_failure(Instant::now());
+        }
+    }
+
+    fn mark_udp_path_success(&self, index: usize, elapsed: Duration) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.mark_success(elapsed);
+        }
+    }
+
+    fn mark_udp_path_failure(&self, index: usize) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.mark_failure(Instant::now());
         }
     }
 }
 
+fn health_observations(records: &mut [ClientPathHealthRecord]) -> Vec<ClientPathObservation> {
+    let now = Instant::now();
+    records
+        .iter_mut()
+        .map(|record| record.observe(now))
+        .collect()
+}
+
 fn ordered_path_indices(
     paths: &[PathSpec],
-    states: &[SchedulerPathState],
+    observations: &[ClientPathObservation],
     class: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<usize> {
@@ -336,12 +418,15 @@ fn ordered_path_indices(
         .iter()
         .enumerate()
         .filter_map(|(index, path)| {
-            let state = states
+            let observation = observations
                 .get(index)
                 .copied()
-                .unwrap_or(SchedulerPathState::Suspect);
+                .unwrap_or(ClientPathObservation {
+                    state: SchedulerPathState::Suspect,
+                    measured_srtt_ms: None,
+                });
             scheduler::score_path(
-                path_snapshot(path, index, state),
+                path_snapshot(path, index, observation),
                 class,
                 payload_bytes,
                 SchedulerPolicy::default(),
@@ -353,7 +438,11 @@ fn ordered_path_indices(
     scores.into_iter().map(|(index, _)| index).collect()
 }
 
-fn path_snapshot(path: &PathSpec, index: usize, state: SchedulerPathState) -> PathSnapshot {
+fn path_snapshot(
+    path: &PathSpec,
+    index: usize,
+    observation: ClientPathObservation,
+) -> PathSnapshot {
     let delivery_rate_bps = match path.metadata.initial_rate {
         RateHint::Unknown => default_path_rate_bps(path.underlay),
         RateHint::Unlimited => 1_000_000_000_000.0,
@@ -362,12 +451,13 @@ fn path_snapshot(path: &PathSpec, index: usize, state: SchedulerPathState) -> Pa
     PathSnapshot {
         id: PathId(index as u16),
         underlay: path.underlay,
-        state,
+        state: observation.state,
         flags: path.metadata.capabilities.into(),
-        srtt_ms: path
-            .metadata
-            .initial_srtt_ms
-            .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from),
+        srtt_ms: observation.measured_srtt_ms.unwrap_or_else(|| {
+            path.metadata
+                .initial_srtt_ms
+                .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
+        }),
         jitter_ms: f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)),
         delivery_rate_bps,
         loss_rate: 0.0,
@@ -522,14 +612,15 @@ async fn open_remote_stream(
     }
     let mut last_retryable_error = None;
     for path_index in candidates {
+        let started_at = Instant::now();
         match open_remote_stream_on_path(context, path_index, target.clone(), ingress, class).await
         {
             Ok(opened) => {
-                context.mark_tcp_path_state(path_index, SchedulerPathState::Active);
+                context.mark_tcp_path_success(path_index, started_at.elapsed());
                 return Ok(opened);
             }
             Err(err) if stream_open_error_is_path_retryable(&err) => {
-                context.mark_tcp_path_state(path_index, SchedulerPathState::Suspect);
+                context.mark_tcp_path_failure(path_index);
                 last_retryable_error = Some(err);
             }
             Err(err) => return Err(err),
@@ -737,6 +828,7 @@ async fn open_udp_datagram_session(
             .udp_paths
             .get(path_index)
             .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+        let started_at = Instant::now();
         match UdpDatagramClientSession::open(
             path,
             PathId(path_index as u16),
@@ -747,11 +839,11 @@ async fn open_udp_datagram_session(
         .await
         {
             Ok(session) => {
-                context.mark_udp_path_state(path_index, SchedulerPathState::Active);
+                context.mark_udp_path_success(path_index, started_at.elapsed());
                 return Ok(session);
             }
             Err(err) if udp_open_error_is_path_retryable(&err) => {
-                context.mark_udp_path_state(path_index, SchedulerPathState::Suspect);
+                context.mark_udp_path_failure(path_index);
                 last_retryable_error = Some(err);
             }
             Err(err) => return Err(err),
@@ -1832,6 +1924,67 @@ mod tests {
         let port = probe.local_addr().expect("reserved addr").port();
         drop(probe);
         format!("udp://127.0.0.1:{port}").parse().expect("path")
+    }
+
+    #[test]
+    fn client_path_health_suppresses_failed_paths_until_cooldown() {
+        let fast_path = "tcp://127.0.0.1:10001?srtt-ms=5&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("fast path");
+        let slow_path = "tcp://127.0.0.1:10002?srtt-ms=200&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("slow path");
+        let context = ClientPathContext::new(
+            vec![fast_path, slow_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+                .first()
+                .copied(),
+            Some(0)
+        );
+        context.mark_tcp_path_failure(0);
+        let failed_order = context.ordered_tcp_path_indices(TrafficClass::Interactive, 512);
+        assert_eq!(failed_order, vec![1]);
+
+        {
+            let mut health = context.health.lock().expect("health lock");
+            health.tcp[0].failed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+        let recovered_order = context.ordered_tcp_path_indices(TrafficClass::Interactive, 512);
+        assert!(recovered_order.contains(&0));
+    }
+
+    #[test]
+    fn measured_path_latency_updates_future_scheduling_order() {
+        let first_path = "tcp://127.0.0.1:10011?srtt-ms=50&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("first path");
+        let second_path = "tcp://127.0.0.1:10012?srtt-ms=50&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("second path");
+        let context = ClientPathContext::new(
+            vec![first_path, second_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_tcp_path_success(0, Duration::from_millis(120));
+        context.mark_tcp_path_success(1, Duration::from_millis(5));
+
+        assert_eq!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+                .first()
+                .copied(),
+            Some(1)
+        );
     }
 
     #[tokio::test]

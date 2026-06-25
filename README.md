@@ -98,8 +98,8 @@ Common environment variables:
 
 The current runtime exposes local SOCKS5 and HTTP CONNECT ingress.
 
-TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT. When several TCP paths are configured, stream setup uses scheduler ETA scoring from path hints and current path health, then retries the next schedulable path after path-level open failures.
+TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT. When several TCP paths are configured, stream setup uses scheduler ETA scoring from path hints and current path health, then retries the next schedulable path after path-level open failures. Successful opens feed measured latency back into later path choices; failed opens put that path into a short cooldown before probing resumes.
 
-SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. When several UDP paths are configured, UDP session setup uses the same scheduler inputs and retries after path-level handshake failures. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
+SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. When several UDP paths are configured, UDP session setup uses the same scheduler inputs and adaptive health records, then retries after path-level handshake failures. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
 
 UDP targets can be reached through direct UDP, bind-source-IP direct UDP, or upstream SOCKS5 UDP ASSOCIATE. Plain HTTP CONNECT outbound is TCP-only.

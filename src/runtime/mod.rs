@@ -33,6 +33,8 @@ const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
 const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const PATH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
+const TCP_STREAM_LOAD_BYTES: u64 = 256 * 1024;
+const UDP_SESSION_LOAD_BYTES: u64 = 64 * 1024;
 
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
@@ -251,6 +253,8 @@ struct ClientPathHealthRecord {
     consecutive_failures: u32,
     measured_srtt_ms: Option<f64>,
     failed_until: Option<Instant>,
+    active_flows: u32,
+    load_bytes: u64,
 }
 
 impl Default for ClientPathHealthRecord {
@@ -260,6 +264,8 @@ impl Default for ClientPathHealthRecord {
             consecutive_failures: 0,
             measured_srtt_ms: None,
             failed_until: None,
+            active_flows: 0,
+            load_bytes: 0,
         }
     }
 }
@@ -268,6 +274,8 @@ impl Default for ClientPathHealthRecord {
 struct ClientPathObservation {
     state: SchedulerPathState,
     measured_srtt_ms: Option<f64>,
+    active_flows: u32,
+    load_bytes: u64,
 }
 
 impl ClientPathHealthRecord {
@@ -281,18 +289,27 @@ impl ClientPathHealthRecord {
         ClientPathObservation {
             state: self.state,
             measured_srtt_ms: self.measured_srtt_ms,
+            active_flows: self.active_flows,
+            load_bytes: self.load_bytes,
         }
     }
 
-    fn mark_success(&mut self, elapsed: Duration) {
+    fn mark_open_success(&mut self, elapsed: Duration, load_bytes: u64) {
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
+        self.active_flows = self.active_flows.saturating_add(1);
+        self.load_bytes = self.load_bytes.saturating_add(load_bytes);
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
         self.measured_srtt_ms = Some(match self.measured_srtt_ms {
             Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
             None => sample_ms,
         });
+    }
+
+    fn release_load(&mut self, load_bytes: u64) {
+        self.active_flows = self.active_flows.saturating_sub(1);
+        self.load_bytes = self.load_bytes.saturating_sub(load_bytes);
     }
 
     fn mark_failure(&mut self, now: Instant) {
@@ -351,7 +368,7 @@ impl ClientPathContext {
         )
     }
 
-    fn mark_tcp_path_success(&self, index: usize, elapsed: Duration) {
+    fn mark_tcp_path_open_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .health
             .lock()
@@ -359,7 +376,19 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_success(elapsed);
+            current.mark_open_success(elapsed, TCP_STREAM_LOAD_BYTES);
+        }
+    }
+
+    fn release_tcp_path_load(&self, index: usize) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+        {
+            current.release_load(TCP_STREAM_LOAD_BYTES);
         }
     }
 
@@ -375,7 +404,7 @@ impl ClientPathContext {
         }
     }
 
-    fn mark_udp_path_success(&self, index: usize, elapsed: Duration) {
+    fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .health
             .lock()
@@ -383,7 +412,19 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.mark_success(elapsed);
+            current.mark_open_success(elapsed, UDP_SESSION_LOAD_BYTES);
+        }
+    }
+
+    fn release_udp_path_load(&self, index: usize) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.release_load(UDP_SESSION_LOAD_BYTES);
         }
     }
 
@@ -424,6 +465,8 @@ fn ordered_path_indices(
                 .unwrap_or(ClientPathObservation {
                     state: SchedulerPathState::Suspect,
                     measured_srtt_ms: None,
+                    active_flows: 0,
+                    load_bytes: 0,
                 });
             scheduler::score_path(
                 path_snapshot(path, index, observation),
@@ -461,8 +504,8 @@ fn path_snapshot(
         jitter_ms: f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)),
         delivery_rate_bps,
         loss_rate: 0.0,
-        queue_bytes: 0,
-        bytes_in_flight: 0,
+        queue_bytes: observation.load_bytes,
+        bytes_in_flight: u64::from(observation.active_flows) * PATH_OPEN_SCORE_BYTES as u64,
     }
 }
 
@@ -526,21 +569,27 @@ where
                     return Err(err);
                 }
             };
-            stream
-                .write_all(&socks5::connect_reply(
-                    Socks5Reply::Succeeded,
-                    SocketAddr::from(([0, 0, 0, 0], 0)),
-                ))
-                .await?;
-            stream.flush().await?;
-            relay_tcp_stream(
-                stream,
-                remote.framed,
-                remote.stream_id,
-                context.mux_limits,
-                remote.max_offset,
-            )
-            .await
+            let path_index = remote.path_index;
+            let result = async {
+                stream
+                    .write_all(&socks5::connect_reply(
+                        Socks5Reply::Succeeded,
+                        SocketAddr::from(([0, 0, 0, 0], 0)),
+                    ))
+                    .await?;
+                stream.flush().await?;
+                relay_tcp_stream(
+                    stream,
+                    remote.framed,
+                    remote.stream_id,
+                    context.mux_limits,
+                    remote.max_offset,
+                )
+                .await
+            }
+            .await;
+            context.release_tcp_path_load(path_index);
+            result
         }
         socks5::Socks5Command::UdpAssociate => {
             handle_socks5_udp_associate(
@@ -579,22 +628,29 @@ where
             return Err(err);
         }
     };
-    stream.write_all(http_connect::success_response()).await?;
-    stream.flush().await?;
-    relay_tcp_stream(
-        stream,
-        remote.framed,
-        remote.stream_id,
-        context.mux_limits,
-        remote.max_offset,
-    )
-    .await
+    let path_index = remote.path_index;
+    let result = async {
+        stream.write_all(http_connect::success_response()).await?;
+        stream.flush().await?;
+        relay_tcp_stream(
+            stream,
+            remote.framed,
+            remote.stream_id,
+            context.mux_limits,
+            remote.max_offset,
+        )
+        .await
+    }
+    .await;
+    context.release_tcp_path_load(path_index);
+    result
 }
 
 struct OpenedRemoteStream {
     framed: EncryptedFramedStream<TcpStream>,
     stream_id: StreamId,
     max_offset: u64,
+    path_index: usize,
 }
 
 async fn open_remote_stream(
@@ -616,7 +672,7 @@ async fn open_remote_stream(
         match open_remote_stream_on_path(context, path_index, target.clone(), ingress, class).await
         {
             Ok(opened) => {
-                context.mark_tcp_path_success(path_index, started_at.elapsed());
+                context.mark_tcp_path_open_success(path_index, started_at.elapsed());
                 return Ok(opened);
             }
             Err(err) if stream_open_error_is_path_retryable(&err) => {
@@ -706,6 +762,7 @@ async fn open_remote_stream_on_path(
                     framed,
                     stream_id,
                     max_offset,
+                    path_index,
                 });
             }
             Frame::StreamReset {
@@ -760,41 +817,71 @@ where
     let mut packet = vec![0u8; local_udp_buffer_len(context.mux_limits)];
     let mut control_probe = [0u8; 1];
     let mut udp_session: Option<UdpDatagramClientSession> = None;
-    loop {
+    let result = loop {
         tokio::select! {
             read = stream.read(&mut control_probe) => {
-                let read = read?;
+                let read = match read {
+                    Ok(read) => read,
+                    Err(err) => break Err(RuntimeError::Io(err)),
+                };
                 if read == 0 {
-                    if let Some(session) = udp_session.as_mut() {
-                        session.close().await?;
-                    }
-                    return Ok(());
+                    break Ok(());
                 }
-                return Err(RuntimeError::Protocol("unexpected data on SOCKS5 UDP control stream"));
+                break Err(RuntimeError::Protocol("unexpected data on SOCKS5 UDP control stream"));
             }
             received = relay_socket.recv_from(&mut packet) => {
-                let (len, peer) = received?;
+                let (len, peer) = match received {
+                    Ok(received) => received,
+                    Err(err) => break Err(RuntimeError::Io(err)),
+                };
                 if !socks5_udp_peer_allowed(&client_endpoint, peer) {
-                    return Err(RuntimeError::Protocol("SOCKS5 UDP peer does not match association"));
+                    break Err(RuntimeError::Protocol("SOCKS5 UDP peer does not match association"));
                 }
-                let (datagram, consumed) = socks5::parse_udp_datagram(&packet[..len])?;
+                let (datagram, consumed) = match socks5::parse_udp_datagram(&packet[..len]) {
+                    Ok(parsed) => parsed,
+                    Err(err) => break Err(RuntimeError::Socks5(err)),
+                };
                 if consumed != len {
-                    return Err(RuntimeError::Protocol("trailing SOCKS5 UDP datagram bytes"));
+                    break Err(RuntimeError::Protocol("trailing SOCKS5 UDP datagram bytes"));
                 }
                 let target = datagram.target.clone();
                 if udp_session.is_none() {
-                    udp_session = Some(open_udp_datagram_session(&context).await?);
+                    match open_udp_datagram_session(&context).await {
+                        Ok(session) => udp_session = Some(session),
+                        Err(err) => break Err(err),
+                    }
                 }
-                let response = udp_session
+                let response = match udp_session
                     .as_mut()
-                    .ok_or(RuntimeError::Protocol("missing UDP datagram session"))?
+                    .ok_or(RuntimeError::Protocol("missing UDP datagram session"))
+                {
+                    Ok(session) => session,
+                    Err(err) => break Err(err),
+                }
                     .send_to(target.clone(), datagram.payload, DEFAULT_SOCKS5_UDP_TTL_MS)
-                    .await?;
-                let response_packet = socks5::udp_datagram(&target, &response)?;
-                relay_socket.send_to(&response_packet, peer).await?;
+                    .await;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(err) => break Err(err),
+                };
+                let response_packet = match socks5::udp_datagram(&target, &response) {
+                    Ok(packet) => packet,
+                    Err(err) => break Err(RuntimeError::Socks5(err)),
+                };
+                if let Err(err) = relay_socket.send_to(&response_packet, peer).await {
+                    break Err(RuntimeError::Io(err));
+                }
             }
         }
+    };
+    if let Some(session) = udp_session.as_mut() {
+        let close_result = session.close().await;
+        context.release_udp_path_load(session.path_index);
+        if result.is_ok() {
+            close_result?;
+        }
     }
+    result
 }
 
 fn local_udp_buffer_len(mux_limits: MuxLimits) -> usize {
@@ -831,6 +918,7 @@ async fn open_udp_datagram_session(
         let started_at = Instant::now();
         match UdpDatagramClientSession::open(
             path,
+            path_index,
             PathId(path_index as u16),
             context.security.clone(),
             context.codec_limits,
@@ -839,7 +927,7 @@ async fn open_udp_datagram_session(
         .await
         {
             Ok(session) => {
-                context.mark_udp_path_success(path_index, started_at.elapsed());
+                context.mark_udp_path_open_success(path_index, started_at.elapsed());
                 return Ok(session);
             }
             Err(err) if udp_open_error_is_path_retryable(&err) => {
@@ -1079,7 +1167,8 @@ async fn client_udp_datagram_round_trip_with_limits(
     ttl_ms: u32,
 ) -> Result<Bytes, RuntimeError> {
     let mut session =
-        UdpDatagramClientSession::open(path, PathId(0), security, codec_limits, mux_limits).await?;
+        UdpDatagramClientSession::open(path, 0, PathId(0), security, codec_limits, mux_limits)
+            .await?;
     let response = session.send_to(target, payload, ttl_ms).await?;
     session.close().await?;
     Ok(response)
@@ -1091,6 +1180,7 @@ struct UdpDatagramClientSession {
     flows: Vec<UdpDatagramClientFlow>,
     next_flow_id: u64,
     mux_limits: MuxLimits,
+    path_index: usize,
 }
 
 struct UdpDatagramClientFlow {
@@ -1102,6 +1192,7 @@ struct UdpDatagramClientFlow {
 impl UdpDatagramClientSession {
     async fn open(
         path: &PathSpec,
+        path_index: usize,
         path_id: PathId,
         security: SecurityConfig,
         codec_limits: CodecLimits,
@@ -1174,6 +1265,7 @@ impl UdpDatagramClientSession {
             flows: Vec::new(),
             next_flow_id: 0,
             mux_limits,
+            path_index,
         })
     }
 
@@ -1961,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_path_latency_updates_future_scheduling_order() {
+    fn measured_path_latency_updates_next_scheduling_order() {
         let first_path = "tcp://127.0.0.1:10011?srtt-ms=50&rate-mbps=100"
             .parse::<PathSpec>()
             .expect("first path");
@@ -1975,8 +2067,8 @@ mod tests {
         )
         .expect("context");
 
-        context.mark_tcp_path_success(0, Duration::from_millis(120));
-        context.mark_tcp_path_success(1, Duration::from_millis(5));
+        context.mark_tcp_path_open_success(0, Duration::from_millis(120));
+        context.mark_tcp_path_open_success(1, Duration::from_millis(5));
 
         assert_eq!(
             context
@@ -1985,6 +2077,74 @@ mod tests {
                 .copied(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
+        let first_path = "tcp://127.0.0.1:10021?srtt-ms=10&rate-mbps=10"
+            .parse::<PathSpec>()
+            .expect("first path");
+        let second_path = "tcp://127.0.0.1:10022?srtt-ms=10&rate-mbps=10"
+            .parse::<PathSpec>()
+            .expect("second path");
+        let context = ClientPathContext::new(
+            vec![first_path, second_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_tcp_path_open_success(0, Duration::from_millis(1));
+        assert_eq!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+                .first()
+                .copied(),
+            Some(1)
+        );
+
+        context.release_tcp_path_load(0);
+        assert_eq!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+                .first()
+                .copied(),
+            Some(0)
+        );
+        let health = context.health.lock().expect("health lock");
+        assert_eq!(health.tcp[0].active_flows, 0);
+        assert_eq!(health.tcp[0].load_bytes, 0);
+    }
+
+    #[test]
+    fn active_udp_load_spreads_new_associations_and_releases_on_close() {
+        let first_path = "udp://127.0.0.1:10031?srtt-ms=10&rate-mbps=10"
+            .parse::<PathSpec>()
+            .expect("first path");
+        let second_path = "udp://127.0.0.1:10032?srtt-ms=10&rate-mbps=10"
+            .parse::<PathSpec>()
+            .expect("second path");
+        let context = ClientPathContext::new(
+            vec![first_path, second_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_udp_path_open_success(0, Duration::from_millis(1));
+        assert_eq!(
+            context.ordered_udp_path_indices(512).first().copied(),
+            Some(1)
+        );
+
+        context.release_udp_path_load(0);
+        assert_eq!(
+            context.ordered_udp_path_indices(512).first().copied(),
+            Some(0)
+        );
+        let health = context.health.lock().expect("health lock");
+        assert_eq!(health.udp[0].active_flows, 0);
+        assert_eq!(health.udp[0].load_bytes, 0);
     }
 
     #[tokio::test]

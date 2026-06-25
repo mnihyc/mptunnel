@@ -356,11 +356,15 @@ where
 
     let mut packet = vec![0u8; local_udp_buffer_len(context.mux_limits)];
     let mut control_probe = [0u8; 1];
+    let mut udp_session: Option<UdpDatagramClientSession> = None;
     loop {
         tokio::select! {
             read = stream.read(&mut control_probe) => {
                 let read = read?;
                 if read == 0 {
+                    if let Some(session) = udp_session.as_mut() {
+                        session.close().await?;
+                    }
                     return Ok(());
                 }
                 return Err(RuntimeError::Protocol("unexpected data on SOCKS5 UDP control stream"));
@@ -375,16 +379,20 @@ where
                     return Err(RuntimeError::Protocol("trailing SOCKS5 UDP datagram bytes"));
                 }
                 let target = datagram.target.clone();
-                let response = client_udp_datagram_round_trip_with_limits(
-                    path,
-                    context.security.clone(),
-                    context.codec_limits,
-                    context.mux_limits,
-                    datagram.target,
-                    datagram.payload,
-                    DEFAULT_SOCKS5_UDP_TTL_MS,
-                )
-                .await?;
+                if udp_session.is_none() {
+                    udp_session = Some(UdpDatagramClientSession::open(
+                        path,
+                        context.security.clone(),
+                        context.codec_limits,
+                        context.mux_limits,
+                    )
+                    .await?);
+                }
+                let response = udp_session
+                    .as_mut()
+                    .ok_or(RuntimeError::Protocol("missing UDP datagram session"))?
+                    .send_to(target.clone(), datagram.payload, DEFAULT_SOCKS5_UDP_TTL_MS)
+                    .await?;
                 let response_packet = socks5::udp_datagram(&target, &response)?;
                 relay_socket.send_to(&response_packet, peer).await?;
             }
@@ -624,90 +632,172 @@ async fn client_udp_datagram_round_trip_with_limits(
     payload: Bytes,
     ttl_ms: u32,
 ) -> Result<Bytes, RuntimeError> {
-    let socket =
-        udp::connect_path(path, crate::transport::udp::UdpConnectOptions::default()).await?;
-    let mut encrypted = EncryptedUdpSocket::new(
-        socket,
-        security.secret.as_bytes(),
-        PeerRole::Client,
-        codec_limits,
-    );
-    let session_id = random_session_id()?;
-    let path_id = PathId(0);
-    let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
-    let session_nonce = random_nonce()?;
-    let session_tag = authenticator.session_auth_tag(session_id, session_nonce);
-    let path_nonce = random_nonce()?;
-    let capabilities = PathCapabilities::default();
-    let path_tag = authenticator.path_join_tag(
-        session_id,
-        path_id,
-        UnderlayProtocol::Udp,
-        path_nonce,
-        capabilities,
-    );
+    let mut session =
+        UdpDatagramClientSession::open(path, security, codec_limits, mux_limits).await?;
+    let response = session.send_to(target, payload, ttl_ms).await?;
+    session.close().await?;
+    Ok(response)
+}
 
-    encrypted
-        .send_frame(&Frame::SessionHello { session_id })
-        .await?;
-    encrypted
-        .send_frame(&Frame::SessionAuth {
-            session_id,
-            nonce: session_nonce,
-            auth_tag: session_tag,
-        })
-        .await?;
-    encrypted
-        .send_frame(&Frame::PathJoin {
+struct UdpDatagramClientSession {
+    encrypted: EncryptedUdpSocket,
+    buffer: Vec<u8>,
+    flows: Vec<UdpDatagramClientFlow>,
+    next_flow_id: u64,
+    mux_limits: MuxLimits,
+}
+
+struct UdpDatagramClientFlow {
+    target: TargetAddr,
+    flow: DatagramFlow,
+    flow_id: DatagramFlowId,
+}
+
+impl UdpDatagramClientSession {
+    async fn open(
+        path: &PathSpec,
+        security: SecurityConfig,
+        codec_limits: CodecLimits,
+        mux_limits: MuxLimits,
+    ) -> Result<Self, RuntimeError> {
+        let socket =
+            udp::connect_path(path, crate::transport::udp::UdpConnectOptions::default()).await?;
+        let mut encrypted = EncryptedUdpSocket::new(
+            socket,
+            security.secret.as_bytes(),
+            PeerRole::Client,
+            codec_limits,
+        );
+        let session_id = random_session_id()?;
+        let path_id = PathId(0);
+        let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
+        let session_nonce = random_nonce()?;
+        let session_tag = authenticator.session_auth_tag(session_id, session_nonce);
+        let path_nonce = random_nonce()?;
+        let capabilities = PathCapabilities::default();
+        let path_tag = authenticator.path_join_tag(
             session_id,
             path_id,
-            underlay: UnderlayProtocol::Udp,
-            nonce: path_nonce,
+            UnderlayProtocol::Udp,
+            path_nonce,
             capabilities,
-            auth_tag: path_tag,
-        })
-        .await?;
+        );
 
-    let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
-    let mut session_ready = false;
-    let mut path_active = false;
-    while !session_ready || !path_active {
-        match encrypted.recv_frame(&mut buffer).await? {
-            Frame::SessionReady => session_ready = true,
-            Frame::PathStatus { .. } => path_active = true,
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-            _ => return Err(RuntimeError::Protocol("unexpected UDP handshake frame")),
+        encrypted
+            .send_frame(&Frame::SessionHello { session_id })
+            .await?;
+        encrypted
+            .send_frame(&Frame::SessionAuth {
+                session_id,
+                nonce: session_nonce,
+                auth_tag: session_tag,
+            })
+            .await?;
+        encrypted
+            .send_frame(&Frame::PathJoin {
+                session_id,
+                path_id,
+                underlay: UnderlayProtocol::Udp,
+                nonce: path_nonce,
+                capabilities,
+                auth_tag: path_tag,
+            })
+            .await?;
+
+        let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
+        let mut session_ready = false;
+        let mut path_active = false;
+        while !session_ready || !path_active {
+            match encrypted.recv_frame(&mut buffer).await? {
+                Frame::SessionReady => session_ready = true,
+                Frame::PathStatus { .. } => path_active = true,
+                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+                _ => return Err(RuntimeError::Protocol("unexpected UDP handshake frame")),
+            }
+        }
+
+        Ok(Self {
+            encrypted,
+            buffer,
+            flows: Vec::new(),
+            next_flow_id: 0,
+            mux_limits,
+        })
+    }
+
+    async fn send_to(
+        &mut self,
+        target: TargetAddr,
+        payload: Bytes,
+        ttl_ms: u32,
+    ) -> Result<Bytes, RuntimeError> {
+        let flow_id = self.ensure_flow(target).await?;
+        let flow = self
+            .flows
+            .iter_mut()
+            .find(|flow| flow.flow_id == flow_id)
+            .ok_or(RuntimeError::Protocol("missing UDP datagram flow"))?;
+        flow.flow.enqueue(0, ttl_ms, payload)?;
+        let frame = self
+            .flows
+            .iter_mut()
+            .find(|flow| flow.flow_id == flow_id)
+            .ok_or(RuntimeError::Protocol("missing UDP datagram flow"))?
+            .flow
+            .pop_frame(0)
+            .ok_or(RuntimeError::Protocol("datagram expired before send"))?;
+        self.encrypted.send_frame(&frame).await?;
+
+        match self.encrypted.recv_frame(&mut self.buffer).await? {
+            Frame::DatagramData {
+                flow_id: response_flow_id,
+                payload,
+                ..
+            } if response_flow_id == flow_id => Ok(payload),
+            Frame::DatagramClose {
+                flow_id: closed_flow_id,
+            } if closed_flow_id == flow_id => Err(RuntimeError::Protocol("datagram flow closed")),
+            Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
+            _ => Err(RuntimeError::Protocol("unexpected UDP datagram frame")),
         }
     }
 
-    let flow_id = DatagramFlowId(0);
-    encrypted
-        .send_frame(&Frame::OpenDatagramFlow {
-            flow_id,
+    async fn ensure_flow(&mut self, target: TargetAddr) -> Result<DatagramFlowId, RuntimeError> {
+        if let Some(flow) = self.flows.iter().find(|flow| flow.target == target) {
+            return Ok(flow.flow_id);
+        }
+        let flow_id = DatagramFlowId(self.next_flow_id);
+        self.next_flow_id = self
+            .next_flow_id
+            .checked_add(1)
+            .ok_or(RuntimeError::Protocol("UDP datagram flow id overflow"))?;
+        self.encrypted
+            .send_frame(&Frame::OpenDatagramFlow {
+                flow_id,
+                target: target.clone(),
+                ingress: IngressKind::TunUdp,
+                outbound: OutboundPolicy::Direct,
+                class: TrafficClass::RealtimeDatagram,
+            })
+            .await?;
+        self.flows.push(UdpDatagramClientFlow {
             target,
-            ingress: IngressKind::TunUdp,
-            outbound: OutboundPolicy::Direct,
-            class: TrafficClass::RealtimeDatagram,
-        })
-        .await?;
-    let mut flow = DatagramFlow::new(flow_id, mux_limits);
-    flow.enqueue(0, ttl_ms, payload)?;
-    let frame = flow
-        .pop_frame(0)
-        .ok_or(RuntimeError::Protocol("datagram expired before send"))?;
-    encrypted.send_frame(&frame).await?;
+            flow: DatagramFlow::new(flow_id, self.mux_limits),
+            flow_id,
+        });
+        Ok(flow_id)
+    }
 
-    match encrypted.recv_frame(&mut buffer).await? {
-        Frame::DatagramData {
-            flow_id: response_flow_id,
-            payload,
-            ..
-        } if response_flow_id == flow_id => Ok(payload),
-        Frame::DatagramClose {
-            flow_id: closed_flow_id,
-        } if closed_flow_id == flow_id => Err(RuntimeError::Protocol("datagram flow closed")),
-        Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
-        _ => Err(RuntimeError::Protocol("unexpected UDP datagram frame")),
+    async fn close(&mut self) -> Result<(), RuntimeError> {
+        for flow in &self.flows {
+            self.encrypted
+                .send_frame(&Frame::DatagramClose {
+                    flow_id: flow.flow_id,
+                })
+                .await?;
+        }
+        self.flows.clear();
+        Ok(())
     }
 }
 
@@ -715,12 +805,25 @@ pub async fn handle_server_udp_datagram_path_once(
     socket: UdpSocket,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
-    handle_server_udp_datagram_path_once_inner(socket, context).await
+    handle_server_udp_datagram_path(socket, context, Some(1)).await
 }
 
-async fn handle_server_udp_datagram_path_once_inner(
+pub async fn handle_server_udp_datagram_path_session(
     socket: UdpSocket,
     context: ServerPathContext,
+) -> Result<(), RuntimeError> {
+    handle_server_udp_datagram_path(socket, context, None).await
+}
+
+struct ServerUdpDatagramFlow {
+    flow_id: DatagramFlowId,
+    outbound_socket: UdpSocket,
+}
+
+async fn handle_server_udp_datagram_path(
+    socket: UdpSocket,
+    context: ServerPathContext,
+    max_datagrams: Option<usize>,
 ) -> Result<(), RuntimeError> {
     let mut encrypted = EncryptedUdpSocket::new(
         socket,
@@ -778,54 +881,81 @@ async fn handle_server_udp_datagram_path_once_inner(
         )
         .await?;
 
-    let (flow_id, target) =
+    let mut flows: Vec<ServerUdpDatagramFlow> = Vec::new();
+    let mut handled_datagrams = 0usize;
+    loop {
         match recv_udp_frame_from_peer(&mut encrypted, &mut buffer, peer).await? {
             Frame::OpenDatagramFlow {
                 flow_id, target, ..
             } => {
+                if flows.iter().any(|flow| flow.flow_id == flow_id) {
+                    return Err(RuntimeError::Protocol("duplicate UDP datagram flow"));
+                }
                 outbound::validate_target(&target)?;
                 context.outbound.ensure_supports(TargetProtocol::Udp)?;
-                (flow_id, target)
+                let outbound_socket = match outbound::connect_udp(
+                    &context.outbound,
+                    &target,
+                    Duration::from_secs(10),
+                )
+                .await
+                {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        encrypted
+                            .send_frame_to(&Frame::DatagramClose { flow_id }, peer)
+                            .await?;
+                        return Err(RuntimeError::OutboundConnect(err));
+                    }
+                };
+                flows.push(ServerUdpDatagramFlow {
+                    flow_id,
+                    outbound_socket,
+                });
             }
-            _ => return Err(RuntimeError::Protocol("expected OPEN_DGRAM_FLOW")),
-        };
-    let outbound_socket =
-        match outbound::connect_udp(&context.outbound, &target, Duration::from_secs(10)).await {
-            Ok(socket) => socket,
-            Err(err) => {
-                encrypted
-                    .send_frame_to(&Frame::DatagramClose { flow_id }, peer)
-                    .await?;
-                return Err(RuntimeError::OutboundConnect(err));
+            Frame::DatagramData {
+                flow_id,
+                ttl_ms,
+                payload,
+                ..
+            } => {
+                if ttl_ms == 0 {
+                    return Err(RuntimeError::Protocol("expired datagram received"));
+                }
+                let flow = flows
+                    .iter_mut()
+                    .find(|flow| flow.flow_id == flow_id)
+                    .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?;
+                flow.outbound_socket.send(&payload).await?;
+                let mut response = vec![0u8; context.mux_limits.max_payload_bytes.min(64 * 1024)];
+                let len = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    flow.outbound_socket.recv(&mut response),
+                )
+                .await
+                .map_err(|_| RuntimeError::Protocol("UDP outbound response timed out"))??;
+                response.truncate(len);
+                let mut response_flow = DatagramFlow::new(flow_id, context.mux_limits);
+                response_flow.enqueue(0, ttl_ms, Bytes::from(response))?;
+                let frame = response_flow
+                    .pop_frame(0)
+                    .ok_or(RuntimeError::Protocol("UDP response expired before send"))?;
+                encrypted.send_frame_to(&frame, peer).await?;
+                handled_datagrams = handled_datagrams.saturating_add(1);
+                if max_datagrams.is_some_and(|limit| handled_datagrams >= limit) {
+                    return Ok(());
+                }
             }
-        };
-    match recv_udp_frame_from_peer(&mut encrypted, &mut buffer, peer).await? {
-        Frame::DatagramData {
-            flow_id: data_flow_id,
-            ttl_ms,
-            payload,
-            ..
-        } if data_flow_id == flow_id => {
-            if ttl_ms == 0 {
-                return Err(RuntimeError::Protocol("expired datagram received"));
+            Frame::DatagramClose { flow_id } => {
+                flows.retain(|flow| flow.flow_id != flow_id);
+                if flows.is_empty() {
+                    return Ok(());
+                }
             }
-            outbound_socket.send(&payload).await?;
-            let mut response = vec![0u8; context.mux_limits.max_payload_bytes.min(64 * 1024)];
-            let len =
-                tokio::time::timeout(Duration::from_secs(1), outbound_socket.recv(&mut response))
-                    .await
-                    .map_err(|_| RuntimeError::Protocol("UDP outbound response timed out"))??;
-            response.truncate(len);
-            let mut response_flow = DatagramFlow::new(flow_id, context.mux_limits);
-            response_flow.enqueue(0, ttl_ms, Bytes::from(response))?;
-            let frame = response_flow
-                .pop_frame(0)
-                .ok_or(RuntimeError::Protocol("UDP response expired before send"))?;
-            encrypted.send_frame_to(&frame, peer).await?;
+            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+            _ => return Err(RuntimeError::Protocol("unexpected UDP datagram path frame")),
         }
-        _ => return Err(RuntimeError::Protocol("expected DGRAM_DATA")),
     }
-    Ok(())
 }
 
 async fn recv_udp_frame_from_peer(
@@ -1137,13 +1267,21 @@ mod tests {
     }
 
     async fn spawn_udp_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_udp_echo_target_count(1).await
+    }
+
+    async fn spawn_udp_echo_target_count(
+        count: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
         let addr = socket.local_addr().expect("target addr");
         let handle = tokio::spawn(async move {
             let mut buf = [0u8; 16];
-            let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
-            assert_eq!(&buf[..len], b"ping");
-            socket.send_to(b"pong", peer).await.expect("target send");
+            for _ in 0..count {
+                let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
+                assert_eq!(&buf[..len], b"ping");
+                socket.send_to(b"pong", peer).await.expect("target send");
+            }
         });
         (addr, handle)
     }
@@ -1290,10 +1428,10 @@ mod tests {
 
     #[tokio::test]
     async fn socks5_udp_associate_relays_datagram_over_encrypted_udp_path() {
-        let (target_addr, target) = spawn_udp_echo_target().await;
+        let (target_addr, target) = spawn_udp_echo_target_count(2).await;
         let path = reserve_udp_path().await;
         let socket = udp::bind_socket(&path).await.expect("bind udp path");
-        let server = tokio::spawn(handle_server_udp_datagram_path_once(
+        let server = tokio::spawn(handle_server_udp_datagram_path_session(
             socket,
             ServerPathContext {
                 outbound: OutboundConfig::Direct,
@@ -1345,19 +1483,22 @@ mod tests {
             .expect("udp client bind");
         let request =
             socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"ping").expect("udp request");
-        udp_client
-            .send_to(&request, relay_addr)
-            .await
-            .expect("send udp request");
-        let mut response = [0u8; 128];
-        let (len, _) = udp_client
-            .recv_from(&mut response)
-            .await
-            .expect("recv udp response");
-        let (datagram, consumed) = socks5::parse_udp_datagram(&response[..len]).expect("datagram");
-        assert_eq!(consumed, len);
-        assert_eq!(datagram.target, TargetAddr::Ip(target_addr));
-        assert_eq!(datagram.payload, Bytes::from_static(b"pong"));
+        for _ in 0..2 {
+            udp_client
+                .send_to(&request, relay_addr)
+                .await
+                .expect("send udp request");
+            let mut response = [0u8; 128];
+            let (len, _) = udp_client
+                .recv_from(&mut response)
+                .await
+                .expect("recv udp response");
+            let (datagram, consumed) =
+                socks5::parse_udp_datagram(&response[..len]).expect("datagram");
+            assert_eq!(consumed, len);
+            assert_eq!(datagram.target, TargetAddr::Ip(target_addr));
+            assert_eq!(datagram.payload, Bytes::from_static(b"pong"));
+        }
         control_client.shutdown().await.expect("control shutdown");
 
         handler.await.expect("handler join").expect("handler");

@@ -1,6 +1,6 @@
 # mptunnel
 
-`mptunnel` is an early Rust application scaffold for multipath proxy and tunnel experiments.
+`mptunnel` is a Rust application for encrypted multipath proxy transport.
 
 ## Build
 
@@ -87,6 +87,10 @@ Common environment variables:
 
 ## Current Runtime Scope
 
-The current runtime supports a first encrypted TCP-underlay path for local SOCKS5 TCP CONNECT and HTTP CONNECT ingress. The remote side can connect TCP targets directly, bind a source IP for direct TCP, or create an upstream TCP tunnel through SOCKS5 CONNECT or HTTP CONNECT.
+The current runtime exposes local SOCKS5 and HTTP CONNECT ingress.
 
-Encrypted UDP-underlay datagram framing is implemented at the transport layer. SOCKS5 UDP ASSOCIATE ingress uses one authenticated encrypted UDP path session per local association, opens compact datagram flows per target, and relays repeated datagrams to direct UDP targets without repeating target metadata on every internal packet. Server runtime binds configured TCP and UDP paths; UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks. Upstream SOCKS5 UDP ASSOCIATE, HTTP CONNECT-UDP, multipath scheduling execution, and TUN-L4 runtime are still under active development.
+TCP ingress uses an encrypted TCP-underlay path and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT.
+
+SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
+
+UDP targets can be reached through direct UDP, bind-source-IP direct UDP, or upstream SOCKS5 UDP ASSOCIATE. Plain HTTP CONNECT outbound is TCP-only.

@@ -554,10 +554,6 @@ fn encode_outbound(
             put_u8(out, 3);
             encode_socket_addr(out, proxy, limits)?;
         }
-        OutboundPolicy::ConnectUdp { proxy } => {
-            put_u8(out, 4);
-            encode_socket_addr(out, proxy, limits)?;
-        }
     }
     Ok(())
 }
@@ -573,9 +569,6 @@ fn decode_outbound(
             proxy: decode_socket_addr(reader, limits)?,
         }),
         3 => Ok(OutboundPolicy::HttpConnect {
-            proxy: decode_socket_addr(reader, limits)?,
-        }),
-        4 => Ok(OutboundPolicy::ConnectUdp {
             proxy: decode_socket_addr(reader, limits)?,
         }),
         _ => Err(CodecError::InvalidEnum),

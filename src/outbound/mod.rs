@@ -1,17 +1,18 @@
 pub mod http_connect;
 pub mod socks5;
 
+use crate::ingress::socks5 as socks5_udp;
 use crate::protocol::TargetAddr;
 use crate::transport::Endpoint;
 use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
 use crate::transport::udp::{self, UdpConnectOptions, UdpTransportError};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 
 const MAX_HTTP_CONNECT_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SOCKS5_UDP_PACKET_BYTES: usize = 65_535;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundConfig {
@@ -19,26 +20,20 @@ pub enum OutboundConfig {
     BindSourceIp(IpAddr),
     Socks5 { proxy: Endpoint },
     HttpConnect { proxy: Endpoint },
-    ConnectUdp { proxy: Endpoint },
 }
 
 impl OutboundConfig {
-    pub fn supports_tcp_targets(&self) -> bool {
-        !matches!(self, Self::ConnectUdp { .. })
-    }
-
     pub fn supports_udp_targets(&self) -> bool {
         matches!(
             self,
-            Self::Direct | Self::BindSourceIp(_) | Self::Socks5 { .. } | Self::ConnectUdp { .. }
+            Self::Direct | Self::BindSourceIp(_) | Self::Socks5 { .. }
         )
     }
 
     pub fn ensure_supports(&self, target_protocol: TargetProtocol) -> Result<(), OutboundError> {
         match target_protocol {
-            TargetProtocol::Tcp if self.supports_tcp_targets() => Ok(()),
+            TargetProtocol::Tcp => Ok(()),
             TargetProtocol::Udp if self.supports_udp_targets() => Ok(()),
-            TargetProtocol::Tcp => Err(OutboundError::TcpNotSupported),
             TargetProtocol::Udp => Err(OutboundError::UdpNotSupported),
         }
     }
@@ -52,21 +47,17 @@ pub enum TargetProtocol {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundError {
-    TcpNotSupported,
     UdpNotSupported,
     DomainTooLong,
     InvalidTargetPort,
-    InvalidProxyPort,
 }
 
 impl std::fmt::Display for OutboundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TcpNotSupported => write!(f, "outbound policy does not support TCP targets"),
             Self::UdpNotSupported => write!(f, "outbound policy does not support UDP targets"),
             Self::DomainTooLong => write!(f, "target domain is too long"),
             Self::InvalidTargetPort => write!(f, "target port must be greater than zero"),
-            Self::InvalidProxyPort => write!(f, "proxy port must be greater than zero"),
         }
     }
 }
@@ -99,7 +90,6 @@ pub async fn connect_tcp(
         OutboundConfig::HttpConnect { proxy } => {
             connect_http_connect_tcp(proxy, target, timeout).await
         }
-        OutboundConfig::ConnectUdp { .. } => Err(OutboundError::TcpNotSupported.into()),
     }
 }
 
@@ -107,19 +97,82 @@ pub async fn connect_udp(
     config: &OutboundConfig,
     target: &TargetAddr,
     timeout: Duration,
-) -> Result<UdpSocket, OutboundConnectError> {
+) -> Result<OutboundUdpSocket, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Udp)?;
     validate_target(target)?;
     match config {
-        OutboundConfig::Direct => connect_direct_udp(target, None, timeout).await,
-        OutboundConfig::BindSourceIp(ip) => connect_direct_udp(target, Some(*ip), timeout).await,
-        OutboundConfig::Socks5 { .. } => Err(OutboundConnectError::UdpProxyNotImplemented(
-            "SOCKS5 UDP ASSOCIATE",
-        )),
+        OutboundConfig::Direct => connect_direct_udp(target, None, timeout)
+            .await
+            .map(OutboundUdpSocket::Direct),
+        OutboundConfig::BindSourceIp(ip) => connect_direct_udp(target, Some(*ip), timeout)
+            .await
+            .map(OutboundUdpSocket::Direct),
+        OutboundConfig::Socks5 { proxy } => connect_socks5_udp(proxy, target, timeout)
+            .await
+            .map(OutboundUdpSocket::Socks5),
         OutboundConfig::HttpConnect { .. } => Err(OutboundError::UdpNotSupported.into()),
-        OutboundConfig::ConnectUdp { .. } => {
-            Err(OutboundConnectError::UdpProxyNotImplemented("CONNECT-UDP"))
+    }
+}
+
+#[derive(Debug)]
+pub enum OutboundUdpSocket {
+    Direct(UdpSocket),
+    Socks5(Socks5UdpAssociation),
+}
+
+impl OutboundUdpSocket {
+    pub async fn send(&mut self, payload: &[u8]) -> Result<usize, OutboundConnectError> {
+        match self {
+            Self::Direct(socket) => Ok(socket.send(payload).await?),
+            Self::Socks5(association) => association.send(payload).await,
         }
+    }
+
+    pub async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, OutboundConnectError> {
+        match self {
+            Self::Direct(socket) => Ok(socket.recv(buffer).await?),
+            Self::Socks5(association) => association.recv(buffer).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Socks5UdpAssociation {
+    _control: TcpStream,
+    relay: UdpSocket,
+    target: TargetAddr,
+    recv_buffer: Vec<u8>,
+}
+
+impl Socks5UdpAssociation {
+    async fn send(&mut self, payload: &[u8]) -> Result<usize, OutboundConnectError> {
+        let packet = socks5_udp::udp_datagram(&self.target, payload)
+            .map_err(OutboundConnectError::Socks5UdpPacket)?;
+        self.relay.send(&packet).await?;
+        Ok(payload.len())
+    }
+
+    async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, OutboundConnectError> {
+        let len = self.relay.recv(&mut self.recv_buffer).await?;
+        let (datagram, consumed) = socks5_udp::parse_udp_datagram(&self.recv_buffer[..len])
+            .map_err(OutboundConnectError::Socks5UdpPacket)?;
+        if consumed != len {
+            return Err(OutboundConnectError::InvalidProxyResponse);
+        }
+        if !socks5_udp_response_target_allowed(&self.target, &datagram.target) {
+            return Err(OutboundConnectError::UdpRelayTargetMismatch {
+                expected: self.target.clone(),
+                actual: datagram.target,
+            });
+        }
+        if datagram.payload.len() > buffer.len() {
+            return Err(OutboundConnectError::UdpReceiveBufferTooSmall {
+                actual: datagram.payload.len(),
+                limit: buffer.len(),
+            });
+        }
+        buffer[..datagram.payload.len()].copy_from_slice(&datagram.payload);
+        Ok(datagram.payload.len())
     }
 }
 
@@ -162,39 +215,52 @@ async fn connect_socks5_tcp(
         },
     )
     .await?;
-    stream.write_all(&socks5::no_auth_greeting()).await?;
-    let mut method = [0u8; 2];
-    stream.read_exact(&mut method).await?;
-    let method = socks5::parse_method_selection(&method)?;
-    if method.method != 0x00 {
-        return Err(OutboundConnectError::ProxyAuthRejected(method.method));
-    }
+    negotiate_socks5_no_auth(&mut stream).await?;
     let request = socks5::connect_request(target)?;
     stream.write_all(&request).await?;
-    let mut prefix = [0u8; 4];
-    stream.read_exact(&mut prefix).await?;
-    if prefix[0] != 0x05 {
-        return Err(OutboundConnectError::InvalidProxyResponse);
+    let reply = read_socks5_reply(&mut stream).await?;
+    if reply.status != 0x00 {
+        return Err(OutboundConnectError::ProxyRejected(reply.status as u16));
     }
-    if prefix[1] != 0x00 {
-        return Err(OutboundConnectError::ProxyRejected(prefix[1] as u16));
-    }
-    if prefix[2] != 0x00 {
-        return Err(OutboundConnectError::InvalidProxyResponse);
-    }
-    let rest_len = match prefix[3] {
-        0x01 => 4 + 2,
-        0x04 => 16 + 2,
-        0x03 => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            len[0] as usize + 2
-        }
-        _ => return Err(OutboundConnectError::InvalidProxyResponse),
-    };
-    let mut rest = vec![0u8; rest_len];
-    stream.read_exact(&mut rest).await?;
     Ok(stream)
+}
+
+async fn connect_socks5_udp(
+    proxy: &Endpoint,
+    target: &TargetAddr,
+    timeout: Duration,
+) -> Result<Socks5UdpAssociation, OutboundConnectError> {
+    let mut control = tcp::connect_endpoint(
+        proxy,
+        TcpConnectOptions {
+            timeout,
+            ..TcpConnectOptions::default()
+        },
+    )
+    .await?;
+    let control_peer = control.peer_addr()?;
+    negotiate_socks5_no_auth(&mut control).await?;
+    let request = socks5::udp_associate_request(socks5_udp_client_endpoint(control.local_addr()?))?;
+    control.write_all(&request).await?;
+    let reply = read_socks5_reply(&mut control).await?;
+    if reply.status != 0x00 {
+        return Err(OutboundConnectError::ProxyRejected(reply.status as u16));
+    }
+    let relay = relay_endpoint_from_socks5_bind(&reply.bind, control_peer)?;
+    let relay = udp::connect_endpoint(
+        &relay,
+        UdpConnectOptions {
+            timeout,
+            ..UdpConnectOptions::default()
+        },
+    )
+    .await?;
+    Ok(Socks5UdpAssociation {
+        _control: control,
+        relay,
+        target: target.clone(),
+        recv_buffer: vec![0u8; MAX_SOCKS5_UDP_PACKET_BYTES],
+    })
 }
 
 async fn connect_http_connect_tcp(
@@ -238,6 +304,87 @@ fn endpoint_from_target(target: &TargetAddr) -> Result<Endpoint, OutboundConnect
     }
 }
 
+async fn negotiate_socks5_no_auth(stream: &mut TcpStream) -> Result<(), OutboundConnectError> {
+    stream.write_all(&socks5::no_auth_greeting()).await?;
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method).await?;
+    let method = socks5::parse_method_selection(&method)?;
+    if method.method != 0x00 {
+        return Err(OutboundConnectError::ProxyAuthRejected(method.method));
+    }
+    Ok(())
+}
+
+async fn read_socks5_reply(
+    stream: &mut TcpStream,
+) -> Result<socks5::Socks5ConnectReply, OutboundConnectError> {
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).await?;
+    if prefix[0] != 0x05 || prefix[2] != 0x00 {
+        return Err(OutboundConnectError::InvalidProxyResponse);
+    }
+    let mut reply = Vec::with_capacity(4 + 255 + 2);
+    reply.extend_from_slice(&prefix);
+    match prefix[3] {
+        0x01 => {
+            reply.resize(4 + 4 + 2, 0);
+            stream.read_exact(&mut reply[4..]).await?;
+        }
+        0x04 => {
+            reply.resize(4 + 16 + 2, 0);
+            stream.read_exact(&mut reply[4..]).await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            reply.push(len[0]);
+            let rest_len = len[0] as usize + 2;
+            let start = reply.len();
+            reply.resize(start + rest_len, 0);
+            stream.read_exact(&mut reply[start..]).await?;
+        }
+        _ => return Err(OutboundConnectError::InvalidProxyResponse),
+    }
+    let parsed = socks5::parse_connect_reply(&reply)?;
+    if parsed.consumed != reply.len() {
+        return Err(OutboundConnectError::InvalidProxyResponse);
+    }
+    Ok(parsed)
+}
+
+fn socks5_udp_client_endpoint(control_local: SocketAddr) -> SocketAddr {
+    let ip = if control_local.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(ip, 0)
+}
+
+fn relay_endpoint_from_socks5_bind(
+    bind: &TargetAddr,
+    control_peer: SocketAddr,
+) -> Result<Endpoint, OutboundConnectError> {
+    match bind {
+        TargetAddr::Domain { host, port } => Ok(Endpoint::new(host.clone(), *port)?),
+        TargetAddr::Ip(addr) => {
+            let ip = if addr.ip().is_unspecified() {
+                control_peer.ip()
+            } else {
+                addr.ip()
+            };
+            Ok(Endpoint::new(ip.to_string(), addr.port())?)
+        }
+    }
+}
+
+fn socks5_udp_response_target_allowed(expected: &TargetAddr, actual: &TargetAddr) -> bool {
+    match expected {
+        TargetAddr::Ip(_) => actual == expected,
+        TargetAddr::Domain { port, .. } => actual.port() == *port,
+    }
+}
+
 #[derive(Debug)]
 pub enum OutboundConnectError {
     Policy(OutboundError),
@@ -249,7 +396,15 @@ pub enum OutboundConnectError {
     HttpConnectClient(http_connect::HttpConnectClientError),
     ProxyAuthRejected(u8),
     ProxyRejected(u16),
-    UdpProxyNotImplemented(&'static str),
+    Socks5UdpPacket(socks5_udp::Socks5Error),
+    UdpRelayTargetMismatch {
+        expected: TargetAddr,
+        actual: TargetAddr,
+    },
+    UdpReceiveBufferTooSmall {
+        actual: usize,
+        limit: usize,
+    },
     InvalidProxyResponse,
 }
 
@@ -311,8 +466,20 @@ impl std::fmt::Display for OutboundConnectError {
             Self::ProxyRejected(status) => {
                 write!(f, "upstream proxy rejected CONNECT with {status}")
             }
-            Self::UdpProxyNotImplemented(mode) => {
-                write!(f, "{mode} outbound UDP runtime is not implemented yet")
+            Self::Socks5UdpPacket(err) => write!(f, "{err}"),
+            Self::UdpRelayTargetMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "SOCKS5 UDP relay returned packet for {}, expected {}",
+                    actual.authority(),
+                    expected.authority()
+                )
+            }
+            Self::UdpReceiveBufferTooSmall { actual, limit } => {
+                write!(
+                    f,
+                    "UDP receive buffer is too small: packet payload is {actual} bytes, buffer is {limit} bytes"
+                )
             }
             Self::InvalidProxyResponse => write!(f, "invalid upstream proxy response"),
         }
@@ -329,9 +496,11 @@ impl std::error::Error for OutboundConnectError {
             Self::Io(err) => Some(err),
             Self::Socks5Client(err) => Some(err),
             Self::HttpConnectClient(err) => Some(err),
+            Self::Socks5UdpPacket(err) => Some(err),
             Self::ProxyAuthRejected(_)
             | Self::ProxyRejected(_)
-            | Self::UdpProxyNotImplemented(_)
+            | Self::UdpRelayTargetMismatch { .. }
+            | Self::UdpReceiveBufferTooSmall { .. }
             | Self::InvalidProxyResponse => None,
         }
     }
@@ -340,6 +509,7 @@ impl std::error::Error for OutboundConnectError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingress::socks5 as ingress_socks5;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
@@ -369,13 +539,6 @@ mod tests {
             }
             .ensure_supports(TargetProtocol::Udp),
             Err(OutboundError::UdpNotSupported)
-        );
-        assert_eq!(
-            OutboundConfig::ConnectUdp {
-                proxy: "127.0.0.1:8443".parse().expect("proxy")
-            }
-            .ensure_supports(TargetProtocol::Tcp),
-            Err(OutboundError::TcpNotSupported)
         );
     }
 
@@ -417,7 +580,7 @@ mod tests {
             target.send_to(b"pong", peer).await.expect("send");
         });
 
-        let socket = connect_udp(
+        let mut socket = connect_udp(
             &OutboundConfig::Direct,
             &TargetAddr::Ip(target_addr),
             Duration::from_secs(1),
@@ -433,33 +596,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_proxy_outbounds_fail_explicitly_until_runtime_is_added() {
-        let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+    async fn socks5_udp_outbound_builds_udp_association() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy: Endpoint = listener
+            .local_addr()
+            .expect("addr")
+            .to_string()
+            .parse()
+            .expect("proxy");
+        let target = TargetAddr::Domain {
+            host: "example.com".to_string(),
+            port: 53,
+        };
+        let expected_target = target.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.expect("greeting");
+            assert_eq!(greeting, socks5::no_auth_greeting());
+            stream.write_all(&[0x05, 0x00]).await.expect("method");
 
-        assert!(matches!(
-            connect_udp(
-                &OutboundConfig::Socks5 {
-                    proxy: "127.0.0.1:1080".parse().expect("proxy"),
-                },
-                &target,
-                Duration::from_secs(1),
-            )
-            .await,
-            Err(OutboundConnectError::UdpProxyNotImplemented(
-                "SOCKS5 UDP ASSOCIATE"
-            ))
-        ));
-        assert!(matches!(
-            connect_udp(
-                &OutboundConfig::ConnectUdp {
-                    proxy: "127.0.0.1:8443".parse().expect("proxy"),
-                },
-                &target,
-                Duration::from_secs(1),
-            )
-            .await,
-            Err(OutboundConnectError::UdpProxyNotImplemented("CONNECT-UDP"))
-        ));
+            let mut request = [0u8; 10];
+            stream.read_exact(&mut request).await.expect("request");
+            assert_eq!(
+                request.as_slice(),
+                socks5::udp_associate_request("0.0.0.0:0".parse().expect("addr"))
+                    .expect("expected request")
+            );
+
+            let relay = UdpSocket::bind("127.0.0.1:0").await.expect("relay bind");
+            let relay_addr = relay.local_addr().expect("relay addr");
+            stream
+                .write_all(&ingress_socks5::connect_reply(
+                    ingress_socks5::Socks5Reply::Succeeded,
+                    relay_addr,
+                ))
+                .await
+                .expect("reply");
+
+            let mut packet = [0u8; 512];
+            let (len, peer) = relay.recv_from(&mut packet).await.expect("relay recv");
+            let (datagram, consumed) =
+                ingress_socks5::parse_udp_datagram(&packet[..len]).expect("udp packet");
+            assert_eq!(consumed, len);
+            assert_eq!(datagram.target, expected_target);
+            assert_eq!(&datagram.payload[..], b"ping");
+
+            let response_target = TargetAddr::Ip("127.0.0.1:53".parse().expect("response target"));
+            let response =
+                ingress_socks5::udp_datagram(&response_target, b"pong").expect("response packet");
+            relay.send_to(&response, peer).await.expect("relay send");
+        });
+
+        let mut socket = connect_udp(
+            &OutboundConfig::Socks5 { proxy },
+            &target,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("connect");
+        socket.send(b"ping").await.expect("send");
+        let mut buf = [0u8; 16];
+        let len = socket.recv(&mut buf).await.expect("recv");
+
+        assert_eq!(&buf[..len], b"pong");
+        server.await.expect("server");
     }
 
     #[tokio::test]

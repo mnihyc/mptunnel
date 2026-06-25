@@ -79,7 +79,6 @@ pub enum OutboundPolicy {
     BindSourceIp(IpAddr),
     Socks5 { proxy: SocketAddr },
     HttpConnect { proxy: SocketAddr },
-    ConnectUdp { proxy: SocketAddr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 use crate::outbound::{OutboundError, validate_target};
 use crate::protocol::TargetAddr;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -84,7 +84,7 @@ fn encode_addr(out: &mut Vec<u8>, target: &TargetAddr) -> Result<(), OutboundErr
     Ok(())
 }
 
-fn parse_addr(input: &[u8]) -> Result<(SocketAddr, usize), Socks5ClientError> {
+fn parse_addr(input: &[u8]) -> Result<(TargetAddr, usize), Socks5ClientError> {
     if input.is_empty() {
         return Err(Socks5ClientError::Incomplete);
     }
@@ -95,10 +95,10 @@ fn parse_addr(input: &[u8]) -> Result<(SocketAddr, usize), Socks5ClientError> {
             }
             let port = u16::from_be_bytes([input[5], input[6]]);
             Ok((
-                SocketAddr::new(
+                TargetAddr::Ip(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(input[1], input[2], input[3], input[4])),
                     port,
-                ),
+                )),
                 7,
             ))
         }
@@ -108,7 +108,37 @@ fn parse_addr(input: &[u8]) -> Result<(SocketAddr, usize), Socks5ClientError> {
             }
             let octets: [u8; 16] = input[1..17].try_into().expect("slice length");
             let port = u16::from_be_bytes([input[17], input[18]]);
-            Ok((SocketAddr::new(IpAddr::V6(octets.into()), port), 19))
+            Ok((
+                TargetAddr::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)),
+                19,
+            ))
+        }
+        ATYP_DOMAIN => {
+            if input.len() < 2 {
+                return Err(Socks5ClientError::Incomplete);
+            }
+            let host_len = input[1] as usize;
+            if host_len == 0 {
+                return Err(Socks5ClientError::InvalidDomain);
+            }
+            let total_len = 2usize
+                .checked_add(host_len)
+                .and_then(|value| value.checked_add(2))
+                .ok_or(Socks5ClientError::MessageTooLong)?;
+            if input.len() < total_len {
+                return Err(Socks5ClientError::Incomplete);
+            }
+            let host = std::str::from_utf8(&input[2..2 + host_len])
+                .map_err(|_| Socks5ClientError::InvalidDomain)?;
+            let port_start = 2 + host_len;
+            let port = u16::from_be_bytes([input[port_start], input[port_start + 1]]);
+            Ok((
+                TargetAddr::Domain {
+                    host: host.to_string(),
+                    port,
+                },
+                total_len,
+            ))
         }
         atyp => Err(Socks5ClientError::UnsupportedAddressType(atyp)),
     }
@@ -119,10 +149,10 @@ pub struct Socks5MethodSelection {
     pub method: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Socks5ConnectReply {
     pub status: u8,
-    pub bind: SocketAddr,
+    pub bind: TargetAddr,
     pub consumed: usize,
 }
 
@@ -132,6 +162,8 @@ pub enum Socks5ClientError {
     UnsupportedVersion(u8),
     UnsupportedAddressType(u8),
     InvalidReservedByte,
+    InvalidDomain,
+    MessageTooLong,
 }
 
 impl std::fmt::Display for Socks5ClientError {
@@ -145,6 +177,8 @@ impl std::fmt::Display for Socks5ClientError {
                 write!(f, "unsupported SOCKS5 address type {atyp}")
             }
             Self::InvalidReservedByte => write!(f, "invalid SOCKS5 reserved byte"),
+            Self::InvalidDomain => write!(f, "invalid SOCKS5 domain"),
+            Self::MessageTooLong => write!(f, "SOCKS5 message is too long"),
         }
     }
 }
@@ -186,7 +220,10 @@ mod tests {
         let reply = parse_connect_reply(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90])
             .expect("reply");
         assert_eq!(reply.status, 0);
-        assert_eq!(reply.bind, "127.0.0.1:8080".parse().expect("addr"));
+        assert_eq!(
+            reply.bind,
+            TargetAddr::Ip("127.0.0.1:8080".parse().expect("addr"))
+        );
         assert_eq!(reply.consumed, 10);
     }
 }

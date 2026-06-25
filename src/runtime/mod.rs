@@ -78,7 +78,6 @@ async fn run_client(
                 });
             }
         }
-        IngressConfig::TunL4(_) => Err(RuntimeError::UnsupportedIngress("tun-l4")),
     }
 }
 
@@ -900,7 +899,7 @@ impl UdpDatagramClientSession {
             .send_frame(&Frame::OpenDatagramFlow {
                 flow_id,
                 target: target.clone(),
-                ingress: IngressKind::TunUdp,
+                ingress: IngressKind::Socks5,
                 outbound: OutboundPolicy::Direct,
                 class: TrafficClass::RealtimeDatagram,
             })
@@ -966,7 +965,7 @@ pub async fn handle_server_udp_datagram_path_session(
 
 struct ServerUdpDatagramFlow {
     flow_id: DatagramFlowId,
-    outbound_socket: UdpSocket,
+    outbound_socket: outbound::OutboundUdpSocket,
 }
 
 struct ServerUdpPathSession {
@@ -1287,7 +1286,6 @@ pub enum RuntimeError {
     PathSpec(PathSpecParseError),
     NoTcpPath,
     NoUdpPath,
-    UnsupportedIngress(&'static str),
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
     Protocol(&'static str),
@@ -1390,9 +1388,6 @@ impl std::fmt::Display for RuntimeError {
             Self::PathSpec(err) => write!(f, "{err}"),
             Self::NoTcpPath => write!(f, "runtime operation requires at least one TCP path"),
             Self::NoUdpPath => write!(f, "runtime operation requires at least one UDP path"),
-            Self::UnsupportedIngress(ingress) => {
-                write!(f, "{ingress} runtime is not implemented yet")
-            }
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
@@ -1419,7 +1414,6 @@ impl std::error::Error for RuntimeError {
             Self::PathSpec(err) => Some(err),
             Self::NoTcpPath
             | Self::NoUdpPath
-            | Self::UnsupportedIngress(_)
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)
             | Self::Protocol(_) => None,
@@ -1431,6 +1425,7 @@ impl std::error::Error for RuntimeError {
 mod tests {
     use super::*;
     use crate::config::SharedSecret;
+    use crate::transport::Endpoint;
     use crate::transport::tcp::bind_listener;
     use tokio::io::duplex;
 
@@ -1491,6 +1486,69 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy: Endpoint = listener
+            .local_addr()
+            .expect("proxy addr")
+            .to_string()
+            .parse()
+            .expect("proxy endpoint");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy accept");
+            let mut greeting = [0u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("proxy greeting");
+            assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream.write_all(&[0x05, 0x00]).await.expect("proxy method");
+
+            let mut request = [0u8; 10];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("udp associate request");
+            assert_eq!(
+                request.as_slice(),
+                crate::outbound::socks5::udp_associate_request(
+                    "0.0.0.0:0".parse().expect("client endpoint")
+                )
+                .expect("expected request")
+            );
+
+            let relay = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp relay bind");
+            let relay_addr = relay.local_addr().expect("relay addr");
+            stream
+                .write_all(&socks5::connect_reply(Socks5Reply::Succeeded, relay_addr))
+                .await
+                .expect("associate reply");
+
+            let mut packet = [0u8; 512];
+            let (len, peer) = relay.recv_from(&mut packet).await.expect("udp relay recv");
+            let (datagram, consumed) =
+                socks5::parse_udp_datagram(&packet[..len]).expect("udp relay packet");
+            assert_eq!(consumed, len);
+            assert_eq!(
+                datagram.target,
+                TargetAddr::Domain {
+                    host: "example.com".to_string(),
+                    port: 53,
+                }
+            );
+            assert_eq!(datagram.payload, Bytes::from_static(b"ping"));
+            let response =
+                socks5::udp_datagram(&datagram.target, b"pong").expect("udp relay response");
+            relay
+                .send_to(&response, peer)
+                .await
+                .expect("udp relay send");
+        });
+        (proxy, handle)
     }
 
     async fn spawn_server_path(
@@ -1617,6 +1675,35 @@ mod tests {
         assert_eq!(response, Bytes::from_static(b"pong"));
         server.await.expect("server join").expect("server");
         target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn encrypted_udp_datagram_path_relays_upstream_socks5_udp_target() {
+        let (proxy, proxy_task) = spawn_socks5_udp_proxy_once().await;
+        let path = reserve_udp_path().await;
+        let socket = udp::bind_socket(&path).await.expect("bind udp path");
+        let server = tokio::spawn(handle_server_udp_datagram_path_session(
+            socket,
+            server_context(OutboundConfig::Socks5 { proxy }),
+        ));
+
+        let response = client_udp_datagram_round_trip(
+            &path,
+            security(),
+            ResourceLimits::default(),
+            TargetAddr::Domain {
+                host: "example.com".to_string(),
+                port: 53,
+            },
+            Bytes::from_static(b"ping"),
+            1000,
+        )
+        .await
+        .expect("round trip");
+
+        assert_eq!(response, Bytes::from_static(b"pong"));
+        server.await.expect("server join").expect("server");
+        proxy_task.await.expect("proxy join");
     }
 
     #[tokio::test]

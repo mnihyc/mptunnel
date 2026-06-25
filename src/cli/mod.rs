@@ -2,7 +2,7 @@ use crate::config::{
     AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig, ServerConfig,
     SharedSecret,
 };
-use crate::ingress::{IngressConfig, IngressConfigError, TunConfig};
+use crate::ingress::IngressConfig;
 use crate::outbound::OutboundConfig;
 use crate::transport::{Endpoint, PathSpec};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -203,12 +203,6 @@ pub struct ClientArgs {
     #[arg(long, env = "MPTUNNEL_LISTEN")]
     pub listen: Option<SocketAddr>,
 
-    #[arg(long, env = "MPTUNNEL_TUN_NAME", default_value = "mtun0")]
-    pub tun_name: String,
-
-    #[arg(long, env = "MPTUNNEL_TUN_MTU", default_value_t = 1280)]
-    pub tun_mtu: u16,
-
     #[arg(
         long = "path",
         env = "MPTUNNEL_PATHS",
@@ -231,7 +225,6 @@ impl ClientArgs {
                     .listen
                     .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
             },
-            IngressArg::TunL4 => IngressConfig::TunL4(TunConfig::new(self.tun_name, self.tun_mtu)?),
         };
         Ok(ClientConfig {
             ingress,
@@ -244,7 +237,6 @@ impl ClientArgs {
 pub enum IngressArg {
     Socks5,
     HttpConnect,
-    TunL4,
 }
 
 #[derive(Debug, Args)]
@@ -288,11 +280,6 @@ impl ServerArgs {
                     .upstream_http
                     .ok_or(CliConfigError::MissingUpstreamHttp)?,
             },
-            OutboundArg::ConnectUdp => OutboundConfig::ConnectUdp {
-                proxy: self
-                    .upstream_http
-                    .ok_or(CliConfigError::MissingUpstreamHttp)?,
-            },
         };
         Ok(ServerConfig {
             bind_paths: self.bind_paths,
@@ -307,14 +294,12 @@ pub enum OutboundArg {
     Bind,
     Socks5,
     HttpConnect,
-    ConnectUdp,
 }
 
 #[derive(Debug)]
 pub enum CliConfigError {
     Config(crate::config::ConfigError),
     Security(crate::config::SecurityPolicyError),
-    Ingress(IngressConfigError),
     PlaintextNotAcknowledged,
     MissingOutboundBindIp,
     MissingUpstreamSocks5,
@@ -333,18 +318,11 @@ impl From<crate::config::SecurityPolicyError> for CliConfigError {
     }
 }
 
-impl From<IngressConfigError> for CliConfigError {
-    fn from(value: IngressConfigError) -> Self {
-        Self::Ingress(value)
-    }
-}
-
 impl std::fmt::Display for CliConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(err) => write!(f, "{err}"),
             Self::Security(err) => write!(f, "{err}"),
-            Self::Ingress(err) => write!(f, "{err}"),
             Self::PlaintextNotAcknowledged => write!(
                 f,
                 "plaintext lab mode requires --i-understand-this-is-insecure"
@@ -355,10 +333,9 @@ impl std::fmt::Display for CliConfigError {
             Self::MissingUpstreamSocks5 => {
                 write!(f, "--outbound socks5 requires --upstream-socks5")
             }
-            Self::MissingUpstreamHttp => write!(
-                f,
-                "--outbound http-connect/connect-udp requires --upstream-http"
-            ),
+            Self::MissingUpstreamHttp => {
+                write!(f, "--outbound http-connect requires --upstream-http")
+            }
         }
     }
 }

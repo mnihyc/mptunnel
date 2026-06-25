@@ -19,6 +19,12 @@ pub const DEFAULT_PATH_PROBE_INTERVAL: Duration =
 pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
 pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
+pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
+    Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS);
+pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS);
 const RELAY_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +92,8 @@ pub struct ResourceLimits {
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
     pub max_tcp_path_inflight_bytes: usize,
+    pub tcp_path_heartbeat_interval: Duration,
+    pub tcp_path_heartbeat_timeout: Duration,
 }
 
 impl Default for ResourceLimits {
@@ -101,6 +109,8 @@ impl Default for ResourceLimits {
             max_reorder_bytes: 16 * 1024 * 1024,
             max_datagram_queue_bytes: 4 * 1024 * 1024,
             max_tcp_path_inflight_bytes: DEFAULT_TCP_PATH_INFLIGHT_BYTES,
+            tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+            tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
         }
     }
 }
@@ -142,6 +152,15 @@ impl ResourceLimits {
         }
         if self.max_tcp_path_inflight_bytes > self.max_repair_bytes {
             return Err(ConfigError::TcpPathInflightLimitExceedsRepairLimit);
+        }
+        if self.tcp_path_heartbeat_interval.is_zero() {
+            return Err(ConfigError::TcpPathHeartbeatIntervalZero);
+        }
+        if self.tcp_path_heartbeat_timeout.is_zero() {
+            return Err(ConfigError::TcpPathHeartbeatTimeoutZero);
+        }
+        if self.tcp_path_heartbeat_timeout < self.tcp_path_heartbeat_interval {
+            return Err(ConfigError::TcpPathHeartbeatTimeoutTooSmall);
         }
         Ok(())
     }
@@ -281,6 +300,9 @@ pub enum ConfigError {
     DatagramQueueLimitTooSmall,
     TcpPathInflightLimitTooSmall,
     TcpPathInflightLimitExceedsRepairLimit,
+    TcpPathHeartbeatIntervalZero,
+    TcpPathHeartbeatTimeoutZero,
+    TcpPathHeartbeatTimeoutTooSmall,
     TooManyPaths { actual: usize, limit: usize },
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
@@ -333,6 +355,18 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "max TCP path inflight bytes must be no greater than max repair bytes"
+                )
+            }
+            Self::TcpPathHeartbeatIntervalZero => {
+                write!(f, "TCP path heartbeat interval must be greater than zero")
+            }
+            Self::TcpPathHeartbeatTimeoutZero => {
+                write!(f, "TCP path heartbeat timeout must be greater than zero")
+            }
+            Self::TcpPathHeartbeatTimeoutTooSmall => {
+                write!(
+                    f,
+                    "TCP path heartbeat timeout must be at least the heartbeat interval"
                 )
             }
             Self::TooManyPaths { actual, limit } => {

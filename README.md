@@ -74,6 +74,8 @@ mptunnel --check-config \
   --max-reorder-bytes 16777216 \
   --max-datagram-queue-bytes 4194304 \
   --max-tcp-path-inflight-bytes 4194304 \
+  --tcp-path-heartbeat-interval-ms 10000 \
+  --tcp-path-heartbeat-timeout-ms 30000 \
   client \
   --path tcp://127.0.0.1:7443
 ```
@@ -106,12 +108,14 @@ Common environment variables:
 - `MPTUNNEL_MAX_REORDER_BYTES`
 - `MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES`
 - `MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES`
+- `MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS`
+- `MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS`
 
 ## Current Runtime Scope
 
 The current runtime exposes local SOCKS5 and HTTP CONNECT ingress.
 
-TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT. When several TCP paths are configured, stream setup classifies each target with the configured TCP traffic policy, then uses scheduler ETA scoring from path hints, current path health, active stream load, and the selected class. It retries the next schedulable path after path-level open failures. Successful opens feed measured latency and live load back into later path choices; finished relays release that load, while failed opens put the path into a short cooldown before probing resumes. The relay caps unacknowledged TCP-underlay stream payload with `--max-tcp-path-inflight-bytes`, so local reads pause until end-to-end tunnel ACKs free budget instead of burying unlimited data in a kernel TCP send buffer. The client also runs bounded authenticated path probes on the configured interval, using `PING`/`PONG` after `PATH_JOIN` so TCP path health can recover without opening remote target connections.
+TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT. When several TCP paths are configured, stream setup classifies each target with the configured TCP traffic policy, then uses scheduler ETA scoring from path hints, current path health, active stream load, and the selected class. It retries the next schedulable path after path-level open failures. Successful opens feed measured latency and live load back into later path choices; finished relays release that load, while failed opens put the path into a short cooldown before probing resumes. The relay caps unacknowledged TCP-underlay stream payload with `--max-tcp-path-inflight-bytes`, so local reads pause until end-to-end tunnel ACKs free budget instead of burying unlimited data in a kernel TCP send buffer. Established TCP relays send encrypted internal `PING`/`PONG` heartbeats using `--tcp-path-heartbeat-interval-ms` and `--tcp-path-heartbeat-timeout-ms`; a heartbeat timeout fails the path, releases live stream load, and lets later scheduling avoid that path until probes recover it. The client also runs bounded authenticated path probes on the configured interval, using `PING`/`PONG` after `PATH_JOIN` so TCP path health can recover without opening remote target connections.
 
 SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. When several UDP paths are configured, UDP session setup uses the same scheduler inputs, adaptive health records, and active association load, then retries after path-level handshake failures. Closed associations release their scheduler load. The same bounded authenticated probe loop exercises UDP path handshakes and `PING`/`PONG` without opening datagram flows. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
 

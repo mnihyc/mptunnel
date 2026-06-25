@@ -1,7 +1,8 @@
 use crate::config::{
     AppConfig, ClientConfig, CommandConfig, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits, SecurityConfig,
-    ServerConfig, SharedSecret, TcpPortClassRule, TrafficPolicy,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits,
+    SecurityConfig, ServerConfig, SharedSecret, TcpPortClassRule, TrafficPolicy,
 };
 use crate::ingress::IngressConfig;
 use crate::outbound::OutboundConfig;
@@ -152,6 +153,22 @@ pub struct ResourceArgs {
         default_value_t = DEFAULT_TCP_PATH_INFLIGHT_BYTES
     )]
     pub max_tcp_path_inflight_bytes: usize,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS",
+        default_value_t = DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS
+    )]
+    pub tcp_path_heartbeat_interval_ms: u64,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS",
+        default_value_t = DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS
+    )]
+    pub tcp_path_heartbeat_timeout_ms: u64,
 }
 
 impl ResourceArgs {
@@ -167,6 +184,8 @@ impl ResourceArgs {
             max_reorder_bytes: self.max_reorder_bytes,
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
             max_tcp_path_inflight_bytes: self.max_tcp_path_inflight_bytes,
+            tcp_path_heartbeat_interval: Duration::from_millis(self.tcp_path_heartbeat_interval_ms),
+            tcp_path_heartbeat_timeout: Duration::from_millis(self.tcp_path_heartbeat_timeout_ms),
         }
     }
 }
@@ -654,6 +673,68 @@ mod tests {
             cli.into_config(),
             Err(CliConfigError::Config(
                 crate::config::ConfigError::TcpPathInflightLimitExceedsRepairLimit
+            ))
+        ));
+    }
+
+    #[test]
+    fn tcp_path_heartbeat_timing_is_validated() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--tcp-path-heartbeat-interval-ms",
+            "0",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TcpPathHeartbeatIntervalZero
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--tcp-path-heartbeat-timeout-ms",
+            "0",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TcpPathHeartbeatTimeoutZero
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--tcp-path-heartbeat-interval-ms",
+            "2000",
+            "--tcp-path-heartbeat-timeout-ms",
+            "1000",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TcpPathHeartbeatTimeoutTooSmall
             ))
         ));
     }

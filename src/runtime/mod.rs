@@ -702,6 +702,9 @@ where
                 .await
             }
             .await;
+            if relay_error_is_tcp_path_failure(&result) {
+                context.mark_tcp_path_failure(path_index);
+            }
             context.release_tcp_path_load(path_index);
             result
         }
@@ -751,6 +754,9 @@ where
         .await
     }
     .await;
+    if relay_error_is_tcp_path_failure(&result) {
+        context.mark_tcp_path_failure(path_index);
+    }
     context.release_tcp_path_load(path_index);
     result
 }
@@ -903,6 +909,17 @@ fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
+    )
+}
+
+fn relay_error_is_tcp_path_failure(result: &Result<(), RuntimeError>) -> bool {
+    matches!(
+        result,
+        Err(RuntimeError::PathHeartbeatTimeout)
+            | Err(RuntimeError::Tcp(_))
+            | Err(RuntimeError::Encrypted(_))
+            | Err(RuntimeError::RemoteClosed(_))
+            | Err(RuntimeError::Protocol(_))
     )
 }
 
@@ -1322,13 +1339,38 @@ where
     let mut buf = vec![0u8; chunk_size];
     let mut local_open = true;
     let mut remote_open = true;
+    let mut next_heartbeat_at =
+        tokio::time::Instant::now() + mux_limits.tcp_path_heartbeat_interval;
+    let mut pending_heartbeat: Option<(u64, tokio::time::Instant)> = None;
 
     loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
             break;
         }
 
+        let heartbeat_at = pending_heartbeat
+            .as_ref()
+            .map(|(_, deadline)| *deadline)
+            .unwrap_or(next_heartbeat_at);
+        let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
+        tokio::pin!(heartbeat_timer);
+
         tokio::select! {
+            _ = &mut heartbeat_timer => {
+                let now = tokio::time::Instant::now();
+                if let Some((_, deadline)) = pending_heartbeat.as_ref()
+                    && now >= *deadline
+                {
+                    return Err(RuntimeError::PathHeartbeatTimeout);
+                }
+                if pending_heartbeat.is_none() && now >= next_heartbeat_at {
+                    let nonce = random_u64()?;
+                    framed.write_frame(&Frame::Ping { nonce }).await?;
+                    framed.flush().await?;
+                    pending_heartbeat =
+                        Some((nonce, now + mux_limits.tcp_path_heartbeat_timeout));
+                }
+            }
             read = async {
                 let read_budget = tcp_relay_read_budget(&send_stream, mux_limits, buf.len());
                 local.read(&mut buf[..read_budget]).await
@@ -1347,7 +1389,7 @@ where
                     framed.flush().await?;
                 }
             }
-            frame = framed.read_frame(), if remote_open || send_stream.repair_bytes() > 0 => {
+            frame = framed.read_frame(), if remote_open || send_stream.repair_bytes() > 0 || pending_heartbeat.is_some() => {
                 match frame? {
                     Frame::StreamData {
                         stream_id: received_stream_id,
@@ -1386,6 +1428,21 @@ where
                         stream_id: reset_stream_id,
                         reason,
                     } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+                    Frame::Ping { nonce } => {
+                        framed.write_frame(&Frame::Pong { nonce }).await?;
+                        framed.flush().await?;
+                    }
+                    Frame::Pong { nonce } => {
+                        let Some((pending_nonce, _)) = pending_heartbeat.as_ref() else {
+                            return Err(RuntimeError::Protocol("unexpected TCP path heartbeat response"));
+                        };
+                        if *pending_nonce != nonce {
+                            return Err(RuntimeError::Protocol("unexpected TCP path heartbeat response"));
+                        }
+                        pending_heartbeat = None;
+                        next_heartbeat_at =
+                            tokio::time::Instant::now() + mux_limits.tcp_path_heartbeat_interval;
+                    }
                     Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
                     _ => return Err(RuntimeError::Protocol("unexpected stream relay frame")),
                 }
@@ -1988,6 +2045,7 @@ pub enum RuntimeError {
     NoSchedulableTcpPath,
     NoSchedulableUdpPath,
     PathIdOverflow,
+    PathHeartbeatTimeout,
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
     Protocol(&'static str),
@@ -2100,6 +2158,7 @@ impl std::fmt::Display for RuntimeError {
                 )
             }
             Self::PathIdOverflow => write!(f, "configured paths exceed protocol path ID space"),
+            Self::PathHeartbeatTimeout => write!(f, "TCP path heartbeat timed out"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
@@ -2129,6 +2188,7 @@ impl std::error::Error for RuntimeError {
             | Self::NoSchedulableTcpPath
             | Self::NoSchedulableUdpPath
             | Self::PathIdOverflow
+            | Self::PathHeartbeatTimeout
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)
             | Self::Protocol(_) => None,
@@ -2289,6 +2349,104 @@ mod tests {
         (path, handle)
     }
 
+    async fn spawn_tcp_relay_heartbeat_blackhole(
+        hold_after_ping: Duration,
+    ) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+        let path = reserve_tcp_path().await;
+        let listener = bind_listener(&path).await.expect("bind");
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let security = security();
+            let mut framed = EncryptedFramedStream::new(
+                stream,
+                security.secret.as_bytes(),
+                PeerRole::Server,
+                CodecLimits::default(),
+            );
+            let session_id = match framed.read_frame().await? {
+                Frame::SessionHello { session_id } => session_id,
+                _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
+            };
+            let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
+            match framed.read_frame().await? {
+                Frame::SessionAuth {
+                    session_id: auth_session_id,
+                    nonce,
+                    auth_tag,
+                } if auth_session_id == session_id
+                    && authenticator.verify_session_auth(session_id, nonce, auth_tag) => {}
+                _ => return Err(RuntimeError::Protocol("invalid SESSION_AUTH")),
+            }
+            let (path_id, capabilities) = match framed.read_frame().await? {
+                Frame::PathJoin {
+                    session_id: join_session_id,
+                    path_id,
+                    underlay,
+                    nonce,
+                    capabilities,
+                    auth_tag,
+                } if join_session_id == session_id
+                    && underlay == UnderlayProtocol::Tcp
+                    && authenticator.verify_path_join(
+                        session_id,
+                        path_id,
+                        underlay,
+                        nonce,
+                        capabilities,
+                        auth_tag,
+                    ) =>
+                {
+                    (path_id, capabilities)
+                }
+                _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
+            };
+            let stream_id = match framed.read_frame().await? {
+                Frame::OpenStream { stream_id, .. } => stream_id,
+                _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+            };
+
+            let resources = ResourceLimits::default();
+            framed.write_frame(&Frame::SessionReady).await?;
+            framed
+                .write_frame(&Frame::PathStatus {
+                    path_id,
+                    status: crate::protocol::PathStatus::Active,
+                    capabilities,
+                })
+                .await?;
+            framed
+                .write_frame(&Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: resources.max_stream_window_bytes,
+                })
+                .await?;
+            framed.flush().await?;
+
+            loop {
+                match framed.read_frame().await? {
+                    Frame::Ping { .. } => {
+                        tokio::time::sleep(hold_after_ping).await;
+                        return Ok(());
+                    }
+                    Frame::StreamAck {
+                        stream_id: ack_stream_id,
+                        ..
+                    }
+                    | Frame::StreamData {
+                        stream_id: ack_stream_id,
+                        ..
+                    }
+                    | Frame::StreamFin {
+                        stream_id: ack_stream_id,
+                    } if ack_stream_id == stream_id => {}
+                    Frame::SessionClose { .. } => return Ok(()),
+                    _ => return Err(RuntimeError::Protocol("unexpected heartbeat test frame")),
+                }
+            }
+        });
+        (path, handle)
+    }
+
     async fn spawn_notified_server_path(
         path: PathSpec,
         marker: u8,
@@ -2320,6 +2478,8 @@ mod tests {
             max_reorder_bytes: 1024 * 1024,
             max_datagram_queue_bytes: 1024 * 1024,
             max_tcp_path_inflight_bytes: 32 * 1024,
+            tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+            tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
         };
         let mut send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
 
@@ -2595,6 +2755,60 @@ mod tests {
             .expect("server join")
             .expect("server path");
         target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn tcp_relay_heartbeat_timeout_marks_path_failed_and_releases_load() {
+        let (path, server_path) =
+            spawn_tcp_relay_heartbeat_blackhole(Duration::from_millis(100)).await;
+        let resources = ResourceLimits {
+            tcp_path_heartbeat_interval: Duration::from_millis(10),
+            tcp_path_heartbeat_timeout: Duration::from_millis(30),
+            ..ResourceLimits::default()
+        };
+        let context = ClientPathContext::new(vec![path], security(), resources).expect("ctx");
+        let health_context = context.clone();
+        let (mut client, server) = duplex(4096);
+        let handler = tokio::spawn(handle_socks5_client_stream(server, context));
+
+        client
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("auth request");
+        let mut auth_response = [0u8; 2];
+        client
+            .read_exact(&mut auth_response)
+            .await
+            .expect("auth response");
+        assert_eq!(auth_response, [0x05, 0x00]);
+
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 203, 0, 113, 1, 0x01, 0xbb])
+            .await
+            .expect("connect");
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.expect("reply");
+        assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+
+        let err = tokio::time::timeout(Duration::from_secs(2), handler)
+            .await
+            .expect("handler timeout")
+            .expect("handler join")
+            .expect_err("heartbeat timeout");
+        assert!(matches!(err, RuntimeError::PathHeartbeatTimeout));
+
+        {
+            let health = health_context.health.lock().expect("health lock");
+            assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
+            assert_eq!(health.tcp[0].consecutive_failures, 1);
+            assert_eq!(health.tcp[0].active_flows, 0);
+            assert_eq!(health.tcp[0].load_bytes, 0);
+        }
+
+        server_path
+            .await
+            .expect("server join")
+            .expect("heartbeat test server");
     }
 
     #[tokio::test]

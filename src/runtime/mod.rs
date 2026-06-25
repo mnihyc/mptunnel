@@ -1,4 +1,6 @@
-use crate::config::{AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig};
+use crate::config::{
+    AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig, TrafficPolicy,
+};
 use crate::ingress::IngressConfig;
 use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
@@ -60,7 +62,12 @@ async fn run_client(
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
-    let context = ClientPathContext::new(client.paths, security, resources)?;
+    let context = ClientPathContext::new_with_policy(
+        client.paths,
+        client.traffic_policy,
+        security,
+        resources,
+    )?;
     match client.ingress {
         IngressConfig::Socks5 { listen } => {
             let listener = TcpListener::bind(listen).await?;
@@ -299,6 +306,7 @@ pub struct ClientPathContext {
     tcp_paths: Arc<Vec<PathSpec>>,
     udp_paths: Arc<Vec<PathSpec>>,
     health: Arc<Mutex<ClientPathHealth>>,
+    traffic_policy: TrafficPolicy,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     security: SecurityConfig,
@@ -392,6 +400,15 @@ impl ClientPathContext {
         security: SecurityConfig,
         resources: ResourceLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_policy(paths, TrafficPolicy::default(), security, resources)
+    }
+
+    pub fn new_with_policy(
+        paths: Vec<PathSpec>,
+        traffic_policy: TrafficPolicy,
+        security: SecurityConfig,
+        resources: ResourceLimits,
+    ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
@@ -412,10 +429,15 @@ impl ClientPathContext {
             tcp_paths: Arc::new(tcp_paths),
             udp_paths: Arc::new(udp_paths),
             health: Arc::new(Mutex::new(health)),
+            traffic_policy,
             codec_limits: resources.into(),
             mux_limits: resources.into(),
             security,
         })
+    }
+
+    fn classify_tcp_target(&self, target: &TargetAddr) -> TrafficClass {
+        self.traffic_policy.classify_tcp_target(target)
     }
 
     fn ordered_tcp_path_indices(&self, class: TrafficClass, payload_bytes: usize) -> Vec<usize> {
@@ -641,11 +663,12 @@ where
     let request = read_socks5_command(&mut stream).await?;
     match request.command {
         socks5::Socks5Command::Connect => {
+            let class = context.classify_tcp_target(&request.target);
             let remote = match open_remote_stream(
                 &context,
                 request.target,
                 IngressKind::Socks5,
-                TrafficClass::Interactive,
+                class,
             )
             .await
             {
@@ -703,22 +726,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request = read_http_connect(&mut stream).await?;
-    let remote = match open_remote_stream(
-        &context,
-        request.target,
-        IngressKind::HttpConnect,
-        TrafficClass::Interactive,
-    )
-    .await
-    {
-        Ok(remote) => remote,
-        Err(err) => {
-            stream
-                .write_all(http_connect::error_response(HttpStatus::BadGateway))
-                .await?;
-            return Err(err);
-        }
-    };
+    let class = context.classify_tcp_target(&request.target);
+    let remote =
+        match open_remote_stream(&context, request.target, IngressKind::HttpConnect, class).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                stream
+                    .write_all(http_connect::error_response(HttpStatus::BadGateway))
+                    .await?;
+                return Err(err);
+            }
+        };
     let path_index = remote.path_index;
     let result = async {
         stream.write_all(http_connect::success_response()).await?;
@@ -2103,7 +2121,7 @@ impl std::error::Error for RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SharedSecret;
+    use crate::config::{SharedSecret, TcpPortClassRule, TrafficPolicy};
     use crate::transport::Endpoint;
     use crate::transport::tcp::bind_listener;
     use tokio::io::duplex;
@@ -2574,6 +2592,83 @@ mod tests {
             .expect("low latency server");
         high_latency_server.abort();
         let _ = high_latency_server.await;
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn socks5_ingress_applies_tcp_class_policy_before_scheduling() {
+        let (target_addr, target) = spawn_echo_target().await;
+        let no_bulk_low_latency_path =
+            reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=1000&no-bulk").await;
+        let bulk_allowed_path = reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=100").await;
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
+        let low_latency_server = spawn_notified_server_path(
+            no_bulk_low_latency_path.clone(),
+            0,
+            OutboundConfig::Direct,
+            accepted_tx.clone(),
+        )
+        .await;
+        let bulk_allowed_server = spawn_notified_server_path(
+            bulk_allowed_path.clone(),
+            1,
+            OutboundConfig::Direct,
+            accepted_tx,
+        )
+        .await;
+        let traffic_policy = TrafficPolicy {
+            default_tcp_class: TrafficClass::Interactive,
+            tcp_port_rules: vec![TcpPortClassRule {
+                port: target_addr.port(),
+                class: TrafficClass::Bulk,
+            }],
+        };
+        let context = ClientPathContext::new_with_policy(
+            vec![no_bulk_low_latency_path, bulk_allowed_path],
+            traffic_policy,
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("ctx");
+        let (mut client, server) = duplex(4096);
+        let handler = tokio::spawn(handle_socks5_client_stream(server, context));
+
+        client
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("auth request");
+        let mut auth_response = [0u8; 2];
+        client
+            .read_exact(&mut auth_response)
+            .await
+            .expect("auth response");
+        assert_eq!(auth_response, [0x05, 0x00]);
+        let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+        match target_addr {
+            SocketAddr::V4(addr) => {
+                connect.extend_from_slice(&addr.ip().octets());
+                connect.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            SocketAddr::V6(_) => panic!("expected IPv4 test target"),
+        }
+        client.write_all(&connect).await.expect("connect");
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.expect("reply");
+        assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+        client.write_all(b"ping").await.expect("payload write");
+        client.shutdown().await.expect("client shutdown");
+        let mut payload = [0u8; 4];
+        client.read_exact(&mut payload).await.expect("payload read");
+        assert_eq!(&payload, b"pong");
+
+        assert_eq!(accepted_rx.recv().await, Some(1));
+        handler.await.expect("join").expect("handler");
+        bulk_allowed_server
+            .await
+            .expect("bulk server join")
+            .expect("bulk server");
+        low_latency_server.abort();
+        let _ = low_latency_server.await;
         target.await.expect("target join");
     }
 

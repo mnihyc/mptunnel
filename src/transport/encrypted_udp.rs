@@ -6,6 +6,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 const MAGIC: &[u8; 4] = b"MPTU";
@@ -17,7 +18,7 @@ const DIR_SERVER_TO_CLIENT: u8 = 2;
 const REPLAY_WINDOW_PACKETS: u64 = 1024;
 
 pub struct EncryptedUdpSocket {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     cipher: ChaCha20Poly1305,
     limits: CodecLimits,
     send_direction: u8,
@@ -40,6 +41,15 @@ impl std::fmt::Debug for EncryptedUdpSocket {
 
 impl EncryptedUdpSocket {
     pub fn new(socket: UdpSocket, secret: &[u8], role: PeerRole, limits: CodecLimits) -> Self {
+        Self::from_shared(Arc::new(socket), secret, role, limits)
+    }
+
+    pub fn from_shared(
+        socket: Arc<UdpSocket>,
+        secret: &[u8],
+        role: PeerRole,
+        limits: CodecLimits,
+    ) -> Self {
         let key = derive_key(secret);
         Self {
             socket,
@@ -57,7 +67,10 @@ impl EncryptedUdpSocket {
     }
 
     pub fn into_inner(self) -> UdpSocket {
-        self.socket
+        match Arc::try_unwrap(self.socket) {
+            Ok(socket) => socket,
+            Err(_) => panic!("encrypted UDP socket is still shared"),
+        }
     }
 
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<usize, EncryptedUdpTransportError> {

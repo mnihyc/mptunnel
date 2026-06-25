@@ -19,7 +19,9 @@ use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
 use crate::transport::udp::{self, UdpTransportError};
 use crate::transport::{PathSpec, PathSpecParseError};
 use bytes::Bytes;
+use std::future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -84,14 +86,42 @@ async fn run_server(
     security: SecurityConfig,
     resources: ResourceLimits,
 ) -> Result<(), RuntimeError> {
-    let bind_path = first_tcp_path(&bind_paths)?;
-    let listener = tcp::bind_listener(bind_path).await?;
     let context = ServerPathContext {
         outbound,
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,
     };
+    for path in bind_paths {
+        match path.underlay {
+            UnderlayProtocol::Tcp => {
+                let listener = tcp::bind_listener(&path).await?;
+                let context = context.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_server_tcp_listener(listener, context).await {
+                        eprintln!("warning: TCP server listener failed: {err}");
+                    }
+                });
+            }
+            UnderlayProtocol::Udp => {
+                let socket = udp::bind_socket(&path).await?;
+                let context = context.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = run_server_udp_listener(socket, context).await {
+                        eprintln!("warning: UDP server listener failed: {err}");
+                    }
+                });
+            }
+        }
+    }
+    future::pending::<()>().await;
+    Ok(())
+}
+
+async fn run_server_tcp_listener(
+    listener: TcpListener,
+    context: ServerPathContext,
+) -> Result<(), RuntimeError> {
     loop {
         let (stream, _) = listener.accept().await?;
         let context = context.clone();
@@ -100,6 +130,20 @@ async fn run_server(
                 eprintln!("warning: server path handler failed: {err}");
             }
         });
+    }
+}
+
+async fn run_server_udp_listener(
+    socket: UdpSocket,
+    context: ServerPathContext,
+) -> Result<(), RuntimeError> {
+    let socket = Arc::new(socket);
+    loop {
+        if let Err(err) =
+            handle_server_udp_datagram_shared_path_session(socket.clone(), context.clone()).await
+        {
+            eprintln!("warning: UDP server path session failed: {err}");
+        }
     }
 }
 
@@ -801,18 +845,30 @@ impl UdpDatagramClientSession {
     }
 }
 
-pub async fn handle_server_udp_datagram_path_once(
-    socket: UdpSocket,
-    context: ServerPathContext,
-) -> Result<(), RuntimeError> {
-    handle_server_udp_datagram_path(socket, context, Some(1)).await
-}
-
 pub async fn handle_server_udp_datagram_path_session(
     socket: UdpSocket,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
-    handle_server_udp_datagram_path(socket, context, None).await
+    let encrypted = EncryptedUdpSocket::new(
+        socket,
+        context.security.secret.as_bytes(),
+        PeerRole::Server,
+        context.codec_limits,
+    );
+    handle_server_udp_datagram_path(encrypted, context).await
+}
+
+async fn handle_server_udp_datagram_shared_path_session(
+    socket: Arc<UdpSocket>,
+    context: ServerPathContext,
+) -> Result<(), RuntimeError> {
+    let encrypted = EncryptedUdpSocket::from_shared(
+        socket,
+        context.security.secret.as_bytes(),
+        PeerRole::Server,
+        context.codec_limits,
+    );
+    handle_server_udp_datagram_path(encrypted, context).await
 }
 
 struct ServerUdpDatagramFlow {
@@ -821,16 +877,9 @@ struct ServerUdpDatagramFlow {
 }
 
 async fn handle_server_udp_datagram_path(
-    socket: UdpSocket,
+    mut encrypted: EncryptedUdpSocket,
     context: ServerPathContext,
-    max_datagrams: Option<usize>,
 ) -> Result<(), RuntimeError> {
-    let mut encrypted = EncryptedUdpSocket::new(
-        socket,
-        context.security.secret.as_bytes(),
-        PeerRole::Server,
-        context.codec_limits,
-    );
     let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
     let (session_id, peer) = match encrypted.recv_frame_from(&mut buffer).await? {
         (Frame::SessionHello { session_id }, peer) => (session_id, peer),
@@ -882,7 +931,6 @@ async fn handle_server_udp_datagram_path(
         .await?;
 
     let mut flows: Vec<ServerUdpDatagramFlow> = Vec::new();
-    let mut handled_datagrams = 0usize;
     loop {
         match recv_udp_frame_from_peer(&mut encrypted, &mut buffer, peer).await? {
             Frame::OpenDatagramFlow {
@@ -941,10 +989,6 @@ async fn handle_server_udp_datagram_path(
                     .pop_frame(0)
                     .ok_or(RuntimeError::Protocol("UDP response expired before send"))?;
                 encrypted.send_frame_to(&frame, peer).await?;
-                handled_datagrams = handled_datagrams.saturating_add(1);
-                if max_datagrams.is_some_and(|limit| handled_datagrams >= limit) {
-                    return Ok(());
-                }
             }
             Frame::DatagramClose { flow_id } => {
                 flows.retain(|flow| flow.flow_id != flow_id);
@@ -1400,7 +1444,7 @@ mod tests {
         let (target_addr, target) = spawn_udp_echo_target().await;
         let path = reserve_udp_path().await;
         let socket = udp::bind_socket(&path).await.expect("bind udp path");
-        let server = tokio::spawn(handle_server_udp_datagram_path_once(
+        let server = tokio::spawn(handle_server_udp_datagram_path_session(
             socket,
             ServerPathContext {
                 outbound: OutboundConfig::Direct,
@@ -1423,6 +1467,35 @@ mod tests {
 
         assert_eq!(response, Bytes::from_static(b"pong"));
         server.await.expect("server join").expect("server");
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
+        let (target_addr, target) = spawn_udp_echo_target().await;
+        let path = reserve_udp_path().await;
+        let server = tokio::spawn(run_server(
+            vec![path.clone()],
+            OutboundConfig::Direct,
+            security(),
+            ResourceLimits::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let response = client_udp_datagram_round_trip(
+            &path,
+            security(),
+            ResourceLimits::default(),
+            TargetAddr::Ip(target_addr),
+            Bytes::from_static(b"ping"),
+            1000,
+        )
+        .await
+        .expect("round trip");
+
+        assert_eq!(response, Bytes::from_static(b"pong"));
+        server.abort();
+        let _ = server.await;
         target.await.expect("target join");
     }
 

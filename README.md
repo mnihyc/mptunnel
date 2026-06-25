@@ -18,8 +18,9 @@ mptunnel --check-config client \
   --secret replace-with-shared-secret \
   --ingress socks5 \
   --listen 127.0.0.1:1080 \
-  --path tcp://203.0.113.10:443 \
-  --path udp://203.0.113.10:443
+  --path 'tcp://203.0.113.10:443?srtt-ms=20&rate-mbps=30&low-latency=true' \
+  --path 'tcp://203.0.113.11:443?srtt-ms=180&rate-mbps=300' \
+  --path 'udp://203.0.113.10:443?srtt-ms=20&rate-mbps=30'
 ```
 
 Server-side path listener and direct outbound:
@@ -42,6 +43,14 @@ mptunnel --check-config \
   client \
   --path tcp://127.0.0.1:7443
 ```
+
+Path URI query parameters seed the runtime scheduler before live health observations exist. Supported path hints are:
+
+- `srtt-ms`, `rtt-ms`, `jitter-ms`
+- `rate-bps`, `rate-kbps`, `rate-mbps`, `rate=unknown`, `rate=unlimited`
+- `backup`, `expensive`, `low-latency`, `bulk-allowed`, `bulk`, `no-bulk`, `probe-only`, `no-udp`
+
+Boolean hints accept `true`, `false`, `1`, `0`, `yes`, `no`, `on`, and `off`; bare boolean hints mean `true`.
 
 Global resource limits are configurable and validated before runtime starts:
 
@@ -89,8 +98,8 @@ Common environment variables:
 
 The current runtime exposes local SOCKS5 and HTTP CONNECT ingress.
 
-TCP ingress uses an encrypted TCP-underlay path and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT.
+TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, or upstream HTTP CONNECT. When several TCP paths are configured, stream setup uses scheduler ETA scoring from path hints and current path health, then retries the next schedulable path after path-level open failures.
 
-SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
+SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. When several UDP paths are configured, UDP session setup uses the same scheduler inputs and retries after path-level handshake failures. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
 
 UDP targets can be reached through direct UDP, bind-source-IP direct UDP, or upstream SOCKS5 UDP ASSOCIATE. Plain HTTP CONNECT outbound is TCP-only.

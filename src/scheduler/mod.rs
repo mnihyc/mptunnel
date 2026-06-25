@@ -1,4 +1,4 @@
-use crate::protocol::{PathId, TrafficClass, UnderlayProtocol};
+use crate::protocol::{PathCapabilities, PathId, TrafficClass, UnderlayProtocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathState {
@@ -15,6 +15,7 @@ pub struct PathFlags {
     pub low_latency: bool,
     pub bulk_allowed: bool,
     pub probe_only: bool,
+    pub no_udp: bool,
 }
 
 impl Default for PathFlags {
@@ -25,6 +26,20 @@ impl Default for PathFlags {
             low_latency: false,
             bulk_allowed: true,
             probe_only: false,
+            no_udp: false,
+        }
+    }
+}
+
+impl From<PathCapabilities> for PathFlags {
+    fn from(value: PathCapabilities) -> Self {
+        Self {
+            backup: value.backup,
+            expensive: value.expensive,
+            low_latency: value.low_latency,
+            bulk_allowed: value.bulk_allowed,
+            probe_only: value.probe_only,
+            no_udp: value.no_udp,
         }
     }
 }
@@ -154,6 +169,9 @@ fn path_is_schedulable(path: PathSnapshot, class: TrafficClass) -> bool {
         return false;
     }
     if class == TrafficClass::Bulk && !path.flags.bulk_allowed {
+        return false;
+    }
+    if class == TrafficClass::RealtimeDatagram && path.flags.no_udp {
         return false;
     }
     true

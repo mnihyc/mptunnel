@@ -98,6 +98,9 @@ impl ResourceLimits {
         if self.max_paths == 0 {
             return Err(ConfigError::PathLimitZero);
         }
+        if self.max_paths > u16::MAX as usize {
+            return Err(ConfigError::PathLimitTooLarge);
+        }
         if self.max_streams == 0 {
             return Err(ConfigError::StreamLimitZero);
         }
@@ -186,6 +189,7 @@ pub enum ConfigError {
     PayloadLimitExceedsFrameLimit,
     AckRangeLimitZero,
     PathLimitZero,
+    PathLimitTooLarge,
     StreamLimitZero,
     StreamWindowLimitZero,
     RepairLimitTooSmall,
@@ -211,6 +215,7 @@ impl std::fmt::Display for ConfigError {
             }
             Self::AckRangeLimitZero => write!(f, "max ack ranges must be greater than zero"),
             Self::PathLimitZero => write!(f, "max paths must be greater than zero"),
+            Self::PathLimitTooLarge => write!(f, "max paths must fit in protocol path IDs"),
             Self::StreamLimitZero => write!(f, "max streams must be greater than zero"),
             Self::StreamWindowLimitZero => {
                 write!(f, "max stream window bytes must be greater than zero")

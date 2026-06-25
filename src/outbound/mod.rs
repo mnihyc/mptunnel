@@ -20,13 +20,17 @@ pub enum OutboundConfig {
     BindSourceIp(IpAddr),
     Socks5 { proxy: Endpoint },
     HttpConnect { proxy: Endpoint },
+    HttpConnectUdp { proxy: Endpoint },
 }
 
 impl OutboundConfig {
     pub fn supports_udp_targets(&self) -> bool {
         matches!(
             self,
-            Self::Direct | Self::BindSourceIp(_) | Self::Socks5 { .. }
+            Self::Direct
+                | Self::BindSourceIp(_)
+                | Self::Socks5 { .. }
+                | Self::HttpConnectUdp { .. }
         )
     }
 
@@ -87,7 +91,7 @@ pub async fn connect_tcp(
         OutboundConfig::Direct => connect_direct_tcp(target, None, timeout).await,
         OutboundConfig::BindSourceIp(ip) => connect_direct_tcp(target, Some(*ip), timeout).await,
         OutboundConfig::Socks5 { proxy } => connect_socks5_tcp(proxy, target, timeout).await,
-        OutboundConfig::HttpConnect { proxy } => {
+        OutboundConfig::HttpConnect { proxy } | OutboundConfig::HttpConnectUdp { proxy } => {
             connect_http_connect_tcp(proxy, target, timeout).await
         }
     }
@@ -110,6 +114,11 @@ pub async fn connect_udp(
         OutboundConfig::Socks5 { proxy } => connect_socks5_udp(proxy, target, timeout)
             .await
             .map(OutboundUdpSocket::Socks5),
+        OutboundConfig::HttpConnectUdp { proxy } => {
+            connect_http_connect_udp(proxy, target, timeout)
+                .await
+                .map(OutboundUdpSocket::HttpConnectUdp)
+        }
         OutboundConfig::HttpConnect { .. } => Err(OutboundError::UdpNotSupported.into()),
     }
 }
@@ -118,6 +127,7 @@ pub async fn connect_udp(
 pub enum OutboundUdpSocket {
     Direct(UdpSocket),
     Socks5(Socks5UdpAssociation),
+    HttpConnectUdp(HttpConnectUdpAssociation),
 }
 
 impl OutboundUdpSocket {
@@ -125,6 +135,7 @@ impl OutboundUdpSocket {
         match self {
             Self::Direct(socket) => Ok(socket.send(payload).await?),
             Self::Socks5(association) => association.send(payload).await,
+            Self::HttpConnectUdp(association) => association.send(payload).await,
         }
     }
 
@@ -132,6 +143,7 @@ impl OutboundUdpSocket {
         match self {
             Self::Direct(socket) => Ok(socket.recv(buffer).await?),
             Self::Socks5(association) => association.recv(buffer).await,
+            Self::HttpConnectUdp(association) => association.recv(buffer).await,
         }
     }
 }
@@ -142,6 +154,31 @@ pub struct Socks5UdpAssociation {
     relay: UdpSocket,
     target: TargetAddr,
     recv_buffer: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct HttpConnectUdpAssociation {
+    stream: TcpStream,
+}
+
+impl HttpConnectUdpAssociation {
+    async fn send(&mut self, payload: &[u8]) -> Result<usize, OutboundConnectError> {
+        let capsule = http_connect::datagram_capsule(payload)?;
+        self.stream.write_all(&capsule).await?;
+        Ok(payload.len())
+    }
+
+    async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, OutboundConnectError> {
+        let payload = http_connect::read_datagram_capsule(&mut self.stream).await?;
+        if payload.len() > buffer.len() {
+            return Err(OutboundConnectError::UdpReceiveBufferTooSmall {
+                actual: payload.len(),
+                limit: buffer.len(),
+            });
+        }
+        buffer[..payload.len()].copy_from_slice(&payload);
+        Ok(payload.len())
+    }
 }
 
 impl Socks5UdpAssociation {
@@ -278,6 +315,35 @@ async fn connect_http_connect_tcp(
     .await?;
     let request = http_connect::connect_request(target, None)?;
     stream.write_all(&request).await?;
+    let response = read_http_proxy_response(&mut stream).await?;
+    let response = http_connect::parse_connect_response(&response)?;
+    if response.status != 200 {
+        return Err(OutboundConnectError::ProxyRejected(response.status));
+    }
+    Ok(stream)
+}
+
+async fn connect_http_connect_udp(
+    proxy: &Endpoint,
+    target: &TargetAddr,
+    timeout: Duration,
+) -> Result<HttpConnectUdpAssociation, OutboundConnectError> {
+    let mut stream = tcp::connect_endpoint(
+        proxy,
+        TcpConnectOptions {
+            timeout,
+            ..TcpConnectOptions::default()
+        },
+    )
+    .await?;
+    let request = http_connect::connect_udp_request(proxy, target)?;
+    stream.write_all(&request).await?;
+    let response = read_http_proxy_response(&mut stream).await?;
+    http_connect::parse_connect_udp_response(&response)?;
+    Ok(HttpConnectUdpAssociation { stream })
+}
+
+async fn read_http_proxy_response(stream: &mut TcpStream) -> Result<Vec<u8>, OutboundConnectError> {
     let mut response = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -290,11 +356,7 @@ async fn connect_http_connect_tcp(
             break;
         }
     }
-    let response = http_connect::parse_connect_response(&response)?;
-    if response.status != 200 {
-        return Err(OutboundConnectError::ProxyRejected(response.status));
-    }
-    Ok(stream)
+    Ok(response)
 }
 
 fn endpoint_from_target(target: &TargetAddr) -> Result<Endpoint, OutboundConnectError> {
@@ -540,6 +602,20 @@ mod tests {
             .ensure_supports(TargetProtocol::Udp),
             Err(OutboundError::UdpNotSupported)
         );
+        assert!(
+            OutboundConfig::HttpConnectUdp {
+                proxy: "127.0.0.1:8080".parse().expect("proxy")
+            }
+            .ensure_supports(TargetProtocol::Tcp)
+            .is_ok()
+        );
+        assert!(
+            OutboundConfig::HttpConnectUdp {
+                proxy: "127.0.0.1:8080".parse().expect("proxy")
+            }
+            .ensure_supports(TargetProtocol::Udp)
+            .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -775,6 +851,62 @@ mod tests {
         stream.read_exact(&mut buf).await.expect("payload read");
 
         assert_eq!(&buf, b"pong");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn http_connect_udp_outbound_builds_capsule_tunnel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let proxy: Endpoint = listener
+            .local_addr()
+            .expect("addr")
+            .to_string()
+            .parse()
+            .expect("proxy");
+        let target = TargetAddr::Domain {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let expected_request = http_connect::connect_udp_request(&proxy, &target).expect("request");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await.expect("request byte");
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert_eq!(request, expected_request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n",
+                )
+                .await
+                .expect("reply");
+
+            let payload = http_connect::read_datagram_capsule(&mut stream)
+                .await
+                .expect("capsule");
+            assert_eq!(&payload, b"ping");
+            let response = http_connect::datagram_capsule(b"pong").expect("response");
+            stream.write_all(&response).await.expect("response write");
+        });
+
+        let mut socket = connect_udp(
+            &OutboundConfig::HttpConnectUdp { proxy },
+            &target,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("connect");
+        socket.send(b"ping").await.expect("send");
+        let mut buf = [0u8; 16];
+        let len = socket.recv(&mut buf).await.expect("recv");
+
+        assert_eq!(&buf[..len], b"pong");
         server.await.expect("server");
     }
 }

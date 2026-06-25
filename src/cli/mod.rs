@@ -423,6 +423,11 @@ impl ServerArgs {
                     .upstream_http
                     .ok_or(CliConfigError::MissingUpstreamHttp)?,
             },
+            OutboundArg::HttpConnectUdp => OutboundConfig::HttpConnectUdp {
+                proxy: self
+                    .upstream_http
+                    .ok_or(CliConfigError::MissingUpstreamHttp)?,
+            },
         };
         Ok(ServerConfig {
             bind_paths: self.bind_paths,
@@ -437,6 +442,7 @@ pub enum OutboundArg {
     Bind,
     Socks5,
     HttpConnect,
+    HttpConnectUdp,
 }
 
 #[derive(Debug)]
@@ -477,7 +483,10 @@ impl std::fmt::Display for CliConfigError {
                 write!(f, "--outbound socks5 requires --upstream-socks5")
             }
             Self::MissingUpstreamHttp => {
-                write!(f, "--outbound http-connect requires --upstream-http")
+                write!(
+                    f,
+                    "--outbound http-connect/http-connect-udp requires --upstream-http"
+                )
             }
         }
     }
@@ -581,6 +590,51 @@ mod tests {
             cli.into_config(),
             Err(CliConfigError::MissingUpstreamSocks5)
         ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "server",
+            "--bind-path",
+            "udp://0.0.0.0:443",
+            "--outbound",
+            "http-connect-udp",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::MissingUpstreamHttp)
+        ));
+    }
+
+    #[test]
+    fn server_http_connect_udp_outbound_is_parsed() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "server",
+            "--bind-path",
+            "udp://0.0.0.0:443",
+            "--outbound",
+            "http-connect-udp",
+            "--upstream-http",
+            "127.0.0.1:8080",
+        ])
+        .expect("parse cli");
+        let config = cli.into_config().expect("config");
+
+        let CommandConfig::Server(server) = config.command else {
+            panic!("expected server config");
+        };
+        assert_eq!(
+            server.outbound,
+            OutboundConfig::HttpConnectUdp {
+                proxy: "127.0.0.1:8080".parse().expect("proxy")
+            }
+        );
     }
 
     #[test]

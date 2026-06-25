@@ -1,12 +1,13 @@
 use crate::config::{
-    AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig, ServerConfig,
-    SharedSecret,
+    AppConfig, ClientConfig, CommandConfig, DEFAULT_PATH_PROBE_INTERVAL_MS,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, ResourceLimits, SecurityConfig, ServerConfig, SharedSecret,
 };
 use crate::ingress::IngressConfig;
 use crate::outbound::OutboundConfig;
 use crate::transport::{Endpoint, PathSpec};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(name = "mptunnel")]
@@ -210,6 +211,20 @@ pub struct ClientArgs {
         required = true
     )]
     pub paths: Vec<PathSpec>,
+
+    #[arg(
+        long,
+        env = "MPTUNNEL_PATH_PROBE_INTERVAL_MS",
+        default_value_t = DEFAULT_PATH_PROBE_INTERVAL_MS
+    )]
+    pub path_probe_interval_ms: u64,
+
+    #[arg(
+        long,
+        env = "MPTUNNEL_PATH_PROBE_TIMEOUT_MS",
+        default_value_t = DEFAULT_PATH_PROBE_TIMEOUT_MS
+    )]
+    pub path_probe_timeout_ms: u64,
 }
 
 impl ClientArgs {
@@ -229,6 +244,8 @@ impl ClientArgs {
         Ok(ClientConfig {
             ingress,
             paths: self.paths,
+            path_probe_interval: Duration::from_millis(self.path_probe_interval_ms),
+            path_probe_timeout: Duration::from_millis(self.path_probe_timeout_ms),
         })
     }
 }
@@ -371,6 +388,14 @@ mod tests {
             CommandConfig::Client(client) => {
                 assert_eq!(client.paths.len(), 2);
                 assert!(matches!(client.ingress, IngressConfig::Socks5 { .. }));
+                assert_eq!(
+                    client.path_probe_interval,
+                    crate::config::DEFAULT_PATH_PROBE_INTERVAL
+                );
+                assert_eq!(
+                    client.path_probe_timeout,
+                    crate::config::DEFAULT_PATH_PROBE_TIMEOUT
+                );
             }
             CommandConfig::Server(_) => panic!("expected client config"),
         }
@@ -471,6 +496,47 @@ mod tests {
             cli.into_config(),
             Err(CliConfigError::Config(
                 crate::config::ConfigError::RepairLimitTooSmall
+            ))
+        ));
+    }
+
+    #[test]
+    fn path_probe_timing_is_validated() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--path-probe-interval-ms",
+            "0",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::PathProbeIntervalZero
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--path-probe-timeout-ms",
+            "0",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::PathProbeTimeoutZero
             ))
         ));
     }

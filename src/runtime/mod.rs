@@ -58,10 +58,13 @@ async fn run_client(
     security: SecurityConfig,
     resources: ResourceLimits,
 ) -> Result<(), RuntimeError> {
+    let path_probe_interval = client.path_probe_interval;
+    let path_probe_timeout = client.path_probe_timeout;
     let context = ClientPathContext::new(client.paths, security, resources)?;
     match client.ingress {
         IngressConfig::Socks5 { listen } => {
             let listener = TcpListener::bind(listen).await?;
+            start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
             loop {
                 let (stream, _) = listener.accept().await?;
                 let context = context.clone();
@@ -74,6 +77,7 @@ async fn run_client(
         }
         IngressConfig::HttpConnect { listen } => {
             let listener = TcpListener::bind(listen).await?;
+            start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
             loop {
                 let (stream, _) = listener.accept().await?;
                 let context = context.clone();
@@ -82,6 +86,65 @@ async fn run_client(
                         eprintln!("warning: HTTP CONNECT client handler failed: {err}");
                     }
                 });
+            }
+        }
+    }
+}
+
+fn start_client_path_probes(context: ClientPathContext, interval: Duration, timeout: Duration) {
+    tokio::spawn(async move {
+        run_client_path_probes(context, interval, timeout).await;
+    });
+}
+
+async fn run_client_path_probes(context: ClientPathContext, interval: Duration, timeout: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        probe_client_paths(&context, timeout).await;
+    }
+}
+
+async fn probe_client_paths(context: &ClientPathContext, timeout: Duration) {
+    let mut probes = tokio::task::JoinSet::new();
+    for path_index in 0..context.tcp_paths.len() {
+        let context = context.clone();
+        probes.spawn(async move {
+            (
+                UnderlayProtocol::Tcp,
+                path_index,
+                probe_tcp_client_path(&context, path_index, timeout).await,
+            )
+        });
+    }
+    for path_index in 0..context.udp_paths.len() {
+        let context = context.clone();
+        probes.spawn(async move {
+            (
+                UnderlayProtocol::Udp,
+                path_index,
+                probe_udp_client_path(&context, path_index, timeout).await,
+            )
+        });
+    }
+
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok((UnderlayProtocol::Tcp, path_index, Ok(elapsed))) => {
+                context.mark_tcp_path_probe_success(path_index, elapsed);
+            }
+            Ok((UnderlayProtocol::Tcp, path_index, Err(_))) => {
+                context.mark_tcp_path_failure(path_index);
+            }
+            Ok((UnderlayProtocol::Udp, path_index, Ok(elapsed))) => {
+                context.mark_udp_path_probe_success(path_index, elapsed);
+            }
+            Ok((UnderlayProtocol::Udp, path_index, Err(_))) => {
+                context.mark_udp_path_failure(path_index);
+            }
+            Err(err) => {
+                eprintln!("warning: path probe task failed: {err}");
             }
         }
     }
@@ -294,17 +357,21 @@ impl ClientPathHealthRecord {
         }
     }
 
-    fn mark_open_success(&mut self, elapsed: Duration, load_bytes: u64) {
+    fn mark_success(&mut self, elapsed: Duration) {
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
-        self.active_flows = self.active_flows.saturating_add(1);
-        self.load_bytes = self.load_bytes.saturating_add(load_bytes);
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
         self.measured_srtt_ms = Some(match self.measured_srtt_ms {
             Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
             None => sample_ms,
         });
+    }
+
+    fn mark_open_success(&mut self, elapsed: Duration, load_bytes: u64) {
+        self.mark_success(elapsed);
+        self.active_flows = self.active_flows.saturating_add(1);
+        self.load_bytes = self.load_bytes.saturating_add(load_bytes);
     }
 
     fn release_load(&mut self, load_bytes: u64) {
@@ -380,6 +447,18 @@ impl ClientPathContext {
         }
     }
 
+    fn mark_tcp_path_probe_success(&self, index: usize, elapsed: Duration) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+        {
+            current.mark_success(elapsed);
+        }
+    }
+
     fn release_tcp_path_load(&self, index: usize) {
         if let Some(current) = self
             .health
@@ -413,6 +492,18 @@ impl ClientPathContext {
             .get_mut(index)
         {
             current.mark_open_success(elapsed, UDP_SESSION_LOAD_BYTES);
+        }
+    }
+
+    fn mark_udp_path_probe_success(&self, index: usize, elapsed: Duration) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.mark_success(elapsed);
         }
     }
 
@@ -685,6 +776,38 @@ async fn open_remote_stream(
     Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableTcpPath))
 }
 
+fn authenticated_path_join_frames(
+    security: &SecurityConfig,
+    path: &PathSpec,
+    path_id: PathId,
+    underlay: UnderlayProtocol,
+) -> Result<(Frame, Frame, Frame), RuntimeError> {
+    let session_id = random_session_id()?;
+    let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
+    let session_nonce = random_nonce()?;
+    let session_tag = authenticator.session_auth_tag(session_id, session_nonce);
+    let path_nonce = random_nonce()?;
+    let capabilities = path.metadata.capabilities;
+    let path_tag =
+        authenticator.path_join_tag(session_id, path_id, underlay, path_nonce, capabilities);
+    Ok((
+        Frame::SessionHello { session_id },
+        Frame::SessionAuth {
+            session_id,
+            nonce: session_nonce,
+            auth_tag: session_tag,
+        },
+        Frame::PathJoin {
+            session_id,
+            path_id,
+            underlay,
+            nonce: path_nonce,
+            capabilities,
+            auth_tag: path_tag,
+        },
+    ))
+}
+
 async fn open_remote_stream_on_path(
     context: &ClientPathContext,
     path_index: usize,
@@ -703,41 +826,13 @@ async fn open_remote_stream_on_path(
         PeerRole::Client,
         context.codec_limits,
     );
-    let session_id = random_session_id()?;
     let path_id = PathId(path_index as u16);
-    let authenticator = SessionAuthenticator::new(context.security.secret.as_bytes())?;
-    let session_nonce = random_nonce()?;
-    let session_tag = authenticator.session_auth_tag(session_id, session_nonce);
-    let path_nonce = random_nonce()?;
-    let capabilities = path.metadata.capabilities;
-    let path_tag = authenticator.path_join_tag(
-        session_id,
-        path_id,
-        UnderlayProtocol::Tcp,
-        path_nonce,
-        capabilities,
-    );
+    let (session_hello, session_auth, path_join) =
+        authenticated_path_join_frames(&context.security, path, path_id, UnderlayProtocol::Tcp)?;
 
-    framed
-        .write_frame(&Frame::SessionHello { session_id })
-        .await?;
-    framed
-        .write_frame(&Frame::SessionAuth {
-            session_id,
-            nonce: session_nonce,
-            auth_tag: session_tag,
-        })
-        .await?;
-    framed
-        .write_frame(&Frame::PathJoin {
-            session_id,
-            path_id,
-            underlay: UnderlayProtocol::Tcp,
-            nonce: path_nonce,
-            capabilities,
-            auth_tag: path_tag,
-        })
-        .await?;
+    framed.write_frame(&session_hello).await?;
+    framed.write_frame(&session_auth).await?;
+    framed.write_frame(&path_join).await?;
     let stream_id = StreamId(0);
     framed
         .write_frame(&Frame::OpenStream {
@@ -923,6 +1018,7 @@ async fn open_udp_datagram_session(
             context.security.clone(),
             context.codec_limits,
             context.mux_limits,
+            UDP_PATH_HANDSHAKE_TIMEOUT,
         )
         .await
         {
@@ -950,6 +1046,112 @@ fn udp_open_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
     )
+}
+
+async fn probe_tcp_client_path(
+    context: &ClientPathContext,
+    path_index: usize,
+    timeout: Duration,
+) -> Result<Duration, RuntimeError> {
+    let path = context
+        .tcp_paths
+        .get(path_index)
+        .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+    let started_at = Instant::now();
+    tokio::time::timeout(timeout, async {
+        let tcp_stream = tcp::connect_path(
+            path,
+            TcpConnectOptions {
+                timeout,
+                ..TcpConnectOptions::default()
+            },
+        )
+        .await?;
+        let mut framed = EncryptedFramedStream::new(
+            tcp_stream,
+            context.security.secret.as_bytes(),
+            PeerRole::Client,
+            context.codec_limits,
+        );
+        let path_id = PathId(path_index as u16);
+        let (session_hello, session_auth, path_join) = authenticated_path_join_frames(
+            &context.security,
+            path,
+            path_id,
+            UnderlayProtocol::Tcp,
+        )?;
+        let nonce = random_u64()?;
+
+        framed.write_frame(&session_hello).await?;
+        framed.write_frame(&session_auth).await?;
+        framed.write_frame(&path_join).await?;
+        framed.write_frame(&Frame::Ping { nonce }).await?;
+        framed.flush().await?;
+
+        let mut session_ready = false;
+        let mut path_active = false;
+        let mut pong_received = false;
+        while !session_ready || !path_active || !pong_received {
+            match framed.read_frame().await? {
+                Frame::SessionReady => session_ready = true,
+                Frame::PathStatus {
+                    status: crate::protocol::PathStatus::Active,
+                    ..
+                } => path_active = true,
+                Frame::PathStatus { .. } => {
+                    return Err(RuntimeError::Protocol(
+                        "TCP path probe did not return active path status",
+                    ));
+                }
+                Frame::Pong {
+                    nonce: received_nonce,
+                } if received_nonce == nonce => pong_received = true,
+                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+                _ => return Err(RuntimeError::Protocol("unexpected TCP path probe frame")),
+            }
+        }
+
+        framed
+            .write_frame(&Frame::SessionClose {
+                reason: CloseReason::Normal,
+            })
+            .await?;
+        framed.flush().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| RuntimeError::Protocol("TCP path probe timed out"))??;
+    Ok(started_at.elapsed())
+}
+
+async fn probe_udp_client_path(
+    context: &ClientPathContext,
+    path_index: usize,
+    timeout: Duration,
+) -> Result<Duration, RuntimeError> {
+    let path = context
+        .udp_paths
+        .get(path_index)
+        .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+    let started_at = Instant::now();
+    tokio::time::timeout(timeout, async {
+        let mut session = UdpDatagramClientSession::open(
+            path,
+            path_index,
+            PathId(path_index as u16),
+            context.security.clone(),
+            context.codec_limits,
+            context.mux_limits,
+            timeout,
+        )
+        .await?;
+        session.ping(timeout).await?;
+        session.close_session().await?;
+        Ok::<(), RuntimeError>(())
+    })
+    .await
+    .map_err(|_| RuntimeError::Protocol("UDP path probe timed out"))??;
+    Ok(started_at.elapsed())
 }
 
 async fn handle_server_path(
@@ -1007,7 +1209,11 @@ async fn handle_server_path(
             context.outbound.ensure_supports(TargetProtocol::Tcp)?;
             (stream_id, target)
         }
-        _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+        Frame::Ping { nonce } => {
+            return handle_server_tcp_probe(framed, path_id, path_capabilities, nonce).await;
+        }
+        Frame::SessionClose { .. } => return Ok(()),
+        _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM or PING")),
     };
     let outbound_stream =
         match outbound::connect_tcp(&context.outbound, &target, Duration::from_secs(10)).await {
@@ -1046,6 +1252,39 @@ async fn handle_server_path(
         context.mux_limits.max_stream_window_bytes,
     )
     .await
+}
+
+async fn handle_server_tcp_probe(
+    mut framed: EncryptedFramedStream<TcpStream>,
+    path_id: PathId,
+    path_capabilities: crate::protocol::PathCapabilities,
+    nonce: u64,
+) -> Result<(), RuntimeError> {
+    framed.write_frame(&Frame::SessionReady).await?;
+    framed
+        .write_frame(&Frame::PathStatus {
+            path_id,
+            status: crate::protocol::PathStatus::Active,
+            capabilities: path_capabilities,
+        })
+        .await?;
+    framed.write_frame(&Frame::Pong { nonce }).await?;
+    framed.flush().await?;
+
+    loop {
+        match framed.read_frame().await? {
+            Frame::Ping { nonce } => {
+                framed.write_frame(&Frame::Pong { nonce }).await?;
+                framed.flush().await?;
+            }
+            Frame::SessionClose { .. } => return Ok(()),
+            Frame::PathClose {
+                path_id: close_path_id,
+                ..
+            } if close_path_id == path_id => return Ok(()),
+            _ => return Err(RuntimeError::Protocol("unexpected TCP path probe frame")),
+        }
+    }
 }
 
 async fn relay_tcp_stream<S>(
@@ -1166,9 +1405,16 @@ async fn client_udp_datagram_round_trip_with_limits(
     payload: Bytes,
     ttl_ms: u32,
 ) -> Result<Bytes, RuntimeError> {
-    let mut session =
-        UdpDatagramClientSession::open(path, 0, PathId(0), security, codec_limits, mux_limits)
-            .await?;
+    let mut session = UdpDatagramClientSession::open(
+        path,
+        0,
+        PathId(0),
+        security,
+        codec_limits,
+        mux_limits,
+        UDP_PATH_HANDSHAKE_TIMEOUT,
+    )
+    .await?;
     let response = session.send_to(target, payload, ttl_ms).await?;
     session.close().await?;
     Ok(response)
@@ -1197,60 +1443,36 @@ impl UdpDatagramClientSession {
         security: SecurityConfig,
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
+        handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
-        let socket =
-            udp::connect_path(path, crate::transport::udp::UdpConnectOptions::default()).await?;
+        let socket = udp::connect_path(
+            path,
+            crate::transport::udp::UdpConnectOptions {
+                timeout: handshake_timeout,
+                ..crate::transport::udp::UdpConnectOptions::default()
+            },
+        )
+        .await?;
         let mut encrypted = EncryptedUdpSocket::new(
             socket,
             security.secret.as_bytes(),
             PeerRole::Client,
             codec_limits,
         );
-        let session_id = random_session_id()?;
-        let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
-        let session_nonce = random_nonce()?;
-        let session_tag = authenticator.session_auth_tag(session_id, session_nonce);
-        let path_nonce = random_nonce()?;
-        let capabilities = path.metadata.capabilities;
-        let path_tag = authenticator.path_join_tag(
-            session_id,
-            path_id,
-            UnderlayProtocol::Udp,
-            path_nonce,
-            capabilities,
-        );
+        let (session_hello, session_auth, path_join) =
+            authenticated_path_join_frames(&security, path, path_id, UnderlayProtocol::Udp)?;
 
-        encrypted
-            .send_frame(&Frame::SessionHello { session_id })
-            .await?;
-        encrypted
-            .send_frame(&Frame::SessionAuth {
-                session_id,
-                nonce: session_nonce,
-                auth_tag: session_tag,
-            })
-            .await?;
-        encrypted
-            .send_frame(&Frame::PathJoin {
-                session_id,
-                path_id,
-                underlay: UnderlayProtocol::Udp,
-                nonce: path_nonce,
-                capabilities,
-                auth_tag: path_tag,
-            })
-            .await?;
+        encrypted.send_frame(&session_hello).await?;
+        encrypted.send_frame(&session_auth).await?;
+        encrypted.send_frame(&path_join).await?;
 
         let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
         let mut session_ready = false;
         let mut path_active = false;
         while !session_ready || !path_active {
-            match tokio::time::timeout(
-                UDP_PATH_HANDSHAKE_TIMEOUT,
-                encrypted.recv_frame(&mut buffer),
-            )
-            .await
-            .map_err(|_| RuntimeError::Protocol("UDP path handshake timed out"))??
+            match tokio::time::timeout(handshake_timeout, encrypted.recv_frame(&mut buffer))
+                .await
+                .map_err(|_| RuntimeError::Protocol("UDP path handshake timed out"))??
             {
                 Frame::SessionReady => session_ready = true,
                 Frame::PathStatus { .. } => path_active = true,
@@ -1341,6 +1563,30 @@ impl UdpDatagramClientSession {
                 .await?;
         }
         self.flows.clear();
+        Ok(())
+    }
+
+    async fn ping(&mut self, probe_timeout: Duration) -> Result<(), RuntimeError> {
+        let nonce = random_u64()?;
+        self.encrypted.send_frame(&Frame::Ping { nonce }).await?;
+        match tokio::time::timeout(probe_timeout, self.encrypted.recv_frame(&mut self.buffer))
+            .await
+            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??
+        {
+            Frame::Pong {
+                nonce: received_nonce,
+            } if received_nonce == nonce => Ok(()),
+            Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
+            _ => Err(RuntimeError::Protocol("unexpected UDP path probe frame")),
+        }
+    }
+
+    async fn close_session(&mut self) -> Result<(), RuntimeError> {
+        self.encrypted
+            .send_frame(&Frame::SessionClose {
+                reason: CloseReason::Normal,
+            })
+            .await?;
         Ok(())
     }
 }
@@ -1497,6 +1743,12 @@ impl ServerUdpPathSession {
                     )
                     .await?;
                 self.state = ServerUdpPathState::Established;
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (ServerUdpPathState::Established, Frame::Ping { nonce }) => {
+                self.encrypted
+                    .send_frame_to(&Frame::Pong { nonce }, self.peer)
+                    .await?;
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
@@ -1664,9 +1916,13 @@ where
 }
 
 fn random_session_id() -> Result<SessionId, RuntimeError> {
+    Ok(SessionId(random_u64()?))
+}
+
+fn random_u64() -> Result<u64, RuntimeError> {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).map_err(RuntimeError::Random)?;
-    Ok(SessionId(u64::from_be_bytes(bytes)))
+    Ok(u64::from_be_bytes(bytes))
 }
 
 fn random_nonce() -> Result<AuthNonce, RuntimeError> {
@@ -2145,6 +2401,63 @@ mod tests {
         let health = context.health.lock().expect("health lock");
         assert_eq!(health.udp[0].active_flows, 0);
         assert_eq!(health.udp[0].load_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn path_probe_refreshes_tcp_health_without_stream_load() {
+        let (path, server) = spawn_server_path(OutboundConfig::Direct).await;
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+
+        probe_client_paths(&context, Duration::from_secs(1)).await;
+
+        server.await.expect("server join").expect("server probe");
+        let health = context.health.lock().expect("health lock");
+        assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
+        assert!(health.tcp[0].measured_srtt_ms.is_some());
+        assert_eq!(health.tcp[0].active_flows, 0);
+        assert_eq!(health.tcp[0].load_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn path_probe_refreshes_udp_health_without_association_load() {
+        let path = reserve_udp_path().await;
+        let socket = udp::bind_socket(&path).await.expect("bind udp path");
+        let server = tokio::spawn(handle_server_udp_datagram_path_session(
+            socket,
+            server_context(OutboundConfig::Direct),
+        ));
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+
+        probe_client_paths(&context, Duration::from_secs(1)).await;
+
+        server.await.expect("server join").expect("server probe");
+        let health = context.health.lock().expect("health lock");
+        assert_eq!(health.udp[0].state, SchedulerPathState::Active);
+        assert!(health.udp[0].measured_srtt_ms.is_some());
+        assert_eq!(health.udp[0].active_flows, 0);
+        assert_eq!(health.udp[0].load_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn path_probe_failure_suppresses_unreachable_tcp_path() {
+        let path = reserve_tcp_path().await;
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+
+        probe_client_paths(&context, Duration::from_millis(50)).await;
+
+        let health = context.health.lock().expect("health lock");
+        assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
+        assert_eq!(health.tcp[0].consecutive_failures, 1);
+        assert!(health.tcp[0].failed_until.is_some());
+        drop(health);
+        assert!(
+            context
+                .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+                .is_empty()
+        );
     }
 
     #[tokio::test]

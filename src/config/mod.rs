@@ -8,6 +8,14 @@ use security::validate_transport_security;
 pub use security::{
     EncryptionMode, SecurityPolicyError, SharedSecret, TransportIntegrity, TransportSecurity,
 };
+use std::time::Duration;
+
+pub const DEFAULT_PATH_PROBE_INTERVAL_MS: u64 = 10_000;
+pub const DEFAULT_PATH_PROBE_TIMEOUT_MS: u64 = 2_000;
+pub const DEFAULT_PATH_PROBE_INTERVAL: Duration =
+    Duration::from_millis(DEFAULT_PATH_PROBE_INTERVAL_MS);
+pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -37,6 +45,12 @@ impl AppConfig {
                         actual: client.paths.len(),
                         limit: self.resources.max_paths,
                     });
+                }
+                if client.path_probe_interval.is_zero() {
+                    return Err(ConfigError::PathProbeIntervalZero);
+                }
+                if client.path_probe_timeout.is_zero() {
+                    return Err(ConfigError::PathProbeTimeoutZero);
                 }
             }
             CommandConfig::Server(server) => {
@@ -173,6 +187,8 @@ pub enum CommandConfig {
 pub struct ClientConfig {
     pub ingress: IngressConfig,
     pub paths: Vec<PathSpec>,
+    pub path_probe_interval: Duration,
+    pub path_probe_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +212,8 @@ pub enum ConfigError {
     ReorderLimitTooSmall,
     DatagramQueueLimitTooSmall,
     TooManyPaths { actual: usize, limit: usize },
+    PathProbeIntervalZero,
+    PathProbeTimeoutZero,
 }
 
 impl From<SecurityPolicyError> for ConfigError {
@@ -234,6 +252,12 @@ impl std::fmt::Display for ConfigError {
             }
             Self::TooManyPaths { actual, limit } => {
                 write!(f, "{actual} paths configured, limit is {limit}")
+            }
+            Self::PathProbeIntervalZero => {
+                write!(f, "path probe interval must be greater than zero")
+            }
+            Self::PathProbeTimeoutZero => {
+                write!(f, "path probe timeout must be greater than zero")
             }
         }
     }

@@ -79,6 +79,11 @@ def tcp_rows(by_case):
                     default=None,
                 ),
                 "median_time": median([record.get("time_s") for record in ok]),
+                "median_recovery_gap": median([record.get("recovery_gap_s") for record in ok]),
+                "max_recovery_gap": max(
+                    [record.get("recovery_gap_s") for record in ok if isinstance(record.get("recovery_gap_s"), (int, float))],
+                    default=None,
+                ),
             }
         )
     return rows
@@ -186,6 +191,7 @@ def source_comparisons(records):
                 ),
                 "failover_status": failover.get("status") if failover else None,
                 "failover_time": failover.get("time_s") if failover else None,
+                "failover_recovery_gap": failover.get("recovery_gap_s") if failover else None,
                 "udp_multi_loss": udp_multi.get("loss_rate") if udp_multi else None,
                 "udp_multi_p95": udp_multi.get("p95_ms") if udp_multi else None,
                 "udp_low_p95": udp_low.get("p95_ms") if udp_low else None,
@@ -204,12 +210,12 @@ def render_markdown(records):
         "",
         "## TCP Downloads",
         "",
-        "| case | runs | ok | fail | median Mbps | best Mbps | median seconds |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| case | runs | ok | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in tcp_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {fail} | {median_goodput} | {best_goodput} | {median_time} |".format(
+            "| {case} | {runs} | {ok} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} |".format(
                 case=row["case"],
                 runs=row["runs"],
                 ok=row["ok"],
@@ -217,6 +223,8 @@ def render_markdown(records):
                 median_goodput=fmt_float(row["median_goodput"]),
                 best_goodput=fmt_float(row["best_goodput"]),
                 median_time=fmt_float(row["median_time"]),
+                median_recovery_gap=fmt_float(row["median_recovery_gap"]),
+                max_recovery_gap=fmt_float(row["max_recovery_gap"]),
             )
         )
 
@@ -250,13 +258,13 @@ def render_markdown(records):
             "",
             "## Per-Run Comparisons",
             "",
-            "| source | best raw | best single | multipath Mbps | mp/raw | mp/single | failover | failover seconds | UDP multi loss | UDP multi p95 ms | UDP low p95 ms |",
-            "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |",
+            "| source | best raw | best single | multipath Mbps | mp/raw | mp/single | failover | failover seconds | recovery gap s | UDP multi loss | UDP multi p95 ms | UDP low p95 ms |",
+            "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in source_comparisons(records):
         lines.append(
-            "| {source} | {best_raw} | {best_single} | {multipath} | {mp_raw} | {mp_single} | {failover_status} | {failover_time} | {udp_loss} | {udp_multi_p95} | {udp_low_p95} |".format(
+            "| {source} | {best_raw} | {best_single} | {multipath} | {mp_raw} | {mp_single} | {failover_status} | {failover_time} | {failover_recovery_gap} | {udp_loss} | {udp_multi_p95} | {udp_low_p95} |".format(
                 source=row["source"],
                 best_raw=(
                     f"{row['best_raw_case']} {fmt_float(row['best_raw_goodput'])}"
@@ -273,6 +281,7 @@ def render_markdown(records):
                 mp_single=fmt_float(row["multipath_vs_single"], 2),
                 failover_status=row["failover_status"] or "-",
                 failover_time=fmt_float(row["failover_time"]),
+                failover_recovery_gap=fmt_float(row["failover_recovery_gap"]),
                 udp_loss=fmt_float(row["udp_multi_loss"], 3),
                 udp_multi_p95=fmt_float(row["udp_multi_p95"]),
                 udp_low_p95=fmt_float(row["udp_low_p95"]),

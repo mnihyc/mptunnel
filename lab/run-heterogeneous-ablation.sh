@@ -216,13 +216,17 @@ run_failover_case() {
   local output exit_code
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-failover.out /tmp/mptunnel-failover.status /tmp/mptunnel-failover.pid"
-  exec_in client "(timeout ${curl_timeout}s curl -sS --fail --location --output /dev/null --write-out '%{time_total} %{speed_download} %{http_code}' --socks5-hostname 127.0.0.1:${proxy_port} 'http://172.31.40.30:8080/large.bin' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after '${failover_after}' --timeout '${curl_timeout}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
   sleep "$failover_after"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-failover.status ]; then echo 124 >/tmp/mptunnel-failover.status; fi"
   output="$(exec_in client "cat /tmp/mptunnel-failover.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-failover.status 2>/dev/null || echo 124")"
-  parse_and_record_curl "$case_name" "tcp" "$exit_code" "$output"
+  if [[ "$exit_code" == "0" && -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    parse_and_record_curl "$case_name" "tcp" "$exit_code" "$output"
+  fi
   apply_netem apply
 }
 

@@ -49,6 +49,8 @@ const TCP_STREAM_LOAD_BYTES: u64 = 256 * 1024;
 const UDP_SESSION_LOAD_BYTES: u64 = 64 * 1024;
 const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 const MIN_RATE_SAMPLE_DURATION: Duration = Duration::from_millis(1);
+const TCP_STREAM_STALL_MIN_TIMEOUT: Duration = Duration::from_millis(350);
+const TCP_STREAM_STALL_MAX_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_DATAGRAM_MIN_TTL_FIT_RATIO: f64 = 0.9;
 const UDP_BBR_PACING_GAIN: f64 = 1.25;
 const UDP_MIN_PACING_RATE_BPS: f64 = 64_000.0;
@@ -1062,12 +1064,16 @@ impl ServerTcpStreamBinding {
                 self.next_commands()
             };
             if let Some((path_id, commands)) = selected {
-                match commands
-                    .send(TcpPathSessionCommand::SendFrame(frame.clone()))
-                    .await
-                {
-                    Ok(()) => return Ok(()),
-                    Err(_) => self.detach(path_id, &commands),
+                tokio::select! {
+                    result = commands.send(TcpPathSessionCommand::SendFrame(frame.clone())) => {
+                        match result {
+                            Ok(()) => return Ok(()),
+                            Err(_) => self.detach(path_id, &commands),
+                        }
+                    }
+                    changed = updates.changed() => {
+                        changed.map_err(|_| RuntimeError::TcpPathSessionClosed)?;
+                    }
                 }
             } else {
                 updates
@@ -2032,19 +2038,49 @@ impl ClientPathContext {
         ordered_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
     }
 
-    fn ordered_tcp_path_indices_with_measured_rate(
+    fn ordered_tcp_auto_bulk_discovery_indices(
         &self,
-        class: TrafficClass,
+        current_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<usize> {
         let observations =
             health_observations(&mut self.health.lock().expect("client path health lock").tcp);
-        ordered_path_scores(&self.tcp_paths, &observations, class, payload_bytes)
+        let scores = ordered_path_scores(
+            &self.tcp_paths,
+            &observations,
+            TrafficClass::Bulk,
+            payload_bytes,
+        );
+        let current_eta = current_path_index.and_then(|current_path_index| {
+            scores
+                .iter()
+                .find_map(|(index, eta)| (*index == current_path_index).then_some(*eta))
+        });
+        let improves_current = |index: usize, eta: f64| {
+            Some(index) != current_path_index && current_eta.is_none_or(|current| eta < current)
+        };
+        let measured = scores
+            .iter()
+            .copied()
+            .filter(|(index, eta)| {
+                improves_current(*index, *eta)
+                    && observations
+                        .get(*index)
+                        .is_some_and(|observation| observation.measured_rate_bps.is_some())
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if !measured.is_empty() {
+            return measured;
+        }
+        scores
             .into_iter()
-            .filter(|(index, _)| {
-                observations
-                    .get(*index)
-                    .is_some_and(|observation| observation.measured_rate_bps.is_some())
+            .filter(|(index, eta)| {
+                improves_current(*index, *eta)
+                    && self
+                        .tcp_paths
+                        .get(*index)
+                        .is_some_and(tcp_path_can_be_auto_discovered)
             })
             .map(|(index, _)| index)
             .collect()
@@ -2430,6 +2466,13 @@ fn path_snapshot(
     }
 }
 
+fn tcp_path_can_be_auto_discovered(path: &PathSpec) -> bool {
+    !path.metadata.capabilities.expensive
+        && !path.metadata.capabilities.backup
+        && !path.metadata.capabilities.probe_only
+        && path.metadata.capabilities.bulk_allowed
+}
+
 fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
     match underlay {
         UnderlayProtocol::Tcp => 50.0,
@@ -2622,6 +2665,10 @@ impl TcpRelayRemoteSet {
         self.paths.first().map(|path| path.path_index)
     }
 
+    fn active_path_index(&self) -> Option<usize> {
+        self.paths.last().map(|path| path.path_index)
+    }
+
     fn contains_path(&self, path_index: usize) -> bool {
         self.paths.iter().any(|path| path.path_index == path_index)
     }
@@ -2743,6 +2790,12 @@ struct TcpRelayOpenSpec {
     target: TargetAddr,
     ingress: IngressKind,
     class_policy: TcpTrafficClass,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TcpRelayAttachMode {
+    Any,
+    AutoBulkDiscovery,
 }
 
 async fn open_remote_stream(
@@ -3219,11 +3272,10 @@ async fn handle_server_path(
                                     .route_frame(
                                         session_id,
                                         stream_id,
-                                        Frame::StreamMaxData {
-                                            stream_id,
-                                            max_offset: context
-                                                .mux_limits
-                                                .max_stream_window_bytes,
+                                        Frame::PathStatus {
+                                            path_id,
+                                            status: crate::protocol::PathStatus::Active,
+                                            capabilities: path_capabilities,
                                         },
                                     )
                                     .await?;
@@ -3538,7 +3590,9 @@ fn tcp_auto_bulk_threshold_bytes(path: Option<PathSnapshot>, mux_limits: MuxLimi
     let bdp_bytes = path.map_or(relay_chunk, |path| {
         ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)).ceil() as u64
     });
-    bdp_bytes.max(relay_chunk).min(window)
+    let ramp_floor = relay_chunk.saturating_mul(4).min(window);
+    let ramp_bdp = bdp_bytes.saturating_div(4).max(relay_chunk).max(ramp_floor);
+    ramp_bdp.min(window)
 }
 
 async fn relay_migrating_tcp_stream<S>(
@@ -3563,6 +3617,7 @@ where
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<usize, PathDeliveryStats>::new();
     let mut class_state = TcpRelayClassState::new(spec.class_policy);
+    let mut last_stream_progress_at = Instant::now();
 
     let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
@@ -3588,11 +3643,13 @@ where
                 &mut remotes,
                 &send_stream,
                 !local_open,
-                true,
+                TcpRelayAttachMode::AutoBulkDiscovery,
             )
             .await
             {
                 eprintln!("warning: TCP auto path attachment failed: {err}");
+            } else {
+                last_stream_progress_at = Instant::now();
             }
             send_stream.update_max_offset(remotes.max_offset());
         }
@@ -3600,8 +3657,47 @@ where
             adaptive_tcp_relay_chunk_bytes(path_snapshot, relay_class, context.mux_limits);
         let adaptive_inflight =
             adaptive_tcp_relay_inflight_bytes(path_snapshot, relay_class, context.mux_limits);
+        let stall_watch_active = tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            remote_open,
+            relay_class,
+            context.mux_limits,
+        );
+        let stall_deadline =
+            tcp_relay_stall_deadline(last_stream_progress_at, path_snapshot, relay_class);
 
         tokio::select! {
+            _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
+                if let Some(path_index) = remotes.active_path_index() {
+                    remotes.fail_path(context, path_index).await;
+                }
+                match attach_tcp_relay_paths(
+                    context,
+                    &spec,
+                    relay_class,
+                    &mut remotes,
+                    &send_stream,
+                    !local_open,
+                    TcpRelayAttachMode::Any,
+                )
+                .await
+                {
+                    Ok(attached) if attached > 0 => {
+                        send_stream.update_max_offset(remotes.max_offset());
+                        last_stream_progress_at = Instant::now();
+                        continue;
+                    }
+                    Ok(_) => {
+                        last_stream_progress_at = Instant::now();
+                    }
+                    Err(err) if remotes.is_empty() => break Err(err),
+                    Err(err) => {
+                        eprintln!("warning: TCP stream stall repair failed: {err}");
+                        last_stream_progress_at = Instant::now();
+                    }
+                }
+            }
             read = async {
                 let read_budget = tcp_relay_read_budget_with_limit(
                     &send_stream,
@@ -3621,7 +3717,9 @@ where
                         .send_frame(context, Frame::StreamFin { stream_id })
                         .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            last_stream_progress_at = Instant::now();
+                        }
                         Err(err) if tcp_relay_error_is_migratable(&err) => {
                             if let Err(err) = attach_tcp_relay_paths(
                                 context,
@@ -3630,12 +3728,13 @@ where
                                 &mut remotes,
                                 &send_stream,
                                 !local_open,
-                                false,
+                                TcpRelayAttachMode::Any,
                             )
                             .await
                             {
                                 break Err(err);
                             }
+                            last_stream_progress_at = Instant::now();
                         }
                         Err(err) => break Err(err),
                     }
@@ -3649,6 +3748,7 @@ where
                     };
                     match remotes.send_frame(context, frame).await {
                         Ok(path_index) => {
+                            last_stream_progress_at = Instant::now();
                             stats.record_payload_bytes(read);
                             path_stats
                                 .entry(path_index)
@@ -3663,11 +3763,12 @@ where
                                 &mut remotes,
                                 &send_stream,
                                 !local_open,
-                                false,
+                                TcpRelayAttachMode::Any,
                             )
                             .await
                             {
                                 Ok(attached) if attached > 0 => {
+                                    last_stream_progress_at = Instant::now();
                                     stats.record_payload_bytes(read);
                                 }
                                 Ok(_) => break Err(err),
@@ -3689,11 +3790,12 @@ where
                             &mut remotes,
                             &send_stream,
                             !local_open,
-                            false,
+                            TcpRelayAttachMode::Any,
                         )
                         .await
                         {
                             Ok(attached) if attached > 0 => {
+                                last_stream_progress_at = Instant::now();
                                 continue;
                             }
                             Ok(_) => break Err(err),
@@ -3714,12 +3816,13 @@ where
                                 &mut remotes,
                                 &send_stream,
                                 !local_open,
-                                false,
+                                TcpRelayAttachMode::Any,
                             )
                             .await
                             {
                                 Ok(attached) if attached > 0 => {
                                     send_stream.update_max_offset(remotes.max_offset());
+                                    last_stream_progress_at = Instant::now();
                                     continue;
                                 }
                                 Ok(_) => break Err(err),
@@ -3741,6 +3844,7 @@ where
                             Ok(outcome) => outcome,
                             Err(err) => break Err(RuntimeError::Stream(err)),
                         };
+                        last_stream_progress_at = Instant::now();
                         let mut write_error = None;
                         for chunk in outcome.delivered {
                             stats.record_payload_bytes(chunk.len());
@@ -3769,11 +3873,13 @@ where
                                     &mut remotes,
                                     &send_stream,
                                     !local_open,
-                                    false,
+                                    TcpRelayAttachMode::Any,
                                 )
-                                .await
-                                {
-                                    Ok(attached) if attached > 0 => {}
+                            .await
+                            {
+                                    Ok(attached) if attached > 0 => {
+                                        last_stream_progress_at = Instant::now();
+                                    }
                                     Ok(_) => break Err(err),
                                     Err(err) => break Err(err),
                                 }
@@ -3793,14 +3899,17 @@ where
                         ranges,
                     } if ack_stream_id == stream_id => {
                         send_stream.apply_ack(&ranges);
+                        last_stream_progress_at = Instant::now();
                     }
                     Frame::StreamMaxData {
                         stream_id: max_stream_id,
                         max_offset,
                     } if max_stream_id == stream_id => {
                         send_stream.update_max_offset(max_offset);
+                        last_stream_progress_at = Instant::now();
                     }
                     Frame::StreamFin { stream_id: fin_stream_id } if fin_stream_id == stream_id => {
+                        last_stream_progress_at = Instant::now();
                         if recv_stream.reorder_bytes() == 0 {
                             if let Err(err) = local.shutdown().await {
                                 break Err(RuntimeError::Io(err));
@@ -3846,19 +3955,12 @@ async fn switch_tcp_relay_to_best_path(
     remotes: &mut TcpRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
-    require_measured_rate: bool,
+    mode: TcpRelayAttachMode,
 ) -> Result<bool, RuntimeError> {
     let previous_paths = remotes.path_indices();
-    let attached = attach_tcp_relay_paths(
-        context,
-        spec,
-        class,
-        remotes,
-        send_stream,
-        resend_fin,
-        require_measured_rate,
-    )
-    .await?;
+    let attached =
+        attach_tcp_relay_paths(context, spec, class, remotes, send_stream, resend_fin, mode)
+            .await?;
     if attached == 0 {
         return Ok(false);
     }
@@ -3884,14 +3986,19 @@ async fn attach_tcp_relay_paths(
     remotes: &mut TcpRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
-    require_measured_rate: bool,
+    mode: TcpRelayAttachMode,
 ) -> Result<usize, RuntimeError> {
     let stream_id = remotes.stream_id();
-    let payload_bytes = tcp_relay_attach_payload_bytes(send_stream, context.mux_limits);
-    let candidates = if require_measured_rate {
-        context.ordered_tcp_path_indices_with_measured_rate(class, payload_bytes)
-    } else {
-        context.ordered_tcp_path_indices(class, payload_bytes)
+    let payload_bytes = match mode {
+        TcpRelayAttachMode::Any => tcp_relay_attach_payload_bytes(send_stream, context.mux_limits),
+        TcpRelayAttachMode::AutoBulkDiscovery => {
+            tcp_relay_auto_bulk_discovery_payload_bytes(send_stream, context.mux_limits)
+        }
+    };
+    let candidates = match mode {
+        TcpRelayAttachMode::Any => context.ordered_tcp_path_indices(class, payload_bytes),
+        TcpRelayAttachMode::AutoBulkDiscovery => context
+            .ordered_tcp_auto_bulk_discovery_indices(remotes.active_path_index(), payload_bytes),
     };
     let mut last_retryable_error = None;
     let mut attached = 0usize;
@@ -3953,6 +4060,61 @@ fn tcp_relay_attach_payload_bytes(
         .max(tcp_relay_buffer_len(mux_limits));
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
     repair_bytes.min(stream_window)
+}
+
+fn tcp_relay_auto_bulk_discovery_payload_bytes(
+    send_stream: &ReliableSendStream,
+    mux_limits: MuxLimits,
+) -> usize {
+    let attach_payload = tcp_relay_attach_payload_bytes(send_stream, mux_limits);
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    attach_payload.max(mux_limits.max_tcp_path_inflight_bytes.min(stream_window))
+}
+
+fn tcp_relay_stall_watch_active(
+    send_stream: &ReliableSendStream,
+    recv_stream: &ReliableRecvStream,
+    remote_open: bool,
+    class: TrafficClass,
+    mux_limits: MuxLimits,
+) -> bool {
+    send_stream.repair_bytes() > 0
+        || (remote_open
+            && (matches!(class, TrafficClass::Bulk | TrafficClass::Background)
+                || recv_stream.next_offset() >= tcp_relay_response_stall_watch_bytes(mux_limits))
+            && recv_stream.next_offset() > 0)
+}
+
+fn tcp_relay_response_stall_watch_bytes(mux_limits: MuxLimits) -> u64 {
+    (tcp_relay_buffer_len(mux_limits) as u64)
+        .saturating_mul(4)
+        .min(mux_limits.max_stream_window_bytes)
+}
+
+fn tcp_relay_stall_deadline(
+    last_progress_at: Instant,
+    path: Option<PathSnapshot>,
+    class: TrafficClass,
+) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(last_progress_at + tcp_relay_stall_timeout(path, class))
+}
+
+fn tcp_relay_stall_timeout(path: Option<PathSnapshot>, class: TrafficClass) -> Duration {
+    let (srtt_ms, jitter_ms) = path.map_or((250.0, 50.0), |path| {
+        (path.srtt_ms.max(1.0), path.jitter_ms.max(0.0))
+    });
+    let rtt_gain = match class {
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => 1.5,
+        TrafficClass::Interactive => 2.0,
+        TrafficClass::Bulk => 1.5,
+        TrafficClass::Background => 3.0,
+    };
+    Duration::from_secs_f64(
+        ((srtt_ms * rtt_gain + jitter_ms * 4.0 + 100.0) / 1000.0).clamp(
+            TCP_STREAM_STALL_MIN_TIMEOUT.as_secs_f64(),
+            TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64(),
+        ),
+    )
 }
 
 async fn replay_tcp_repair_cache(
@@ -4159,6 +4321,12 @@ where
                         max_offset,
                     } if max_stream_id == stream_id => {
                         send_stream.update_max_offset(max_offset);
+                    }
+                    Frame::PathStatus {
+                        status: crate::protocol::PathStatus::Active,
+                        ..
+                    } => {
+                        replay_tcp_repair_cache(&path_stream, &send_stream, false).await?;
                     }
                     Frame::StreamFin { stream_id: fin_stream_id } if fin_stream_id == stream_id => {
                         local.shutdown().await?;
@@ -6103,7 +6271,16 @@ mod tests {
         let mux_limits = MuxLimits::default();
         let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
         let threshold = tcp_auto_bulk_threshold_bytes(Some(path), mux_limits);
+        let high_bdp_path =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 300_000_000.0);
+        let high_bdp_threshold = tcp_auto_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
+        let high_bdp = ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0))
+            .ceil() as u64;
         let mut state = TcpRelayClassState::new(TcpTrafficClass::Auto);
+
+        assert!(threshold >= (tcp_relay_buffer_len(mux_limits) as u64).saturating_mul(4));
+        assert!(high_bdp_threshold < high_bdp);
+        assert!(high_bdp_threshold >= high_bdp / 4);
 
         let before = state.refresh(Some(path), threshold.saturating_sub(1), 0, 0, mux_limits);
         assert_eq!(before.class, TrafficClass::Interactive);
@@ -6147,6 +6324,231 @@ mod tests {
             adaptive_tcp_relay_inflight_bytes(Some(unstable), TrafficClass::Bulk, mux_limits);
         assert!(bulk_inflight >= interactive_inflight);
         assert!(unstable_bulk_inflight < bulk_inflight);
+    }
+
+    #[test]
+    fn tcp_relay_stall_timeout_is_adaptive_and_bounded_for_fluent_failover() {
+        let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
+        let mut cross_continent =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 900.0, 300_000_000.0);
+        cross_continent.jitter_ms = 400.0;
+
+        assert_eq!(
+            tcp_relay_stall_timeout(Some(low_latency), TrafficClass::Interactive),
+            TCP_STREAM_STALL_MIN_TIMEOUT
+        );
+        assert!(
+            tcp_relay_stall_timeout(Some(cross_continent), TrafficClass::Bulk)
+                <= TCP_STREAM_STALL_MAX_TIMEOUT
+        );
+        assert!(TCP_STREAM_STALL_MAX_TIMEOUT < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
+        let mux_limits = MuxLimits::default();
+        let mut send_stream = ReliableSendStream::new(StreamId(11), mux_limits);
+        let mut recv_stream = ReliableRecvStream::new(StreamId(11), mux_limits);
+
+        assert!(!tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            false,
+            TrafficClass::Interactive,
+            mux_limits
+        ));
+        assert!(!tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            TrafficClass::Interactive,
+            mux_limits
+        ));
+
+        send_stream
+            .send_data(Bytes::from_static(b"request"), StreamFlags::NONE)
+            .expect("request data");
+        assert!(tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            TrafficClass::Interactive,
+            mux_limits
+        ));
+        send_stream.apply_ack(&[crate::protocol::OffsetRange { start: 0, end: 7 }]);
+        assert!(!tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            TrafficClass::Interactive,
+            mux_limits
+        ));
+
+        recv_stream
+            .receive_data(0, Bytes::from_static(b"response"), StreamFlags::NONE)
+            .expect("response data");
+        assert!(!tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            TrafficClass::Interactive,
+            mux_limits
+        ));
+        assert!(tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            TrafficClass::Bulk,
+            mux_limits
+        ));
+        assert!(!tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            false,
+            TrafficClass::Bulk,
+            mux_limits
+        ));
+
+        let response_watch_bytes = tcp_relay_response_stall_watch_bytes(mux_limits);
+        let current_offset = recv_stream.next_offset();
+        let fill_bytes = response_watch_bytes.saturating_sub(current_offset);
+        let first_fill = fill_bytes.min(mux_limits.max_payload_bytes as u64) as usize;
+        recv_stream
+            .receive_data(
+                current_offset,
+                Bytes::from(vec![0u8; first_fill]),
+                StreamFlags::NONE,
+            )
+            .expect("first sustained response data");
+        let remaining = response_watch_bytes.saturating_sub(recv_stream.next_offset());
+        if remaining > 0 {
+            recv_stream
+                .receive_data(
+                    recv_stream.next_offset(),
+                    Bytes::from(vec![0u8; remaining as usize]),
+                    StreamFlags::NONE,
+                )
+                .expect("second sustained response data");
+        }
+        assert!(tcp_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            TrafficClass::Interactive,
+            mux_limits
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_tcp_binding_reselects_blocked_data_send_after_path_update() {
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        old_tx
+            .send(TcpPathSessionCommand::SendFrame(Frame::Ping { nonce: 1 }))
+            .await
+            .expect("fill old path command queue");
+        let binding = ServerTcpStreamBinding::new(PathId(0), old_tx);
+        let send_binding = binding.clone();
+        let send_task = tokio::spawn(async move {
+            send_binding
+                .send_frame(
+                    StreamId(7),
+                    Frame::StreamData {
+                        stream_id: StreamId(7),
+                        offset: 0,
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from_static(b"bulk"),
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!send_task.is_finished());
+
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        binding.attach(PathId(1), new_tx);
+        send_task
+            .await
+            .expect("binding send join")
+            .expect("binding send");
+        match new_rx.recv().await.expect("new path command") {
+            TcpPathSessionCommand::SendFrame(Frame::StreamData {
+                stream_id, payload, ..
+            }) => {
+                assert_eq!(stream_id, StreamId(7));
+                assert_eq!(&payload[..], b"bulk");
+            }
+            _ => panic!("expected stream data on reselected path"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_tcp_relay_replays_response_repair_cache_on_path_reattach() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(42);
+        let (mut target_peer, target_side) = duplex(4096);
+        let (commands_tx, mut commands_rx) = mpsc::channel(8);
+        let (frames_tx, frames_rx) = mpsc::channel(8);
+        let relay = tokio::spawn(relay_tcp_stream(
+            target_side,
+            TcpPathStream {
+                stream_id,
+                max_offset: mux_limits.max_stream_window_bytes,
+                output: TcpPathStreamOutput::Fixed(commands_tx),
+                frames: frames_rx,
+            },
+            mux_limits,
+        ));
+
+        target_peer
+            .write_all(b"response")
+            .await
+            .expect("target write");
+        let first = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
+            .await
+            .expect("first relay frame timeout")
+            .expect("first relay frame");
+        match first {
+            TcpPathSessionCommand::SendFrame(Frame::StreamData {
+                stream_id: received_stream_id,
+                offset,
+                payload,
+                ..
+            }) => {
+                assert_eq!(received_stream_id, stream_id);
+                assert_eq!(offset, 0);
+                assert_eq!(&payload[..], b"response");
+            }
+            _ => panic!("expected first response stream data"),
+        }
+
+        frames_tx
+            .send(Ok(Frame::PathStatus {
+                path_id: PathId(1),
+                status: crate::protocol::PathStatus::Active,
+                capabilities: Default::default(),
+            }))
+            .await
+            .expect("reattach signal");
+        let replay = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
+            .await
+            .expect("replay frame timeout")
+            .expect("replay frame");
+        match replay {
+            TcpPathSessionCommand::SendFrame(Frame::StreamData {
+                stream_id: received_stream_id,
+                offset,
+                payload,
+                ..
+            }) => {
+                assert_eq!(received_stream_id, stream_id);
+                assert_eq!(offset, 0);
+                assert_eq!(&payload[..], b"response");
+            }
+            _ => panic!("expected replayed response stream data"),
+        }
+
+        relay.abort();
+        let _ = relay.await;
     }
 
     #[test]
@@ -6252,11 +6654,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_bulk_discovery_uses_bulk_horizon_for_unmeasured_high_bandwidth_path() {
+        let low_latency_path = "tcp://127.0.0.1:10015?srtt-ms=20&rate-mbps=30&low-latency=true"
+            .parse::<PathSpec>()
+            .expect("low-latency path");
+        let high_bandwidth_path = "tcp://127.0.0.1:10016?srtt-ms=180&rate-mbps=300"
+            .parse::<PathSpec>()
+            .expect("high-bandwidth path");
+        let context = ClientPathContext::new(
+            vec![low_latency_path, high_bandwidth_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
+            context
+                .ordered_tcp_auto_bulk_discovery_indices(
+                    Some(0),
+                    MuxLimits::default().max_tcp_path_inflight_bytes,
+                )
+                .first()
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn auto_bulk_discovery_skips_unmeasured_expensive_path() {
+        let low_latency_path = "tcp://127.0.0.1:10017?srtt-ms=20&rate-mbps=30&low-latency=true"
+            .parse::<PathSpec>()
+            .expect("low-latency path");
+        let expensive_path = "tcp://127.0.0.1:10018?srtt-ms=80&rate-mbps=500&expensive=true"
+            .parse::<PathSpec>()
+            .expect("expensive path");
+        let context = ClientPathContext::new(
+            vec![low_latency_path, expensive_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert!(
+            context
+                .ordered_tcp_auto_bulk_discovery_indices(
+                    Some(0),
+                    MuxLimits::default().max_tcp_path_inflight_bytes,
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn measured_udp_delivery_rate_updates_next_datagram_order() {
-        let hinted_slow_path = "udp://127.0.0.1:10015?srtt-ms=20&rate-mbps=10"
+        let hinted_slow_path = "udp://127.0.0.1:10019?srtt-ms=20&rate-mbps=10"
             .parse::<PathSpec>()
             .expect("hinted slow path");
-        let hinted_fast_path = "udp://127.0.0.1:10016?srtt-ms=20&rate-mbps=100"
+        let hinted_fast_path = "udp://127.0.0.1:10020?srtt-ms=20&rate-mbps=100"
             .parse::<PathSpec>()
             .expect("hinted fast path");
         let context = ClientPathContext::new(
@@ -6294,10 +6748,10 @@ mod tests {
 
     #[test]
     fn udp_datagram_feedback_updates_scheduler_health() {
-        let stale_path = "udp://127.0.0.1:10017?srtt-ms=250&rate-mbps=1"
+        let stale_path = "udp://127.0.0.1:10021?srtt-ms=250&rate-mbps=1"
             .parse::<PathSpec>()
             .expect("stale path");
-        let observed_path = "udp://127.0.0.1:10018?srtt-ms=250&rate-mbps=1"
+        let observed_path = "udp://127.0.0.1:10022?srtt-ms=250&rate-mbps=1"
             .parse::<PathSpec>()
             .expect("observed path");
         let context = ClientPathContext::new(
@@ -6334,7 +6788,7 @@ mod tests {
 
     #[test]
     fn udp_freshness_filter_rejects_paths_that_cannot_fit_ttl() {
-        let high_latency_path = "udp://127.0.0.1:10019?srtt-ms=1000&rate-mbps=1"
+        let high_latency_path = "udp://127.0.0.1:10023?srtt-ms=1000&rate-mbps=1"
             .parse::<PathSpec>()
             .expect("high latency path");
         let context = ClientPathContext::new(

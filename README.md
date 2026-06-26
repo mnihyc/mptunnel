@@ -7,6 +7,7 @@
 ```bash
 cargo build
 cargo test
+cargo run -- bench --strict
 ```
 
 Cross-platform release archives are produced by the packaging scripts:
@@ -24,6 +25,13 @@ Platform, TUN, service, and release-target report:
 
 ```bash
 mptunnel platform
+```
+
+Release benchmark gates:
+
+```bash
+mptunnel bench --strict
+mptunnel bench --strict --format json
 ```
 
 Client-side proxy ingress:
@@ -190,6 +198,9 @@ Common environment variables:
 - `MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES`
 - `MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS`
 - `MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS`
+- `MPTUNNEL_BENCH_STRICT`
+- `MPTUNNEL_BENCH_FORMAT`
+- `MPTUNNEL_BENCH_RESOURCE_SAMPLE_MIB`
 
 ## Current Runtime Scope
 
@@ -222,3 +233,7 @@ The deterministic simulator exercises the scheduler against heterogeneous path c
 - bulk tail avoidance that promotes the final bulk bytes onto latency-sensitive scoring
 - duplication of small control/realtime packets onto a second close-ETA path
 - shared-bottleneck suspicion that avoids a low-RTT path when a similar-RTT peer is already queued
+
+## Release Benchmark Gates
+
+`mptunnel bench --strict` runs the public release benchmark profile. It checks modeled page-load completion, interactive p95 under bulk load, video startup/rebuffering, file-download goodput, aggregation efficiency, failover recovery gap, repaired chunks, local AEAD CPU cost for ChaCha20-Poly1305 and AES-256-GCM, and default RAM budgets. Details are in `docs/BENCHMARKS.md`.

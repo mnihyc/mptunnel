@@ -27,6 +27,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Benchmark gates
+        run: cargo run -- bench --strict --resource-sample-mib 1
       - name: Build
         run: cargo build
 

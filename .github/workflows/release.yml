@@ -10,8 +10,18 @@ permissions:
   contents: write
 
 jobs:
+  benchmark-gates:
+    name: benchmark gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run benchmark gates
+        run: cargo run -- bench --strict --resource-sample-mib 1
+
   package:
     name: package (${{ matrix.target }})
+    needs: benchmark-gates
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

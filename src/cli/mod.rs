@@ -70,6 +70,7 @@ impl Cli {
             Command::Client(args) => CommandConfig::Client(args.into_config()?),
             Command::Server(args) => CommandConfig::Server(args.into_config()?),
             Command::Platform(_) => return Err(CliConfigError::PlatformCommandNotRuntimeConfig),
+            Command::Bench(_) => return Err(CliConfigError::BenchCommandNotRuntimeConfig),
         };
         let config = AppConfig {
             log_level: self.log_level,
@@ -284,10 +285,45 @@ pub enum Command {
     Server(ServerArgs),
     /// Print platform, TUN, service, and release-target information.
     Platform(PlatformArgs),
+    /// Run deterministic release benchmark gates.
+    Bench(BenchArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct PlatformArgs {}
+
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    #[arg(
+        long,
+        env = "MPTUNNEL_BENCH_STRICT",
+        default_value_t = false,
+        help = "Exit nonzero when any release benchmark gate fails"
+    )]
+    pub strict: bool,
+
+    #[arg(
+        long,
+        env = "MPTUNNEL_BENCH_FORMAT",
+        value_enum,
+        default_value_t = BenchmarkFormatArg::Text
+    )]
+    pub format: BenchmarkFormatArg,
+
+    #[arg(
+        long,
+        env = "MPTUNNEL_BENCH_RESOURCE_SAMPLE_MIB",
+        default_value_t = crate::benchmarks::BenchmarkOptions::default().resource_sample_mib,
+        help = "Bounded local crypto sample size in MiB, 1..=1024"
+    )]
+    pub resource_sample_mib: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BenchmarkFormatArg {
+    Text,
+    Json,
+}
 
 #[derive(Debug, Args)]
 pub struct ClientArgs {
@@ -634,6 +670,7 @@ pub enum CliConfigError {
     MissingUpstreamHttp,
     TunIpv4DisabledWithIpv4Options,
     PlatformCommandNotRuntimeConfig,
+    BenchCommandNotRuntimeConfig,
 }
 
 impl From<crate::config::ConfigError> for CliConfigError {
@@ -677,6 +714,9 @@ impl std::fmt::Display for CliConfigError {
             }
             Self::PlatformCommandNotRuntimeConfig => {
                 write!(f, "platform command does not build a runtime config")
+            }
+            Self::BenchCommandNotRuntimeConfig => {
+                write!(f, "bench command does not build a runtime config")
             }
         }
     }
@@ -825,6 +865,27 @@ mod tests {
     fn platform_command_does_not_require_runtime_secret() {
         let cli = Cli::try_parse_from(["mptunnel", "platform"]).expect("parse cli");
         assert!(matches!(cli.command, Command::Platform(_)));
+    }
+
+    #[test]
+    fn bench_command_does_not_require_runtime_secret() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "bench",
+            "--strict",
+            "--format",
+            "json",
+            "--resource-sample-mib",
+            "1",
+        ])
+        .expect("parse cli");
+        let Command::Bench(bench) = cli.command else {
+            panic!("expected bench command");
+        };
+
+        assert!(bench.strict);
+        assert_eq!(bench.format, BenchmarkFormatArg::Json);
+        assert_eq!(bench.resource_sample_mib, 1);
     }
 
     #[test]

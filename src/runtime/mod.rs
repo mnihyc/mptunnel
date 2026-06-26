@@ -3590,8 +3590,8 @@ fn tcp_auto_bulk_threshold_bytes(path: Option<PathSnapshot>, mux_limits: MuxLimi
     let bdp_bytes = path.map_or(relay_chunk, |path| {
         ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)).ceil() as u64
     });
-    let ramp_floor = relay_chunk.saturating_mul(4).min(window);
-    let ramp_bdp = bdp_bytes.saturating_div(4).max(relay_chunk).max(ramp_floor);
+    let ramp_floor = relay_chunk.saturating_mul(2).min(window);
+    let ramp_bdp = bdp_bytes.saturating_div(8).max(relay_chunk).max(ramp_floor);
     ramp_bdp.min(window)
 }
 
@@ -6278,9 +6278,9 @@ mod tests {
             .ceil() as u64;
         let mut state = TcpRelayClassState::new(TcpTrafficClass::Auto);
 
-        assert!(threshold >= (tcp_relay_buffer_len(mux_limits) as u64).saturating_mul(4));
-        assert!(high_bdp_threshold < high_bdp);
-        assert!(high_bdp_threshold >= high_bdp / 4);
+        assert!(threshold >= (tcp_relay_buffer_len(mux_limits) as u64).saturating_mul(2));
+        assert!(high_bdp_threshold < high_bdp / 4);
+        assert!(high_bdp_threshold >= high_bdp / 8);
 
         let before = state.refresh(Some(path), threshold.saturating_sub(1), 0, 0, mux_limits);
         assert_eq!(before.class, TrafficClass::Interactive);

@@ -12,6 +12,8 @@ use std::time::Instant;
 const PROFILE: &str = "developer-gates-v1";
 const MIB: usize = 1024 * 1024;
 const GIB_BYTES: f64 = 1024.0 * 1024.0 * 1024.0;
+const IDEAL_LAB_TARGET_MIB: f64 = 256.0;
+const IDEAL_LAB_TARGET_MBPS: f64 = 950.0;
 pub const MAX_RESOURCE_SAMPLE_MIB: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +191,14 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
         0.70,
         "ratio",
     ));
+    let ideal = ideal_lab_benchmark();
+    gates.push(at_least(
+        "ideal_lab_goodput",
+        "ideal_lab_goodput_mbps",
+        ideal.goodput_mbps,
+        IDEAL_LAB_TARGET_MBPS,
+        "Mbps",
+    ));
 
     let failover = failover_benchmark();
     gates.push(at_most(
@@ -240,6 +250,13 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
         "tcp_path_inflight_budget_mib",
         resource.tcp_path_inflight_budget_mib,
         8.0,
+        "MiB",
+    ));
+    gates.push(at_most(
+        "lab_hot_path_ram_budget",
+        "lab_hot_path_ram_budget_mib",
+        resource.lab_hot_path_ram_budget_mib,
+        IDEAL_LAB_TARGET_MIB,
         "MiB",
     ));
 
@@ -550,6 +567,17 @@ fn file_download_benchmark() -> DownloadMetrics {
     }
 }
 
+fn ideal_lab_benchmark() -> DownloadMetrics {
+    let mut simulator = Simulator::new(SchedulerPolicy::default(), ideal_lab_paths());
+    let transfer = simulator
+        .schedule_transfer(TrafficClass::Bulk, 1024 * MIB, MIB)
+        .expect("ideal lab paths schedule file download");
+    DownloadMetrics {
+        goodput_mbps: transfer.achieved_goodput_bps() / 1_000_000.0,
+        aggregation_efficiency: transfer.aggregation_efficiency(mbps(1_000.0)),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FailoverMetrics {
     gap_ms: f64,
@@ -582,6 +610,7 @@ struct ResourceMetrics {
     stream_memory_budget_mib: f64,
     datagram_queue_budget_mib: f64,
     tcp_path_inflight_budget_mib: f64,
+    lab_hot_path_ram_budget_mib: f64,
 }
 
 fn resource_benchmark(sample_mib: u32) -> Result<ResourceMetrics, BenchmarkError> {
@@ -601,7 +630,15 @@ fn resource_benchmark(sample_mib: u32) -> Result<ResourceMetrics, BenchmarkError
         stream_memory_budget_mib,
         datagram_queue_budget_mib: bytes_to_mib(limits.max_datagram_queue_bytes as u64),
         tcp_path_inflight_budget_mib: bytes_to_mib(limits.max_tcp_path_inflight_bytes as u64),
+        lab_hot_path_ram_budget_mib: bytes_to_mib(lab_hot_path_ram_budget_bytes(limits)),
     })
+}
+
+fn lab_hot_path_ram_budget_bytes(limits: ResourceLimits) -> u64 {
+    limits.max_repair_bytes as u64
+        + limits.max_reorder_bytes as u64
+        + limits.max_tcp_path_inflight_bytes as u64
+        + limits.max_datagram_queue_bytes as u64
 }
 
 fn measure_chacha20poly1305(sample_bytes: usize) -> Result<f64, BenchmarkError> {
@@ -674,6 +711,18 @@ fn download_paths() -> Vec<VirtualPath> {
         VirtualPath::new(low_latency),
         VirtualPath::new(high_bandwidth),
         VirtualPath::new(unstable),
+    ]
+}
+
+fn ideal_lab_paths() -> Vec<VirtualPath> {
+    let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 4.0, mbps(500.0));
+    let high_bandwidth = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 8.0, mbps(500.0));
+    let mut tcp_like = PathSnapshot::new(PathId(2), UnderlayProtocol::Tcp, 6.0, mbps(250.0));
+    tcp_like.jitter_ms = 0.5;
+    vec![
+        VirtualPath::new(low_latency),
+        VirtualPath::new(high_bandwidth),
+        VirtualPath::new(tcp_like),
     ]
 }
 

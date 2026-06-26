@@ -252,6 +252,18 @@ impl ReliableRecvStream {
         }
     }
 
+    pub fn max_data_offset(&self) -> u64 {
+        self.next_offset
+            .saturating_add(self.limits.max_stream_window_bytes)
+    }
+
+    pub fn max_data_frame(&self) -> Frame {
+        Frame::StreamMaxData {
+            stream_id: self.stream_id,
+            max_offset: self.max_data_offset(),
+        }
+    }
+
     fn overlaps_existing(&self, start: u64, end: u64) -> bool {
         if end <= self.next_offset {
             return false;
@@ -396,6 +408,7 @@ mod tests {
             max_reorder_bytes: 2048,
             max_datagram_queue_bytes: 2048,
             max_tcp_path_inflight_bytes: 2048,
+            max_tcp_relay_chunk_bytes: 1024,
             tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
         }
@@ -446,6 +459,7 @@ mod tests {
     #[test]
     fn recv_stream_reassembles_out_of_order_data_and_builds_ack_ranges() {
         let mut stream = ReliableRecvStream::new(StreamId(7), limits());
+        assert_eq!(stream.max_data_offset(), limits().max_stream_window_bytes);
         let first = stream
             .receive_data(
                 5,
@@ -476,6 +490,17 @@ mod tests {
         assert_eq!(
             stream.ack_ranges(),
             vec![OffsetRange::new(0, 11).expect("range")]
+        );
+        assert_eq!(
+            stream.max_data_offset(),
+            11 + limits().max_stream_window_bytes
+        );
+        assert_eq!(
+            stream.max_data_frame(),
+            Frame::StreamMaxData {
+                stream_id: StreamId(7),
+                max_offset: 11 + limits().max_stream_window_bytes
+            }
         );
     }
 

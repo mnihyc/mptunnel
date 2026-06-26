@@ -13,6 +13,7 @@ pub struct MuxLimits {
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
     pub max_tcp_path_inflight_bytes: usize,
+    pub max_tcp_relay_chunk_bytes: usize,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
 }
@@ -27,6 +28,7 @@ impl Default for MuxLimits {
             max_reorder_bytes: 16 * 1024 * 1024,
             max_datagram_queue_bytes: 4 * 1024 * 1024,
             max_tcp_path_inflight_bytes: crate::config::DEFAULT_TCP_PATH_INFLIGHT_BYTES,
+            max_tcp_relay_chunk_bytes: crate::config::DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
         }
@@ -43,6 +45,7 @@ impl From<ResourceLimits> for MuxLimits {
             max_reorder_bytes: value.max_reorder_bytes,
             max_datagram_queue_bytes: value.max_datagram_queue_bytes,
             max_tcp_path_inflight_bytes: value.max_tcp_path_inflight_bytes,
+            max_tcp_relay_chunk_bytes: value.max_tcp_relay_chunk_bytes,
             tcp_path_heartbeat_interval: value.tcp_path_heartbeat_interval,
             tcp_path_heartbeat_timeout: value.tcp_path_heartbeat_timeout,
         }

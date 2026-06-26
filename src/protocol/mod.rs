@@ -299,6 +299,9 @@ pub enum Frame {
     StreamFin {
         stream_id: StreamId,
     },
+    StreamDetach {
+        stream_id: StreamId,
+    },
     StreamReset {
         stream_id: StreamId,
         reason: ResetReason,

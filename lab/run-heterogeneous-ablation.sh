@@ -19,6 +19,9 @@ udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 path_probe_interval_ms="${PATH_PROBE_INTERVAL_MS:-10000}"
 path_probe_timeout_ms="${PATH_PROBE_TIMEOUT_MS:-5000}"
+build_product="${BUILD_PRODUCT:-1}"
+build_lab_images="${BUILD_LAB_IMAGES:-1}"
+case_filter="${CASE_FILTER:-}"
 secret="${MPTUNNEL_LAB_SECRET:-mptunnel-lab-secret-change-me-32-bytes-minimum}"
 
 compose() {
@@ -29,6 +32,26 @@ exec_in() {
   local service="$1"
   shift
   compose exec -T "$service" bash -lc "$*"
+}
+
+exec_netem() {
+  local service="$1"
+  local mode="$2"
+  compose exec -T \
+    -e MPTUNNEL_LAB_LOWLAT_RATE="${MPTUNNEL_LAB_LOWLAT_RATE:-30mbit}" \
+    -e MPTUNNEL_LAB_LOWLAT_DELAY="${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms}" \
+    -e MPTUNNEL_LAB_LOWLAT_JITTER="${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms}" \
+    -e MPTUNNEL_LAB_LOWLAT_LOSS="${MPTUNNEL_LAB_LOWLAT_LOSS:-0.01%}" \
+    -e MPTUNNEL_LAB_FAT_RATE="${MPTUNNEL_LAB_FAT_RATE:-300mbit}" \
+    -e MPTUNNEL_LAB_FAT_DELAY="${MPTUNNEL_LAB_FAT_DELAY:-180ms}" \
+    -e MPTUNNEL_LAB_FAT_JITTER="${MPTUNNEL_LAB_FAT_JITTER:-20ms}" \
+    -e MPTUNNEL_LAB_FAT_LOSS="${MPTUNNEL_LAB_FAT_LOSS:-0.10%}" \
+    -e MPTUNNEL_LAB_POOR_RATE="${MPTUNNEL_LAB_POOR_RATE:-8mbit}" \
+    -e MPTUNNEL_LAB_POOR_DELAY="${MPTUNNEL_LAB_POOR_DELAY:-420ms}" \
+    -e MPTUNNEL_LAB_POOR_JITTER="${MPTUNNEL_LAB_POOR_JITTER:-120ms}" \
+    -e MPTUNNEL_LAB_POOR_LOSS="${MPTUNNEL_LAB_POOR_LOSS:-3.00%}" \
+    -e MPTUNNEL_LAB_BLACKHOLE_LOSS="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}" \
+    "$service" bash -lc "/workspace/lab/configure-netem.sh '$mode'"
 }
 
 append_curl_result() {
@@ -100,14 +123,31 @@ cleanup() {
 
 apply_netem() {
   local mode="$1"
-  exec_in client "/workspace/lab/configure-netem.sh '$mode'"
-  exec_in server "/workspace/lab/configure-netem.sh '$mode'"
-  exec_in target "/workspace/lab/configure-netem.sh '$mode'"
+  exec_netem client "$mode"
+  exec_netem server "$mode"
+  exec_netem target "$mode"
 }
 
 apply_failover_blackhole() {
-  exec_in client "/workspace/lab/configure-netem.sh blackhole-fat"
-  exec_in server "/workspace/lab/configure-netem.sh blackhole-fat"
+  exec_netem client blackhole-fat
+  exec_netem server blackhole-fat
+}
+
+should_run_case() {
+  local case_name="$1"
+  local pattern
+
+  if [[ -z "$case_filter" ]]; then
+    return 0
+  fi
+
+  IFS=',' read -r -a patterns <<< "$case_filter"
+  for pattern in "${patterns[@]}"; do
+    if [[ "$case_name" == $pattern ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 start_target_services() {
@@ -190,8 +230,12 @@ mkdir -p "$result_dir"
 : > "$result_file"
 
 docker compose version >/dev/null
-cargo build --release --bin mptunnel
-compose build
+if [[ "$build_product" == "1" ]]; then
+  cargo build --release --bin mptunnel
+fi
+if [[ "$build_lab_images" == "1" ]]; then
+  compose build
+fi
 compose up -d --remove-orphans
 trap cleanup EXIT
 
@@ -209,27 +253,51 @@ udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
 udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
 udp_all="${udp_lowlat} ${udp_fat} ${udp_poor}"
 
-run_curl_case "direct_low_latency" "tcp" "http://172.31.10.30:8080/large.bin"
-run_curl_case "direct_cross_continent_high_bandwidth" "tcp" "http://172.31.20.30:8080/large.bin"
-run_curl_case "direct_poor_internet" "tcp" "http://172.31.30.30:8080/large.bin"
+if should_run_case "direct_low_latency"; then
+  run_curl_case "direct_low_latency" "tcp" "http://172.31.10.30:8080/large.bin"
+fi
+if should_run_case "direct_cross_continent_high_bandwidth"; then
+  run_curl_case "direct_cross_continent_high_bandwidth" "tcp" "http://172.31.20.30:8080/large.bin"
+fi
+if should_run_case "direct_poor_internet"; then
+  run_curl_case "direct_poor_internet" "tcp" "http://172.31.30.30:8080/large.bin"
+fi
 
-start_client "tcp_single_low_latency" "$tcp_lowlat"
-run_curl_case "mptunnel_tcp_single_low_latency" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+if should_run_case "mptunnel_tcp_single_low_latency"; then
+  start_client "tcp_single_low_latency" "$tcp_lowlat"
+  run_curl_case "mptunnel_tcp_single_low_latency" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+fi
 
-start_client "tcp_single_cross_continent_high_bandwidth" "$tcp_fat"
-run_curl_case "mptunnel_tcp_single_cross_continent_high_bandwidth" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+if should_run_case "mptunnel_tcp_single_cross_continent_high_bandwidth"; then
+  start_client "tcp_single_cross_continent_high_bandwidth" "$tcp_fat"
+  run_curl_case "mptunnel_tcp_single_cross_continent_high_bandwidth" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+fi
 
-start_client "tcp_single_poor_internet" "$tcp_poor"
-run_curl_case "mptunnel_tcp_single_poor_internet" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+if should_run_case "mptunnel_tcp_single_poor_internet"; then
+  start_client "tcp_single_poor_internet" "$tcp_poor"
+  run_curl_case "mptunnel_tcp_single_poor_internet" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+fi
 
-start_client "tcp_multipath_all" "$tcp_all"
-run_curl_case "mptunnel_tcp_multipath_all" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+if should_run_case "mptunnel_tcp_multipath_all"; then
+  start_client "tcp_multipath_all" "$tcp_all"
+  run_curl_case "mptunnel_tcp_multipath_all" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+fi
 
-run_udp_case "mptunnel_udp_single_low_latency" "$udp_lowlat"
-run_udp_case "mptunnel_udp_single_cross_continent_high_bandwidth" "$udp_fat"
-run_udp_case "mptunnel_udp_single_poor_internet" "$udp_poor"
-run_udp_case "mptunnel_udp_multipath_all" "$udp_all"
+if should_run_case "mptunnel_udp_single_low_latency"; then
+  run_udp_case "mptunnel_udp_single_low_latency" "$udp_lowlat"
+fi
+if should_run_case "mptunnel_udp_single_cross_continent_high_bandwidth"; then
+  run_udp_case "mptunnel_udp_single_cross_continent_high_bandwidth" "$udp_fat"
+fi
+if should_run_case "mptunnel_udp_single_poor_internet"; then
+  run_udp_case "mptunnel_udp_single_poor_internet" "$udp_poor"
+fi
+if should_run_case "mptunnel_udp_multipath_all"; then
+  run_udp_case "mptunnel_udp_multipath_all" "$udp_all"
+fi
 
-run_failover_case
+if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat"; then
+  run_failover_case
+fi
 
 echo "$result_file"

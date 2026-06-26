@@ -1,9 +1,10 @@
 use crate::config::{
-    AppConfig, ClientConfig, CommandConfig, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
-    DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits, SecurityConfig, ServerConfig, ServiceConfig,
-    SharedSecret, TcpPortClassRule, TrafficPolicy,
+    AppConfig, ClientConfig, CommandConfig, DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
+    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits,
+    SecurityConfig, ServerConfig, ServiceConfig, SharedSecret, TcpPortClassRule, TcpTrafficClass,
+    TrafficPolicy,
 };
 use crate::ingress::IngressConfig;
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
@@ -214,6 +215,14 @@ pub struct ResourceArgs {
     #[arg(
         long,
         global = true,
+        env = "MPTUNNEL_MAX_TCP_RELAY_CHUNK_BYTES",
+        default_value_t = DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES
+    )]
+    pub max_tcp_relay_chunk_bytes: usize,
+
+    #[arg(
+        long,
+        global = true,
         env = "MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS",
         default_value_t = DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS
     )]
@@ -241,6 +250,7 @@ impl ResourceArgs {
             max_reorder_bytes: self.max_reorder_bytes,
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
             max_tcp_path_inflight_bytes: self.max_tcp_path_inflight_bytes,
+            max_tcp_relay_chunk_bytes: self.max_tcp_relay_chunk_bytes,
             tcp_path_heartbeat_interval: Duration::from_millis(self.tcp_path_heartbeat_interval_ms),
             tcp_path_heartbeat_timeout: Duration::from_millis(self.tcp_path_heartbeat_timeout_ms),
         }
@@ -360,7 +370,7 @@ pub struct ClientArgs {
         long,
         env = "MPTUNNEL_DEFAULT_TCP_CLASS",
         value_enum,
-        default_value_t = TcpTrafficClassArg::Interactive
+        default_value_t = TcpTrafficClassArg::Auto
     )]
     pub default_tcp_class: TcpTrafficClassArg,
 
@@ -441,19 +451,21 @@ pub enum IngressArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TcpTrafficClassArg {
+    Auto,
     Control,
     Interactive,
     Bulk,
     Background,
 }
 
-impl From<TcpTrafficClassArg> for TrafficClass {
+impl From<TcpTrafficClassArg> for TcpTrafficClass {
     fn from(value: TcpTrafficClassArg) -> Self {
         match value {
-            TcpTrafficClassArg::Control => Self::Control,
-            TcpTrafficClassArg::Interactive => Self::Interactive,
-            TcpTrafficClassArg::Bulk => Self::Bulk,
-            TcpTrafficClassArg::Background => Self::Background,
+            TcpTrafficClassArg::Auto => Self::Auto,
+            TcpTrafficClassArg::Control => Self::Fixed(TrafficClass::Control),
+            TcpTrafficClassArg::Interactive => Self::Fixed(TrafficClass::Interactive),
+            TcpTrafficClassArg::Bulk => Self::Fixed(TrafficClass::Bulk),
+            TcpTrafficClassArg::Background => Self::Fixed(TrafficClass::Background),
         }
     }
 }
@@ -461,12 +473,13 @@ impl From<TcpTrafficClassArg> for TrafficClass {
 impl TcpTrafficClassArg {
     fn parse_rule_value(value: &str) -> Result<Self, String> {
         match value {
+            "auto" => Ok(Self::Auto),
             "control" => Ok(Self::Control),
             "interactive" => Ok(Self::Interactive),
             "bulk" => Ok(Self::Bulk),
             "background" => Ok(Self::Background),
             _ => Err(format!(
-                "invalid TCP traffic class {value:?}; expected control, interactive, bulk, or background"
+                "invalid TCP traffic class {value:?}; expected auto, control, interactive, bulk, or background"
             )),
         }
     }
@@ -721,7 +734,7 @@ mod tests {
                 );
                 assert_eq!(
                     client.traffic_policy.default_tcp_class,
-                    TrafficClass::Interactive
+                    TcpTrafficClass::Auto
                 );
                 assert!(client.traffic_policy.tcp_port_rules.is_empty());
                 assert_eq!(
@@ -1183,6 +1196,8 @@ mod tests {
             "1024",
             "--max-repair-bytes",
             "4096",
+            "--max-tcp-relay-chunk-bytes",
+            "1024",
             "--max-tcp-path-inflight-bytes",
             "512",
             "client",
@@ -1206,6 +1221,8 @@ mod tests {
             "1024",
             "--max-repair-bytes",
             "4096",
+            "--max-tcp-relay-chunk-bytes",
+            "1024",
             "--max-tcp-path-inflight-bytes",
             "8192",
             "client",
@@ -1218,6 +1235,46 @@ mod tests {
             cli.into_config(),
             Err(CliConfigError::Config(
                 crate::config::ConfigError::TcpPathInflightLimitExceedsRepairLimit
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--max-tcp-relay-chunk-bytes",
+            "0",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::MaxTcpRelayChunkBytesZero
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--max-payload-bytes",
+            "1024",
+            "--max-tcp-relay-chunk-bytes",
+            "2048",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::MaxTcpRelayChunkExceedsPayloadLimit
             ))
         ));
     }
@@ -1347,17 +1404,20 @@ mod tests {
         let CommandConfig::Client(client) = config.command else {
             panic!("expected client config");
         };
-        assert_eq!(client.traffic_policy.default_tcp_class, TrafficClass::Bulk);
+        assert_eq!(
+            client.traffic_policy.default_tcp_class,
+            TcpTrafficClass::Fixed(TrafficClass::Bulk)
+        );
         assert_eq!(
             client.traffic_policy.tcp_port_rules,
             vec![
                 TcpPortClassRule {
                     port: 22,
-                    class: TrafficClass::Control,
+                    class: TcpTrafficClass::Fixed(TrafficClass::Control),
                 },
                 TcpPortClassRule {
                     port: 443,
-                    class: TrafficClass::Interactive,
+                    class: TcpTrafficClass::Fixed(TrafficClass::Interactive),
                 },
             ]
         );

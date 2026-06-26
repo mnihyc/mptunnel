@@ -19,6 +19,7 @@ pub const DEFAULT_PATH_PROBE_INTERVAL: Duration =
 pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
 pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
@@ -30,8 +31,6 @@ pub const DEFAULT_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
 pub const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_millis(DEFAULT_RESTART_BACKOFF_MS);
 pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
     Duration::from_millis(DEFAULT_RESTART_MAX_BACKOFF_MS);
-const RELAY_CHUNK_BYTES: usize = 16 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub log_level: String,
@@ -157,6 +156,7 @@ pub struct ResourceLimits {
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
     pub max_tcp_path_inflight_bytes: usize,
+    pub max_tcp_relay_chunk_bytes: usize,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
 }
@@ -174,6 +174,7 @@ impl Default for ResourceLimits {
             max_reorder_bytes: 16 * 1024 * 1024,
             max_datagram_queue_bytes: 4 * 1024 * 1024,
             max_tcp_path_inflight_bytes: DEFAULT_TCP_PATH_INFLIGHT_BYTES,
+            max_tcp_relay_chunk_bytes: DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
         }
@@ -212,7 +213,13 @@ impl ResourceLimits {
         if self.max_datagram_queue_bytes < self.max_payload_bytes {
             return Err(ConfigError::DatagramQueueLimitTooSmall);
         }
-        if self.max_tcp_path_inflight_bytes < self.max_payload_bytes.min(RELAY_CHUNK_BYTES) {
+        if self.max_tcp_relay_chunk_bytes == 0 {
+            return Err(ConfigError::MaxTcpRelayChunkBytesZero);
+        }
+        if self.max_tcp_relay_chunk_bytes > self.max_payload_bytes {
+            return Err(ConfigError::MaxTcpRelayChunkExceedsPayloadLimit);
+        }
+        if self.max_tcp_path_inflight_bytes < self.max_tcp_relay_chunk_bytes {
             return Err(ConfigError::TcpPathInflightLimitTooSmall);
         }
         if self.max_tcp_path_inflight_bytes > self.max_repair_bytes {
@@ -291,14 +298,14 @@ pub struct ClientConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficPolicy {
-    pub default_tcp_class: TrafficClass,
+    pub default_tcp_class: TcpTrafficClass,
     pub tcp_port_rules: Vec<TcpPortClassRule>,
 }
 
 impl Default for TrafficPolicy {
     fn default() -> Self {
         Self {
-            default_tcp_class: TrafficClass::Interactive,
+            default_tcp_class: TcpTrafficClass::Auto,
             tcp_port_rules: Vec::new(),
         }
     }
@@ -320,7 +327,7 @@ impl TrafficPolicy {
         Ok(())
     }
 
-    pub fn classify_tcp_target(&self, target: &TargetAddr) -> TrafficClass {
+    pub fn classify_tcp_target(&self, target: &TargetAddr) -> TcpTrafficClass {
         let port = target.port();
         self.tcp_port_rules
             .iter()
@@ -330,16 +337,37 @@ impl TrafficPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpPortClassRule {
-    pub port: u16,
-    pub class: TrafficClass,
+pub enum TcpTrafficClass {
+    Auto,
+    Fixed(TrafficClass),
 }
 
-fn validate_tcp_class(class: TrafficClass) -> Result<(), ConfigError> {
-    if class == TrafficClass::RealtimeDatagram {
-        Err(ConfigError::TcpPolicyUsesDatagramClass)
-    } else {
-        Ok(())
+impl TcpTrafficClass {
+    pub fn initial_class(self) -> TrafficClass {
+        match self {
+            Self::Auto => TrafficClass::Interactive,
+            Self::Fixed(class) => class,
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpPortClassRule {
+    pub port: u16,
+    pub class: TcpTrafficClass,
+}
+
+fn validate_tcp_class(class: TcpTrafficClass) -> Result<(), ConfigError> {
+    match class {
+        TcpTrafficClass::Auto => Ok(()),
+        TcpTrafficClass::Fixed(TrafficClass::RealtimeDatagram) => {
+            Err(ConfigError::TcpPolicyUsesDatagramClass)
+        }
+        TcpTrafficClass::Fixed(_) => Ok(()),
     }
 }
 
@@ -417,6 +445,8 @@ pub enum ConfigError {
     RepairLimitTooSmall,
     ReorderLimitTooSmall,
     DatagramQueueLimitTooSmall,
+    MaxTcpRelayChunkBytesZero,
+    MaxTcpRelayChunkExceedsPayloadLimit,
     TcpPathInflightLimitTooSmall,
     TcpPathInflightLimitExceedsRepairLimit,
     TcpPathHeartbeatIntervalZero,
@@ -478,6 +508,15 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "max datagram queue bytes must be at least max payload bytes"
+                )
+            }
+            Self::MaxTcpRelayChunkBytesZero => {
+                write!(f, "max TCP relay chunk bytes must be greater than zero")
+            }
+            Self::MaxTcpRelayChunkExceedsPayloadLimit => {
+                write!(
+                    f,
+                    "max TCP relay chunk bytes must be no greater than max payload bytes"
                 )
             }
             Self::TcpPathInflightLimitTooSmall => {

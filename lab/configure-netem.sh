@@ -3,6 +3,23 @@ set -euo pipefail
 
 mode="${1:-apply}"
 
+lowlat_rate="${MPTUNNEL_LAB_LOWLAT_RATE:-30mbit}"
+lowlat_delay="${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms}"
+lowlat_jitter="${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms}"
+lowlat_loss="${MPTUNNEL_LAB_LOWLAT_LOSS:-0.01%}"
+
+fat_rate="${MPTUNNEL_LAB_FAT_RATE:-300mbit}"
+fat_delay="${MPTUNNEL_LAB_FAT_DELAY:-180ms}"
+fat_jitter="${MPTUNNEL_LAB_FAT_JITTER:-20ms}"
+fat_loss="${MPTUNNEL_LAB_FAT_LOSS:-0.10%}"
+
+poor_rate="${MPTUNNEL_LAB_POOR_RATE:-8mbit}"
+poor_delay="${MPTUNNEL_LAB_POOR_DELAY:-420ms}"
+poor_jitter="${MPTUNNEL_LAB_POOR_JITTER:-120ms}"
+poor_loss="${MPTUNNEL_LAB_POOR_LOSS:-3.00%}"
+
+blackhole_loss="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}"
+
 interface_for_subnet() {
   local subnet_prefix="$1"
   ip -o -4 addr show scope global \
@@ -37,7 +54,7 @@ blackhole_profile() {
     return 0
   fi
 
-  tc qdisc replace dev "$iface" root netem loss 100%
+  tc qdisc replace dev "$iface" root netem loss "$blackhole_loss"
 }
 
 clear_profile() {
@@ -66,11 +83,11 @@ show_profile() {
 case "$mode" in
   apply)
     # Short regional hop: low RTT, modest bandwidth, nearly clean.
-    apply_profile "172.31.10" "30mbit" "20ms" "2ms" "0.01%"
+    apply_profile "172.31.10" "$lowlat_rate" "$lowlat_delay" "$lowlat_jitter" "$lowlat_loss"
     # Cross-continent fiber: high RTT, high throughput, small random loss.
-    apply_profile "172.31.20" "300mbit" "180ms" "20ms" "0.10%"
+    apply_profile "172.31.20" "$fat_rate" "$fat_delay" "$fat_jitter" "$fat_loss"
     # Poor Internet: very high RTT, low throughput, heavy jitter/loss.
-    apply_profile "172.31.30" "8mbit" "420ms" "120ms" "3.00%"
+    apply_profile "172.31.30" "$poor_rate" "$poor_delay" "$poor_jitter" "$poor_loss"
     ;;
   blackhole-fat)
     blackhole_profile "172.31.20"

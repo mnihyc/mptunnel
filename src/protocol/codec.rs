@@ -278,6 +278,10 @@ fn encode_payload(
             put_u64(out, stream_id.0);
             Ok(FrameKind::StreamFin)
         }
+        Frame::StreamDetach { stream_id } => {
+            put_u64(out, stream_id.0);
+            Ok(FrameKind::StreamDetach)
+        }
         Frame::StreamReset { stream_id, reason } => {
             put_u64(out, stream_id.0);
             put_u8(out, reset_reason_to_u8(*reason));
@@ -464,6 +468,9 @@ fn decode_payload(
             max_offset: reader.get_u64()?,
         }),
         FrameKind::StreamFin => Ok(Frame::StreamFin {
+            stream_id: StreamId(reader.get_u64()?),
+        }),
+        FrameKind::StreamDetach => Ok(Frame::StreamDetach {
             stream_id: StreamId(reader.get_u64()?),
         }),
         FrameKind::StreamReset => Ok(Frame::StreamReset {
@@ -961,6 +968,7 @@ enum FrameKind {
     StreamFin = 27,
     PathMtuProbe = 28,
     PathMtuAck = 29,
+    StreamDetach = 30,
 }
 
 impl FrameKind {
@@ -995,6 +1003,7 @@ impl FrameKind {
             27 => Ok(Self::StreamFin),
             28 => Ok(Self::PathMtuProbe),
             29 => Ok(Self::PathMtuAck),
+            30 => Ok(Self::StreamDetach),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1214,6 +1223,9 @@ mod tests {
             ],
         });
         round_trip(Frame::StreamFin {
+            stream_id: StreamId(7),
+        });
+        round_trip(Frame::StreamDetach {
             stream_id: StreamId(7),
         });
     }

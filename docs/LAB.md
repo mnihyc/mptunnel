@@ -12,7 +12,7 @@ Run the heterogeneous ablation lab from the repository root:
 lab/run-heterogeneous-ablation.sh
 ```
 
-The script builds the product binary on the host, then runs all network mutation inside Docker containers. It does not change host routes, host DNS, host TUN devices, or host `tc` state.
+The script builds the product binary on the host, then runs all network mutation inside Docker containers. It does not change host routes, host DNS, host TUN devices, or host `tc` state. Product client launches are intentionally user-like by default: they pass the secret, SOCKS5 listen endpoint, and TCP/UDP path endpoints only. They do not inject traffic modes, path metadata hints, probe timing, resource limits, or other tuning flags unless an explicit lab override is set.
 
 For repeated manual experiments, use the matrix runner:
 
@@ -77,8 +77,9 @@ Useful environment variables:
 - `FAILOVER_AFTER_SECONDS`: seconds before blackholing the high-bandwidth path, default `2`.
 - `FAILOVER_AFTER_MATRIX`: space-separated failover timing matrix for `lab/run-exhaustive-experiments.sh`.
 - `REPEATS`: repeat count for each matrix point.
-- `PATH_PROBE_INTERVAL_MS`: mptunnel client path-probe interval, default `10000`.
-- `PATH_PROBE_TIMEOUT_MS`: mptunnel client path-probe timeout, default `5000`.
+- `PATH_PROBE_INTERVAL_MS`: optional diagnostic override for the mptunnel client path-probe interval. Unset by default so product launches use built-in defaults.
+- `PATH_PROBE_TIMEOUT_MS`: optional diagnostic override for the mptunnel client path-probe timeout. Unset by default so product launches use built-in defaults.
+- `MPTUNNEL_LAB_USE_PATH_HINTS=1`: optional diagnostic override that adds RTT/rate/capability query hints to path URIs. Unset by default so product launches use endpoint paths only.
 - `MPTUNNEL_LAB_LOWLAT_RATE`, `MPTUNNEL_LAB_LOWLAT_DELAY`, `MPTUNNEL_LAB_LOWLAT_JITTER`, `MPTUNNEL_LAB_LOWLAT_LOSS`: low-latency path netem values.
 - `MPTUNNEL_LAB_FAT_RATE`, `MPTUNNEL_LAB_FAT_DELAY`, `MPTUNNEL_LAB_FAT_JITTER`, `MPTUNNEL_LAB_FAT_LOSS`: high-bandwidth path netem values.
 - `MPTUNNEL_LAB_POOR_RATE`, `MPTUNNEL_LAB_POOR_DELAY`, `MPTUNNEL_LAB_POOR_JITTER`, `MPTUNNEL_LAB_POOR_LOSS`: poor-Internet path netem values.

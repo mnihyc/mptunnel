@@ -3,13 +3,11 @@ pub mod security;
 use crate::ingress::IngressConfig;
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{TargetAddr, TrafficClass};
 use crate::transport::PathSpec;
 use security::validate_transport_security;
 pub use security::{
     EncryptionMode, SecurityPolicyError, SharedSecret, TransportIntegrity, TransportSecurity,
 };
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub const DEFAULT_PATH_PROBE_INTERVAL_MS: u64 = 10_000;
@@ -69,7 +67,6 @@ impl AppConfig {
                 if client.path_probe_timeout.is_zero() {
                     return Err(ConfigError::PathProbeTimeoutZero);
                 }
-                client.traffic_policy.validate()?;
                 if let IngressConfig::TunL4(tun) = &client.ingress {
                     validate_tun_l4(tun)?;
                     if !client
@@ -293,82 +290,6 @@ pub struct ClientConfig {
     pub paths: Vec<PathSpec>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
-    pub traffic_policy: TrafficPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrafficPolicy {
-    pub default_tcp_class: TcpTrafficClass,
-    pub tcp_port_rules: Vec<TcpPortClassRule>,
-}
-
-impl Default for TrafficPolicy {
-    fn default() -> Self {
-        Self {
-            default_tcp_class: TcpTrafficClass::Auto,
-            tcp_port_rules: Vec::new(),
-        }
-    }
-}
-
-impl TrafficPolicy {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_tcp_class(self.default_tcp_class)?;
-        let mut ports = BTreeSet::new();
-        for rule in &self.tcp_port_rules {
-            if rule.port == 0 {
-                return Err(ConfigError::TcpClassRulePortZero);
-            }
-            validate_tcp_class(rule.class)?;
-            if !ports.insert(rule.port) {
-                return Err(ConfigError::DuplicateTcpClassRule { port: rule.port });
-            }
-        }
-        Ok(())
-    }
-
-    pub fn classify_tcp_target(&self, target: &TargetAddr) -> TcpTrafficClass {
-        let port = target.port();
-        self.tcp_port_rules
-            .iter()
-            .find_map(|rule| (rule.port == port).then_some(rule.class))
-            .unwrap_or(self.default_tcp_class)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpTrafficClass {
-    Auto,
-    Fixed(TrafficClass),
-}
-
-impl TcpTrafficClass {
-    pub fn initial_class(self) -> TrafficClass {
-        match self {
-            Self::Auto => TrafficClass::Interactive,
-            Self::Fixed(class) => class,
-        }
-    }
-
-    pub fn is_auto(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpPortClassRule {
-    pub port: u16,
-    pub class: TcpTrafficClass,
-}
-
-fn validate_tcp_class(class: TcpTrafficClass) -> Result<(), ConfigError> {
-    match class {
-        TcpTrafficClass::Auto => Ok(()),
-        TcpTrafficClass::Fixed(TrafficClass::RealtimeDatagram) => {
-            Err(ConfigError::TcpPolicyUsesDatagramClass)
-        }
-        TcpTrafficClass::Fixed(_) => Ok(()),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,9 +381,6 @@ pub enum ConfigError {
     TooManyPaths { actual: usize, limit: usize },
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
-    TcpPolicyUsesDatagramClass,
-    TcpClassRulePortZero,
-    DuplicateTcpClassRule { port: u16 },
     TunAddressRequired,
     TunIpv4PrefixInvalid,
     TunIpv6PrefixInvalid,
@@ -565,15 +483,6 @@ impl std::fmt::Display for ConfigError {
             }
             Self::PathProbeTimeoutZero => {
                 write!(f, "path probe timeout must be greater than zero")
-            }
-            Self::TcpPolicyUsesDatagramClass => {
-                write!(f, "TCP traffic policy cannot use realtime datagram class")
-            }
-            Self::TcpClassRulePortZero => {
-                write!(f, "TCP traffic class rule port must be in 1..=65535")
-            }
-            Self::DuplicateTcpClassRule { port } => {
-                write!(f, "duplicate TCP traffic class rule for port {port}")
             }
             Self::TunAddressRequired => write!(f, "TUN L4 ingress requires IPv4 or IPv6 address"),
             Self::TunIpv4PrefixInvalid => write!(f, "TUN IPv4 prefix must be in 0..=32"),

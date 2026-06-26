@@ -52,8 +52,6 @@ repeats="${REPEATS:-$default_repeats}"
 curl_timeout="${CURL_TIMEOUT_SECONDS:-$default_curl_timeout}"
 udp_payload_bytes="${UDP_PAYLOAD_BYTES:-512}"
 udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
-path_probe_interval_ms="${PATH_PROBE_INTERVAL_MS:-10000}"
-path_probe_timeout_ms="${PATH_PROBE_TIMEOUT_MS:-5000}"
 case_filter="${CASE_FILTER:-}"
 
 mkdir -p "$result_root"
@@ -83,8 +81,6 @@ for file_mib in "${file_mibs[@]}"; do
           UDP_TIMEOUT_MS="$udp_timeout_ms" \
           FAILOVER_AFTER_SECONDS="$failover_after" \
           CURL_TIMEOUT_SECONDS="$curl_timeout" \
-          PATH_PROBE_INTERVAL_MS="$path_probe_interval_ms" \
-          PATH_PROBE_TIMEOUT_MS="$path_probe_timeout_ms" \
           CASE_FILTER="$case_filter" \
           RESULT_FILE="$result_file" \
           "$script_dir/run-heterogeneous-ablation.sh"

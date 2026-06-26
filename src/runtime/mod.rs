@@ -1,7 +1,4 @@
-use crate::config::{
-    AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig, TcpTrafficClass,
-    TrafficPolicy,
-};
+use crate::config::{AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig};
 use crate::ingress::IngressConfig;
 use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
@@ -86,12 +83,7 @@ async fn run_client(
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
-    let context = ClientPathContext::new_with_policy(
-        client.paths,
-        client.traffic_policy,
-        security,
-        resources,
-    )?;
+    let context = ClientPathContext::new(client.paths, security, resources)?;
     match client.ingress {
         IngressConfig::Socks5 { listen } => {
             run_socks5_client_ingress(listen, context, path_probe_interval, path_probe_timeout)
@@ -354,12 +346,11 @@ where
 {
     let target = TargetAddr::Ip(remote);
     outbound::validate_target(&target)?;
-    let class_policy = context.classify_tcp_target(&target);
     let remote = open_remote_stream(
         &context,
         target.clone(),
         IngressKind::TunTcp,
-        class_policy.initial_class(),
+        TrafficClass::Interactive,
     )
     .await?;
     relay_migrating_tcp_stream(
@@ -368,7 +359,6 @@ where
         TcpRelayOpenSpec {
             target,
             ingress: IngressKind::TunTcp,
-            class_policy,
         },
         remote,
     )
@@ -703,7 +693,6 @@ pub struct ClientPathContext {
     tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     next_tcp_stream_id: Arc<Mutex<u64>>,
     health: Arc<Mutex<ClientPathHealth>>,
-    traffic_policy: TrafficPolicy,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     security: SecurityConfig,
@@ -1958,15 +1947,6 @@ impl ClientPathContext {
         security: SecurityConfig,
         resources: ResourceLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_policy(paths, TrafficPolicy::default(), security, resources)
-    }
-
-    pub fn new_with_policy(
-        paths: Vec<PathSpec>,
-        traffic_policy: TrafficPolicy,
-        security: SecurityConfig,
-        resources: ResourceLimits,
-    ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
@@ -2009,15 +1989,10 @@ impl ClientPathContext {
             tcp_sessions: Arc::new(tcp_sessions),
             next_tcp_stream_id: Arc::new(Mutex::new(0)),
             health: Arc::new(Mutex::new(health)),
-            traffic_policy,
             codec_limits,
             mux_limits,
             security,
         })
-    }
-
-    fn classify_tcp_target(&self, target: &TargetAddr) -> TcpTrafficClass {
-        self.traffic_policy.classify_tcp_target(target)
     }
 
     fn allocate_tcp_stream_id(&self) -> Result<StreamId, RuntimeError> {
@@ -2518,12 +2493,11 @@ where
     match request.command {
         socks5::Socks5Command::Connect => {
             let target = request.target;
-            let class_policy = context.classify_tcp_target(&target);
             let remote = match open_remote_stream(
                 &context,
                 target.clone(),
                 IngressKind::Socks5,
-                class_policy.initial_class(),
+                TrafficClass::Interactive,
             )
             .await
             {
@@ -2552,7 +2526,6 @@ where
                     TcpRelayOpenSpec {
                         target,
                         ingress: IngressKind::Socks5,
-                        class_policy,
                     },
                     remote,
                 )
@@ -2583,12 +2556,11 @@ where
 {
     let request = read_http_connect(&mut stream).await?;
     let target = request.target;
-    let class_policy = context.classify_tcp_target(&target);
     let remote = match open_remote_stream(
         &context,
         target.clone(),
         IngressKind::HttpConnect,
-        class_policy.initial_class(),
+        TrafficClass::Interactive,
     )
     .await
     {
@@ -2609,7 +2581,6 @@ where
             TcpRelayOpenSpec {
                 target,
                 ingress: IngressKind::HttpConnect,
-                class_policy,
             },
             remote,
         )
@@ -2789,7 +2760,6 @@ impl TcpRelayRemoteSet {
 struct TcpRelayOpenSpec {
     target: TargetAddr,
     ingress: IngressKind,
-    class_policy: TcpTrafficClass,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3524,16 +3494,14 @@ fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
 
 #[derive(Debug, Clone, Copy)]
 struct TcpRelayClassState {
-    policy: TcpTrafficClass,
     current: TrafficClass,
     rebalance_attempted: bool,
 }
 
 impl TcpRelayClassState {
-    fn new(policy: TcpTrafficClass) -> Self {
+    fn new() -> Self {
         Self {
-            policy,
-            current: policy.initial_class(),
+            current: TrafficClass::Interactive,
             rebalance_attempted: false,
         }
     }
@@ -3546,14 +3514,6 @@ impl TcpRelayClassState {
         repair_bytes: usize,
         mux_limits: MuxLimits,
     ) -> TcpRelayClassUpdate {
-        if !self.policy.is_auto() {
-            self.current = self.policy.initial_class();
-            return TcpRelayClassUpdate {
-                class: self.current,
-                promoted_to_bulk: false,
-            };
-        }
-
         let observed_bytes = sent_offset
             .max(received_offset)
             .saturating_add(repair_bytes as u64);
@@ -3570,7 +3530,7 @@ impl TcpRelayClassState {
     }
 
     fn should_rebalance(self, update: TcpRelayClassUpdate) -> bool {
-        self.policy.is_auto() && update.promoted_to_bulk && !self.rebalance_attempted
+        update.promoted_to_bulk && !self.rebalance_attempted
     }
 
     fn mark_rebalance_attempted(&mut self) {
@@ -3616,7 +3576,7 @@ where
     let mut pending_remote_fin = false;
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<usize, PathDeliveryStats>::new();
-    let mut class_state = TcpRelayClassState::new(spec.class_policy);
+    let mut class_state = TcpRelayClassState::new();
     let mut last_stream_progress_at = Instant::now();
 
     let result = loop {
@@ -4579,23 +4539,6 @@ impl UdpDatagramClientAssociation {
         payload_bytes: usize,
         ttl_ms: u32,
     ) -> Option<usize> {
-        if let Some(path_index) = candidates
-            .iter()
-            .copied()
-            .filter(|path_index| !attempted.contains(path_index))
-            .find(|path_index| {
-                self.paths
-                    .iter()
-                    .all(|path| path.session.path_index != *path_index)
-                    && self
-                        .context
-                        .udp_path_runtime_model(*path_index, ttl_ms)
-                        .is_some_and(|model| model.accepts_or_can_probe(payload_bytes))
-            })
-        {
-            return Some(path_index);
-        }
-
         let now = Instant::now();
         candidates
             .iter()
@@ -5711,7 +5654,7 @@ impl std::error::Error for RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SharedSecret, TcpPortClassRule, TcpTrafficClass, TrafficPolicy};
+    use crate::config::SharedSecret;
     use crate::transport::Endpoint;
     use crate::transport::tcp::bind_listener;
     use tokio::io::duplex;
@@ -6276,7 +6219,7 @@ mod tests {
         let high_bdp_threshold = tcp_auto_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
         let high_bdp = ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0))
             .ceil() as u64;
-        let mut state = TcpRelayClassState::new(TcpTrafficClass::Auto);
+        let mut state = TcpRelayClassState::new();
 
         assert!(threshold >= (tcp_relay_buffer_len(mux_limits) as u64).saturating_mul(2));
         assert!(high_bdp_threshold < high_bdp / 4);
@@ -7430,7 +7373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socks5_ingress_applies_tcp_class_policy_before_scheduling() {
+    async fn socks5_ingress_starts_tcp_auto_latency_first() {
         let (target_addr, target) = spawn_echo_target().await;
         let no_bulk_low_latency_path =
             reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=1000&no-bulk").await;
@@ -7450,16 +7393,8 @@ mod tests {
             accepted_tx,
         )
         .await;
-        let traffic_policy = TrafficPolicy {
-            default_tcp_class: TcpTrafficClass::Fixed(TrafficClass::Interactive),
-            tcp_port_rules: vec![TcpPortClassRule {
-                port: target_addr.port(),
-                class: TcpTrafficClass::Fixed(TrafficClass::Bulk),
-            }],
-        };
-        let context = ClientPathContext::new_with_policy(
+        let context = ClientPathContext::new(
             vec![no_bulk_low_latency_path, bulk_allowed_path],
-            traffic_policy,
             security(),
             ResourceLimits::default(),
         )
@@ -7495,14 +7430,14 @@ mod tests {
         client.read_exact(&mut payload).await.expect("payload read");
         assert_eq!(&payload, b"pong");
 
-        assert_eq!(accepted_rx.recv().await, Some(1));
+        assert_eq!(accepted_rx.recv().await, Some(0));
         handler.await.expect("join").expect("handler");
-        bulk_allowed_server
+        low_latency_server
             .await
-            .expect("bulk server join")
-            .expect("bulk server");
-        low_latency_server.abort();
-        let _ = low_latency_server.await;
+            .expect("low latency server join")
+            .expect("low latency server");
+        bulk_allowed_server.abort();
+        let _ = bulk_allowed_server.await;
         target.await.expect("target join");
     }
 
@@ -7804,22 +7739,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socks5_udp_associate_keeps_multiple_udp_paths_active() {
+    async fn socks5_udp_associate_prefers_ready_low_latency_path() {
         let (target_addr, target) = spawn_udp_echo_target_count(2).await;
         let first_path = reserve_udp_path_with_query("srtt-ms=10&rate-mbps=10").await;
         let second_path = reserve_udp_path_with_query("srtt-ms=10&rate-mbps=10").await;
         let first_socket = udp::bind_socket(&first_path)
             .await
             .expect("bind first udp path");
-        let second_socket = udp::bind_socket(&second_path)
-            .await
-            .expect("bind second udp path");
         let first_server = tokio::spawn(handle_server_udp_datagram_path_session(
             first_socket,
-            server_context(OutboundConfig::Direct),
-        ));
-        let second_server = tokio::spawn(handle_server_udp_datagram_path_session(
-            second_socket,
             server_context(OutboundConfig::Direct),
         ));
         let context = ClientPathContext::new(
@@ -7885,7 +7813,9 @@ mod tests {
         {
             let health = health_context.health.lock().expect("health lock");
             assert_eq!(health.udp[0].active_flows, 1);
-            assert_eq!(health.udp[1].active_flows, 1);
+            assert_eq!(health.udp[1].active_flows, 0);
+            assert_eq!(health.udp[1].state, SchedulerPathState::Active);
+            assert_eq!(health.udp[1].consecutive_failures, 0);
         }
         control_client.shutdown().await.expect("control shutdown");
 
@@ -7899,10 +7829,6 @@ mod tests {
             .await
             .expect("first server join")
             .expect("first server");
-        second_server
-            .await
-            .expect("second server join")
-            .expect("second server");
         target.await.expect("target join");
     }
 

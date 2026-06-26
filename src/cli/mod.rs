@@ -3,17 +3,14 @@ use crate::config::{
     DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
     DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
     DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits,
-    SecurityConfig, ServerConfig, ServiceConfig, SharedSecret, TcpPortClassRule, TcpTrafficClass,
-    TrafficPolicy,
+    SecurityConfig, ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::IngressConfig;
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
 use crate::outbound::{DnsConfig, DnsIpStrategy, OutboundConfig};
-use crate::protocol::TrafficClass;
 use crate::transport::{Endpoint, PathSpec};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::str::FromStr;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -365,21 +362,6 @@ pub struct ClientArgs {
         default_value_t = DEFAULT_PATH_PROBE_TIMEOUT_MS
     )]
     pub path_probe_timeout_ms: u64,
-
-    #[arg(
-        long,
-        env = "MPTUNNEL_DEFAULT_TCP_CLASS",
-        value_enum,
-        default_value_t = TcpTrafficClassArg::Auto
-    )]
-    pub default_tcp_class: TcpTrafficClassArg,
-
-    #[arg(
-        long = "tcp-class-rule",
-        env = "MPTUNNEL_TCP_CLASS_RULES",
-        value_delimiter = ','
-    )]
-    pub tcp_class_rules: Vec<TcpClassRuleArg>,
 }
 
 impl ClientArgs {
@@ -422,14 +404,6 @@ impl ClientArgs {
             paths: self.paths,
             path_probe_interval: Duration::from_millis(self.path_probe_interval_ms),
             path_probe_timeout: Duration::from_millis(self.path_probe_timeout_ms),
-            traffic_policy: TrafficPolicy {
-                default_tcp_class: self.default_tcp_class.into(),
-                tcp_port_rules: self
-                    .tcp_class_rules
-                    .into_iter()
-                    .map(TcpPortClassRule::from)
-                    .collect(),
-            },
         })
     }
 }
@@ -447,81 +421,6 @@ pub enum IngressArg {
     Socks5,
     HttpConnect,
     TunL4,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TcpTrafficClassArg {
-    Auto,
-    Control,
-    Interactive,
-    Bulk,
-    Background,
-}
-
-impl From<TcpTrafficClassArg> for TcpTrafficClass {
-    fn from(value: TcpTrafficClassArg) -> Self {
-        match value {
-            TcpTrafficClassArg::Auto => Self::Auto,
-            TcpTrafficClassArg::Control => Self::Fixed(TrafficClass::Control),
-            TcpTrafficClassArg::Interactive => Self::Fixed(TrafficClass::Interactive),
-            TcpTrafficClassArg::Bulk => Self::Fixed(TrafficClass::Bulk),
-            TcpTrafficClassArg::Background => Self::Fixed(TrafficClass::Background),
-        }
-    }
-}
-
-impl TcpTrafficClassArg {
-    fn parse_rule_value(value: &str) -> Result<Self, String> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "control" => Ok(Self::Control),
-            "interactive" => Ok(Self::Interactive),
-            "bulk" => Ok(Self::Bulk),
-            "background" => Ok(Self::Background),
-            _ => Err(format!(
-                "invalid TCP traffic class {value:?}; expected auto, control, interactive, bulk, or background"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpClassRuleArg {
-    port: u16,
-    class: TcpTrafficClassArg,
-}
-
-impl From<TcpClassRuleArg> for TcpPortClassRule {
-    fn from(value: TcpClassRuleArg) -> Self {
-        Self {
-            port: value.port,
-            class: value.class.into(),
-        }
-    }
-}
-
-impl FromStr for TcpClassRuleArg {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err("TCP class rule must not be empty".to_string());
-        }
-        let (port, class) = value
-            .split_once('=')
-            .or_else(|| value.split_once(':'))
-            .ok_or_else(|| "TCP class rule must use port=class or port:class syntax".to_string())?;
-        let port = port
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| "TCP class rule port must be in 1..=65535".to_string())?;
-        if port == 0 {
-            return Err("TCP class rule port must be in 1..=65535".to_string());
-        }
-        let class = TcpTrafficClassArg::parse_rule_value(class.trim())?;
-        Ok(Self { port, class })
-    }
 }
 
 #[derive(Debug, Args)]
@@ -732,11 +631,6 @@ mod tests {
                         listen: vec!["127.0.0.1:1080".parse().expect("listen")]
                     }
                 );
-                assert_eq!(
-                    client.traffic_policy.default_tcp_class,
-                    TcpTrafficClass::Auto
-                );
-                assert!(client.traffic_policy.tcp_port_rules.is_empty());
                 assert_eq!(
                     client.path_probe_interval,
                     crate::config::DEFAULT_PATH_PROBE_INTERVAL
@@ -1383,64 +1277,39 @@ mod tests {
     }
 
     #[test]
-    fn tcp_traffic_policy_is_parsed_and_validated() {
-        let cli = Cli::try_parse_from([
-            "mptunnel",
-            "--secret",
-            "0123456789abcdef",
-            "client",
-            "--default-tcp-class",
-            "bulk",
-            "--tcp-class-rule",
-            "22=control",
-            "--tcp-class-rule",
-            "443:interactive",
-            "--path",
-            "tcp://127.0.0.1:443",
-        ])
-        .expect("parse cli");
-        let config = cli.into_config().expect("config");
-
-        let CommandConfig::Client(client) = config.command else {
-            panic!("expected client config");
-        };
-        assert_eq!(
-            client.traffic_policy.default_tcp_class,
-            TcpTrafficClass::Fixed(TrafficClass::Bulk)
-        );
-        assert_eq!(
-            client.traffic_policy.tcp_port_rules,
-            vec![
-                TcpPortClassRule {
-                    port: 22,
-                    class: TcpTrafficClass::Fixed(TrafficClass::Control),
-                },
-                TcpPortClassRule {
-                    port: 443,
-                    class: TcpTrafficClass::Fixed(TrafficClass::Interactive),
-                },
-            ]
+    fn fixed_tcp_traffic_modes_are_not_user_configurable() {
+        assert!(
+            Cli::try_parse_from([
+                "mptunnel",
+                "--secret",
+                "0123456789abcdef",
+                "client",
+                "--default-tcp-class",
+                "bulk",
+                "--tcp-class-rule",
+                "22=control",
+                "--tcp-class-rule",
+                "443:interactive",
+                "--path",
+                "tcp://127.0.0.1:443",
+            ])
+            .is_err()
         );
 
-        let cli = Cli::try_parse_from([
-            "mptunnel",
-            "--secret",
-            "0123456789abcdef",
-            "client",
-            "--tcp-class-rule",
-            "443=bulk",
-            "--tcp-class-rule",
-            "443=interactive",
-            "--path",
-            "tcp://127.0.0.1:443",
-        ])
-        .expect("parse cli");
-
-        assert!(matches!(
-            cli.into_config(),
-            Err(CliConfigError::Config(
-                crate::config::ConfigError::DuplicateTcpClassRule { port: 443 }
-            ))
-        ));
+        assert!(
+            Cli::try_parse_from([
+                "mptunnel",
+                "--secret",
+                "0123456789abcdef",
+                "client",
+                "--tcp-class-rule",
+                "443=bulk",
+                "--tcp-class-rule",
+                "443=interactive",
+                "--path",
+                "tcp://127.0.0.1:443",
+            ])
+            .is_err()
+        );
     }
 }

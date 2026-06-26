@@ -51,14 +51,9 @@ mptunnel --check-config client \
   --ingress socks5 \
   --listen 127.0.0.1:1080 \
   --listen '[::1]:1080' \
-  --path-probe-interval-ms 10000 \
-  --path-probe-timeout-ms 2000 \
-  --default-tcp-class auto \
-  --tcp-class-rule 22=control \
-  --tcp-class-rule 8443=bulk \
-  --path 'tcp://203.0.113.10:443?srtt-ms=20&rate-mbps=30&low-latency=true' \
-  --path 'tcp://203.0.113.11:443?srtt-ms=180&rate-mbps=300' \
-  --path 'udp://203.0.113.10:443?srtt-ms=20&rate-mbps=30'
+  --path tcp://203.0.113.10:443 \
+  --path tcp://203.0.113.11:443 \
+  --path udp://203.0.113.10:443
 ```
 
 Proxy ingress accepts repeated or comma-separated `--listen` addresses, so IPv4 and IPv6 listeners can be configured explicitly without relying on platform-specific dual-stack socket defaults.
@@ -77,8 +72,8 @@ mptunnel --check-config client \
   --tun-mtu 1500 \
   --tun-dns-resolver 1.1.1.1:53 \
   --tun-dns-resolver '[2606:4700:4700::1111]:53' \
-  --path 'tcp://203.0.113.10:443?srtt-ms=20&rate-mbps=30&low-latency=true' \
-  --path 'udp://203.0.113.10:443?srtt-ms=20&rate-mbps=30'
+  --path tcp://203.0.113.10:443 \
+  --path udp://203.0.113.10:443
 ```
 
 For IPv6-only TUN ingress, add `--tun-disable-ipv4` and provide `--tun-ipv6`.
@@ -122,7 +117,7 @@ mptunnel --check-config \
   --path tcp://127.0.0.1:7443
 ```
 
-Path URI query parameters seed the runtime scheduler before live health observations exist. Supported path hints are:
+Normal client launches only need endpoint paths. Optional path URI query parameters can seed the runtime scheduler before live health observations exist, but Auto must correct those hints from measured link status and flow demand. Supported path hints are:
 
 - `srtt-ms`, `rtt-ms`, `jitter-ms`
 - `rate-bps`, `rate-kbps`, `rate-mbps`, `rate=unknown`, `rate=unlimited`
@@ -131,7 +126,7 @@ Path URI query parameters seed the runtime scheduler before live health observat
 
 Boolean hints accept `true`, `false`, `1`, `0`, `yes`, `no`, `on`, and `off`; bare boolean hints mean `true`.
 
-TCP ingress traffic class policy is port-based at stream open and adaptive during relay. `--default-tcp-class` accepts `auto`, `control`, `interactive`, `bulk`, or `background`; the default `auto` starts TCP streams latency-first and promotes sustained larger flows toward bulk scheduling and larger adaptive inflight/chunk budgets from live BDP, queue, jitter, and loss observations. `--tcp-class-rule` accepts repeated or comma-separated `port=class` and `port:class` rules. Explicit non-`auto` rules are fixed overrides. `realtime-datagram` is reserved for UDP datagram flows and is not valid for TCP class rules.
+TCP ingress is always adaptive Auto. There is no fixed user-selectable transmission mode. New TCP streams start latency-first for browsing, SSH, and other small interactive demand, then promote sustained larger transfers toward throughput-first scheduling when live byte counts, BDP, delivery rate, queue pressure, jitter, loss, and repair state show bulk demand. Auto can switch back toward latency-sensitive scoring for tails, stalls, congestion, or path failures, so low latency and high throughput are chosen from current link status and client/server flow behavior instead of hardcoded port rules.
 
 Global resource limits are configurable and validated before runtime starts:
 
@@ -187,8 +182,6 @@ Common environment variables:
 - `MPTUNNEL_TUN_DNS_TTL_MS`
 - `MPTUNNEL_PATH_PROBE_INTERVAL_MS`
 - `MPTUNNEL_PATH_PROBE_TIMEOUT_MS`
-- `MPTUNNEL_DEFAULT_TCP_CLASS`
-- `MPTUNNEL_TCP_CLASS_RULES`
 - `MPTUNNEL_OUTBOUND`
 - `MPTUNNEL_OUTBOUND_BIND_IP`
 - `MPTUNNEL_UPSTREAM_SOCKS5`
@@ -216,9 +209,9 @@ The current runtime exposes local SOCKS5, HTTP CONNECT, and TUN L4 ingress.
 
 SOCKS5 and HTTP CONNECT ingress support explicit IPv4/IPv6 dual-stack operation through repeated `--listen` values such as `127.0.0.1:1080` and `[::1]:1080`. TUN, server bind paths, outbound DNS resolvers, upstream proxy endpoints, and direct target addresses all preserve IPv4 and IPv6 socket addresses; DNS resolution order is controlled by `--outbound-dns-strategy`.
 
-TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, upstream HTTP CONNECT, or `http-connect-udp` using ordinary CONNECT for TCP targets. Each configured TCP path is managed as a lazy persistent encrypted path session, and multiple local SOCKS5/HTTP CONNECT streams can multiplex over the same authenticated TCP path instead of creating a fresh internal TCP connection for every proxy stream. When several TCP paths are configured, stream setup classifies each target with the configured TCP traffic policy, then uses scheduler ETA scoring from path hints, current path health, observed delivery rate, active stream load, and the selected class. The default `auto` policy opens streams as interactive, promotes sustained flows to bulk from live BDP/resource observations, and can detach and reattach the same logical stream to a better bulk path without closing the remote TCP target. It retries the next schedulable path after path-level open failures. Active TCP streams use one logical stream ID across TCP path sessions; when a path fails, the client can re-open that logical stream on a survivor path and replay unacknowledged data from the reliable-stream repair cache, while the server reattaches the same outbound TCP connection through its shared stream registry. Successful opens feed measured latency and live load back into later path choices; completed relays feed measured payload delivery rate after enough useful payload has been observed and release that load, while failed opens put the path into a short cooldown before probing resumes. The relay caps unacknowledged TCP-underlay stream payload with `--max-tcp-path-inflight-bytes`, and uses adaptive effective inflight/chunk budgets under that cap from live BDP, queue, jitter, loss, and traffic class, so local reads pause until end-to-end tunnel ACKs free budget instead of burying unlimited data in a kernel TCP send buffer. TCP path sessions send encrypted internal `PING`/`PONG` heartbeats using `--tcp-path-heartbeat-interval-ms` and `--tcp-path-heartbeat-timeout-ms`; a heartbeat timeout fails the path, releases live stream load, and lets later scheduling avoid that path until probes recover it. The TCP path-session reader is isolated from writer/heartbeat scheduling so encrypted frame reads are not cancelled mid-frame. The client also runs bounded authenticated path probes on the configured interval, using `PING`/`PONG` after `PATH_JOIN` so TCP path health can recover without opening remote target connections.
+TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, upstream HTTP CONNECT, or `http-connect-udp` using ordinary CONNECT for TCP targets. Each configured TCP path is managed as a lazy persistent encrypted path session, and multiple local SOCKS5/HTTP CONNECT streams can multiplex over the same authenticated TCP path instead of creating a fresh internal TCP connection for every proxy stream. When several TCP paths are configured, stream setup starts in Auto latency-first mode, then uses scheduler ETA scoring from path hints, current path health, observed delivery rate, active stream load, and live demand. Auto promotes sustained flows to bulk from live BDP/resource observations, can detach and reattach the same logical stream to a better bulk path without closing the remote TCP target, and returns to repair/latency-sensitive behavior for stalls, failures, and tails. It retries the next schedulable path after path-level open failures. Active TCP streams use one logical stream ID across TCP path sessions; when a path fails, the client can re-open that logical stream on a survivor path and replay unacknowledged data from the reliable-stream repair cache, while the server reattaches the same outbound TCP connection through its shared stream registry. Successful opens feed measured latency and live load back into later path choices; completed relays feed measured payload delivery rate after enough useful payload has been observed and release that load, while failed opens put the path into a short cooldown before probing resumes. The relay caps unacknowledged TCP-underlay stream payload with `--max-tcp-path-inflight-bytes`, and uses adaptive effective inflight/chunk budgets under that cap from live BDP, queue, jitter, loss, and Auto's current internal class, so local reads pause until end-to-end tunnel ACKs free budget instead of burying unlimited data in a kernel TCP send buffer. TCP path sessions send encrypted internal `PING`/`PONG` heartbeats using `--tcp-path-heartbeat-interval-ms` and `--tcp-path-heartbeat-timeout-ms`; a heartbeat timeout fails the path, releases live stream load, and lets later scheduling avoid that path until probes recover it. The TCP path-session reader is isolated from writer/heartbeat scheduling so encrypted frame reads are not cancelled mid-frame. The client also runs bounded authenticated path probes on the configured interval, using `PING`/`PONG` after `PATH_JOIN` so TCP path health can recover without opening remote target connections.
 
-SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. Datagrams are acknowledged with internal `DGRAM_FEEDBACK` ranges; client-side ACK observations update UDP path RTT, jitter, loss, and delivery-rate inputs for later scheduling, while response datagrams are acknowledged back to the server. When several UDP paths are configured, one local UDP association can keep multiple encrypted UDP path sessions active under one logical session ID. It opens additional eligible paths before paced reuse, uses a BBR-style runtime model from observed delivery rate, RTT, jitter, and loss to pace sends and set response timeouts, probes encrypted UDP path MTU before sending larger datagrams, records measured MTU in path health, and retries a timed-out datagram on a survivor path. Request blackholes mark the path failed; ACKed request/response-loss timeouts record packet loss without declaring the whole path dead. UDP session setup still uses scheduler inputs, adaptive health records, datagram freshness TTL, observed delivery rate, measured MTU, and active association load, then retries after path-level handshake failures. Closed associations feed measured datagram delivery rate after enough useful payload has been observed and release their scheduler load. The same bounded authenticated probe loop exercises UDP path handshakes and `PING`/`PONG` without opening datagram flows. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
+SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. Datagrams are acknowledged with internal `DGRAM_FEEDBACK` ranges; client-side ACK observations update UDP path RTT, jitter, loss, and delivery-rate inputs for later scheduling, while response datagrams are acknowledged back to the server. When several UDP paths are configured, one local UDP association can use multiple encrypted UDP path sessions under one logical session ID, but realtime datagrams prefer the ready lowest-ETA path instead of spraying ordinary probes across high-RTT paths. It opens survivor paths for retry, MTU probing, pacing pressure, and failure recovery, uses a BBR-style runtime model from observed delivery rate, RTT, jitter, and loss to pace sends and set response timeouts, probes encrypted UDP path MTU before sending larger datagrams, records measured MTU in path health, and retries a timed-out datagram on a survivor path. Request blackholes mark the path failed; ACKed request/response-loss timeouts record packet loss without declaring the whole path dead. UDP session setup still uses scheduler inputs, adaptive health records, datagram freshness TTL, observed delivery rate, measured MTU, and active association load, then retries after path-level handshake failures. Closed associations feed measured datagram delivery rate after enough useful payload has been observed and release their scheduler load. The same bounded authenticated probe loop exercises UDP path handshakes and `PING`/`PONG` without opening datagram flows. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
 
 TUN L4 ingress uses `tun-rs` for cross-platform TUN device creation and `netstack-smoltcp` for user-space TCP/UDP flow translation. TCP packets accepted from the TUN stack become encrypted internal reliable streams with `IngressKind::TunTcp`; UDP packets are demuxed by local/remote socket pair into bounded per-flow tasks and sent as encrypted internal datagram flows with `IngressKind::TunUdp`. TUN supports IPv4, IPv6, or dual-stack addressing. UDP port 53 traffic can be explicitly remapped to configured `--tun-dns-resolver` addresses while responses are written back to the TUN client as if they came from the original DNS destination, so DNS traffic can pass through TUN without relying on host resolver defaults.
 

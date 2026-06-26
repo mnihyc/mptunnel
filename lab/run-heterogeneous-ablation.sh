@@ -17,8 +17,6 @@ udp_count="${UDP_COUNT:-60}"
 udp_payload_bytes="${UDP_PAYLOAD_BYTES:-512}"
 udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
-path_probe_interval_ms="${PATH_PROBE_INTERVAL_MS:-10000}"
-path_probe_timeout_ms="${PATH_PROBE_TIMEOUT_MS:-5000}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 case_filter="${CASE_FILTER:-}"
@@ -180,6 +178,13 @@ start_client() {
   local profile="$1"
   shift
   local path_args="$*"
+  local probe_args=""
+  if [[ -n "${PATH_PROBE_INTERVAL_MS:-}" ]]; then
+    probe_args="${probe_args} --path-probe-interval-ms '${PATH_PROBE_INTERVAL_MS}'"
+  fi
+  if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
+    probe_args="${probe_args} --path-probe-timeout-ms '${PATH_PROBE_TIMEOUT_MS}'"
+  fi
   stop_client
   exec_in client "\
     MPTUNNEL_LOG=info /workspace/target/release/mptunnel \
@@ -187,8 +192,7 @@ start_client() {
       client \
       --ingress socks5 \
       --listen 127.0.0.1:${proxy_port} \
-      --path-probe-interval-ms '${path_probe_interval_ms}' \
-      --path-probe-timeout-ms '${path_probe_timeout_ms}' \
+      ${probe_args} \
       ${path_args} \
       >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
   sleep 1
@@ -247,14 +251,22 @@ start_target_services
 apply_netem apply
 start_server
 
-tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=30&low-latency=true'"
-tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
-tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
+if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=30&low-latency=true'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
+  udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=30&low-latency=true'"
+  udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
+  udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
+else
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}'"
+  udp_lowlat="--path 'udp://172.31.10.20:${server_port}'"
+  udp_fat="--path 'udp://172.31.20.20:${server_port}'"
+  udp_poor="--path 'udp://172.31.30.20:${server_port}'"
+fi
 tcp_all="${tcp_lowlat} ${tcp_fat} ${tcp_poor}"
-
-udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=30&low-latency=true'"
-udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
-udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
 udp_all="${udp_lowlat} ${udp_fat} ${udp_poor}"
 
 if should_run_case "direct_low_latency"; then

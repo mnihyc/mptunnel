@@ -1,0 +1,76 @@
+services:
+  client:
+    build:
+      context: ..
+      dockerfile: lab/docker/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    command: sleep infinity
+    networks:
+      path_lowlat:
+        ipv4_address: 172.31.10.10
+      path_fat:
+        ipv4_address: 172.31.20.10
+      path_poor:
+        ipv4_address: 172.31.30.10
+
+  server:
+    build:
+      context: ..
+      dockerfile: lab/docker/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    command: sleep infinity
+    networks:
+      path_lowlat:
+        ipv4_address: 172.31.10.20
+      path_fat:
+        ipv4_address: 172.31.20.20
+      path_poor:
+        ipv4_address: 172.31.30.20
+      target_net:
+        ipv4_address: 172.31.40.20
+
+  target:
+    build:
+      context: ..
+      dockerfile: lab/docker/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace
+    command: sleep infinity
+    networks:
+      path_lowlat:
+        ipv4_address: 172.31.10.30
+      path_fat:
+        ipv4_address: 172.31.20.30
+      path_poor:
+        ipv4_address: 172.31.30.30
+      target_net:
+        ipv4_address: 172.31.40.30
+
+networks:
+  path_lowlat:
+    ipam:
+      config:
+        - subnet: 172.31.10.0/24
+  path_fat:
+    ipam:
+      config:
+        - subnet: 172.31.20.0/24
+  path_poor:
+    ipam:
+      config:
+        - subnet: 172.31.30.0/24
+  target_net:
+    ipam:
+      config:
+        - subnet: 172.31.40.0/24

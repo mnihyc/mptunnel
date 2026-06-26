@@ -10,13 +10,13 @@ pub struct ReleaseTarget {
 
 pub const RELEASE_TARGETS: &[ReleaseTarget] = &[
     ReleaseTarget {
-        triple: "x86_64-unknown-linux-gnu",
+        triple: "x86_64-unknown-linux-musl",
         os: "linux",
         arch: "amd64",
         artifact_ext: "tar.gz",
     },
     ReleaseTarget {
-        triple: "aarch64-unknown-linux-gnu",
+        triple: "aarch64-unknown-linux-musl",
         os: "linux",
         arch: "aarch64",
         artifact_ext: "tar.gz",

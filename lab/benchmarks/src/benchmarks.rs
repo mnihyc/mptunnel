@@ -1,15 +1,15 @@
-use crate::config::ResourceLimits;
-use crate::protocol::{PathId, TrafficClass, UnderlayProtocol};
-use crate::scheduler::{PathSnapshot, SchedulerPolicy};
-use crate::simulator::{Simulator, VirtualPath};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
+use mptunnel::config::ResourceLimits;
+use mptunnel::protocol::{PathId, TrafficClass, UnderlayProtocol};
+use mptunnel::scheduler::{PathSnapshot, SchedulerPolicy};
+use mptunnel::simulator::{Simulator, VirtualPath};
 use serde::Serialize;
 use std::hint::black_box;
 use std::time::Instant;
 
-const PROFILE: &str = "release-gates-v1";
+const PROFILE: &str = "developer-gates-v1";
 const MIB: usize = 1024 * 1024;
 const GIB_BYTES: f64 = 1024.0 * 1024.0 * 1024.0;
 pub const MAX_RESOURCE_SAMPLE_MIB: u32 = 1024;
@@ -249,6 +249,174 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
         passed,
         gates,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AblationReport {
+    pub profile: String,
+    pub rows: Vec<AblationRow>,
+}
+
+impl AblationReport {
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str("mptunnel deterministic ablation report\n");
+        out.push_str(&format!("profile: {}\n", self.profile));
+        out.push_str("rows:\n");
+        for row in &self.rows {
+            out.push_str(&format!(
+                "  {}: page_p95={:.3} ms, download={:.3} Mbps, aggregation={:.3}, failover_gap={:.3} ms, repaired_chunks={}\n",
+                row.name,
+                row.page_interactive_p95_ms,
+                row.download_goodput_mbps,
+                row.aggregation_efficiency,
+                row.failover_gap_ms,
+                row.repaired_chunks
+            ));
+        }
+        out
+    }
+
+    pub fn render_json(&self) -> Result<String, BenchmarkError> {
+        serde_json::to_string_pretty(self).map_err(BenchmarkError::Serialize)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AblationRow {
+    pub name: String,
+    pub path_profile: String,
+    pub scheduler_profile: String,
+    pub page_interactive_p95_ms: f64,
+    pub download_goodput_mbps: f64,
+    pub aggregation_efficiency: f64,
+    pub failover_gap_ms: f64,
+    pub repaired_chunks: usize,
+}
+
+pub fn run_ablation_study() -> AblationReport {
+    let rows = vec![
+        ablation_row(
+            "single_low_latency",
+            "low_latency_only",
+            "default",
+            vec![download_paths()[0]],
+            SchedulerPolicy::default(),
+        ),
+        ablation_row(
+            "single_high_bandwidth",
+            "high_bandwidth_only",
+            "default",
+            vec![download_paths()[1]],
+            SchedulerPolicy::default(),
+        ),
+        ablation_row(
+            "single_poor_internet",
+            "poor_internet_only",
+            "default",
+            vec![download_paths()[2]],
+            SchedulerPolicy::default(),
+        ),
+        ablation_row(
+            "multipath_full",
+            "heterogeneous_all_links",
+            "default",
+            download_paths(),
+            SchedulerPolicy::default(),
+        ),
+        ablation_row(
+            "multipath_no_tail_avoidance",
+            "heterogeneous_all_links",
+            "tail_avoidance_disabled",
+            download_paths(),
+            SchedulerPolicy {
+                tail_avoidance_threshold_bytes: 0,
+                ..SchedulerPolicy::default()
+            },
+        ),
+        ablation_row(
+            "multipath_no_duplication",
+            "heterogeneous_all_links",
+            "duplication_disabled",
+            download_paths(),
+            SchedulerPolicy {
+                duplication_max_payload_bytes: 0,
+                ..SchedulerPolicy::default()
+            },
+        ),
+        ablation_row(
+            "multipath_no_shared_bottleneck_penalty",
+            "heterogeneous_all_links",
+            "shared_bottleneck_penalty_disabled",
+            download_paths(),
+            SchedulerPolicy {
+                shared_bottleneck_queue_penalty_ms: 0.0,
+                ..SchedulerPolicy::default()
+            },
+        ),
+    ];
+    AblationReport {
+        profile: "deterministic-ablation-v1".to_string(),
+        rows,
+    }
+}
+
+fn ablation_row(
+    name: &str,
+    path_profile: &str,
+    scheduler_profile: &str,
+    paths: Vec<VirtualPath>,
+    policy: SchedulerPolicy,
+) -> AblationRow {
+    let mut page_simulator = Simulator::new(policy, paths.clone());
+    page_simulator
+        .schedule_transfer(TrafficClass::Bulk, 128 * MIB, MIB)
+        .expect("ablation paths schedule background bulk");
+    let page_interactive_p95_ms = page_simulator
+        .route_interactive_burst(1024, 20, 5.0)
+        .expect("ablation paths schedule interactive burst")
+        .p95_latency_ms()
+        .expect("interactive burst is nonempty");
+
+    let mut download_simulator = Simulator::new(policy, paths.clone());
+    let download = download_simulator
+        .schedule_transfer(TrafficClass::Bulk, 512 * MIB, MIB)
+        .expect("ablation paths schedule file download");
+
+    let mut failover_simulator = Simulator::new(policy, failover_paths_for(paths));
+    let failover = failover_simulator
+        .schedule_transfer_with_repair(TrafficClass::Bulk, 8 * MIB, 256 * 1024, 10.0)
+        .expect("ablation paths schedule repaired transfer");
+
+    AblationRow {
+        name: name.to_string(),
+        path_profile: path_profile.to_string(),
+        scheduler_profile: scheduler_profile.to_string(),
+        page_interactive_p95_ms,
+        download_goodput_mbps: download.achieved_goodput_bps() / 1_000_000.0,
+        aggregation_efficiency: download.aggregation_efficiency(mbps(1_000.0)),
+        failover_gap_ms: failover.failover_gap_ms.unwrap_or(f64::INFINITY),
+        repaired_chunks: failover.repaired_chunks,
+    }
+}
+
+fn failover_paths_for(paths: Vec<VirtualPath>) -> Vec<VirtualPath> {
+    let mut snapshots = paths
+        .into_iter()
+        .map(|path| path.snapshot)
+        .collect::<Vec<_>>();
+    if snapshots.len() < 2 {
+        snapshots.push(PathSnapshot::new(
+            PathId(99),
+            UnderlayProtocol::Udp,
+            80.0,
+            mbps(160.0),
+        ));
+    }
+    vec![
+        VirtualPath::new(snapshots[0]).with_failure_at(70.0),
+        VirtualPath::new(snapshots[1]),
+    ]
 }
 
 fn at_most(name: &str, metric: &str, value: f64, threshold: f64, unit: &str) -> BenchmarkGate {
@@ -528,7 +696,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn release_benchmark_gates_pass() {
+    fn developer_benchmark_gates_pass() {
         let report = run_benchmarks(BenchmarkOptions {
             resource_sample_mib: 1,
         })
@@ -566,8 +734,23 @@ mod tests {
         let json = report.render_json().expect("json");
 
         assert!(json.contains("\"profile\""));
-        assert!(json.contains("\"release-gates-v1\""));
+        assert!(json.contains("\"developer-gates-v1\""));
         assert!(json.contains("\"gates\""));
+    }
+
+    #[test]
+    fn ablation_report_compares_single_and_multipath_profiles() {
+        let report = run_ablation_study();
+
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.name == "single_low_latency")
+        );
+        assert!(report.rows.iter().any(|row| row.name == "multipath_full"));
+        let json = report.render_json().expect("json");
+        assert!(json.contains("deterministic-ablation-v1"));
     }
 
     #[test]

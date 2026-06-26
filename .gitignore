@@ -1,4 +1,8 @@
 /target/
+/lab/benchmarks/target/
+/dist/
+/lab/results/
+/lab/__pycache__/
 /AGENTS.md
 /DESIGN.md
 /PROGRESS.md

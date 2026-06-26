@@ -14,7 +14,7 @@ $Binary = "mptunnel.exe"
 $TargetDir = Join-Path "target" (Join-Path $Target $Profile)
 
 if (-not $NoBuild) {
-    cargo build --profile $Profile --target $Target
+    cargo build --profile $Profile --target $Target --bin mptunnel
 }
 
 $Metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
@@ -31,7 +31,6 @@ Copy-Item (Join-Path $TargetDir $Binary) $Stage
 Copy-Item README.md $Stage
 Copy-Item LICENSE $Stage
 Copy-Item -Recurse docs $Stage
-Copy-Item -Recurse packaging $Stage
 
 New-Item -ItemType Directory -Force $DistDir | Out-Null
 $Archive = Join-Path $DistDir "$Package.zip"

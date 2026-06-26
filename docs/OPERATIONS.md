@@ -19,19 +19,16 @@ Linux:
 - TUN backend: `/dev/net/tun` through `tun-rs`.
 - TUN privilege: run with `CAP_NET_ADMIN` or an equivalent service capability.
 - Binding ports below 1024 needs `CAP_NET_BIND_SERVICE`.
-- The supplied systemd client unit grants `CAP_NET_ADMIN`; the server unit grants `CAP_NET_BIND_SERVICE`.
 
 macOS:
 
 - TUN backend: utun through `tun-rs`.
-- TUN and route/DNS configuration require administrator-approved launchd setup.
-- Use the supplied launchd plists as service templates.
+- TUN and route/DNS configuration require administrator-approved service or launchd setup.
 
 Windows:
 
 - TUN backend: Wintun through `tun-rs`.
 - TUN mode requires Administrator rights and the Wintun driver.
-- Use `packaging/windows/install-service.ps1` from an elevated PowerShell session.
 
 ## Service Mode
 
@@ -75,7 +72,7 @@ Server path bindings use the same explicit model through repeated or comma-separ
 Local release packaging:
 
 ```bash
-scripts/package-release.sh --target x86_64-unknown-linux-gnu
+scripts/package-release.sh --target x86_64-unknown-linux-musl
 pwsh scripts/package-release.ps1 -Target x86_64-pc-windows-msvc
 ```
 
@@ -84,17 +81,48 @@ Each package contains:
 - `mptunnel` or `mptunnel.exe`
 - `README.md`
 - `LICENSE`
-- `packaging/`
+- `docs/`
 - a SHA-256 checksum next to the archive
+
+Release archives intentionally do not include `mptunnel-bench`, Docker lab scripts, generated lab results, service templates, or other developer-only tooling. The product binary is built as `--bin mptunnel`.
+
+Linux release artifacts use musl targets, not glibc targets, so they do not depend on a host glibc baseline:
+
+```bash
+scripts/package-release.sh --target x86_64-unknown-linux-musl
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+  scripts/package-release.sh --target aarch64-unknown-linux-musl
+```
 
 Release targets:
 
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 - `aarch64-pc-windows-msvc`
+
+## Tag Releases
+
+GitHub Actions publishes releases from tags that match `v*`, for example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow runs:
+
+- format, clippy, and tests for the product code
+- Linux packages through musl Rust targets
+- macOS and Windows packages through the native packaging scripts
+- artifact upload for all target archives and `.sha256` files
+- GitHub Release publication only when the workflow was triggered by a tag
+
+Manual `workflow_dispatch` runs execute the same checks and package jobs, but the publish job is skipped unless the ref is a tag.
+
+Benchmarks and Docker lab checks are manual-only processes. They are not part of CI, release checks, package jobs, or tag publication.
 
 ## Test Policy
 

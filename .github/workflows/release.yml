@@ -10,30 +10,35 @@ permissions:
   contents: write
 
 jobs:
-  benchmark-gates:
-    name: benchmark gates
+  check:
+    name: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run benchmark gates
-        run: cargo run -- bench --strict --resource-sample-mib 1
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
 
   package:
     name: package (${{ matrix.target }})
-    needs: benchmark-gates
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             shell: bash
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             shell: bash
-            cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
             shell: bash
@@ -51,21 +56,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install cross
-        if: matrix.cross == true
-        run: cargo install cross --locked
-      - name: Build Linux cross target
-        if: matrix.cross == true
-        run: cross build --release --target ${{ matrix.target }}
       - name: Package Unix
         if: matrix.shell == 'bash'
         shell: bash
-        run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            scripts/package-release.sh --target "${{ matrix.target }}" --no-build
-          else
-            scripts/package-release.sh --target "${{ matrix.target }}"
-          fi
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: scripts/package-release.sh --target "${{ matrix.target }}"
       - name: Package Windows
         if: matrix.shell == 'pwsh'
         shell: pwsh

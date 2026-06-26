@@ -37,7 +37,7 @@ if [[ "$target" == *windows* ]]; then
 fi
 
 if [[ "$build" -eq 1 ]]; then
-  cargo build --profile "$profile" --target "$target"
+  cargo build --profile "$profile" --target "$target" --bin mptunnel
 fi
 
 version="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)"
@@ -50,7 +50,6 @@ mkdir -p "$stage"
 cp "${target_dir}/${binary}" "$stage/"
 cp README.md LICENSE "$stage/"
 cp -R docs "$stage/"
-cp -R packaging "$stage/"
 
 mkdir -p "$dist_dir"
 if [[ "$target" == *windows* ]]; then

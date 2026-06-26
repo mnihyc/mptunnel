@@ -7,17 +7,16 @@
 ```bash
 cargo build
 cargo test
-cargo run -- bench --strict
 ```
 
 Cross-platform release archives are produced by the packaging scripts:
 
 ```bash
-scripts/package-release.sh --target x86_64-unknown-linux-gnu
+scripts/package-release.sh --target x86_64-unknown-linux-musl
 pwsh scripts/package-release.ps1 -Target x86_64-pc-windows-msvc
 ```
 
-CI checks Linux, macOS, and Windows, plus amd64/aarch64 Rust targets. Tag builds publish release archives with SHA-256 checksums.
+CI checks Linux, macOS, and Windows, plus amd64/aarch64 Rust targets. Tag builds such as `v0.1.0` publish release archives with SHA-256 checksums. Linux tag artifacts use musl targets and do not depend on glibc. Release process details are in `docs/OPERATIONS.md`.
 
 ## Configuration Check
 
@@ -27,12 +26,22 @@ Platform, TUN, service, and release-target report:
 mptunnel platform
 ```
 
-Release benchmark gates:
+Developer-only benchmark and ablation tool:
 
 ```bash
-mptunnel bench --strict
-mptunnel bench --strict --format json
+cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict
+cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation --format json
 ```
+
+Benchmarks are manual lab tooling outside the root crate and are not part of CI, release, package, or normal build workflows.
+
+Docker-only heterogeneous network lab:
+
+```bash
+lab/run-heterogeneous-ablation.sh
+```
+
+The lab emulates low-latency, cross-continent high-bandwidth, and poor-Internet paths at the same time, then records direct, single-path, multipath, UDP, and failover comparison results under `lab/results/`. It mutates Docker network namespaces only.
 
 Client-side proxy ingress:
 
@@ -198,9 +207,6 @@ Common environment variables:
 - `MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES`
 - `MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS`
 - `MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS`
-- `MPTUNNEL_BENCH_STRICT`
-- `MPTUNNEL_BENCH_FORMAT`
-- `MPTUNNEL_BENCH_RESOURCE_SAMPLE_MIB`
 
 ## Current Runtime Scope
 
@@ -218,7 +224,7 @@ UDP targets can be reached through direct UDP, bind-source-IP direct UDP, upstre
 
 Server direct and bind-source outbounds resolve domain targets through `--outbound-dns-resolver` when configured, or the system resolver when no explicit resolver is supplied. `--outbound-dns-strategy` controls IPv4/IPv6 lookup ordering and filtering for dual-stack targets.
 
-`--service-mode --supervise` is intended for systemd, launchd, and Windows Service Control Manager deployments. It restarts the runtime after top-level listener/device failures with exponential backoff controlled by `--restart-backoff-ms`, `--restart-max-backoff-ms`, and `--max-restarts`. Service templates and env examples are in `packaging/`; operational details are in `docs/OPERATIONS.md`.
+`--service-mode --supervise` is intended for systemd, launchd, Windows Service Control Manager, or another process supervisor. It restarts the runtime after top-level listener/device failures with exponential backoff controlled by `--restart-backoff-ms`, `--restart-max-backoff-ms`, and `--max-restarts`. Operational details are in `docs/OPERATIONS.md`.
 
 ## Scheduler Regression Gates
 
@@ -234,6 +240,6 @@ The deterministic simulator exercises the scheduler against heterogeneous path c
 - duplication of small control/realtime packets onto a second close-ETA path
 - shared-bottleneck suspicion that avoids a low-RTT path when a similar-RTT peer is already queued
 
-## Release Benchmark Gates
+## Developer Benchmark Gates
 
-`mptunnel bench --strict` runs the public release benchmark profile. It checks modeled page-load completion, interactive p95 under bulk load, video startup/rebuffering, file-download goodput, aggregation efficiency, failover recovery gap, repaired chunks, local AEAD CPU cost for ChaCha20-Poly1305 and AES-256-GCM, and default RAM budgets. Details are in `docs/BENCHMARKS.md`.
+`cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict` runs the manual developer regression profile. It checks modeled page-load completion, interactive p95 under bulk load, video startup/rebuffering, file-download goodput, aggregation efficiency, failover recovery gap, repaired chunks, local AEAD CPU cost for ChaCha20-Poly1305 and AES-256-GCM, and default RAM budgets. `cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation` compares single-link, multipath, and scheduler-ablation profiles. Docker lab comparisons are documented in `docs/LAB.md`.

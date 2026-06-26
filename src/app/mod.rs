@@ -1,5 +1,4 @@
-use crate::benchmarks::{BenchmarkError, BenchmarkOptions};
-use crate::cli::{BenchmarkFormatArg, Cli, CliConfigError, Command};
+use crate::cli::{Cli, CliConfigError, Command};
 use crate::config::AppConfig;
 use std::time::Duration;
 
@@ -13,20 +12,6 @@ pub fn run(cli: Cli) -> Result<(), AppError> {
             "{}",
             crate::platform::PlatformReport::current().render_text()
         );
-        return Ok(());
-    }
-    if let Command::Bench(args) = &cli.command {
-        let options = BenchmarkOptions::new(args.resource_sample_mib)?;
-        let report = crate::benchmarks::run_benchmarks(options)?;
-        match args.format {
-            BenchmarkFormatArg::Text => print!("{}", report.render_text()),
-            BenchmarkFormatArg::Json => println!("{}", report.render_json()?),
-        }
-        if args.strict && !report.passed {
-            return Err(AppError::Benchmark(BenchmarkError::GateFailures(
-                report.failure_count(),
-            )));
-        }
         return Ok(());
     }
     let config = build_config(cli)?;
@@ -86,7 +71,6 @@ pub enum AppError {
     Config(CliConfigError),
     Runtime(crate::runtime::RuntimeError),
     BuildRuntime(std::io::Error),
-    Benchmark(BenchmarkError),
 }
 
 impl From<CliConfigError> for AppError {
@@ -101,19 +85,12 @@ impl From<crate::runtime::RuntimeError> for AppError {
     }
 }
 
-impl From<BenchmarkError> for AppError {
-    fn from(value: BenchmarkError) -> Self {
-        Self::Benchmark(value)
-    }
-}
-
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(err) => write!(f, "{err}"),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::BuildRuntime(err) => write!(f, "failed to build async runtime: {err}"),
-            Self::Benchmark(err) => write!(f, "{err}"),
         }
     }
 }

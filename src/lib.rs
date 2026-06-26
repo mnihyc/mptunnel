@@ -1,5 +1,4 @@
 pub mod app;
-pub mod benchmarks;
 pub mod cli;
 pub mod config;
 pub mod ingress;

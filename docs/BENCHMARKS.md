@@ -1,22 +1,31 @@
-# Benchmarks
+# Developer Benchmarks
 
-`mptunnel bench` runs the release benchmark gates used to protect browsing smoothness, video startup, file-download aggregation, failover recovery, CPU cost, and memory budgets.
-
-```bash
-cargo run -- bench --strict
-```
-
-JSON output is available for CI artifacts and dashboards:
+`mptunnel-bench` is a manual developer/lab tool under `lab/benchmarks/`. It is outside the root crate, is intentionally not part of the release `mptunnel` binary, is not packaged in release archives, and is not built or run by CI/release workflows.
 
 ```bash
-cargo run -- bench --strict --format json
+cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict
 ```
 
-The command is safe to run on a normal host. It uses deterministic scheduler/runtime models and a bounded local AEAD hot-path sample. It does not create TUN devices, alter routes, change DNS, bind privileged service state, or modify host networking.
+JSON output is available for saved lab reports and dashboards:
+
+```bash
+cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict --format json
+```
+
+The gate command is safe to run on a normal host. It uses deterministic scheduler/runtime models and a bounded local AEAD hot-path sample. It does not create TUN devices, alter routes, change DNS, bind privileged service state, or modify host networking.
+
+Deterministic ablation output is also available:
+
+```bash
+cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation
+cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation --format json
+```
+
+The ablation report compares single low-latency, single high-bandwidth, single poor-Internet, full multipath, and scheduler-ablation profiles. These are model comparisons only; Docker lab tests are required before making external performance claims.
 
 ## Gates
 
-The current release profile is `release-gates-v1`.
+The current developer profile is `developer-gates-v1`.
 
 | Gate | Metric | Requirement |
 | --- | --- | --- |
@@ -45,7 +54,7 @@ The CPU gates benchmark both ChaCha20-Poly1305 and AES-256-GCM because supported
 : Print a human-readable report or machine-readable JSON.
 
 `--resource-sample-mib <N>`
-: Set the bounded local crypto sample size in MiB, from 1 through 1024. CI uses a small sample for speed; release and local validation can use the default larger sample.
+: Set the bounded local crypto sample size in MiB, from 1 through 1024. Manual quick checks can use a small sample for speed; manual local validation can use the default larger sample.
 
 Environment variables:
 
@@ -53,12 +62,6 @@ Environment variables:
 - `MPTUNNEL_BENCH_FORMAT`
 - `MPTUNNEL_BENCH_RESOURCE_SAMPLE_MIB`
 
-## CI
+## Build Policy
 
-CI runs:
-
-```bash
-cargo run -- bench --strict --resource-sample-mib 1
-```
-
-Release packaging depends on the same gate, so archives are produced only after the benchmark profile passes.
+CI and release workflows do not build or run this benchmark crate. Benchmarks are manual lab checks only. Normal root-level `cargo build`, `cargo test`, `cargo clippy`, target checks, and release packaging build only the product crate and `--bin mptunnel`.

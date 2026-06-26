@@ -75,6 +75,7 @@ pub struct PathMetadata {
     pub initial_srtt_ms: Option<u32>,
     pub initial_jitter_ms: Option<u32>,
     pub initial_rate: RateHint,
+    pub initial_mtu_payload_bytes: Option<usize>,
 }
 
 impl Default for PathMetadata {
@@ -84,6 +85,7 @@ impl Default for PathMetadata {
             initial_srtt_ms: None,
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
+            initial_mtu_payload_bytes: None,
         }
     }
 }
@@ -126,6 +128,7 @@ fn parse_path_metadata(query: &str) -> Result<PathMetadata, PathSpecParseError> 
     let mut srtt_set = false;
     let mut jitter_set = false;
     let mut rate_set = false;
+    let mut mtu_set = false;
     for part in query.split('&') {
         if part.is_empty() {
             return Err(PathSpecParseError::EmptyQueryParam);
@@ -183,6 +186,11 @@ fn parse_path_metadata(query: &str) -> Result<PathMetadata, PathSpecParseError> 
                     }
                 };
             }
+            "mtu" | "mtu-bytes" | "payload-mtu" => {
+                reject_duplicate(mtu_set, key)?;
+                mtu_set = true;
+                metadata.initial_mtu_payload_bytes = Some(parse_mtu_param(key, value)?);
+            }
             "backup" => metadata.capabilities.backup = parse_bool_param(key, value)?,
             "expensive" => metadata.capabilities.expensive = parse_bool_param(key, value)?,
             "low-latency" => metadata.capabilities.low_latency = parse_bool_param(key, value)?,
@@ -218,6 +226,22 @@ fn parse_u64_param(key: &str, value: Option<&str>) -> Result<u64, PathSpecParseE
     value
         .parse::<u64>()
         .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
+}
+
+fn parse_mtu_param(key: &str, value: Option<&str>) -> Result<usize, PathSpecParseError> {
+    const MIN_MTU: usize = 512;
+    const MAX_MTU: usize = 65_000;
+    let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
+    let mtu = value.parse::<usize>().map_err(|_| {
+        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+    })?;
+    if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        ));
+    }
+    Ok(mtu)
 }
 
 fn parse_bool_param(key: &str, value: Option<&str>) -> Result<bool, PathSpecParseError> {
@@ -325,7 +349,7 @@ mod tests {
         let tcp = "tcp://example.com:443?srtt-ms=20&rate-mbps=30&low-latency=true"
             .parse::<PathSpec>()
             .expect("tcp");
-        let udp = "udp://[2001:db8::1]:8443?jitter-ms=5&rate-bps=100000000"
+        let udp = "udp://[2001:db8::1]:8443?jitter-ms=5&rate-bps=100000000&mtu=1400"
             .parse::<PathSpec>()
             .expect("udp");
 
@@ -346,6 +370,7 @@ mod tests {
             udp.metadata.initial_rate,
             RateHint::BitsPerSecond(100_000_000)
         );
+        assert_eq!(udp.metadata.initial_mtu_payload_bytes, Some(1400));
     }
 
     #[test]
@@ -364,5 +389,6 @@ mod tests {
                 .parse::<PathSpec>()
                 .is_err()
         );
+        assert!("udp://example.com:443?mtu=100".parse::<PathSpec>().is_err());
     }
 }

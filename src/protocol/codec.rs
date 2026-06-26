@@ -195,6 +195,28 @@ fn encode_payload(
             put_u8(out, close_reason_to_u8(*reason));
             Ok(FrameKind::PathClose)
         }
+        Frame::PathMtuProbe {
+            path_id,
+            probe_id,
+            payload,
+        } => {
+            encode_payload_bytes_len(payload.len(), limits)?;
+            put_u16(out, path_id.0);
+            put_u64(out, *probe_id);
+            put_u32(out, payload.len() as u32);
+            out.extend_from_slice(payload);
+            Ok(FrameKind::PathMtuProbe)
+        }
+        Frame::PathMtuAck {
+            path_id,
+            probe_id,
+            payload_bytes,
+        } => {
+            put_u16(out, path_id.0);
+            put_u64(out, *probe_id);
+            put_u32(out, *payload_bytes);
+            Ok(FrameKind::PathMtuAck)
+        }
         Frame::OpenStream {
             stream_id,
             target,
@@ -382,6 +404,21 @@ fn decode_payload(
         FrameKind::PathClose => Ok(Frame::PathClose {
             path_id: PathId(reader.get_u16()?),
             reason: close_reason_from_u8(reader.get_u8()?)?,
+        }),
+        FrameKind::PathMtuProbe => {
+            let path_id = PathId(reader.get_u16()?);
+            let probe_id = reader.get_u64()?;
+            let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
+            Ok(Frame::PathMtuProbe {
+                path_id,
+                probe_id,
+                payload,
+            })
+        }
+        FrameKind::PathMtuAck => Ok(Frame::PathMtuAck {
+            path_id: PathId(reader.get_u16()?),
+            probe_id: reader.get_u64()?,
+            payload_bytes: reader.get_u32()?,
         }),
         FrameKind::OpenStream => Ok(Frame::OpenStream {
             stream_id: StreamId(reader.get_u64()?),
@@ -922,6 +959,8 @@ enum FrameKind {
     RxRateHint = 25,
     KeyUpdate = 26,
     StreamFin = 27,
+    PathMtuProbe = 28,
+    PathMtuAck = 29,
 }
 
 impl FrameKind {
@@ -954,6 +993,8 @@ impl FrameKind {
             25 => Ok(Self::RxRateHint),
             26 => Ok(Self::KeyUpdate),
             27 => Ok(Self::StreamFin),
+            28 => Ok(Self::PathMtuProbe),
+            29 => Ok(Self::PathMtuAck),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1242,6 +1283,16 @@ mod tests {
         round_trip(Frame::PathClose {
             path_id: PathId(3),
             reason: CloseReason::ProtocolError,
+        });
+        round_trip(Frame::PathMtuProbe {
+            path_id: PathId(3),
+            probe_id: 99,
+            payload: Bytes::from_static(b"mtu-probe"),
+        });
+        round_trip(Frame::PathMtuAck {
+            path_id: PathId(3),
+            probe_id: 99,
+            payload_bytes: 9,
         });
         round_trip(Frame::DatagramFeedback {
             flow_id: DatagramFlowId(10),

@@ -48,6 +48,9 @@ const UDP_BBR_PACING_GAIN: f64 = 1.25;
 const UDP_MIN_PACING_RATE_BPS: f64 = 64_000.0;
 const UDP_MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const UDP_MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
+const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
+const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
+const UDP_MAX_MTU_PAYLOAD_BYTES: usize = 65_000;
 
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
@@ -341,6 +344,7 @@ struct ClientPathHealthRecord {
     measured_jitter_ms: Option<f64>,
     measured_rate_bps: Option<f64>,
     measured_loss_rate: Option<f64>,
+    measured_mtu_payload_bytes: Option<usize>,
     failed_until: Option<Instant>,
     active_flows: u32,
     load_bytes: u64,
@@ -355,6 +359,7 @@ impl Default for ClientPathHealthRecord {
             measured_jitter_ms: None,
             measured_rate_bps: None,
             measured_loss_rate: None,
+            measured_mtu_payload_bytes: None,
             failed_until: None,
             active_flows: 0,
             load_bytes: 0,
@@ -369,6 +374,7 @@ struct ClientPathObservation {
     measured_jitter_ms: Option<f64>,
     measured_rate_bps: Option<f64>,
     measured_loss_rate: Option<f64>,
+    measured_mtu_payload_bytes: Option<usize>,
     active_flows: u32,
     load_bytes: u64,
 }
@@ -387,6 +393,7 @@ impl ClientPathHealthRecord {
             measured_jitter_ms: self.measured_jitter_ms,
             measured_rate_bps: self.measured_rate_bps,
             measured_loss_rate: self.measured_loss_rate,
+            measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
             active_flows: self.active_flows,
             load_bytes: self.load_bytes,
         }
@@ -439,6 +446,10 @@ impl ClientPathHealthRecord {
             Some(previous) => previous.mul_add(0.875, observation.loss_rate * 0.125),
             None => observation.loss_rate,
         });
+    }
+
+    fn mark_udp_mtu(&mut self, payload_bytes: usize) {
+        self.measured_mtu_payload_bytes = Some(payload_bytes);
     }
 
     fn mark_failure(&mut self, now: Instant) {
@@ -1539,7 +1550,9 @@ impl ClientPathContext {
         Some(UdpPathRuntimeModel::from_snapshot(
             snapshot,
             ttl_ms,
-            self.mux_limits.max_payload_bytes,
+            udp_mtu_payload_bytes(path, observation, self.mux_limits.max_payload_bytes),
+            observation.measured_mtu_payload_bytes.is_some(),
+            udp_probe_ceiling_payload_bytes(self.mux_limits.max_payload_bytes),
         ))
     }
 
@@ -1669,6 +1682,18 @@ impl ClientPathContext {
         }
     }
 
+    fn mark_udp_path_mtu(&self, index: usize, payload_bytes: usize) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.mark_udp_mtu(payload_bytes);
+        }
+    }
+
     fn mark_udp_path_failure(&self, index: usize) {
         if let Some(current) = self
             .health
@@ -1687,10 +1712,18 @@ struct UdpPathRuntimeModel {
     pacing_rate_bps: f64,
     response_timeout: Duration,
     mtu_payload_bytes: usize,
+    mtu_is_measured: bool,
+    mtu_probe_ceiling_payload_bytes: usize,
 }
 
 impl UdpPathRuntimeModel {
-    fn from_snapshot(snapshot: PathSnapshot, ttl_ms: u32, mtu_payload_bytes: usize) -> Self {
+    fn from_snapshot(
+        snapshot: PathSnapshot,
+        ttl_ms: u32,
+        mtu_payload_bytes: usize,
+        mtu_is_measured: bool,
+        mtu_probe_ceiling_payload_bytes: usize,
+    ) -> Self {
         let loss_backoff = (1.0 - snapshot.loss_rate.clamp(0.0, 1.0)).clamp(0.25, 1.0);
         let pacing_rate_bps = (snapshot.delivery_rate_bps * UDP_BBR_PACING_GAIN * loss_backoff)
             .max(UDP_MIN_PACING_RATE_BPS);
@@ -1704,7 +1737,14 @@ impl UdpPathRuntimeModel {
             pacing_rate_bps,
             response_timeout,
             mtu_payload_bytes,
+            mtu_is_measured,
+            mtu_probe_ceiling_payload_bytes,
         }
+    }
+
+    fn accepts_or_can_probe(self, payload_bytes: usize) -> bool {
+        payload_bytes <= self.mtu_payload_bytes
+            || (!self.mtu_is_measured && payload_bytes <= self.mtu_probe_ceiling_payload_bytes)
     }
 
     fn pacing_interval(self, payload_bytes: usize) -> Duration {
@@ -1713,6 +1753,25 @@ impl UdpPathRuntimeModel {
         }
         Duration::from_secs_f64(payload_bytes as f64 * 8.0 / self.pacing_rate_bps)
     }
+}
+
+fn udp_mtu_payload_bytes(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+    max_payload_bytes: usize,
+) -> usize {
+    let seeded = observation
+        .measured_mtu_payload_bytes
+        .or(path.metadata.initial_mtu_payload_bytes)
+        .unwrap_or(UDP_DEFAULT_MTU_PAYLOAD_BYTES);
+    seeded.clamp(
+        UDP_MIN_MTU_PAYLOAD_BYTES,
+        udp_probe_ceiling_payload_bytes(max_payload_bytes),
+    )
+}
+
+fn udp_probe_ceiling_payload_bytes(max_payload_bytes: usize) -> usize {
+    max_payload_bytes.clamp(UDP_MIN_MTU_PAYLOAD_BYTES, UDP_MAX_MTU_PAYLOAD_BYTES)
 }
 
 fn health_observations(records: &mut [ClientPathHealthRecord]) -> Vec<ClientPathObservation> {
@@ -1771,6 +1830,7 @@ fn ordered_path_scores(
                     measured_jitter_ms: None,
                     measured_rate_bps: None,
                     measured_loss_rate: None,
+                    measured_mtu_payload_bytes: None,
                     active_flows: 0,
                     load_bytes: 0,
                 });
@@ -3183,7 +3243,13 @@ impl UdpDatagramPacer {
 }
 
 enum UdpPathSendError {
-    Timeout { path_was_acked: bool },
+    MtuExceeded {
+        limit: usize,
+    },
+    Timeout {
+        path_was_acked: bool,
+        response_timeout: Duration,
+    },
     Runtime(RuntimeError),
 }
 
@@ -3226,10 +3292,30 @@ impl UdpDatagramClientAssociation {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(UdpPathSendError::Timeout { path_was_acked }) => {
+                Err(UdpPathSendError::MtuExceeded { limit }) => {
+                    last_retryable_error =
+                        Some(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
+                            actual: payload.len(),
+                            limit,
+                        }));
+                }
+                Err(UdpPathSendError::Timeout {
+                    path_was_acked,
+                    response_timeout,
+                }) => {
                     self.remove_path(path_index).await;
                     if !path_was_acked {
                         self.context.mark_udp_path_failure(path_index);
+                    } else {
+                        self.context.mark_udp_path_feedback(
+                            path_index,
+                            UdpDatagramPathObservation {
+                                rtt: response_timeout,
+                                jitter: Duration::ZERO,
+                                loss_rate: 1.0,
+                                rate_sample: None,
+                            },
+                        );
                     }
                     last_retryable_error =
                         Some(RuntimeError::Protocol("UDP datagram response timed out"));
@@ -3284,7 +3370,7 @@ impl UdpDatagramClientAssociation {
                     && self
                         .context
                         .udp_path_runtime_model(*path_index, ttl_ms)
-                        .is_some_and(|model| payload_bytes <= model.mtu_payload_bytes)
+                        .is_some_and(|model| model.accepts_or_can_probe(payload_bytes))
             })
         {
             return Some(path_index);
@@ -3297,7 +3383,7 @@ impl UdpDatagramClientAssociation {
             .filter(|(_, path_index)| !attempted.contains(path_index))
             .filter_map(|(rank, path_index)| {
                 let model = self.context.udp_path_runtime_model(*path_index, ttl_ms)?;
-                if payload_bytes > model.mtu_payload_bytes {
+                if !model.accepts_or_can_probe(payload_bytes) {
                     return None;
                 }
                 let ready_at = self
@@ -3325,18 +3411,52 @@ impl UdpDatagramClientAssociation {
             .ok_or(UdpPathSendError::Runtime(
                 RuntimeError::NoSchedulableUdpPath,
             ))?;
-        if payload.len() > model.mtu_payload_bytes {
-            return Err(UdpPathSendError::Runtime(RuntimeError::Datagram(
-                DatagramError::PayloadTooLarge {
-                    actual: payload.len(),
-                    limit: model.mtu_payload_bytes,
-                },
-            )));
+        if !model.accepts_or_can_probe(payload.len()) {
+            return Err(UdpPathSendError::MtuExceeded {
+                limit: model.mtu_payload_bytes,
+            });
         }
         let position = self
             .ensure_path_session(path_index)
             .await
             .map_err(UdpPathSendError::Runtime)?;
+        let current_mtu = self
+            .paths
+            .get(position)
+            .ok_or(UdpPathSendError::Runtime(
+                RuntimeError::NoSchedulableUdpPath,
+            ))?
+            .session
+            .mtu_payload_bytes();
+        if payload.len() > current_mtu {
+            let probe_result = {
+                let path = self
+                    .paths
+                    .get_mut(position)
+                    .ok_or(UdpPathSendError::Runtime(
+                        RuntimeError::NoSchedulableUdpPath,
+                    ))?;
+                tokio::time::timeout(
+                    model.response_timeout,
+                    path.session.probe_mtu(payload.len()),
+                )
+                .await
+            };
+            match probe_result {
+                Ok(Ok(probed_mtu)) => {
+                    self.context.mark_udp_path_mtu(path_index, probed_mtu);
+                }
+                Ok(Err(err)) if udp_datagram_error_is_path_retryable(&err) => {
+                    self.context.mark_udp_path_mtu(path_index, current_mtu);
+                    return Err(UdpPathSendError::MtuExceeded { limit: current_mtu });
+                }
+                Ok(Err(err)) => return Err(UdpPathSendError::Runtime(err)),
+                Err(_) => {
+                    self.context.mark_udp_path_mtu(path_index, current_mtu);
+                    return Err(UdpPathSendError::MtuExceeded { limit: current_mtu });
+                }
+            }
+        }
         let (path_was_acked, observation_path_index, observation, result) = {
             let path = self
                 .paths
@@ -3362,7 +3482,10 @@ impl UdpDatagramClientAssociation {
         match result {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => Err(UdpPathSendError::Runtime(err)),
-            Err(_) => Err(UdpPathSendError::Timeout { path_was_acked }),
+            Err(_) => Err(UdpPathSendError::Timeout {
+                path_was_acked,
+                response_timeout: model.response_timeout,
+            }),
         }
     }
 
@@ -3423,6 +3546,7 @@ struct UdpDatagramClientSession {
     sent_datagrams: HashMap<(DatagramFlowId, DatagramId), UdpSentDatagram>,
     last_datagram_rtt: Option<Duration>,
     last_feedback_observation: Option<UdpDatagramPathObservation>,
+    mtu_payload_bytes: usize,
 }
 
 struct UdpDatagramClientFlow {
@@ -3523,6 +3647,7 @@ impl UdpDatagramClientSession {
             sent_datagrams: HashMap::new(),
             last_datagram_rtt: None,
             last_feedback_observation: None,
+            mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
         })
     }
 
@@ -3664,6 +3789,49 @@ impl UdpDatagramClientSession {
 
     fn delivery_stats(&self) -> PathDeliveryStats {
         self.stats
+    }
+
+    fn mtu_payload_bytes(&self) -> usize {
+        self.mtu_payload_bytes
+    }
+
+    async fn probe_mtu(&mut self, payload_bytes: usize) -> Result<usize, RuntimeError> {
+        if payload_bytes <= self.mtu_payload_bytes {
+            return Ok(self.mtu_payload_bytes);
+        }
+        if payload_bytes > self.mux_limits.max_payload_bytes {
+            return Err(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
+                actual: payload_bytes,
+                limit: self.mux_limits.max_payload_bytes,
+            }));
+        }
+        let probe_id = random_u64()?;
+        self.encrypted
+            .send_frame(&Frame::PathMtuProbe {
+                path_id: self.path_id,
+                probe_id,
+                payload: Bytes::from(vec![0u8; payload_bytes]),
+            })
+            .await?;
+        loop {
+            match self.encrypted.recv_frame(&mut self.buffer).await? {
+                Frame::PathMtuAck {
+                    path_id,
+                    probe_id: received_probe_id,
+                    payload_bytes: received_payload_bytes,
+                } if path_id == self.path_id && received_probe_id == probe_id => {
+                    let payload_bytes = received_payload_bytes as usize;
+                    self.mtu_payload_bytes = payload_bytes;
+                    return Ok(payload_bytes);
+                }
+                Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
+                    self.observe_remote_path_metrics(metrics);
+                }
+                Frame::RxRateHint { path_id, .. } if path_id == self.path_id => {}
+                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+                _ => return Err(RuntimeError::Protocol("unexpected UDP MTU probe frame")),
+            }
+        }
     }
 
     fn take_feedback_observation(&mut self) -> Option<UdpDatagramPathObservation> {
@@ -3913,6 +4081,26 @@ impl ServerUdpPathSession {
             (ServerUdpPathState::Established, Frame::Ping { nonce }) => {
                 self.encrypted
                     .send_frame_to(&Frame::Pong { nonce }, self.peer)
+                    .await?;
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (
+                ServerUdpPathState::Established,
+                Frame::PathMtuProbe {
+                    path_id,
+                    probe_id,
+                    payload,
+                },
+            ) => {
+                self.encrypted
+                    .send_frame_to(
+                        &Frame::PathMtuAck {
+                            path_id,
+                            probe_id,
+                            payload_bytes: payload.len() as u32,
+                        },
+                        self.peer,
+                    )
                     .await?;
                 Ok(ServerUdpSessionOutcome::Active)
             }
@@ -4381,6 +4569,24 @@ mod tests {
         (addr, handle)
     }
 
+    async fn spawn_udp_payload_target(
+        expected: Bytes,
+        response: Bytes,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
+        let addr = socket.local_addr().expect("target addr");
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; expected.len().max(16)];
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
+            assert_eq!(&buf[..len], expected.as_ref());
+            socket
+                .send_to(response.as_ref(), peer)
+                .await
+                .expect("target send");
+        });
+        (addr, handle)
+    }
+
     async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
         let proxy: Endpoint = listener
@@ -4624,6 +4830,65 @@ mod tests {
                 match session_ref.handle_frame(frame).await? {
                     ServerUdpSessionOutcome::Active => {}
                     ServerUdpSessionOutcome::Closed => return Ok(()),
+                }
+            }
+        })
+    }
+
+    async fn spawn_udp_datagram_ack_then_drop_path(
+        path: PathSpec,
+    ) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
+        let socket = udp::bind_socket(&path).await.expect("bind udp path");
+        tokio::spawn(async move {
+            let socket = Arc::new(socket);
+            let probe = EncryptedUdpSocket::from_shared(
+                socket.clone(),
+                security().secret.as_bytes(),
+                PeerRole::Server,
+                CodecLimits::default(),
+            );
+            let mut buffer = vec![0u8; probe.max_datagram_bytes()?];
+            let mut session = None;
+            loop {
+                let (len, peer) = socket.recv_from(&mut buffer).await?;
+                if session.is_none() {
+                    session = Some(ServerUdpPathSession::new(
+                        socket.clone(),
+                        peer,
+                        server_context(OutboundConfig::Direct),
+                    )?);
+                }
+                let session_ref = session
+                    .as_mut()
+                    .ok_or(RuntimeError::Protocol("missing UDP path session"))?;
+                if session_ref.peer != peer {
+                    return Err(RuntimeError::Protocol(
+                        "UDP datagram arrived from unexpected peer",
+                    ));
+                }
+                let frame = session_ref.open_frame(&buffer[..len])?;
+                match frame {
+                    Frame::DatagramData {
+                        flow_id,
+                        datagram_id,
+                        ..
+                    } => {
+                        session_ref
+                            .encrypted
+                            .send_frame_to(
+                                &Frame::DatagramFeedback {
+                                    flow_id,
+                                    received: vec![datagram_ack_range(datagram_id)?],
+                                },
+                                session_ref.peer,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                    frame => match session_ref.handle_frame(frame).await? {
+                        ServerUdpSessionOutcome::Active => {}
+                        ServerUdpSessionOutcome::Closed => return Ok(()),
+                    },
                 }
             }
         })
@@ -5887,6 +6152,120 @@ mod tests {
             .await
             .expect("blackhole join")
             .expect("blackhole path");
+        survivor
+            .await
+            .expect("survivor join")
+            .expect("survivor path");
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn udp_association_probes_mtu_before_large_datagram() {
+        let payload = Bytes::from(vec![0x5a; UDP_DEFAULT_MTU_PAYLOAD_BYTES + 256]);
+        let (target_addr, target) =
+            spawn_udp_payload_target(payload.clone(), Bytes::from_static(b"pong")).await;
+        let path = reserve_udp_path().await;
+        let socket = udp::bind_socket(&path).await.expect("bind udp path");
+        let server = tokio::spawn(handle_server_udp_datagram_path_session(
+            socket,
+            server_context(OutboundConfig::Direct),
+        ));
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+
+        let response = association
+            .send_to(TargetAddr::Ip(target_addr), payload.clone(), 1000)
+            .await
+            .expect("large datagram");
+
+        assert_eq!(response, Bytes::from_static(b"pong"));
+        {
+            let health = context.health.lock().expect("health lock");
+            assert_eq!(
+                health.udp[0].measured_mtu_payload_bytes,
+                Some(payload.len())
+            );
+        }
+        association.close().await.expect("close association");
+        server.await.expect("server join").expect("server");
+        target.await.expect("target join");
+    }
+
+    #[test]
+    fn udp_measured_mtu_skips_oversized_path_candidate() {
+        let low_mtu_path = "udp://127.0.0.1:12001?srtt-ms=5&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("low mtu path");
+        let probeable_path = "udp://127.0.0.1:12002?srtt-ms=20&rate-mbps=100"
+            .parse::<PathSpec>()
+            .expect("probeable path");
+        let context = ClientPathContext::new(
+            vec![low_mtu_path, probeable_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("ctx");
+        context.mark_udp_path_mtu(0, UDP_DEFAULT_MTU_PAYLOAD_BYTES);
+        let association = UdpDatagramClientAssociation::new(context).expect("assoc");
+
+        assert_eq!(
+            association.select_path_candidate(
+                &[0, 1],
+                &HashSet::new(),
+                UDP_DEFAULT_MTU_PAYLOAD_BYTES + 256,
+                1000,
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_association_retries_after_acked_response_loss_without_failing_path() {
+        let (target_addr, target) = spawn_udp_echo_target().await;
+        let drop_path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
+        let survivor_path = reserve_udp_path_with_query("srtt-ms=20&rate-mbps=100").await;
+        let drop_server = spawn_udp_datagram_ack_then_drop_path(drop_path.clone()).await;
+        let survivor_socket = udp::bind_socket(&survivor_path)
+            .await
+            .expect("bind survivor udp path");
+        let survivor = tokio::spawn(handle_server_udp_datagram_path_session(
+            survivor_socket,
+            server_context(OutboundConfig::Direct),
+        ));
+        let context = ClientPathContext::new(
+            vec![drop_path, survivor_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("ctx");
+        let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+
+        let response = association
+            .send_to(
+                TargetAddr::Ip(target_addr),
+                Bytes::from_static(b"ping"),
+                1000,
+            )
+            .await
+            .expect("retry response");
+
+        assert_eq!(response, Bytes::from_static(b"pong"));
+        {
+            let health = context.health.lock().expect("health lock");
+            assert_eq!(health.udp[0].state, SchedulerPathState::Active);
+            assert!(
+                health.udp[0]
+                    .measured_loss_rate
+                    .is_some_and(|loss| loss > 0.0)
+            );
+            assert_eq!(health.udp[1].state, SchedulerPathState::Active);
+        }
+        association.close().await.expect("close association");
+        drop_server
+            .await
+            .expect("drop server join")
+            .expect("drop server");
         survivor
             .await
             .expect("survivor join")

@@ -265,6 +265,16 @@ pub enum Frame {
         path_id: PathId,
         reason: CloseReason,
     },
+    PathMtuProbe {
+        path_id: PathId,
+        probe_id: u64,
+        payload: Bytes,
+    },
+    PathMtuAck {
+        path_id: PathId,
+        probe_id: u64,
+        payload_bytes: u32,
+    },
     OpenStream {
         stream_id: StreamId,
         target: TargetAddr,

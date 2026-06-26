@@ -2032,6 +2032,24 @@ impl ClientPathContext {
         ordered_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
     }
 
+    fn ordered_tcp_path_indices_with_measured_rate(
+        &self,
+        class: TrafficClass,
+        payload_bytes: usize,
+    ) -> Vec<usize> {
+        let observations =
+            health_observations(&mut self.health.lock().expect("client path health lock").tcp);
+        ordered_path_scores(&self.tcp_paths, &observations, class, payload_bytes)
+            .into_iter()
+            .filter(|(index, _)| {
+                observations
+                    .get(*index)
+                    .is_some_and(|observation| observation.measured_rate_bps.is_some())
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn tcp_path_snapshot(&self, index: usize) -> Option<PathSnapshot> {
         let path = self.tcp_paths.get(index)?;
         let observation = self
@@ -3570,6 +3588,7 @@ where
                 &mut remotes,
                 &send_stream,
                 !local_open,
+                true,
             )
             .await
             {
@@ -3611,6 +3630,7 @@ where
                                 &mut remotes,
                                 &send_stream,
                                 !local_open,
+                                false,
                             )
                             .await
                             {
@@ -3643,6 +3663,7 @@ where
                                 &mut remotes,
                                 &send_stream,
                                 !local_open,
+                                false,
                             )
                             .await
                             {
@@ -3668,6 +3689,7 @@ where
                             &mut remotes,
                             &send_stream,
                             !local_open,
+                            false,
                         )
                         .await
                         {
@@ -3692,6 +3714,7 @@ where
                                 &mut remotes,
                                 &send_stream,
                                 !local_open,
+                                false,
                             )
                             .await
                             {
@@ -3746,6 +3769,7 @@ where
                                     &mut remotes,
                                     &send_stream,
                                     !local_open,
+                                    false,
                                 )
                                 .await
                                 {
@@ -3822,10 +3846,19 @@ async fn switch_tcp_relay_to_best_path(
     remotes: &mut TcpRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
+    require_measured_rate: bool,
 ) -> Result<bool, RuntimeError> {
     let previous_paths = remotes.path_indices();
-    let attached =
-        attach_tcp_relay_paths(context, spec, class, remotes, send_stream, resend_fin).await?;
+    let attached = attach_tcp_relay_paths(
+        context,
+        spec,
+        class,
+        remotes,
+        send_stream,
+        resend_fin,
+        require_measured_rate,
+    )
+    .await?;
     if attached == 0 {
         return Ok(false);
     }
@@ -3851,12 +3884,15 @@ async fn attach_tcp_relay_paths(
     remotes: &mut TcpRelayRemoteSet,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
+    require_measured_rate: bool,
 ) -> Result<usize, RuntimeError> {
     let stream_id = remotes.stream_id();
-    let candidates = context.ordered_tcp_path_indices(
-        class,
-        tcp_relay_attach_payload_bytes(send_stream, context.mux_limits),
-    );
+    let payload_bytes = tcp_relay_attach_payload_bytes(send_stream, context.mux_limits);
+    let candidates = if require_measured_rate {
+        context.ordered_tcp_path_indices_with_measured_rate(class, payload_bytes)
+    } else {
+        context.ordered_tcp_path_indices(class, payload_bytes)
+    };
     let mut last_retryable_error = None;
     let mut attached = 0usize;
 
@@ -6534,7 +6570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_bulk_tcp_stream_attaches_additional_path_for_large_response() {
+    async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         let payload = vec![0x5au8; 2 * 1024 * 1024];
         let expected_payload = payload.clone();
         let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
@@ -6594,6 +6630,14 @@ mod tests {
             ResourceLimits::default(),
         )
         .expect("ctx");
+        context.mark_tcp_path_delivery(
+            1,
+            PathDeliveryStats {
+                payload_bytes: 4 * 1024 * 1024,
+                first_payload_at: Some(Instant::now()),
+                last_payload_at: Some(Instant::now() + Duration::from_millis(100)),
+            },
+        );
         let health_context = context.clone();
         let ingress_listener = TcpListener::bind("127.0.0.1:0")
             .await

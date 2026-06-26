@@ -2355,6 +2355,25 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> Vec<usize> {
         let observations = self.tcp_health_observations_for_class(TrafficClass::Bulk);
+        let any_measured_delivery = observations
+            .iter()
+            .any(|observation| observation.measured_rate_bps.is_some());
+        if !any_measured_delivery && self.tcp_paths.iter().all(tcp_path_is_endpoint_only) {
+            return configured_order_path_indices(
+                &self.tcp_paths,
+                &observations,
+                TrafficClass::Bulk,
+                payload_bytes,
+            )
+            .into_iter()
+            .filter(|index| Some(*index) != current_path_index)
+            .filter(|index| {
+                self.tcp_paths
+                    .get(*index)
+                    .is_some_and(tcp_path_can_be_auto_discovered)
+            })
+            .collect();
+        }
         let scores = ordered_path_scores(
             &self.tcp_paths,
             &observations,
@@ -3704,111 +3723,118 @@ async fn handle_server_path(
     let mut draining = false;
 
     loop {
-        tokio::select! {
-            biased;
-            command = recv_tcp_path_command(&mut commands_rx), if !tcp_path_receivers_closed(&commands_rx) => {
-                match command {
-                    Some(command) => if !handle_server_tcp_path_command(
-                        command,
-                        &mut writer,
-                        &context,
-                        &mut attached_streams,
-                        ServerTcpPathCommandContext {
-                            session_id,
-                            path_id,
-                            commands_tx: &commands_tx,
-                            draining,
-                        },
-                    ).await? {
-                        return Ok(());
+        let Some(event) = recv_server_tcp_path_event(&mut path_frames, &mut commands_rx).await?
+        else {
+            return Ok(());
+        };
+        match event {
+            ServerTcpPathEvent::Command(command) => {
+                if !handle_server_tcp_path_command(
+                    command,
+                    &mut writer,
+                    &context,
+                    &mut attached_streams,
+                    ServerTcpPathCommandContext {
+                        session_id,
+                        path_id,
+                        commands_tx: &commands_tx,
+                        draining,
                     },
-                    None => {
-                        if tcp_path_receivers_closed(&commands_rx) {
-                            return Ok(());
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+            ServerTcpPathEvent::Frame(frame) => match frame {
+                Frame::OpenStream {
+                    stream_id,
+                    target,
+                    class,
+                    ..
+                } if !draining => {
+                    outbound::validate_target(&target)?;
+                    context.outbound.ensure_supports(TargetProtocol::Tcp)?;
+                    match context.tcp_streams.open_or_attach(
+                        ServerTcpStreamOpenRequest {
+                            session_id,
+                            stream_id,
+                            target: &target,
+                            class,
+                            attachment: ServerTcpPathAttachment {
+                                path_id,
+                                commands: commands_tx.clone(),
+                            },
+                        },
+                        context.mux_limits,
+                        context.max_tcp_streams,
+                    )? {
+                        ServerTcpStreamOpen::New(stream) => {
+                            attached_streams.insert(stream_id);
+                            let stream_context = context.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = run_server_tcp_stream(
+                                    stream_context,
+                                    session_id,
+                                    stream,
+                                    target,
+                                )
+                                .await
+                                {
+                                    eprintln!("warning: server TCP stream failed: {err}");
+                                }
+                            });
+                        }
+                        ServerTcpStreamOpen::Existing => {
+                            attached_streams.insert(stream_id);
+                            context
+                                .tcp_streams
+                                .route_frame(
+                                    session_id,
+                                    stream_id,
+                                    Frame::PathStatus {
+                                        path_id,
+                                        status: crate::protocol::PathStatus::Active,
+                                        capabilities: path_capabilities,
+                                    },
+                                )
+                                .await?;
+                            if !server_write_tcp_path_frame(
+                                &mut writer,
+                                &Frame::StreamMaxData {
+                                    stream_id,
+                                    max_offset: context.mux_limits.max_stream_window_bytes,
+                                },
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
                         }
                     }
                 }
-            }
-            frame = path_frames.recv() => {
-                match frame.ok_or(RuntimeError::TcpPathSessionClosed)?? {
-                    Frame::OpenStream {
-                        stream_id, target, class, ..
-                    } if !draining => {
-                        outbound::validate_target(&target)?;
-                        context.outbound.ensure_supports(TargetProtocol::Tcp)?;
-                        match context.tcp_streams.open_or_attach(
-                            ServerTcpStreamOpenRequest {
-                                session_id,
-                                stream_id,
-                                target: &target,
-                                class,
-                                attachment: ServerTcpPathAttachment {
-                                    path_id,
-                                    commands: commands_tx.clone(),
-                                },
-                            },
-                            context.mux_limits,
-                            context.max_tcp_streams,
-                        )? {
-                            ServerTcpStreamOpen::New(stream) => {
-                                attached_streams.insert(stream_id);
-                                let stream_context = context.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = run_server_tcp_stream(
-                                        stream_context,
-                                        session_id,
-                                        stream,
-                                        target,
-                                    )
-                                    .await
-                                    {
-                                        eprintln!("warning: server TCP stream failed: {err}");
-                                    }
-                                });
-                            }
-                            ServerTcpStreamOpen::Existing => {
-                                attached_streams.insert(stream_id);
-                                context
-                                    .tcp_streams
-                                    .route_frame(
-                                        session_id,
-                                        stream_id,
-                                        Frame::PathStatus {
-                                            path_id,
-                                            status: crate::protocol::PathStatus::Active,
-                                            capabilities: path_capabilities,
-                                        },
-                                    )
-                                    .await?;
-                                if !server_write_tcp_path_frame(
-                                    &mut writer,
-                                    &Frame::StreamMaxData {
-                                        stream_id,
-                                        max_offset: context.mux_limits.max_stream_window_bytes,
-                                    },
-                                )
-                                .await?
-                                {
-                                    return Ok(());
-                                }
-                            }
-                        }
+                Frame::OpenStream { stream_id, .. } => {
+                    if !server_write_tcp_path_frame(
+                        &mut writer,
+                        &Frame::StreamReset {
+                            stream_id,
+                            reason: ResetReason::Refused,
+                        },
+                    )
+                    .await?
+                    {
+                        return Ok(());
                     }
-                    Frame::OpenStream { stream_id, .. } => {
-                        if !server_write_tcp_path_frame(
-                            &mut writer,
-                            &Frame::StreamReset {
-                                stream_id,
-                                reason: ResetReason::Refused,
-                            },
-                        )
-                        .await?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Frame::StreamData { stream_id, offset, flags, payload } => {
-                        context.tcp_streams.route_frame(
+                }
+                Frame::StreamData {
+                    stream_id,
+                    offset,
+                    flags,
+                    payload,
+                } => {
+                    context
+                        .tcp_streams
+                        .route_frame(
                             session_id,
                             stream_id,
                             Frame::StreamData {
@@ -3819,20 +3845,24 @@ async fn handle_server_path(
                             },
                         )
                         .await?;
-                    }
-                    Frame::StreamAck { stream_id, ranges } => {
-                        context.tcp_streams.route_frame(
+                }
+                Frame::StreamAck { stream_id, ranges } => {
+                    context
+                        .tcp_streams
+                        .route_frame(
                             session_id,
                             stream_id,
                             Frame::StreamAck { stream_id, ranges },
                         )
                         .await?;
-                    }
-                    Frame::StreamMaxData {
-                        stream_id,
-                        max_offset,
-                    } => {
-                        context.tcp_streams.route_frame(
+                }
+                Frame::StreamMaxData {
+                    stream_id,
+                    max_offset,
+                } => {
+                    context
+                        .tcp_streams
+                        .route_frame(
                             session_id,
                             stream_id,
                             Frame::StreamMaxData {
@@ -3841,74 +3871,75 @@ async fn handle_server_path(
                             },
                         )
                         .await?;
-                    }
-                    Frame::StreamFin { stream_id } => {
-                        context.tcp_streams.route_frame(
-                            session_id,
-                            stream_id,
-                            Frame::StreamFin { stream_id },
-                        )
+                }
+                Frame::StreamFin { stream_id } => {
+                    context
+                        .tcp_streams
+                        .route_frame(session_id, stream_id, Frame::StreamFin { stream_id })
                         .await?;
-                    }
-                    Frame::StreamDetach { stream_id } => {
-                        attached_streams.remove(&stream_id);
-                        context
-                            .tcp_streams
-                            .detach_path(session_id, stream_id, path_id, &commands_tx);
-                        if draining && attached_streams.is_empty() {
-                            if !server_write_tcp_path_frame(
-                                &mut writer,
-                                &Frame::PathClose {
-                                    path_id,
-                                    reason: CloseReason::Normal,
-                                },
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-                            return Ok(());
-                        }
-                    }
-                    Frame::StreamReset { stream_id, reason } => {
-                        context.tcp_streams.route_frame(
-                            session_id,
-                            stream_id,
-                            Frame::StreamReset { stream_id, reason },
-                        )
-                        .await?;
-                    }
-                    Frame::Ping { nonce } => {
-                        if !server_write_tcp_path_frame(&mut writer, &Frame::Pong { nonce }).await? {
-                            return Ok(());
-                        }
-                    }
-                    Frame::PathDrain { path_id: drain_path_id } if drain_path_id == path_id => {
-                        draining = true;
+                }
+                Frame::StreamDetach { stream_id } => {
+                    attached_streams.remove(&stream_id);
+                    context
+                        .tcp_streams
+                        .detach_path(session_id, stream_id, path_id, &commands_tx);
+                    if draining && attached_streams.is_empty() {
                         if !server_write_tcp_path_frame(
                             &mut writer,
-                            &Frame::PathStatus {
+                            &Frame::PathClose {
                                 path_id,
-                                status: crate::protocol::PathStatus::Draining,
-                                capabilities: path_capabilities,
+                                reason: CloseReason::Normal,
                             },
                         )
                         .await?
                         {
                             return Ok(());
                         }
-                        if attached_streams.is_empty() {
-                            return Ok(());
-                        }
+                        return Ok(());
                     }
-                    Frame::PathClose {
-                        path_id: close_path_id,
-                        ..
-                    } if close_path_id == path_id => return Ok(()),
-                    Frame::SessionClose { .. } => return Ok(()),
-                    _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
                 }
-            }
+                Frame::StreamReset { stream_id, reason } => {
+                    context
+                        .tcp_streams
+                        .route_frame(
+                            session_id,
+                            stream_id,
+                            Frame::StreamReset { stream_id, reason },
+                        )
+                        .await?;
+                }
+                Frame::Ping { nonce } => {
+                    if !server_write_tcp_path_frame(&mut writer, &Frame::Pong { nonce }).await? {
+                        return Ok(());
+                    }
+                }
+                Frame::PathDrain {
+                    path_id: drain_path_id,
+                } if drain_path_id == path_id => {
+                    draining = true;
+                    if !server_write_tcp_path_frame(
+                        &mut writer,
+                        &Frame::PathStatus {
+                            path_id,
+                            status: crate::protocol::PathStatus::Draining,
+                            capabilities: path_capabilities,
+                        },
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    if attached_streams.is_empty() {
+                        return Ok(());
+                    }
+                }
+                Frame::PathClose {
+                    path_id: close_path_id,
+                    ..
+                } if close_path_id == path_id => return Ok(()),
+                Frame::SessionClose { .. } => return Ok(()),
+                _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
+            },
         }
     }
 }
@@ -5795,6 +5826,37 @@ enum ServerUdpSessionOutcome {
     Closed,
 }
 
+enum ServerTcpPathEvent {
+    Frame(Frame),
+    Command(TcpPathSessionCommand),
+}
+
+async fn recv_server_tcp_path_event(
+    path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    commands_rx: &mut TcpPathSessionCommandReceivers,
+) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
+    loop {
+        let command_may_recv = !tcp_path_receivers_closed(commands_rx);
+        tokio::select! {
+            biased;
+            frame = path_frames.recv() => {
+                return match frame {
+                    Some(Ok(frame)) => Ok(Some(ServerTcpPathEvent::Frame(frame))),
+                    Some(Err(err)) => Err(RuntimeError::Encrypted(err)),
+                    None => Err(RuntimeError::TcpPathSessionClosed),
+                };
+            }
+            command = recv_tcp_path_command(commands_rx), if command_may_recv => {
+                match command {
+                    Some(command) => return Ok(Some(ServerTcpPathEvent::Command(command))),
+                    None if tcp_path_receivers_closed(commands_rx) => return Ok(None),
+                    None => continue,
+                }
+            }
+        }
+    }
+}
+
 impl ServerUdpPathSession {
     fn new(
         socket: Arc<UdpSocket>,
@@ -7266,6 +7328,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
+        let (tx, mut commands_rx) = tcp_path_session_command_channels(1);
+        tx.send_frame(
+            Frame::StreamData {
+                stream_id: StreamId(10),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"bulk"),
+            },
+            TrafficClass::Bulk,
+        )
+        .await
+        .expect("fill bulk output command queue");
+        let (frame_tx, mut path_frames) = mpsc::channel(1);
+        frame_tx
+            .send(Ok(Frame::Ping { nonce: 7 }))
+            .await
+            .expect("queue inbound ping");
+
+        match recv_server_tcp_path_event(&mut path_frames, &mut commands_rx)
+            .await
+            .expect("server path event")
+            .expect("event")
+        {
+            ServerTcpPathEvent::Frame(Frame::Ping { nonce }) => assert_eq!(nonce, 7),
+            _ => panic!("expected inbound frame before queued bulk output"),
+        }
+    }
+
+    #[tokio::test]
     async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
         let stream_id = StreamId(7);
         let (frames_tx, frames_rx) = mpsc::channel(1);
@@ -7593,6 +7685,36 @@ mod tests {
                     MuxLimits::default().max_tcp_path_inflight_bytes,
                 )
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn endpoint_only_tcp_bulk_discovery_validates_configured_order_before_probe_noise() {
+        let low_latency_path = "tcp://127.0.0.1:10132"
+            .parse::<PathSpec>()
+            .expect("low latency path");
+        let high_bandwidth_path = "tcp://127.0.0.1:10133"
+            .parse::<PathSpec>()
+            .expect("high bandwidth path");
+        let poor_path = "tcp://127.0.0.1:10134"
+            .parse::<PathSpec>()
+            .expect("poor path");
+        let context = ClientPathContext::new(
+            vec![low_latency_path, high_bandwidth_path, poor_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+        context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
+
+        assert_eq!(
+            context.ordered_tcp_auto_bulk_discovery_indices(
+                Some(0),
+                MuxLimits::default().max_tcp_path_inflight_bytes
+            ),
+            vec![1, 2]
         );
     }
 

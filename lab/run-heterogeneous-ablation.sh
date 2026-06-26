@@ -215,6 +215,41 @@ run_udp_case() {
   fi
 }
 
+run_mixed_case() {
+  local case_name="$1"
+  shift
+  start_client "$case_name" "$@"
+  set +e
+  local output
+  output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --bulk-path /large.bin --failover-after -1 --timeout '${curl_timeout}' --udp-count '${udp_count}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}'" 2>/dev/null)"
+  local exit_code="$?"
+  set -e
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    printf '{"case":"%s","protocol":"mixed","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
+  fi
+}
+
+run_mixed_failover_case() {
+  local case_name="mptunnel_mixed_multipath_failover_blackhole_fat"
+  local output exit_code
+  start_client "$case_name" "$tcp_all $udp_all"
+  exec_in client "rm -f /tmp/mptunnel-mixed.out /tmp/mptunnel-mixed.status /tmp/mptunnel-mixed.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --bulk-path /large.bin --failover-after '${failover_after}' --timeout '${curl_timeout}' --udp-count '${udp_count}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' > /tmp/mptunnel-mixed.out 2>/tmp/mptunnel-mixed.err; echo \$? >/tmp/mptunnel-mixed.status) & echo \$! >/tmp/mptunnel-mixed.pid"
+  sleep "$failover_after"
+  apply_failover_blackhole
+  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-mixed.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-mixed.status ]; then echo 124 >/tmp/mptunnel-mixed.status; fi"
+  output="$(exec_in client "cat /tmp/mptunnel-mixed.out 2>/dev/null || true")"
+  exit_code="$(exec_in client "cat /tmp/mptunnel-mixed.status 2>/dev/null || echo 124")"
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    printf '{"case":"%s","protocol":"mixed","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
+  fi
+  apply_netem apply
+}
+
 run_failover_case() {
   local case_name="mptunnel_tcp_multipath_failover_blackhole_fat"
   local output exit_code
@@ -310,6 +345,16 @@ if should_run_case "mptunnel_udp_single_poor_internet"; then
 fi
 if should_run_case "mptunnel_udp_multipath_all"; then
   run_udp_case "mptunnel_udp_multipath_all" "$udp_all"
+fi
+
+if should_run_case "mptunnel_mixed_single_low_latency"; then
+  run_mixed_case "mptunnel_mixed_single_low_latency" "$tcp_lowlat $udp_lowlat"
+fi
+if should_run_case "mptunnel_mixed_multipath_all"; then
+  run_mixed_case "mptunnel_mixed_multipath_all" "$tcp_all $udp_all"
+fi
+if should_run_case "mptunnel_mixed_multipath_failover_blackhole_fat"; then
+  run_mixed_failover_case
 fi
 
 if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat"; then

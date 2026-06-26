@@ -111,6 +111,56 @@ def udp_rows(by_case):
     return rows
 
 
+def mixed_rows(by_case):
+    rows = []
+    for case, records in by_case.items():
+        if not any(record.get("protocol") == "mixed" for record in records):
+            continue
+        ok = [record for record in records if record.get("status") == "ok"]
+        rows.append(
+            {
+                "case": case,
+                "runs": len(records),
+                "ok": len(ok),
+                "loss": sum(1 for record in records if record.get("status") == "loss"),
+                "fail": sum(
+                    1 for record in records if record.get("status") not in ("ok", "loss")
+                ),
+                "bulk_median_goodput": median(
+                    [record.get("bulk_goodput_mbps") for record in ok]
+                ),
+                "bulk_max_gap": max(
+                    [
+                        record.get("bulk_recovery_gap_s")
+                        for record in ok
+                        if isinstance(record.get("bulk_recovery_gap_s"), (int, float))
+                    ],
+                    default=None,
+                ),
+                "small_p95": median([record.get("small_p95_ms") for record in records]),
+                "small_max": max(
+                    [
+                        record.get("small_max_ms")
+                        for record in records
+                        if isinstance(record.get("small_max_ms"), (int, float))
+                    ],
+                    default=None,
+                ),
+                "udp_loss": mean([record.get("udp_loss_rate") for record in records]),
+                "udp_p95": median([record.get("udp_p95_ms") for record in records]),
+                "udp_max": max(
+                    [
+                        record.get("udp_max_ms")
+                        for record in records
+                        if isinstance(record.get("udp_max_ms"), (int, float))
+                    ],
+                    default=None,
+                ),
+            }
+        )
+    return rows
+
+
 def best_goodput(records, prefix):
     candidates = [
         record
@@ -256,6 +306,33 @@ def render_markdown(records):
     lines.extend(
         [
             "",
+            "## Mixed Workloads",
+            "",
+            "| case | runs | ok | loss | fail | median bulk Mbps | max bulk recovery gap s | median small p95 ms | max small ms | avg UDP loss | median UDP p95 ms | max UDP ms |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in mixed_rows(by_case):
+        lines.append(
+            "| {case} | {runs} | {ok} | {loss} | {fail} | {bulk_median_goodput} | {bulk_max_gap} | {small_p95} | {small_max} | {udp_loss} | {udp_p95} | {udp_max} |".format(
+                case=row["case"],
+                runs=row["runs"],
+                ok=row["ok"],
+                loss=row["loss"],
+                fail=row["fail"],
+                bulk_median_goodput=fmt_float(row["bulk_median_goodput"]),
+                bulk_max_gap=fmt_float(row["bulk_max_gap"]),
+                small_p95=fmt_float(row["small_p95"]),
+                small_max=fmt_float(row["small_max"]),
+                udp_loss=fmt_float(row["udp_loss"], 3),
+                udp_p95=fmt_float(row["udp_p95"]),
+                udp_max=fmt_float(row["udp_max"]),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
             "## Per-Run Comparisons",
             "",
             "| source | best raw | best single | multipath Mbps | mp/raw | mp/single | failover | failover seconds | recovery gap s | UDP multi loss | UDP multi p95 ms | UDP low p95 ms |",
@@ -298,6 +375,7 @@ def render_json(records):
         "sources": len(by_source(records)),
         "tcp": tcp_rows(by_case),
         "udp": udp_rows(by_case),
+        "mixed": mixed_rows(by_case),
         "comparisons": source_comparisons(records),
     }
     return json.dumps(payload, indent=2, sort_keys=True)

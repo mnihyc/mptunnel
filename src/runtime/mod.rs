@@ -28,7 +28,8 @@ use crate::transport::{PathSpec, PathSpecParseError};
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use netstack_smoltcp::{StackBuilder, TcpListener as TunTcpListener, UdpSocket as TunUdpSocket};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -536,7 +537,7 @@ async fn run_server(
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,
-        tcp_streams: Arc::new(ServerTcpStreamRegistry::default()),
+        tcp_streams: Arc::new(ServerTcpStreamRegistry::new(resources.max_streams)),
         max_tcp_streams: resources.max_streams,
         max_udp_sessions: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
@@ -884,6 +885,50 @@ impl PathDeliveryStats {
     }
 }
 
+#[derive(Debug)]
+struct RecentIdCache<T>
+where
+    T: Copy + Eq + Hash,
+{
+    capacity: usize,
+    order: VecDeque<T>,
+    set: HashSet<T>,
+}
+
+impl<T> RecentIdCache<T>
+where
+    T: Copy + Eq + Hash,
+{
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            set: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, id: T) {
+        if self.set.contains(&id) {
+            return;
+        }
+        self.order.push_back(id);
+        self.set.insert(id);
+        while self.order.len() > self.capacity {
+            if let Some(expired) = self.order.pop_front() {
+                self.set.remove(&expired);
+            }
+        }
+    }
+
+    fn contains(&self, id: &T) -> bool {
+        self.set.contains(id)
+    }
+}
+
+fn tcp_closed_stream_cache_capacity(max_streams: usize) -> usize {
+    max_streams.saturating_mul(2).clamp(128, 65_536)
+}
+
 struct TcpPathStream {
     stream_id: StreamId,
     max_offset: u64,
@@ -943,17 +988,14 @@ impl TcpPathStreamHandle {
 
 #[derive(Clone)]
 enum TcpPathStreamOutput {
-    Fixed(mpsc::Sender<TcpPathSessionCommand>),
+    Fixed(TcpPathSessionCommandSender),
     Switchable(Arc<ServerTcpStreamBinding>),
 }
 
 impl TcpPathStreamOutput {
     async fn send_frame(&self, stream_id: StreamId, frame: Frame) -> Result<(), RuntimeError> {
         match self {
-            Self::Fixed(commands) => commands
-                .send(TcpPathSessionCommand::SendFrame(frame))
-                .await
-                .map_err(|_| RuntimeError::TcpPathSessionClosed),
+            Self::Fixed(commands) => commands.send_frame(frame).await,
             Self::Switchable(binding) => binding.send_frame(stream_id, frame).await,
         }
     }
@@ -961,13 +1003,9 @@ impl TcpPathStreamOutput {
     async fn close_stream(&self, stream_id: StreamId) {
         match self {
             Self::Fixed(commands) => {
+                let _ = commands.send_frame(Frame::StreamDetach { stream_id }).await;
                 let _ = commands
-                    .send(TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
-                        stream_id,
-                    }))
-                    .await;
-                let _ = commands
-                    .send(TcpPathSessionCommand::CloseStream(stream_id))
+                    .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                     .await;
             }
             Self::Switchable(binding) => binding.close_stream(stream_id).await,
@@ -981,7 +1019,7 @@ struct ServerTcpStreamBinding {
 }
 
 impl ServerTcpStreamBinding {
-    fn new(path_id: PathId, commands: mpsc::Sender<TcpPathSessionCommand>) -> Arc<Self> {
+    fn new(path_id: PathId, commands: TcpPathSessionCommandSender) -> Arc<Self> {
         let (version, _) = watch::channel(0);
         Arc::new(Self {
             outputs: Mutex::new(ServerTcpStreamOutputs {
@@ -992,7 +1030,7 @@ impl ServerTcpStreamBinding {
         })
     }
 
-    fn attach(&self, path_id: PathId, commands: mpsc::Sender<TcpPathSessionCommand>) {
+    fn attach(&self, path_id: PathId, commands: TcpPathSessionCommandSender) {
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         if let Some(entry) = outputs
             .entries
@@ -1010,7 +1048,7 @@ impl ServerTcpStreamBinding {
         self.notify_update();
     }
 
-    fn detach(&self, path_id: PathId, commands: &mpsc::Sender<TcpPathSessionCommand>) {
+    fn detach(&self, path_id: PathId, commands: &TcpPathSessionCommandSender) {
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let before = outputs.entries.len();
         outputs
@@ -1023,7 +1061,7 @@ impl ServerTcpStreamBinding {
         }
     }
 
-    fn next_commands(&self) -> Option<(PathId, mpsc::Sender<TcpPathSessionCommand>)> {
+    fn next_commands(&self) -> Option<(PathId, TcpPathSessionCommandSender)> {
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         if outputs.entries.is_empty() {
             return None;
@@ -1034,7 +1072,7 @@ impl ServerTcpStreamBinding {
         Some((entry.path_id, entry.commands))
     }
 
-    fn data_commands(&self) -> Option<(PathId, mpsc::Sender<TcpPathSessionCommand>)> {
+    fn data_commands(&self) -> Option<(PathId, TcpPathSessionCommandSender)> {
         self.outputs
             .lock()
             .expect("server TCP stream binding lock")
@@ -1054,7 +1092,7 @@ impl ServerTcpStreamBinding {
             };
             if let Some((path_id, commands)) = selected {
                 tokio::select! {
-                    result = commands.send(TcpPathSessionCommand::SendFrame(frame.clone())) => {
+                    result = commands.send_frame(frame.clone()) => {
                         match result {
                             Ok(()) => return Ok(()),
                             Err(_) => self.detach(path_id, &commands),
@@ -1083,7 +1121,7 @@ impl ServerTcpStreamBinding {
         for entry in outputs {
             let _ = entry
                 .commands
-                .send(TcpPathSessionCommand::CloseStream(stream_id))
+                .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                 .await;
         }
     }
@@ -1101,7 +1139,7 @@ fn server_frame_prefers_current_data_path(frame: &Frame) -> bool {
 #[derive(Clone)]
 struct ServerTcpStreamOutputEntry {
     path_id: PathId,
-    commands: mpsc::Sender<TcpPathSessionCommand>,
+    commands: TcpPathSessionCommandSender,
 }
 
 struct ServerTcpStreamOutputs {
@@ -1109,9 +1147,9 @@ struct ServerTcpStreamOutputs {
     next_index: usize,
 }
 
-#[derive(Default)]
 struct ServerTcpStreamRegistry {
     streams: Mutex<HashMap<(SessionId, StreamId), ServerTcpStreamEntry>>,
+    closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
 }
 
 impl std::fmt::Debug for ServerTcpStreamRegistry {
@@ -1129,7 +1167,7 @@ struct ServerTcpStreamEntry {
 
 struct ServerTcpPathAttachment {
     path_id: PathId,
-    commands: mpsc::Sender<TcpPathSessionCommand>,
+    commands: TcpPathSessionCommandSender,
 }
 
 enum ServerTcpStreamOpen {
@@ -1138,6 +1176,15 @@ enum ServerTcpStreamOpen {
 }
 
 impl ServerTcpStreamRegistry {
+    fn new(max_streams: usize) -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+            closed_streams: Mutex::new(RecentIdCache::new(tcp_closed_stream_cache_capacity(
+                max_streams,
+            ))),
+        }
+    }
+
     fn open_or_attach(
         &self,
         session_id: SessionId,
@@ -1190,7 +1237,7 @@ impl ServerTcpStreamRegistry {
         session_id: SessionId,
         stream_id: StreamId,
         path_id: PathId,
-        commands: &mpsc::Sender<TcpPathSessionCommand>,
+        commands: &TcpPathSessionCommandSender,
     ) {
         if let Some(binding) = self
             .streams
@@ -1219,6 +1266,15 @@ impl ServerTcpStreamRegistry {
                 .map(|entry| entry.frames.clone())
         };
         let Some(stream) = stream else {
+            let closed_key = (session_id, stream_id);
+            if self
+                .closed_streams
+                .lock()
+                .expect("server TCP stream closed cache lock")
+                .contains(&closed_key)
+            {
+                return Ok(());
+            }
             return Err(RuntimeError::Protocol(
                 "frame for unknown server TCP stream",
             ));
@@ -1230,16 +1286,30 @@ impl ServerTcpStreamRegistry {
     }
 
     fn close(&self, session_id: SessionId, stream_id: StreamId) {
-        self.streams
+        let removed = self
+            .streams
             .lock()
             .expect("server TCP stream registry lock")
-            .remove(&(session_id, stream_id));
+            .remove(&(session_id, stream_id))
+            .is_some();
+        if removed {
+            self.closed_streams
+                .lock()
+                .expect("server TCP stream closed cache lock")
+                .insert((session_id, stream_id));
+        }
+    }
+}
+
+impl Default for ServerTcpStreamRegistry {
+    fn default() -> Self {
+        Self::new(ResourceLimits::default().max_streams)
     }
 }
 
 struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
-    commands: Arc<Mutex<Option<mpsc::Sender<TcpPathSessionCommand>>>>,
+    commands: Arc<Mutex<Option<TcpPathSessionCommandSender>>>,
 }
 
 impl std::fmt::Debug for ClientTcpPathSessionHandle {
@@ -1276,7 +1346,7 @@ impl ClientTcpPathSessionHandle {
         let commands = self.ensure_session();
         let (response_tx, response_rx) = oneshot::channel();
         commands
-            .send(TcpPathSessionCommand::OpenStream {
+            .send_control(TcpPathSessionCommand::OpenStream {
                 stream_id,
                 target,
                 ingress,
@@ -1291,7 +1361,7 @@ impl ClientTcpPathSessionHandle {
             .map_err(|_| RuntimeError::TcpPathSessionClosed)?
     }
 
-    fn ensure_session(&self) -> mpsc::Sender<TcpPathSessionCommand> {
+    fn ensure_session(&self) -> TcpPathSessionCommandSender {
         let mut current = self.commands.lock().expect("TCP path session lock");
         if let Some(commands) = current.as_ref()
             && !commands.is_closed()
@@ -1299,10 +1369,75 @@ impl ClientTcpPathSessionHandle {
             return commands.clone();
         }
 
-        let (commands, receiver) = mpsc::channel(self.runtime.command_queue);
-        tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receiver));
+        let (commands, receivers) = tcp_path_session_command_channels(self.runtime.command_queue);
+        tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receivers));
         *current = Some(commands.clone());
         commands
+    }
+}
+
+#[derive(Clone)]
+struct TcpPathSessionCommandSender {
+    commands: mpsc::Sender<TcpPathSessionCommand>,
+}
+
+struct TcpPathSessionCommandReceivers {
+    commands: mpsc::Receiver<TcpPathSessionCommand>,
+}
+
+impl TcpPathSessionCommandSender {
+    async fn send_control(
+        &self,
+        command: TcpPathSessionCommand,
+    ) -> Result<(), mpsc::error::SendError<TcpPathSessionCommand>> {
+        self.commands.send(command).await
+    }
+
+    async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
+        self.commands
+            .send(TcpPathSessionCommand::SendFrame(frame))
+            .await
+            .map_err(|_| RuntimeError::TcpPathSessionClosed)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
+    fn same_channel(&self, other: &Self) -> bool {
+        self.commands.same_channel(&other.commands)
+    }
+}
+
+fn tcp_path_session_command_channels(
+    queue: usize,
+) -> (TcpPathSessionCommandSender, TcpPathSessionCommandReceivers) {
+    let (commands_tx, commands_rx) = mpsc::channel(queue.max(1));
+    (
+        TcpPathSessionCommandSender {
+            commands: commands_tx,
+        },
+        TcpPathSessionCommandReceivers {
+            commands: commands_rx,
+        },
+    )
+}
+
+fn tcp_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
+    !receiver.is_closed() || !receiver.is_empty()
+}
+
+fn tcp_path_receivers_closed(receivers: &TcpPathSessionCommandReceivers) -> bool {
+    !tcp_receiver_may_recv(&receivers.commands)
+}
+
+async fn recv_tcp_path_command(
+    receivers: &mut TcpPathSessionCommandReceivers,
+) -> Option<TcpPathSessionCommand> {
+    if tcp_receiver_may_recv(&receivers.commands) {
+        receivers.commands.recv().await
+    } else {
+        None
     }
 }
 
@@ -1312,7 +1447,7 @@ enum TcpPathSessionCommand {
         target: TargetAddr,
         ingress: IngressKind,
         class: TrafficClass,
-        session_commands: mpsc::Sender<TcpPathSessionCommand>,
+        session_commands: TcpPathSessionCommandSender,
         response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
     },
     SendFrame(Frame),
@@ -1338,7 +1473,7 @@ struct ClientTcpPathStreamState {
 struct ClientTcpPendingOpen {
     response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
-    session_commands: mpsc::Sender<TcpPathSessionCommand>,
+    session_commands: TcpPathSessionCommandSender,
 }
 
 #[derive(Clone)]
@@ -1351,11 +1486,13 @@ struct ClientTcpPathSessionRuntime {
     mux_limits: MuxLimits,
     command_queue: usize,
     stream_frame_queue: usize,
+    closed_stream_cache_capacity: usize,
 }
 
 struct ClientTcpPathSessionState {
     connection: Option<ClientTcpPathConnection>,
     streams: HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: RecentIdCache<StreamId>,
 }
 
 struct ClientTcpOpenStreamRequest {
@@ -1363,22 +1500,23 @@ struct ClientTcpOpenStreamRequest {
     target: TargetAddr,
     ingress: IngressKind,
     class: TrafficClass,
-    session_commands: mpsc::Sender<TcpPathSessionCommand>,
+    session_commands: TcpPathSessionCommandSender,
     response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
 }
 
 async fn run_client_tcp_path_session(
     runtime: ClientTcpPathSessionRuntime,
-    mut commands: mpsc::Receiver<TcpPathSessionCommand>,
+    mut commands: TcpPathSessionCommandReceivers,
 ) {
     let mut state = ClientTcpPathSessionState {
         connection: None,
         streams: HashMap::new(),
+        closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
     };
 
     loop {
         if state.connection.is_none() {
-            match commands.recv().await {
+            match recv_tcp_path_command(&mut commands).await {
                 Some(command) => {
                     handle_disconnected_client_tcp_command(command, &runtime, &mut state).await;
                 }
@@ -1401,16 +1539,30 @@ async fn run_client_tcp_path_session(
         let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
         tokio::pin!(heartbeat_timer);
 
+        let command_may_recv = tcp_receiver_may_recv(&commands.commands);
+        if !command_may_recv {
+            if let Some(connection_ref) = state.connection.as_mut() {
+                let _ = close_client_tcp_path(
+                    connection_ref,
+                    PathId(runtime.path_index as u16),
+                    !state.streams.is_empty(),
+                )
+                .await;
+            }
+            return;
+        }
+
         let mut drop_connection = false;
         tokio::select! {
             biased;
-            command = commands.recv() => {
+            command = commands.commands.recv(), if command_may_recv => {
                 match command {
                     Some(command) => {
                         if let Err(err) = handle_connected_client_tcp_command(
                             command,
                             state.connection.as_mut().expect("checked connected TCP path session"),
                             &mut state.streams,
+                            &mut state.closed_streams,
                             runtime.stream_frame_queue,
                         )
                         .await
@@ -1421,15 +1573,17 @@ async fn run_client_tcp_path_session(
                         }
                     }
                     None => {
-                        if let Some(connection_ref) = state.connection.as_mut() {
-                            let _ = close_client_tcp_path(
-                                connection_ref,
-                                PathId(runtime.path_index as u16),
-                                !state.streams.is_empty(),
-                            )
-                            .await;
+                        if tcp_path_receivers_closed(&commands) {
+                            if let Some(connection_ref) = state.connection.as_mut() {
+                                let _ = close_client_tcp_path(
+                                    connection_ref,
+                                    PathId(runtime.path_index as u16),
+                                    !state.streams.is_empty(),
+                                )
+                                .await;
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
             }
@@ -1440,6 +1594,7 @@ async fn run_client_tcp_path_session(
                             frame,
                             state.connection.as_mut().expect("checked connected TCP path session"),
                             &mut state.streams,
+                            &mut state.closed_streams,
                             runtime.mux_limits,
                         )
                         .await
@@ -1540,6 +1695,7 @@ async fn handle_connected_client_tcp_command(
     command: TcpPathSessionCommand,
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
     stream_frame_queue: usize,
 ) -> Result<(), RuntimeError> {
     match command {
@@ -1568,7 +1724,9 @@ async fn handle_connected_client_tcp_command(
             Ok(())
         }
         TcpPathSessionCommand::CloseStream(stream_id) => {
-            streams.remove(&stream_id);
+            if streams.remove(&stream_id).is_some() {
+                closed_streams.insert(stream_id);
+            }
             Ok(())
         }
     }
@@ -1674,6 +1832,7 @@ async fn handle_client_tcp_path_frame(
     frame: Frame,
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
     mux_limits: MuxLimits,
 ) -> Result<(), RuntimeError> {
     refresh_client_tcp_path_liveness(connection, mux_limits);
@@ -1700,6 +1859,7 @@ async fn handle_client_tcp_path_frame(
             }
             route_client_tcp_stream_frame(
                 streams,
+                closed_streams,
                 stream_id,
                 Frame::StreamMaxData {
                     stream_id,
@@ -1712,6 +1872,7 @@ async fn handle_client_tcp_path_frame(
             if let Some(mut state) = streams.remove(&stream_id)
                 && let Some(pending) = state.pending_open.take()
             {
+                closed_streams.insert(stream_id);
                 let _ = pending
                     .response
                     .send(Err(RuntimeError::RemoteReset(reason)));
@@ -1719,6 +1880,7 @@ async fn handle_client_tcp_path_frame(
             }
             route_client_tcp_stream_frame(
                 streams,
+                closed_streams,
                 stream_id,
                 Frame::StreamReset { stream_id, reason },
             )
@@ -1732,6 +1894,7 @@ async fn handle_client_tcp_path_frame(
         } => {
             route_client_tcp_stream_frame(
                 streams,
+                closed_streams,
                 stream_id,
                 Frame::StreamData {
                     stream_id,
@@ -1745,13 +1908,20 @@ async fn handle_client_tcp_path_frame(
         Frame::StreamAck { stream_id, ranges } => {
             route_client_tcp_stream_frame(
                 streams,
+                closed_streams,
                 stream_id,
                 Frame::StreamAck { stream_id, ranges },
             )
             .await
         }
         Frame::StreamFin { stream_id } => {
-            route_client_tcp_stream_frame(streams, stream_id, Frame::StreamFin { stream_id }).await
+            route_client_tcp_stream_frame(
+                streams,
+                closed_streams,
+                stream_id,
+                Frame::StreamFin { stream_id },
+            )
+            .await
         }
         Frame::Ping { nonce } => {
             connection
@@ -1817,17 +1987,21 @@ fn refresh_client_tcp_path_liveness_state(
 
 async fn route_client_tcp_stream_frame(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
     stream_id: StreamId,
     frame: Frame,
 ) -> Result<(), RuntimeError> {
     let Some(state) = streams.get_mut(&stream_id) else {
+        if closed_streams.contains(&stream_id) {
+            return Ok(());
+        }
         return Err(RuntimeError::Protocol("frame for unknown TCP stream"));
     };
-    state
-        .frames
-        .send(Ok(frame))
-        .await
-        .map_err(|_| RuntimeError::TcpPathSessionClosed)
+    if state.frames.send(Ok(frame)).await.is_err() {
+        streams.remove(&stream_id);
+        closed_streams.insert(stream_id);
+    }
+    Ok(())
 }
 
 async fn tick_client_tcp_path_heartbeat(
@@ -1922,7 +2096,21 @@ fn spawn_encrypted_tcp_reader(
 }
 
 fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
-    resources.max_streams.clamp(1, 1024)
+    tcp_path_command_queue(resources.into())
+}
+
+fn tcp_path_command_queue(mux_limits: MuxLimits) -> usize {
+    let frame_payload = mux_limits
+        .max_tcp_relay_chunk_bytes
+        .min(mux_limits.max_payload_bytes)
+        .max(1);
+    let inflight_frames = mux_limits
+        .max_tcp_path_inflight_bytes
+        .saturating_add(frame_payload - 1)
+        / frame_payload;
+    inflight_frames
+        .saturating_add(4)
+        .clamp(4, tcp_path_session_frame_queue(mux_limits).max(4))
 }
 
 fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
@@ -1980,6 +2168,9 @@ impl ClientPathContext {
                     mux_limits,
                     command_queue: tcp_session_command_queue(resources),
                     stream_frame_queue: tcp_stream_frame_queue(mux_limits),
+                    closed_stream_cache_capacity: tcp_closed_stream_cache_capacity(
+                        resources.max_streams,
+                    ),
                 })
             })
             .collect::<Vec<_>>();
@@ -3264,19 +3455,40 @@ async fn handle_server_path(
     let mut path_frames =
         spawn_encrypted_tcp_reader(reader, tcp_path_session_frame_queue(context.mux_limits));
     let (commands_tx, mut commands_rx) =
-        mpsc::channel::<TcpPathSessionCommand>(tcp_server_session_command_queue(&context));
+        tcp_path_session_command_channels(tcp_server_session_command_queue(&context));
     let mut attached_streams = HashSet::new();
     let mut draining = false;
 
     loop {
         tokio::select! {
             biased;
+            command = commands_rx.commands.recv(), if tcp_receiver_may_recv(&commands_rx.commands) => {
+                match command {
+                    Some(command) => if !handle_server_tcp_path_command(
+                        command,
+                        &mut writer,
+                        &context,
+                        &mut attached_streams,
+                        ServerTcpPathCommandContext {
+                            session_id,
+                            path_id,
+                            commands_tx: &commands_tx,
+                            draining,
+                        },
+                    ).await? {
+                        return Ok(());
+                    },
+                    None => {
+                        if tcp_path_receivers_closed(&commands_rx) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             frame = path_frames.recv() => {
                 match frame.ok_or(RuntimeError::TcpPathSessionClosed)?? {
                     Frame::OpenStream {
-                        stream_id,
-                        target,
-                        ..
+                        stream_id, target, ..
                     } if !draining => {
                         outbound::validate_target(&target)?;
                         context.outbound.ensure_supports(TargetProtocol::Tcp)?;
@@ -3295,14 +3507,13 @@ async fn handle_server_path(
                                 attached_streams.insert(stream_id);
                                 let stream_context = context.clone();
                                 tokio::spawn(async move {
-                                    if let Err(err) =
-                                        run_server_tcp_stream(
-                                            stream_context,
-                                            session_id,
-                                            stream,
-                                            target,
-                                        )
-                                        .await
+                                    if let Err(err) = run_server_tcp_stream(
+                                        stream_context,
+                                        session_id,
+                                        stream,
+                                        target,
+                                    )
+                                    .await
                                     {
                                         eprintln!("warning: server TCP stream failed: {err}");
                                     }
@@ -3451,40 +3662,52 @@ async fn handle_server_path(
                     _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
                 }
             }
-            command = commands_rx.recv() => {
-                match command {
-                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
-                        if !server_write_tcp_path_frame(&mut writer, &frame).await? {
-                            return Ok(());
-                        }
-                    }
-                    Some(TcpPathSessionCommand::CloseStream(stream_id)) => {
-                        attached_streams.remove(&stream_id);
-                        context
-                            .tcp_streams
-                            .detach_path(session_id, stream_id, path_id, &commands_tx);
-                        if draining && attached_streams.is_empty() {
-                            if !server_write_tcp_path_frame(
-                                &mut writer,
-                                &Frame::PathClose {
-                                    path_id,
-                                    reason: CloseReason::Normal,
-                                },
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-                            return Ok(());
-                        }
-                    }
-                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
-                        return Err(RuntimeError::Protocol("server TCP path received client open command"));
-                    }
-                    None => return Ok(()),
-                }
-            }
         }
+    }
+}
+
+struct ServerTcpPathCommandContext<'a> {
+    session_id: SessionId,
+    path_id: PathId,
+    commands_tx: &'a TcpPathSessionCommandSender,
+    draining: bool,
+}
+
+async fn handle_server_tcp_path_command(
+    command: TcpPathSessionCommand,
+    writer: &mut EncryptedTcpWriter,
+    context: &ServerPathContext,
+    attached_streams: &mut HashSet<StreamId>,
+    command_context: ServerTcpPathCommandContext<'_>,
+) -> Result<bool, RuntimeError> {
+    match command {
+        TcpPathSessionCommand::SendFrame(frame) => {
+            server_write_tcp_path_frame(writer, &frame).await
+        }
+        TcpPathSessionCommand::CloseStream(stream_id) => {
+            attached_streams.remove(&stream_id);
+            context.tcp_streams.detach_path(
+                command_context.session_id,
+                stream_id,
+                command_context.path_id,
+                command_context.commands_tx,
+            );
+            if command_context.draining && attached_streams.is_empty() {
+                let _ = server_write_tcp_path_frame(
+                    writer,
+                    &Frame::PathClose {
+                        path_id: command_context.path_id,
+                        reason: CloseReason::Normal,
+                    },
+                )
+                .await?;
+                return Ok(false);
+            }
+            Ok(true)
+        }
+        TcpPathSessionCommand::OpenStream { .. } => Err(RuntimeError::Protocol(
+            "server TCP path received client open command",
+        )),
     }
 }
 
@@ -3562,7 +3785,7 @@ async fn run_server_tcp_stream(
 }
 
 fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
-    context.max_tcp_streams.clamp(1, 1024)
+    tcp_path_command_queue(context.mux_limits)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4311,7 +4534,9 @@ where
             }, if local_open && tcp_relay_can_read(&send_stream, mux_limits) => {
                 let read = read?;
                 if read == 0 {
-                    path_stream.send_frame(Frame::StreamFin { stream_id }).await?;
+                    path_stream
+                        .send_frame(Frame::StreamFin { stream_id })
+                        .await?;
                     close_sent = true;
                     local_open = false;
                 } else {
@@ -6325,6 +6550,31 @@ mod tests {
     }
 
     #[test]
+    fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 1024 * 1024,
+            max_ack_ranges: 256,
+            max_stream_window_bytes: 16 * 1024 * 1024,
+            max_repair_bytes: 16 * 1024 * 1024,
+            max_reorder_bytes: 16 * 1024 * 1024,
+            max_datagram_queue_bytes: 4 * 1024 * 1024,
+            max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+            max_tcp_relay_chunk_bytes: 256 * 1024,
+            tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+            tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        };
+        assert_eq!(tcp_path_command_queue(mux_limits), 20);
+
+        let resources = ResourceLimits {
+            max_streams: 65_536,
+            max_tcp_path_inflight_bytes: mux_limits.max_tcp_path_inflight_bytes,
+            max_tcp_relay_chunk_bytes: mux_limits.max_tcp_relay_chunk_bytes,
+            ..ResourceLimits::default()
+        };
+        assert_eq!(tcp_session_command_queue(resources), 20);
+    }
+
+    #[test]
     fn auto_tcp_class_promotes_after_runtime_bdp_threshold() {
         let mux_limits = MuxLimits::default();
         let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
@@ -6499,9 +6749,14 @@ mod tests {
 
     #[tokio::test]
     async fn server_tcp_binding_reselects_blocked_data_send_after_path_update() {
-        let (old_tx, _old_rx) = mpsc::channel(1);
+        let (old_tx, _old_rx) = tcp_path_session_command_channels(1);
         old_tx
-            .send(TcpPathSessionCommand::SendFrame(Frame::Ping { nonce: 1 }))
+            .send_frame(Frame::StreamData {
+                stream_id: StreamId(99),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"fill"),
+            })
             .await
             .expect("fill old path command queue");
         let binding = ServerTcpStreamBinding::new(PathId(0), old_tx);
@@ -6522,13 +6777,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!send_task.is_finished());
 
-        let (new_tx, mut new_rx) = mpsc::channel(1);
+        let (new_tx, mut new_rx) = tcp_path_session_command_channels(1);
         binding.attach(PathId(1), new_tx);
         send_task
             .await
             .expect("binding send join")
             .expect("binding send");
-        match new_rx.recv().await.expect("new path command") {
+        match new_rx.commands.recv().await.expect("new path command") {
             TcpPathSessionCommand::SendFrame(Frame::StreamData {
                 stream_id, payload, ..
             }) => {
@@ -6540,11 +6795,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
+        let stream_id = StreamId(7);
+        let (frames_tx, frames_rx) = mpsc::channel(1);
+        let mut streams = HashMap::new();
+        streams.insert(
+            stream_id,
+            ClientTcpPathStreamState {
+                frames: frames_tx,
+                pending_open: None,
+            },
+        );
+        let mut closed_streams = RecentIdCache::new(8);
+        drop(frames_rx);
+
+        route_client_tcp_stream_frame(
+            &mut streams,
+            &mut closed_streams,
+            stream_id,
+            Frame::StreamFin { stream_id },
+        )
+        .await
+        .expect("receiver close should mark stream drained");
+        assert!(!streams.contains_key(&stream_id));
+        assert!(closed_streams.contains(&stream_id));
+
+        route_client_tcp_stream_frame(
+            &mut streams,
+            &mut closed_streams,
+            stream_id,
+            Frame::StreamAck {
+                stream_id,
+                ranges: Vec::new(),
+            },
+        )
+        .await
+        .expect("late frame for closed stream should be ignored");
+
+        let unknown = StreamId(99);
+        let err = route_client_tcp_stream_frame(
+            &mut streams,
+            &mut closed_streams,
+            unknown,
+            Frame::StreamFin { stream_id: unknown },
+        )
+        .await
+        .expect_err("unknown stream should remain a protocol error");
+        assert!(matches!(err, RuntimeError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
+        let registry = ServerTcpStreamRegistry::new(8);
+        let session_id = SessionId(11);
+        let stream_id = StreamId(5);
+        let (commands, _receivers) = tcp_path_session_command_channels(4);
+        let target = TargetAddr::Domain {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+
+        let opened = registry
+            .open_or_attach(
+                session_id,
+                stream_id,
+                &target,
+                ServerTcpPathAttachment {
+                    path_id: PathId(0),
+                    commands,
+                },
+                MuxLimits::default(),
+                8,
+            )
+            .expect("server stream open");
+        assert!(matches!(opened, ServerTcpStreamOpen::New(_)));
+
+        registry.close(session_id, stream_id);
+        registry
+            .route_frame(session_id, stream_id, Frame::StreamFin { stream_id })
+            .await
+            .expect("late server stream frame should be ignored");
+
+        let unknown = StreamId(99);
+        let err = registry
+            .route_frame(session_id, unknown, Frame::StreamFin { stream_id: unknown })
+            .await
+            .expect_err("unknown server stream should remain a protocol error");
+        assert!(matches!(err, RuntimeError::Protocol(_)));
+    }
+
+    #[tokio::test]
     async fn server_tcp_relay_replays_response_repair_cache_on_path_reattach() {
         let mux_limits = MuxLimits::default();
         let stream_id = StreamId(42);
         let (mut target_peer, target_side) = duplex(4096);
-        let (commands_tx, mut commands_rx) = mpsc::channel(8);
+        let (commands_tx, mut commands_rx) = tcp_path_session_command_channels(8);
         let (frames_tx, frames_rx) = mpsc::channel(8);
         let relay = tokio::spawn(relay_tcp_stream(
             target_side,
@@ -6561,10 +6906,13 @@ mod tests {
             .write_all(b"response")
             .await
             .expect("target write");
-        let first = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
-            .await
-            .expect("first relay frame timeout")
-            .expect("first relay frame");
+        let first = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_tcp_path_command(&mut commands_rx),
+        )
+        .await
+        .expect("first relay frame timeout")
+        .expect("first relay frame");
         match first {
             TcpPathSessionCommand::SendFrame(Frame::StreamData {
                 stream_id: received_stream_id,
@@ -6587,10 +6935,13 @@ mod tests {
             }))
             .await
             .expect("reattach signal");
-        let replay = tokio::time::timeout(Duration::from_secs(1), commands_rx.recv())
-            .await
-            .expect("replay frame timeout")
-            .expect("replay frame");
+        let replay = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_tcp_path_command(&mut commands_rx),
+        )
+        .await
+        .expect("replay frame timeout")
+        .expect("replay frame");
         match replay {
             TcpPathSessionCommand::SendFrame(Frame::StreamData {
                 stream_id: received_stream_id,

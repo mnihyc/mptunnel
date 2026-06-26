@@ -2777,14 +2777,10 @@ fn apply_tcp_bulk_isolation(
 
 fn tcp_latency_startup_should_use_configured_order(
     paths: &[PathSpec],
-    observations: &[ClientPathObservation],
+    _observations: &[ClientPathObservation],
     class: TrafficClass,
 ) -> bool {
-    tcp_relay_expects_interactive_response(class)
-        && observations
-            .iter()
-            .all(|observation| observation.active_latency_sensitive_flows == 0)
-        && paths.iter().all(tcp_path_is_endpoint_only)
+    tcp_relay_expects_interactive_response(class) && paths.iter().all(tcp_path_is_endpoint_only)
 }
 
 fn tcp_path_is_endpoint_only(path: &PathSpec) -> bool {
@@ -7850,6 +7846,33 @@ mod tests {
         assert_eq!(
             context.ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn endpoint_only_tcp_interactive_opens_stay_latency_first_under_active_flow() {
+        let low_latency_path = "tcp://127.0.0.1:10129"
+            .parse::<PathSpec>()
+            .expect("low latency path");
+        let high_latency_path = "tcp://127.0.0.1:10130"
+            .parse::<PathSpec>()
+            .expect("high latency path");
+        let poor_path = "tcp://127.0.0.1:10131"
+            .parse::<PathSpec>()
+            .expect("poor path");
+        let context = ClientPathContext::new(
+            vec![low_latency_path, high_latency_path, poor_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+        context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
+
+        assert_eq!(
+            context.ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+            vec![0, 1, 2]
         );
     }
 

@@ -2073,19 +2073,83 @@ impl ClientPathContext {
         Some(path_snapshot(path, index, observation))
     }
 
-    fn ordered_udp_path_indices_for_ttl(&self, payload_bytes: usize, ttl_ms: u32) -> Vec<usize> {
+    fn ordered_udp_path_candidates_for_ttl(
+        &self,
+        payload_bytes: usize,
+        ttl_ms: u32,
+    ) -> Vec<UdpPathCandidate> {
         if ttl_ms == 0 {
             return Vec::new();
         }
         let observations =
             health_observations(&mut self.health.lock().expect("client path health lock").udp);
-        ordered_path_indices_for_ttl(
+        let mut candidates = ordered_path_scores_for_ttl(
             &self.udp_paths,
             &observations,
             TrafficClass::RealtimeDatagram,
             payload_bytes,
             ttl_ms,
         )
+        .into_iter()
+        .map(|(path_index, eta_ms)| UdpPathCandidate { path_index, eta_ms })
+        .collect::<Vec<_>>();
+        if candidates
+            .iter()
+            .any(|candidate| self.udp_path_candidate_has_realtime_model(*candidate, &observations))
+        {
+            candidates.retain(|candidate| {
+                self.udp_path_candidate_has_realtime_model(*candidate, &observations)
+            });
+        }
+        candidates
+    }
+
+    fn udp_path_candidate_has_realtime_model(
+        &self,
+        candidate: UdpPathCandidate,
+        observations: &[ClientPathObservation],
+    ) -> bool {
+        let Some(path) = self.udp_paths.get(candidate.path_index) else {
+            return false;
+        };
+        observations
+            .get(candidate.path_index)
+            .copied()
+            .is_some_and(|observation| udp_path_has_realtime_model(path, observation))
+    }
+
+    fn udp_path_eta_for_ttl(
+        &self,
+        index: usize,
+        payload_bytes: usize,
+        ttl_ms: u32,
+        discount_open_udp_session: bool,
+    ) -> Option<f64> {
+        if ttl_ms == 0 {
+            return None;
+        }
+        let path = self.udp_paths.get(index)?;
+        let mut observation = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)?
+            .observe(Instant::now());
+        if discount_open_udp_session {
+            observation.active_flows = observation.active_flows.saturating_sub(1);
+            observation.load_bytes = observation
+                .load_bytes
+                .saturating_sub(UDP_SESSION_LOAD_BYTES);
+        }
+        let score = scheduler::score_path(
+            path_snapshot(path, index, observation),
+            TrafficClass::RealtimeDatagram,
+            payload_bytes,
+            SchedulerPolicy::default(),
+        )?;
+        let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
+        (score.eta_ms <= freshness_budget_ms).then_some(score.eta_ms)
     }
 
     fn udp_path_runtime_model(&self, index: usize, ttl_ms: u32) -> Option<UdpPathRuntimeModel> {
@@ -2354,20 +2418,19 @@ fn ordered_path_indices(
         .collect()
 }
 
-fn ordered_path_indices_for_ttl(
+fn ordered_path_scores_for_ttl(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     class: TrafficClass,
     payload_bytes: usize,
     ttl_ms: u32,
-) -> Vec<usize> {
+) -> Vec<(usize, f64)> {
     let scores = ordered_path_scores(paths, observations, class, payload_bytes);
     let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
     scores
         .iter()
         .copied()
         .filter(|(_, eta_ms)| *eta_ms <= freshness_budget_ms)
-        .map(|(index, _)| index)
         .collect::<Vec<_>>()
 }
 
@@ -2439,6 +2502,16 @@ fn path_snapshot(
         queue_bytes: observation.load_bytes,
         bytes_in_flight: u64::from(observation.active_flows) * PATH_OPEN_SCORE_BYTES as u64,
     }
+}
+
+fn udp_path_has_realtime_model(path: &PathSpec, observation: ClientPathObservation) -> bool {
+    observation.measured_srtt_ms.is_some()
+        || observation.measured_jitter_ms.is_some()
+        || observation.measured_rate_bps.is_some()
+        || observation.measured_loss_rate.is_some()
+        || path.metadata.initial_srtt_ms.is_some()
+        || path.metadata.initial_jitter_ms.is_some()
+        || path.metadata.initial_rate != RateHint::Unknown
 }
 
 fn tcp_path_can_be_auto_discovered(path: &PathSpec) -> bool {
@@ -4392,6 +4465,12 @@ struct UdpDatagramClientAssociation {
     paths: Vec<UdpDatagramAssociationPath>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct UdpPathCandidate {
+    path_index: usize,
+    eta_ms: f64,
+}
+
 struct UdpDatagramAssociationPath {
     session: UdpDatagramClientSession,
     pacer: UdpDatagramPacer,
@@ -4456,7 +4535,7 @@ impl UdpDatagramClientAssociation {
         }
         let candidates = self
             .context
-            .ordered_udp_path_indices_for_ttl(payload.len(), ttl_ms);
+            .ordered_udp_path_candidates_for_ttl(payload.len(), ttl_ms);
         if candidates.is_empty() {
             return Err(RuntimeError::NoSchedulableUdpPath);
         }
@@ -4534,31 +4613,55 @@ impl UdpDatagramClientAssociation {
 
     fn select_path_candidate(
         &self,
-        candidates: &[usize],
+        candidates: &[UdpPathCandidate],
         attempted: &HashSet<usize>,
         payload_bytes: usize,
         ttl_ms: u32,
     ) -> Option<usize> {
         let now = Instant::now();
+        let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
         candidates
             .iter()
             .enumerate()
-            .filter(|(_, path_index)| !attempted.contains(path_index))
-            .filter_map(|(rank, path_index)| {
-                let model = self.context.udp_path_runtime_model(*path_index, ttl_ms)?;
+            .filter(|(_, candidate)| !attempted.contains(&candidate.path_index))
+            .filter_map(|(rank, candidate)| {
+                let open_ready_at = self
+                    .paths
+                    .iter()
+                    .find(|path| path.session.path_index == candidate.path_index)
+                    .map(|path| path.pacer.ready_at());
+                let has_open_session = open_ready_at.is_some();
+                let eta_ms = self.context.udp_path_eta_for_ttl(
+                    candidate.path_index,
+                    payload_bytes,
+                    ttl_ms,
+                    has_open_session,
+                )?;
+                let model = self
+                    .context
+                    .udp_path_runtime_model(candidate.path_index, ttl_ms)?;
                 if !model.accepts_or_can_probe(payload_bytes) {
                     return None;
                 }
-                let ready_at = self
-                    .paths
-                    .iter()
-                    .find(|path| path.session.path_index == *path_index)
-                    .map(|path| path.pacer.ready_at())
-                    .unwrap_or(now);
-                Some((*path_index, ready_at, rank))
+                let ready_at = open_ready_at.unwrap_or(now);
+                let ready_delay_ms = ready_at.saturating_duration_since(now).as_secs_f64() * 1000.0;
+                let completion_ms = eta_ms + ready_delay_ms;
+                (completion_ms <= freshness_budget_ms).then_some((
+                    candidate.path_index,
+                    completion_ms,
+                    eta_ms,
+                    !has_open_session,
+                    rank,
+                ))
             })
-            .min_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)))
-            .map(|(path_index, _, _)| path_index)
+            .min_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| left.3.cmp(&right.3))
+                    .then_with(|| left.4.cmp(&right.4))
+            })
+            .map(|(path_index, _, _, _, _)| path_index)
     }
 
     async fn send_to_path(
@@ -5663,6 +5766,18 @@ mod tests {
         SecurityConfig::encrypted(SharedSecret::new(b"0123456789abcdef".to_vec()).expect("secret"))
     }
 
+    fn udp_candidate_indices(
+        context: &ClientPathContext,
+        payload_bytes: usize,
+        ttl_ms: u32,
+    ) -> Vec<usize> {
+        context
+            .ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms)
+            .into_iter()
+            .map(|candidate| candidate.path_index)
+            .collect()
+    }
+
     fn server_context(outbound: OutboundConfig) -> ServerPathContext {
         let resources = ResourceLimits::default();
         ServerPathContext {
@@ -6664,8 +6779,7 @@ mod tests {
         .expect("context");
 
         assert_eq!(
-            context
-                .ordered_udp_path_indices_for_ttl(1024 * 1024, DEFAULT_SOCKS5_UDP_TTL_MS)
+            udp_candidate_indices(&context, 1024 * 1024, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(1)
@@ -6681,8 +6795,7 @@ mod tests {
         );
 
         assert_eq!(
-            context
-                .ordered_udp_path_indices_for_ttl(1024 * 1024, DEFAULT_SOCKS5_UDP_TTL_MS)
+            udp_candidate_indices(&context, 1024 * 1024, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(0)
@@ -6715,8 +6828,7 @@ mod tests {
         );
 
         assert_eq!(
-            context
-                .ordered_udp_path_indices_for_ttl(4096, DEFAULT_SOCKS5_UDP_TTL_MS)
+            udp_candidate_indices(&context, 4096, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(1)
@@ -6741,10 +6853,34 @@ mod tests {
         )
         .expect("context");
 
-        assert!(
-            context
-                .ordered_udp_path_indices_for_ttl(1024, 10)
-                .is_empty()
+        assert!(udp_candidate_indices(&context, 1024, 10).is_empty());
+    }
+
+    #[test]
+    fn realtime_udp_prefers_measured_model_before_unmeasured_startup_paths() {
+        let first_path = "udp://127.0.0.1:10024"
+            .parse::<PathSpec>()
+            .expect("first path");
+        let second_path = "udp://127.0.0.1:10025"
+            .parse::<PathSpec>()
+            .expect("second path");
+        let context = ClientPathContext::new(
+            vec![first_path, second_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
+            udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS),
+            vec![0, 1]
+        );
+
+        context.mark_udp_path_probe_success(0, Duration::from_millis(20));
+
+        assert_eq!(
+            udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS),
+            vec![0]
         );
     }
 
@@ -6800,10 +6936,10 @@ mod tests {
         )
         .expect("context");
 
+        context.mark_udp_path_probe_success(1, Duration::from_millis(1));
         context.mark_udp_path_open_success(0, Duration::from_millis(1));
         assert_eq!(
-            context
-                .ordered_udp_path_indices_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS)
+            udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(1)
@@ -6811,8 +6947,7 @@ mod tests {
 
         context.release_udp_path_load(0);
         assert_eq!(
-            context
-                .ordered_udp_path_indices_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS)
+            udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS)
                 .first()
                 .copied(),
             Some(0)
@@ -7833,6 +7968,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_association_scores_pacer_delay_against_path_eta() {
+        let (target_addr, target) = spawn_udp_echo_target().await;
+        let low_latency_path = reserve_udp_path_with_query("srtt-ms=10&rate-mbps=100").await;
+        let slower_path = reserve_udp_path_with_query("srtt-ms=120&rate-mbps=100").await;
+        let low_latency_socket = udp::bind_socket(&low_latency_path)
+            .await
+            .expect("bind low latency udp path");
+        let low_latency_server = tokio::spawn(handle_server_udp_datagram_path_session(
+            low_latency_socket,
+            server_context(OutboundConfig::Direct),
+        ));
+        let context = ClientPathContext::new(
+            vec![low_latency_path, slower_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("ctx");
+        let observed_context = context.clone();
+        let mut association = UdpDatagramClientAssociation::new(context).expect("assoc");
+
+        let response = association
+            .send_to(
+                TargetAddr::Ip(target_addr),
+                Bytes::from_static(b"ping"),
+                1000,
+            )
+            .await
+            .expect("initial response");
+
+        assert_eq!(response, Bytes::from_static(b"pong"));
+        association
+            .paths
+            .iter_mut()
+            .find(|path| path.session.path_index == 0)
+            .expect("low latency path session")
+            .pacer
+            .next_send_at = Instant::now() + Duration::from_millis(30);
+
+        assert_eq!(
+            association.select_path_candidate(
+                &[
+                    UdpPathCandidate {
+                        path_index: 0,
+                        eta_ms: 10.0,
+                    },
+                    UdpPathCandidate {
+                        path_index: 1,
+                        eta_ms: 120.0,
+                    },
+                ],
+                &HashSet::new(),
+                512,
+                1000,
+            ),
+            Some(0)
+        );
+        observed_context.mark_udp_path_probe_success(1, Duration::from_millis(20));
+        assert_eq!(
+            association.select_path_candidate(
+                &[
+                    UdpPathCandidate {
+                        path_index: 0,
+                        eta_ms: 10.0,
+                    },
+                    UdpPathCandidate {
+                        path_index: 1,
+                        eta_ms: 25.0,
+                    },
+                ],
+                &HashSet::new(),
+                512,
+                1000,
+            ),
+            Some(1)
+        );
+
+        association.close().await.expect("close association");
+        low_latency_server
+            .await
+            .expect("low latency server join")
+            .expect("low latency server");
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
     async fn udp_association_retries_datagram_on_survivor_path_after_timeout() {
         let (target_addr, target) = spawn_udp_echo_target().await;
         let blackhole_path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
@@ -7934,7 +8154,16 @@ mod tests {
 
         assert_eq!(
             association.select_path_candidate(
-                &[0, 1],
+                &[
+                    UdpPathCandidate {
+                        path_index: 0,
+                        eta_ms: 5.0,
+                    },
+                    UdpPathCandidate {
+                        path_index: 1,
+                        eta_ms: 20.0,
+                    },
+                ],
                 &HashSet::new(),
                 UDP_DEFAULT_MTU_PAYLOAD_BYTES + 256,
                 1000,

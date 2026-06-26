@@ -4342,9 +4342,7 @@ fn tcp_relay_stall_watch_active(
 }
 
 fn tcp_relay_response_stall_watch_bytes(mux_limits: MuxLimits) -> u64 {
-    (tcp_relay_buffer_len(mux_limits) as u64)
-        .saturating_mul(4)
-        .min(mux_limits.max_stream_window_bytes)
+    (tcp_relay_buffer_len(mux_limits) as u64).min(mux_limits.max_stream_window_bytes)
 }
 
 fn tcp_relay_stall_deadline(
@@ -6718,6 +6716,10 @@ mod tests {
         ));
 
         let response_watch_bytes = tcp_relay_response_stall_watch_bytes(mux_limits);
+        assert_eq!(
+            response_watch_bytes,
+            tcp_relay_buffer_len(mux_limits) as u64
+        );
         let current_offset = recv_stream.next_offset();
         let fill_bytes = response_watch_bytes.saturating_sub(current_offset);
         let first_fill = fill_bytes.min(mux_limits.max_payload_bytes as u64) as usize;

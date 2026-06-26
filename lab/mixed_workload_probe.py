@@ -184,23 +184,52 @@ def bulk_worker(args, started_at, bulk_ready, result):
             last_body_s = None
             max_read_gap_s = 0.0
             recovery_gap_s = 0.0
+            bytes_at_failover = None
+            max_gap_start_s = None
+            max_gap_end_s = None
+            max_gap_start_bytes = None
+            max_gap_end_bytes = None
+            recovery_gap_start_s = None
+            recovery_gap_end_s = None
+            recovery_gap_start_bytes = None
+            recovery_gap_end_bytes = None
 
             def record_chunk(size):
                 nonlocal bytes_read, first_body_s, last_body_s, max_read_gap_s, recovery_gap_s
+                nonlocal bytes_at_failover
+                nonlocal max_gap_start_s, max_gap_end_s, max_gap_start_bytes, max_gap_end_bytes
+                nonlocal recovery_gap_start_s, recovery_gap_end_s
+                nonlocal recovery_gap_start_bytes, recovery_gap_end_bytes
                 if size <= 0:
                     return
                 now_s = time.monotonic() - started_at
                 if first_body_s is None:
                     first_body_s = now_s
                     bulk_ready.set()
+                if (
+                    args.failover_after >= 0
+                    and bytes_at_failover is None
+                    and now_s >= args.failover_after
+                ):
+                    bytes_at_failover = bytes_read
                 if last_body_s is not None:
                     gap = now_s - last_body_s
-                    max_read_gap_s = max(max_read_gap_s, gap)
+                    if gap > max_read_gap_s:
+                        max_read_gap_s = gap
+                        max_gap_start_s = last_body_s
+                        max_gap_end_s = now_s
+                        max_gap_start_bytes = bytes_read
+                        max_gap_end_bytes = bytes_read + size
                     if (
                         args.failover_after >= 0
                         and (now_s >= args.failover_after or last_body_s >= args.failover_after)
                     ):
-                        recovery_gap_s = max(recovery_gap_s, gap)
+                        if gap > recovery_gap_s:
+                            recovery_gap_s = gap
+                            recovery_gap_start_s = last_body_s
+                            recovery_gap_end_s = now_s
+                            recovery_gap_start_bytes = bytes_read
+                            recovery_gap_end_bytes = bytes_read + size
                 last_body_s = now_s
                 bytes_read += size
 
@@ -217,14 +246,24 @@ def bulk_worker(args, started_at, bulk_ready, result):
             {
                 "bulk_status": "ok" if 200 <= status < 400 else "fail",
                 "bulk_http_code": status,
+                "bulk_content_length": content_length,
                 "bulk_bytes": bytes_read,
                 "bulk_time_s": elapsed,
                 "bulk_goodput_mbps": bytes_read * 8 / elapsed / 1_000_000
                 if elapsed > 0
                 else 0.0,
                 "bulk_first_body_s": first_body_s,
+                "bulk_bytes_at_failover": bytes_at_failover,
                 "bulk_max_read_gap_s": max_read_gap_s,
+                "bulk_max_gap_start_s": max_gap_start_s,
+                "bulk_max_gap_end_s": max_gap_end_s,
+                "bulk_max_gap_start_bytes": max_gap_start_bytes,
+                "bulk_max_gap_end_bytes": max_gap_end_bytes,
                 "bulk_recovery_gap_s": recovery_gap_s,
+                "bulk_recovery_gap_start_s": recovery_gap_start_s,
+                "bulk_recovery_gap_end_s": recovery_gap_end_s,
+                "bulk_recovery_gap_start_bytes": recovery_gap_start_bytes,
+                "bulk_recovery_gap_end_bytes": recovery_gap_end_bytes,
             }
         )
     except Exception as exc:

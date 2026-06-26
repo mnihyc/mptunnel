@@ -24,6 +24,8 @@ failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 case_filter="${CASE_FILTER:-}"
+client_settle_seconds="${CLIENT_SETTLE_SECONDS:-2}"
+isolate_cases="${ISOLATE_CASES:-1}"
 secret="${MPTUNNEL_LAB_SECRET:-mptunnel-lab-secret-change-me-32-bytes-minimum}"
 
 compose() {
@@ -100,6 +102,20 @@ run_curl_case() {
   parse_and_record_curl "$case_name" "$protocol" "$exit_code" "$output"
 }
 
+run_tcp_download_probe_case() {
+  local case_name="$1"
+  set +e
+  local output
+  output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after -1 --timeout '${curl_timeout}'" 2>/dev/null)"
+  local exit_code="$?"
+  set -e
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    printf '{"case":"%s","protocol":"tcp","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
+  fi
+}
+
 stop_process() {
   local service="$1"
   local pid_file="$2"
@@ -109,6 +125,7 @@ stop_process() {
 
 stop_client() {
   stop_process client /tmp/mptunnel-client.pid
+  sleep "$client_settle_seconds"
 }
 
 stop_server() {
@@ -191,7 +208,12 @@ start_client() {
   if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
     probe_args="${probe_args} --path-probe-timeout-ms '${PATH_PROBE_TIMEOUT_MS}'"
   fi
-  stop_client
+  if [[ "$isolate_cases" == "1" ]]; then
+    stop_client
+    start_server
+  else
+    stop_client
+  fi
   exec_in client "\
     MPTUNNEL_LOG=info /workspace/target/release/mptunnel \
       --secret '${secret}' \
@@ -322,22 +344,32 @@ fi
 
 if should_run_case "mptunnel_tcp_single_low_latency"; then
   start_client "tcp_single_low_latency" "$tcp_lowlat"
-  run_curl_case "mptunnel_tcp_single_low_latency" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+  run_tcp_download_probe_case "mptunnel_tcp_single_low_latency"
 fi
 
 if should_run_case "mptunnel_tcp_single_cross_continent_high_bandwidth"; then
   start_client "tcp_single_cross_continent_high_bandwidth" "$tcp_fat"
-  run_curl_case "mptunnel_tcp_single_cross_continent_high_bandwidth" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+  run_tcp_download_probe_case "mptunnel_tcp_single_cross_continent_high_bandwidth"
 fi
 
 if should_run_case "mptunnel_tcp_single_poor_internet"; then
   start_client "tcp_single_poor_internet" "$tcp_poor"
-  run_curl_case "mptunnel_tcp_single_poor_internet" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+  run_tcp_download_probe_case "mptunnel_tcp_single_poor_internet"
 fi
 
 if should_run_case "mptunnel_tcp_multipath_all"; then
   start_client "tcp_multipath_all" "$tcp_all"
-  run_curl_case "mptunnel_tcp_multipath_all" "tcp" "http://172.31.40.30:8080/large.bin" "--socks5-hostname 127.0.0.1:${proxy_port}"
+  run_tcp_download_probe_case "mptunnel_tcp_multipath_all"
+fi
+
+if should_run_case "mptunnel_udp_stream_single_low_latency"; then
+  start_client "udp_stream_single_low_latency" "$udp_lowlat"
+  run_tcp_download_probe_case "mptunnel_udp_stream_single_low_latency"
+fi
+
+if should_run_case "mptunnel_udp_stream_multipath_all"; then
+  start_client "udp_stream_multipath_all" "$udp_all"
+  run_tcp_download_probe_case "mptunnel_udp_stream_multipath_all"
 fi
 
 if should_run_case "mptunnel_udp_single_low_latency"; then
@@ -368,3 +400,24 @@ if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat"; then
 fi
 
 echo "$result_file"
+python3 - "$result_file" <<'PY'
+import json
+import sys
+
+failed = []
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    for line_number, line in enumerate(handle, 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("status") != "ok":
+            failed.append((line_number, row.get("case", "unknown"), row.get("status")))
+
+if failed:
+    for line_number, case, status in failed:
+        print(
+            f"failed experiment row {line_number}: {case} status={status}",
+            file=sys.stderr,
+        )
+    sys.exit(1)
+PY

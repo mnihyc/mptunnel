@@ -95,7 +95,13 @@ def record_body_chunk(now, state, size):
     if state["last_body_at"] is not None:
         gap = now - state["last_body_at"]
         state["max_read_gap_s"] = max(state["max_read_gap_s"], gap)
-        if now >= state["failover_after_s"] or state["last_body_at"] >= state["failover_after_s"]:
+        if (
+            state["failover_after_s"] >= 0
+            and (
+                now >= state["failover_after_s"]
+                or state["last_body_at"] >= state["failover_after_s"]
+            )
+        ):
             state["recovery_gap_s"] = max(state["recovery_gap_s"], gap)
     state["last_body_at"] = now
     state["bytes"] += size
@@ -104,6 +110,7 @@ def record_body_chunk(now, state, size):
 def download(args):
     started = time.monotonic()
     sock, target_host, target_port = connect_socks5(args.proxy, args.target, args.timeout)
+    sock.settimeout(min(args.timeout, 1.0))
     with sock:
         request = (
             f"GET {args.path} HTTP/1.1\r\n"
@@ -114,7 +121,12 @@ def download(args):
         sock.sendall(request)
         buffer = b""
         while b"\r\n\r\n" not in buffer:
-            chunk = sock.recv(args.chunk_bytes)
+            if time.monotonic() - started >= args.timeout:
+                raise RuntimeError("timeout before HTTP headers")
+            try:
+                chunk = sock.recv(args.chunk_bytes)
+            except socket.timeout:
+                continue
             if not chunk:
                 raise RuntimeError("EOF before HTTP headers")
             buffer += chunk
@@ -128,23 +140,38 @@ def download(args):
             "failover_after_s": args.failover_after,
         }
         record_body_chunk(time.monotonic() - started, state, len(body))
+        timed_out = False
         while content_length is None or state["bytes"] < content_length:
-            chunk = sock.recv(args.chunk_bytes)
+            if time.monotonic() - started >= args.timeout:
+                timed_out = True
+                break
+            try:
+                chunk = sock.recv(args.chunk_bytes)
+            except socket.timeout:
+                continue
             if not chunk:
                 break
             record_body_chunk(time.monotonic() - started, state, len(chunk))
     elapsed = time.monotonic() - started
-    if content_length is not None and state["bytes"] != content_length:
-        raise RuntimeError(f"incomplete body: {state['bytes']} of {content_length} bytes")
+    complete = content_length is None or state["bytes"] == content_length
+    ok = 200 <= status < 400 and complete
+    error = None
+    if timed_out:
+        error = f"timeout after {state['bytes']} of {content_length} bytes"
+    elif not complete:
+        error = f"incomplete body: {state['bytes']} of {content_length} bytes"
     return {
         "case": args.label,
         "protocol": "tcp",
-        "status": "ok" if 200 <= status < 400 else "fail",
-        "exit_code": 0 if 200 <= status < 400 else 22,
+        "status": "ok" if ok else "fail",
+        "exit_code": 0 if ok else (124 if timed_out else (18 if not complete else 22)),
         "http_code": status,
         "time_s": round(elapsed, 6),
         "goodput_mbps": round(state["bytes"] * 8 / elapsed / 1_000_000, 3) if elapsed > 0 else 0,
         "bytes": state["bytes"],
+        "content_length": content_length,
+        "complete": complete,
+        "error": error,
         "first_body_s": round(state["first_body_at"], 6) if state["first_body_at"] is not None else None,
         "max_read_gap_s": round(state["max_read_gap_s"], 6),
         "recovery_gap_s": round(state["recovery_gap_s"], 6),

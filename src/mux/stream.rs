@@ -134,6 +134,28 @@ impl ReliableSendStream {
             })
             .collect()
     }
+
+    pub fn retransmission_frames_limited(&self, byte_limit: usize) -> Vec<Frame> {
+        if byte_limit == 0 {
+            return Vec::new();
+        }
+
+        let mut frames = Vec::new();
+        let mut emitted_bytes = 0usize;
+        for chunk in self.repair_cache.values() {
+            if emitted_bytes >= byte_limit {
+                break;
+            }
+            emitted_bytes = emitted_bytes.saturating_add(chunk.payload.len());
+            frames.push(Frame::StreamData {
+                stream_id: self.stream_id,
+                offset: chunk.offset,
+                flags: chunk.flags,
+                payload: chunk.payload.clone(),
+            });
+        }
+        frames
+    }
 }
 
 fn range_covers_chunk(range: OffsetRange, chunk: &SentChunk) -> bool {
@@ -224,7 +246,6 @@ impl ReliableRecvStream {
 
         let mut received_ranges = self.received_ranges.clone();
         received_ranges.insert(offset, end);
-        received_ranges.ensure_range_limit(self.limits.max_ack_ranges)?;
         self.reorder_bytes = new_reorder_bytes;
         self.received_ranges = received_ranges;
         self.buffered.insert(offset, RecvChunk { payload, flags });
@@ -245,11 +266,58 @@ impl ReliableRecvStream {
         self.received_ranges.ranges()
     }
 
+    pub fn ack_ranges_limited(&self, limit: usize) -> Vec<OffsetRange> {
+        let ranges = self.received_ranges.ranges();
+        if ranges.len() <= limit {
+            return ranges;
+        }
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let early_slots = (limit / 2).max(1).min(limit);
+        let mut limited = ranges.iter().take(early_slots).copied().collect::<Vec<_>>();
+        let remaining_slots = limit.saturating_sub(limited.len());
+        let tail = &ranges[early_slots..];
+        if remaining_slots == 1 {
+            if let Some(range) = tail.last().copied() {
+                limited.push(range);
+            }
+        } else if remaining_slots > 1 && !tail.is_empty() {
+            let max_index = tail.len().saturating_sub(1);
+            for slot in 0..remaining_slots {
+                let index = slot.saturating_mul(max_index) / remaining_slots.saturating_sub(1);
+                limited.push(tail[index]);
+            }
+        }
+        limited.dedup();
+        limited.truncate(limit);
+        limited
+    }
+
     pub fn ack_frame(&self) -> Frame {
         Frame::StreamAck {
             stream_id: self.stream_id,
-            ranges: self.ack_ranges(),
+            ranges: self.ack_ranges_limited(self.limits.max_ack_ranges),
         }
+    }
+
+    pub fn ack_frames(&self) -> Vec<Frame> {
+        let ranges = self.ack_ranges();
+        let chunk_size = self.limits.max_ack_ranges.max(1);
+        if ranges.is_empty() {
+            return vec![Frame::StreamAck {
+                stream_id: self.stream_id,
+                ranges,
+            }];
+        }
+        ranges
+            .chunks(chunk_size)
+            .map(|chunk| Frame::StreamAck {
+                stream_id: self.stream_id,
+                ranges: chunk.to_vec(),
+            })
+            .collect()
     }
 
     pub fn max_data_offset(&self) -> u64 {
@@ -336,17 +404,6 @@ impl RangeSet {
             .iter()
             .filter_map(|(&start, &end)| OffsetRange::new(start, end))
             .collect()
-    }
-
-    fn ensure_range_limit(&self, limit: usize) -> Result<(), StreamError> {
-        if self.ranges.len() > limit {
-            Err(StreamError::TooManyAckRanges {
-                actual: self.ranges.len(),
-                limit,
-            })
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -437,6 +494,26 @@ mod tests {
     }
 
     #[test]
+    fn send_stream_limited_retransmission_uses_byte_budget() {
+        let mut stream = ReliableSendStream::new(StreamId(1), limits());
+        stream
+            .send_data(Bytes::from_static(b"aaaa"), StreamFlags::NONE)
+            .expect("first send");
+        stream
+            .send_data(Bytes::from_static(b"bbbb"), StreamFlags::NONE)
+            .expect("second send");
+        stream
+            .send_data(Bytes::from_static(b"cccc"), StreamFlags::NONE)
+            .expect("third send");
+
+        assert!(stream.retransmission_frames_limited(0).is_empty());
+        assert_eq!(stream.retransmission_frames_limited(1).len(), 1);
+        assert_eq!(stream.retransmission_frames_limited(4).len(), 1);
+        assert_eq!(stream.retransmission_frames_limited(5).len(), 2);
+        assert_eq!(stream.retransmission_frames_limited(32).len(), 3);
+    }
+
+    #[test]
     fn send_stream_enforces_flow_control_and_repair_limit() {
         let mut limit = limits();
         limit.max_stream_window_bytes = 4;
@@ -501,6 +578,83 @@ mod tests {
                 stream_id: StreamId(7),
                 max_offset: 11 + limits().max_stream_window_bytes
             }
+        );
+    }
+
+    #[test]
+    fn recv_stream_limits_encoded_ack_ranges_without_rejecting_reordering() {
+        let mut limit = limits();
+        limit.max_ack_ranges = 4;
+        let mut stream = ReliableRecvStream::new(StreamId(7), limit);
+
+        stream
+            .receive_data(0, Bytes::from_static(b"a"), StreamFlags::NONE)
+            .expect("first chunk");
+        stream
+            .receive_data(10, Bytes::from_static(b"b"), StreamFlags::NONE)
+            .expect("second range");
+        stream
+            .receive_data(20, Bytes::from_static(b"c"), StreamFlags::NONE)
+            .expect("third range");
+        stream
+            .receive_data(30, Bytes::from_static(b"d"), StreamFlags::NONE)
+            .expect("fourth range");
+        stream
+            .receive_data(40, Bytes::from_static(b"e"), StreamFlags::NONE)
+            .expect("fifth range");
+        stream
+            .receive_data(50, Bytes::from_static(b"f"), StreamFlags::NONE)
+            .expect("sixth range");
+
+        assert_eq!(stream.ack_ranges().len(), 6);
+        assert_eq!(
+            stream.ack_frame(),
+            Frame::StreamAck {
+                stream_id: StreamId(7),
+                ranges: vec![
+                    OffsetRange::new(0, 1).expect("contiguous range"),
+                    OffsetRange::new(10, 11).expect("first repair-adjacent range"),
+                    OffsetRange::new(20, 21).expect("sampled range"),
+                    OffsetRange::new(50, 51).expect("tail range"),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn recv_stream_splits_large_ack_sets_into_bounded_frames() {
+        let mut limit = limits();
+        limit.max_ack_ranges = 2;
+        let mut stream = ReliableRecvStream::new(StreamId(7), limit);
+
+        for offset in [0, 10, 20, 30, 40] {
+            stream
+                .receive_data(offset, Bytes::from_static(b"x"), StreamFlags::NONE)
+                .expect("range");
+        }
+
+        assert_eq!(
+            stream.ack_frames(),
+            vec![
+                Frame::StreamAck {
+                    stream_id: StreamId(7),
+                    ranges: vec![
+                        OffsetRange::new(0, 1).expect("first"),
+                        OffsetRange::new(10, 11).expect("second"),
+                    ],
+                },
+                Frame::StreamAck {
+                    stream_id: StreamId(7),
+                    ranges: vec![
+                        OffsetRange::new(20, 21).expect("third"),
+                        OffsetRange::new(30, 31).expect("fourth"),
+                    ],
+                },
+                Frame::StreamAck {
+                    stream_id: StreamId(7),
+                    ranges: vec![OffsetRange::new(40, 41).expect("fifth")],
+                },
+            ]
         );
     }
 

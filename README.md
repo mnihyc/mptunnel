@@ -141,3 +141,8 @@ The deterministic simulator exercises the scheduler against heterogeneous path c
 - failover gap after path failure and chunk reinjection onto a survivor path
 - interactive p95 latency while a bulk transfer is queued
 - bulk tail penalty for heterogeneous RTT/bandwidth paths
+- per-class priority and per-flow deficit scheduling
+- per-path queued-byte pressure from scheduled payloads
+- bulk tail avoidance that promotes the final bulk bytes onto latency-sensitive scoring
+- duplication of small control/realtime packets onto a second close-ETA path
+- shared-bottleneck suspicion that avoids a low-RTT path when a similar-RTT peer is already queued

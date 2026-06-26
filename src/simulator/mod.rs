@@ -1,5 +1,8 @@
 use crate::protocol::{PathId, TrafficClass};
-use crate::scheduler::{PathSnapshot, PathState, SchedulerPolicy, choose_path};
+use crate::scheduler::{
+    EnqueueRequest, FlowId, HeterogeneousScheduler, PathSnapshot, PathState, SchedulerPolicy,
+    SchedulingMode,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -24,8 +27,12 @@ impl VirtualPath {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimulatedSend {
+    pub flow_id: FlowId,
     pub path_id: PathId,
+    pub duplicate_path_id: Option<PathId>,
     pub class: TrafficClass,
+    pub scheduled_class: TrafficClass,
+    pub mode: SchedulingMode,
     pub payload_bytes: usize,
     pub queued_bytes_after: u64,
     pub estimated_completion_ms: f64,
@@ -124,6 +131,8 @@ pub struct Simulator {
     now_ms: f64,
     policy: SchedulerPolicy,
     paths: Vec<VirtualPath>,
+    scheduler: HeterogeneousScheduler,
+    next_flow_id: u64,
 }
 
 impl Simulator {
@@ -132,6 +141,8 @@ impl Simulator {
             now_ms: 0.0,
             policy,
             paths,
+            scheduler: HeterogeneousScheduler::default(),
+            next_flow_id: 0,
         }
     }
 
@@ -144,29 +155,44 @@ impl Simulator {
     }
 
     pub fn route(&mut self, class: TrafficClass, payload_bytes: usize) -> Option<SimulatedSend> {
-        self.apply_failures();
-        let snapshots = self
-            .paths
-            .iter()
-            .map(|path| path.snapshot)
-            .collect::<Vec<_>>();
-        let score = choose_path(&snapshots, class, payload_bytes, self.policy)?;
-        let path = self
-            .paths
-            .iter_mut()
-            .find(|path| path.snapshot.id == score.path_id)
-            .expect("chosen path must exist");
-        path.snapshot.queue_bytes = path
-            .snapshot
-            .queue_bytes
-            .saturating_add(payload_bytes as u64);
-
-        Some(SimulatedSend {
-            path_id: score.path_id,
+        let flow_id = self.allocate_flow_id();
+        self.route_flow(
+            flow_id,
             class,
             payload_bytes,
-            queued_bytes_after: path.snapshot.queue_bytes,
-            estimated_completion_ms: self.now_ms + score.eta_ms,
+            payload_bytes,
+            duplicate_default(class),
+        )
+    }
+
+    pub fn route_flow(
+        &mut self,
+        flow_id: FlowId,
+        class: TrafficClass,
+        payload_bytes: usize,
+        remaining_flow_bytes: usize,
+        duplicate_eligible: bool,
+    ) -> Option<SimulatedSend> {
+        self.apply_failures();
+        self.scheduler.enqueue(EnqueueRequest {
+            flow_id,
+            class,
+            payload_bytes,
+            remaining_flow_bytes,
+            duplicate_eligible,
+        });
+        let snapshots = self.path_snapshots();
+        let decision = self.scheduler.schedule_next(&snapshots, self.policy)?;
+        Some(SimulatedSend {
+            flow_id: decision.flow_id,
+            path_id: decision.path_id,
+            duplicate_path_id: decision.duplicate_path_id,
+            class,
+            scheduled_class: decision.scheduled_class,
+            mode: decision.mode,
+            payload_bytes,
+            queued_bytes_after: self.scheduler.queued_path_bytes(decision.path_id),
+            estimated_completion_ms: self.now_ms + decision.estimated_completion_ms,
         })
     }
 
@@ -183,10 +209,11 @@ impl Simulator {
         let start_capacity_bps = self.healthy_capacity_bps();
         let mut remaining = total_bytes;
         let mut attempts = Vec::new();
+        let flow_id = self.allocate_flow_id();
         while remaining > 0 {
             let payload_bytes = remaining.min(chunk_bytes);
             let scheduled_at_ms = self.now_ms;
-            let send = self.route(class, payload_bytes)?;
+            let send = self.route_flow(flow_id, class, payload_bytes, remaining, false)?;
             attempts.push(SimulatedChunkAttempt {
                 path_id: send.path_id,
                 class,
@@ -317,6 +344,8 @@ impl Simulator {
 
         let elapsed_ms = now_ms - self.now_ms;
         self.now_ms = now_ms;
+        let snapshots = self.path_snapshots();
+        self.scheduler.advance_time(&snapshots, elapsed_ms);
         for path in &mut self.paths {
             if !matches!(path.snapshot.state, PathState::Active | PathState::Suspect) {
                 continue;
@@ -336,6 +365,7 @@ impl Simulator {
                 path.snapshot.state = PathState::Failed;
                 path.snapshot.queue_bytes = 0;
                 path.snapshot.bytes_in_flight = 0;
+                self.scheduler.remove_path(path.snapshot.id);
             }
         }
     }
@@ -346,6 +376,23 @@ impl Simulator {
             .find(|path| path.snapshot.id == path_id)
             .and_then(|path| path.fail_at_ms)
     }
+
+    fn path_snapshots(&self) -> Vec<PathSnapshot> {
+        self.paths.iter().map(|path| path.snapshot).collect()
+    }
+
+    fn allocate_flow_id(&mut self) -> FlowId {
+        let flow_id = FlowId(self.next_flow_id);
+        self.next_flow_id = self.next_flow_id.saturating_add(1);
+        flow_id
+    }
+}
+
+fn duplicate_default(class: TrafficClass) -> bool {
+    matches!(
+        class,
+        TrafficClass::Control | TrafficClass::RealtimeDatagram
+    )
 }
 
 fn transfer_completion_ms(attempts: &[SimulatedChunkAttempt]) -> Option<f64> {
@@ -534,5 +581,72 @@ mod tests {
             .expect("bulk transfer");
 
         assert_between(transfer.bulk_tail_penalty_ms(), 0.0, 250.0);
+    }
+
+    #[test]
+    fn simulator_duplicates_small_control_packets_when_cheap() {
+        let first = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(100.0));
+        let second = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 24.0, mbps(100.0));
+        let mut simulator = Simulator::new(
+            SchedulerPolicy::default(),
+            vec![VirtualPath::new(first), VirtualPath::new(second)],
+        );
+
+        let send = simulator
+            .route(TrafficClass::Control, 512)
+            .expect("control route");
+
+        assert_eq!(send.path_id, PathId(0));
+        assert_eq!(send.duplicate_path_id, Some(PathId(1)));
+    }
+
+    #[test]
+    fn simulator_routes_bulk_tail_in_tail_avoidance_mode() {
+        let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(50.0));
+        let high_bandwidth =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(300.0));
+        let mut simulator = Simulator::new(
+            SchedulerPolicy::default(),
+            vec![
+                VirtualPath::new(low_latency),
+                VirtualPath::new(high_bandwidth),
+            ],
+        );
+
+        let send = simulator
+            .route_flow(
+                FlowId(77),
+                TrafficClass::Bulk,
+                128 * 1024,
+                128 * 1024,
+                false,
+            )
+            .expect("tail route");
+
+        assert_eq!(send.mode, SchedulingMode::TailAvoidance);
+        assert_eq!(send.scheduled_class, TrafficClass::Interactive);
+        assert_eq!(send.path_id, PathId(0));
+    }
+
+    #[test]
+    fn simulator_avoids_suspected_shared_bottleneck_path() {
+        let preferred = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 10.0, mbps(100.0));
+        let mut busy_peer = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 12.0, mbps(100.0));
+        busy_peer.queue_bytes = 1024 * 1024;
+        let independent = PathSnapshot::new(PathId(2), UnderlayProtocol::Udp, 24.0, mbps(100.0));
+        let mut simulator = Simulator::new(
+            SchedulerPolicy::default(),
+            vec![
+                VirtualPath::new(preferred),
+                VirtualPath::new(busy_peer),
+                VirtualPath::new(independent),
+            ],
+        );
+
+        let send = simulator
+            .route(TrafficClass::Interactive, 1024)
+            .expect("interactive route");
+
+        assert_eq!(send.path_id, PathId(2));
     }
 }

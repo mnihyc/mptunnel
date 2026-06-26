@@ -372,6 +372,16 @@ if should_run_case "mptunnel_udp_stream_multipath_all"; then
   run_tcp_download_probe_case "mptunnel_udp_stream_multipath_all"
 fi
 
+if should_run_case "mptunnel_reliable_mixed_single_low_latency"; then
+  start_client "reliable_mixed_single_low_latency" "$tcp_lowlat $udp_lowlat"
+  run_tcp_download_probe_case "mptunnel_reliable_mixed_single_low_latency"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
+  start_client "reliable_mixed_multipath_all" "$tcp_all $udp_all"
+  run_tcp_download_probe_case "mptunnel_reliable_mixed_multipath_all"
+fi
+
 if should_run_case "mptunnel_udp_single_low_latency"; then
   run_udp_case "mptunnel_udp_single_low_latency" "$udp_lowlat"
 fi

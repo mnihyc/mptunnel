@@ -1120,6 +1120,7 @@ struct ServerTcpStreamBinding {
 
 impl ServerTcpStreamBinding {
     fn new(
+        underlay: UnderlayProtocol,
         path_id: PathId,
         commands: TcpPathSessionCommandSender,
         class: TrafficClass,
@@ -1129,27 +1130,33 @@ impl ServerTcpStreamBinding {
             class: Mutex::new(class),
             outputs: Mutex::new(ServerTcpStreamOutputs {
                 next_index: 0,
-                entries: vec![ServerTcpStreamOutputEntry { path_id, commands }],
+                entries: vec![ServerTcpStreamOutputEntry {
+                    key: ServerTcpPathKey { underlay, path_id },
+                    commands,
+                }],
             }),
             version,
         })
     }
 
-    fn attach(&self, path_id: PathId, commands: TcpPathSessionCommandSender, class: TrafficClass) {
+    fn attach(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        commands: TcpPathSessionCommandSender,
+        class: TrafficClass,
+    ) {
         *self.class.lock().expect("server TCP stream class lock") = class;
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
-        if let Some(position) = outputs
-            .entries
-            .iter()
-            .position(|entry| entry.path_id == path_id)
-        {
+        let key = ServerTcpPathKey { underlay, path_id };
+        if let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) {
             let mut entry = outputs.entries.remove(position);
             entry.commands = commands;
             outputs.entries.push(entry);
         } else {
             outputs
                 .entries
-                .push(ServerTcpStreamOutputEntry { path_id, commands });
+                .push(ServerTcpStreamOutputEntry { key, commands });
         }
         outputs.next_index %= outputs.entries.len().max(1);
         drop(outputs);
@@ -1160,12 +1167,12 @@ impl ServerTcpStreamBinding {
         *self.class.lock().expect("server TCP stream class lock")
     }
 
-    fn detach(&self, path_id: PathId, commands: &TcpPathSessionCommandSender) {
+    fn detach(&self, key: ServerTcpPathKey, commands: &TcpPathSessionCommandSender) {
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let before = outputs.entries.len();
         outputs
             .entries
-            .retain(|entry| entry.path_id != path_id || !entry.commands.same_channel(commands));
+            .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
         if outputs.entries.len() != before {
             outputs.next_index %= outputs.entries.len().max(1);
             drop(outputs);
@@ -1173,7 +1180,7 @@ impl ServerTcpStreamBinding {
         }
     }
 
-    fn next_commands(&self) -> Option<(PathId, TcpPathSessionCommandSender)> {
+    fn next_commands(&self) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         if outputs.entries.is_empty() {
             return None;
@@ -1181,17 +1188,17 @@ impl ServerTcpStreamBinding {
         outputs.next_index %= outputs.entries.len();
         let entry = outputs.entries[outputs.next_index].clone();
         outputs.next_index = (outputs.next_index + 1) % outputs.entries.len();
-        Some((entry.path_id, entry.commands))
+        Some((entry.key, entry.commands))
     }
 
-    fn data_commands(&self) -> Option<(PathId, TcpPathSessionCommandSender)> {
+    fn data_commands(&self) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
         self.outputs
             .lock()
             .expect("server TCP stream binding lock")
             .entries
             .last()
             .cloned()
-            .map(|entry| (entry.path_id, entry.commands))
+            .map(|entry| (entry.key, entry.commands))
     }
 
     async fn send_frame(
@@ -1207,13 +1214,13 @@ impl ServerTcpStreamBinding {
             } else {
                 self.next_commands()
             };
-            if let Some((path_id, commands)) = selected {
+            if let Some((key, commands)) = selected {
                 let class = self.class();
                 tokio::select! {
                     result = commands.send_frame(frame.clone(), class) => {
                         match result {
                             Ok(()) => return Ok(()),
-                            Err(_) => self.detach(path_id, &commands),
+                            Err(_) => self.detach(key, &commands),
                         }
                     }
                     changed = updates.changed() => {
@@ -1254,9 +1261,15 @@ fn server_frame_prefers_current_data_path(frame: &Frame) -> bool {
     matches!(frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ServerTcpPathKey {
+    underlay: UnderlayProtocol,
+    path_id: PathId,
+}
+
 #[derive(Clone)]
 struct ServerTcpStreamOutputEntry {
-    path_id: PathId,
+    key: ServerTcpPathKey,
     commands: TcpPathSessionCommandSender,
 }
 
@@ -1342,7 +1355,7 @@ impl ServerTcpStreamRegistry {
             entry.class = class;
             entry
                 .binding
-                .attach(attachment.path_id, attachment.commands, class);
+                .attach(underlay, attachment.path_id, attachment.commands, class);
             return Ok(ServerTcpStreamOpen::Existing);
         }
 
@@ -1351,7 +1364,8 @@ impl ServerTcpStreamRegistry {
         }
 
         let (frames_tx, frames_rx) = mpsc::channel(tcp_stream_frame_queue(mux_limits));
-        let binding = ServerTcpStreamBinding::new(attachment.path_id, attachment.commands, class);
+        let binding =
+            ServerTcpStreamBinding::new(underlay, attachment.path_id, attachment.commands, class);
         streams.insert(
             (session_id, stream_id),
             ServerTcpStreamEntry {
@@ -1376,6 +1390,7 @@ impl ServerTcpStreamRegistry {
         &self,
         session_id: SessionId,
         stream_id: StreamId,
+        underlay: UnderlayProtocol,
         path_id: PathId,
         commands: &TcpPathSessionCommandSender,
     ) {
@@ -1386,7 +1401,7 @@ impl ServerTcpStreamRegistry {
             .get(&(session_id, stream_id))
             .map(|entry| entry.binding.clone())
         {
-            binding.detach(path_id, commands);
+            binding.detach(ServerTcpPathKey { underlay, path_id }, commands);
         }
     }
 
@@ -2516,6 +2531,55 @@ impl ClientPathContext {
             .collect()
     }
 
+    fn ordered_udp_stream_repair_path_indices(
+        &self,
+        current_path_index: Option<usize>,
+        class: TrafficClass,
+        payload_bytes: usize,
+        require_delivery_evidence: bool,
+    ) -> Vec<usize> {
+        let observations =
+            health_observations(&mut self.health.lock().expect("client path health lock").udp);
+        let scores = if reliable_stream_latency_startup_should_use_configured_order(
+            &self.udp_paths,
+            &observations,
+            class,
+        ) {
+            configured_order_path_scores(&self.udp_paths, &observations, class, payload_bytes)
+        } else {
+            ordered_path_scores(&self.udp_paths, &observations, class, payload_bytes)
+        };
+        scores
+            .into_iter()
+            .filter(|(index, _)| Some(*index) != current_path_index)
+            .filter(|(index, _)| {
+                if !require_delivery_evidence {
+                    return true;
+                }
+                let Some(path) = self.udp_paths.get(*index) else {
+                    return false;
+                };
+                let observation =
+                    observations
+                        .get(*index)
+                        .copied()
+                        .unwrap_or(ClientPathObservation {
+                            state: SchedulerPathState::Suspect,
+                            measured_srtt_ms: None,
+                            measured_jitter_ms: None,
+                            measured_rate_bps: None,
+                            measured_loss_rate: None,
+                            measured_mtu_payload_bytes: None,
+                            active_flows: 0,
+                            active_latency_sensitive_flows: 0,
+                            load_bytes: 0,
+                        });
+                udp_stream_path_can_be_auto_discovered(path, observation)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn ordered_reliable_auto_bulk_discovery_path_keys(
         &self,
         current_tcp_path_index: Option<usize>,
@@ -2569,31 +2633,7 @@ impl ClientPathContext {
             .iter()
             .any(|observation| observation.measured_rate_bps.is_some());
         if !any_measured_delivery && self.tcp_paths.iter().all(path_is_endpoint_only) {
-            if observations
-                .iter()
-                .map(|observation| observation.active_latency_sensitive_flows)
-                .sum::<u32>()
-                > 1
-            {
-                return Vec::new();
-            }
-            return configured_order_path_scores(
-                &self.tcp_paths,
-                &observations,
-                TrafficClass::Bulk,
-                payload_bytes,
-            )
-            .into_iter()
-            .filter(|(index, _)| Some(*index) != current_path_index)
-            .filter(|(index, _)| {
-                self.tcp_paths.get(*index).is_some_and(|path| {
-                    observations
-                        .get(*index)
-                        .copied()
-                        .is_some_and(|observation| path_can_be_auto_discovered(path, observation))
-                })
-            })
-            .collect();
+            return Vec::new();
         }
         let scores = ordered_path_scores(
             &self.tcp_paths,
@@ -3629,12 +3669,6 @@ impl TcpRelayRemoteSet {
     }
 
     fn fin_requires_repair_drain(&self) -> bool {
-        self.paths
-            .iter()
-            .any(|path| path.stream.underlay == UnderlayProtocol::Udp)
-    }
-
-    fn has_udp_path(&self) -> bool {
         self.paths
             .iter()
             .any(|path| path.stream.underlay == UnderlayProtocol::Udp)
@@ -4786,9 +4820,13 @@ async fn handle_server_path(
                 }
                 Frame::StreamDetach { stream_id } => {
                     attached_streams.remove(&stream_id);
-                    context
-                        .tcp_streams
-                        .detach_path(session_id, stream_id, path_id, &commands_tx);
+                    context.tcp_streams.detach_path(
+                        session_id,
+                        stream_id,
+                        UnderlayProtocol::Tcp,
+                        path_id,
+                        &commands_tx,
+                    );
                     if draining && attached_streams.is_empty() {
                         if !server_write_tcp_path_frame(
                             &mut writer,
@@ -4873,6 +4911,7 @@ async fn handle_server_tcp_path_command(
             context.tcp_streams.detach_path(
                 command_context.session_id,
                 stream_id,
+                UnderlayProtocol::Tcp,
                 command_context.path_id,
                 command_context.commands_tx,
             );
@@ -5140,7 +5179,7 @@ where
             tcp_relay_stall_deadline(stall_progress_anchor, path_snapshot, relay_class);
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at
-                + udp_stream_recv_progress_interval(path_snapshot, relay_class),
+                + reliable_stream_recv_progress_interval(path_snapshot, relay_class),
         );
 
         tokio::select! {
@@ -5308,7 +5347,7 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.has_udp_path()
+            _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.path_keys().len() > 1
                 && tcp_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
                 match send_tcp_recv_progress_remote_set(&mut remotes, context, &recv_stream).await {
                     Ok(()) => {
@@ -5914,7 +5953,17 @@ async fn attach_udp_relay_paths(
         }
     };
     let mut candidates = match mode {
-        TcpRelayAttachMode::Any => context.ordered_udp_stream_path_indices(class, payload_bytes),
+        TcpRelayAttachMode::Any => {
+            let require_delivery_evidence =
+                matches!(class, TrafficClass::Bulk | TrafficClass::Background)
+                    && !remotes.is_empty();
+            context.ordered_udp_stream_repair_path_indices(
+                remotes.active_path_index_for(UnderlayProtocol::Udp),
+                class,
+                payload_bytes,
+                require_delivery_evidence,
+            )
+        }
         TcpRelayAttachMode::AutoBulkDiscovery => context
             .ordered_udp_stream_auto_bulk_discovery_indices(
                 remotes.active_path_index_for(UnderlayProtocol::Udp),
@@ -6361,7 +6410,10 @@ fn tcp_relay_recv_progress_resend_active(
     remote_open && (recv_stream.next_offset() > 0 || recv_stream.reorder_bytes() > 0)
 }
 
-fn udp_stream_recv_progress_interval(path: Option<PathSnapshot>, class: TrafficClass) -> Duration {
+fn reliable_stream_recv_progress_interval(
+    path: Option<PathSnapshot>,
+    class: TrafficClass,
+) -> Duration {
     tcp_relay_stall_timeout(path, class)
         .div_f64(2.0)
         .max(UDP_MIN_RESPONSE_TIMEOUT)
@@ -6507,7 +6559,8 @@ where
         let repair_replay_deadline =
             tokio::time::Instant::from_std(last_repair_replay_at + repair_replay_interval);
         let recv_progress_deadline = tokio::time::Instant::from_std(
-            last_recv_progress_sent_at + udp_stream_recv_progress_interval(None, path_stream.class),
+            last_recv_progress_sent_at
+                + reliable_stream_recv_progress_interval(None, path_stream.class),
         );
 
         tokio::select! {
@@ -8056,6 +8109,7 @@ impl ServerUdpPathSession {
                 self.context.tcp_streams.detach_path(
                     session_id,
                     stream_id,
+                    UnderlayProtocol::Udp,
                     path_id,
                     &self.commands_tx,
                 );
@@ -8181,6 +8235,7 @@ impl ServerUdpPathSession {
                 self.context.tcp_streams.detach_path(
                     session_id,
                     stream_id,
+                    UnderlayProtocol::Udp,
                     path_id,
                     &self.commands_tx,
                 );
@@ -9292,7 +9347,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_stream_recv_progress_resend_tracks_received_state() {
+    fn reliable_stream_recv_progress_resend_tracks_received_state() {
         let mux_limits = MuxLimits::default();
         let mut recv_stream = ReliableRecvStream::new(StreamId(21), mux_limits);
         let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, 30_000_000.0);
@@ -9308,9 +9363,9 @@ mod tests {
         assert!(!tcp_relay_recv_progress_resend_active(&recv_stream, false));
 
         let low_interval =
-            udp_stream_recv_progress_interval(Some(low_latency), TrafficClass::Interactive);
+            reliable_stream_recv_progress_interval(Some(low_latency), TrafficClass::Interactive);
         let high_interval =
-            udp_stream_recv_progress_interval(Some(cross_continent), TrafficClass::Bulk);
+            reliable_stream_recv_progress_interval(Some(cross_continent), TrafficClass::Bulk);
         assert!(low_interval >= UDP_MIN_RESPONSE_TIMEOUT);
         assert!(low_interval <= TCP_STREAM_STALL_MIN_TIMEOUT);
         assert!(high_interval >= low_interval);
@@ -9679,7 +9734,12 @@ mod tests {
             )
             .await
             .expect("fill old path priority command queue");
-        let binding = ServerTcpStreamBinding::new(PathId(0), old_tx, TrafficClass::Interactive);
+        let binding = ServerTcpStreamBinding::new(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            old_tx,
+            TrafficClass::Interactive,
+        );
         let send_binding = binding.clone();
         let send_task = tokio::spawn(async move {
             send_binding
@@ -9699,7 +9759,7 @@ mod tests {
         assert!(!send_task.is_finished());
 
         let (new_tx, mut new_rx) = tcp_path_session_command_channels(1);
-        binding.attach(PathId(1), new_tx, TrafficClass::Bulk);
+        binding.attach(UnderlayProtocol::Tcp, PathId(1), new_tx, TrafficClass::Bulk);
         assert_eq!(binding.class(), TrafficClass::Bulk);
         send_task
             .await
@@ -9722,12 +9782,26 @@ mod tests {
     #[tokio::test]
     async fn server_tcp_binding_reattach_promotes_existing_path_for_data() {
         let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-        let binding =
-            ServerTcpStreamBinding::new(PathId(0), path0_initial_tx, TrafficClass::Interactive);
+        let binding = ServerTcpStreamBinding::new(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            path0_initial_tx,
+            TrafficClass::Interactive,
+        );
         let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
-        binding.attach(PathId(1), path1_tx, TrafficClass::Bulk);
+        binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(1),
+            path1_tx,
+            TrafficClass::Bulk,
+        );
         let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
-        binding.attach(PathId(0), path0_repair_tx, TrafficClass::Bulk);
+        binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            path0_repair_tx,
+            TrafficClass::Bulk,
+        );
 
         binding
             .send_frame(
@@ -9760,6 +9834,36 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
+        let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
+        let binding = ServerTcpStreamBinding::new(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            tcp_tx,
+            TrafficClass::Interactive,
+        );
+        let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
+        binding.attach(UnderlayProtocol::Udp, PathId(0), udp_tx, TrafficClass::Bulk);
+
+        binding.close_stream(StreamId(7)).await;
+
+        match recv_tcp_path_command(&mut tcp_rx)
+            .await
+            .expect("tcp close command")
+        {
+            TcpPathSessionCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
+            _ => panic!("expected TCP close stream command"),
+        }
+        match recv_tcp_path_command(&mut udp_rx)
+            .await
+            .expect("udp close command")
+        {
+            TcpPathSessionCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
+            _ => panic!("expected UDP close stream command"),
+        }
     }
 
     #[tokio::test]
@@ -10232,7 +10336,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_only_tcp_bulk_discovery_validates_configured_order_before_probe_noise() {
+    fn endpoint_only_tcp_bulk_discovery_waits_for_delivery_evidence_before_probe_noise() {
         let low_latency_path = "tcp://127.0.0.1:10132"
             .parse::<PathSpec>()
             .expect("low latency path");
@@ -10252,18 +10356,37 @@ mod tests {
         context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
         context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
-        assert_eq!(
+        assert!(
             tcp_auto_bulk_discovery_indices(
                 &context,
                 Some(0),
                 MuxLimits::default().max_tcp_path_inflight_bytes
+            )
+            .is_empty()
+        );
+
+        let now = Instant::now();
+        context.mark_tcp_path_delivery(
+            1,
+            PathDeliveryStats {
+                payload_bytes: 4 * 1024 * 1024,
+                first_payload_at: Some(now),
+                last_payload_at: Some(now + Duration::from_millis(40)),
+            },
+        );
+
+        assert_eq!(
+            tcp_auto_bulk_discovery_indices(
+                &context,
+                Some(0),
+                MuxLimits::default().max_tcp_path_inflight_bytes,
             ),
-            vec![1, 2]
+            vec![1]
         );
     }
 
     #[test]
-    fn endpoint_only_tcp_bulk_discovery_pauses_for_concurrent_latency_demand() {
+    fn endpoint_only_tcp_bulk_discovery_requires_delivery_under_concurrent_latency_demand() {
         let low_latency_path = "tcp://127.0.0.1:10146"
             .parse::<PathSpec>()
             .expect("low latency path");
@@ -10278,16 +10401,6 @@ mod tests {
         .expect("context");
 
         context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
-        assert_eq!(
-            tcp_auto_bulk_discovery_indices(
-                &context,
-                Some(0),
-                MuxLimits::default().max_tcp_path_inflight_bytes,
-            ),
-            vec![1]
-        );
-
-        context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
         assert!(
             tcp_auto_bulk_discovery_indices(
                 &context,
@@ -10295,6 +10408,25 @@ mod tests {
                 MuxLimits::default().max_tcp_path_inflight_bytes,
             )
             .is_empty()
+        );
+
+        context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+        let now = Instant::now();
+        context.mark_tcp_path_delivery(
+            1,
+            PathDeliveryStats {
+                payload_bytes: 4 * 1024 * 1024,
+                first_payload_at: Some(now),
+                last_payload_at: Some(now + Duration::from_millis(40)),
+            },
+        );
+        assert_eq!(
+            tcp_auto_bulk_discovery_indices(
+                &context,
+                Some(0),
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+            ),
+            vec![1]
         );
     }
 
@@ -10372,6 +10504,129 @@ mod tests {
             context.ordered_udp_stream_auto_bulk_discovery_indices(
                 Some(0),
                 MuxLimits::default().max_tcp_path_inflight_bytes,
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn mixed_udp_repair_waits_for_delivery_evidence_on_active_tcp_stream() {
+        let tcp_path = "tcp://127.0.0.1:10157"
+            .parse::<PathSpec>()
+            .expect("tcp path");
+        let udp_low_latency_path = "udp://127.0.0.1:10158"
+            .parse::<PathSpec>()
+            .expect("udp low latency path");
+        let udp_probe_only_path = "udp://127.0.0.1:10159"
+            .parse::<PathSpec>()
+            .expect("udp probe path");
+        let context = ClientPathContext::new(
+            vec![tcp_path, udp_low_latency_path, udp_probe_only_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_udp_path_probe_success(1, Duration::from_millis(1));
+        assert!(
+            context
+                .ordered_udp_stream_repair_path_indices(
+                    None,
+                    TrafficClass::Bulk,
+                    MuxLimits::default().max_tcp_path_inflight_bytes,
+                    true,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            context
+                .ordered_udp_stream_repair_path_indices(
+                    None,
+                    TrafficClass::Bulk,
+                    MuxLimits::default().max_tcp_path_inflight_bytes,
+                    false,
+                )
+                .first()
+                .copied(),
+            Some(1)
+        );
+
+        let now = Instant::now();
+        context.mark_udp_path_delivery(
+            1,
+            PathDeliveryStats {
+                payload_bytes: 4 * 1024 * 1024,
+                first_payload_at: Some(now),
+                last_payload_at: Some(now + Duration::from_millis(40)),
+            },
+        );
+
+        assert_eq!(
+            context.ordered_udp_stream_repair_path_indices(
+                None,
+                TrafficClass::Bulk,
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+                true,
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn udp_repair_waits_for_delivery_evidence_on_active_endpoint_only_stream() {
+        let udp_low_latency_path = "udp://127.0.0.1:10160"
+            .parse::<PathSpec>()
+            .expect("udp low latency path");
+        let udp_probe_path = "udp://127.0.0.1:10161"
+            .parse::<PathSpec>()
+            .expect("udp probe path");
+        let context = ClientPathContext::new(
+            vec![udp_low_latency_path, udp_probe_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        context.mark_udp_path_probe_success(1, Duration::from_millis(1));
+        assert!(
+            context
+                .ordered_udp_stream_repair_path_indices(
+                    Some(0),
+                    TrafficClass::Bulk,
+                    MuxLimits::default().max_tcp_path_inflight_bytes,
+                    true,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            context
+                .ordered_udp_stream_repair_path_indices(
+                    Some(0),
+                    TrafficClass::Bulk,
+                    MuxLimits::default().max_tcp_path_inflight_bytes,
+                    false,
+                )
+                .first()
+                .copied(),
+            Some(1)
+        );
+
+        let now = Instant::now();
+        context.mark_udp_path_delivery(
+            1,
+            PathDeliveryStats {
+                payload_bytes: 4 * 1024 * 1024,
+                first_payload_at: Some(now),
+                last_payload_at: Some(now + Duration::from_millis(40)),
+            },
+        );
+
+        assert_eq!(
+            context.ordered_udp_stream_repair_path_indices(
+                Some(0),
+                TrafficClass::Bulk,
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+                true,
             ),
             vec![1]
         );

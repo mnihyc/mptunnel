@@ -397,7 +397,7 @@ pub fn score_path(
     eta_ms += path.loss_rate.clamp(0.0, 1.0) * policy.loss_penalty_scale_ms;
 
     if path.state == PathState::Suspect {
-        eta_ms += policy.suspect_penalty_ms;
+        eta_ms += suspect_penalty_ms(class, policy);
     }
     if path.flags.backup {
         eta_ms += policy.backup_penalty_ms;
@@ -531,6 +531,14 @@ fn path_is_schedulable(path: PathSnapshot, class: TrafficClass) -> bool {
     true
 }
 
+fn suspect_penalty_ms(class: TrafficClass, policy: SchedulerPolicy) -> f64 {
+    if prefers_low_reorder(class) {
+        0.0
+    } else {
+        policy.suspect_penalty_ms
+    }
+}
+
 fn prefers_low_reorder(class: TrafficClass) -> bool {
     matches!(
         class,
@@ -601,6 +609,31 @@ mod tests {
         );
 
         assert_eq!(choice.map(|score| score.path_id), Some(PathId(2)));
+    }
+
+    #[test]
+    fn latency_sensitive_streams_validate_suspect_low_latency_path() {
+        let mut low_latency =
+            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, mbps(100.0));
+        low_latency.state = PathState::Suspect;
+        let active_high_latency =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, mbps(100.0));
+
+        let interactive = choose_path(
+            &[low_latency, active_high_latency],
+            TrafficClass::Interactive,
+            512,
+            SchedulerPolicy::default(),
+        );
+        let bulk = choose_path(
+            &[low_latency, active_high_latency],
+            TrafficClass::Bulk,
+            4 * 1024 * 1024,
+            SchedulerPolicy::default(),
+        );
+
+        assert_eq!(interactive.map(|score| score.path_id), Some(PathId(0)));
+        assert_eq!(bulk.map(|score| score.path_id), Some(PathId(1)));
     }
 
     #[test]

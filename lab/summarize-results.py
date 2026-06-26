@@ -146,6 +146,23 @@ def mixed_rows(by_case):
                     ],
                     default=None,
                 ),
+                "interactive_ok": median([record.get("interactive_ok") for record in records]),
+                "interactive_count": median(
+                    [record.get("interactive_count") for record in records]
+                ),
+                "interactive_p95": median(
+                    [record.get("interactive_p95_ms") for record in records]
+                ),
+                "interactive_gap": max(
+                    [
+                        record.get("interactive_failover_gap_s")
+                        for record in records
+                        if isinstance(
+                            record.get("interactive_failover_gap_s"), (int, float)
+                        )
+                    ],
+                    default=None,
+                ),
                 "udp_loss": mean([record.get("udp_loss_rate") for record in records]),
                 "udp_p95": median([record.get("udp_p95_ms") for record in records]),
                 "udp_max": max(
@@ -308,13 +325,13 @@ def render_markdown(records):
             "",
             "## Mixed Workloads",
             "",
-            "| case | runs | ok | loss | fail | median bulk Mbps | max bulk recovery gap s | median small p95 ms | max small ms | avg UDP loss | median UDP p95 ms | max UDP ms |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| case | runs | ok | loss | fail | median bulk Mbps | max bulk recovery gap s | median small p95 ms | max small ms | median interactive ok | median interactive count | median interactive p95 ms | max interactive failover gap s | avg UDP loss | median UDP p95 ms | max UDP ms |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in mixed_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {loss} | {fail} | {bulk_median_goodput} | {bulk_max_gap} | {small_p95} | {small_max} | {udp_loss} | {udp_p95} | {udp_max} |".format(
+            "| {case} | {runs} | {ok} | {loss} | {fail} | {bulk_median_goodput} | {bulk_max_gap} | {small_p95} | {small_max} | {interactive_ok} | {interactive_count} | {interactive_p95} | {interactive_gap} | {udp_loss} | {udp_p95} | {udp_max} |".format(
                 case=row["case"],
                 runs=row["runs"],
                 ok=row["ok"],
@@ -324,6 +341,10 @@ def render_markdown(records):
                 bulk_max_gap=fmt_float(row["bulk_max_gap"]),
                 small_p95=fmt_float(row["small_p95"]),
                 small_max=fmt_float(row["small_max"]),
+                interactive_ok=fmt_float(row["interactive_ok"]),
+                interactive_count=fmt_float(row["interactive_count"]),
+                interactive_p95=fmt_float(row["interactive_p95"]),
+                interactive_gap=fmt_float(row["interactive_gap"]),
                 udp_loss=fmt_float(row["udp_loss"], 3),
                 udp_p95=fmt_float(row["udp_p95"]),
                 udp_max=fmt_float(row["udp_max"]),

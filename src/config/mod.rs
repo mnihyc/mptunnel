@@ -1,7 +1,7 @@
 pub mod security;
 
 use crate::ingress::IngressConfig;
-use crate::outbound::OutboundConfig;
+use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{TargetAddr, TrafficClass};
 use crate::transport::PathSpec;
@@ -63,6 +63,23 @@ impl AppConfig {
                     return Err(ConfigError::PathProbeTimeoutZero);
                 }
                 client.traffic_policy.validate()?;
+                if let IngressConfig::TunL4(tun) = &client.ingress {
+                    validate_tun_l4(tun)?;
+                    if !client
+                        .paths
+                        .iter()
+                        .any(|path| path.underlay == crate::protocol::UnderlayProtocol::Tcp)
+                    {
+                        return Err(ConfigError::TunRequiresTcpPath);
+                    }
+                    if !client
+                        .paths
+                        .iter()
+                        .any(|path| path.underlay == crate::protocol::UnderlayProtocol::Udp)
+                    {
+                        return Err(ConfigError::TunRequiresUdpPath);
+                    }
+                }
             }
             CommandConfig::Server(server) => {
                 if server.bind_paths.is_empty() {
@@ -74,6 +91,7 @@ impl AppConfig {
                         limit: self.resources.max_paths,
                     });
                 }
+                server.outbound_dns.validate()?;
             }
         }
         Ok(())
@@ -282,6 +300,48 @@ fn validate_tcp_class(class: TrafficClass) -> Result<(), ConfigError> {
 pub struct ServerConfig {
     pub bind_paths: Vec<PathSpec>,
     pub outbound: OutboundConfig,
+    pub outbound_dns: DnsConfig,
+}
+
+impl DnsConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.timeout.is_zero() {
+            return Err(ConfigError::OutboundDnsTimeoutZero);
+        }
+        if self.resolvers.iter().any(|resolver| resolver.port() == 0) {
+            return Err(ConfigError::OutboundDnsResolverPortZero);
+        }
+        Ok(())
+    }
+}
+
+fn validate_tun_l4(tun: &crate::ingress::tun::TunL4Config) -> Result<(), ConfigError> {
+    if tun.ipv4.is_none() && tun.ipv6.is_none() {
+        return Err(ConfigError::TunAddressRequired);
+    }
+    if tun.ipv4_prefix > 32 {
+        return Err(ConfigError::TunIpv4PrefixInvalid);
+    }
+    if tun.ipv6_prefix > 128 {
+        return Err(ConfigError::TunIpv6PrefixInvalid);
+    }
+    if tun.mtu < 576 {
+        return Err(ConfigError::TunMtuTooSmall);
+    }
+    if tun.ipv6.is_some() && tun.mtu < 1280 {
+        return Err(ConfigError::TunIpv6MtuTooSmall);
+    }
+    if tun.dns_ttl_ms == 0 {
+        return Err(ConfigError::TunDnsTtlZero);
+    }
+    if tun
+        .dns_resolvers
+        .iter()
+        .any(|resolver| resolver.port() == 0)
+    {
+        return Err(ConfigError::TunDnsResolverPortZero);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +369,17 @@ pub enum ConfigError {
     TcpPolicyUsesDatagramClass,
     TcpClassRulePortZero,
     DuplicateTcpClassRule { port: u16 },
+    TunAddressRequired,
+    TunIpv4PrefixInvalid,
+    TunIpv6PrefixInvalid,
+    TunMtuTooSmall,
+    TunIpv6MtuTooSmall,
+    TunDnsTtlZero,
+    TunDnsResolverPortZero,
+    TunRequiresTcpPath,
+    TunRequiresUdpPath,
+    OutboundDnsTimeoutZero,
+    OutboundDnsResolverPortZero,
 }
 
 impl From<SecurityPolicyError> for ConfigError {
@@ -386,6 +457,21 @@ impl std::fmt::Display for ConfigError {
             }
             Self::DuplicateTcpClassRule { port } => {
                 write!(f, "duplicate TCP traffic class rule for port {port}")
+            }
+            Self::TunAddressRequired => write!(f, "TUN L4 ingress requires IPv4 or IPv6 address"),
+            Self::TunIpv4PrefixInvalid => write!(f, "TUN IPv4 prefix must be in 0..=32"),
+            Self::TunIpv6PrefixInvalid => write!(f, "TUN IPv6 prefix must be in 0..=128"),
+            Self::TunMtuTooSmall => write!(f, "TUN MTU must be at least 576 bytes"),
+            Self::TunIpv6MtuTooSmall => write!(f, "TUN IPv6 MTU must be at least 1280 bytes"),
+            Self::TunDnsTtlZero => write!(f, "TUN DNS TTL must be greater than zero"),
+            Self::TunDnsResolverPortZero => write!(f, "TUN DNS resolver port must be nonzero"),
+            Self::TunRequiresTcpPath => write!(f, "TUN L4 ingress requires at least one TCP path"),
+            Self::TunRequiresUdpPath => write!(f, "TUN L4 ingress requires at least one UDP path"),
+            Self::OutboundDnsTimeoutZero => {
+                write!(f, "outbound DNS timeout must be greater than zero")
+            }
+            Self::OutboundDnsResolverPortZero => {
+                write!(f, "outbound DNS resolver port must be nonzero")
             }
         }
     }

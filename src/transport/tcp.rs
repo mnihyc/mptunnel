@@ -74,7 +74,7 @@ async fn resolve_endpoint(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, TcpTra
     }
 }
 
-async fn connect_addr(
+pub async fn connect_addr(
     addr: SocketAddr,
     options: TcpConnectOptions,
 ) -> Result<TcpStream, TcpTransportError> {

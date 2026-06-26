@@ -4,10 +4,11 @@ use crate::config::{
 use crate::ingress::IngressConfig;
 use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
+use crate::ingress::tun::TunL4Config;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::{DatagramError, DatagramFlow};
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, StreamError};
-use crate::outbound::{self, OutboundConfig, TargetProtocol};
+use crate::outbound::{self, DnsConfig, OutboundConfig, TargetProtocol};
 use crate::protocol::RateHint;
 use crate::protocol::auth::{AuthError, SessionAuthenticator};
 use crate::protocol::codec::CodecLimits;
@@ -25,7 +26,9 @@ use crate::transport::encrypted_udp::{EncryptedUdpSocket, EncryptedUdpTransportE
 use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
 use crate::transport::udp::{self, UdpTransportError};
 use crate::transport::{PathSpec, PathSpecParseError};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::{SinkExt, StreamExt};
+use netstack_smoltcp::{StackBuilder, TcpListener as TunTcpListener, UdpSocket as TunUdpSocket};
 use std::collections::{HashMap, HashSet};
 use std::future;
 use std::net::SocketAddr;
@@ -34,6 +37,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
+use tun_rs::DeviceBuilder;
+use tun_rs::async_framed::{BytesCodec, DeviceFramed};
 
 const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
@@ -51,6 +56,7 @@ const UDP_MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
 const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
 const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
 const UDP_MAX_MTU_PAYLOAD_BYTES: usize = 65_000;
+const TUN_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
@@ -61,6 +67,7 @@ pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
             run_server(
                 server.bind_paths,
                 server.outbound,
+                server.outbound_dns,
                 config.security,
                 config.resources,
             )
@@ -108,6 +115,10 @@ async fn run_client(
                     }
                 });
             }
+        }
+        IngressConfig::TunL4(tun) => {
+            start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
+            run_tun_l4_client(tun, context).await
         }
     }
 }
@@ -171,14 +182,275 @@ async fn probe_client_paths(context: &ClientPathContext, timeout: Duration) {
     }
 }
 
+async fn run_tun_l4_client(
+    tun: TunL4Config,
+    context: ClientPathContext,
+) -> Result<(), RuntimeError> {
+    let device = build_tun_device(&tun)?;
+    let framed = DeviceFramed::new(device, BytesCodec::new());
+    let (mut tun_sink, mut tun_stream) = framed.split();
+
+    let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
+        .enable_tcp(true)
+        .enable_udp(true)
+        .enable_icmp(tun.enable_icmp)
+        .mtu(usize::from(tun.mtu))
+        .build()?;
+    let runner = runner.ok_or(RuntimeError::Protocol("TUN stack runner is unavailable"))?;
+    let udp_socket = udp_socket.ok_or(RuntimeError::Protocol("TUN UDP socket is unavailable"))?;
+    let tcp_listener =
+        tcp_listener.ok_or(RuntimeError::Protocol("TUN TCP listener is unavailable"))?;
+    let (mut stack_sink, mut stack_stream) = stack.split();
+
+    let stack_to_tun = async move {
+        while let Some(packet) = stack_stream.next().await {
+            let packet = packet?;
+            tun_sink.send(BytesMut::from(packet.as_slice())).await?;
+        }
+        Ok::<(), RuntimeError>(())
+    };
+    let tun_to_stack = async move {
+        while let Some(packet) = tun_stream.next().await {
+            let packet = packet?;
+            stack_sink.send(packet.to_vec()).await?;
+        }
+        Ok::<(), RuntimeError>(())
+    };
+    let stack_runner = async move { runner.await.map_err(RuntimeError::Io) };
+
+    tokio::try_join!(
+        stack_runner,
+        stack_to_tun,
+        tun_to_stack,
+        run_tun_tcp_listener(tcp_listener, context.clone()),
+        run_tun_udp_socket(udp_socket, context, tun)
+    )?;
+    Ok(())
+}
+
+fn build_tun_device(tun: &TunL4Config) -> std::io::Result<tun_rs::AsyncDevice> {
+    let mut builder = DeviceBuilder::new().mtu(tun.mtu);
+    if let Some(name) = &tun.name {
+        builder = builder.name(name.clone());
+    }
+    if let Some(ipv4) = tun.ipv4 {
+        builder = builder.ipv4(ipv4, tun.ipv4_prefix, tun.ipv4_gateway);
+    }
+    if let Some(ipv6) = tun.ipv6 {
+        builder = builder.ipv6(ipv6, tun.ipv6_prefix);
+    }
+    builder.build_async()
+}
+
+async fn run_tun_tcp_listener(
+    mut listener: TunTcpListener,
+    context: ClientPathContext,
+) -> Result<(), RuntimeError> {
+    while let Some((stream, local, remote)) = listener.next().await {
+        let context = context.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_tun_tcp_stream(stream, local, remote, context).await {
+                eprintln!("warning: TUN TCP flow {local} -> {remote} failed: {err}");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_tun_tcp_stream<S>(
+    stream: S,
+    _local: SocketAddr,
+    remote: SocketAddr,
+    context: ClientPathContext,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let target = TargetAddr::Ip(remote);
+    outbound::validate_target(&target)?;
+    let class = context.classify_tcp_target(&target);
+    let remote = open_remote_stream(&context, target.clone(), IngressKind::TunTcp, class).await?;
+    relay_migrating_tcp_stream(
+        stream,
+        &context,
+        TcpRelayOpenSpec {
+            target,
+            ingress: IngressKind::TunTcp,
+            class,
+        },
+        remote,
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TunUdpFlowKey {
+    local: SocketAddr,
+    remote: SocketAddr,
+}
+
+struct TunUdpResponse {
+    payload: Vec<u8>,
+    source: SocketAddr,
+    destination: SocketAddr,
+}
+
+async fn run_tun_udp_socket(
+    udp_socket: TunUdpSocket,
+    context: ClientPathContext,
+    tun: TunL4Config,
+) -> Result<(), RuntimeError> {
+    let (mut read_half, mut write_half) = udp_socket.split();
+    let mut flows: HashMap<TunUdpFlowKey, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let flow_limit = tun_udp_flow_limit(&context);
+    let flow_queue = tun_udp_flow_queue(&context);
+    let response_queue = tun_udp_response_queue(&context);
+    let done_queue = flow_limit.clamp(1, 1024);
+    let (response_tx, mut response_rx) = mpsc::channel::<TunUdpResponse>(response_queue);
+    let (done_tx, mut done_rx) = mpsc::channel::<TunUdpFlowKey>(done_queue);
+
+    loop {
+        tokio::select! {
+            received = read_half.next() => {
+                let Some((payload, local, remote)) = received else {
+                    return Ok(());
+                };
+                let key = TunUdpFlowKey { local, remote };
+                if !flows.contains_key(&key) {
+                    if flows.len() >= flow_limit {
+                        eprintln!("warning: TUN UDP flow limit reached; dropping datagram from {local} to {remote}");
+                        continue;
+                    }
+                    let (tx, rx) = mpsc::channel(flow_queue);
+                    let flow_context = context.clone();
+                    let flow_tun = tun.clone();
+                    let flow_responses = response_tx.clone();
+                    let flow_done = done_tx.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            handle_tun_udp_flow(key, flow_context, flow_tun, rx, flow_responses)
+                                .await;
+                        let _ = flow_done.send(key).await;
+                        if let Err(err) = result {
+                            eprintln!(
+                                "warning: TUN UDP flow {} -> {} failed: {err}",
+                                key.local, key.remote
+                            );
+                        }
+                    });
+                    flows.insert(key, tx);
+                }
+                let send_result = flows
+                    .get(&key)
+                    .ok_or(RuntimeError::Protocol("missing TUN UDP flow"))?
+                    .try_send(payload);
+                match send_result {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        eprintln!("warning: TUN UDP flow queue full; dropping datagram from {local} to {remote}");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        flows.remove(&key);
+                    }
+                }
+            }
+            response = response_rx.recv() => {
+                let Some(response) = response else {
+                    return Ok(());
+                };
+                write_half
+                    .send((response.payload, response.source, response.destination))
+                    .await?;
+            }
+            done = done_rx.recv() => {
+                if let Some(key) = done {
+                    flows.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+async fn handle_tun_udp_flow(
+    key: TunUdpFlowKey,
+    context: ClientPathContext,
+    tun: TunL4Config,
+    mut datagrams: mpsc::Receiver<Vec<u8>>,
+    responses: mpsc::Sender<TunUdpResponse>,
+) -> Result<(), RuntimeError> {
+    let mut association = UdpDatagramClientAssociation::new(context)?;
+    let result = loop {
+        let payload = match tokio::time::timeout(TUN_UDP_FLOW_IDLE_TIMEOUT, datagrams.recv()).await
+        {
+            Ok(Some(payload)) => payload,
+            Ok(None) | Err(_) => break Ok(()),
+        };
+        let target = tun_udp_target_for_remote(key.remote, &tun);
+        let ttl_ms = tun_udp_ttl_ms(key.remote, &tun);
+        let response = association
+            .send_to(TargetAddr::Ip(target), Bytes::from(payload), ttl_ms)
+            .await?;
+        responses
+            .send(TunUdpResponse {
+                payload: response.to_vec(),
+                source: key.remote,
+                destination: key.local,
+            })
+            .await
+            .map_err(|_| RuntimeError::Protocol("TUN UDP response channel closed"))?;
+    };
+    let close_result = association.close().await;
+    if result.is_ok() {
+        close_result?;
+    }
+    result
+}
+
+fn tun_udp_target_for_remote(remote: SocketAddr, tun: &TunL4Config) -> SocketAddr {
+    if remote.port() != 53 || tun.dns_resolvers.is_empty() {
+        return remote;
+    }
+    tun.dns_resolvers
+        .iter()
+        .copied()
+        .find(|resolver| resolver.ip().is_ipv4() == remote.ip().is_ipv4())
+        .unwrap_or(tun.dns_resolvers[0])
+}
+
+fn tun_udp_ttl_ms(remote: SocketAddr, tun: &TunL4Config) -> u32 {
+    if remote.port() == 53 {
+        tun.dns_ttl_ms
+    } else {
+        DEFAULT_SOCKS5_UDP_TTL_MS
+    }
+}
+
+fn tun_udp_flow_limit(context: &ClientPathContext) -> usize {
+    let payload = context.mux_limits.max_payload_bytes.max(1);
+    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 4096)
+}
+
+fn tun_udp_flow_queue(context: &ClientPathContext) -> usize {
+    let payload = context.mux_limits.max_payload_bytes.max(1);
+    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 256)
+}
+
+fn tun_udp_response_queue(context: &ClientPathContext) -> usize {
+    let payload = context.mux_limits.max_payload_bytes.max(1);
+    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 1024)
+}
+
 async fn run_server(
     bind_paths: Vec<PathSpec>,
     outbound: OutboundConfig,
+    outbound_dns: DnsConfig,
     security: SecurityConfig,
     resources: ResourceLimits,
 ) -> Result<(), RuntimeError> {
     let context = ServerPathContext {
         outbound,
+        outbound_dns,
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,
@@ -1897,6 +2169,7 @@ fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
 #[derive(Debug, Clone)]
 pub struct ServerPathContext {
     outbound: OutboundConfig,
+    outbound_dns: DnsConfig,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     security: SecurityConfig,
@@ -2690,35 +2963,38 @@ async fn run_server_tcp_stream(
     target: TargetAddr,
 ) -> Result<(), RuntimeError> {
     let stream_id = stream.stream_id;
-    let result =
-        async {
-            let outbound_stream =
-                match outbound::connect_tcp(&context.outbound, &target, Duration::from_secs(10))
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        stream
-                            .send_frame(Frame::StreamReset {
-                                stream_id,
-                                reason: ResetReason::Refused,
-                            })
-                            .await?;
-                        stream.close().await;
-                        return Err(RuntimeError::OutboundConnect(err));
-                    }
-                };
-            stream
-                .send_frame(Frame::StreamMaxData {
-                    stream_id,
-                    max_offset: context.mux_limits.max_stream_window_bytes,
-                })
-                .await?;
-            relay_tcp_stream(outbound_stream, stream, context.mux_limits)
-                .await
-                .map(|_| ())
-        }
-        .await;
+    let result = async {
+        let outbound_stream = match outbound::connect_tcp(
+            &context.outbound,
+            &context.outbound_dns,
+            &target,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                stream
+                    .send_frame(Frame::StreamReset {
+                        stream_id,
+                        reason: ResetReason::Refused,
+                    })
+                    .await?;
+                stream.close().await;
+                return Err(RuntimeError::OutboundConnect(err));
+            }
+        };
+        stream
+            .send_frame(Frame::StreamMaxData {
+                stream_id,
+                max_offset: context.mux_limits.max_stream_window_bytes,
+            })
+            .await?;
+        relay_tcp_stream(outbound_stream, stream, context.mux_limits)
+            .await
+            .map(|_| ())
+    }
+    .await;
     context.tcp_streams.close(session_id, stream_id);
     result
 }
@@ -4123,6 +4399,7 @@ impl ServerUdpPathSession {
                 self.context.outbound.ensure_supports(TargetProtocol::Udp)?;
                 let outbound_socket = match outbound::connect_udp(
                     &self.context.outbound,
+                    &self.context.outbound_dns,
                     &target,
                     Duration::from_secs(10),
                 )
@@ -4493,6 +4770,7 @@ mod tests {
         let resources = ResourceLimits::default();
         ServerPathContext {
             outbound,
+            outbound_dns: DnsConfig::default(),
             codec_limits: resources.into(),
             mux_limits: resources.into(),
             security: security(),
@@ -4501,6 +4779,30 @@ mod tests {
             max_udp_sessions: resources.max_streams,
             max_udp_flows_per_session: resources.max_streams,
         }
+    }
+
+    #[test]
+    fn tun_udp_dns_target_uses_configured_matching_resolver() {
+        let tun = TunL4Config {
+            dns_resolvers: vec![
+                "[2606:4700:4700::1111]:5353".parse().expect("resolver"),
+                "1.1.1.1:5353".parse().expect("resolver"),
+            ],
+            ..TunL4Config::default()
+        };
+
+        assert_eq!(
+            tun_udp_target_for_remote("8.8.8.8:53".parse().expect("remote"), &tun),
+            "1.1.1.1:5353".parse().expect("resolver")
+        );
+        assert_eq!(
+            tun_udp_target_for_remote("[2001:4860:4860::8888]:53".parse().expect("remote"), &tun),
+            "[2606:4700:4700::1111]:5353".parse().expect("resolver")
+        );
+        assert_eq!(
+            tun_udp_target_for_remote("8.8.8.8:443".parse().expect("remote"), &tun),
+            "8.8.8.8:443".parse().expect("remote")
+        );
     }
 
     async fn reserve_tcp_path() -> PathSpec {
@@ -5856,6 +6158,7 @@ mod tests {
         let server = tokio::spawn(run_server(
             vec![path.clone()],
             OutboundConfig::Direct,
+            DnsConfig::default(),
             security(),
             ResourceLimits::default(),
         ));
@@ -5886,6 +6189,7 @@ mod tests {
         let server = tokio::spawn(run_server(
             vec![path.clone()],
             OutboundConfig::Direct,
+            DnsConfig::default(),
             security(),
             ResourceLimits::default(),
         ));
@@ -6283,6 +6587,7 @@ mod tests {
                 stream,
                 ServerPathContext {
                     outbound: OutboundConfig::Direct,
+                    outbound_dns: DnsConfig::default(),
                     codec_limits: CodecLimits::default(),
                     mux_limits: ResourceLimits::default().into(),
                     security: SecurityConfig::encrypted(

@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod http_connect;
 pub mod socks5;
 
@@ -6,6 +7,7 @@ use crate::protocol::TargetAddr;
 use crate::transport::Endpoint;
 use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
 use crate::transport::udp::{self, UdpConnectOptions, UdpTransportError};
+pub use dns::{DnsConfig, DnsIpStrategy};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -82,14 +84,17 @@ pub fn validate_target(target: &TargetAddr) -> Result<(), OutboundError> {
 
 pub async fn connect_tcp(
     config: &OutboundConfig,
+    dns: &DnsConfig,
     target: &TargetAddr,
     timeout: Duration,
 ) -> Result<TcpStream, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Tcp)?;
     validate_target(target)?;
     match config {
-        OutboundConfig::Direct => connect_direct_tcp(target, None, timeout).await,
-        OutboundConfig::BindSourceIp(ip) => connect_direct_tcp(target, Some(*ip), timeout).await,
+        OutboundConfig::Direct => connect_direct_tcp(target, dns, None, timeout).await,
+        OutboundConfig::BindSourceIp(ip) => {
+            connect_direct_tcp(target, dns, Some(*ip), timeout).await
+        }
         OutboundConfig::Socks5 { proxy } => connect_socks5_tcp(proxy, target, timeout).await,
         OutboundConfig::HttpConnect { proxy } | OutboundConfig::HttpConnectUdp { proxy } => {
             connect_http_connect_tcp(proxy, target, timeout).await
@@ -99,16 +104,17 @@ pub async fn connect_tcp(
 
 pub async fn connect_udp(
     config: &OutboundConfig,
+    dns: &DnsConfig,
     target: &TargetAddr,
     timeout: Duration,
 ) -> Result<OutboundUdpSocket, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Udp)?;
     validate_target(target)?;
     match config {
-        OutboundConfig::Direct => connect_direct_udp(target, None, timeout)
+        OutboundConfig::Direct => connect_direct_udp(target, dns, None, timeout)
             .await
             .map(OutboundUdpSocket::Direct),
-        OutboundConfig::BindSourceIp(ip) => connect_direct_udp(target, Some(*ip), timeout)
+        OutboundConfig::BindSourceIp(ip) => connect_direct_udp(target, dns, Some(*ip), timeout)
             .await
             .map(OutboundUdpSocket::Direct),
         OutboundConfig::Socks5 { proxy } => connect_socks5_udp(proxy, target, timeout)
@@ -215,28 +221,59 @@ impl Socks5UdpAssociation {
 
 async fn connect_direct_tcp(
     target: &TargetAddr,
+    dns: &DnsConfig,
     source_ip: Option<IpAddr>,
     timeout: Duration,
 ) -> Result<TcpStream, OutboundConnectError> {
-    let endpoint = endpoint_from_target(target)?;
-    Ok(tcp::connect_endpoint(
-        &endpoint,
-        TcpConnectOptions {
-            source_ip,
-            timeout,
-            ..TcpConnectOptions::default()
-        },
-    )
-    .await?)
+    let addrs = resolve_target(target, dns).await?;
+    let mut last_error = None;
+    for addr in addrs {
+        if let Some(source_ip) = source_ip
+            && source_ip.is_ipv4() != addr.is_ipv4()
+        {
+            continue;
+        }
+        match tcp::connect_addr(
+            addr,
+            TcpConnectOptions {
+                source_ip,
+                timeout,
+                ..TcpConnectOptions::default()
+            },
+        )
+        .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or(TcpTransportError::NoCompatibleAddress)
+        .into())
 }
 
 async fn connect_direct_udp(
     target: &TargetAddr,
+    dns: &DnsConfig,
     source_ip: Option<IpAddr>,
     timeout: Duration,
 ) -> Result<UdpSocket, OutboundConnectError> {
-    let endpoint = endpoint_from_target(target)?;
-    Ok(udp::connect_endpoint(&endpoint, UdpConnectOptions { source_ip, timeout }).await?)
+    let addrs = resolve_target(target, dns).await?;
+    let mut last_error = None;
+    for addr in addrs {
+        if let Some(source_ip) = source_ip
+            && source_ip.is_ipv4() != addr.is_ipv4()
+        {
+            continue;
+        }
+        match udp::connect_addr(addr, UdpConnectOptions { source_ip, timeout }).await {
+            Ok(socket) => return Ok(socket),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or(UdpTransportError::NoCompatibleAddress)
+        .into())
 }
 
 async fn connect_socks5_tcp(
@@ -359,10 +396,13 @@ async fn read_http_proxy_response(stream: &mut TcpStream) -> Result<Vec<u8>, Out
     Ok(response)
 }
 
-fn endpoint_from_target(target: &TargetAddr) -> Result<Endpoint, OutboundConnectError> {
+async fn resolve_target(
+    target: &TargetAddr,
+    dns: &DnsConfig,
+) -> Result<Vec<SocketAddr>, OutboundConnectError> {
     match target {
-        TargetAddr::Domain { host, port } => Ok(Endpoint::new(host.clone(), *port)?),
-        TargetAddr::Ip(addr) => Ok(Endpoint::new(addr.ip().to_string(), addr.port())?),
+        TargetAddr::Ip(addr) => Ok(vec![*addr]),
+        TargetAddr::Domain { host, port } => Ok(dns::resolve_socket_addrs(host, *port, dns).await?),
     }
 }
 
@@ -454,6 +494,7 @@ pub enum OutboundConnectError {
     Tcp(TcpTransportError),
     Udp(UdpTransportError),
     Io(std::io::Error),
+    Dns(dns::DnsError),
     Socks5Client(socks5::Socks5ClientError),
     HttpConnectClient(http_connect::HttpConnectClientError),
     ProxyAuthRejected(u8),
@@ -500,6 +541,12 @@ impl From<std::io::Error> for OutboundConnectError {
     }
 }
 
+impl From<dns::DnsError> for OutboundConnectError {
+    fn from(value: dns::DnsError) -> Self {
+        Self::Dns(value)
+    }
+}
+
 impl From<socks5::Socks5ClientError> for OutboundConnectError {
     fn from(value: socks5::Socks5ClientError) -> Self {
         Self::Socks5Client(value)
@@ -520,6 +567,7 @@ impl std::fmt::Display for OutboundConnectError {
             Self::Tcp(err) => write!(f, "{err}"),
             Self::Udp(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
+            Self::Dns(err) => write!(f, "{err}"),
             Self::Socks5Client(err) => write!(f, "{err}"),
             Self::HttpConnectClient(err) => write!(f, "{err}"),
             Self::ProxyAuthRejected(method) => {
@@ -556,6 +604,7 @@ impl std::error::Error for OutboundConnectError {
             Self::Tcp(err) => Some(err),
             Self::Udp(err) => Some(err),
             Self::Io(err) => Some(err),
+            Self::Dns(err) => Some(err),
             Self::Socks5Client(err) => Some(err),
             Self::HttpConnectClient(err) => Some(err),
             Self::Socks5UdpPacket(err) => Some(err),
@@ -632,6 +681,7 @@ mod tests {
 
         let mut stream = connect_tcp(
             &OutboundConfig::Direct,
+            &DnsConfig::default(),
             &TargetAddr::Ip(addr),
             Duration::from_secs(1),
         )
@@ -658,6 +708,7 @@ mod tests {
 
         let mut socket = connect_udp(
             &OutboundConfig::Direct,
+            &DnsConfig::default(),
             &TargetAddr::Ip(target_addr),
             Duration::from_secs(1),
         )
@@ -726,6 +777,7 @@ mod tests {
 
         let mut socket = connect_udp(
             &OutboundConfig::Socks5 { proxy },
+            &DnsConfig::default(),
             &target,
             Duration::from_secs(1),
         )
@@ -778,6 +830,7 @@ mod tests {
 
         let mut stream = connect_tcp(
             &OutboundConfig::Socks5 { proxy },
+            &DnsConfig::default(),
             &TargetAddr::Domain {
                 host: "example.com".to_string(),
                 port: 443,
@@ -838,6 +891,7 @@ mod tests {
 
         let mut stream = connect_tcp(
             &OutboundConfig::HttpConnect { proxy },
+            &DnsConfig::default(),
             &TargetAddr::Domain {
                 host: "example.com".to_string(),
                 port: 443,
@@ -897,6 +951,7 @@ mod tests {
 
         let mut socket = connect_udp(
             &OutboundConfig::HttpConnectUdp { proxy },
+            &DnsConfig::default(),
             &target,
             Duration::from_secs(1),
         )

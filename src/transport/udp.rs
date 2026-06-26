@@ -68,7 +68,7 @@ async fn resolve_endpoint(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, UdpTra
     }
 }
 
-async fn connect_addr(
+pub async fn connect_addr(
     addr: SocketAddr,
     options: UdpConnectOptions,
 ) -> Result<UdpSocket, UdpTransportError> {

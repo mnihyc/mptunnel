@@ -5,11 +5,12 @@ use crate::config::{
     SecurityConfig, ServerConfig, SharedSecret, TcpPortClassRule, TrafficPolicy,
 };
 use crate::ingress::IngressConfig;
-use crate::outbound::OutboundConfig;
+use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
+use crate::outbound::{DnsConfig, DnsIpStrategy, OutboundConfig};
 use crate::protocol::TrafficClass;
 use crate::transport::{Endpoint, PathSpec};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -235,6 +236,43 @@ pub struct ClientArgs {
     #[arg(long, env = "MPTUNNEL_LISTEN")]
     pub listen: Option<SocketAddr>,
 
+    #[arg(long, env = "MPTUNNEL_TUN_NAME")]
+    pub tun_name: Option<String>,
+
+    #[arg(long, env = "MPTUNNEL_TUN_IPV4")]
+    pub tun_ipv4: Option<Ipv4Addr>,
+
+    #[arg(long, env = "MPTUNNEL_TUN_DISABLE_IPV4", default_value_t = false)]
+    pub tun_disable_ipv4: bool,
+
+    #[arg(long, env = "MPTUNNEL_TUN_IPV4_PREFIX", default_value_t = crate::ingress::tun::DEFAULT_TUN_IPV4_PREFIX)]
+    pub tun_ipv4_prefix: u8,
+
+    #[arg(long, env = "MPTUNNEL_TUN_IPV4_GATEWAY")]
+    pub tun_ipv4_gateway: Option<Ipv4Addr>,
+
+    #[arg(long, env = "MPTUNNEL_TUN_IPV6")]
+    pub tun_ipv6: Option<Ipv6Addr>,
+
+    #[arg(long, env = "MPTUNNEL_TUN_IPV6_PREFIX", default_value_t = 64)]
+    pub tun_ipv6_prefix: u8,
+
+    #[arg(long, env = "MPTUNNEL_TUN_MTU", default_value_t = DEFAULT_TUN_MTU)]
+    pub tun_mtu: u16,
+
+    #[arg(long, env = "MPTUNNEL_TUN_DISABLE_ICMP", default_value_t = false)]
+    pub tun_disable_icmp: bool,
+
+    #[arg(
+        long = "tun-dns-resolver",
+        env = "MPTUNNEL_TUN_DNS_RESOLVERS",
+        value_delimiter = ','
+    )]
+    pub tun_dns_resolvers: Vec<SocketAddr>,
+
+    #[arg(long, env = "MPTUNNEL_TUN_DNS_TTL_MS", default_value_t = DEFAULT_TUN_DNS_TTL_MS)]
+    pub tun_dns_ttl_ms: u32,
+
     #[arg(
         long = "path",
         env = "MPTUNNEL_PATHS",
@@ -286,6 +324,31 @@ impl ClientArgs {
                     .listen
                     .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
             },
+            IngressArg::TunL4 => {
+                let tun_ipv4 = if self.tun_disable_ipv4 {
+                    if self.tun_ipv4.is_some() || self.tun_ipv4_gateway.is_some() {
+                        return Err(CliConfigError::TunIpv4DisabledWithIpv4Options);
+                    }
+                    None
+                } else {
+                    Some(
+                        self.tun_ipv4
+                            .unwrap_or(crate::ingress::tun::DEFAULT_TUN_IPV4),
+                    )
+                };
+                IngressConfig::TunL4(TunL4Config {
+                    name: self.tun_name,
+                    ipv4: tun_ipv4,
+                    ipv4_prefix: self.tun_ipv4_prefix,
+                    ipv4_gateway: self.tun_ipv4_gateway,
+                    ipv6: self.tun_ipv6,
+                    ipv6_prefix: self.tun_ipv6_prefix,
+                    mtu: self.tun_mtu,
+                    enable_icmp: !self.tun_disable_icmp,
+                    dns_resolvers: self.tun_dns_resolvers,
+                    dns_ttl_ms: self.tun_dns_ttl_ms,
+                })
+            }
         };
         Ok(ClientConfig {
             ingress,
@@ -308,6 +371,7 @@ impl ClientArgs {
 pub enum IngressArg {
     Socks5,
     HttpConnect,
+    TunL4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -403,6 +467,28 @@ pub struct ServerArgs {
 
     #[arg(long, env = "MPTUNNEL_UPSTREAM_HTTP")]
     pub upstream_http: Option<Endpoint>,
+
+    #[arg(
+        long = "outbound-dns-resolver",
+        env = "MPTUNNEL_OUTBOUND_DNS_RESOLVERS",
+        value_delimiter = ','
+    )]
+    pub outbound_dns_resolvers: Vec<SocketAddr>,
+
+    #[arg(
+        long,
+        env = "MPTUNNEL_OUTBOUND_DNS_STRATEGY",
+        value_enum,
+        default_value_t = DnsStrategyArg::Ipv4ThenIpv6
+    )]
+    pub outbound_dns_strategy: DnsStrategyArg,
+
+    #[arg(
+        long,
+        env = "MPTUNNEL_OUTBOUND_DNS_TIMEOUT_MS",
+        default_value_t = crate::outbound::dns::DEFAULT_OUTBOUND_DNS_TIMEOUT_MS
+    )]
+    pub outbound_dns_timeout_ms: u64,
 }
 
 impl ServerArgs {
@@ -432,7 +518,35 @@ impl ServerArgs {
         Ok(ServerConfig {
             bind_paths: self.bind_paths,
             outbound,
+            outbound_dns: DnsConfig {
+                resolvers: self.outbound_dns_resolvers,
+                strategy: self.outbound_dns_strategy.into(),
+                timeout: Duration::from_millis(self.outbound_dns_timeout_ms),
+            },
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DnsStrategyArg {
+    Ipv4ThenIpv6,
+    Ipv6ThenIpv4,
+    Ipv4Only,
+    Ipv6Only,
+    Ipv4AndIpv6,
+    Ipv6AndIpv4,
+}
+
+impl From<DnsStrategyArg> for DnsIpStrategy {
+    fn from(value: DnsStrategyArg) -> Self {
+        match value {
+            DnsStrategyArg::Ipv4ThenIpv6 => Self::Ipv4ThenIpv6,
+            DnsStrategyArg::Ipv6ThenIpv4 => Self::Ipv6ThenIpv4,
+            DnsStrategyArg::Ipv4Only => Self::Ipv4Only,
+            DnsStrategyArg::Ipv6Only => Self::Ipv6Only,
+            DnsStrategyArg::Ipv4AndIpv6 => Self::Ipv4AndIpv6,
+            DnsStrategyArg::Ipv6AndIpv4 => Self::Ipv6AndIpv4,
+        }
     }
 }
 
@@ -453,6 +567,7 @@ pub enum CliConfigError {
     MissingOutboundBindIp,
     MissingUpstreamSocks5,
     MissingUpstreamHttp,
+    TunIpv4DisabledWithIpv4Options,
 }
 
 impl From<crate::config::ConfigError> for CliConfigError {
@@ -486,6 +601,12 @@ impl std::fmt::Display for CliConfigError {
                 write!(
                     f,
                     "--outbound http-connect/http-connect-udp requires --upstream-http"
+                )
+            }
+            Self::TunIpv4DisabledWithIpv4Options => {
+                write!(
+                    f,
+                    "--tun-disable-ipv4 cannot be combined with --tun-ipv4 or --tun-ipv4-gateway"
                 )
             }
         }
@@ -635,6 +756,211 @@ mod tests {
                 proxy: "127.0.0.1:8080".parse().expect("proxy")
             }
         );
+    }
+
+    #[test]
+    fn server_outbound_dns_is_parsed() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "server",
+            "--bind-path",
+            "tcp://0.0.0.0:443",
+            "--outbound-dns-resolver",
+            "1.1.1.1:53",
+            "--outbound-dns-resolver",
+            "[2606:4700:4700::1111]:53",
+            "--outbound-dns-strategy",
+            "ipv6-then-ipv4",
+            "--outbound-dns-timeout-ms",
+            "1500",
+        ])
+        .expect("parse cli");
+        let config = cli.into_config().expect("config");
+
+        let CommandConfig::Server(server) = config.command else {
+            panic!("expected server config");
+        };
+        assert_eq!(
+            server.outbound_dns.resolvers,
+            vec![
+                "1.1.1.1:53".parse().expect("resolver"),
+                "[2606:4700:4700::1111]:53".parse().expect("resolver"),
+            ]
+        );
+        assert_eq!(server.outbound_dns.strategy, DnsIpStrategy::Ipv6ThenIpv4);
+        assert_eq!(server.outbound_dns.timeout, Duration::from_millis(1500));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "server",
+            "--bind-path",
+            "tcp://0.0.0.0:443",
+            "--outbound-dns-resolver",
+            "1.1.1.1:0",
+        ])
+        .expect("parse cli");
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::OutboundDnsResolverPortZero
+            ))
+        ));
+    }
+
+    #[test]
+    fn tun_l4_cli_parses_dual_stack_and_dns() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "tun-l4",
+            "--tun-name",
+            "mptun0",
+            "--tun-ipv6",
+            "fd00::1",
+            "--tun-dns-resolver",
+            "1.1.1.1:53",
+            "--tun-dns-resolver",
+            "[2606:4700:4700::1111]:53",
+            "--path",
+            "tcp://127.0.0.1:443",
+            "--path",
+            "udp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        let config = cli.into_config().expect("config");
+
+        let CommandConfig::Client(client) = config.command else {
+            panic!("expected client config");
+        };
+        let IngressConfig::TunL4(tun) = client.ingress else {
+            panic!("expected TUN L4 ingress");
+        };
+        assert_eq!(tun.name.as_deref(), Some("mptun0"));
+        assert_eq!(tun.ipv4, Some(crate::ingress::tun::DEFAULT_TUN_IPV4));
+        assert_eq!(tun.ipv6, Some("fd00::1".parse().expect("ipv6")));
+        assert_eq!(
+            tun.dns_resolvers,
+            vec![
+                "1.1.1.1:53".parse().expect("resolver"),
+                "[2606:4700:4700::1111]:53".parse().expect("resolver"),
+            ]
+        );
+        assert!(tun.enable_icmp);
+        assert!(
+            client
+                .paths
+                .iter()
+                .any(|path| { path.underlay == crate::protocol::UnderlayProtocol::Tcp })
+        );
+        assert!(
+            client
+                .paths
+                .iter()
+                .any(|path| { path.underlay == crate::protocol::UnderlayProtocol::Udp })
+        );
+    }
+
+    #[test]
+    fn tun_l4_cli_supports_ipv6_only() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "tun-l4",
+            "--tun-disable-ipv4",
+            "--tun-ipv6",
+            "fd00::1",
+            "--path",
+            "tcp://127.0.0.1:443",
+            "--path",
+            "udp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        let config = cli.into_config().expect("config");
+
+        let CommandConfig::Client(client) = config.command else {
+            panic!("expected client config");
+        };
+        let IngressConfig::TunL4(tun) = client.ingress else {
+            panic!("expected TUN L4 ingress");
+        };
+        assert_eq!(tun.ipv4, None);
+        assert_eq!(tun.ipv6, Some("fd00::1".parse().expect("ipv6")));
+    }
+
+    #[test]
+    fn tun_l4_validation_rejects_bad_underlay_and_ipv4_flags() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "tun-l4",
+            "--tun-disable-ipv4",
+            "--tun-ipv4",
+            "10.88.0.2",
+            "--tun-ipv6",
+            "fd00::1",
+            "--path",
+            "tcp://127.0.0.1:443",
+            "--path",
+            "udp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::TunIpv4DisabledWithIpv4Options)
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "tun-l4",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TunRequiresUdpPath
+            ))
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "tun-l4",
+            "--tun-dns-resolver",
+            "1.1.1.1:0",
+            "--path",
+            "tcp://127.0.0.1:443",
+            "--path",
+            "udp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::TunDnsResolverPortZero
+            ))
+        ));
     }
 
     #[test]

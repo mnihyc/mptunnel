@@ -9,6 +9,7 @@ use crate::mux::MuxLimits;
 use crate::mux::datagram::{DatagramError, DatagramFlow};
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::outbound::{self, DnsConfig, OutboundConfig, TargetProtocol};
+use crate::platform;
 use crate::protocol::RateHint;
 use crate::protocol::auth::{AuthError, SessionAuthenticator};
 use crate::protocol::codec::CodecLimits;
@@ -30,7 +31,6 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use netstack_smoltcp::{StackBuilder, TcpListener as TunTcpListener, UdpSocket as TunUdpSocket};
 use std::collections::{HashMap, HashSet};
-use std::future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -91,36 +91,119 @@ async fn run_client(
     )?;
     match client.ingress {
         IngressConfig::Socks5 { listen } => {
-            let listener = TcpListener::bind(listen).await?;
-            start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let context = context.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_socks5_client_stream(stream, context).await {
-                        eprintln!("warning: SOCKS5 client handler failed: {err}");
-                    }
-                });
-            }
+            run_socks5_client_ingress(listen, context, path_probe_interval, path_probe_timeout)
+                .await
         }
         IngressConfig::HttpConnect { listen } => {
-            let listener = TcpListener::bind(listen).await?;
-            start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let context = context.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_http_connect_client_stream(stream, context).await {
-                        eprintln!("warning: HTTP CONNECT client handler failed: {err}");
-                    }
-                });
-            }
+            run_http_connect_client_ingress(
+                listen,
+                context,
+                path_probe_interval,
+                path_probe_timeout,
+            )
+            .await
         }
         IngressConfig::TunL4(tun) => {
             start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
             run_tun_l4_client(tun, context).await
         }
     }
+}
+
+async fn run_socks5_client_ingress(
+    listen: Vec<SocketAddr>,
+    context: ClientPathContext,
+    path_probe_interval: Duration,
+    path_probe_timeout: Duration,
+) -> Result<(), RuntimeError> {
+    let mut bound = Vec::with_capacity(listen.len());
+    for addr in listen {
+        bound.push(TcpListener::bind(addr).await?);
+    }
+    if bound.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "SOCKS5 ingress has no listener tasks",
+        ));
+    }
+    let mut listeners = tokio::task::JoinSet::new();
+    for listener in bound {
+        let context = context.clone();
+        listeners.spawn(async move { run_socks5_client_listener(listener, context).await });
+    }
+    start_client_path_probes(context, path_probe_interval, path_probe_timeout);
+    wait_for_ingress_listener_failure(listeners, "SOCKS5").await
+}
+
+async fn run_socks5_client_listener(
+    listener: TcpListener,
+    context: ClientPathContext,
+) -> Result<(), RuntimeError> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let context = context.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_socks5_client_stream(stream, context).await {
+                eprintln!("warning: SOCKS5 client handler failed: {err}");
+            }
+        });
+    }
+}
+
+async fn run_http_connect_client_ingress(
+    listen: Vec<SocketAddr>,
+    context: ClientPathContext,
+    path_probe_interval: Duration,
+    path_probe_timeout: Duration,
+) -> Result<(), RuntimeError> {
+    let mut bound = Vec::with_capacity(listen.len());
+    for addr in listen {
+        bound.push(TcpListener::bind(addr).await?);
+    }
+    if bound.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "HTTP CONNECT ingress has no listener tasks",
+        ));
+    }
+    let mut listeners = tokio::task::JoinSet::new();
+    for listener in bound {
+        let context = context.clone();
+        listeners.spawn(async move { run_http_connect_client_listener(listener, context).await });
+    }
+    start_client_path_probes(context, path_probe_interval, path_probe_timeout);
+    wait_for_ingress_listener_failure(listeners, "HTTP CONNECT").await
+}
+
+async fn run_http_connect_client_listener(
+    listener: TcpListener,
+    context: ClientPathContext,
+) -> Result<(), RuntimeError> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let context = context.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_http_connect_client_stream(stream, context).await {
+                eprintln!("warning: HTTP CONNECT client handler failed: {err}");
+            }
+        });
+    }
+}
+
+async fn wait_for_ingress_listener_failure(
+    mut listeners: tokio::task::JoinSet<Result<(), RuntimeError>>,
+    ingress: &'static str,
+) -> Result<(), RuntimeError> {
+    if let Some(result) = listeners.join_next().await {
+        match result {
+            Ok(Ok(())) => return Err(RuntimeError::Protocol("client ingress listener exited")),
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(RuntimeError::TaskJoin(err)),
+        }
+    }
+    Err(RuntimeError::Protocol(match ingress {
+        "SOCKS5" => "SOCKS5 ingress has no listener tasks",
+        "HTTP CONNECT" => "HTTP CONNECT ingress has no listener tasks",
+        _ => "client ingress has no listener tasks",
+    }))
 }
 
 fn start_client_path_probes(context: ClientPathContext, interval: Duration, timeout: Duration) {
@@ -228,7 +311,7 @@ async fn run_tun_l4_client(
     Ok(())
 }
 
-fn build_tun_device(tun: &TunL4Config) -> std::io::Result<tun_rs::AsyncDevice> {
+fn build_tun_device(tun: &TunL4Config) -> Result<tun_rs::AsyncDevice, RuntimeError> {
     let mut builder = DeviceBuilder::new().mtu(tun.mtu);
     if let Some(name) = &tun.name {
         builder = builder.name(name.clone());
@@ -239,7 +322,7 @@ fn build_tun_device(tun: &TunL4Config) -> std::io::Result<tun_rs::AsyncDevice> {
     if let Some(ipv6) = tun.ipv6 {
         builder = builder.ipv6(ipv6, tun.ipv6_prefix);
     }
-    builder.build_async()
+    builder.build_async().map_err(RuntimeError::TunDevice)
 }
 
 async fn run_tun_tcp_listener(
@@ -459,30 +542,45 @@ async fn run_server(
         max_udp_sessions: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
     };
+    let mut bound = Vec::with_capacity(bind_paths.len());
     for path in bind_paths {
         match path.underlay {
             UnderlayProtocol::Tcp => {
                 let listener = tcp::bind_listener(&path).await?;
-                let context = context.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = run_server_tcp_listener(listener, context).await {
-                        eprintln!("warning: TCP server listener failed: {err}");
-                    }
-                });
+                bound.push(BoundServerPath::Tcp(listener));
             }
             UnderlayProtocol::Udp => {
                 let socket = udp::bind_socket(&path).await?;
-                let context = context.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = run_server_udp_listener(socket, context).await {
-                        eprintln!("warning: UDP server listener failed: {err}");
-                    }
-                });
+                bound.push(BoundServerPath::Udp(socket));
             }
         }
     }
-    future::pending::<()>().await;
-    Ok(())
+    let mut listeners = tokio::task::JoinSet::new();
+    for bound_path in bound {
+        match bound_path {
+            BoundServerPath::Tcp(listener) => {
+                let context = context.clone();
+                listeners.spawn(async move { run_server_tcp_listener(listener, context).await });
+            }
+            BoundServerPath::Udp(socket) => {
+                let context = context.clone();
+                listeners.spawn(async move { run_server_udp_listener(socket, context).await });
+            }
+        }
+    }
+    if let Some(result) = listeners.join_next().await {
+        match result {
+            Ok(Ok(())) => return Err(RuntimeError::Protocol("server listener exited")),
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(RuntimeError::TaskJoin(err)),
+        }
+    }
+    Err(RuntimeError::Protocol("server has no listener tasks"))
+}
+
+enum BoundServerPath {
+    Tcp(TcpListener),
+    Udp(UdpSocket),
 }
 
 async fn run_server_tcp_listener(
@@ -4595,6 +4693,8 @@ pub enum RuntimeError {
     Stream(StreamError),
     Datagram(DatagramError),
     PathSpec(PathSpecParseError),
+    TunDevice(std::io::Error),
+    TaskJoin(tokio::task::JoinError),
     NoTcpPath,
     NoUdpPath,
     NoSchedulableTcpPath,
@@ -4702,6 +4802,12 @@ impl std::fmt::Display for RuntimeError {
             Self::Stream(err) => write!(f, "{err}"),
             Self::Datagram(err) => write!(f, "{err}"),
             Self::PathSpec(err) => write!(f, "{err}"),
+            Self::TunDevice(err) => write!(
+                f,
+                "failed to create TUN device: {err}; {}",
+                platform::tun_privilege_hint()
+            ),
+            Self::TaskJoin(err) => write!(f, "runtime task failed: {err}"),
             Self::NoTcpPath => write!(f, "runtime operation requires at least one TCP path"),
             Self::NoUdpPath => write!(f, "runtime operation requires at least one UDP path"),
             Self::NoSchedulableTcpPath => {
@@ -4740,6 +4846,8 @@ impl std::error::Error for RuntimeError {
             Self::Stream(err) => Some(err),
             Self::Datagram(err) => Some(err),
             Self::PathSpec(err) => Some(err),
+            Self::TunDevice(err) => Some(err),
+            Self::TaskJoin(err) => Some(err),
             Self::NoTcpPath
             | Self::NoUdpPath
             | Self::NoSchedulableTcpPath

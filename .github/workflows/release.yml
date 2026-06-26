@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            shell: bash
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            shell: bash
+            cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            shell: bash
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            shell: bash
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            shell: pwsh
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+      - name: Build Linux cross target
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Package Unix
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            scripts/package-release.sh --target "${{ matrix.target }}" --no-build
+          else
+            scripts/package-release.sh --target "${{ matrix.target }}"
+          fi
+      - name: Package Windows
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: scripts/package-release.ps1 -Target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mptunnel-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  publish:
+    name: publish
+    needs: package
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256

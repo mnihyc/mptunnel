@@ -7,7 +7,7 @@ use tun::TunL4Config;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressConfig {
-    Socks5 { listen: SocketAddr },
-    HttpConnect { listen: SocketAddr },
+    Socks5 { listen: Vec<SocketAddr> },
+    HttpConnect { listen: Vec<SocketAddr> },
     TunL4(TunL4Config),
 }

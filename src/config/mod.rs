@@ -25,12 +25,18 @@ pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS);
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS);
+pub const DEFAULT_RESTART_BACKOFF_MS: u64 = 1_000;
+pub const DEFAULT_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
+pub const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_millis(DEFAULT_RESTART_BACKOFF_MS);
+pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
+    Duration::from_millis(DEFAULT_RESTART_MAX_BACKOFF_MS);
 const RELAY_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub log_level: String,
     pub check_config: bool,
+    pub service: ServiceConfig,
     pub resources: ResourceLimits,
     pub security: SecurityConfig,
     pub command: CommandConfig,
@@ -44,12 +50,14 @@ impl AppConfig {
             self.security.integrity,
             &self.security.secret,
         )?;
+        self.service.validate()?;
         self.resources.validate()?;
         match &self.command {
             CommandConfig::Client(client) => {
                 if client.paths.is_empty() {
                     return Err(ConfigError::NoPaths);
                 }
+                validate_ingress(&client.ingress)?;
                 if client.paths.len() > self.resources.max_paths {
                     return Err(ConfigError::TooManyPaths {
                         actual: client.paths.len(),
@@ -93,6 +101,45 @@ impl AppConfig {
                 }
                 server.outbound_dns.validate()?;
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceConfig {
+    pub service_mode: bool,
+    pub supervise: bool,
+    pub restart_backoff: Duration,
+    pub restart_max_backoff: Duration,
+    pub max_restarts: Option<u32>,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            service_mode: false,
+            supervise: false,
+            restart_backoff: DEFAULT_RESTART_BACKOFF,
+            restart_max_backoff: DEFAULT_RESTART_MAX_BACKOFF,
+            max_restarts: None,
+        }
+    }
+}
+
+impl ServiceConfig {
+    pub fn validate(self) -> Result<(), ConfigError> {
+        if self.restart_backoff.is_zero() {
+            return Err(ConfigError::RestartBackoffZero);
+        }
+        if self.restart_max_backoff.is_zero() {
+            return Err(ConfigError::RestartMaxBackoffZero);
+        }
+        if self.restart_max_backoff < self.restart_backoff {
+            return Err(ConfigError::RestartMaxBackoffTooSmall);
+        }
+        if self.max_restarts == Some(0) {
+            return Err(ConfigError::RestartLimitZero);
         }
         Ok(())
     }
@@ -315,6 +362,18 @@ impl DnsConfig {
     }
 }
 
+fn validate_ingress(ingress: &IngressConfig) -> Result<(), ConfigError> {
+    match ingress {
+        IngressConfig::Socks5 { listen } | IngressConfig::HttpConnect { listen } => {
+            if listen.is_empty() {
+                return Err(ConfigError::NoListenAddresses);
+            }
+        }
+        IngressConfig::TunL4(_) => {}
+    }
+    Ok(())
+}
+
 fn validate_tun_l4(tun: &crate::ingress::tun::TunL4Config) -> Result<(), ConfigError> {
     if tun.ipv4.is_none() && tun.ipv6.is_none() {
         return Err(ConfigError::TunAddressRequired);
@@ -363,6 +422,11 @@ pub enum ConfigError {
     TcpPathHeartbeatIntervalZero,
     TcpPathHeartbeatTimeoutZero,
     TcpPathHeartbeatTimeoutTooSmall,
+    RestartBackoffZero,
+    RestartMaxBackoffZero,
+    RestartMaxBackoffTooSmall,
+    RestartLimitZero,
+    NoListenAddresses,
     TooManyPaths { actual: usize, limit: usize },
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
@@ -439,6 +503,20 @@ impl std::fmt::Display for ConfigError {
                     f,
                     "TCP path heartbeat timeout must be at least the heartbeat interval"
                 )
+            }
+            Self::RestartBackoffZero => write!(f, "restart backoff must be greater than zero"),
+            Self::RestartMaxBackoffZero => {
+                write!(f, "maximum restart backoff must be greater than zero")
+            }
+            Self::RestartMaxBackoffTooSmall => {
+                write!(
+                    f,
+                    "maximum restart backoff must be at least the initial restart backoff"
+                )
+            }
+            Self::RestartLimitZero => write!(f, "max restarts must be greater than zero"),
+            Self::NoListenAddresses => {
+                write!(f, "proxy ingress requires at least one listen address")
             }
             Self::TooManyPaths { actual, limit } => {
                 write!(f, "{actual} paths configured, limit is {limit}")

@@ -4,6 +4,7 @@ pub mod config;
 pub mod ingress;
 pub mod mux;
 pub mod outbound;
+pub mod platform;
 pub mod protocol;
 pub mod runtime;
 pub mod scheduler;

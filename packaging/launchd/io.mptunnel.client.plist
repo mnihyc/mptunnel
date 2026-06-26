@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.mptunnel.client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/mptunnel</string>
+    <string>--service-mode</string>
+    <string>--supervise</string>
+    <string>client</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MPTUNNEL_SECRET</key>
+    <string>replace-with-shared-secret</string>
+    <key>MPTUNNEL_INGRESS</key>
+    <string>socks5</string>
+    <key>MPTUNNEL_LISTEN</key>
+    <string>127.0.0.1:1080,[::1]:1080</string>
+    <key>MPTUNNEL_PATHS</key>
+    <string>tcp://203.0.113.10:443,udp://203.0.113.10:443</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/mptunnel-client.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/mptunnel-client.err.log</string>
+</dict>
+</plist>

@@ -1,8 +1,9 @@
 use crate::config::{
     AppConfig, ClientConfig, CommandConfig, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits,
-    SecurityConfig, ServerConfig, SharedSecret, TcpPortClassRule, TrafficPolicy,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
+    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
+    DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits, SecurityConfig, ServerConfig, ServiceConfig,
+    SharedSecret, TcpPortClassRule, TrafficPolicy,
 };
 use crate::ingress::IngressConfig;
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
@@ -53,6 +54,9 @@ pub struct Cli {
     #[command(flatten)]
     pub resources: ResourceArgs,
 
+    #[command(flatten)]
+    pub service: ServiceArgs,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -65,16 +69,68 @@ impl Cli {
         let command = match self.command {
             Command::Client(args) => CommandConfig::Client(args.into_config()?),
             Command::Server(args) => CommandConfig::Server(args.into_config()?),
+            Command::Platform(_) => return Err(CliConfigError::PlatformCommandNotRuntimeConfig),
         };
         let config = AppConfig {
             log_level: self.log_level,
             check_config: self.check_config,
+            service: self.service.into_config(),
             resources: self.resources.into_limits(),
             security,
             command,
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceArgs {
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_SERVICE_MODE",
+        default_value_t = false
+    )]
+    pub service_mode: bool,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_SUPERVISE",
+        default_value_t = false
+    )]
+    pub supervise: bool,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_RESTART_BACKOFF_MS",
+        default_value_t = DEFAULT_RESTART_BACKOFF_MS
+    )]
+    pub restart_backoff_ms: u64,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_RESTART_MAX_BACKOFF_MS",
+        default_value_t = DEFAULT_RESTART_MAX_BACKOFF_MS
+    )]
+    pub restart_max_backoff_ms: u64,
+
+    #[arg(long, global = true, env = "MPTUNNEL_MAX_RESTARTS")]
+    pub max_restarts: Option<u32>,
+}
+
+impl ServiceArgs {
+    fn into_config(self) -> ServiceConfig {
+        ServiceConfig {
+            service_mode: self.service_mode,
+            supervise: self.supervise,
+            restart_backoff: Duration::from_millis(self.restart_backoff_ms),
+            restart_max_backoff: Duration::from_millis(self.restart_max_backoff_ms),
+            max_restarts: self.max_restarts,
+        }
     }
 }
 
@@ -226,15 +282,20 @@ pub enum Command {
     Client(ClientArgs),
     /// Run the remote path listener and outbound connector side.
     Server(ServerArgs),
+    /// Print platform, TUN, service, and release-target information.
+    Platform(PlatformArgs),
 }
+
+#[derive(Debug, Args)]
+pub struct PlatformArgs {}
 
 #[derive(Debug, Args)]
 pub struct ClientArgs {
     #[arg(long, env = "MPTUNNEL_INGRESS", value_enum, default_value_t = IngressArg::Socks5)]
     pub ingress: IngressArg,
 
-    #[arg(long, env = "MPTUNNEL_LISTEN")]
-    pub listen: Option<SocketAddr>,
+    #[arg(long = "listen", env = "MPTUNNEL_LISTEN", value_delimiter = ',')]
+    pub listen: Vec<SocketAddr>,
 
     #[arg(long, env = "MPTUNNEL_TUN_NAME")]
     pub tun_name: Option<String>,
@@ -315,14 +376,10 @@ impl ClientArgs {
     fn into_config(self) -> Result<ClientConfig, CliConfigError> {
         let ingress = match self.ingress {
             IngressArg::Socks5 => IngressConfig::Socks5 {
-                listen: self
-                    .listen
-                    .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 1080))),
+                listen: listen_or_default(self.listen, 1080),
             },
             IngressArg::HttpConnect => IngressConfig::HttpConnect {
-                listen: self
-                    .listen
-                    .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
+                listen: listen_or_default(self.listen, 8080),
             },
             IngressArg::TunL4 => {
                 let tun_ipv4 = if self.tun_disable_ipv4 {
@@ -364,6 +421,14 @@ impl ClientArgs {
                     .collect(),
             },
         })
+    }
+}
+
+fn listen_or_default(listen: Vec<SocketAddr>, port: u16) -> Vec<SocketAddr> {
+    if listen.is_empty() {
+        vec![SocketAddr::from(([127, 0, 0, 1], port))]
+    } else {
+        listen
     }
 }
 
@@ -568,6 +633,7 @@ pub enum CliConfigError {
     MissingUpstreamSocks5,
     MissingUpstreamHttp,
     TunIpv4DisabledWithIpv4Options,
+    PlatformCommandNotRuntimeConfig,
 }
 
 impl From<crate::config::ConfigError> for CliConfigError {
@@ -609,6 +675,9 @@ impl std::fmt::Display for CliConfigError {
                     "--tun-disable-ipv4 cannot be combined with --tun-ipv4 or --tun-ipv4-gateway"
                 )
             }
+            Self::PlatformCommandNotRuntimeConfig => {
+                write!(f, "platform command does not build a runtime config")
+            }
         }
     }
 }
@@ -639,11 +708,17 @@ mod tests {
 
         assert_eq!(config.security.transport, TransportSecurity::Encrypted);
         assert!(config.check_config);
+        assert_eq!(config.service, ServiceConfig::default());
         assert_eq!(config.resources, ResourceLimits::default());
         match config.command {
             CommandConfig::Client(client) => {
                 assert_eq!(client.paths.len(), 2);
-                assert!(matches!(client.ingress, IngressConfig::Socks5 { .. }));
+                assert_eq!(
+                    client.ingress,
+                    IngressConfig::Socks5 {
+                        listen: vec!["127.0.0.1:1080".parse().expect("listen")]
+                    }
+                );
                 assert_eq!(
                     client.traffic_policy.default_tcp_class,
                     TrafficClass::Interactive
@@ -660,6 +735,96 @@ mod tests {
             }
             CommandConfig::Server(_) => panic!("expected client config"),
         }
+    }
+
+    #[test]
+    fn client_proxy_cli_accepts_multiple_dual_stack_listen_addresses() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "http-connect",
+            "--listen",
+            "127.0.0.1:8080",
+            "--listen",
+            "[::1]:8080",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        let config = cli.into_config().expect("config");
+
+        let CommandConfig::Client(client) = config.command else {
+            panic!("expected client config");
+        };
+        assert_eq!(
+            client.ingress,
+            IngressConfig::HttpConnect {
+                listen: vec![
+                    "127.0.0.1:8080".parse().expect("ipv4 listen"),
+                    "[::1]:8080".parse().expect("ipv6 listen"),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn service_supervisor_cli_is_parsed_and_validated() {
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--service-mode",
+            "--supervise",
+            "--restart-backoff-ms",
+            "500",
+            "--restart-max-backoff-ms",
+            "5000",
+            "--max-restarts",
+            "3",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        let config = cli.into_config().expect("config");
+
+        assert!(config.service.service_mode);
+        assert!(config.service.supervise);
+        assert_eq!(config.service.restart_backoff, Duration::from_millis(500));
+        assert_eq!(
+            config.service.restart_max_backoff,
+            Duration::from_millis(5000)
+        );
+        assert_eq!(config.service.max_restarts, Some(3));
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "--restart-backoff-ms",
+            "5000",
+            "--restart-max-backoff-ms",
+            "500",
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(
+                crate::config::ConfigError::RestartMaxBackoffTooSmall
+            ))
+        ));
+    }
+
+    #[test]
+    fn platform_command_does_not_require_runtime_secret() {
+        let cli = Cli::try_parse_from(["mptunnel", "platform"]).expect("parse cli");
+        assert!(matches!(cli.command, Command::Platform(_)));
     }
 
     #[test]

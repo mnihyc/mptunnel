@@ -3,6 +3,7 @@ services:
     build:
       context: ..
       dockerfile: lab/docker/Dockerfile
+    cpus: 2
     cap_add:
       - NET_ADMIN
     volumes:
@@ -23,6 +24,7 @@ services:
     build:
       context: ..
       dockerfile: lab/docker/Dockerfile
+    cpus: 2
     cap_add:
       - NET_ADMIN
     volumes:
@@ -45,6 +47,7 @@ services:
     build:
       context: ..
       dockerfile: lab/docker/Dockerfile
+    cpus: 2
     cap_add:
       - NET_ADMIN
     volumes:

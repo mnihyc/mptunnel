@@ -510,6 +510,7 @@ impl ClientPathContext {
         let codec_limits = resources.into();
         let mux_limits = resources.into();
         let tcp_session_id = random_session_id()?;
+        let reuse_tcp_latency_sessions = tcp_paths.len() > 1;
         let tcp_sessions = tcp_paths
             .iter()
             .cloned()
@@ -527,6 +528,7 @@ impl ClientPathContext {
                     closed_stream_cache_capacity: tcp_closed_stream_cache_capacity(
                         resources.max_streams,
                     ),
+                    reuse_latency_session: reuse_tcp_latency_sessions,
                 })
             })
             .collect::<Vec<_>>();

@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--label", default="mptunnel_udp")
     parser.add_argument("--proxy", default="127.0.0.1:1080")
     parser.add_argument("--target", required=True)
-    parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--payload-bytes", type=int, default=512)
     parser.add_argument("--timeout-ms", type=int, default=1500)
     parser.add_argument("--interval-ms", type=int, default=20)
@@ -104,6 +104,8 @@ def main():
 
     control = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     control.settimeout(timeout)
+    started_at = time.monotonic()
+    deadline = started_at + args.load_duration
     control.sendall(b"\x05\x01\x00")
     if recv_exact(control, 2) != b"\x05\x00":
         raise OSError("SOCKS5 proxy did not accept no-auth negotiation")
@@ -121,15 +123,18 @@ def main():
     target_prefix = b"\x00\x00\x00" + encode_socks_addr(target_host, target_port)
     latencies = []
     received = 0
+    attempted = 0
 
     body_len = max(4, args.payload_bytes)
-    for index in range(args.count):
+    index = 0
+    while time.monotonic() < deadline:
         payload = struct.pack("!I", index) + bytes([index % 251]) * (body_len - 4)
         started = time.monotonic()
+        attempted += 1
         udp.sendto(target_prefix + payload, (relay_host, relay_port))
-        deadline = started + timeout
+        packet_deadline = min(started + timeout, deadline)
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = packet_deadline - time.monotonic()
             if remaining <= 0:
                 break
             udp.settimeout(remaining)
@@ -143,17 +148,21 @@ def main():
                 latencies.append((time.monotonic() - started) * 1000.0)
                 break
         if interval > 0:
-            time.sleep(interval)
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+        index += 1
 
     latencies.sort()
+    elapsed = time.monotonic() - started_at
     result = {
         "case": args.label,
         "protocol": "udp",
-        "status": "ok" if received == args.count else "loss",
+        "status": "ok" if attempted > 0 and received == attempted else "loss",
         "target": args.target,
-        "count": args.count,
+        "load_duration_s": args.load_duration,
+        "time_s": elapsed,
+        "count": attempted,
         "received": received,
-        "loss_rate": (args.count - received) / args.count if args.count else 0.0,
+        "loss_rate": (attempted - received) / attempted if attempted else 0.0,
         "payload_bytes": args.payload_bytes,
         "min_ms": latencies[0] if latencies else None,
         "p50_ms": percentile(latencies, 0.50),

@@ -9,22 +9,29 @@ compose_file="${COMPOSE_FILE:-lab/docker-compose.yml}"
 result_dir="${RESULT_DIR:-lab/results}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 result_file="${RESULT_FILE:-$result_dir/heterogeneous-$timestamp.jsonl}"
-file_mib="${FILE_MIB:-128}"
+object_mib="${MPTUNNEL_LAB_OBJECT_MIB:-1024}"
+large_http_path="${MPTUNNEL_LAB_LARGE_HTTP_PATH:-/large.bin}"
+small_http_path="${MPTUNNEL_LAB_SMALL_HTTP_PATH:-/small.bin}"
+small_object_kib="${MPTUNNEL_LAB_SMALL_OBJECT_KIB:-32}"
 load_duration_seconds="${MPTUNNEL_LAB_LOAD_DURATION_SECONDS:-30}"
 bulk_connections="${MPTUNNEL_LAB_BULK_CONNECTIONS:-2}"
 proxy_port="${PROXY_PORT:-1080}"
+baseline_proxy_port="${BASELINE_PROXY_PORT:-1090}"
 server_port="${SERVER_PORT:-7443}"
+baseline_vmess_port="${BASELINE_VMESS_PORT:-18443}"
+baseline_hysteria2_port="${BASELINE_HYSTERIA2_PORT:-18444}"
+baseline_mptcp_port="${BASELINE_MPTCP_PORT:-18081}"
 curl_timeout="${CURL_TIMEOUT_SECONDS:-120}"
-udp_count="${UDP_COUNT:-60}"
 udp_payload_bytes="${UDP_PAYLOAD_BYTES:-512}"
 udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
-tcp_echo_count="${TCP_ECHO_COUNT:-40}"
 tcp_echo_payload_bytes="${TCP_ECHO_PAYLOAD_BYTES:-64}"
 tcp_echo_timeout_ms="${TCP_ECHO_TIMEOUT_MS:-5000}"
 tcp_echo_interval_ms="${TCP_ECHO_INTERVAL_MS:-500}"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
+lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
+lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
 case_filter="${CASE_FILTER:-}"
 client_settle_seconds="${CLIENT_SETTLE_SECONDS:-2}"
 isolate_cases="${ISOLATE_CASES:-1}"
@@ -34,6 +41,7 @@ if [[ -n "${MPTUNNEL_LAB_SECRET:-}" ]]; then
 else
   secret="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 fi
+baseline_uuid="${BASELINE_UUID:-$(SECRET="$secret" python3 -c 'import os, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, os.environ["SECRET"]))')}"
 saturate_protocol="${MPTUNNEL_LAB_SATURATE_PROTOCOL:-udp}"
 saturate_udp_packet_bytes="${MPTUNNEL_LAB_SATURATE_UDP_PACKET_BYTES:-1200}"
 saturate_tcp_parallel="${MPTUNNEL_LAB_SATURATE_TCP_PARALLEL:-4}"
@@ -106,34 +114,29 @@ exec_netem() {
     "$service" bash -lc "/workspace/lab/configure-netem.sh '$mode'"
 }
 
-append_curl_result() {
-  local case_name="$1"
-  local protocol="$2"
-  local status="$3"
-  local exit_code="$4"
-  local http_code="$5"
-  local time_s="$6"
-  local goodput_mbps="$7"
-
-  printf '{"case":"%s","protocol":"%s","status":"%s","exit_code":%s,"http_code":%s,"time_s":%s,"goodput_mbps":%s}\n' \
-    "$case_name" "$protocol" "$status" "$exit_code" "$http_code" "$time_s" "$goodput_mbps" \
-    >> "$result_file"
+build_mptunnel_binary() {
+  if [[ "$lab_diagnostics" == "1" ]]; then
+    cargo build --release --bin mptunnel --features lab-diagnostics
+  else
+    cargo build --release --bin mptunnel
+  fi
 }
 
-parse_and_record_curl() {
+append_skipped_result() {
   local case_name="$1"
   local protocol="$2"
-  local exit_code="$3"
-  local output="$4"
-  local time_s speed_bytes http_code goodput_mbps
+  local reason="$3"
+  CASE_NAME="$case_name" PROTOCOL="$protocol" REASON="$reason" python3 - <<'PY' >> "$result_file"
+import json
+import os
 
-  if [[ "$exit_code" == "0" ]]; then
-    read -r time_s speed_bytes http_code <<< "$output"
-    goodput_mbps="$(awk -v speed="$speed_bytes" 'BEGIN {printf "%.3f", speed * 8 / 1000000}')"
-    append_curl_result "$case_name" "$protocol" "ok" "$exit_code" "$http_code" "$time_s" "$goodput_mbps"
-  else
-    append_curl_result "$case_name" "$protocol" "fail" "$exit_code" "null" "0" "0"
-  fi
+print(json.dumps({
+    "case": os.environ["CASE_NAME"],
+    "protocol": os.environ["PROTOCOL"],
+    "status": "skipped",
+    "reason": os.environ["REASON"],
+}, sort_keys=True))
+PY
 }
 
 append_download_probe_result() {
@@ -186,18 +189,20 @@ print(json.dumps(row, sort_keys=True))
 PY
 }
 
-run_curl_case() {
+run_unproxied_download_probe_case() {
   local case_name="$1"
   local protocol="$2"
-  local url="$3"
-  local proxy_arg="${4:-}"
-  local output exit_code
-
+  local target="$3"
+  local out_file="/tmp/mptunnel-probe-${case_name}.out"
+  local err_file="/tmp/mptunnel-probe-${case_name}.err"
   set +e
-  output="$(exec_in client "timeout ${curl_timeout}s curl -sS --fail --location --output /dev/null --write-out '%{time_total} %{speed_download} %{http_code}' ${proxy_arg} '${url}'" 2>/dev/null)"
-  exit_code="$?"
+  local output probe_stderr
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --protocol '${protocol}' --target '${target}' --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  local exit_code="$?"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  parse_and_record_curl "$case_name" "$protocol" "$exit_code" "$output"
+  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
 }
 
 run_tcp_download_probe_case() {
@@ -206,7 +211,7 @@ run_tcp_download_probe_case() {
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
   set +e
   local output probe_stderr
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
@@ -219,6 +224,17 @@ stop_process() {
   local pid_file="$2"
   exec_in "$service" "if [ -f '$pid_file' ]; then kill \$(cat '$pid_file') >/dev/null 2>&1 || true; rm -f '$pid_file'; fi" \
     >/dev/null 2>&1 || true
+}
+
+stop_baselines() {
+  for service in client server target; do
+    exec_in "$service" "\
+      for file in /tmp/mptunnel-baseline-*.pid; do \
+        [ -f \"\$file\" ] || continue; \
+        kill \$(cat \"\$file\") >/dev/null 2>&1 || true; \
+        rm -f \"\$file\"; \
+      done" >/dev/null 2>&1 || true
+  done
 }
 
 stop_client() {
@@ -260,6 +276,7 @@ stop_random_flapping() {
 cleanup() {
   stop_random_flapping
   stop_saturation
+  stop_baselines
   stop_client
   stop_server
   if [[ "${KEEP_LAB:-0}" != "1" ]]; then
@@ -386,15 +403,18 @@ should_run_case() {
 
   IFS=',' read -r -a patterns <<< "$case_filter"
   for pattern in "${patterns[@]}"; do
-    if [[ "$case_name" == $pattern ]]; then
-      return 0
-    fi
+    # CASE_FILTER supports shell-style globs, for example mptunnel_mixed_*.
+    # shellcheck disable=SC2254
+    case "$case_name" in
+      $pattern) return 0 ;;
+    esac
   done
   return 1
 }
 
 start_target_services() {
-  exec_in target "mkdir -p /tmp/mptunnel-lab && dd if=/dev/zero of=/tmp/mptunnel-lab/large.bin bs=1M count='${file_mib}' status=none"
+  exec_in target "mkdir -p /tmp/mptunnel-lab && truncate -s '${object_mib}M' /tmp/mptunnel-lab/large.bin"
+  exec_in target "dd if=/dev/zero of=/tmp/mptunnel-lab/small.bin bs=1K count='${small_object_kib}' status=none && printf 'mptunnel lab target\\n' >/tmp/mptunnel-lab/index.html"
   exec_in target "if [ -f /tmp/mptunnel-http.pid ]; then kill \$(cat /tmp/mptunnel-http.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-http.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-udp-echo.pid ]; then kill \$(cat /tmp/mptunnel-udp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-udp-echo.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-tcp-echo.pid ]; then kill \$(cat /tmp/mptunnel-tcp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-tcp-echo.pid; fi"
@@ -406,7 +426,7 @@ start_target_services() {
 start_server() {
   stop_server
   exec_in server "\
-    MPTUNNEL_LOG=info /workspace/target/release/mptunnel \
+    MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       server \
       --bind-path tcp://172.31.10.20:${server_port} \
@@ -450,7 +470,7 @@ start_client_with_netem() {
     apply_netem "$netem_mode"
   fi
   exec_in client "\
-    MPTUNNEL_LOG=info /workspace/target/release/mptunnel \
+    MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
       --listen 127.0.0.1:${proxy_port} \
@@ -492,7 +512,7 @@ start_tun_client() {
     stop_client
   fi
   exec_in client "\
-    MPTUNNEL_LOG=info /workspace/target/release/mptunnel \
+    MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
       --tun \
@@ -511,13 +531,8 @@ start_tun_client() {
 run_tun_download_case() {
   local case_name="$1"
   shift
-  local output exit_code
   start_tun_client "$case_name" "$@"
-  set +e
-  output="$(exec_in client "timeout ${curl_timeout}s curl -sS --fail --location --output /dev/null --write-out '%{time_total} %{speed_download} %{http_code}' http://172.31.40.30:8080/large.bin" 2>/dev/null)"
-  exit_code="$?"
-  set -e
-  parse_and_record_curl "$case_name" "tun" "$exit_code" "$output"
+  run_unproxied_download_probe_case "$case_name" "tun" "172.31.40.30:8080"
 }
 
 run_udp_case() {
@@ -526,7 +541,7 @@ run_udp_case() {
   start_client "$case_name" "$@"
   set +e
   local output
-  output="$(exec_in client "python3 /workspace/lab/socks5_udp_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:9090 --count '${udp_count}' --payload-bytes '${udp_payload_bytes}' --timeout-ms '${udp_timeout_ms}'" 2>/dev/null)"
+  output="$(exec_in client "python3 /workspace/lab/socks5_udp_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:9090 --load-duration '${load_duration_seconds}' --payload-bytes '${udp_payload_bytes}' --timeout-ms '${udp_timeout_ms}'" 2>/dev/null)"
   local exit_code="$?"
   set -e
   if [[ "$exit_code" == "0" ]]; then
@@ -536,11 +551,157 @@ run_udp_case() {
   fi
 }
 
+prepare_baseline_case() {
+  local netem_mode="$1"
+  stop_baselines
+  stop_client
+  if [[ "$isolate_cases" == "1" && "$isolate_containers" == "1" ]]; then
+    stop_server
+    compose down --remove-orphans >/dev/null 2>&1 || true
+    compose up -d --remove-orphans >/dev/null
+  else
+    stop_server
+  fi
+  apply_netem "$netem_mode"
+  start_target_services
+}
+
+run_baseline_download_probe_case() {
+  local case_name="$1"
+  local protocol="$2"
+  local proxy_port_arg="$3"
+  local out_file="/tmp/mptunnel-baseline-${case_name}.out"
+  local err_file="/tmp/mptunnel-baseline-${case_name}.err"
+  local output probe_stderr exit_code
+  set +e
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exit_code="$?"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  set -e
+  if [[ -n "$output" ]]; then
+    ROW="$output" PROTOCOL="$protocol" python3 - <<'PY' >> "$result_file"
+import json
+import os
+
+row = json.loads(os.environ["ROW"])
+row["protocol"] = os.environ["PROTOCOL"]
+print(json.dumps(row, sort_keys=True))
+PY
+  else
+    append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr"
+  fi
+}
+
+ensure_baseline_tool() {
+  local service="$1"
+  local tool="$2"
+  exec_in "$service" "bash /workspace/lab/baseline-tools.sh 'ensure-${tool}'"
+}
+
+run_vmess_baseline_case() {
+  local case_name="$1"
+  local server_ip="$2"
+  prepare_baseline_case apply
+  if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
+    append_skipped_result "$case_name" "vmess" "xray baseline binary unavailable"
+    return 0
+  fi
+  exec_in server "bash /workspace/lab/baseline-tools.sh write-xray-server '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}'"
+  exec_in client "bash /workspace/lab/baseline-tools.sh write-xray-client '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}' 127.0.0.1 '${baseline_proxy_port}'"
+  exec_in server "bash /workspace/lab/baseline-tools.sh run-xray-server >/tmp/mptunnel-baseline-vmess-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-server.pid"
+  exec_in client "bash /workspace/lab/baseline-tools.sh run-xray-client >/tmp/mptunnel-baseline-vmess-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-client.pid"
+  sleep 1
+  if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-server.pid)" || \
+     ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-client.pid)"; then
+    append_skipped_result "$case_name" "vmess" "xray baseline failed to start"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_download_probe_case "$case_name" "vmess" "$baseline_proxy_port"
+  stop_baselines
+}
+
+run_hysteria2_baseline_case() {
+  local case_name="$1"
+  local server_ip="$2"
+  prepare_baseline_case apply
+  if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
+    append_skipped_result "$case_name" "hysteria2" "hysteria2 baseline binary unavailable"
+    return 0
+  fi
+  if ! exec_in server "bash /workspace/lab/baseline-tools.sh write-hysteria-server '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}'"; then
+    append_skipped_result "$case_name" "hysteria2" "hysteria2 TLS certificate generation unavailable"
+    return 0
+  fi
+  exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}'"
+  exec_in server "bash /workspace/lab/baseline-tools.sh run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
+  exec_in client "bash /workspace/lab/baseline-tools.sh run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
+  sleep 1
+  if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-server.pid)" || \
+     ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-client.pid)"; then
+    append_skipped_result "$case_name" "hysteria2" "hysteria2 baseline failed to start"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port"
+  stop_baselines
+}
+
+configure_mptcp_endpoints() {
+  local service="$1"
+  shift
+  exec_in "$service" "ip mptcp limits set subflows 4 add_addr_accepted 4 && { ip mptcp endpoint flush || true; }"
+  local id=1
+  local addr dev
+  for addr in "$@"; do
+    dev="$(exec_in "$service" "ip -o addr show | awk -v ip='${addr}' '\$4 ~ \"^\" ip \"/\" {print \$2; exit}'" 2>/dev/null || true)"
+    if [[ -n "$dev" ]]; then
+      exec_in "$service" "ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal subflow fullmesh 2>/dev/null || ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal 2>/dev/null || true"
+    fi
+    id=$((id + 1))
+  done
+  exec_in "$service" "ip mptcp endpoint show | grep -q ."
+}
+
+run_mptcp_baseline_case() {
+  local case_name="$1"
+  prepare_baseline_case apply
+  if ! exec_in client "python3 /workspace/lab/mptcp_http.py check" || \
+     ! exec_in target "python3 /workspace/lab/mptcp_http.py check"; then
+    append_skipped_result "$case_name" "mptcp" "kernel MPTCP sockets unavailable"
+    return 0
+  fi
+  if ! configure_mptcp_endpoints client 172.31.10.10 172.31.15.10 172.31.20.10 172.31.30.10 || \
+     ! configure_mptcp_endpoints target 172.31.10.30 172.31.15.30 172.31.20.30 172.31.30.30; then
+    append_skipped_result "$case_name" "mptcp" "kernel MPTCP endpoint configuration unavailable"
+    return 0
+  fi
+  exec_in target "python3 /workspace/lab/mptcp_http.py serve --bind 0.0.0.0:${baseline_mptcp_port} --file /tmp/mptunnel-lab/large.bin >/tmp/mptunnel-baseline-mptcp-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-mptcp-server.pid"
+  sleep 1
+  if ! exec_in target "kill -0 \$(cat /tmp/mptunnel-baseline-mptcp-server.pid)"; then
+    append_skipped_result "$case_name" "mptcp" "MPTCP HTTP server failed to start"
+    stop_baselines
+    return 0
+  fi
+  set +e
+  local output exit_code
+  output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/mptcp_http.py download --label '${case_name}' --target 172.31.10.30:${baseline_mptcp_port} --path '${large_http_path}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}'" 2>/dev/null)"
+  exit_code="$?"
+  set -e
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    printf '{"case":"%s","protocol":"mptcp","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
+  fi
+  stop_baselines
+}
+
 record_mixed_probe_case() {
   local case_name="$1"
   set +e
   local output
-  output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path /large.bin --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-count '${udp_count}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-count '${tcp_echo_count}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
+  output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
   local exit_code="$?"
   set -e
   if [[ -n "$output" ]]; then
@@ -645,7 +806,7 @@ run_mixed_failover_case() {
   local started_file="/tmp/mptunnel-mixed.started"
   start_client "$case_name" "$tcp_all $udp_all"
   exec_in client "rm -f /tmp/mptunnel-mixed.out /tmp/mptunnel-mixed.status /tmp/mptunnel-mixed.pid '${started_file}'"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path /large.bin --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-count '${udp_count}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-count '${tcp_echo_count}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed.out 2>/tmp/mptunnel-mixed.err; echo \$? >/tmp/mptunnel-mixed.status) & echo \$! >/tmp/mptunnel-mixed.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed.out 2>/tmp/mptunnel-mixed.err; echo \$? >/tmp/mptunnel-mixed.status) & echo \$! >/tmp/mptunnel-mixed.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_failover_blackhole
@@ -666,7 +827,7 @@ run_mixed_latency_spike_case() {
   local started_file="/tmp/mptunnel-mixed-spike.started"
   start_client "$case_name" "$tcp_all $udp_all"
   exec_in client "rm -f /tmp/mptunnel-mixed-spike.out /tmp/mptunnel-mixed-spike.status /tmp/mptunnel-mixed-spike.pid '${started_file}'"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path /large.bin --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-count '${udp_count}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-count '${tcp_echo_count}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed-spike.out 2>/tmp/mptunnel-mixed-spike.err; echo \$? >/tmp/mptunnel-mixed-spike.status) & echo \$! >/tmp/mptunnel-mixed-spike.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed-spike.out 2>/tmp/mptunnel-mixed-spike.err; echo \$? >/tmp/mptunnel-mixed-spike.status) & echo \$! >/tmp/mptunnel-mixed-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
@@ -687,7 +848,7 @@ run_failover_case() {
   local started_file="/tmp/mptunnel-failover.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-failover.out /tmp/mptunnel-failover.status /tmp/mptunnel-failover.pid '${started_file}'"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_failover_blackhole
@@ -697,7 +858,9 @@ run_failover_case() {
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
     printf '%s\n' "$output" >> "$result_file"
   else
-    parse_and_record_curl "$case_name" "tcp" "$exit_code" "$output"
+    local probe_stderr
+    probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-failover.err 2>/dev/null | tail -c 4000 || true")"
+    append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
   fi
   apply_netem apply
 }
@@ -708,7 +871,7 @@ run_latency_spike_case() {
   local started_file="/tmp/mptunnel-spike.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-spike.out /tmp/mptunnel-spike.status /tmp/mptunnel-spike.pid '${started_file}'"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-spike.out 2>/tmp/mptunnel-spike.err; echo \$? >/tmp/mptunnel-spike.status) & echo \$! >/tmp/mptunnel-spike.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-spike.out 2>/tmp/mptunnel-spike.err; echo \$? >/tmp/mptunnel-spike.status) & echo \$! >/tmp/mptunnel-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
@@ -718,7 +881,9 @@ run_latency_spike_case() {
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
     printf '%s\n' "$output" >> "$result_file"
   else
-    parse_and_record_curl "$case_name" "tcp" "$exit_code" "$output"
+    local probe_stderr
+    probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-spike.err 2>/dev/null | tail -c 4000 || true")"
+    append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
   fi
   apply_netem apply
 }
@@ -728,7 +893,7 @@ mkdir -p "$result_dir"
 
 docker compose version >/dev/null
 if [[ "$build_product" == "1" ]]; then
-  cargo build --release --bin mptunnel
+  build_mptunnel_binary
 fi
 if [[ "$build_lab_images" == "1" ]]; then
   compose build
@@ -763,16 +928,28 @@ tcp_all="${tcp_lowlat} ${tcp_balanced} ${tcp_fat} ${tcp_poor}"
 udp_all="${udp_lowlat} ${udp_balanced} ${udp_fat} ${udp_poor}"
 
 if should_run_case "direct_low_latency"; then
-  run_curl_case "direct_low_latency" "tcp" "http://172.31.10.30:8080/large.bin"
+  run_unproxied_download_probe_case "direct_low_latency" "tcp" "172.31.10.30:8080"
 fi
 if should_run_case "direct_balanced"; then
-  run_curl_case "direct_balanced" "tcp" "http://172.31.15.30:8080/large.bin"
+  run_unproxied_download_probe_case "direct_balanced" "tcp" "172.31.15.30:8080"
 fi
 if should_run_case "direct_cross_continent_high_bandwidth"; then
-  run_curl_case "direct_cross_continent_high_bandwidth" "tcp" "http://172.31.20.30:8080/large.bin"
+  run_unproxied_download_probe_case "direct_cross_continent_high_bandwidth" "tcp" "172.31.20.30:8080"
 fi
 if should_run_case "direct_poor_internet"; then
-  run_curl_case "direct_poor_internet" "tcp" "http://172.31.30.30:8080/large.bin"
+  run_unproxied_download_probe_case "direct_poor_internet" "tcp" "172.31.30.30:8080"
+fi
+
+if should_run_case "baseline_vmess_tcp_single_balanced"; then
+  run_vmess_baseline_case "baseline_vmess_tcp_single_balanced" "172.31.15.20"
+fi
+
+if should_run_case "baseline_hysteria2_udp_single_balanced"; then
+  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_balanced" "172.31.15.20"
+fi
+
+if should_run_case "baseline_mptcp_tcp_multipath_all"; then
+  run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_all"
 fi
 
 if should_run_case "mptunnel_tcp_single_low_latency"; then

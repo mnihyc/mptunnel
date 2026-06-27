@@ -5,6 +5,10 @@ edition = "2024"
 description = "Encrypted multipath proxy and tunnel"
 license = "Apache-2.0"
 
+[features]
+default = []
+lab-diagnostics = []
+
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"

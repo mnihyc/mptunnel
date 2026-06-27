@@ -23,9 +23,9 @@ EXPERIMENT_PROFILE=standard lab/run-exhaustive-experiments.sh
 Profiles:
 
 - `smoke`: one short run for harness validation.
-- `standard`: two file sizes and two failover timings.
-- `exhaustive`: larger file-size, UDP-count, failover-timing, and repeat matrix.
-- `custom`: requires `FILE_MIB_MATRIX`, `UDP_COUNT_MATRIX`, `FAILOVER_AFTER_MATRIX`, and `REPEATS`.
+- `standard`: sustained-duration, bulk-concurrency, and failover-timing matrix.
+- `exhaustive`: longer duration, higher concurrency, failover-timing, and repeat matrix.
+- `custom`: requires `LOAD_DURATION_MATRIX`, `BULK_CONNECTIONS_MATRIX`, `FAILOVER_AFTER_MATRIX`, and `REPEATS`.
 
 The matrix runner writes per-run JSONL files plus `summary.md` and `summary.json` under `lab/results/exhaustive-<timestamp>/`. It is manual lab tooling only and is not referenced by CI, release, package, or normal build workflows.
 
@@ -36,6 +36,8 @@ The lab starts three containers:
 - `client`: local SOCKS5 ingress and benchmark driver.
 - `server`: mptunnel path listener and direct outbound connector.
 - `target`: HTTP download target and UDP echo target.
+
+Each container is capped at two CPUs in Docker Compose to approximate a modest VPS instead of an unconstrained host.
 
 It creates four simultaneous client/server path networks plus a server/target network:
 
@@ -56,6 +58,7 @@ The lab writes JSON Lines to `lab/results/heterogeneous-<timestamp>.jsonl`.
 It records:
 
 - Raw direct HTTP downloads over each path network.
+- Plain VMess-over-TCP, Hysteria2-over-UDP, and kernel MPTCP baselines when the external tools/kernel support are available in the lab containers.
 - mptunnel SOCKS5 HTTP downloads over each single TCP underlay path.
 - mptunnel SOCKS5 HTTP download with all TCP underlay paths configured.
 - mptunnel TUN L4 HTTP downloads over TCP, UDP reliable-stream, and mixed underlay paths.
@@ -67,27 +70,31 @@ It records:
 - mptunnel mixed-workload ideal comparisons where one selected path is forced to 0% loss.
 - mptunnel controlled matrix cases over one TCP+UDP path where bandwidth, latency, and loss each toggle between good and poor values.
 
-The HTTP and mixed cases record wall time, HTTP status, goodput Mbps, first-body time, max read gap, recovery gap, and one-second interval goodput samples during sustained load windows. UDP cases record sent/received datagram counts, loss rate, and latency percentiles. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
+Download cases use a sparse 1 GiB HTTP object by default and run for a fixed duration, so a valid measurement is usually a partial HTTP body at the end of the test window rather than a completed small file. Mixed cases run several workloads for the same fixed window: a sustained large-object download, repeated small-object HTTP requests for browsing latency, one persistent TCP echo stream with periodic payloads for SSH-like interaction, and duration-driven UDP datagrams for realtime traffic. The harness should not finish early just because one request completed.
+
+The HTTP and mixed cases record wall time, HTTP status, goodput Mbps, first-body time, max read gap, recovery gap, and one-second interval goodput samples during sustained load windows. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
 
 ## Controls
 
 Useful environment variables:
 
 - `MPTUNNEL_LAB_SECRET`: optional UUID or 32+ byte shared secret for reproducible lab runs. When unset, the lab generates a fresh UUID secret for that run. The release binary itself has no default secret.
-- `FILE_MIB`: HTTP test file size in MiB, default `128`.
-- `FILE_MIB_MATRIX`: space-separated matrix for `lab/run-exhaustive-experiments.sh`.
+- `MPTUNNEL_LAB_OBJECT_MIB`: sparse large HTTP object size in MiB, default `1024`. This is backing data for sustained file-download tests, not the test-length control.
+- `MPTUNNEL_LAB_SMALL_OBJECT_KIB`: small HTTP object size in KiB for browsing probes, default `32`.
+- `MPTUNNEL_LAB_LARGE_HTTP_PATH`: large-object URL path, default `/large.bin`.
+- `MPTUNNEL_LAB_SMALL_HTTP_PATH`: small-object URL path, default `/small.bin`.
 - `MPTUNNEL_LAB_LOAD_DURATION_SECONDS`: sustained workload duration for download and mixed probes, default `30`.
 - `LOAD_DURATION_MATRIX`: space-separated sustained workload duration matrix for `lab/run-exhaustive-experiments.sh`.
 - `MPTUNNEL_LAB_BULK_CONNECTIONS`: parallel pure-download connections for capacity tests, default `2`.
 - `BULK_CONNECTIONS_MATRIX`: space-separated bulk connection-count matrix for `lab/run-exhaustive-experiments.sh`.
 - `CURL_TIMEOUT_SECONDS`: per-download timeout, default `120`.
-- `UDP_COUNT`: UDP probe datagram count, default `60`.
-- `UDP_COUNT_MATRIX`: space-separated UDP-count matrix for `lab/run-exhaustive-experiments.sh`.
 - `UDP_PAYLOAD_BYTES`: UDP probe payload size, default `512`.
 - `UDP_TIMEOUT_MS`: per-datagram UDP timeout, default `2500`.
 - `FAILOVER_AFTER_SECONDS`: seconds before blackholing the high-bandwidth path, default `2`.
 - `FAILOVER_AFTER_MATRIX`: space-separated failover timing matrix for `lab/run-exhaustive-experiments.sh`.
 - `REPEATS`: repeat count for each matrix point.
+- `MPTUNNEL_LAB_DIAGNOSTICS=1`: build an optimized lab binary with the `lab-diagnostics` feature for extra experiment-only instrumentation when that feature is used. Release packaging and CI release jobs do not enable this feature.
+- `MPTUNNEL_LAB_LOG`: log level passed to lab-launched mptunnel processes, default `info`.
 - `PATH_PROBE_INTERVAL_MS`: optional diagnostic override for the mptunnel client path-probe interval. Unset by default so product launches use built-in defaults.
 - `PATH_PROBE_TIMEOUT_MS`: optional diagnostic override for the mptunnel client path-probe timeout. Unset by default so product launches use built-in defaults.
 - `MPTUNNEL_LAB_USE_PATH_HINTS=1`: optional diagnostic override that adds RTT/rate/capability query hints to path URIs. Unset by default so product launches use endpoint paths only.

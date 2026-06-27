@@ -1,5 +1,42 @@
 use super::*;
 
+fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSessionRuntime {
+    ClientTcpPathSessionRuntime {
+        path: PathSpec {
+            underlay: UnderlayProtocol::Tcp,
+            endpoint: Endpoint::new("127.0.0.1", 1).expect("endpoint"),
+            metadata: crate::transport::PathMetadata::default(),
+        },
+        path_index: 0,
+        session_id: SessionId(7),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        reuse_latency_session,
+    }
+}
+
+#[tokio::test]
+async fn tcp_path_latency_lane_reuse_depends_on_topology() {
+    let single_path = ClientTcpPathSessionHandle::new(test_tcp_session_runtime(false));
+    let first_single = single_path.ensure_session(TrafficClass::Interactive);
+    let second_single = single_path.ensure_session(TrafficClass::Interactive);
+    assert!(!first_single.same_channel(&second_single));
+
+    let multipath = ClientTcpPathSessionHandle::new(test_tcp_session_runtime(true));
+    let first_latency = multipath.ensure_session(TrafficClass::Interactive);
+    let second_latency = multipath.ensure_session(TrafficClass::Interactive);
+    let realtime_latency = multipath.ensure_session(TrafficClass::RealtimeDatagram);
+    assert!(first_latency.same_channel(&second_latency));
+    assert!(first_latency.same_channel(&realtime_latency));
+
+    let bulk = multipath.ensure_session(TrafficClass::Bulk);
+    assert!(!first_latency.same_channel(&bulk));
+}
+
 #[tokio::test]
 async fn tcp_path_control_command_bypasses_saturated_data_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);

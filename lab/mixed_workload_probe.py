@@ -132,6 +132,11 @@ def write_started_file(path):
         handle.write(f"{time.time():.9f}\n")
 
 
+def workload_deadline(started_at, args):
+    duration = args.load_duration if args.load_duration > 0 else args.timeout
+    return started_at + min(duration, args.timeout)
+
+
 def parse_http_headers(buffer):
     head, _, body = buffer.partition(b"\r\n\r\n")
     status_line = head.splitlines()[0].decode("iso-8859-1", errors="replace")
@@ -199,7 +204,7 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
         partial_requests = 0
         last_status = None
         last_content_length = None
-        deadline = started_at + args.load_duration if args.load_duration > 0 else None
+        deadline = workload_deadline(started_at, args)
 
         def record_chunk(size):
             nonlocal bytes_read, first_body_s, last_body_s, max_read_gap_s, recovery_gap_s
@@ -243,14 +248,13 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
             bytes_read += size
 
         while True:
-            if deadline is not None and time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 break
             requests += 1
             sock, target_host, target_port = connect_socks5(
                 args.proxy, args.http_target, args.timeout
             )
-            if deadline is not None:
-                sock.settimeout(min(args.timeout, 1.0))
+            sock.settimeout(min(args.timeout, 1.0))
             with sock:
                 request = (
                     f"GET {args.bulk_path} HTTP/1.1\r\n"
@@ -261,7 +265,7 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 sock.sendall(request)
                 buffer = b""
                 while b"\r\n\r\n" not in buffer:
-                    if deadline is not None and time.monotonic() >= deadline:
+                    if time.monotonic() >= deadline:
                         partial_requests += 1
                         break
                     try:
@@ -280,7 +284,7 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 record_chunk(len(body))
                 request_bytes += len(body)
                 while content_length is None or request_bytes < content_length:
-                    if deadline is not None and time.monotonic() >= deadline:
+                    if time.monotonic() >= deadline:
                         partial_requests += 1
                         break
                     try:
@@ -293,16 +297,12 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                     record_chunk(len(chunk))
                 else:
                     complete_requests += 1
-            if deadline is None:
-                break
         elapsed = time.monotonic() - started_at
         fixed_complete = (
             last_content_length is None
             or complete_requests > 0
-            or (deadline is not None and bytes_read > 0)
+            or bytes_read > 0
         )
-        if deadline is None and not fixed_complete:
-            raise OSError(f"incomplete bulk body: {bytes_read} of {last_content_length}")
         result.update(
             {
                 "bulk_status": "ok" if bytes_read > 0 and (last_status is None or 200 <= last_status < 400) else "fail",
@@ -341,23 +341,23 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
         bulk_ready.set()
 
 
-def small_http_worker(args, bulk_ready, result):
+def small_http_worker(args, started_at, bulk_ready, result):
     latencies = []
     failures = 0
     attempts = 0
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
-    deadline = time.monotonic() + args.load_duration if args.load_duration > 0 else None
-    while (deadline is not None and time.monotonic() < deadline) or (
-        deadline is None and attempts < args.small_count
-    ):
+    worker_started = time.monotonic()
+    deadline = workload_deadline(started_at, args)
+    while time.monotonic() < deadline:
         attempts += 1
         started = time.monotonic()
+        remaining = max(0.1, min(args.timeout, deadline - started))
         try:
             status, _, _ = http_get_via_socks(
                 args.proxy,
                 args.http_target,
                 args.small_path,
-                args.timeout,
+                remaining,
                 args.chunk_bytes,
             )
             if not 200 <= status < 400:
@@ -367,9 +367,16 @@ def small_http_worker(args, bulk_ready, result):
         except Exception:
             failures += 1
         if args.small_interval_ms > 0:
-            time.sleep(args.small_interval_ms / 1000.0)
+            sleep_s = min(
+                args.small_interval_ms / 1000.0,
+                max(0.0, deadline - time.monotonic()),
+            )
+            if sleep_s > 0:
+                time.sleep(sleep_s)
     result.update(
         {
+            "small_start_s": worker_started - started_at,
+            "small_time_s": time.monotonic() - worker_started,
             "small_count": attempts,
             "small_ok": len(latencies),
             "small_fail": failures,
@@ -392,69 +399,102 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     last_success_s = None
     max_success_gap_s = 0.0
     failover_gap_s = 0.0
+    first_error = None
     timeout = args.tcp_echo_timeout_ms / 1000.0
     payload_len = max(8, args.tcp_echo_payload_bytes)
+    deadline = workload_deadline(started_at, args)
+    interval_s = max(0.0, args.tcp_echo_interval_ms / 1000.0)
+    index = 0
+    sock = None
+    worker_started = time.monotonic()
 
     try:
-        sock, _, _ = connect_socks5(args.proxy, args.tcp_echo_target, args.timeout)
-        connected = True
-        with sock:
-            sock.settimeout(timeout)
-            deadline = started_at + args.load_duration if args.load_duration > 0 else None
-            index = 0
-            while (deadline is not None and time.monotonic() < deadline) or (
-                deadline is None and index < args.tcp_echo_count
-            ):
-                payload = (
-                    struct.pack("!I", index)
-                    + bytes([index % 251]) * (payload_len - 4)
-                )
-                started = time.monotonic()
-                now_s = started - started_at
+        while time.monotonic() < deadline:
+            interval_started = time.monotonic()
+            if sock is None and disconnected_at_s is None:
                 try:
-                    sock.sendall(payload)
-                    response = recv_exact(sock, len(payload))
-                    if response != payload:
-                        failures += 1
-                    else:
-                        finished_s = time.monotonic() - started_at
-                        latency_ms = (time.monotonic() - started) * 1000.0
-                        latencies.append(latency_ms)
-                        if len(latencies) == 1:
-                            interactive_ready.set()
-                        if last_success_s is not None:
-                            gap = finished_s - last_success_s
-                            max_success_gap_s = max(max_success_gap_s, gap)
-                            if (
-                                args.failover_after >= 0
-                                and (
-                                    finished_s >= args.failover_after
-                                    or last_success_s >= args.failover_after
-                                )
-                            ):
-                                failover_gap_s = max(failover_gap_s, gap)
-                        last_success_s = finished_s
-                except Exception:
-                    interactive_ready.set()
+                    connect_timeout = max(
+                        0.1, min(args.timeout, timeout, deadline - time.monotonic())
+                    )
+                    sock, _, _ = connect_socks5(
+                        args.proxy, args.tcp_echo_target, connect_timeout
+                    )
+                    sock.settimeout(timeout)
+                    connected = True
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = str(exc)
                     failures += 1
-                    if disconnected_at_s is None:
-                        disconnected_at_s = time.monotonic() - started_at
-                    break
+                    interactive_ready.set()
+                    sock = None
 
-                remaining_interval = args.tcp_echo_interval_ms / 1000.0 - (
-                    time.monotonic() - started
-                )
-                if remaining_interval > 0:
-                    time.sleep(remaining_interval)
+            if sock is None:
+                if disconnected_at_s is not None:
+                    failures += 1
+                sleep_s = min(interval_s, max(0.0, deadline - time.monotonic()))
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
                 index += 1
-    except Exception as exc:
-        result.update({"interactive_error": str(exc)})
+                continue
+
+            payload = (
+                struct.pack("!I", index)
+                + bytes([index % 251]) * (payload_len - 4)
+            )
+            started = time.monotonic()
+            try:
+                sock.sendall(payload)
+                response = recv_exact(sock, len(payload))
+                if response != payload:
+                    failures += 1
+                else:
+                    finished_s = time.monotonic() - started_at
+                    latency_ms = (time.monotonic() - started) * 1000.0
+                    latencies.append(latency_ms)
+                    if len(latencies) == 1:
+                        interactive_ready.set()
+                    if last_success_s is not None:
+                        gap = finished_s - last_success_s
+                        max_success_gap_s = max(max_success_gap_s, gap)
+                        if (
+                            args.failover_after >= 0
+                            and (
+                                finished_s >= args.failover_after
+                                or last_success_s >= args.failover_after
+                            )
+                        ):
+                            failover_gap_s = max(failover_gap_s, gap)
+                    last_success_s = finished_s
+            except Exception as exc:
+                if first_error is None:
+                    first_error = str(exc)
+                interactive_ready.set()
+                failures += 1
+                if disconnected_at_s is None:
+                    disconnected_at_s = time.monotonic() - started_at
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                sock = None
+
+            remaining_interval = interval_s - (time.monotonic() - interval_started)
+            if remaining_interval > 0:
+                time.sleep(min(remaining_interval, max(0.0, deadline - time.monotonic())))
+            index += 1
     finally:
         interactive_ready.set()
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     result.update(
         {
             "interactive_connected": connected,
+            "interactive_start_s": worker_started - started_at,
+            "interactive_time_s": time.monotonic() - worker_started,
             "interactive_count": len(latencies) + failures,
             "interactive_ok": len(latencies),
             "interactive_fail": failures,
@@ -464,6 +504,7 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
             "interactive_max_success_gap_s": max_success_gap_s,
             "interactive_failover_gap_s": failover_gap_s,
             "interactive_disconnected_at_s": disconnected_at_s,
+            "interactive_error": first_error,
         }
     )
 
@@ -480,9 +521,11 @@ def udp_worker(args, started_at, bulk_ready, result):
     max_after_failover_end_s = None
     received = 0
     attempted = 0
-    probe_deadline = started_at + args.timeout
+    safety_deadline = started_at + args.timeout
+    workload_deadline_at = workload_deadline(started_at, args)
     deadline_hit = False
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
+    worker_started = time.monotonic()
     try:
         proxy_host, proxy_port = parse_host_port(args.proxy)
         target_host, target_port = parse_host_port(args.udp_target)
@@ -509,10 +552,8 @@ def udp_worker(args, started_at, bulk_ready, result):
                 )
                 body_len = max(4, args.udp_payload_bytes)
                 index = 0
-                while (args.load_duration > 0 and time.monotonic() < probe_deadline) or (
-                    args.load_duration <= 0 and index < args.udp_count
-                ):
-                    if time.monotonic() >= probe_deadline:
+                while time.monotonic() < workload_deadline_at:
+                    if time.monotonic() >= safety_deadline:
                         deadline_hit = True
                         break
                     payload = struct.pack("!I", index) + bytes([index % 251]) * (
@@ -522,11 +563,15 @@ def udp_worker(args, started_at, bulk_ready, result):
                     started = time.monotonic()
                     started_s = started - started_at
                     udp.sendto(target_prefix + payload, (relay_host, relay_port))
-                    deadline = min(started + timeout, probe_deadline)
+                    deadline = min(
+                        started + timeout,
+                        safety_deadline,
+                        workload_deadline_at,
+                    )
                     while True:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            if time.monotonic() >= probe_deadline:
+                            if time.monotonic() >= safety_deadline:
                                 deadline_hit = True
                             break
                         udp.settimeout(remaining)
@@ -579,6 +624,8 @@ def udp_worker(args, started_at, bulk_ready, result):
         result.update({"udp_error": str(exc)})
     result.update(
             {
+                "udp_start_s": worker_started - started_at,
+                "udp_time_s": time.monotonic() - worker_started,
                 "udp_count": attempted,
                 "udp_received": received,
                 "udp_loss_rate": (attempted - received) / attempted
@@ -600,10 +647,15 @@ def udp_worker(args, started_at, bulk_ready, result):
 
 def build_record(args, bulk, small, interactive, udp):
     bulk_ok = bulk.get("bulk_status") == "ok"
-    small_ok = small.get("small_ok", 0) == small.get("small_count", args.small_count)
+    small_attempts = small.get("small_count", 0)
+    small_ok = small_attempts > 0 and small.get("small_fail", 0) == 0
     interactive_expected = interactive.get("interactive_count", 0)
-    interactive_ok = interactive.get("interactive_ok", 0) == interactive_expected
-    udp_ok = udp.get("udp_received", 0) == udp.get("udp_count", args.udp_count)
+    interactive_ok = (
+        not args.tcp_echo_target
+        or (interactive_expected > 0 and interactive.get("interactive_fail", 0) == 0)
+    )
+    udp_attempts = udp.get("udp_count", 0)
+    udp_ok = udp_attempts > 0 and udp.get("udp_received", 0) == udp_attempts
     status = (
         "ok"
         if bulk_ok and small_ok and interactive_ok and udp_ok
@@ -615,11 +667,12 @@ def build_record(args, bulk, small, interactive, udp):
         "case": args.label,
         "protocol": "mixed",
         "status": status,
-        "target": args.http_target,
-        "udp_target": args.udp_target,
-        "tcp_echo_target": args.tcp_echo_target,
-        "failover_after_s": args.failover_after,
-    }
+            "target": args.http_target,
+            "udp_target": args.udp_target,
+            "tcp_echo_target": args.tcp_echo_target,
+            "failover_after_s": args.failover_after,
+            "test_duration_s": args.load_duration if args.load_duration > 0 else args.timeout,
+        }
     record.update(bulk)
     record.update(small)
     record.update(interactive)
@@ -635,19 +688,16 @@ def main():
     parser.add_argument("--udp-target", required=True)
     parser.add_argument("--tcp-echo-target")
     parser.add_argument("--bulk-path", default="/large.bin")
-    parser.add_argument("--small-path", default="/")
+    parser.add_argument("--small-path", default="/small.bin")
     parser.add_argument("--failover-after", type=float, default=-1.0)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
-    parser.add_argument("--load-duration", type=float, default=0.0)
+    parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
-    parser.add_argument("--small-count", type=int, default=20)
     parser.add_argument("--small-interval-ms", type=int, default=100)
-    parser.add_argument("--udp-count", type=int, default=60)
     parser.add_argument("--udp-payload-bytes", type=int, default=512)
     parser.add_argument("--udp-timeout-ms", type=int, default=2500)
     parser.add_argument("--udp-interval-ms", type=int, default=20)
-    parser.add_argument("--tcp-echo-count", type=int, default=40)
     parser.add_argument("--tcp-echo-payload-bytes", type=int, default=64)
     parser.add_argument("--tcp-echo-timeout-ms", type=int, default=5000)
     parser.add_argument("--tcp-echo-interval-ms", type=int, default=500)
@@ -668,7 +718,11 @@ def main():
             args=(args, started_at, interactive_ready, bulk_ready, bulk),
             daemon=True,
         ),
-        threading.Thread(target=small_http_worker, args=(args, bulk_ready, small), daemon=True),
+        threading.Thread(
+            target=small_http_worker,
+            args=(args, started_at, bulk_ready, small),
+            daemon=True,
+        ),
         threading.Thread(
             target=interactive_tcp_worker,
             args=(args, started_at, interactive_ready, interactive),

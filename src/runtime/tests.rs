@@ -1663,6 +1663,9 @@ fn tcp_path_sessions_are_dedicated_for_latency_sensitive_classes() {
         TrafficClass::Interactive
     ));
     assert!(tcp_path_class_uses_dedicated_session(TrafficClass::Control));
+    assert!(tcp_path_class_uses_dedicated_session(
+        TrafficClass::RealtimeDatagram
+    ));
     assert!(!tcp_path_class_uses_dedicated_session(TrafficClass::Bulk));
     assert!(!tcp_path_class_uses_dedicated_session(
         TrafficClass::Background

@@ -491,6 +491,7 @@ impl Default for ServerTcpStreamRegistry {
 pub(super) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
     commands: Arc<Mutex<Option<TcpPathSessionCommandSender>>>,
+    latency_commands: Arc<Mutex<Option<TcpPathSessionCommandSender>>>,
 }
 
 impl std::fmt::Debug for ClientTcpPathSessionHandle {
@@ -505,6 +506,7 @@ impl Clone for ClientTcpPathSessionHandle {
         Self {
             runtime: self.runtime.clone(),
             commands: self.commands.clone(),
+            latency_commands: self.latency_commands.clone(),
         }
     }
 }
@@ -514,6 +516,7 @@ impl ClientTcpPathSessionHandle {
         Self {
             runtime,
             commands: Arc::new(Mutex::new(None)),
+            latency_commands: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -542,15 +545,20 @@ impl ClientTcpPathSessionHandle {
             .map_err(|_| RuntimeError::TcpPathSessionClosed)?
     }
 
-    fn ensure_session(&self, class: TrafficClass) -> TcpPathSessionCommandSender {
-        if tcp_path_class_uses_dedicated_session(class) {
+    pub(super) fn ensure_session(&self, class: TrafficClass) -> TcpPathSessionCommandSender {
+        if tcp_path_class_uses_dedicated_session(class) && !self.runtime.reuse_latency_session {
             let (commands, receivers) =
                 tcp_path_session_command_channels(self.runtime.command_queue);
             tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receivers));
             return commands;
         }
 
-        let mut current = self.commands.lock().expect("TCP path session lock");
+        let lane = if tcp_path_class_uses_dedicated_session(class) {
+            &self.latency_commands
+        } else {
+            &self.commands
+        };
+        let mut current = lane.lock().expect("TCP path session lock");
         if let Some(commands) = current.as_ref()
             && !commands.is_closed()
         {
@@ -565,7 +573,10 @@ impl ClientTcpPathSessionHandle {
 }
 
 pub(super) fn tcp_path_class_uses_dedicated_session(class: TrafficClass) -> bool {
-    matches!(class, TrafficClass::Control | TrafficClass::Interactive)
+    matches!(
+        class,
+        TrafficClass::Control | TrafficClass::Interactive | TrafficClass::RealtimeDatagram
+    )
 }
 
 #[derive(Clone)]
@@ -744,6 +755,7 @@ pub(super) struct ClientTcpPathSessionRuntime {
     pub(super) command_queue: usize,
     pub(super) stream_frame_queue: usize,
     pub(super) closed_stream_cache_capacity: usize,
+    pub(super) reuse_latency_session: bool,
 }
 
 struct ClientTcpPathSessionState {

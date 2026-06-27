@@ -320,7 +320,7 @@ async fn socks5_ingress_relays_tcp_payload_over_encrypted_udp_stream_path() {
 }
 
 #[tokio::test]
-async fn tcp_path_sessions_handle_multiple_dedicated_interactive_streams() {
+async fn tcp_path_sessions_handle_multiple_single_path_interactive_streams() {
     let (target_addr, target) = spawn_echo_target_count(2).await;
     let (path, server_path) = spawn_server_path_count(OutboundConfig::Direct, 2).await;
     let context =

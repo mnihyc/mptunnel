@@ -81,6 +81,15 @@ def connect_socks5(proxy, target, timeout):
     return sock, target_host, target_port
 
 
+def connect_http(args):
+    if args.proxy:
+        return connect_socks5(args.proxy, args.target, args.timeout)
+    target_host, target_port = split_host_port(args.target)
+    sock = socket.create_connection((target_host, target_port), timeout=args.timeout)
+    sock.settimeout(args.timeout)
+    return sock, target_host, target_port
+
+
 def parse_headers(buffer):
     head, _, body = buffer.partition(b"\r\n\r\n")
     status_line = head.splitlines()[0].decode("iso-8859-1", errors="replace")
@@ -93,26 +102,6 @@ def parse_headers(buffer):
         if sep and key.strip().lower() == b"content-length":
             content_length = int(value.strip())
     return int(parts[1]), content_length, body
-
-
-def record_body_chunk(now, state, size):
-    if size <= 0:
-        return
-    if state["first_body_at"] is None:
-        state["first_body_at"] = now
-    if state["last_body_at"] is not None:
-        gap = now - state["last_body_at"]
-        state["max_read_gap_s"] = max(state["max_read_gap_s"], gap)
-        if (
-            state["failover_after_s"] >= 0
-            and (
-                now >= state["failover_after_s"]
-                or state["last_body_at"] >= state["failover_after_s"]
-            )
-        ):
-            state["recovery_gap_s"] = max(state["recovery_gap_s"], gap)
-    state["last_body_at"] = now
-    state["bytes"] += size
 
 
 def interval_rates_mbps(interval_bytes, interval_seconds):
@@ -153,7 +142,7 @@ def record_interval_chunk(started, state, lock, size):
 
 
 def download_one_request(args, started, deadline, state, lock):
-    sock, target_host, target_port = connect_socks5(args.proxy, args.target, args.timeout)
+    sock, target_host, target_port = connect_http(args)
     sock.settimeout(min(args.timeout, 1.0))
     with sock:
         request = (
@@ -248,7 +237,7 @@ def interval_download(args):
     status = "ok" if bytes_read > 0 and state["failures"] == 0 else "loss" if bytes_read > 0 else "fail"
     return {
         "case": args.label,
-        "protocol": "tcp",
+        "protocol": args.protocol,
         "status": status,
         "exit_code": 0 if status != "fail" else 1,
         "http_code": 200 if bytes_read > 0 else None,
@@ -273,98 +262,23 @@ def interval_download(args):
     }
 
 
-def download(args):
-    if args.load_duration > 0 or args.parallel_downloads > 1:
-        return interval_download(args)
-
-    started = time.monotonic()
-    write_started_file(args.started_file)
-    sock, target_host, target_port = connect_socks5(args.proxy, args.target, args.timeout)
-    sock.settimeout(min(args.timeout, 1.0))
-    with sock:
-        request = (
-            f"GET {args.path} HTTP/1.1\r\n"
-            f"Host: {target_host}:{target_port}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode("ascii")
-        sock.sendall(request)
-        buffer = b""
-        while b"\r\n\r\n" not in buffer:
-            if time.monotonic() - started >= args.timeout:
-                raise RuntimeError("timeout before HTTP headers")
-            try:
-                chunk = sock.recv(args.chunk_bytes)
-            except socket.timeout:
-                continue
-            if not chunk:
-                raise RuntimeError("EOF before HTTP headers")
-            buffer += chunk
-        status, content_length, body = parse_headers(buffer)
-        state = {
-            "bytes": 0,
-            "first_body_at": None,
-            "last_body_at": None,
-            "max_read_gap_s": 0.0,
-            "recovery_gap_s": 0.0,
-            "failover_after_s": args.failover_after,
-        }
-        record_body_chunk(time.monotonic() - started, state, len(body))
-        timed_out = False
-        while content_length is None or state["bytes"] < content_length:
-            if time.monotonic() - started >= args.timeout:
-                timed_out = True
-                break
-            try:
-                chunk = sock.recv(args.chunk_bytes)
-            except socket.timeout:
-                continue
-            if not chunk:
-                break
-            record_body_chunk(time.monotonic() - started, state, len(chunk))
-    elapsed = time.monotonic() - started
-    complete = content_length is None or state["bytes"] == content_length
-    ok = 200 <= status < 400 and complete
-    error = None
-    if timed_out:
-        error = f"timeout after {state['bytes']} of {content_length} bytes"
-    elif not complete:
-        error = f"incomplete body: {state['bytes']} of {content_length} bytes"
-    return {
-        "case": args.label,
-        "protocol": "tcp",
-        "status": "ok" if ok else "fail",
-        "exit_code": 0 if ok else (124 if timed_out else (18 if not complete else 22)),
-        "http_code": status,
-        "time_s": round(elapsed, 6),
-        "goodput_mbps": round(state["bytes"] * 8 / elapsed / 1_000_000, 3) if elapsed > 0 else 0,
-        "bytes": state["bytes"],
-        "content_length": content_length,
-        "complete": complete,
-        "error": error,
-        "first_body_s": round(state["first_body_at"], 6) if state["first_body_at"] is not None else None,
-        "max_read_gap_s": round(state["max_read_gap_s"], 6),
-        "recovery_gap_s": round(state["recovery_gap_s"], 6),
-        "failover_after_s": args.failover_after,
-    }
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
-    parser.add_argument("--proxy", required=True)
+    parser.add_argument("--protocol", default="tcp")
+    parser.add_argument("--proxy")
     parser.add_argument("--target", required=True)
     parser.add_argument("--path", default="/large.bin")
     parser.add_argument("--failover-after", type=float, required=True)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
-    parser.add_argument("--load-duration", type=float, default=0.0)
+    parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--parallel-downloads", type=int, default=1)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--started-file")
     args = parser.parse_args()
     try:
-        result = download(args)
+        result = interval_download(args)
         print(json.dumps(result, sort_keys=True))
         if result.get("status") == "fail":
             return int(result.get("exit_code") or 1)
@@ -373,7 +287,7 @@ def main():
             json.dumps(
                 {
                     "case": args.label,
-                    "protocol": "tcp",
+                    "protocol": args.protocol,
                     "status": "fail",
                     "exit_code": 1,
                     "error": str(exc),

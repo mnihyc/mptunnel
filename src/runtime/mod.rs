@@ -400,6 +400,7 @@ struct UdpEdgeCompletion<M> {
 struct UdpEdgeLane<M> {
     lane_id: usize,
     pending: usize,
+    successful_completions: usize,
     requests: mpsc::Sender<UdpEdgeRequest<M>>,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -412,6 +413,26 @@ fn udp_edge_queue_slots(context: &ClientPathContext) -> usize {
 fn udp_edge_lane_limit(context: &ClientPathContext) -> usize {
     let path_parallelism = context.udp_paths.len().max(1).saturating_mul(2);
     udp_edge_queue_slots(context).min(path_parallelism.max(1))
+}
+
+fn udp_edge_startup_lane_limit(context: &ClientPathContext) -> usize {
+    let queue_slots = udp_edge_queue_slots(context);
+    let hedge_lane = usize::from(queue_slots > 1 && !context.udp_paths.is_empty());
+    udp_edge_lane_limit(context)
+        .min(queue_slots)
+        .min(1usize.saturating_add(hedge_lane))
+        .max(1)
+}
+
+fn udp_edge_lane_spawn_allowed(
+    lane_count: usize,
+    successful_lane_count: usize,
+    context: &ClientPathContext,
+) -> bool {
+    if lane_count < udp_edge_startup_lane_limit(context) {
+        return true;
+    }
+    successful_lane_count > 0
 }
 
 fn udp_edge_lane_queue(context: &ClientPathContext) -> usize {
@@ -436,6 +457,7 @@ fn spawn_udp_edge_lane<M: Send + 'static>(
     UdpEdgeLane {
         lane_id,
         pending: 0,
+        successful_completions: 0,
         requests,
         handle,
     }
@@ -491,7 +513,15 @@ fn dispatch_udp_edge_request<M: Send + 'static>(
 ) -> Result<(), UdpEdgeRequest<M>> {
     let lane_limit = udp_edge_lane_limit(context);
     let lane_queue = udp_edge_lane_queue(context);
-    if lanes.is_empty() || (lanes.len() < lane_limit && lanes.iter().all(|lane| lane.pending > 0)) {
+    let successful_lane_count = lanes
+        .iter()
+        .filter(|lane| lane.successful_completions > 0)
+        .count();
+    if lanes.is_empty()
+        || (lanes.len() < lane_limit
+            && lanes.iter().all(|lane| lane.pending > 0)
+            && udp_edge_lane_spawn_allowed(lanes.len(), successful_lane_count, context))
+    {
         let lane_id = *next_lane_id;
         *next_lane_id = next_lane_id.saturating_add(1);
         lanes.push(spawn_udp_edge_lane(
@@ -529,6 +559,9 @@ fn finish_udp_edge_completion<M>(lanes: &mut [UdpEdgeLane<M>], completion: &UdpE
         .find(|lane| lane.lane_id == completion.lane_id)
     {
         lane.pending = lane.pending.saturating_sub(1);
+        if completion.result.is_ok() {
+            lane.successful_completions = lane.successful_completions.saturating_add(1);
+        }
     }
 }
 
@@ -12232,6 +12265,40 @@ mod tests {
         let lossy_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
         assert!(lossy_budget > stable_budget);
         assert!(lossy_budget <= UDP_MAX_RETRY_BUDGET);
+    }
+
+    #[test]
+    fn udp_edge_lane_startup_ramps_after_success_feedback() {
+        let paths = vec![
+            "udp://127.0.0.1:10180".parse().expect("first path"),
+            "udp://127.0.0.1:10181".parse().expect("second path"),
+            "udp://127.0.0.1:10182".parse().expect("third path"),
+        ];
+        let context =
+            ClientPathContext::new(paths, security(), ResourceLimits::default()).expect("context");
+
+        assert!(udp_edge_lane_limit(&context) > udp_edge_startup_lane_limit(&context));
+        assert_eq!(udp_edge_startup_lane_limit(&context), 2);
+        assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
+        assert!(udp_edge_lane_spawn_allowed(1, 0, &context));
+        assert!(!udp_edge_lane_spawn_allowed(2, 0, &context));
+        assert!(udp_edge_lane_spawn_allowed(2, 1, &context));
+    }
+
+    #[test]
+    fn udp_edge_lane_startup_respects_queue_capacity() {
+        let path = "udp://127.0.0.1:10183".parse().expect("path");
+        let resources = ResourceLimits {
+            max_datagram_queue_bytes: ResourceLimits::default().max_payload_bytes,
+            ..ResourceLimits::default()
+        };
+        let context = ClientPathContext::new(vec![path], security(), resources).expect("context");
+
+        assert_eq!(udp_edge_queue_slots(&context), 1);
+        assert_eq!(udp_edge_startup_lane_limit(&context), 1);
+        assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
+        assert!(!udp_edge_lane_spawn_allowed(1, 0, &context));
+        assert!(udp_edge_lane_spawn_allowed(1, 1, &context));
     }
 
     #[test]

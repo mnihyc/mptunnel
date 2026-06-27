@@ -404,6 +404,11 @@ if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"; then
   run_tcp_download_probe_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"
 fi
 
+if should_run_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat"; then
+  start_client "reliable_mixed_tcp_fat_udp_lowlat" "$tcp_fat $udp_lowlat"
+  run_tcp_download_probe_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat"
+fi
+
 if should_run_case "mptunnel_udp_single_low_latency"; then
   run_udp_case "mptunnel_udp_single_low_latency" "$udp_lowlat"
 fi
@@ -419,6 +424,12 @@ fi
 
 if should_run_case "mptunnel_mixed_single_low_latency"; then
   run_mixed_case "mptunnel_mixed_single_low_latency" "$tcp_lowlat $udp_lowlat"
+fi
+if should_run_case "mptunnel_mixed_tcp_lowlat_udp_fat"; then
+  run_mixed_case "mptunnel_mixed_tcp_lowlat_udp_fat" "$tcp_lowlat $udp_fat"
+fi
+if should_run_case "mptunnel_mixed_tcp_fat_udp_lowlat"; then
+  run_mixed_case "mptunnel_mixed_tcp_fat_udp_lowlat" "$tcp_fat $udp_lowlat"
 fi
 if should_run_case "mptunnel_mixed_multipath_all"; then
   run_mixed_case "mptunnel_mixed_multipath_all" "$tcp_all $udp_all"

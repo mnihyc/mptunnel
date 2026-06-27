@@ -408,6 +408,8 @@ def udp_worker(args, started_at, bulk_ready, result):
     max_after_failover_start_s = None
     max_after_failover_end_s = None
     received = 0
+    probe_deadline = started_at + args.timeout
+    deadline_hit = False
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
     try:
         proxy_host, proxy_port = parse_host_port(args.proxy)
@@ -435,16 +437,21 @@ def udp_worker(args, started_at, bulk_ready, result):
                 )
                 body_len = max(4, args.udp_payload_bytes)
                 for index in range(args.udp_count):
+                    if time.monotonic() >= probe_deadline:
+                        deadline_hit = True
+                        break
                     payload = struct.pack("!I", index) + bytes([index % 251]) * (
                         body_len - 4
                     )
                     started = time.monotonic()
                     started_s = started - started_at
                     udp.sendto(target_prefix + payload, (relay_host, relay_port))
-                    deadline = started + timeout
+                    deadline = min(started + timeout, probe_deadline)
                     while True:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
+                            if time.monotonic() >= probe_deadline:
+                                deadline_hit = True
                             break
                         udp.settimeout(remaining)
                         try:
@@ -480,7 +487,17 @@ def udp_worker(args, started_at, bulk_ready, result):
                             break
                     if args.udp_interval_ms > 0:
                         time.sleep(args.udp_interval_ms / 1000.0)
-        result.update({"udp_error": None})
+                    if deadline_hit:
+                        break
+        result.update(
+            {
+                "udp_error": (
+                    f"UDP probe deadline exceeded after {args.timeout:.3f}s"
+                    if deadline_hit
+                    else None
+                )
+            }
+        )
     except Exception as exc:
         result.update({"udp_error": str(exc)})
     result.update(

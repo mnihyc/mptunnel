@@ -410,8 +410,27 @@ fn udp_edge_queue_slots(context: &ClientPathContext) -> usize {
     (context.mux_limits.max_datagram_queue_bytes / payload).max(1)
 }
 
+fn udp_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usize {
+    if snapshot.state == SchedulerPathState::Failed {
+        return 0;
+    }
+    let model = UdpPathRuntimeModel::from_snapshot(
+        snapshot,
+        DEFAULT_SOCKS5_UDP_TTL_MS,
+        UDP_DEFAULT_MTU_PAYLOAD_BYTES,
+        false,
+        UDP_MAX_MTU_PAYLOAD_BYTES,
+    );
+    (model.response_timeout.as_secs_f64() / UDP_MIN_RESPONSE_TIMEOUT.as_secs_f64())
+        .ceil()
+        .max(2.0) as usize
+}
+
 fn udp_edge_lane_limit(context: &ClientPathContext) -> usize {
-    let path_parallelism = context.udp_paths.len().max(1).saturating_mul(2);
+    let path_parallelism = (0..context.udp_paths.len())
+        .filter_map(|index| context.udp_path_snapshot(index))
+        .map(udp_edge_path_lane_parallelism)
+        .sum::<usize>();
     udp_edge_queue_slots(context).min(path_parallelism.max(1))
 }
 
@@ -12265,6 +12284,36 @@ mod tests {
         let lossy_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
         assert!(lossy_budget > stable_budget);
         assert!(lossy_budget <= UDP_MAX_RETRY_BUDGET);
+    }
+
+    #[test]
+    fn udp_edge_lane_limit_scales_with_realtime_response_model() {
+        let low_latency = "udp://127.0.0.1:10184?srtt-ms=20&jitter-ms=0&rate-mbps=30"
+            .parse::<PathSpec>()
+            .expect("low-latency path");
+        let high_rtt = "udp://127.0.0.1:10185?srtt-ms=180&jitter-ms=20&rate-mbps=300"
+            .parse::<PathSpec>()
+            .expect("high-rtt path");
+        let low_context =
+            ClientPathContext::new(vec![low_latency], security(), ResourceLimits::default())
+                .expect("low context");
+        let high_context = ClientPathContext::new(
+            vec![high_rtt.clone()],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("high context");
+
+        assert_eq!(udp_edge_lane_limit(&low_context), 2);
+        assert!(udp_edge_lane_limit(&high_context) > udp_edge_lane_limit(&low_context));
+
+        let capped_resources = ResourceLimits {
+            max_datagram_queue_bytes: ResourceLimits::default().max_payload_bytes * 3,
+            ..ResourceLimits::default()
+        };
+        let capped_context = ClientPathContext::new(vec![high_rtt], security(), capped_resources)
+            .expect("capped context");
+        assert_eq!(udp_edge_lane_limit(&capped_context), 3);
     }
 
     #[test]

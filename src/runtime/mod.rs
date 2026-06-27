@@ -4388,35 +4388,6 @@ async fn run_client_udp_stream_path_session(
         }
         tokio::select! {
             biased;
-            command = recv_tcp_path_command(&mut commands), if command_may_recv => {
-                match command {
-                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
-                        if let Err(err) = encrypted.send_frame(&frame).await {
-                            let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
-                            return;
-                        }
-                    }
-                    Some(TcpPathSessionCommand::CloseStream(close_stream_id)) => {
-                        if close_stream_id == stream_id {
-                            let _ = encrypted
-                                .send_frame(&Frame::SessionClose {
-                                    reason: CloseReason::Normal,
-                                })
-                                .await;
-                            return;
-                        }
-                    }
-                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
-                        let _ = frames
-                            .send(Err(RuntimeError::Protocol(
-                                "client UDP stream path received open command",
-                            )))
-                            .await;
-                        return;
-                    }
-                    None => {}
-                }
-            }
             _ = async {
                 if let Some((_, _, deadline)) = &pending_open_retry {
                     tokio::time::sleep_until(*deadline).await;
@@ -4474,6 +4445,35 @@ async fn run_client_udp_stream_path_session(
                         let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
                         return;
                     }
+                }
+            }
+            command = recv_tcp_path_command(&mut commands), if command_may_recv => {
+                match command {
+                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
+                        if let Err(err) = encrypted.send_frame(&frame).await {
+                            let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
+                            return;
+                        }
+                    }
+                    Some(TcpPathSessionCommand::CloseStream(close_stream_id)) => {
+                        if close_stream_id == stream_id {
+                            let _ = encrypted
+                                .send_frame(&Frame::SessionClose {
+                                    reason: CloseReason::Normal,
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
+                        let _ = frames
+                            .send(Err(RuntimeError::Protocol(
+                                "client UDP stream path received open command",
+                            )))
+                            .await;
+                        return;
+                    }
+                    None => {}
                 }
             }
         }

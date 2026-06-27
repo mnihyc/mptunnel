@@ -446,6 +446,18 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     class: TrafficClass,
     path_index: usize,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "reliable_stream_open_attempt",
+        format_args!(
+            "stream_id={} underlay=tcp path_index={} class={:?} wait_for_accept=true tcp_paths={} udp_paths={}",
+            stream_id.0,
+            path_index,
+            class,
+            context.tcp_paths.len(),
+            context.udp_paths.len(),
+        ),
+    );
     let started_at = Instant::now();
     let stream = context
         .tcp_sessions
@@ -453,7 +465,19 @@ pub(super) async fn open_remote_stream_on_reserved_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
         .open_stream(stream_id, target, ingress, class)
         .await?;
-    context.mark_tcp_path_reserved_open_success(path_index, started_at.elapsed());
+    let elapsed = started_at.elapsed();
+    context.mark_tcp_path_reserved_open_success(path_index, elapsed);
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "reliable_stream_open_success",
+        format_args!(
+            "stream_id={} underlay=tcp path_index={} class={:?} elapsed_ms={:.3}",
+            stream_id.0,
+            path_index,
+            class,
+            elapsed.as_secs_f64() * 1000.0,
+        ),
+    );
     Ok(OpenedRemoteStream { stream, path_index })
 }
 
@@ -547,6 +571,19 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         .udp_paths
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "reliable_stream_open_attempt",
+        format_args!(
+            "stream_id={} underlay=udp path_index={} class={:?} wait_for_accept={} tcp_paths={} udp_paths={}",
+            stream_id.0,
+            path_index,
+            class,
+            wait_for_accept,
+            context.tcp_paths.len(),
+            context.udp_paths.len(),
+        ),
+    );
     let started_at = Instant::now();
     let socket = udp::connect_path(
         path,
@@ -696,7 +733,20 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         frames_tx,
         pending_open_retry,
     ));
-    context.mark_udp_stream_reserved_open_success(path_index, started_at.elapsed());
+    let elapsed = started_at.elapsed();
+    context.mark_udp_stream_reserved_open_success(path_index, elapsed);
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "reliable_stream_open_success",
+        format_args!(
+            "stream_id={} underlay=udp path_index={} class={:?} wait_for_accept={} elapsed_ms={:.3}",
+            stream_id.0,
+            path_index,
+            class,
+            wait_for_accept,
+            elapsed.as_secs_f64() * 1000.0,
+        ),
+    );
     Ok(OpenedRemoteStream {
         stream: TcpPathStream {
             stream_id,

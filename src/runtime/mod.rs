@@ -2586,6 +2586,8 @@ impl ClientPathContext {
         current_udp_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
+        let active_underlay =
+            active_underlay_for_reliable_stream(current_tcp_path_index, current_udp_path_index);
         let mut candidates = self
             .ordered_tcp_auto_bulk_discovery_scores(current_tcp_path_index, payload_bytes)
             .into_iter()
@@ -2615,6 +2617,9 @@ impl ClientPathContext {
                 }),
             )
             .collect::<Vec<_>>();
+        if let Some(active_underlay) = active_underlay {
+            candidates.retain(|(key, _)| key.underlay == active_underlay);
+        }
         candidates.sort_by(|left, right| {
             left.1
                 .total_cmp(&right.1)
@@ -3637,6 +3642,10 @@ impl TcpRelayRemoteSet {
             .rev()
             .find(|path| path.stream.underlay == underlay)
             .map(|path| path.path_index)
+    }
+
+    fn active_carrier_underlay(&self) -> Option<UnderlayProtocol> {
+        self.paths.first().map(|path| path.stream.underlay)
     }
 
     fn contains_path_key(&self, key: RelayPathKey) -> bool {
@@ -5749,8 +5758,9 @@ async fn attach_relay_path_candidates(
     let stream_id = remotes.stream_id();
     let mut last_retryable_error = None;
     let mut attached = 0usize;
+    let active_underlay = remotes.active_carrier_underlay();
 
-    for key in request.candidates {
+    for key in relay_path_candidates_for_active_carrier(request.candidates, active_underlay) {
         if remotes.contains_path_key(key) {
             continue;
         }
@@ -5871,6 +5881,18 @@ async fn attach_tcp_relay_paths(
         )
         .await;
     }
+    if remotes.active_carrier_underlay() == Some(UnderlayProtocol::Udp) {
+        return attach_udp_relay_paths(
+            context,
+            spec,
+            class,
+            remotes,
+            send_stream,
+            resend_fin,
+            mode,
+        )
+        .await;
+    }
     if matches!(mode, TcpRelayAttachMode::AutoBulkDiscovery) {
         let candidates = context.ordered_reliable_auto_bulk_discovery_path_keys(
             remotes.active_path_index_for(UnderlayProtocol::Tcp),
@@ -5919,7 +5941,7 @@ async fn attach_tcp_relay_paths(
     if attached > 0 {
         return Ok(attached);
     }
-    if !context.udp_paths.is_empty() {
+    if !context.udp_paths.is_empty() && remotes.is_empty() {
         return attach_udp_relay_paths(
             context,
             spec,
@@ -5943,6 +5965,9 @@ async fn attach_udp_relay_paths(
     resend_fin: bool,
     mode: TcpRelayAttachMode,
 ) -> Result<usize, RuntimeError> {
+    if remotes.active_carrier_underlay() == Some(UnderlayProtocol::Tcp) {
+        return Ok(0);
+    }
     let stream_id = remotes.stream_id();
     let payload_bytes = match mode {
         TcpRelayAttachMode::Any => {
@@ -6038,6 +6063,19 @@ async fn attach_udp_relay_paths(
     } else {
         Ok(0)
     }
+}
+
+fn relay_path_candidates_for_active_carrier(
+    candidates: Vec<RelayPathKey>,
+    active_underlay: Option<UnderlayProtocol>,
+) -> Vec<RelayPathKey> {
+    let Some(active_underlay) = active_underlay else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.underlay == active_underlay)
+        .collect()
 }
 
 fn tcp_relay_should_race_repair(
@@ -6300,6 +6338,20 @@ fn relay_path_key_order(left: RelayPathKey, right: RelayPathKey) -> std::cmp::Or
     relay_underlay_order(left.underlay)
         .cmp(&relay_underlay_order(right.underlay))
         .then_with(|| left.index.cmp(&right.index))
+}
+
+fn active_underlay_for_reliable_stream(
+    current_tcp_path_index: Option<usize>,
+    current_udp_path_index: Option<usize>,
+) -> Option<UnderlayProtocol> {
+    match (
+        current_tcp_path_index.is_some(),
+        current_udp_path_index.is_some(),
+    ) {
+        (true, false) => Some(UnderlayProtocol::Tcp),
+        (false, true) => Some(UnderlayProtocol::Udp),
+        _ => None,
+    }
 }
 
 fn relay_underlay_order(underlay: UnderlayProtocol) -> u8 {
@@ -10633,7 +10685,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_auto_bulk_discovery_selects_evidence_backed_udp_when_it_beats_tcp() {
+    fn mixed_auto_bulk_discovery_stays_with_active_tcp_carrier() {
         let tcp_path = "tcp://127.0.0.1:10140?srtt-ms=20&rate-mbps=30"
             .parse::<PathSpec>()
             .expect("tcp path");
@@ -10648,9 +10700,34 @@ mod tests {
         .expect("context");
 
         assert_eq!(
+            context.ordered_reliable_auto_bulk_discovery_path_keys(
+                Some(0),
+                None,
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+            ),
+            Vec::<RelayPathKey>::new()
+        );
+    }
+
+    #[test]
+    fn mixed_auto_bulk_discovery_can_choose_best_carrier_without_active_cohort() {
+        let tcp_path = "tcp://127.0.0.1:10144?srtt-ms=20&rate-mbps=30"
+            .parse::<PathSpec>()
+            .expect("tcp path");
+        let udp_path = "udp://127.0.0.1:10145?srtt-ms=40&rate-mbps=300"
+            .parse::<PathSpec>()
+            .expect("udp path");
+        let context = ClientPathContext::new(
+            vec![tcp_path, udp_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
             context
                 .ordered_reliable_auto_bulk_discovery_path_keys(
-                    Some(0),
+                    None,
                     None,
                     MuxLimits::default().max_tcp_path_inflight_bytes,
                 )
@@ -10660,6 +10737,31 @@ mod tests {
                 underlay: UnderlayProtocol::Udp,
                 index: 0,
             })
+        );
+    }
+
+    #[test]
+    fn relay_candidate_filter_preserves_current_carrier_cohort() {
+        let tcp = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        };
+        let udp = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 2,
+        };
+
+        assert_eq!(
+            relay_path_candidates_for_active_carrier(vec![udp, tcp], Some(UnderlayProtocol::Tcp)),
+            vec![tcp]
+        );
+        assert_eq!(
+            relay_path_candidates_for_active_carrier(vec![tcp, udp], Some(UnderlayProtocol::Udp)),
+            vec![udp]
+        );
+        assert_eq!(
+            relay_path_candidates_for_active_carrier(vec![tcp, udp], None),
+            vec![tcp, udp]
         );
     }
 

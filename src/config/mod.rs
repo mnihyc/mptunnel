@@ -69,20 +69,6 @@ impl AppConfig {
                 }
                 if let IngressConfig::TunL4(tun) = &client.ingress {
                     validate_tun_l4(tun)?;
-                    if !client
-                        .paths
-                        .iter()
-                        .any(|path| path.underlay == crate::protocol::UnderlayProtocol::Tcp)
-                    {
-                        return Err(ConfigError::TunRequiresTcpPath);
-                    }
-                    if !client
-                        .paths
-                        .iter()
-                        .any(|path| path.underlay == crate::protocol::UnderlayProtocol::Udp)
-                    {
-                        return Err(ConfigError::TunRequiresUdpPath);
-                    }
                 }
             }
             CommandConfig::Server(server) => {
@@ -388,8 +374,6 @@ pub enum ConfigError {
     TunIpv6MtuTooSmall,
     TunDnsTtlZero,
     TunDnsResolverPortZero,
-    TunRequiresTcpPath,
-    TunRequiresUdpPath,
     OutboundDnsTimeoutZero,
     OutboundDnsResolverPortZero,
 }
@@ -491,8 +475,6 @@ impl std::fmt::Display for ConfigError {
             Self::TunIpv6MtuTooSmall => write!(f, "TUN IPv6 MTU must be at least 1280 bytes"),
             Self::TunDnsTtlZero => write!(f, "TUN DNS TTL must be greater than zero"),
             Self::TunDnsResolverPortZero => write!(f, "TUN DNS resolver port must be nonzero"),
-            Self::TunRequiresTcpPath => write!(f, "TUN L4 ingress requires at least one TCP path"),
-            Self::TunRequiresUdpPath => write!(f, "TUN L4 ingress requires at least one UDP path"),
             Self::OutboundDnsTimeoutZero => {
                 write!(f, "outbound DNS timeout must be greater than zero")
             }

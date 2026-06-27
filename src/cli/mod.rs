@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn tun_l4_validation_rejects_bad_underlay_and_ipv4_flags() {
+    fn tun_l4_validation_accepts_single_underlay_and_rejects_ipv4_flags() {
         let cli = Cli::try_parse_from([
             "mptunnel",
             "--secret",
@@ -1005,12 +1005,20 @@ mod tests {
             "tcp://127.0.0.1:443",
         ])
         .expect("parse cli");
-        assert!(matches!(
-            cli.into_config(),
-            Err(CliConfigError::Config(
-                crate::config::ConfigError::TunRequiresUdpPath
-            ))
-        ));
+        cli.into_config().expect("TCP-only TUN config");
+
+        let cli = Cli::try_parse_from([
+            "mptunnel",
+            "--secret",
+            "0123456789abcdef",
+            "client",
+            "--ingress",
+            "tun-l4",
+            "--path",
+            "udp://127.0.0.1:443",
+        ])
+        .expect("parse cli");
+        cli.into_config().expect("UDP-only TUN config");
 
         let cli = Cli::try_parse_from([
             "mptunnel",

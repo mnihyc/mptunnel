@@ -57,6 +57,7 @@ It records:
 - Raw direct HTTP downloads over each path network.
 - mptunnel SOCKS5 HTTP downloads over each single TCP underlay path.
 - mptunnel SOCKS5 HTTP download with all TCP underlay paths configured.
+- mptunnel TUN L4 HTTP downloads over TCP, UDP reliable-stream, and mixed underlay paths.
 - mptunnel SOCKS5 UDP ASSOCIATE probes over each single UDP underlay path.
 - mptunnel SOCKS5 UDP ASSOCIATE probes with all UDP underlay paths configured.
 - mptunnel TCP multipath download while the high-bandwidth path is blackholed during transfer.

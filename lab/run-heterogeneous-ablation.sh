@@ -235,6 +235,59 @@ start_client() {
   exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"
 }
 
+start_tun_client() {
+  local profile="$1"
+  shift
+  local path_args="$*"
+  local probe_args=""
+  if [[ -n "${PATH_PROBE_INTERVAL_MS:-}" ]]; then
+    probe_args="${probe_args} --path-probe-interval-ms '${PATH_PROBE_INTERVAL_MS}'"
+  fi
+  if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
+    probe_args="${probe_args} --path-probe-timeout-ms '${PATH_PROBE_TIMEOUT_MS}'"
+  fi
+  if [[ "$isolate_cases" == "1" ]]; then
+    stop_client
+    if [[ "$isolate_containers" == "1" ]]; then
+      stop_server
+      compose down --remove-orphans >/dev/null 2>&1 || true
+      compose up -d --remove-orphans >/dev/null
+    fi
+    apply_netem apply
+    start_target_services
+    start_server
+  else
+    stop_client
+  fi
+  exec_in client "\
+    MPTUNNEL_LOG=info /workspace/target/release/mptunnel \
+      --secret '${secret}' \
+      client \
+      --ingress tun-l4 \
+      --tun-name mptun0 \
+      --tun-ipv4 10.88.0.1 \
+      --tun-ipv4-prefix 24 \
+      ${probe_args} \
+      ${path_args} \
+      >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
+  sleep 1
+  exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"
+  exec_in client "deadline=\$((SECONDS + 10)); while ! ip link show mptun0 >/dev/null 2>&1 && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; ip link show mptun0 >/dev/null"
+  exec_in client "ip route replace 172.31.40.30/32 dev mptun0"
+}
+
+run_tun_download_case() {
+  local case_name="$1"
+  shift
+  local output exit_code
+  start_tun_client "$case_name" "$@"
+  set +e
+  output="$(exec_in client "timeout ${curl_timeout}s curl -sS --fail --location --output /dev/null --write-out '%{time_total} %{speed_download} %{http_code}' http://172.31.40.30:8080/large.bin" 2>/dev/null)"
+  exit_code="$?"
+  set -e
+  parse_and_record_curl "$case_name" "tun" "$exit_code" "$output"
+}
+
 run_udp_case() {
   local case_name="$1"
   shift
@@ -407,6 +460,18 @@ fi
 if should_run_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat"; then
   start_client "reliable_mixed_tcp_fat_udp_lowlat" "$tcp_fat $udp_lowlat"
   run_tcp_download_probe_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat"
+fi
+
+if should_run_case "mptunnel_tun_tcp_single_low_latency"; then
+  run_tun_download_case "mptunnel_tun_tcp_single_low_latency" "$tcp_lowlat"
+fi
+
+if should_run_case "mptunnel_tun_udp_stream_single_low_latency"; then
+  run_tun_download_case "mptunnel_tun_udp_stream_single_low_latency" "$udp_lowlat"
+fi
+
+if should_run_case "mptunnel_tun_mixed_multipath_all"; then
+  run_tun_download_case "mptunnel_tun_mixed_multipath_all" "$tcp_all $udp_all"
 fi
 
 if should_run_case "mptunnel_udp_single_low_latency"; then

@@ -3856,7 +3856,7 @@ impl TcpRelayRemoteSet {
     }
 
     fn active_carrier_underlay(&self) -> Option<UnderlayProtocol> {
-        self.paths.first().map(|path| path.stream.underlay)
+        self.paths.last().map(|path| path.stream.underlay)
     }
 
     fn contains_path_key(&self, key: RelayPathKey) -> bool {
@@ -11571,6 +11571,73 @@ mod tests {
         assert_eq!(
             relay_path_candidates_for_active_carrier(vec![tcp, udp], None),
             vec![tcp, udp]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_relay_current_carrier_tracks_latest_data_path() {
+        fn opened_relay_stream_for_test(
+            underlay: UnderlayProtocol,
+            path_index: usize,
+        ) -> (
+            OpenedRemoteStream,
+            TcpPathSessionCommandReceivers,
+            mpsc::Sender<Result<Frame, RuntimeError>>,
+        ) {
+            let (commands, command_rx) = tcp_path_session_command_channels(4);
+            let (frames_tx, frames_rx) = mpsc::channel(4);
+            (
+                OpenedRemoteStream {
+                    path_index,
+                    stream: TcpPathStream {
+                        stream_id: StreamId(44),
+                        max_offset: MuxLimits::default().max_stream_window_bytes,
+                        class: TrafficClass::Bulk,
+                        underlay,
+                        max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                        output: TcpPathStreamOutput::Fixed(commands),
+                        frames: frames_rx,
+                    },
+                },
+                command_rx,
+                frames_tx,
+            )
+        }
+
+        let (tcp_stream, _tcp_commands, _tcp_frames) =
+            opened_relay_stream_for_test(UnderlayProtocol::Tcp, 0);
+        let mut remotes = TcpRelayRemoteSet::new(tcp_stream, 4);
+        assert_eq!(
+            remotes.active_carrier_underlay(),
+            Some(UnderlayProtocol::Tcp)
+        );
+
+        let (udp_stream, _udp_commands, _udp_frames) =
+            opened_relay_stream_for_test(UnderlayProtocol::Udp, 1);
+        remotes.attach(udp_stream);
+        assert_eq!(
+            remotes.active_carrier_underlay(),
+            Some(UnderlayProtocol::Udp)
+        );
+
+        assert_eq!(
+            relay_path_candidates_for_active_carrier(
+                vec![
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index: 0,
+                    },
+                    RelayPathKey {
+                        underlay: UnderlayProtocol::Udp,
+                        index: 2,
+                    },
+                ],
+                remotes.active_carrier_underlay(),
+            ),
+            vec![RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 2,
+            }]
         );
     }
 

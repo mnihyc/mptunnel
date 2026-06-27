@@ -124,6 +124,9 @@ pub(super) async fn run_client_path_probes(
 pub(super) async fn probe_client_paths(context: &ClientPathContext, timeout: Duration) {
     let mut probes = tokio::task::JoinSet::new();
     for path_index in 0..context.tcp_paths.len() {
+        if !context.should_probe_tcp_path(path_index) {
+            continue;
+        }
         let context = context.clone();
         probes.spawn(async move {
             (
@@ -134,6 +137,9 @@ pub(super) async fn probe_client_paths(context: &ClientPathContext, timeout: Dur
         });
     }
     for path_index in 0..context.udp_paths.len() {
+        if !context.should_probe_udp_path(path_index) {
+            continue;
+        }
         let context = context.clone();
         probes.spawn(async move {
             (
@@ -428,6 +434,18 @@ where
 
 pub(super) fn tcp_closed_stream_cache_capacity(max_streams: usize) -> usize {
     max_streams.saturating_mul(2).clamp(128, 65_536)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct PathJoinReplayKey {
+    pub(super) session_id: SessionId,
+    pub(super) path_id: PathId,
+    pub(super) underlay: UnderlayProtocol,
+    pub(super) nonce: AuthNonce,
+}
+
+pub(super) fn path_join_replay_cache_capacity(max_streams: usize) -> usize {
+    max_streams.saturating_mul(4).clamp(1024, 262_144)
 }
 
 impl ClientPathContext {
@@ -984,6 +1002,17 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn should_probe_tcp_path(&self, index: usize) -> bool {
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+            .is_some_and(|record| {
+                path_observation_is_idle_for_probe(record.observe(Instant::now()))
+            })
+    }
+
     pub(super) fn release_tcp_path_load(&self, index: usize, class: TrafficClass) {
         if let Some(current) = self
             .health
@@ -1107,6 +1136,17 @@ impl ClientPathContext {
         {
             current.mark_success(elapsed);
         }
+    }
+
+    pub(super) fn should_probe_udp_path(&self, index: usize) -> bool {
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+            .is_some_and(|record| {
+                path_observation_is_idle_for_probe(record.observe(Instant::now()))
+            })
     }
 
     pub(super) fn release_udp_path_load(&self, index: usize) {
@@ -1266,6 +1306,10 @@ pub(super) fn path_records_have_schedulable_alternative(
                 SchedulerPathState::Failed | SchedulerPathState::Draining
             )
     })
+}
+
+pub(super) fn path_observation_is_idle_for_probe(observation: ClientPathObservation) -> bool {
+    observation.active_flows == 0 && observation.load_bytes == 0
 }
 
 pub(super) fn apply_tcp_bulk_isolation(
@@ -1588,9 +1632,33 @@ pub struct ServerPathContext {
     pub(super) mux_limits: MuxLimits,
     pub(super) security: SecurityConfig,
     pub(super) tcp_streams: Arc<ServerTcpStreamRegistry>,
+    pub(super) path_join_replay: Arc<Mutex<RecentIdCache<PathJoinReplayKey>>>,
     pub(super) max_tcp_streams: usize,
     pub(super) max_udp_sessions: usize,
     pub(super) max_udp_flows_per_session: usize,
+}
+
+impl ServerPathContext {
+    pub(super) fn accept_path_join_nonce(
+        &self,
+        session_id: SessionId,
+        path_id: PathId,
+        underlay: UnderlayProtocol,
+        nonce: AuthNonce,
+    ) -> bool {
+        let key = PathJoinReplayKey {
+            session_id,
+            path_id,
+            underlay,
+            nonce,
+        };
+        let mut replay = self.path_join_replay.lock().expect("path join replay lock");
+        if replay.contains(&key) {
+            return false;
+        }
+        replay.insert(key);
+        true
+    }
 }
 
 pub(super) fn random_session_id() -> Result<SessionId, RuntimeError> {

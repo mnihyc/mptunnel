@@ -44,6 +44,9 @@ fn server_context(outbound: OutboundConfig) -> ServerPathContext {
         mux_limits: resources.into(),
         security: security(),
         tcp_streams: Arc::new(ServerTcpStreamRegistry::default()),
+        path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
+            path_join_replay_cache_capacity(resources.max_streams),
+        ))),
         max_tcp_streams: resources.max_streams,
         max_udp_sessions: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
@@ -1970,4 +1973,5 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
 
 mod datagram;
 mod integration;
+mod security;
 mod tcp_path;

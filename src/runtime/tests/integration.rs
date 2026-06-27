@@ -38,6 +38,38 @@ async fn path_probe_refreshes_udp_health_without_association_load() {
 }
 
 #[tokio::test]
+async fn path_probe_skips_tcp_path_with_active_stream_load() {
+    let path = reserve_tcp_path().await;
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    context.mark_tcp_path_open_success(0, Duration::from_millis(5), TrafficClass::Bulk);
+
+    probe_client_paths(&context, Duration::from_millis(20)).await;
+
+    let health = context.health.lock().expect("health lock");
+    assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
+    assert_eq!(health.tcp[0].consecutive_failures, 0);
+    assert_eq!(health.tcp[0].active_flows, 1);
+    assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
+}
+
+#[tokio::test]
+async fn path_probe_skips_udp_path_with_active_session_load() {
+    let path = reserve_udp_path().await;
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    context.mark_udp_path_open_success(0, Duration::from_millis(5));
+
+    probe_client_paths(&context, Duration::from_millis(20)).await;
+
+    let health = context.health.lock().expect("health lock");
+    assert_eq!(health.udp[0].state, SchedulerPathState::Active);
+    assert_eq!(health.udp[0].consecutive_failures, 0);
+    assert_eq!(health.udp[0].active_flows, 1);
+    assert_eq!(health.udp[0].load_bytes, UDP_SESSION_LOAD_BYTES);
+}
+
+#[tokio::test]
 async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     let path = reserve_tcp_path().await;
     let context =
@@ -1761,6 +1793,9 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
                         .expect("secret"),
                 ),
                 tcp_streams: Arc::new(ServerTcpStreamRegistry::default()),
+                path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
+                    path_join_replay_cache_capacity(ResourceLimits::default().max_streams),
+                ))),
                 max_tcp_streams: ResourceLimits::default().max_streams,
                 max_udp_sessions: ResourceLimits::default().max_streams,
                 max_udp_flows_per_session: ResourceLimits::default().max_streams,

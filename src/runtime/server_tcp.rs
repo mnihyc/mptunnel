@@ -56,7 +56,8 @@ pub(super) async fn handle_server_path(
                 tag: auth_tag,
                 now_unix_secs,
                 freshness_window_secs: auth_freshness_window_secs,
-            }) =>
+            })
+            && context.accept_path_join_nonce(session_id, path_id, underlay, nonce) =>
         {
             (path_id, capabilities)
         }

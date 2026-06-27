@@ -557,7 +557,10 @@ impl ServerUdpPathSession {
                     tag: auth_tag,
                     now_unix_secs: 0,
                     freshness_window_secs: 0,
-                }) =>
+                })
+                && self
+                    .context
+                    .accept_path_join_nonce(session_id, path_id, underlay, nonce) =>
             {
                 self.establish_udp_path(session_id, path_id, capabilities)
                     .await

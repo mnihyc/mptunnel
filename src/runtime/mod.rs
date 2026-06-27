@@ -5351,6 +5351,7 @@ where
     let mut receive_hole_repair_attempts = 0_u32;
     let mut path_last_delivery_at = HashMap::from([(initial_key, Instant::now())]);
     let mut interactive_response_pending = false;
+    let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
 
     let result = loop {
@@ -5591,7 +5592,15 @@ where
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.path_keys().len() > 1
                 && tcp_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
-                match send_tcp_recv_progress_remote_set(&mut remotes, context, &recv_stream).await {
+                match send_tcp_recv_progress_remote_set(
+                    &mut remotes,
+                    context,
+                    &recv_stream,
+                    &mut recv_progress,
+                    true,
+                )
+                .await
+                {
                     Ok(()) => {
                         last_stream_progress_at = Instant::now();
                         last_recv_progress_sent_at = Instant::now();
@@ -5826,7 +5835,15 @@ where
                         if delivered_progress {
                             interactive_response_pending = false;
                         }
-                        match send_tcp_recv_progress_remote_set(&mut remotes, context, &recv_stream).await {
+                        match send_tcp_recv_progress_remote_set(
+                            &mut remotes,
+                            context,
+                            &recv_stream,
+                            &mut recv_progress,
+                            false,
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 last_recv_progress_sent_at = Instant::now();
                             }
@@ -6735,14 +6752,53 @@ fn tcp_relay_error_is_migratable(err: &RuntimeError) -> bool {
     )
 }
 
+#[derive(Debug, Default)]
+struct ReliableRecvProgress {
+    last_max_data_offset: u64,
+}
+
+impl ReliableRecvProgress {
+    fn should_send_max_data(
+        &mut self,
+        recv_stream: &ReliableRecvStream,
+        mux_limits: MuxLimits,
+        force: bool,
+    ) -> bool {
+        let max_offset = recv_stream.max_data_offset();
+        if force
+            || self.last_max_data_offset == 0
+            || max_offset.saturating_sub(self.last_max_data_offset)
+                >= reliable_stream_max_data_update_bytes(mux_limits)
+        {
+            self.last_max_data_offset = max_offset;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn reliable_stream_max_data_update_bytes(mux_limits: MuxLimits) -> u64 {
+    let window_step = mux_limits.max_stream_window_bytes.saturating_div(4).max(1);
+    let payload_step = tcp_relay_buffer_len(mux_limits) as u64;
+    window_step
+        .max(payload_step)
+        .min(mux_limits.max_stream_window_bytes)
+}
+
 async fn send_tcp_recv_progress(
     path_stream: &TcpPathStream,
     recv_stream: &ReliableRecvStream,
+    progress: &mut ReliableRecvProgress,
+    mux_limits: MuxLimits,
+    force_max_data: bool,
 ) -> Result<(), RuntimeError> {
     for frame in recv_stream.ack_frames() {
         path_stream.send_frame(frame).await?;
     }
-    path_stream.send_frame(recv_stream.max_data_frame()).await?;
+    if progress.should_send_max_data(recv_stream, mux_limits, force_max_data) {
+        path_stream.send_frame(recv_stream.max_data_frame()).await?;
+    }
     Ok(())
 }
 
@@ -6767,13 +6823,17 @@ async fn send_tcp_recv_progress_remote_set(
     remotes: &mut TcpRelayRemoteSet,
     context: &ClientPathContext,
     recv_stream: &ReliableRecvStream,
+    progress: &mut ReliableRecvProgress,
+    force_max_data: bool,
 ) -> Result<(), RuntimeError> {
     for frame in recv_stream.ack_frames() {
         remotes.send_frame(context, frame).await?;
     }
-    remotes
-        .send_frame(context, recv_stream.max_data_frame())
-        .await?;
+    if progress.should_send_max_data(recv_stream, context.mux_limits, force_max_data) {
+        remotes
+            .send_frame(context, recv_stream.max_data_frame())
+            .await?;
+    }
     Ok(())
 }
 
@@ -6888,6 +6948,7 @@ where
     let mut last_repair_replay_at = Instant::now();
     let mut udp_congestion = (path_stream.underlay == UnderlayProtocol::Udp)
         .then(|| UdpStreamCongestion::new(mux_limits));
+    let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
 
     let result = loop {
@@ -6933,7 +6994,14 @@ where
                             local.write_all(&chunk).await?;
                         }
                         local.flush().await?;
-                        send_tcp_recv_progress(&path_stream, &recv_stream).await?;
+                        send_tcp_recv_progress(
+                            &path_stream,
+                            &recv_stream,
+                            &mut recv_progress,
+                            mux_limits,
+                            false,
+                        )
+                        .await?;
                         last_recv_progress_sent_at = Instant::now();
                         if outcome.fin {
                             local.shutdown().await?;
@@ -7013,7 +7081,14 @@ where
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
                 && tcp_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
-                send_tcp_recv_progress(&path_stream, &recv_stream).await?;
+                send_tcp_recv_progress(
+                    &path_stream,
+                    &recv_stream,
+                    &mut recv_progress,
+                    mux_limits,
+                    true,
+                )
+                .await?;
                 last_recv_progress_sent_at = Instant::now();
             }
             read = local.read(&mut buf[..read_budget]), if can_read_local => {
@@ -10208,6 +10283,37 @@ mod tests {
         assert!(low_interval <= TCP_STREAM_STALL_MIN_TIMEOUT);
         assert!(high_interval >= low_interval);
         assert!(high_interval <= TCP_STREAM_STALL_MIN_TIMEOUT);
+    }
+
+    #[test]
+    fn reliable_recv_progress_batches_max_data_updates() {
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 1024,
+            max_tcp_relay_chunk_bytes: 1024,
+            max_tcp_path_inflight_bytes: 4096,
+            max_stream_window_bytes: 4096,
+            max_repair_bytes: 4096,
+            max_reorder_bytes: 4096,
+            ..MuxLimits::default()
+        };
+        let mut recv_stream = ReliableRecvStream::new(StreamId(22), mux_limits);
+        let mut progress = ReliableRecvProgress::default();
+        let step = reliable_stream_max_data_update_bytes(mux_limits);
+
+        assert_eq!(step, 1024);
+        assert!(progress.should_send_max_data(&recv_stream, mux_limits, false));
+        assert!(!progress.should_send_max_data(&recv_stream, mux_limits, false));
+
+        recv_stream
+            .receive_data(0, Bytes::from(vec![0x11; 512]), StreamFlags::NONE)
+            .expect("half-step data");
+        assert!(!progress.should_send_max_data(&recv_stream, mux_limits, false));
+
+        recv_stream
+            .receive_data(512, Bytes::from(vec![0x22; 512]), StreamFlags::NONE)
+            .expect("full-step data");
+        assert!(progress.should_send_max_data(&recv_stream, mux_limits, false));
+        assert!(progress.should_send_max_data(&recv_stream, mux_limits, true));
     }
 
     #[test]

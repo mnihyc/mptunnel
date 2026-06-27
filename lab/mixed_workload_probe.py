@@ -115,6 +115,13 @@ def percentile(values, rank):
     return ordered[index]
 
 
+def write_started_file(path):
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"{time.time():.9f}\n")
+
+
 def parse_http_headers(buffer):
     head, _, body = buffer.partition(b"\r\n\r\n")
     status_line = head.splitlines()[0].decode("iso-8859-1", errors="replace")
@@ -548,9 +555,11 @@ def main():
     parser.add_argument("--tcp-echo-payload-bytes", type=int, default=64)
     parser.add_argument("--tcp-echo-timeout-ms", type=int, default=5000)
     parser.add_argument("--tcp-echo-interval-ms", type=int, default=500)
+    parser.add_argument("--started-file")
     args = parser.parse_args()
 
     started_at = time.monotonic()
+    write_started_file(args.started_file)
     interactive_ready = threading.Event()
     bulk_ready = threading.Event()
     bulk = {}

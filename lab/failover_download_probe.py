@@ -45,6 +45,13 @@ def read_exact(sock, size):
     return b"".join(chunks)
 
 
+def write_started_file(path):
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"{time.time():.9f}\n")
+
+
 def connect_socks5(proxy, target, timeout):
     proxy_host, proxy_port = split_host_port(proxy)
     target_host, target_port = split_host_port(target)
@@ -109,6 +116,7 @@ def record_body_chunk(now, state, size):
 
 def download(args):
     started = time.monotonic()
+    write_started_file(args.started_file)
     sock, target_host, target_port = connect_socks5(args.proxy, args.target, args.timeout)
     sock.settimeout(min(args.timeout, 1.0))
     with sock:
@@ -188,6 +196,7 @@ def main():
     parser.add_argument("--failover-after", type=float, required=True)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
+    parser.add_argument("--started-file")
     args = parser.parse_args()
     try:
         print(json.dumps(download(args), sort_keys=True))

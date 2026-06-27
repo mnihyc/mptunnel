@@ -51,6 +51,7 @@ const TCP_STREAM_STALL_MIN_TIMEOUT: Duration = Duration::from_millis(350);
 const TCP_STREAM_STALL_MAX_TIMEOUT: Duration = Duration::from_millis(1500);
 const UDP_DATAGRAM_MIN_TTL_FIT_RATIO: f64 = 0.9;
 const UDP_BBR_PACING_GAIN: f64 = 1.25;
+const UDP_FIRST_OPEN_RTT_MULTIPLIER: f64 = 8.0;
 const UDP_MIN_PACING_RATE_BPS: f64 = 64_000.0;
 const UDP_MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const UDP_MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
@@ -6939,8 +6940,17 @@ impl UdpDatagramClientAssociation {
             self.select_path_candidate(&candidates, &attempted, payload.len(), ttl_ms)
         {
             attempted.insert(path_index);
+            let has_unattempted_alternative = candidates
+                .iter()
+                .any(|candidate| !attempted.contains(&candidate.path_index));
             match self
-                .send_to_path(path_index, target.clone(), payload.clone(), ttl_ms)
+                .send_to_path(
+                    path_index,
+                    target.clone(),
+                    payload.clone(),
+                    ttl_ms,
+                    has_unattempted_alternative,
+                )
                 .await
             {
                 Ok(response) => {
@@ -7149,6 +7159,7 @@ impl UdpDatagramClientAssociation {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
+        has_unattempted_alternative: bool,
     ) -> Result<Bytes, UdpPathSendError> {
         let model = self
             .context
@@ -7161,7 +7172,12 @@ impl UdpDatagramClientAssociation {
                 limit: model.mtu_payload_bytes,
             });
         }
-        let handshake_timeout = udp_datagram_path_open_timeout(!self.paths.is_empty(), model);
+        let handshake_timeout = udp_datagram_path_open_timeout(
+            !self.paths.is_empty(),
+            has_unattempted_alternative,
+            model,
+            ttl_ms,
+        );
         let position = self
             .ensure_path_session(path_index, handshake_timeout)
             .await
@@ -7291,15 +7307,25 @@ fn udp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
 
 fn udp_datagram_path_open_timeout(
     association_has_open_path: bool,
+    has_unattempted_alternative: bool,
     model: UdpPathRuntimeModel,
+    ttl_ms: u32,
 ) -> Duration {
-    if !association_has_open_path {
-        return UDP_PATH_HANDSHAKE_TIMEOUT;
+    let ttl_timeout = Duration::from_millis(u64::from(ttl_ms));
+    if !association_has_open_path && !has_unattempted_alternative {
+        return UDP_PATH_HANDSHAKE_TIMEOUT.min(ttl_timeout);
     }
-    model
-        .response_timeout
+    let response_timeout = if association_has_open_path {
+        model.response_timeout
+    } else {
+        Duration::from_secs_f64(
+            model.response_timeout.as_secs_f64() * UDP_FIRST_OPEN_RTT_MULTIPLIER,
+        )
+    };
+    response_timeout
         .max(UDP_MIN_RESPONSE_TIMEOUT)
         .min(UDP_PATH_HANDSHAKE_TIMEOUT)
+        .min(ttl_timeout)
 }
 
 struct UdpDatagramClientSession {
@@ -11056,7 +11082,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_additional_path_open_uses_adaptive_timeout() {
+    fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
         let mut model = UdpPathRuntimeModel {
             pacing_rate_bps: UDP_MIN_PACING_RATE_BPS,
             response_timeout: Duration::from_millis(300),
@@ -11066,23 +11092,42 @@ mod tests {
         };
 
         assert_eq!(
-            udp_datagram_path_open_timeout(false, model),
+            udp_datagram_path_open_timeout(false, false, model, DEFAULT_SOCKS5_UDP_TTL_MS),
             UDP_PATH_HANDSHAKE_TIMEOUT
         );
         assert_eq!(
-            udp_datagram_path_open_timeout(true, model),
+            udp_datagram_path_open_timeout(true, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
             Duration::from_millis(300)
+        );
+        assert_eq!(
+            udp_datagram_path_open_timeout(false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+            UDP_PATH_HANDSHAKE_TIMEOUT
         );
 
         model.response_timeout = Duration::from_millis(1);
         assert_eq!(
-            udp_datagram_path_open_timeout(true, model),
+            udp_datagram_path_open_timeout(true, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
             UDP_MIN_RESPONSE_TIMEOUT
         );
+        assert_eq!(
+            udp_datagram_path_open_timeout(false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+            UDP_MIN_RESPONSE_TIMEOUT
+        );
+
+        model.response_timeout = Duration::from_millis(65);
+        assert_eq!(
+            udp_datagram_path_open_timeout(false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+            Duration::from_millis(520)
+        );
+
         model.response_timeout = UDP_PATH_HANDSHAKE_TIMEOUT + Duration::from_secs(1);
         assert_eq!(
-            udp_datagram_path_open_timeout(true, model),
+            udp_datagram_path_open_timeout(true, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
             UDP_PATH_HANDSHAKE_TIMEOUT
+        );
+        assert_eq!(
+            udp_datagram_path_open_timeout(false, false, model, 250),
+            Duration::from_millis(250)
         );
     }
 

@@ -81,6 +81,10 @@ impl TcpRelayRemoteSet {
         self.paths.last().map(TcpRelayRemotePath::instance)
     }
 
+    pub(super) fn active_path_key(&self) -> Option<RelayPathKey> {
+        self.active_path_instance().map(|instance| instance.key)
+    }
+
     pub(super) fn active_path_index_for(&self, underlay: UnderlayProtocol) -> Option<usize> {
         self.paths
             .iter()
@@ -135,6 +139,14 @@ impl TcpRelayRemoteSet {
     }
 
     pub(super) fn attach(&mut self, opened: OpenedRemoteStream) {
+        self.attach_with_placement(opened, RelayPathPlacement::Active);
+    }
+
+    pub(super) fn attach_for_repair(&mut self, opened: OpenedRemoteStream) {
+        self.attach_with_placement(opened, RelayPathPlacement::PreserveActive);
+    }
+
+    fn attach_with_placement(&mut self, opened: OpenedRemoteStream, placement: RelayPathPlacement) {
         let path_index = opened.path_index;
         let underlay = opened.stream.underlay;
         let key = RelayPathKey {
@@ -171,11 +183,23 @@ impl TcpRelayRemoteSet {
                 })
                 .await;
         });
-        self.paths.push(TcpRelayRemotePath {
+        let path = TcpRelayRemotePath {
             path_index,
             instance_id,
             stream,
-        });
+        };
+        let insert_at = match placement {
+            RelayPathPlacement::Active => self.paths.len(),
+            RelayPathPlacement::PreserveActive if self.paths.is_empty() => self.paths.len(),
+            RelayPathPlacement::PreserveActive => self.paths.len() - 1,
+        };
+        if insert_at < self.paths.len() && self.next_send_index >= insert_at {
+            self.next_send_index = self.next_send_index.saturating_add(1);
+        }
+        self.paths.insert(insert_at, path);
+        if !self.paths.is_empty() {
+            self.next_send_index %= self.paths.len();
+        }
     }
 
     pub(super) async fn recv_frame(&mut self) -> Result<TcpRelayRemoteFrame, RuntimeError> {
@@ -320,6 +344,23 @@ impl TcpRelayRemoteSet {
         Some(path)
     }
 
+    pub(super) fn promote_path_instance_to_active(&mut self, instance: RelayPathInstance) -> bool {
+        let Some(position) = self
+            .paths
+            .iter()
+            .position(|path| path.instance() == instance)
+        else {
+            return false;
+        };
+        if position + 1 == self.paths.len() {
+            return false;
+        }
+        let path = self.paths.remove(position);
+        self.paths.push(path);
+        self.next_send_index = 0;
+        true
+    }
+
     pub(super) async fn replay_repair_cache_to_instance(
         &mut self,
         instance: RelayPathInstance,
@@ -347,6 +388,12 @@ impl TcpRelayRemoteSet {
         }
         Ok(true)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelayPathPlacement {
+    Active,
+    PreserveActive,
 }
 
 #[derive(Clone)]

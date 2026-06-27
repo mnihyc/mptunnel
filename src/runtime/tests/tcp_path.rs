@@ -1057,38 +1057,40 @@ fn relay_candidate_filter_preserves_current_carrier_cohort() {
     );
 }
 
+fn opened_relay_stream_for_test(
+    stream_id: StreamId,
+    underlay: UnderlayProtocol,
+    path_index: usize,
+) -> (
+    OpenedRemoteStream,
+    TcpPathSessionCommandReceivers,
+    mpsc::Sender<Result<Frame, RuntimeError>>,
+) {
+    let mux_limits = MuxLimits::default();
+    let (commands, command_rx) = tcp_path_session_command_channels(4);
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    (
+        OpenedRemoteStream {
+            path_index,
+            stream: TcpPathStream {
+                stream_id,
+                max_offset: mux_limits.max_stream_window_bytes,
+                class: TrafficClass::Bulk,
+                underlay,
+                max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
+                output: TcpPathStreamOutput::Fixed(commands),
+                frames: frames_rx,
+            },
+        },
+        command_rx,
+        frames_tx,
+    )
+}
+
 #[tokio::test]
 async fn mixed_relay_current_carrier_tracks_latest_data_path() {
-    fn opened_relay_stream_for_test(
-        underlay: UnderlayProtocol,
-        path_index: usize,
-    ) -> (
-        OpenedRemoteStream,
-        TcpPathSessionCommandReceivers,
-        mpsc::Sender<Result<Frame, RuntimeError>>,
-    ) {
-        let (commands, command_rx) = tcp_path_session_command_channels(4);
-        let (frames_tx, frames_rx) = mpsc::channel(4);
-        (
-            OpenedRemoteStream {
-                path_index,
-                stream: TcpPathStream {
-                    stream_id: StreamId(44),
-                    max_offset: MuxLimits::default().max_stream_window_bytes,
-                    class: TrafficClass::Bulk,
-                    underlay,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
-                    output: TcpPathStreamOutput::Fixed(commands),
-                    frames: frames_rx,
-                },
-            },
-            command_rx,
-            frames_tx,
-        )
-    }
-
     let (tcp_stream, _tcp_commands, _tcp_frames) =
-        opened_relay_stream_for_test(UnderlayProtocol::Tcp, 0);
+        opened_relay_stream_for_test(StreamId(44), UnderlayProtocol::Tcp, 0);
     let mut remotes = TcpRelayRemoteSet::new(tcp_stream, 4);
     assert_eq!(
         remotes.active_carrier_underlay(),
@@ -1096,7 +1098,7 @@ async fn mixed_relay_current_carrier_tracks_latest_data_path() {
     );
 
     let (udp_stream, _udp_commands, _udp_frames) =
-        opened_relay_stream_for_test(UnderlayProtocol::Udp, 1);
+        opened_relay_stream_for_test(StreamId(44), UnderlayProtocol::Udp, 1);
     remotes.attach(udp_stream);
     assert_eq!(
         remotes.active_carrier_underlay(),
@@ -1122,6 +1124,149 @@ async fn mixed_relay_current_carrier_tracks_latest_data_path() {
             index: 2,
         }]
     );
+}
+
+#[tokio::test]
+async fn repair_race_attach_preserves_active_data_path() {
+    let stream_id = StreamId(46);
+    let (active_stream, mut active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = TcpRelayRemoteSet::new(active_stream, 4);
+    let (repair_stream, mut repair_commands, _repair_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 1);
+
+    remotes.attach_for_repair(repair_stream);
+
+    assert_eq!(
+        remotes.active_path_index_for(UnderlayProtocol::Udp),
+        Some(0)
+    );
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:11000".parse().expect("first path"),
+            "udp://127.0.0.1:11001".parse().expect("second path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    remotes
+        .send_frame(
+            &context,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"data"),
+            },
+        )
+        .await
+        .expect("send data");
+
+    match recv_tcp_path_command(&mut active_commands)
+        .await
+        .expect("active command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { payload, .. }) => {
+            assert_eq!(&payload[..], b"data");
+        }
+        _ => panic!("expected data on active path"),
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut repair_commands)
+        )
+        .await
+        .is_err(),
+        "repair path should not become active for new data"
+    );
+}
+
+#[tokio::test]
+async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
+    let stream_id = StreamId(47);
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:11010?srtt-ms=20&rate-mbps=120"
+                .parse()
+                .expect("fast path"),
+            "udp://127.0.0.1:11011?srtt-ms=180&rate-mbps=30"
+                .parse()
+                .expect("slow path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let (slow_active, mut slow_commands, _slow_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 1);
+    let mut remotes = TcpRelayRemoteSet::new(slow_active, 4);
+    let (fast_repair, mut fast_commands, _fast_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    remotes.attach_for_repair(fast_repair);
+    let fast_instance = remotes
+        .paths
+        .iter()
+        .find(|path| path.path_index == 0)
+        .expect("fast repair path")
+        .instance();
+
+    assert!(tcp_relay_delivery_path_should_become_active(
+        &context,
+        remotes.active_path_key(),
+        fast_instance.key,
+        TrafficClass::Bulk,
+        64 * 1024,
+    ));
+    assert!(remotes.promote_path_instance_to_active(fast_instance));
+    assert_eq!(
+        remotes.active_path_index_for(UnderlayProtocol::Udp),
+        Some(0)
+    );
+
+    remotes
+        .send_frame(
+            &context,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"bulk"),
+            },
+        )
+        .await
+        .expect("send data");
+    match recv_tcp_path_command(&mut fast_commands)
+        .await
+        .expect("fast command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { payload, .. }) => {
+            assert_eq!(&payload[..], b"bulk");
+        }
+        _ => panic!("expected data on promoted fast path"),
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut slow_commands)
+        )
+        .await
+        .is_err(),
+        "slow active path should stop receiving new data after promotion"
+    );
+
+    let worse_path = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 1,
+    };
+    assert!(!tcp_relay_delivery_path_should_become_active(
+        &context,
+        remotes.active_path_key(),
+        worse_path,
+        TrafficClass::Bulk,
+        64 * 1024,
+    ));
 }
 
 #[tokio::test]

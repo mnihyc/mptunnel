@@ -594,6 +594,20 @@ where
                             receive_hole_repair_attempts = 0;
                             response_stall_reannounce_attempts = 0;
                             path_last_delivery_at.insert(path_key, Instant::now());
+                            if tcp_relay_delivery_path_should_become_active(
+                                context,
+                                remotes.active_path_key(),
+                                path_key,
+                                relay_class,
+                                tcp_relay_attach_payload_bytes(
+                                    &send_stream,
+                                    relay_class,
+                                    context.mux_limits,
+                                ),
+                            ) && remotes.promote_path_instance_to_active(instance)
+                            {
+                                last_stream_progress_at = Instant::now();
+                            }
                         }
                         let mut write_error = None;
                         for chunk in outcome.delivered {
@@ -920,7 +934,11 @@ pub(super) async fn attach_relay_path_candidates(
                 .await
                 {
                     Ok(()) => {
-                        remotes.attach(opened);
+                        if request.race_repair {
+                            remotes.attach_for_repair(opened);
+                        } else {
+                            remotes.attach(opened);
+                        }
                         attached += 1;
                         if !request.race_repair {
                             return Ok(attached);
@@ -1174,7 +1192,11 @@ pub(super) async fn attach_udp_relay_paths(
             Ok(opened) => {
                 match replay_tcp_repair_cache(&opened.stream, send_stream, resend_fin).await {
                     Ok(()) => {
-                        remotes.attach(opened);
+                        if race_repair {
+                            remotes.attach_for_repair(opened);
+                        } else {
+                            remotes.attach(opened);
+                        }
                         attached += 1;
                         if !race_repair {
                             return Ok(attached);
@@ -1546,12 +1568,39 @@ pub(super) fn tcp_relay_receive_hole_victim_score(
     class: TrafficClass,
     payload_bytes: usize,
 ) -> f64 {
-    relay_path_snapshot(context, key)
-        .and_then(|snapshot| {
-            scheduler::score_path(snapshot, class, payload_bytes, SchedulerPolicy::default())
-                .map(|score| score.eta_ms)
-        })
-        .unwrap_or(f64::INFINITY)
+    tcp_relay_path_eta_ms(context, key, class, payload_bytes).unwrap_or(f64::INFINITY)
+}
+
+pub(super) fn tcp_relay_delivery_path_should_become_active(
+    context: &ClientPathContext,
+    current: Option<RelayPathKey>,
+    delivered: RelayPathKey,
+    class: TrafficClass,
+    payload_bytes: usize,
+) -> bool {
+    if current == Some(delivered) {
+        return false;
+    }
+    let Some(delivered_eta) = tcp_relay_path_eta_ms(context, delivered, class, payload_bytes)
+    else {
+        return false;
+    };
+    let current_eta = current
+        .and_then(|key| tcp_relay_path_eta_ms(context, key, class, payload_bytes))
+        .unwrap_or(f64::INFINITY);
+    delivered_eta < current_eta
+}
+
+pub(super) fn tcp_relay_path_eta_ms(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    class: TrafficClass,
+    payload_bytes: usize,
+) -> Option<f64> {
+    relay_path_snapshot(context, key).and_then(|snapshot| {
+        scheduler::score_path(snapshot, class, payload_bytes, SchedulerPolicy::default())
+            .map(|score| score.eta_ms)
+    })
 }
 
 pub(super) fn tcp_relay_stale_delivery_order(

@@ -390,8 +390,16 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     )
 
 
-def udp_worker(args, bulk_ready, result):
+def udp_worker(args, started_at, bulk_ready, result):
     latencies = []
+    max_latency_ms = None
+    max_index = None
+    max_start_s = None
+    max_end_s = None
+    max_after_failover_ms = None
+    max_after_failover_index = None
+    max_after_failover_start_s = None
+    max_after_failover_end_s = None
     received = 0
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
     try:
@@ -424,6 +432,7 @@ def udp_worker(args, bulk_ready, result):
                         body_len - 4
                     )
                     started = time.monotonic()
+                    started_s = started - started_at
                     udp.sendto(target_prefix + payload, (relay_host, relay_port))
                     deadline = started + timeout
                     while True:
@@ -437,8 +446,30 @@ def udp_worker(args, bulk_ready, result):
                             break
                         _, _, response = parse_udp_packet(packet)
                         if response == payload:
+                            finished_s = time.monotonic() - started_at
+                            latency_ms = (time.monotonic() - started) * 1000.0
                             received += 1
-                            latencies.append((time.monotonic() - started) * 1000.0)
+                            latencies.append(latency_ms)
+                            if max_latency_ms is None or latency_ms > max_latency_ms:
+                                max_latency_ms = latency_ms
+                                max_index = index
+                                max_start_s = started_s
+                                max_end_s = finished_s
+                            if (
+                                args.failover_after >= 0
+                                and (
+                                    finished_s >= args.failover_after
+                                    or started_s >= args.failover_after
+                                )
+                                and (
+                                    max_after_failover_ms is None
+                                    or latency_ms > max_after_failover_ms
+                                )
+                            ):
+                                max_after_failover_ms = latency_ms
+                                max_after_failover_index = index
+                                max_after_failover_start_s = started_s
+                                max_after_failover_end_s = finished_s
                             break
                     if args.udp_interval_ms > 0:
                         time.sleep(args.udp_interval_ms / 1000.0)
@@ -454,7 +485,14 @@ def udp_worker(args, bulk_ready, result):
             else 0.0,
             "udp_p50_ms": percentile(latencies, 0.50),
             "udp_p95_ms": percentile(latencies, 0.95),
-            "udp_max_ms": max(latencies) if latencies else None,
+            "udp_max_ms": max_latency_ms,
+            "udp_max_index": max_index,
+            "udp_max_start_s": max_start_s,
+            "udp_max_end_s": max_end_s,
+            "udp_max_after_failover_ms": max_after_failover_ms,
+            "udp_max_after_failover_index": max_after_failover_index,
+            "udp_max_after_failover_start_s": max_after_failover_start_s,
+            "udp_max_after_failover_end_s": max_after_failover_end_s,
         }
     )
 
@@ -531,7 +569,7 @@ def main():
             args=(args, started_at, interactive_ready, interactive),
             daemon=True,
         ),
-        threading.Thread(target=udp_worker, args=(args, bulk_ready, udp), daemon=True),
+        threading.Thread(target=udp_worker, args=(args, started_at, bulk_ready, udp), daemon=True),
     ]
     for thread in threads:
         thread.start()

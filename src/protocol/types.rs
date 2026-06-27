@@ -346,11 +346,6 @@ pub enum Frame {
     Pong {
         nonce: u64,
     },
-    KeyUpdate {
-        key_phase: u64,
-        nonce: AuthNonce,
-        auth_tag: AuthTag,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

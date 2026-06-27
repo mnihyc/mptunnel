@@ -360,16 +360,6 @@ fn encode_payload(
             put_u64(out, *nonce);
             Ok(FrameKind::Pong)
         }
-        Frame::KeyUpdate {
-            key_phase,
-            nonce,
-            auth_tag,
-        } => {
-            put_u64(out, *key_phase);
-            encode_nonce(out, *nonce);
-            encode_auth_tag(out, *auth_tag);
-            Ok(FrameKind::KeyUpdate)
-        }
     }
 }
 
@@ -540,11 +530,6 @@ fn decode_payload(
         }),
         FrameKind::Pong => Ok(Frame::Pong {
             nonce: reader.get_u64()?,
-        }),
-        FrameKind::KeyUpdate => Ok(Frame::KeyUpdate {
-            key_phase: reader.get_u64()?,
-            nonce: decode_nonce(reader)?,
-            auth_tag: decode_auth_tag(reader)?,
         }),
     }
 }
@@ -986,7 +971,6 @@ enum FrameKind {
     DatagramFeedback = 23,
     PathMetrics = 24,
     RxRateHint = 25,
-    KeyUpdate = 26,
     StreamFin = 27,
     PathMtuProbe = 28,
     PathMtuAck = 29,
@@ -1022,7 +1006,6 @@ impl FrameKind {
             23 => Ok(Self::DatagramFeedback),
             24 => Ok(Self::PathMetrics),
             25 => Ok(Self::RxRateHint),
-            26 => Ok(Self::KeyUpdate),
             27 => Ok(Self::StreamFin),
             28 => Ok(Self::PathMtuProbe),
             29 => Ok(Self::PathMtuAck),
@@ -1285,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn control_frames_round_trip_auth_path_metrics_and_key_update() {
+    fn control_frames_round_trip_auth_and_path_metrics() {
         let nonce = AuthNonce([7; 16]);
         let auth_tag = AuthTag([9; 32]);
         let caps = PathCapabilities {
@@ -1369,11 +1352,6 @@ mod tests {
         round_trip(Frame::RxRateHint {
             path_id: PathId(3),
             hint: RateHint::BitsPerSecond(300_000_000),
-        });
-        round_trip(Frame::KeyUpdate {
-            key_phase: 2,
-            nonce,
-            auth_tag,
         });
     }
 

@@ -211,7 +211,6 @@ fn frame_kind_name(frame: &Frame) -> &'static str {
         Frame::MaxConnectionData { .. } => "MAX_CONNECTION_DATA",
         Frame::Ping { .. } => "PING",
         Frame::Pong { .. } => "PONG",
-        Frame::KeyUpdate { .. } => "KEY_UPDATE",
     }
 }
 
@@ -295,7 +294,6 @@ fn frame_subject(frame: &Frame) -> String {
         Frame::PathMetrics { metrics } => format!("path_id={}", metrics.path_id.0),
         Frame::MaxConnectionData { max_bytes } => format!("max_bytes={max_bytes}"),
         Frame::Ping { nonce } | Frame::Pong { nonce } => format!("nonce={nonce}"),
-        Frame::KeyUpdate { key_phase, .. } => format!("key_phase={key_phase}"),
     }
 }
 
@@ -1094,6 +1092,5 @@ fn udp_pre_establishment_frame_can_be_dropped(frame: &Frame) -> bool {
             | Frame::MaxConnectionData { .. }
             | Frame::Ping { .. }
             | Frame::Pong { .. }
-            | Frame::KeyUpdate { .. }
     )
 }

@@ -2,7 +2,7 @@
 name = "mptunnel"
 version = "0.1.0"
 edition = "2024"
-description = "Multipath proxy and tunnel prototype"
+description = "Encrypted multipath proxy and tunnel"
 license = "Apache-2.0"
 
 [dependencies]

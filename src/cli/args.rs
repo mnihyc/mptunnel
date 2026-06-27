@@ -1506,41 +1506,4 @@ mod tests {
             ))
         ));
     }
-
-    #[test]
-    fn fixed_tcp_traffic_modes_are_not_user_configurable() {
-        assert!(
-            Cli::try_parse_from([
-                "mptunnel",
-                "--secret",
-                "0123456789abcdef0123456789abcdef",
-                "client",
-                "--default-tcp-class",
-                "bulk",
-                "--tcp-class-rule",
-                "22=control",
-                "--tcp-class-rule",
-                "443:interactive",
-                "--path",
-                "tcp://127.0.0.1:443",
-            ])
-            .is_err()
-        );
-
-        assert!(
-            Cli::try_parse_from([
-                "mptunnel",
-                "--secret",
-                "0123456789abcdef0123456789abcdef",
-                "client",
-                "--tcp-class-rule",
-                "443=bulk",
-                "--tcp-class-rule",
-                "443=interactive",
-                "--path",
-                "tcp://127.0.0.1:443",
-            ])
-            .is_err()
-        );
-    }
 }

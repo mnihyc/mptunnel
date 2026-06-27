@@ -6,7 +6,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v1";
 const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v1";
-const KEY_UPDATE_CONTEXT: &[u8] = b"mptunnel key update v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAuthCheck {
@@ -114,22 +113,6 @@ impl SessionAuthenticator {
         update_issued_at(&mut mac, check.issued_at_unix_secs);
         update_capabilities(&mut mac, check.capabilities);
         verify_tag(mac, check.tag)
-    }
-
-    pub fn key_update_tag(&self, key_phase: u64, nonce: AuthNonce) -> AuthTag {
-        let mut mac = self.mac();
-        mac.update(KEY_UPDATE_CONTEXT);
-        mac.update(&key_phase.to_be_bytes());
-        update_nonce(&mut mac, nonce);
-        finalize_tag(mac)
-    }
-
-    pub fn verify_key_update(&self, key_phase: u64, nonce: AuthNonce, tag: AuthTag) -> bool {
-        let mut mac = self.mac();
-        mac.update(KEY_UPDATE_CONTEXT);
-        mac.update(&key_phase.to_be_bytes());
-        update_nonce(&mut mac, nonce);
-        verify_tag(mac, tag)
     }
 
     fn mac(&self) -> HmacSha256 {
@@ -323,17 +306,5 @@ mod tests {
             now_unix_secs: issued_at + 301,
             freshness_window_secs: 300,
         }));
-    }
-
-    #[test]
-    fn key_update_tags_are_domain_separated_from_session_auth() {
-        let auth = authenticator();
-        let nonce = AuthNonce([4; 16]);
-        let session_tag = auth.session_auth_tag(SessionId(7), nonce, 1_735_689_600);
-        let key_tag = auth.key_update_tag(7, nonce);
-
-        assert_ne!(session_tag, key_tag);
-        assert!(auth.verify_key_update(7, nonce, key_tag));
-        assert!(!auth.verify_key_update(8, nonce, key_tag));
     }
 }

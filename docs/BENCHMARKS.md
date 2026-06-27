@@ -58,7 +58,7 @@ The current developer profile is `developer-gates-v1`.
 | `tcp_path_inflight_budget` | default TCP path inflight budget | <= 8 MiB |
 | `lab_hot_path_ram_budget` | modeled hot-path RAM budget for manual lab target | <= 256 MiB |
 
-The CPU gates benchmark both ChaCha20-Poly1305 and AES-256-GCM because supported machines vary by architecture and hardware acceleration. The running transport currently uses ChaCha20-Poly1305; the AES gate prevents regressions in the alternative crypto profile the design evaluates for amd64 and aarch64.
+The CPU gates measure both AES-256-GCM and ChaCha20-Poly1305 because supported machines vary by architecture and hardware acceleration. AES-256-GCM is the production default, while ChaCha20-Poly1305 remains a selectable profile for deployments where it performs better.
 
 ## Options
 

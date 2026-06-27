@@ -97,6 +97,56 @@ parse_and_record_curl() {
   fi
 }
 
+append_download_probe_result() {
+  local case_name="$1"
+  local exit_code="$2"
+  local output="$3"
+  local probe_stderr="$4"
+  local client_log server_log
+
+  client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n 80 \"\$file\"; done | tail -c 4000" 2>/dev/null || true)"
+  server_log="$(exec_in server "tail -n 120 /tmp/mptunnel-server.log 2>/dev/null | tail -c 4000" 2>/dev/null || true)"
+
+  ROW="$output" \
+  EXIT_CODE="$exit_code" \
+  PROBE_STDERR="$probe_stderr" \
+  CLIENT_LOG="$client_log" \
+  SERVER_LOG="$server_log" \
+  python3 - "$case_name" <<'PY' >> "$result_file"
+import json
+import os
+import sys
+
+case = sys.argv[1]
+raw = os.environ.get("ROW", "")
+try:
+    row = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+    row = {"raw_output": raw}
+if not row:
+    try:
+        exit_code = int(os.environ.get("EXIT_CODE", "124"))
+    except ValueError:
+        exit_code = 124
+    row = {
+        "case": case,
+        "protocol": "tcp",
+        "status": "fail",
+        "exit_code": exit_code,
+    }
+if row.get("status") != "ok":
+    for env_name, field in (
+        ("PROBE_STDERR", "probe_stderr_tail"),
+        ("CLIENT_LOG", "client_log_tail"),
+        ("SERVER_LOG", "server_log_tail"),
+    ):
+        value = os.environ.get(env_name, "")
+        if value:
+            row[field] = value[-4000:]
+print(json.dumps(row, sort_keys=True))
+PY
+}
+
 run_curl_case() {
   local case_name="$1"
   local protocol="$2"
@@ -113,16 +163,16 @@ run_curl_case() {
 
 run_tcp_download_probe_case() {
   local case_name="$1"
+  local out_file="/tmp/mptunnel-probe-${case_name}.out"
+  local err_file="/tmp/mptunnel-probe-${case_name}.err"
   set +e
-  local output
-  output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after -1 --timeout '${curl_timeout}'" 2>/dev/null)"
+  local output probe_stderr
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path /large.bin --failover-after -1 --timeout '${curl_timeout}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  if [[ -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
-  else
-    printf '{"case":"%s","protocol":"tcp","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
-  fi
+  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
 }
 
 stop_process() {

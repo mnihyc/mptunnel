@@ -381,6 +381,167 @@ struct TunUdpResponse {
     destination: SocketAddr,
 }
 
+struct UdpEdgeRequest<M> {
+    target: TargetAddr,
+    payload: Bytes,
+    ttl_ms: u32,
+    metadata: M,
+}
+
+struct UdpEdgeCompletion<M> {
+    lane_id: usize,
+    target: TargetAddr,
+    metadata: M,
+    result: Result<Bytes, RuntimeError>,
+}
+
+struct UdpEdgeLane<M> {
+    lane_id: usize,
+    pending: usize,
+    requests: mpsc::Sender<UdpEdgeRequest<M>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+fn udp_edge_queue_slots(context: &ClientPathContext) -> usize {
+    let payload = context.mux_limits.max_payload_bytes.max(1);
+    (context.mux_limits.max_datagram_queue_bytes / payload).max(1)
+}
+
+fn udp_edge_lane_limit(context: &ClientPathContext) -> usize {
+    let path_parallelism = context.udp_paths.len().max(1).saturating_mul(2);
+    udp_edge_queue_slots(context).min(path_parallelism.max(1))
+}
+
+fn udp_edge_lane_queue(context: &ClientPathContext) -> usize {
+    let lanes = udp_edge_lane_limit(context).max(1);
+    (udp_edge_queue_slots(context) / lanes).max(1)
+}
+
+fn udp_edge_completion_queue(context: &ClientPathContext) -> usize {
+    udp_edge_lane_limit(context)
+        .saturating_mul(udp_edge_lane_queue(context))
+        .max(1)
+}
+
+fn spawn_udp_edge_lane<M: Send + 'static>(
+    lane_id: usize,
+    context: ClientPathContext,
+    lane_queue: usize,
+    completions: mpsc::Sender<UdpEdgeCompletion<M>>,
+) -> UdpEdgeLane<M> {
+    let (requests, rx) = mpsc::channel(lane_queue);
+    let handle = tokio::spawn(run_udp_edge_lane(lane_id, context, rx, completions));
+    UdpEdgeLane {
+        lane_id,
+        pending: 0,
+        requests,
+        handle,
+    }
+}
+
+async fn run_udp_edge_lane<M: Send + 'static>(
+    lane_id: usize,
+    context: ClientPathContext,
+    mut requests: mpsc::Receiver<UdpEdgeRequest<M>>,
+    completions: mpsc::Sender<UdpEdgeCompletion<M>>,
+) {
+    let mut association = match UdpDatagramClientAssociation::new(context) {
+        Ok(association) => association,
+        Err(err) => {
+            eprintln!("warning: UDP edge lane could not start: {err}");
+            return;
+        }
+    };
+    while let Some(request) = requests.recv().await {
+        let UdpEdgeRequest {
+            target,
+            payload,
+            ttl_ms,
+            metadata,
+        } = request;
+        let result = association
+            .send_to_with_adaptive_retries(target.clone(), payload, ttl_ms)
+            .await;
+        if completions
+            .send(UdpEdgeCompletion {
+                lane_id,
+                target,
+                metadata,
+                result,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    if let Err(err) = association.close().await {
+        eprintln!("warning: UDP edge lane close failed: {err}");
+    }
+}
+
+fn dispatch_udp_edge_request<M: Send + 'static>(
+    lanes: &mut Vec<UdpEdgeLane<M>>,
+    next_lane_id: &mut usize,
+    context: &ClientPathContext,
+    completions: &mpsc::Sender<UdpEdgeCompletion<M>>,
+    request: UdpEdgeRequest<M>,
+) -> Result<(), UdpEdgeRequest<M>> {
+    let lane_limit = udp_edge_lane_limit(context);
+    let lane_queue = udp_edge_lane_queue(context);
+    if lanes.is_empty() || (lanes.len() < lane_limit && lanes.iter().all(|lane| lane.pending > 0)) {
+        let lane_id = *next_lane_id;
+        *next_lane_id = next_lane_id.saturating_add(1);
+        lanes.push(spawn_udp_edge_lane(
+            lane_id,
+            context.clone(),
+            lane_queue,
+            completions.clone(),
+        ));
+    }
+
+    let Some((position, _)) = lanes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, lane)| (lane.pending, lane.lane_id))
+    else {
+        return Err(request);
+    };
+
+    match lanes[position].requests.try_send(request) {
+        Ok(()) => {
+            lanes[position].pending = lanes[position].pending.saturating_add(1);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(request)) => Err(request),
+        Err(mpsc::error::TrySendError::Closed(request)) => {
+            lanes.swap_remove(position);
+            Err(request)
+        }
+    }
+}
+
+fn finish_udp_edge_completion<M>(lanes: &mut [UdpEdgeLane<M>], completion: &UdpEdgeCompletion<M>) {
+    if let Some(lane) = lanes
+        .iter_mut()
+        .find(|lane| lane.lane_id == completion.lane_id)
+    {
+        lane.pending = lane.pending.saturating_sub(1);
+    }
+}
+
+async fn close_udp_edge_lanes<M>(lanes: Vec<UdpEdgeLane<M>>) {
+    let handles = lanes
+        .into_iter()
+        .map(|lane| lane.handle)
+        .collect::<Vec<_>>();
+    for handle in handles {
+        if let Err(err) = handle.await {
+            eprintln!("warning: UDP edge lane task failed: {err}");
+        }
+    }
+}
+
 async fn run_tun_udp_socket(
     udp_socket: TunUdpSocket,
     context: ClientPathContext,
@@ -464,42 +625,65 @@ async fn handle_tun_udp_flow(
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     responses: mpsc::Sender<TunUdpResponse>,
 ) -> Result<(), RuntimeError> {
-    let mut association = UdpDatagramClientAssociation::new(context)?;
+    let (completion_tx, mut completion_rx) =
+        mpsc::channel::<UdpEdgeCompletion<TunUdpFlowKey>>(udp_edge_completion_queue(&context));
+    let mut lanes = Vec::<UdpEdgeLane<TunUdpFlowKey>>::new();
+    let mut next_lane_id = 0usize;
+    let target = TargetAddr::Ip(tun_udp_target_for_remote(key.remote, &tun));
+    let ttl_ms = tun_udp_ttl_ms(key.remote, &tun);
     let result = loop {
-        let payload = match tokio::time::timeout(TUN_UDP_FLOW_IDLE_TIMEOUT, datagrams.recv()).await
-        {
-            Ok(Some(payload)) => payload,
-            Ok(None) | Err(_) => break Ok(()),
-        };
-        let target = tun_udp_target_for_remote(key.remote, &tun);
-        let ttl_ms = tun_udp_ttl_ms(key.remote, &tun);
-        let payload = Bytes::from(payload);
-        let response = match association
-            .send_to_with_adaptive_retries(TargetAddr::Ip(target), payload, ttl_ms)
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                eprintln!(
-                    "warning: TUN UDP datagram {} -> {} failed: {err}",
-                    key.local, key.remote
-                );
-                continue;
+        tokio::select! {
+            payload = tokio::time::timeout(TUN_UDP_FLOW_IDLE_TIMEOUT, datagrams.recv()) => {
+                let payload = match payload {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) | Err(_) => break Ok(()),
+                };
+                if dispatch_udp_edge_request(
+                    &mut lanes,
+                    &mut next_lane_id,
+                    &context,
+                    &completion_tx,
+                    UdpEdgeRequest {
+                        target: target.clone(),
+                        payload: Bytes::from(payload),
+                        ttl_ms,
+                        metadata: key,
+                    },
+                )
+                .is_err()
+                {
+                    eprintln!("warning: TUN UDP lane queue full; dropping datagram from {} to {}", key.local, key.remote);
+                }
             }
-        };
-        responses
-            .send(TunUdpResponse {
-                payload: response.to_vec(),
-                source: key.remote,
-                destination: key.local,
-            })
-            .await
-            .map_err(|_| RuntimeError::Protocol("TUN UDP response channel closed"))?;
+            completion = completion_rx.recv() => {
+                let Some(completion) = completion else {
+                    break Err(RuntimeError::Protocol("TUN UDP completion channel closed"));
+                };
+                finish_udp_edge_completion(&mut lanes, &completion);
+                match completion.result {
+                    Ok(response) => {
+                        responses
+                            .send(TunUdpResponse {
+                                payload: response.to_vec(),
+                                source: completion.metadata.remote,
+                                destination: completion.metadata.local,
+                            })
+                            .await
+                            .map_err(|_| RuntimeError::Protocol("TUN UDP response channel closed"))?;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "warning: TUN UDP datagram {} -> {} failed: {err}",
+                            completion.metadata.local, completion.metadata.remote
+                        );
+                    }
+                }
+            }
+            else => break Ok(()),
+        }
     };
-    let close_result = association.close().await;
-    if result.is_ok() {
-        close_result?;
-    }
+    drop(completion_tx);
+    close_udp_edge_lanes(lanes).await;
     result
 }
 
@@ -4374,7 +4558,10 @@ where
 
     let mut packet = vec![0u8; local_udp_buffer_len(context.mux_limits)];
     let mut control_probe = [0u8; 1];
-    let mut udp_association = UdpDatagramClientAssociation::new(context.clone())?;
+    let (completion_tx, mut completion_rx) =
+        mpsc::channel::<UdpEdgeCompletion<SocketAddr>>(udp_edge_completion_queue(&context));
+    let mut lanes = Vec::<UdpEdgeLane<SocketAddr>>::new();
+    let mut next_lane_id = 0usize;
     let result = loop {
         tokio::select! {
             read = stream.read(&mut control_probe) => {
@@ -4403,31 +4590,50 @@ where
                     break Err(RuntimeError::Protocol("trailing SOCKS5 UDP datagram bytes"));
                 }
                 let target = datagram.target.clone();
-                let payload = datagram.payload;
-                let response = match udp_association
-                    .send_to_with_adaptive_retries(target.clone(), payload, DEFAULT_SOCKS5_UDP_TTL_MS)
-                    .await
+                if dispatch_udp_edge_request(
+                    &mut lanes,
+                    &mut next_lane_id,
+                    &context,
+                    &completion_tx,
+                    UdpEdgeRequest {
+                        target,
+                        payload: datagram.payload,
+                        ttl_ms: DEFAULT_SOCKS5_UDP_TTL_MS,
+                        metadata: peer,
+                    },
+                )
+                .is_err()
                 {
-                    Ok(response) => response,
-                    Err(err) => {
-                        eprintln!("warning: SOCKS5 UDP datagram to {target:?} failed: {err}");
-                        continue;
+                    eprintln!("warning: SOCKS5 UDP lane queue full; dropping datagram from {peer}");
+                }
+            }
+            completion = completion_rx.recv() => {
+                let Some(completion) = completion else {
+                    break Err(RuntimeError::Protocol("SOCKS5 UDP completion channel closed"));
+                };
+                finish_udp_edge_completion(&mut lanes, &completion);
+                match completion.result {
+                    Ok(response) => {
+                        let response_packet = match socks5::udp_datagram(&completion.target, &response) {
+                            Ok(packet) => packet,
+                            Err(err) => break Err(RuntimeError::Socks5(err)),
+                        };
+                        if let Err(err) = relay_socket.send_to(&response_packet, completion.metadata).await {
+                            break Err(RuntimeError::Io(err));
+                        }
                     }
-                };
-                let response_packet = match socks5::udp_datagram(&target, &response) {
-                    Ok(packet) => packet,
-                    Err(err) => break Err(RuntimeError::Socks5(err)),
-                };
-                if let Err(err) = relay_socket.send_to(&response_packet, peer).await {
-                    break Err(RuntimeError::Io(err));
+                    Err(err) => {
+                        eprintln!(
+                            "warning: SOCKS5 UDP datagram to {:?} failed: {err}",
+                            completion.target
+                        );
+                    }
                 }
             }
         }
     };
-    let close_result = udp_association.close().await;
-    if result.is_ok() {
-        close_result?;
-    }
+    drop(completion_tx);
+    close_udp_edge_lanes(lanes).await;
     result
 }
 
@@ -9069,6 +9275,41 @@ mod tests {
         (addr, handle)
     }
 
+    async fn spawn_udp_reordered_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("target bind"));
+        let addr = socket.local_addr().expect("target addr");
+        let handle = tokio::spawn(async move {
+            let mut delayed = tokio::task::JoinSet::new();
+            let mut buf = [0u8; 16];
+            for _ in 0..2 {
+                let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
+                match &buf[..len] {
+                    b"slow" => {
+                        let socket = socket.clone();
+                        delayed.spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            socket
+                                .send_to(b"slow-pong", peer)
+                                .await
+                                .expect("target delayed send");
+                        });
+                    }
+                    b"fast" => {
+                        socket
+                            .send_to(b"fast-pong", peer)
+                            .await
+                            .expect("target fast send");
+                    }
+                    payload => panic!("unexpected UDP payload: {payload:?}"),
+                }
+            }
+            while let Some(result) = delayed.join_next().await {
+                result.expect("delayed target response");
+            }
+        });
+        (addr, handle)
+    }
+
     async fn spawn_udp_drop_first_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
         let addr = socket.local_addr().expect("target addr");
@@ -12865,6 +13106,89 @@ mod tests {
             assert_eq!(health.udp[0].measured_loss_rate, Some(0.0));
         }
         server.await.expect("server join").expect("server");
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response() {
+        let (target_addr, target) = spawn_udp_reordered_echo_target().await;
+        let path = reserve_udp_path().await;
+        let server = tokio::spawn(run_server(
+            vec![path.clone()],
+            OutboundConfig::Direct,
+            DnsConfig::default(),
+            security(),
+            ResourceLimits::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let (mut control_client, control_server) = duplex(4096);
+        let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
+
+        control_client
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("auth request");
+        let mut auth_response = [0u8; 2];
+        control_client
+            .read_exact(&mut auth_response)
+            .await
+            .expect("auth response");
+        assert_eq!(auth_response, [0x05, 0x00]);
+        control_client
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .expect("udp associate");
+        let mut associate_response = [0u8; 10];
+        control_client
+            .read_exact(&mut associate_response)
+            .await
+            .expect("associate response");
+        let relay_addr = SocketAddr::from((
+            [
+                associate_response[4],
+                associate_response[5],
+                associate_response[6],
+                associate_response[7],
+            ],
+            u16::from_be_bytes([associate_response[8], associate_response[9]]),
+        ));
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp client bind");
+        let slow =
+            socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"slow").expect("slow request");
+        let fast =
+            socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"fast").expect("fast request");
+        udp_client
+            .send_to(&slow, relay_addr)
+            .await
+            .expect("send slow request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        udp_client
+            .send_to(&fast, relay_addr)
+            .await
+            .expect("send fast request");
+
+        let mut response = [0u8; 128];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_millis(400),
+            udp_client.recv_from(&mut response),
+        )
+        .await
+        .expect("fast response should not wait for slow response")
+        .expect("fast recv");
+        let (datagram, consumed) = socks5::parse_udp_datagram(&response[..len]).expect("datagram");
+        assert_eq!(consumed, len);
+        assert_eq!(datagram.target, TargetAddr::Ip(target_addr));
+        assert_eq!(datagram.payload, Bytes::from_static(b"fast-pong"));
+
+        control_client.shutdown().await.expect("control shutdown");
+        handler.await.expect("handler join").expect("handler");
+        server.abort();
+        let _ = server.await;
         target.await.expect("target join");
     }
 

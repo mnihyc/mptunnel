@@ -18,6 +18,9 @@ pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
 pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES: usize = 256 * 1024;
+pub const MIN_UDP_REPLAY_WINDOW_PACKETS: u64 = 1_024;
+pub const MAX_UDP_REPLAY_WINDOW_PACKETS: u64 = 65_536;
+pub const UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES: usize = 512;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
@@ -29,6 +32,15 @@ pub const DEFAULT_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
 pub const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_millis(DEFAULT_RESTART_BACKOFF_MS);
 pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
     Duration::from_millis(DEFAULT_RESTART_MAX_BACKOFF_MS);
+
+pub fn udp_replay_window_packets_for_inflight(inflight_bytes: usize) -> u64 {
+    let packets = inflight_bytes.saturating_add(UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES - 1)
+        / UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES;
+    (packets as u64)
+        .saturating_mul(2)
+        .clamp(MIN_UDP_REPLAY_WINDOW_PACKETS, MAX_UDP_REPLAY_WINDOW_PACKETS)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub log_level: String,
@@ -228,6 +240,9 @@ impl From<ResourceLimits> for CodecLimits {
             max_payload_bytes: value.max_payload_bytes,
             max_ack_ranges: value.max_ack_ranges,
             max_host_bytes: 255,
+            max_udp_replay_window_packets: udp_replay_window_packets_for_inflight(
+                value.max_tcp_path_inflight_bytes,
+            ),
         }
     }
 }
@@ -486,3 +501,41 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_replay_window_tracks_path_inflight_budget() {
+        assert_eq!(
+            udp_replay_window_packets_for_inflight(0),
+            MIN_UDP_REPLAY_WINDOW_PACKETS
+        );
+        assert_eq!(
+            udp_replay_window_packets_for_inflight(DEFAULT_TCP_PATH_INFLIGHT_BYTES),
+            16_384
+        );
+        assert_eq!(
+            udp_replay_window_packets_for_inflight(usize::MAX),
+            MAX_UDP_REPLAY_WINDOW_PACKETS
+        );
+
+        let default_codec: CodecLimits = ResourceLimits::default().into();
+        assert_eq!(
+            default_codec.max_udp_replay_window_packets,
+            udp_replay_window_packets_for_inflight(DEFAULT_TCP_PATH_INFLIGHT_BYTES)
+        );
+
+        let compact_codec: CodecLimits = ResourceLimits {
+            max_tcp_path_inflight_bytes: 256 * 1024,
+            max_tcp_relay_chunk_bytes: 64 * 1024,
+            ..ResourceLimits::default()
+        }
+        .into();
+        assert_eq!(
+            compact_codec.max_udp_replay_window_packets,
+            MIN_UDP_REPLAY_WINDOW_PACKETS
+        );
+    }
+}

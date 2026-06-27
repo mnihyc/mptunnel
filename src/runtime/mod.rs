@@ -12,8 +12,8 @@ use crate::protocol::auth::SessionAuthenticator;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
     AuthNonce, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
-    OutboundPolicy, PathId, ResetReason, SessionId, StreamFlags, StreamId, TargetAddr,
-    TrafficClass, UnderlayProtocol,
+    OutboundPolicy, PathCapabilities, PathId, ResetReason, SessionId, StreamFlags, StreamId,
+    TargetAddr, TrafficClass, UnderlayProtocol,
 };
 use crate::scheduler::{self, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy};
 use crate::transport::PathSpec;
@@ -4137,6 +4137,33 @@ impl TcpRelayRemoteSet {
         }
         Some(path)
     }
+
+    async fn replay_repair_cache_to_instance(
+        &mut self,
+        instance: RelayPathInstance,
+        send_stream: &ReliableSendStream,
+        resend_fin: bool,
+    ) -> Result<bool, RuntimeError> {
+        let Some(position) = self
+            .paths
+            .iter()
+            .position(|path| path.instance() == instance)
+        else {
+            return Ok(false);
+        };
+        for frame in send_stream.retransmission_frames() {
+            self.paths[position].stream.send_frame(frame).await?;
+        }
+        if resend_fin {
+            self.paths[position]
+                .stream
+                .send_frame(Frame::StreamFin {
+                    stream_id: self.stream_id,
+                })
+                .await?;
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Clone)]
@@ -5939,6 +5966,55 @@ where
                     } if ack_stream_id == stream_id => {
                         send_stream.apply_ack(&ranges);
                         last_stream_progress_at = Instant::now();
+                        if remotes.active_carrier_underlay() == Some(UnderlayProtocol::Udp) {
+                            let gap_budget = udp_stream_ack_gap_repair_budget(
+                                send_stream.repair_bytes(),
+                                context.mux_limits,
+                            );
+                            let mut gap_replay_error = None;
+                            for frame in send_stream
+                                .retransmission_frames_for_ack_gaps(&ranges, gap_budget)
+                            {
+                                match remotes.send_frame(context, frame).await {
+                                    Ok(_) => {
+                                        last_response_stall_repair_at = Instant::now();
+                                    }
+                                    Err(err) if tcp_relay_error_is_migratable(&err) => {
+                                        match attach_tcp_relay_paths(
+                                            context,
+                                            &spec,
+                                            relay_class,
+                                            &mut remotes,
+                                            &send_stream,
+                                            !local_open,
+                                            TcpRelayAttachMode::Any,
+                                        )
+                                        .await
+                                        {
+                                            Ok(attached) if attached > 0 => {
+                                                send_stream.update_max_offset(remotes.max_offset());
+                                                last_stream_progress_at = Instant::now();
+                                            }
+                                            Ok(_) => {
+                                                gap_replay_error = Some(err);
+                                                break;
+                                            }
+                                            Err(err) => {
+                                                gap_replay_error = Some(err);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        gap_replay_error = Some(err);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(err) = gap_replay_error {
+                                break Err(err);
+                            }
+                        }
                         if pending_local_fin && send_stream.repair_bytes() == 0 {
                             match remotes
                                 .send_frame(context, Frame::StreamFin { stream_id })
@@ -5992,11 +6068,44 @@ where
                             pending_remote_fin = true;
                         }
                     }
+                    Frame::PathStatus {
+                        status: crate::protocol::PathStatus::Active,
+                        ..
+                    } => {
+                        match remotes
+                            .replay_repair_cache_to_instance(
+                                instance,
+                                &send_stream,
+                                pending_local_fin,
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                last_stream_progress_at = Instant::now();
+                                last_response_stall_repair_at = Instant::now();
+                            }
+                            Ok(false) => {}
+                            Err(err) if tcp_relay_error_is_migratable(&err) => {
+                                remotes.fail_path_instance(context, instance).await;
+                                if remotes.is_empty() {
+                                    break Err(err);
+                                }
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
                     Frame::StreamReset {
                         stream_id: reset_stream_id,
                         reason,
                     } if reset_stream_id == stream_id => break Err(RuntimeError::RemoteReset(reason)),
-                    _ => break Err(RuntimeError::Protocol("unexpected stream relay frame")),
+                    unexpected => {
+                        log_unexpected_stream_relay_frame(
+                            "migrating",
+                            stream_id,
+                            &unexpected,
+                        );
+                        break Err(RuntimeError::Protocol("unexpected stream relay frame"));
+                    }
                 }
             }
             else => break Ok(stats),
@@ -6448,14 +6557,7 @@ struct UdpStreamSentSample {
 impl UdpStreamCongestion {
     fn new(mux_limits: MuxLimits) -> Self {
         let mss_bytes = udp_stream_frame_payload_bytes(mux_limits).max(1);
-        let max_bytes = mux_limits
-            .max_tcp_path_inflight_bytes
-            .min(
-                mux_limits
-                    .max_tcp_relay_chunk_bytes
-                    .max(mss_bytes.saturating_mul(10)),
-            )
-            .max(mss_bytes);
+        let max_bytes = mux_limits.max_tcp_path_inflight_bytes.max(mss_bytes);
         let initial_bytes = udp_stream_initial_cwnd_bytes(mss_bytes, max_bytes);
         Self {
             cwnd_bytes: initial_bytes,
@@ -6475,7 +6577,24 @@ impl UdpStreamCongestion {
         if repair_bytes == 0 {
             return 0;
         }
-        repair_bytes.min(self.inflight_limit()).max(self.mss_bytes)
+        let burst = self
+            .inflight_limit()
+            .saturating_div(4)
+            .clamp(self.mss_bytes, self.max_bytes);
+        repair_bytes.min(burst).max(self.mss_bytes)
+    }
+
+    fn pacing_interval(&self, bytes: usize) -> Option<Duration> {
+        if bytes == 0 {
+            return Some(Duration::ZERO);
+        }
+        let srtt = self.srtt?;
+        let pacing_rate_bytes_per_second =
+            (self.inflight_limit() as f64 / srtt.as_secs_f64()) * UDP_BBR_PACING_GAIN;
+        Some(
+            Duration::from_secs_f64(bytes as f64 / pacing_rate_bytes_per_second.max(1.0))
+                .max(Duration::from_micros(1)),
+        )
     }
 
     fn on_send(&mut self, bytes: usize) {
@@ -6777,23 +6896,91 @@ async fn replay_tcp_repair_cache(
     Ok(())
 }
 
-async fn replay_tcp_repair_cache_limited(
+async fn pace_udp_stream_frame(
+    congestion: Option<&UdpStreamCongestion>,
+    frame: &Frame,
+    next_send_at: &mut Instant,
+) {
+    let Some(congestion) = congestion else {
+        return;
+    };
+    let bytes = frame_pacing_bytes(frame);
+    let Some(interval) = congestion.pacing_interval(bytes) else {
+        return;
+    };
+    let now = Instant::now();
+    if *next_send_at > now {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(*next_send_at)).await;
+    }
+    let anchor = if *next_send_at > now {
+        *next_send_at
+    } else {
+        now
+    };
+    *next_send_at = anchor + interval;
+}
+
+fn frame_pacing_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::StreamData { payload, .. } => payload.len().max(1),
+        Frame::StreamFin { .. }
+        | Frame::StreamAck { .. }
+        | Frame::StreamMaxData { .. }
+        | Frame::StreamReset { .. }
+        | Frame::StreamDetach { .. } => 1,
+        _ => 0,
+    }
+}
+
+async fn replay_tcp_repair_cache_limited_paced(
     path_stream: &TcpPathStream,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     byte_limit: usize,
+    congestion: Option<&UdpStreamCongestion>,
+    next_send_at: &mut Instant,
 ) -> Result<(), RuntimeError> {
     for frame in send_stream.retransmission_frames_limited(byte_limit) {
+        pace_udp_stream_frame(congestion, &frame, next_send_at).await;
         path_stream.send_frame(frame).await?;
     }
     if resend_fin {
-        path_stream
-            .send_frame(Frame::StreamFin {
-                stream_id: path_stream.stream_id,
-            })
-            .await?;
+        let frame = Frame::StreamFin {
+            stream_id: path_stream.stream_id,
+        };
+        pace_udp_stream_frame(congestion, &frame, next_send_at).await;
+        path_stream.send_frame(frame).await?;
     }
     Ok(())
+}
+
+async fn replay_tcp_repair_ack_gaps_limited_paced(
+    path_stream: &TcpPathStream,
+    send_stream: &ReliableSendStream,
+    ranges: &[OffsetRange],
+    byte_limit: usize,
+    congestion: Option<&UdpStreamCongestion>,
+    next_send_at: &mut Instant,
+) -> Result<bool, RuntimeError> {
+    let frames = send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit);
+    let replayed = !frames.is_empty();
+    for frame in frames {
+        pace_udp_stream_frame(congestion, &frame, next_send_at).await;
+        path_stream.send_frame(frame).await?;
+    }
+    Ok(replayed)
+}
+
+fn udp_stream_ack_gap_repair_budget(repair_bytes: usize, mux_limits: MuxLimits) -> usize {
+    if repair_bytes == 0 {
+        return 0;
+    }
+    let floor = udp_stream_frame_payload_bytes(mux_limits).max(1);
+    let burst = mux_limits
+        .max_tcp_path_inflight_bytes
+        .saturating_div(4)
+        .clamp(floor, mux_limits.max_tcp_path_inflight_bytes.max(floor));
+    repair_bytes.min(burst).max(floor)
 }
 
 fn tcp_relay_error_is_migratable(err: &RuntimeError) -> bool {
@@ -7004,6 +7191,7 @@ where
     let mut last_repair_replay_at = Instant::now();
     let mut udp_congestion = (path_stream.underlay == UnderlayProtocol::Udp)
         .then(|| UdpStreamCongestion::new(mux_limits));
+    let mut next_udp_send_at = Instant::now();
     let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
 
@@ -7076,10 +7264,40 @@ where
                         if send_stream.repair_bytes() < previous_repair_bytes {
                             last_repair_replay_at = Instant::now();
                         }
+                        if path_stream.underlay == UnderlayProtocol::Udp {
+                            let budget = udp_congestion
+                                .as_ref()
+                                .map(|congestion| {
+                                    congestion.repair_budget(send_stream.repair_bytes())
+                                })
+                                .unwrap_or_else(|| {
+                                    udp_stream_ack_gap_repair_budget(
+                                        send_stream.repair_bytes(),
+                                        mux_limits,
+                                    )
+                                });
+                            let replayed = replay_tcp_repair_ack_gaps_limited_paced(
+                                &path_stream,
+                                &send_stream,
+                                &ranges,
+                                budget,
+                                udp_congestion.as_ref(),
+                                &mut next_udp_send_at,
+                            )
+                            .await?;
+                            if replayed {
+                                last_repair_replay_at = Instant::now();
+                            }
+                        }
                         if pending_local_fin && send_stream.repair_bytes() == 0 {
-                            path_stream
-                                .send_frame(Frame::StreamFin { stream_id })
-                                .await?;
+                            let frame = Frame::StreamFin { stream_id };
+                            pace_udp_stream_frame(
+                                udp_congestion.as_ref(),
+                                &frame,
+                                &mut next_udp_send_at,
+                            )
+                            .await;
+                            path_stream.send_frame(frame).await?;
                             close_sent = true;
                             pending_local_fin = false;
                         }
@@ -7101,11 +7319,13 @@ where
                                     congestion.repair_budget(send_stream.repair_bytes())
                                 })
                                 .unwrap_or_else(|| send_stream.repair_bytes());
-                            replay_tcp_repair_cache_limited(
+                            replay_tcp_repair_cache_limited_paced(
                                 &path_stream,
                                 &send_stream,
                                 false,
                                 budget,
+                                udp_congestion.as_ref(),
+                                &mut next_udp_send_at,
                             )
                             .await?;
                         } else {
@@ -7121,7 +7341,10 @@ where
                         stream_id: reset_stream_id,
                         reason,
                     } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
-                    _ => return Err(RuntimeError::Protocol("unexpected stream relay frame")),
+                    unexpected => {
+                        log_unexpected_stream_relay_frame("single", stream_id, &unexpected);
+                        return Err(RuntimeError::Protocol("unexpected stream relay frame"));
+                    }
                 }
             }
             _ = tokio::time::sleep_until(repair_replay_deadline), if send_stream.repair_bytes() > 0 => {
@@ -7132,7 +7355,15 @@ where
                     .as_ref()
                     .map(|congestion| congestion.repair_budget(send_stream.repair_bytes()))
                     .unwrap_or_else(|| send_stream.repair_bytes());
-                replay_tcp_repair_cache_limited(&path_stream, &send_stream, false, budget).await?;
+                replay_tcp_repair_cache_limited_paced(
+                    &path_stream,
+                    &send_stream,
+                    false,
+                    budget,
+                    udp_congestion.as_ref(),
+                    &mut next_udp_send_at,
+                )
+                .await?;
                 last_repair_replay_at = Instant::now();
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
@@ -7155,17 +7386,28 @@ where
                     {
                         pending_local_fin = true;
                     } else {
-                        path_stream
-                            .send_frame(Frame::StreamFin { stream_id })
-                            .await?;
-                        close_sent = true;
-                    }
+                            let frame = Frame::StreamFin { stream_id };
+                            pace_udp_stream_frame(
+                                udp_congestion.as_ref(),
+                                &frame,
+                                &mut next_udp_send_at,
+                            )
+                            .await;
+                            path_stream.send_frame(frame).await?;
+                            close_sent = true;
+                        }
                     local_open = false;
                 } else {
                     let frame = send_stream.send_data(
                         Bytes::copy_from_slice(&buf[..read]),
                         StreamFlags::NONE,
                     )?;
+                    pace_udp_stream_frame(
+                        udp_congestion.as_ref(),
+                        &frame,
+                        &mut next_udp_send_at,
+                    )
+                    .await;
                     path_stream.send_frame(frame).await?;
                     if let Some(congestion) = &mut udp_congestion {
                         congestion.on_send(read);
@@ -8521,6 +8763,131 @@ fn server_udp_next_response_ttl(
         .map(|(_, ttl_ms, datagram_id)| (ttl_ms, datagram_id))
 }
 
+fn frame_kind_name(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::SessionHello { .. } => "SESSION_HELLO",
+        Frame::SessionAuth { .. } => "SESSION_AUTH",
+        Frame::SessionReady => "SESSION_READY",
+        Frame::SessionClose { .. } => "SESSION_CLOSE",
+        Frame::PathJoin { .. } => "PATH_JOIN",
+        Frame::PathJoinOk { .. } => "PATH_JOIN_OK",
+        Frame::PathChallenge { .. } => "PATH_CHALLENGE",
+        Frame::PathResponse { .. } => "PATH_RESPONSE",
+        Frame::PathStatus { .. } => "PATH_STATUS",
+        Frame::PathDrain { .. } => "PATH_DRAIN",
+        Frame::PathClose { .. } => "PATH_CLOSE",
+        Frame::PathMtuProbe { .. } => "PATH_MTU_PROBE",
+        Frame::PathMtuAck { .. } => "PATH_MTU_ACK",
+        Frame::OpenStream { .. } => "OPEN_STREAM",
+        Frame::StreamData { .. } => "STREAM_DATA",
+        Frame::StreamAck { .. } => "STREAM_ACK",
+        Frame::StreamMaxData { .. } => "STREAM_MAX_DATA",
+        Frame::StreamFin { .. } => "STREAM_FIN",
+        Frame::StreamDetach { .. } => "STREAM_DETACH",
+        Frame::StreamReset { .. } => "STREAM_RESET",
+        Frame::OpenDatagramFlow { .. } => "OPEN_DGRAM_FLOW",
+        Frame::DatagramData { .. } => "DGRAM_DATA",
+        Frame::DatagramClose { .. } => "DGRAM_CLOSE",
+        Frame::DatagramFeedback { .. } => "DGRAM_FEEDBACK",
+        Frame::PathMetrics { .. } => "PATH_METRICS",
+        Frame::RxRateHint { .. } => "RX_RATE_HINT",
+        Frame::MaxConnectionData { .. } => "MAX_CONNECTION_DATA",
+        Frame::Ping { .. } => "PING",
+        Frame::Pong { .. } => "PONG",
+        Frame::KeyUpdate { .. } => "KEY_UPDATE",
+    }
+}
+
+fn frame_subject(frame: &Frame) -> String {
+    match frame {
+        Frame::SessionHello { session_id } => format!("session_id={}", session_id.0),
+        Frame::SessionAuth { session_id, .. } => format!("session_id={}", session_id.0),
+        Frame::SessionReady => "none".to_string(),
+        Frame::SessionClose { reason } => format!("reason={reason:?}"),
+        Frame::PathJoin {
+            session_id,
+            path_id,
+            underlay,
+            ..
+        } => format!(
+            "session_id={} path_id={} underlay={underlay:?}",
+            session_id.0, path_id.0
+        ),
+        Frame::PathJoinOk { path_id, .. }
+        | Frame::PathChallenge { path_id, .. }
+        | Frame::PathResponse { path_id, .. }
+        | Frame::PathDrain { path_id }
+        | Frame::PathMtuProbe { path_id, .. }
+        | Frame::PathMtuAck { path_id, .. }
+        | Frame::RxRateHint { path_id, .. } => format!("path_id={}", path_id.0),
+        Frame::PathStatus {
+            path_id, status, ..
+        } => format!("path_id={} status={status:?}", path_id.0),
+        Frame::PathClose { path_id, reason } => {
+            format!("path_id={} reason={reason:?}", path_id.0)
+        }
+        Frame::OpenStream {
+            stream_id, class, ..
+        } => format!("stream_id={} class={class:?}", stream_id.0),
+        Frame::StreamData {
+            stream_id,
+            offset,
+            payload,
+            ..
+        } => format!(
+            "stream_id={} offset={} payload_len={}",
+            stream_id.0,
+            offset,
+            payload.len()
+        ),
+        Frame::StreamAck { stream_id, ranges } => {
+            format!("stream_id={} ranges={}", stream_id.0, ranges.len())
+        }
+        Frame::StreamMaxData {
+            stream_id,
+            max_offset,
+        } => format!("stream_id={} max_offset={max_offset}", stream_id.0),
+        Frame::StreamFin { stream_id } | Frame::StreamDetach { stream_id } => {
+            format!("stream_id={}", stream_id.0)
+        }
+        Frame::StreamReset { stream_id, reason } => {
+            format!("stream_id={} reason={reason:?}", stream_id.0)
+        }
+        Frame::OpenDatagramFlow { flow_id, class, .. } => {
+            format!("flow_id={} class={class:?}", flow_id.0)
+        }
+        Frame::DatagramData {
+            flow_id,
+            datagram_id,
+            ttl_ms,
+            payload,
+        } => format!(
+            "flow_id={} datagram_id={} ttl_ms={} payload_len={}",
+            flow_id.0,
+            datagram_id.0,
+            ttl_ms,
+            payload.len()
+        ),
+        Frame::DatagramClose { flow_id } => format!("flow_id={}", flow_id.0),
+        Frame::DatagramFeedback { flow_id, received } => {
+            format!("flow_id={} ranges={}", flow_id.0, received.len())
+        }
+        Frame::PathMetrics { metrics } => format!("path_id={}", metrics.path_id.0),
+        Frame::MaxConnectionData { max_bytes } => format!("max_bytes={max_bytes}"),
+        Frame::Ping { nonce } | Frame::Pong { nonce } => format!("nonce={nonce}"),
+        Frame::KeyUpdate { key_phase, .. } => format!("key_phase={key_phase}"),
+    }
+}
+
+fn log_unexpected_stream_relay_frame(kind: &'static str, expected: StreamId, frame: &Frame) {
+    eprintln!(
+        "warning: unexpected {kind} stream relay frame: expected_stream_id={} frame_kind={} {}",
+        expected.0,
+        frame_kind_name(frame),
+        frame_subject(frame)
+    );
+}
+
 struct ServerUdpPathSession {
     peer: SocketAddr,
     encrypted: EncryptedUdpSocket,
@@ -8539,9 +8906,18 @@ struct ServerUdpPathSession {
 
 enum ServerUdpPathState {
     AwaitSessionHello,
-    AwaitSessionAuth { session_id: SessionId },
-    AwaitPathJoin { session_id: SessionId },
+    AwaitSessionAuth,
+    AwaitPathJoin,
     Established,
+}
+
+fn server_udp_path_state_name(state: &ServerUdpPathState) -> &'static str {
+    match state {
+        ServerUdpPathState::AwaitSessionHello => "AwaitSessionHello",
+        ServerUdpPathState::AwaitSessionAuth => "AwaitSessionAuth",
+        ServerUdpPathState::AwaitPathJoin => "AwaitPathJoin",
+        ServerUdpPathState::Established => "Established",
+    }
 }
 
 enum ServerUdpSessionOutcome {
@@ -8616,13 +8992,40 @@ impl ServerUdpPathSession {
         Ok(self.encrypted.open_frame_datagram(datagram)?)
     }
 
+    async fn establish_udp_path(
+        &mut self,
+        session_id: SessionId,
+        path_id: PathId,
+        capabilities: PathCapabilities,
+    ) -> Result<ServerUdpSessionOutcome, RuntimeError> {
+        self.encrypted
+            .send_frame_to(&Frame::SessionReady, self.peer)
+            .await?;
+        self.encrypted
+            .send_frame_to(
+                &Frame::PathStatus {
+                    path_id,
+                    status: crate::protocol::PathStatus::Active,
+                    capabilities,
+                },
+                self.peer,
+            )
+            .await?;
+        self.session_id = Some(session_id);
+        self.path_id = Some(path_id);
+        self.path_capabilities = Some(capabilities);
+        self.draining = false;
+        self.state = ServerUdpPathState::Established;
+        Ok(ServerUdpSessionOutcome::Active)
+    }
+
     async fn handle_frame(
         &mut self,
         frame: Frame,
     ) -> Result<ServerUdpSessionOutcome, RuntimeError> {
         match (&self.state, frame) {
-            (ServerUdpPathState::AwaitSessionHello, Frame::SessionHello { session_id }) => {
-                self.state = ServerUdpPathState::AwaitSessionAuth { session_id };
+            (ServerUdpPathState::AwaitSessionHello, Frame::SessionHello { .. }) => {
+                self.state = ServerUdpPathState::AwaitSessionAuth;
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (ServerUdpPathState::Established, Frame::SessionHello { session_id })
@@ -8631,31 +9034,30 @@ impl ServerUdpPathSession {
                 self.send_established_udp_path_ready().await?;
                 Ok(ServerUdpSessionOutcome::Active)
             }
-            (_, Frame::SessionHello { session_id }) => {
+            (_, Frame::SessionHello { .. }) => {
                 self.flows.clear();
                 self.attached_streams.clear();
                 self.session_id = None;
                 self.path_id = None;
                 self.path_capabilities = None;
                 self.draining = false;
-                self.state = ServerUdpPathState::AwaitSessionAuth { session_id };
+                self.state = ServerUdpPathState::AwaitSessionAuth;
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
-                ServerUdpPathState::AwaitSessionAuth { session_id },
+                ServerUdpPathState::AwaitSessionHello
+                | ServerUdpPathState::AwaitSessionAuth
+                | ServerUdpPathState::AwaitPathJoin,
                 Frame::SessionAuth {
-                    session_id: auth_session_id,
+                    session_id,
                     nonce,
                     auth_tag,
                 },
-            ) if auth_session_id == *session_id
-                && self
-                    .authenticator
-                    .verify_session_auth(*session_id, nonce, auth_tag) =>
+            ) if self
+                .authenticator
+                .verify_session_auth(session_id, nonce, auth_tag) =>
             {
-                self.state = ServerUdpPathState::AwaitPathJoin {
-                    session_id: *session_id,
-                };
+                self.state = ServerUdpPathState::AwaitPathJoin;
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
@@ -8674,19 +9076,20 @@ impl ServerUdpPathSession {
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
-                ServerUdpPathState::AwaitPathJoin { session_id },
+                ServerUdpPathState::AwaitSessionHello
+                | ServerUdpPathState::AwaitSessionAuth
+                | ServerUdpPathState::AwaitPathJoin,
                 Frame::PathJoin {
-                    session_id: join_session_id,
+                    session_id,
                     path_id,
                     underlay,
                     nonce,
                     capabilities,
                     auth_tag,
                 },
-            ) if join_session_id == *session_id
-                && underlay == UnderlayProtocol::Udp
+            ) if underlay == UnderlayProtocol::Udp
                 && self.authenticator.verify_path_join(
-                    *session_id,
+                    session_id,
                     path_id,
                     underlay,
                     nonce,
@@ -8694,25 +9097,8 @@ impl ServerUdpPathSession {
                     auth_tag,
                 ) =>
             {
-                self.encrypted
-                    .send_frame_to(&Frame::SessionReady, self.peer)
-                    .await?;
-                self.encrypted
-                    .send_frame_to(
-                        &Frame::PathStatus {
-                            path_id,
-                            status: crate::protocol::PathStatus::Active,
-                            capabilities,
-                        },
-                        self.peer,
-                    )
-                    .await?;
-                self.session_id = Some(*session_id);
-                self.path_id = Some(path_id);
-                self.path_capabilities = Some(capabilities);
-                self.draining = false;
-                self.state = ServerUdpPathState::Established;
-                Ok(ServerUdpSessionOutcome::Active)
+                self.establish_udp_path(session_id, path_id, capabilities)
+                    .await
             }
             (
                 ServerUdpPathState::Established,
@@ -9096,7 +9482,20 @@ impl ServerUdpPathSession {
                 }
             }
             (_, Frame::SessionClose { .. }) => Ok(ServerUdpSessionOutcome::Closed),
-            _ => Err(RuntimeError::Protocol("unexpected UDP datagram path frame")),
+            (state, unexpected) => {
+                eprintln!(
+                    "warning: unexpected UDP datagram path frame: state={} session_id={:?} path_id={:?} draining={} attached_streams={} flows={} frame_kind={} {}",
+                    server_udp_path_state_name(state),
+                    self.session_id.map(|session_id| session_id.0),
+                    self.path_id.map(|path_id| path_id.0),
+                    self.draining,
+                    self.attached_streams.len(),
+                    self.flows.len(),
+                    frame_kind_name(&unexpected),
+                    frame_subject(&unexpected)
+                );
+                Err(RuntimeError::Protocol("unexpected UDP datagram path frame"))
+            }
         }
     }
 

@@ -156,6 +156,42 @@ impl ReliableSendStream {
         }
         frames
     }
+
+    pub fn retransmission_frames_for_ack_gaps(
+        &self,
+        ranges: &[OffsetRange],
+        byte_limit: usize,
+    ) -> Vec<Frame> {
+        if byte_limit == 0 {
+            return Vec::new();
+        }
+        let Some(largest_acked_end) = ranges.iter().map(|range| range.end).max() else {
+            return Vec::new();
+        };
+
+        let mut frames = Vec::new();
+        let mut emitted_bytes = 0usize;
+        for chunk in self.repair_cache.values() {
+            let end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+            if end > largest_acked_end {
+                break;
+            }
+            if ranges.iter().any(|range| range_covers_chunk(*range, chunk)) {
+                continue;
+            }
+            if emitted_bytes >= byte_limit {
+                break;
+            }
+            emitted_bytes = emitted_bytes.saturating_add(chunk.payload.len());
+            frames.push(Frame::StreamData {
+                stream_id: self.stream_id,
+                offset: chunk.offset,
+                flags: chunk.flags,
+                payload: chunk.payload.clone(),
+            });
+        }
+        frames
+    }
 }
 
 fn range_covers_chunk(range: OffsetRange, chunk: &SentChunk) -> bool {
@@ -511,6 +547,35 @@ mod tests {
         assert_eq!(stream.retransmission_frames_limited(4).len(), 1);
         assert_eq!(stream.retransmission_frames_limited(5).len(), 2);
         assert_eq!(stream.retransmission_frames_limited(32).len(), 3);
+    }
+
+    #[test]
+    fn send_stream_retransmits_ack_range_holes_before_later_inflight() {
+        let mut stream = ReliableSendStream::new(StreamId(7), limits());
+        for payload in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {
+            stream
+                .send_data(Bytes::copy_from_slice(payload), StreamFlags::NONE)
+                .expect("send");
+        }
+
+        let frames = stream.retransmission_frames_for_ack_gaps(
+            &[
+                OffsetRange { start: 0, end: 4 },
+                OffsetRange { start: 8, end: 12 },
+            ],
+            1024,
+        );
+
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            Frame::StreamData { offset: 4, payload, .. } if payload.as_ref() == b"bbbb"
+        ));
+        assert!(
+            stream
+                .retransmission_frames_for_ack_gaps(&[OffsetRange { start: 0, end: 4 }], 1024)
+                .is_empty()
+        );
     }
 
     #[test]

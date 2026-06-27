@@ -661,6 +661,94 @@ async fn server_udp_path_tolerates_duplicate_established_handshake_frames() {
 }
 
 #[tokio::test]
+async fn server_udp_path_accepts_session_auth_before_hello() {
+    let socket = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("server udp bind"),
+    );
+    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
+    let peer_addr = peer.local_addr().expect("peer addr");
+    let context = server_context(OutboundConfig::Direct);
+    let mut session =
+        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
+    let path = "udp://127.0.0.1:7443".parse::<PathSpec>().expect("path");
+    let session_id = SessionId(78);
+    let path_id = PathId(3);
+    let (hello, auth, join) = authenticated_path_join_frames_for_session(
+        &security(),
+        &path,
+        path_id,
+        UnderlayProtocol::Udp,
+        session_id,
+    )
+    .expect("auth frames");
+
+    session
+        .handle_frame(auth)
+        .await
+        .expect("auth first should advance handshake");
+    assert!(matches!(session.state, ServerUdpPathState::AwaitPathJoin));
+
+    session
+        .handle_frame(hello)
+        .await
+        .expect("late hello should stay recoverable");
+    session
+        .handle_frame(join)
+        .await
+        .expect("join should establish after reordered auth");
+    assert!(matches!(session.state, ServerUdpPathState::Established));
+    assert_eq!(session.session_id, Some(session_id));
+    assert_eq!(session.path_id, Some(path_id));
+}
+
+#[tokio::test]
+async fn server_udp_path_accepts_path_join_before_session_frames() {
+    let socket = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("server udp bind"),
+    );
+    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
+    let peer_addr = peer.local_addr().expect("peer addr");
+    let context = server_context(OutboundConfig::Direct);
+    let mut session =
+        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
+    let path = "udp://127.0.0.1:7443".parse::<PathSpec>().expect("path");
+    let session_id = SessionId(79);
+    let path_id = PathId(4);
+    let (hello, auth, join) = authenticated_path_join_frames_for_session(
+        &security(),
+        &path,
+        path_id,
+        UnderlayProtocol::Udp,
+        session_id,
+    )
+    .expect("auth frames");
+
+    session
+        .handle_frame(join)
+        .await
+        .expect("authenticated join should establish without ordered prelude");
+    assert!(matches!(session.state, ServerUdpPathState::Established));
+    assert_eq!(session.session_id, Some(session_id));
+    assert_eq!(session.path_id, Some(path_id));
+
+    session
+        .handle_frame(hello)
+        .await
+        .expect("late hello should be idempotent");
+    session
+        .handle_frame(auth)
+        .await
+        .expect("late auth should be idempotent");
+    assert!(matches!(session.state, ServerUdpPathState::Established));
+    assert_eq!(session.session_id, Some(session_id));
+    assert_eq!(session.path_id, Some(path_id));
+}
+
+#[tokio::test]
 async fn server_udp_path_handles_idempotent_control_and_drain() {
     let socket = Arc::new(
         UdpSocket::bind("127.0.0.1:0")
@@ -1147,6 +1235,75 @@ fn udp_stream_congestion_self_clocks_and_cuts_back_on_repair_timeout() {
     congestion.on_repair_timeout();
     assert!(congestion.inflight_limit() < 64 * 1024);
     assert!(congestion.inflight_limit() >= udp_stream_min_cwnd_bytes(mss).min(64 * 1024));
+}
+
+#[test]
+fn udp_stream_congestion_ceiling_uses_path_inflight_budget() {
+    let mux_limits = MuxLimits {
+        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_tcp_relay_chunk_bytes: 256 * 1024,
+        ..MuxLimits::default()
+    };
+    let mss = udp_stream_frame_payload_bytes(mux_limits);
+    let mut congestion = UdpStreamCongestion::new(mux_limits);
+
+    assert!(congestion.inflight_limit() < mux_limits.max_tcp_relay_chunk_bytes);
+    for _ in 0..32 {
+        congestion.on_ack(mux_limits.max_tcp_path_inflight_bytes);
+    }
+    assert_eq!(
+        congestion.inflight_limit(),
+        mux_limits.max_tcp_path_inflight_bytes
+    );
+    assert_eq!(
+        congestion.repair_budget(usize::MAX),
+        mux_limits.max_tcp_path_inflight_bytes / 4
+    );
+    assert!(congestion.repair_budget(usize::MAX) >= mux_limits.max_tcp_relay_chunk_bytes);
+    assert!(congestion.repair_budget(mss / 2) >= mss);
+}
+
+#[test]
+fn udp_stream_ack_gap_repair_budget_is_bounded_to_path_burst() {
+    let mux_limits = MuxLimits {
+        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_tcp_relay_chunk_bytes: 256 * 1024,
+        ..MuxLimits::default()
+    };
+    let mss = udp_stream_frame_payload_bytes(mux_limits);
+
+    assert_eq!(udp_stream_ack_gap_repair_budget(0, mux_limits), 0);
+    assert_eq!(udp_stream_ack_gap_repair_budget(mss / 2, mux_limits), mss);
+    assert_eq!(
+        udp_stream_ack_gap_repair_budget(usize::MAX, mux_limits),
+        mux_limits.max_tcp_path_inflight_bytes / 4
+    );
+}
+
+#[test]
+fn udp_stream_congestion_paces_after_rtt_evidence() {
+    let mux_limits = MuxLimits::default();
+    let mss = udp_stream_frame_payload_bytes(mux_limits);
+    let mut congestion = UdpStreamCongestion::new(mux_limits);
+
+    assert_eq!(congestion.pacing_interval(mss), None);
+
+    congestion.on_send(mss);
+    let sample = congestion
+        .pending_samples
+        .front_mut()
+        .expect("pending sample");
+    sample.sent_at = sample
+        .sent_at
+        .checked_sub(Duration::from_millis(80))
+        .expect("past sample");
+    congestion.on_ack(mss);
+
+    let interval = congestion
+        .pacing_interval(mss)
+        .expect("paced after ack RTT");
+    assert!(interval > Duration::ZERO);
+    assert!(interval < Duration::from_millis(80));
 }
 
 #[test]
@@ -2562,6 +2719,57 @@ async fn mixed_relay_current_carrier_tracks_latest_data_path() {
             index: 2,
         }]
     );
+}
+
+#[tokio::test]
+async fn mixed_relay_path_status_active_replays_repair_cache_on_instance() {
+    let mux_limits = MuxLimits::default();
+    let stream_id = StreamId(45);
+    let (commands, mut command_rx) = tcp_path_session_command_channels(4);
+    let (_frames_tx, frames_rx) = mpsc::channel(4);
+    let opened = OpenedRemoteStream {
+        path_index: 1,
+        stream: TcpPathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            class: TrafficClass::Bulk,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
+            output: TcpPathStreamOutput::Fixed(commands),
+            frames: frames_rx,
+        },
+    };
+    let mut remotes = TcpRelayRemoteSet::new(opened, 4);
+    let instance = remotes.active_path_instance().expect("active path");
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    send_stream
+        .send_data(Bytes::from_static(b"repair"), StreamFlags::NONE)
+        .expect("repair data");
+
+    assert!(
+        remotes
+            .replay_repair_cache_to_instance(instance, &send_stream, false)
+            .await
+            .expect("replay")
+    );
+
+    match recv_tcp_path_command(&mut command_rx)
+        .await
+        .expect("replay command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            stream_id: received_stream_id,
+            offset,
+            payload,
+            ..
+        }) => {
+            assert_eq!(received_stream_id, stream_id);
+            assert_eq!(offset, 0);
+            assert_eq!(&payload[..], b"repair");
+        }
+        _ => panic!("expected replayed repair data"),
+    }
 }
 
 #[test]

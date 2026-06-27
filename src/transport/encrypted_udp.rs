@@ -15,7 +15,6 @@ const HEADER_LEN: usize = 18;
 const TAG_LEN: usize = 16;
 const DIR_CLIENT_TO_SERVER: u8 = 1;
 const DIR_SERVER_TO_CLIENT: u8 = 2;
-const REPLAY_WINDOW_PACKETS: u64 = 1024;
 
 pub struct EncryptedUdpSocket {
     socket: Arc<UdpSocket>,
@@ -58,7 +57,7 @@ impl EncryptedUdpSocket {
             send_direction: send_direction(role),
             recv_direction: recv_direction(role),
             send_counter: 0,
-            replay: ReplayWindow::new(REPLAY_WINDOW_PACKETS),
+            replay: ReplayWindow::new(limits.max_udp_replay_window_packets),
         }
     }
 
@@ -564,6 +563,24 @@ mod tests {
         );
         assert!(matches!(
             receiver.recv_frame(&mut buffer).await,
+            Err(EncryptedUdpTransportError::Replay)
+        ));
+    }
+
+    #[test]
+    fn replay_window_accepts_configured_reordering_span() {
+        let mut replay = ReplayWindow::new(4096);
+        replay.insert(5000);
+
+        assert!(replay.check(1000).is_ok());
+        assert!(matches!(
+            replay.check(904),
+            Err(EncryptedUdpTransportError::Replay)
+        ));
+
+        replay.insert(1000);
+        assert!(matches!(
+            replay.check(1000),
             Err(EncryptedUdpTransportError::Replay)
         ));
     }

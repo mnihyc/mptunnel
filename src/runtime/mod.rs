@@ -55,6 +55,8 @@ const UDP_FIRST_OPEN_RTT_MULTIPLIER: f64 = 8.0;
 const UDP_MIN_PACING_RATE_BPS: f64 = 64_000.0;
 const UDP_MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 const UDP_MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
+const UDP_MIN_RETRY_BUDGET: Duration = Duration::from_millis(250);
+const UDP_MAX_RETRY_BUDGET: Duration = Duration::from_millis(500);
 const UDP_MIN_PATH_SUPPRESSION: Duration = Duration::from_millis(250);
 const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
 const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
@@ -2759,8 +2761,6 @@ impl ClientPathContext {
         current_udp_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
-        let active_underlay =
-            active_underlay_for_reliable_stream(current_tcp_path_index, current_udp_path_index);
         let mut candidates = self
             .ordered_tcp_auto_bulk_discovery_scores(current_tcp_path_index, payload_bytes)
             .into_iter()
@@ -2790,8 +2790,12 @@ impl ClientPathContext {
                 }),
             )
             .collect::<Vec<_>>();
-        if let Some(active_underlay) = active_underlay {
-            candidates.retain(|(key, _)| key.underlay == active_underlay);
+        if let Some(current_eta_ms) = self.reliable_stream_current_eta_ms(
+            current_tcp_path_index,
+            current_udp_path_index,
+            payload_bytes,
+        ) {
+            candidates.retain(|(_, eta_ms)| *eta_ms < current_eta_ms);
         }
         candidates.sort_by(|left, right| {
             left.1
@@ -2799,6 +2803,38 @@ impl ClientPathContext {
                 .then_with(|| relay_path_key_order(left.0, right.0))
         });
         candidates.into_iter().map(|(key, _)| key).collect()
+    }
+
+    fn reliable_stream_current_eta_ms(
+        &self,
+        current_tcp_path_index: Option<usize>,
+        current_udp_path_index: Option<usize>,
+        payload_bytes: usize,
+    ) -> Option<f64> {
+        [
+            current_tcp_path_index.map(|index| RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index,
+            }),
+            current_udp_path_index.map(|index| RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index,
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|key| {
+            relay_path_snapshot(self, key).and_then(|snapshot| {
+                scheduler::score_path(
+                    snapshot,
+                    TrafficClass::Bulk,
+                    payload_bytes,
+                    SchedulerPolicy::default(),
+                )
+                .map(|score| score.eta_ms)
+            })
+        })
+        .min_by(|left, right| left.total_cmp(right))
     }
 
     fn ordered_tcp_auto_bulk_discovery_scores(
@@ -5934,6 +5970,7 @@ struct RelayPathAttachRequest<'a> {
     resend_fin: bool,
     candidates: Vec<RelayPathKey>,
     race_repair: bool,
+    allow_mixed_carrier: bool,
 }
 
 async fn attach_relay_path_candidates(
@@ -5945,8 +5982,13 @@ async fn attach_relay_path_candidates(
     let mut last_retryable_error = None;
     let mut attached = 0usize;
     let active_underlay = remotes.active_carrier_underlay();
+    let candidates = if request.allow_mixed_carrier {
+        request.candidates
+    } else {
+        relay_path_candidates_for_active_carrier(request.candidates, active_underlay)
+    };
 
-    for key in relay_path_candidates_for_active_carrier(request.candidates, active_underlay) {
+    for key in candidates {
         if remotes.contains_path_key(key) {
             continue;
         }
@@ -6055,6 +6097,27 @@ async fn attach_tcp_relay_paths(
             tcp_relay_auto_bulk_discovery_payload_bytes(send_stream, context.mux_limits)
         }
     };
+    if matches!(mode, TcpRelayAttachMode::AutoBulkDiscovery) {
+        let candidates = context.ordered_reliable_auto_bulk_discovery_path_keys(
+            remotes.active_path_index_for(UnderlayProtocol::Tcp),
+            remotes.active_path_index_for(UnderlayProtocol::Udp),
+            payload_bytes,
+        );
+        return attach_relay_path_candidates(
+            context,
+            remotes,
+            RelayPathAttachRequest {
+                spec,
+                class,
+                send_stream,
+                resend_fin,
+                candidates,
+                race_repair: false,
+                allow_mixed_carrier: true,
+            },
+        )
+        .await;
+    }
     if context.tcp_paths.is_empty() {
         return attach_udp_relay_paths(
             context,
@@ -6076,26 +6139,6 @@ async fn attach_tcp_relay_paths(
             send_stream,
             resend_fin,
             mode,
-        )
-        .await;
-    }
-    if matches!(mode, TcpRelayAttachMode::AutoBulkDiscovery) {
-        let candidates = context.ordered_reliable_auto_bulk_discovery_path_keys(
-            remotes.active_path_index_for(UnderlayProtocol::Tcp),
-            remotes.active_path_index_for(UnderlayProtocol::Udp),
-            payload_bytes,
-        );
-        return attach_relay_path_candidates(
-            context,
-            remotes,
-            RelayPathAttachRequest {
-                spec,
-                class,
-                send_stream,
-                resend_fin,
-                candidates,
-                race_repair: false,
-            },
         )
         .await;
     }
@@ -6121,6 +6164,7 @@ async fn attach_tcp_relay_paths(
                 })
                 .collect(),
             race_repair,
+            allow_mixed_carrier: false,
         },
     )
     .await?;
@@ -6524,20 +6568,6 @@ fn relay_path_key_order(left: RelayPathKey, right: RelayPathKey) -> std::cmp::Or
     relay_underlay_order(left.underlay)
         .cmp(&relay_underlay_order(right.underlay))
         .then_with(|| left.index.cmp(&right.index))
-}
-
-fn active_underlay_for_reliable_stream(
-    current_tcp_path_index: Option<usize>,
-    current_udp_path_index: Option<usize>,
-) -> Option<UnderlayProtocol> {
-    match (
-        current_tcp_path_index.is_some(),
-        current_udp_path_index.is_some(),
-    ) {
-        (true, false) => Some(UnderlayProtocol::Tcp),
-        (false, true) => Some(UnderlayProtocol::Udp),
-        _ => None,
-    }
 }
 
 fn relay_underlay_order(underlay: UnderlayProtocol) -> u8 {
@@ -7272,7 +7302,8 @@ impl UdpDatagramClientAssociation {
             .min()
             .unwrap_or(UDP_MAX_RESPONSE_TIMEOUT);
         Duration::from_secs_f64(response_timeout.as_secs_f64() * 4.0)
-            .max(UDP_MIN_RESPONSE_TIMEOUT)
+            .max(UDP_MIN_RETRY_BUDGET)
+            .min(UDP_MAX_RETRY_BUDGET)
             .min(ttl)
     }
 
@@ -11341,11 +11372,39 @@ mod tests {
     }
 
     #[test]
-    fn mixed_auto_bulk_discovery_stays_with_active_tcp_carrier() {
+    fn mixed_auto_bulk_discovery_can_cross_to_better_udp_carrier() {
         let tcp_path = "tcp://127.0.0.1:10140?srtt-ms=20&rate-mbps=30"
             .parse::<PathSpec>()
             .expect("tcp path");
         let udp_path = "udp://127.0.0.1:10141?srtt-ms=40&rate-mbps=300"
+            .parse::<PathSpec>()
+            .expect("udp path");
+        let context = ClientPathContext::new(
+            vec![tcp_path, udp_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+
+        assert_eq!(
+            context.ordered_reliable_auto_bulk_discovery_path_keys(
+                Some(0),
+                None,
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+            ),
+            vec![RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn mixed_auto_bulk_discovery_rejects_worse_udp_carrier() {
+        let tcp_path = "tcp://127.0.0.1:10140?srtt-ms=20&rate-mbps=300"
+            .parse::<PathSpec>()
+            .expect("tcp path");
+        let udp_path = "udp://127.0.0.1:10141?srtt-ms=180&rate-mbps=30"
             .parse::<PathSpec>()
             .expect("udp path");
         let context = ClientPathContext::new(
@@ -11855,6 +11914,8 @@ mod tests {
             ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
         let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
         let stable_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+        assert!(stable_budget >= UDP_MIN_RETRY_BUDGET);
+        assert!(stable_budget <= UDP_MAX_RETRY_BUDGET);
 
         context.mark_udp_path_feedback(
             0,
@@ -11868,6 +11929,7 @@ mod tests {
 
         let lossy_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
         assert!(lossy_budget > stable_budget);
+        assert!(lossy_budget <= UDP_MAX_RETRY_BUDGET);
     }
 
     #[test]

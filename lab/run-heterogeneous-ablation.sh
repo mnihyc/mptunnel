@@ -367,6 +367,11 @@ if should_run_case "mptunnel_udp_stream_single_low_latency"; then
   run_tcp_download_probe_case "mptunnel_udp_stream_single_low_latency"
 fi
 
+if should_run_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth"; then
+  start_client "udp_stream_single_cross_continent_high_bandwidth" "$udp_fat"
+  run_tcp_download_probe_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth"
+fi
+
 if should_run_case "mptunnel_udp_stream_multipath_all"; then
   start_client "udp_stream_multipath_all" "$udp_all"
   run_tcp_download_probe_case "mptunnel_udp_stream_multipath_all"
@@ -380,6 +385,11 @@ fi
 if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
   start_client "reliable_mixed_multipath_all" "$tcp_all $udp_all"
   run_tcp_download_probe_case "mptunnel_reliable_mixed_multipath_all"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"; then
+  start_client "reliable_mixed_tcp_lowlat_udp_fat" "$tcp_lowlat $udp_fat"
+  run_tcp_download_probe_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"
 fi
 
 if should_run_case "mptunnel_udp_single_low_latency"; then

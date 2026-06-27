@@ -1,7 +1,7 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
     OutboundPolicy, PathCapabilities, PathId, PathMetrics, PathStatus, RateHint, ResetReason,
-    SessionId, StreamFlags, StreamId, TargetAddr, TrafficClass, UnderlayProtocol,
+    SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr, TrafficClass, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -229,12 +229,14 @@ fn encode_payload(
             ingress,
             outbound,
             class,
+            role,
         } => {
             put_u64(out, stream_id.0);
             encode_target(out, target, limits)?;
             put_u8(out, ingress_to_u8(*ingress));
             encode_outbound(out, outbound, limits)?;
             put_u8(out, traffic_class_to_u8(*class));
+            put_u8(out, stream_open_role_to_u8(*role));
             Ok(FrameKind::OpenStream)
         }
         Frame::StreamClass { stream_id, class } => {
@@ -437,6 +439,7 @@ fn decode_payload(
             ingress: ingress_from_u8(reader.get_u8()?)?,
             outbound: decode_outbound(reader, limits)?,
             class: traffic_class_from_u8(reader.get_u8()?)?,
+            role: stream_open_role_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::StreamClass => Ok(Frame::StreamClass {
             stream_id: StreamId(reader.get_u64()?),
@@ -1090,6 +1093,21 @@ fn traffic_class_from_u8(value: u8) -> Result<TrafficClass, CodecError> {
     }
 }
 
+fn stream_open_role_to_u8(value: StreamOpenRole) -> u8 {
+    match value {
+        StreamOpenRole::Active => 1,
+        StreamOpenRole::Repair => 2,
+    }
+}
+
+fn stream_open_role_from_u8(value: u8) -> Result<StreamOpenRole, CodecError> {
+    match value {
+        1 => Ok(StreamOpenRole::Active),
+        2 => Ok(StreamOpenRole::Repair),
+        _ => Err(CodecError::InvalidEnum),
+    }
+}
+
 fn close_reason_to_u8(value: CloseReason) -> u8 {
     match value {
         CloseReason::Normal => 0,
@@ -1212,6 +1230,7 @@ mod tests {
             ingress: IngressKind::Socks5,
             outbound: OutboundPolicy::Direct,
             class: TrafficClass::Interactive,
+            role: StreamOpenRole::Active,
         });
         round_trip(Frame::StreamClass {
             stream_id: StreamId(7),

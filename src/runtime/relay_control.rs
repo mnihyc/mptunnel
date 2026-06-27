@@ -922,6 +922,11 @@ pub(super) async fn attach_relay_path_candidates(
             request.spec.ingress,
             request.class,
             key,
+            if request.race_repair {
+                StreamOpenRole::Repair
+            } else {
+                StreamOpenRole::Active
+            },
         )
         .await
         {
@@ -978,14 +983,25 @@ pub(super) async fn open_remote_stream_for_relay_path(
     ingress: IngressKind,
     class: TrafficClass,
     key: RelayPathKey,
+    role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     match key.underlay {
         UnderlayProtocol::Tcp => {
-            open_remote_stream_on_path(context, stream_id, target, ingress, class, key.index).await
+            open_remote_stream_on_path(context, stream_id, target, ingress, class, key.index, role)
+                .await
         }
         UnderlayProtocol::Udp => {
             open_remote_stream_on_udp_path(
-                context, stream_id, target, ingress, class, key.index, false,
+                context,
+                stream_id,
+                target,
+                ingress,
+                class,
+                key.index,
+                UdpStreamOpenOptions {
+                    wait_for_accept: false,
+                    role,
+                },
             )
             .await
         }
@@ -1185,7 +1201,14 @@ pub(super) async fn attach_udp_relay_paths(
             spec.ingress,
             class,
             path_index,
-            false,
+            UdpStreamOpenOptions {
+                wait_for_accept: false,
+                role: if race_repair {
+                    StreamOpenRole::Repair
+                } else {
+                    StreamOpenRole::Active
+                },
+            },
         )
         .await
         {

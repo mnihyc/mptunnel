@@ -48,6 +48,12 @@ pub enum TrafficClass {
     Background,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOpenRole {
+    Active,
+    Repair,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetAddr {
     Domain { host: String, port: u16 },
@@ -280,6 +286,7 @@ pub enum Frame {
         ingress: IngressKind,
         outbound: OutboundPolicy,
         class: TrafficClass,
+        role: StreamOpenRole,
     },
     StreamClass {
         stream_id: StreamId,

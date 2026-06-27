@@ -121,6 +121,7 @@ pub(super) async fn handle_server_path(
                     stream_id,
                     target,
                     class,
+                    role,
                     ..
                 } if !draining => {
                     outbound::validate_target(&target)?;
@@ -136,6 +137,7 @@ pub(super) async fn handle_server_path(
                                 underlay: UnderlayProtocol::Tcp,
                                 commands: commands_tx.clone(),
                                 max_frame_payload_bytes: tcp_relay_buffer_len(context.mux_limits),
+                                role,
                             },
                         },
                         context.mux_limits,

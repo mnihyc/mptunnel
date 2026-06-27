@@ -673,6 +673,7 @@ impl ServerUdpPathSession {
                     stream_id,
                     target,
                     class,
+                    role,
                     ..
                 },
             ) if !self.draining => {
@@ -692,6 +693,7 @@ impl ServerUdpPathSession {
                             max_frame_payload_bytes: udp_stream_frame_payload_bytes(
                                 self.context.mux_limits,
                             ),
+                            role,
                         },
                     },
                     self.context.mux_limits,

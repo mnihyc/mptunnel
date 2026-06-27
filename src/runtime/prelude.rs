@@ -14,7 +14,7 @@ pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{
     AuthNonce, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
     OutboundPolicy, PathCapabilities, PathId, RateHint, ResetReason, SessionId, StreamFlags,
-    StreamId, TargetAddr, TrafficClass, UnderlayProtocol,
+    StreamId, StreamOpenRole, TargetAddr, TrafficClass, UnderlayProtocol,
 };
 pub(super) use crate::scheduler::{
     self, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,

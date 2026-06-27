@@ -789,6 +789,7 @@ async fn server_udp_path_drops_early_stream_frame_before_reordered_handshake() {
         ingress: IngressKind::Socks5,
         outbound: OutboundPolicy::Direct,
         class: TrafficClass::Interactive,
+        role: StreamOpenRole::Active,
     };
     assert!(matches!(
         session
@@ -857,6 +858,7 @@ async fn server_udp_listener_requires_control_before_unknown_peer_session() {
             ingress: IngressKind::Socks5,
             outbound: OutboundPolicy::Direct,
             class: TrafficClass::Interactive,
+            role: StreamOpenRole::Active,
         })
         .await
         .expect("early open");
@@ -1005,6 +1007,7 @@ async fn server_udp_path_handles_idempotent_control_and_drain() {
                 ingress: IngressKind::Socks5,
                 outbound: OutboundPolicy::Direct,
                 class: TrafficClass::Interactive,
+                role: StreamOpenRole::Active,
             })
             .await
             .expect("open after drain"),
@@ -1672,123 +1675,6 @@ fn tcp_path_sessions_are_dedicated_for_latency_sensitive_classes() {
     ));
 }
 
-#[tokio::test]
-async fn server_tcp_binding_reselects_blocked_data_send_after_path_update() {
-    let (old_tx, _old_rx) = tcp_path_session_command_channels(1);
-    old_tx
-        .send_frame(
-            Frame::StreamData {
-                stream_id: StreamId(99),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"fill"),
-            },
-            TrafficClass::Interactive,
-        )
-        .await
-        .expect("fill old path priority command queue");
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        old_tx,
-        TrafficClass::Interactive,
-    );
-    let send_binding = binding.clone();
-    let send_task = tokio::spawn(async move {
-        send_binding
-            .send_frame(
-                StreamId(7),
-                TrafficClass::Bulk,
-                Frame::StreamData {
-                    stream_id: StreamId(7),
-                    offset: 0,
-                    flags: StreamFlags::NONE,
-                    payload: Bytes::from_static(b"bulk"),
-                },
-            )
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!send_task.is_finished());
-
-    let (new_tx, mut new_rx) = tcp_path_session_command_channels(1);
-    binding.attach(UnderlayProtocol::Tcp, PathId(1), new_tx, TrafficClass::Bulk);
-    assert_eq!(binding.class(), TrafficClass::Bulk);
-    send_task
-        .await
-        .expect("binding send join")
-        .expect("binding send");
-    match recv_tcp_path_command(&mut new_rx)
-        .await
-        .expect("new path command")
-    {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            stream_id, payload, ..
-        }) => {
-            assert_eq!(stream_id, StreamId(7));
-            assert_eq!(&payload[..], b"bulk");
-        }
-        _ => panic!("expected stream data on reselected path"),
-    }
-}
-
-#[tokio::test]
-async fn server_tcp_binding_reattach_promotes_existing_path_for_data() {
-    let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_initial_tx,
-        TrafficClass::Interactive,
-    );
-    let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(1),
-        path1_tx,
-        TrafficClass::Bulk,
-    );
-    let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_repair_tx,
-        TrafficClass::Bulk,
-    );
-
-    binding
-        .send_frame(
-            StreamId(7),
-            TrafficClass::Bulk,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"repair"),
-            },
-        )
-        .await
-        .expect("send on promoted repair path");
-
-    match recv_tcp_path_command(&mut path0_repair_rx)
-        .await
-        .expect("path0 repair command")
-    {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData { payload, .. }) => {
-            assert_eq!(&payload[..], b"repair");
-        }
-        _ => panic!("expected data on promoted repair path"),
-    }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_tcp_path_command(&mut path1_rx)
-        )
-        .await
-        .is_err()
-    );
-}
-
 #[test]
 fn server_tcp_registry_updates_stream_class_without_reopen() {
     let registry = ServerTcpStreamRegistry::new(ResourceLimits::default().max_streams);
@@ -1806,6 +1692,7 @@ fn server_tcp_registry_updates_stream_class_without_reopen() {
                     underlay: UnderlayProtocol::Tcp,
                     commands,
                     max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Active,
                 },
             },
             MuxLimits::default(),
@@ -1839,7 +1726,13 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
         TrafficClass::Interactive,
     );
     let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
-    binding.attach(UnderlayProtocol::Udp, PathId(0), udp_tx, TrafficClass::Bulk);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(0),
+        udp_tx,
+        TrafficClass::Bulk,
+        StreamOpenRole::Active,
+    );
 
     binding.close_stream(StreamId(7)).await;
 

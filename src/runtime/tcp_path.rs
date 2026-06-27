@@ -148,18 +148,29 @@ impl ServerTcpStreamBinding {
         path_id: PathId,
         commands: TcpPathSessionCommandSender,
         class: TrafficClass,
+        role: StreamOpenRole,
     ) {
         *self.class.lock().expect("server TCP stream class lock") = class;
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let key = ServerTcpPathKey { underlay, path_id };
-        if let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) {
-            let mut entry = outputs.entries.remove(position);
-            entry.commands = commands;
+        let mut was_active = false;
+        let entry =
+            if let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) {
+                was_active = position + 1 == outputs.entries.len();
+                let mut entry = outputs.entries.remove(position);
+                entry.commands = commands;
+                entry
+            } else {
+                ServerTcpStreamOutputEntry { key, commands }
+            };
+        let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role, class)
+            || was_active
+            || outputs.entries.is_empty();
+        if promote_or_keep_active_slot {
             outputs.entries.push(entry);
         } else {
-            outputs
-                .entries
-                .push(ServerTcpStreamOutputEntry { key, commands });
+            let insert_at = outputs.entries.len().saturating_sub(1);
+            outputs.entries.insert(insert_at, entry);
         }
         outputs.next_index %= outputs.entries.len().max(1);
         drop(outputs);
@@ -269,6 +280,14 @@ fn server_frame_prefers_current_data_path(frame: &Frame) -> bool {
     matches!(frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
 }
 
+fn server_stream_open_role_promotes_data_path(role: StreamOpenRole, class: TrafficClass) -> bool {
+    role == StreamOpenRole::Active
+        || !matches!(
+            class,
+            TrafficClass::Control | TrafficClass::RealtimeDatagram
+        )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ServerTcpPathKey {
     underlay: UnderlayProtocol,
@@ -310,6 +329,7 @@ pub(super) struct ServerTcpPathAttachment {
     pub(super) underlay: UnderlayProtocol,
     pub(super) commands: TcpPathSessionCommandSender,
     pub(super) max_frame_payload_bytes: usize,
+    pub(super) role: StreamOpenRole,
 }
 
 pub(super) struct ServerTcpStreamOpenRequest<'a> {
@@ -361,9 +381,13 @@ impl ServerTcpStreamRegistry {
                 ));
             }
             entry.class = class;
-            entry
-                .binding
-                .attach(underlay, attachment.path_id, attachment.commands, class);
+            entry.binding.attach(
+                underlay,
+                attachment.path_id,
+                attachment.commands,
+                class,
+                attachment.role,
+            );
             return Ok(ServerTcpStreamOpen::Existing);
         }
 
@@ -537,6 +561,7 @@ impl ClientTcpPathSessionHandle {
         target: TargetAddr,
         ingress: IngressKind,
         class: TrafficClass,
+        role: StreamOpenRole,
     ) -> Result<TcpPathStream, RuntimeError> {
         let commands = self.ensure_session(class);
         let (response_tx, response_rx) = oneshot::channel();
@@ -546,6 +571,7 @@ impl ClientTcpPathSessionHandle {
                 target,
                 ingress,
                 class,
+                role,
                 session_commands: commands.clone(),
                 response: response_tx,
             })
@@ -725,6 +751,7 @@ pub(super) enum TcpPathSessionCommand {
         target: TargetAddr,
         ingress: IngressKind,
         class: TrafficClass,
+        role: StreamOpenRole,
         session_commands: TcpPathSessionCommandSender,
         response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
     },
@@ -780,6 +807,7 @@ struct ClientTcpOpenStreamRequest {
     target: TargetAddr,
     ingress: IngressKind,
     class: TrafficClass,
+    role: StreamOpenRole,
     session_commands: TcpPathSessionCommandSender,
     response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
 }
@@ -930,6 +958,7 @@ async fn handle_disconnected_client_tcp_command(
             target,
             ingress,
             class,
+            role,
             session_commands,
             response,
         } => match connect_client_tcp_path(
@@ -948,6 +977,7 @@ async fn handle_disconnected_client_tcp_command(
                     target,
                     ingress,
                     class,
+                    role,
                     session_commands,
                     response,
                 };
@@ -987,6 +1017,7 @@ async fn handle_connected_client_tcp_command(
             target,
             ingress,
             class,
+            role,
             session_commands,
             response,
         } => {
@@ -995,6 +1026,7 @@ async fn handle_connected_client_tcp_command(
                 target,
                 ingress,
                 class,
+                role,
                 session_commands,
                 response,
             };
@@ -1110,6 +1142,7 @@ async fn open_client_tcp_stream_on_connection(
             ingress: open.ingress,
             outbound: OutboundPolicy::Direct,
             class: open.class,
+            role: open.role,
         })
         .await?;
     connection.writer.flush().await?;

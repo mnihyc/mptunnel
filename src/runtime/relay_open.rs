@@ -382,13 +382,16 @@ pub(super) async fn open_remote_stream_with_id(
         return open_remote_stream_with_id_over_udp(context, stream_id, target, ingress, class)
             .await;
     }
-    let candidates = context.ordered_tcp_path_indices(class, PATH_OPEN_SCORE_BYTES);
-    if candidates.is_empty() {
-        return Err(RuntimeError::NoSchedulableTcpPath);
-    }
+    let mut attempted = Vec::new();
     let mut last_retryable_error = None;
-    for path_index in candidates {
-        match open_remote_stream_on_path(
+    while attempted.len() < context.tcp_paths.len() {
+        let Some(path_index) =
+            context.reserve_tcp_stream_path(class, PATH_OPEN_SCORE_BYTES, &attempted)
+        else {
+            break;
+        };
+        attempted.push(path_index);
+        match open_remote_stream_on_reserved_path(
             context,
             stream_id,
             target.clone(),
@@ -400,16 +403,42 @@ pub(super) async fn open_remote_stream_with_id(
         {
             Ok(opened) => return Ok(opened),
             Err(err) if stream_open_error_is_path_retryable(&err) => {
+                context.release_tcp_path_load(path_index, class);
                 context.mark_tcp_path_failure(path_index);
                 last_retryable_error = Some(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                context.release_tcp_path_load(path_index, class);
+                return Err(err);
+            }
         }
     }
     Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableTcpPath))
 }
 
 pub(super) async fn open_remote_stream_on_path(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    target: TargetAddr,
+    ingress: IngressKind,
+    class: TrafficClass,
+    path_index: usize,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    context.reserve_tcp_path_load(path_index, class);
+    match open_remote_stream_on_reserved_path(
+        context, stream_id, target, ingress, class, path_index,
+    )
+    .await
+    {
+        Ok(opened) => Ok(opened),
+        Err(err) => {
+            context.release_tcp_path_load(path_index, class);
+            Err(err)
+        }
+    }
+}
+
+pub(super) async fn open_remote_stream_on_reserved_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -424,7 +453,7 @@ pub(super) async fn open_remote_stream_on_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
         .open_stream(stream_id, target, ingress, class)
         .await?;
-    context.mark_tcp_path_open_success(path_index, started_at.elapsed(), class);
+    context.mark_tcp_path_reserved_open_success(path_index, started_at.elapsed());
     Ok(OpenedRemoteStream { stream, path_index })
 }
 
@@ -438,13 +467,16 @@ pub(super) async fn open_remote_stream_with_id_over_udp(
     if context.udp_paths.is_empty() {
         return Err(RuntimeError::NoTcpPath);
     }
-    let candidates = context.ordered_udp_stream_path_indices(class, PATH_OPEN_SCORE_BYTES);
-    if candidates.is_empty() {
-        return Err(RuntimeError::NoSchedulableUdpPath);
-    }
+    let mut attempted = Vec::new();
     let mut last_retryable_error = None;
-    for path_index in candidates {
-        match open_remote_stream_on_udp_path(
+    while attempted.len() < context.udp_paths.len() {
+        let Some(path_index) =
+            context.reserve_udp_stream_path(class, PATH_OPEN_SCORE_BYTES, &attempted)
+        else {
+            break;
+        };
+        attempted.push(path_index);
+        match open_remote_stream_on_reserved_udp_path(
             context,
             stream_id,
             target.clone(),
@@ -457,16 +489,52 @@ pub(super) async fn open_remote_stream_with_id_over_udp(
         {
             Ok(opened) => return Ok(opened),
             Err(err) if udp_stream_open_error_is_path_retryable(&err) => {
+                context.release_udp_stream_path_load(path_index, class);
                 context.mark_udp_path_failure(path_index);
                 last_retryable_error = Some(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                context.release_udp_stream_path_load(path_index, class);
+                return Err(err);
+            }
         }
     }
     Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath))
 }
 
 pub(super) async fn open_remote_stream_on_udp_path(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    target: TargetAddr,
+    ingress: IngressKind,
+    class: TrafficClass,
+    path_index: usize,
+    wait_for_accept: bool,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    if context.udp_paths.get(path_index).is_none() {
+        return Err(RuntimeError::NoSchedulableUdpPath);
+    }
+    context.reserve_udp_stream_path_load(path_index, class);
+    match open_remote_stream_on_reserved_udp_path(
+        context,
+        stream_id,
+        target,
+        ingress,
+        class,
+        path_index,
+        wait_for_accept,
+    )
+    .await
+    {
+        Ok(opened) => Ok(opened),
+        Err(err) => {
+            context.release_udp_stream_path_load(path_index, class);
+            Err(err)
+        }
+    }
+}
+
+pub(super) async fn open_remote_stream_on_reserved_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -628,7 +696,7 @@ pub(super) async fn open_remote_stream_on_udp_path(
         frames_tx,
         pending_open_retry,
     ));
-    context.mark_udp_stream_path_open_success(path_index, started_at.elapsed(), class);
+    context.mark_udp_stream_reserved_open_success(path_index, started_at.elapsed());
     Ok(OpenedRemoteStream {
         stream: TcpPathStream {
             stream_id,

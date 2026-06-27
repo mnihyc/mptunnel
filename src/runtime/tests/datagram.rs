@@ -702,7 +702,7 @@ fn endpoint_only_tcp_startup_validates_order_before_noisy_probe_scores() {
 }
 
 #[test]
-fn endpoint_only_tcp_interactive_opens_stay_latency_first_under_active_flow() {
+fn endpoint_only_tcp_interactive_opens_spread_active_load_without_probe_noise() {
     let low_latency_path = "tcp://127.0.0.1:10129"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -724,8 +724,142 @@ fn endpoint_only_tcp_interactive_opens_stay_latency_first_under_active_flow() {
 
     assert_eq!(
         context.ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
-        vec![0, 1, 2]
+        vec![1, 2, 0]
     );
+}
+
+#[test]
+fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_noise() {
+    let first_path = "tcp://127.0.0.1:10162"
+        .parse::<PathSpec>()
+        .expect("first path");
+    let second_path = "tcp://127.0.0.1:10163"
+        .parse::<PathSpec>()
+        .expect("second path");
+    let probe_noisy_path = "tcp://127.0.0.1:10164"
+        .parse::<PathSpec>()
+        .expect("probe noisy path");
+    let context = ClientPathContext::new(
+        vec![first_path, second_path, probe_noisy_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
+
+    let first = context
+        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("first reservation");
+    let second = context
+        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("second reservation");
+
+    assert_eq!(first, 0);
+    assert_eq!(second, 1);
+
+    context.mark_tcp_path_reserved_open_success(first, Duration::from_millis(20));
+    context.mark_tcp_path_reserved_open_success(second, Duration::from_millis(80));
+    context.release_tcp_path_load(first, TrafficClass::Interactive);
+    context.release_tcp_path_load(second, TrafficClass::Interactive);
+
+    let health = context.health.lock().expect("health lock");
+    assert_eq!(health.tcp[0].active_flows, 0);
+    assert_eq!(health.tcp[1].active_flows, 0);
+    assert_eq!(health.tcp[0].load_bytes, 0);
+    assert_eq!(health.tcp[1].load_bytes, 0);
+}
+
+#[test]
+fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
+    let first_path = "tcp://127.0.0.1:10166"
+        .parse::<PathSpec>()
+        .expect("first path");
+    let second_path = "tcp://127.0.0.1:10167"
+        .parse::<PathSpec>()
+        .expect("second path");
+    let context = ClientPathContext::new(
+        vec![first_path, second_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.reclassify_relay_path_load(
+        UnderlayProtocol::Tcp,
+        0,
+        TrafficClass::Interactive,
+        TrafficClass::Bulk,
+    );
+
+    let reserved = context
+        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("interactive reservation");
+    assert_eq!(reserved, 1);
+}
+
+#[test]
+fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_realtime_work() {
+    let first_path = "tcp://127.0.0.1:10168"
+        .parse::<PathSpec>()
+        .expect("first path");
+    let second_path = "tcp://127.0.0.1:10169"
+        .parse::<PathSpec>()
+        .expect("second path");
+    let udp_path = "udp://127.0.0.1:10170"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context = ClientPathContext::new(
+        vec![first_path, second_path, udp_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.reclassify_relay_path_load(
+        UnderlayProtocol::Tcp,
+        0,
+        TrafficClass::Interactive,
+        TrafficClass::Bulk,
+    );
+    context.mark_udp_path_open_success(0, Duration::from_millis(30));
+
+    let reserved = context
+        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("interactive reservation");
+    assert_eq!(reserved, 0);
+}
+
+#[test]
+fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_latency_first() {
+    let first_path = "tcp://127.0.0.1:10171"
+        .parse::<PathSpec>()
+        .expect("first path");
+    let second_path = "tcp://127.0.0.1:10172"
+        .parse::<PathSpec>()
+        .expect("second path");
+    let context = ClientPathContext::new(
+        vec![first_path, second_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.reclassify_relay_path_load(
+        UnderlayProtocol::Tcp,
+        0,
+        TrafficClass::Interactive,
+        TrafficClass::Bulk,
+    );
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+
+    let reserved = context
+        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("interactive reservation");
+    assert_eq!(reserved, 0);
 }
 
 #[test]

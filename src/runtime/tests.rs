@@ -35,6 +35,16 @@ fn tcp_auto_bulk_discovery_indices(
         .collect()
 }
 
+fn udp_stream_path_indices(
+    context: &ClientPathContext,
+    class: TrafficClass,
+    payload_bytes: usize,
+) -> Vec<usize> {
+    let observations =
+        health_observations(&mut context.health.lock().expect("client path health lock").udp);
+    ordered_reliable_path_indices(&context.udp_paths, &observations, class, payload_bytes)
+}
+
 fn server_context(outbound: OutboundConfig) -> ServerPathContext {
     let resources = ResourceLimits::default();
     ServerPathContext {

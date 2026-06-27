@@ -283,6 +283,19 @@ impl ClientPathHealthRecord {
         self.load_bytes = self.load_bytes.saturating_add(load_bytes);
     }
 
+    pub(super) fn reserve_load(&mut self, load_bytes: u64, class: TrafficClass) {
+        self.active_flows = self.active_flows.saturating_add(1);
+        if tcp_relay_expects_interactive_response(class) {
+            self.active_latency_sensitive_flows =
+                self.active_latency_sensitive_flows.saturating_add(1);
+        }
+        self.load_bytes = self.load_bytes.saturating_add(load_bytes);
+    }
+
+    pub(super) fn mark_reserved_open_success(&mut self, elapsed: Duration) {
+        self.mark_success(elapsed);
+    }
+
     pub(super) fn release_load(&mut self, load_bytes: u64, class: TrafficClass) {
         self.active_flows = self.active_flows.saturating_sub(1);
         if tcp_relay_expects_interactive_response(class) {
@@ -290,6 +303,20 @@ impl ClientPathHealthRecord {
                 self.active_latency_sensitive_flows.saturating_sub(1);
         }
         self.load_bytes = self.load_bytes.saturating_sub(load_bytes);
+    }
+
+    pub(super) fn reclassify_load(&mut self, from: TrafficClass, to: TrafficClass) {
+        if tcp_relay_expects_interactive_response(from)
+            && !tcp_relay_expects_interactive_response(to)
+        {
+            self.active_latency_sensitive_flows =
+                self.active_latency_sensitive_flows.saturating_sub(1);
+        } else if !tcp_relay_expects_interactive_response(from)
+            && tcp_relay_expects_interactive_response(to)
+        {
+            self.active_latency_sensitive_flows =
+                self.active_latency_sensitive_flows.saturating_add(1);
+        }
     }
 
     pub(super) fn mark_delivery(&mut self, sample: PathRateSample) {
@@ -546,29 +573,88 @@ impl ClientPathContext {
                 payload_bytes,
             );
         }
-        ordered_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
+        ordered_reliable_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
     }
 
-    pub(super) fn ordered_udp_stream_path_indices(
+    pub(super) fn reserve_tcp_stream_path(
         &self,
         class: TrafficClass,
         payload_bytes: usize,
-    ) -> Vec<usize> {
-        let observations =
-            health_observations(&mut self.health.lock().expect("client path health lock").udp);
-        if reliable_stream_latency_startup_should_use_configured_order(
-            &self.udp_paths,
+        excluded: &[usize],
+    ) -> Option<usize> {
+        let mut health = self.health.lock().expect("client path health lock");
+        let mut observations = health_observations(&mut health.tcp);
+        apply_tcp_bulk_isolation(&mut observations, class, self.mux_limits);
+        let active_udp_work = health
+            .udp
+            .iter()
+            .any(|record| record.active_flows > 0 || record.load_bytes > 0);
+        let indices = if endpoint_only_tcp_startup_should_spread_bulk_load(
+            &self.tcp_paths,
             &observations,
             class,
+            active_udp_work,
         ) {
-            return configured_order_path_indices(
-                &self.udp_paths,
+            endpoint_only_reliable_startup_path_indices(
+                &self.tcp_paths,
                 &observations,
                 class,
                 payload_bytes,
-            );
+            )
+        } else {
+            ordered_reliable_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
+        };
+        let index = indices
+            .into_iter()
+            .find(|index| !excluded.contains(index))?;
+        health
+            .tcp
+            .get_mut(index)?
+            .reserve_load(TCP_STREAM_LOAD_BYTES, class);
+        Some(index)
+    }
+
+    pub(super) fn reserve_tcp_path_load(&self, index: usize, class: TrafficClass) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+        {
+            current.reserve_load(TCP_STREAM_LOAD_BYTES, class);
         }
-        ordered_path_indices(&self.udp_paths, &observations, class, payload_bytes)
+    }
+
+    pub(super) fn reserve_udp_stream_path(
+        &self,
+        class: TrafficClass,
+        payload_bytes: usize,
+        excluded: &[usize],
+    ) -> Option<usize> {
+        let mut health = self.health.lock().expect("client path health lock");
+        let observations = health_observations(&mut health.udp);
+        let index =
+            ordered_reliable_path_indices(&self.udp_paths, &observations, class, payload_bytes)
+                .into_iter()
+                .find(|index| !excluded.contains(index))?;
+        health
+            .udp
+            .get_mut(index)?
+            .reserve_load(TCP_STREAM_LOAD_BYTES, class);
+        Some(index)
+    }
+
+    pub(super) fn reserve_udp_stream_path_load(&self, index: usize, class: TrafficClass) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            current.reserve_load(TCP_STREAM_LOAD_BYTES, class);
+        }
     }
 
     pub(super) fn ordered_tcp_repair_path_indices(
@@ -990,6 +1076,18 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn mark_tcp_path_reserved_open_success(&self, index: usize, elapsed: Duration) {
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+        {
+            current.mark_reserved_open_success(elapsed);
+        }
+    }
+
     pub(super) fn mark_tcp_path_probe_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .health
@@ -1025,12 +1123,7 @@ impl ClientPathContext {
         }
     }
 
-    pub(super) fn mark_udp_stream_path_open_success(
-        &self,
-        index: usize,
-        elapsed: Duration,
-        class: TrafficClass,
-    ) {
+    pub(super) fn mark_udp_stream_reserved_open_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .health
             .lock()
@@ -1038,7 +1131,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.mark_open_success(elapsed, TCP_STREAM_LOAD_BYTES, class);
+            current.mark_reserved_open_success(elapsed);
         }
     }
 
@@ -1070,6 +1163,31 @@ impl ClientPathContext {
         match underlay {
             UnderlayProtocol::Tcp => self.release_tcp_path_load(index, class),
             UnderlayProtocol::Udp => self.release_udp_stream_path_load(index, class),
+        }
+    }
+
+    pub(super) fn reclassify_relay_path_load(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        from: TrafficClass,
+        to: TrafficClass,
+    ) {
+        if from == to {
+            return;
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        match underlay {
+            UnderlayProtocol::Tcp => {
+                if let Some(current) = health.tcp.get_mut(index) {
+                    current.reclassify_load(from, to);
+                }
+            }
+            UnderlayProtocol::Udp => {
+                if let Some(current) = health.udp.get_mut(index) {
+                    current.reclassify_load(from, to);
+                }
+            }
         }
     }
 
@@ -1337,10 +1455,99 @@ pub(super) fn apply_tcp_bulk_isolation(
 
 pub(super) fn reliable_stream_latency_startup_should_use_configured_order(
     paths: &[PathSpec],
-    _observations: &[ClientPathObservation],
+    observations: &[ClientPathObservation],
     class: TrafficClass,
 ) -> bool {
-    tcp_relay_expects_interactive_response(class) && paths.iter().all(path_is_endpoint_only)
+    tcp_relay_expects_interactive_response(class)
+        && paths.iter().all(path_is_endpoint_only)
+        && (!endpoint_only_startup_has_latency_sensitive_load(observations)
+            || endpoint_only_startup_has_bulk_load(observations))
+}
+
+pub(super) fn reliable_stream_latency_startup_should_use_load_balanced_order(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    class: TrafficClass,
+) -> bool {
+    tcp_relay_expects_interactive_response(class)
+        && paths.iter().all(path_is_endpoint_only)
+        && endpoint_only_startup_has_latency_sensitive_load(observations)
+        && !endpoint_only_startup_has_bulk_load(observations)
+}
+
+pub(super) fn endpoint_only_startup_has_latency_sensitive_load(
+    observations: &[ClientPathObservation],
+) -> bool {
+    observations
+        .iter()
+        .any(|observation| observation.active_latency_sensitive_flows > 0)
+}
+
+pub(super) fn endpoint_only_startup_has_any_load(observations: &[ClientPathObservation]) -> bool {
+    observations
+        .iter()
+        .any(|observation| observation.active_flows > 0 || observation.load_bytes > 0)
+}
+
+pub(super) fn endpoint_only_startup_has_bulk_load(observations: &[ClientPathObservation]) -> bool {
+    observations
+        .iter()
+        .any(|observation| observation.active_flows > observation.active_latency_sensitive_flows)
+}
+
+pub(super) fn endpoint_only_tcp_startup_should_spread_bulk_load(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    class: TrafficClass,
+    active_udp_work: bool,
+) -> bool {
+    tcp_relay_expects_interactive_response(class)
+        && paths.iter().all(path_is_endpoint_only)
+        && endpoint_only_startup_has_any_load(observations)
+        && endpoint_only_startup_has_bulk_load(observations)
+        && !endpoint_only_startup_has_latency_sensitive_load(observations)
+        && !active_udp_work
+}
+
+pub(super) fn ordered_reliable_path_indices(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    class: TrafficClass,
+    payload_bytes: usize,
+) -> Vec<usize> {
+    if reliable_stream_latency_startup_should_use_configured_order(paths, observations, class) {
+        return configured_order_path_indices(paths, observations, class, payload_bytes);
+    }
+    if reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, class) {
+        return endpoint_only_reliable_startup_path_indices(
+            paths,
+            observations,
+            class,
+            payload_bytes,
+        );
+    }
+    ordered_path_indices(paths, observations, class, payload_bytes)
+}
+
+pub(super) fn endpoint_only_reliable_startup_path_indices(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    class: TrafficClass,
+    payload_bytes: usize,
+) -> Vec<usize> {
+    let observations = observations
+        .iter()
+        .copied()
+        .map(|observation| ClientPathObservation {
+            measured_srtt_ms: None,
+            measured_jitter_ms: None,
+            measured_rate_bps: None,
+            measured_loss_rate: None,
+            measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
+            ..observation
+        })
+        .collect::<Vec<_>>();
+    ordered_path_indices(paths, &observations, class, payload_bytes)
 }
 
 pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {

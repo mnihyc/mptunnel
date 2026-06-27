@@ -33,6 +33,7 @@ impl TcpRelayClassState {
         };
         TcpRelayClassUpdate {
             class: self.current,
+            previous_class: previous,
             promoted_to_bulk: previous != TrafficClass::Bulk && self.current == TrafficClass::Bulk,
         }
     }
@@ -49,6 +50,7 @@ impl TcpRelayClassState {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TcpRelayClassUpdate {
     pub(super) class: TrafficClass,
+    pub(super) previous_class: TrafficClass,
     pub(super) promoted_to_bulk: bool,
 }
 
@@ -131,6 +133,14 @@ where
                 .await
             {
                 eprintln!("warning: TCP stream class update failed: {err}");
+            }
+            for key in remotes.path_keys() {
+                context.reclassify_relay_path_load(
+                    key.underlay,
+                    key.index,
+                    class_update.previous_class,
+                    relay_class,
+                );
             }
             remotes.set_class(relay_class);
         }

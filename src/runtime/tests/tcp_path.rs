@@ -354,7 +354,7 @@ fn single_path_failure_stays_probeable_without_alternative() {
     udp_context.mark_udp_path_failure(0);
     udp_context.mark_udp_path_failure(0);
     assert_eq!(
-        udp_context.ordered_udp_stream_path_indices(TrafficClass::Interactive, 512),
+        udp_stream_path_indices(&udp_context, TrafficClass::Interactive, 512),
         vec![0]
     );
 }
@@ -563,6 +563,76 @@ fn endpoint_only_tcp_bulk_discovery_waits_for_delivery_evidence_before_probe_noi
 }
 
 #[test]
+fn endpoint_only_tcp_bulk_discovery_still_requires_delivery_after_bulk_promotion() {
+    let low_latency_path = "tcp://127.0.0.1:10162"
+        .parse::<PathSpec>()
+        .expect("low latency path");
+    let balanced_path = "tcp://127.0.0.1:10163"
+        .parse::<PathSpec>()
+        .expect("balanced path");
+    let fat_path = "tcp://127.0.0.1:10164"
+        .parse::<PathSpec>()
+        .expect("fat path");
+    let context = ClientPathContext::new(
+        vec![low_latency_path, balanced_path, fat_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.reclassify_relay_path_load(
+        UnderlayProtocol::Tcp,
+        0,
+        TrafficClass::Interactive,
+        TrafficClass::Bulk,
+    );
+
+    assert!(
+        tcp_auto_bulk_discovery_indices(
+            &context,
+            Some(0),
+            MuxLimits::default().max_tcp_path_inflight_bytes,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn bulk_promotion_reclassifies_active_path_load_without_leaking_flow_accounting() {
+    let path = "tcp://127.0.0.1:10165".parse::<PathSpec>().expect("path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    {
+        let health = context.health.lock().expect("client path health lock");
+        assert_eq!(health.tcp[0].active_flows, 1);
+        assert_eq!(health.tcp[0].active_latency_sensitive_flows, 1);
+        assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
+    }
+
+    context.reclassify_relay_path_load(
+        UnderlayProtocol::Tcp,
+        0,
+        TrafficClass::Interactive,
+        TrafficClass::Bulk,
+    );
+    {
+        let health = context.health.lock().expect("client path health lock");
+        assert_eq!(health.tcp[0].active_flows, 1);
+        assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
+        assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
+    }
+
+    context.release_relay_path_load(UnderlayProtocol::Tcp, 0, TrafficClass::Bulk);
+    let health = context.health.lock().expect("client path health lock");
+    assert_eq!(health.tcp[0].active_flows, 0);
+    assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
+    assert_eq!(health.tcp[0].load_bytes, 0);
+}
+
+#[test]
 fn endpoint_only_tcp_bulk_discovery_requires_delivery_under_concurrent_latency_demand() {
     let low_latency_path = "tcp://127.0.0.1:10146"
         .parse::<PathSpec>()
@@ -626,13 +696,13 @@ fn endpoint_only_udp_stream_startup_preserves_configured_order_on_probe_noise() 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
 
     assert_eq!(
-        context.ordered_udp_stream_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        udp_stream_path_indices(&context, TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
         vec![0, 1]
     );
 
     context.mark_udp_path_failure(0);
     assert_eq!(
-        context.ordered_udp_stream_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        udp_stream_path_indices(&context, TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
         vec![1]
     );
 }

@@ -4391,6 +4391,7 @@ async fn open_remote_stream_on_udp_path(
                     Frame::SessionClose { reason } => {
                         return Err(RuntimeError::RemoteClosed(reason));
                     }
+                    Frame::SessionReady => {}
                     Frame::PathStatus { .. } => {}
                     _ => return Err(RuntimeError::Protocol("unexpected UDP stream open frame")),
                 },
@@ -4474,6 +4475,7 @@ async fn run_client_udp_stream_path_session(
                             return;
                         }
                     }
+                    Ok(Frame::SessionReady) => {}
                     Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
                         | Frame::StreamMaxData { stream_id: received_stream_id, .. }
@@ -8115,6 +8117,7 @@ impl UdpDatagramClientSession {
                     Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                         self.observe_remote_path_metrics(metrics);
                     }
+                    Frame::SessionReady => {}
                     Frame::RxRateHint { path_id, .. } if path_id == self.path_id => {}
                     Frame::DatagramClose {
                         flow_id: closed_flow_id,
@@ -8240,6 +8243,7 @@ impl UdpDatagramClientSession {
                 Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                     self.observe_remote_path_metrics(metrics);
                 }
+                Frame::SessionReady => {}
                 Frame::RxRateHint { path_id, .. } if path_id == self.path_id => {}
                 Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
                 _ => return Err(RuntimeError::Protocol("unexpected UDP MTU probe frame")),
@@ -8521,6 +8525,7 @@ struct ServerUdpPathSession {
     context: ServerPathContext,
     authenticator: SessionAuthenticator,
     state: ServerUdpPathState,
+    draining: bool,
     flows: Vec<ServerUdpDatagramFlow>,
     commands_tx: TcpPathSessionCommandSender,
     commands_rx: TcpPathSessionCommandReceivers,
@@ -8594,6 +8599,7 @@ impl ServerUdpPathSession {
             context,
             authenticator,
             state: ServerUdpPathState::AwaitSessionHello,
+            draining: false,
             flows: Vec::new(),
             commands_tx,
             commands_rx,
@@ -8629,6 +8635,7 @@ impl ServerUdpPathSession {
                 self.session_id = None;
                 self.path_id = None;
                 self.path_capabilities = None;
+                self.draining = false;
                 self.state = ServerUdpPathState::AwaitSessionAuth { session_id };
                 Ok(ServerUdpSessionOutcome::Active)
             }
@@ -8701,6 +8708,7 @@ impl ServerUdpPathSession {
                 self.session_id = Some(*session_id);
                 self.path_id = Some(path_id);
                 self.path_capabilities = Some(capabilities);
+                self.draining = false;
                 self.state = ServerUdpPathState::Established;
                 Ok(ServerUdpSessionOutcome::Active)
             }
@@ -8730,6 +8738,54 @@ impl ServerUdpPathSession {
                 self.send_established_udp_path_ready().await?;
                 Ok(ServerUdpSessionOutcome::Active)
             }
+            (ServerUdpPathState::Established, Frame::PathChallenge { path_id, nonce })
+                if Some(path_id) == self.path_id =>
+            {
+                self.encrypted
+                    .send_frame_to(&Frame::PathResponse { path_id, nonce }, self.peer)
+                    .await?;
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (
+                ServerUdpPathState::Established,
+                Frame::PathResponse { path_id, .. }
+                | Frame::PathMetrics {
+                    metrics: crate::protocol::PathMetrics { path_id, .. },
+                }
+                | Frame::RxRateHint { path_id, .. }
+                | Frame::PathStatus { path_id, .. },
+            ) if Some(path_id) == self.path_id => Ok(ServerUdpSessionOutcome::Active),
+            (
+                ServerUdpPathState::Established,
+                Frame::PathDrain {
+                    path_id: drain_path_id,
+                },
+            ) if Some(drain_path_id) == self.path_id => {
+                self.draining = true;
+                let (_, path_id, capabilities) = self.established_stream_context()?;
+                self.encrypted
+                    .send_frame_to(
+                        &Frame::PathStatus {
+                            path_id,
+                            status: crate::protocol::PathStatus::Draining,
+                            capabilities,
+                        },
+                        self.peer,
+                    )
+                    .await?;
+                if self.flows.is_empty() && self.attached_streams.is_empty() {
+                    Ok(ServerUdpSessionOutcome::Closed)
+                } else {
+                    Ok(ServerUdpSessionOutcome::Active)
+                }
+            }
+            (
+                ServerUdpPathState::Established,
+                Frame::PathClose {
+                    path_id: close_path_id,
+                    ..
+                },
+            ) if Some(close_path_id) == self.path_id => Ok(ServerUdpSessionOutcome::Closed),
             (ServerUdpPathState::Established, Frame::Ping { nonce }) => {
                 self.encrypted
                     .send_frame_to(&Frame::Pong { nonce }, self.peer)
@@ -8764,7 +8820,7 @@ impl ServerUdpPathSession {
                     class,
                     ..
                 },
-            ) => {
+            ) if !self.draining => {
                 let (session_id, path_id, capabilities) = self.established_stream_context()?;
                 outbound::validate_target(&target)?;
                 self.context.outbound.ensure_supports(TargetProtocol::Tcp)?;
@@ -8823,6 +8879,18 @@ impl ServerUdpPathSession {
                             .await?;
                     }
                 }
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (ServerUdpPathState::Established, Frame::OpenStream { stream_id, .. }) => {
+                self.encrypted
+                    .send_frame_to(
+                        &Frame::StreamReset {
+                            stream_id,
+                            reason: ResetReason::Refused,
+                        },
+                        self.peer,
+                    )
+                    .await?;
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
@@ -8920,7 +8988,7 @@ impl ServerUdpPathSession {
                 Frame::OpenDatagramFlow {
                     flow_id, target, ..
                 },
-            ) => {
+            ) if !self.draining => {
                 if self.flows.iter().any(|flow| flow.flow_id == flow_id) {
                     return Err(RuntimeError::Protocol("duplicate UDP datagram flow"));
                 }
@@ -8955,6 +9023,12 @@ impl ServerUdpPathSession {
                     self.context.mux_limits,
                 );
                 self.flows.push(ServerUdpDatagramFlow { flow_id, requests });
+                Ok(ServerUdpSessionOutcome::Active)
+            }
+            (ServerUdpPathState::Established, Frame::OpenDatagramFlow { flow_id, .. }) => {
+                self.encrypted
+                    .send_frame_to(&Frame::DatagramClose { flow_id }, self.peer)
+                    .await?;
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
@@ -10032,6 +10106,120 @@ mod tests {
         assert!(matches!(session.state, ServerUdpPathState::Established));
         assert_eq!(session.session_id, Some(session_id));
         assert_eq!(session.path_id, Some(path_id));
+    }
+
+    #[tokio::test]
+    async fn server_udp_path_handles_idempotent_control_and_drain() {
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("server udp bind"),
+        );
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let context = server_context(OutboundConfig::Direct);
+        let mut session =
+            ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
+        let path = "udp://127.0.0.1:7444".parse::<PathSpec>().expect("path");
+        let session_id = SessionId(78);
+        let path_id = PathId(3);
+        let (hello, auth, join) = authenticated_path_join_frames_for_session(
+            &security(),
+            &path,
+            path_id,
+            UnderlayProtocol::Udp,
+            session_id,
+        )
+        .expect("auth frames");
+
+        session.handle_frame(hello).await.expect("hello");
+        session.handle_frame(auth).await.expect("auth");
+        session.handle_frame(join).await.expect("join");
+        assert!(matches!(session.state, ServerUdpPathState::Established));
+
+        assert!(matches!(
+            session
+                .handle_frame(Frame::PathChallenge { path_id, nonce: 99 })
+                .await
+                .expect("path challenge"),
+            ServerUdpSessionOutcome::Active
+        ));
+        assert!(matches!(
+            session
+                .handle_frame(Frame::PathStatus {
+                    path_id,
+                    status: crate::protocol::PathStatus::Active,
+                    capabilities: crate::protocol::PathCapabilities::default(),
+                })
+                .await
+                .expect("path status"),
+            ServerUdpSessionOutcome::Active
+        ));
+        assert!(matches!(
+            session
+                .handle_frame(Frame::PathMetrics {
+                    metrics: crate::protocol::PathMetrics {
+                        path_id,
+                        min_rtt_us: 1_000,
+                        srtt_us: 2_000,
+                        rttvar_us: 500,
+                        jitter_us: 250,
+                        delivery_rate_bps: 10_000_000,
+                        loss_ppm: 1_000,
+                        ecn_ppm: 0,
+                        bytes_in_flight: 1024,
+                        queue_bytes: 2048,
+                    },
+                })
+                .await
+                .expect("path metrics"),
+            ServerUdpSessionOutcome::Active
+        ));
+        assert!(matches!(
+            session
+                .handle_frame(Frame::RxRateHint {
+                    path_id,
+                    hint: RateHint::BitsPerSecond(10_000_000),
+                })
+                .await
+                .expect("rate hint"),
+            ServerUdpSessionOutcome::Active
+        ));
+        let active_stream = StreamId(123);
+        session.attached_streams.insert(active_stream);
+        assert!(matches!(
+            session
+                .handle_frame(Frame::PathDrain { path_id })
+                .await
+                .expect("path drain"),
+            ServerUdpSessionOutcome::Active
+        ));
+        assert!(session.draining);
+        assert!(matches!(
+            session
+                .handle_frame(Frame::OpenStream {
+                    stream_id: StreamId(124),
+                    target: TargetAddr::Domain {
+                        host: "example.com".to_string(),
+                        port: 443,
+                    },
+                    ingress: IngressKind::Socks5,
+                    outbound: OutboundPolicy::Direct,
+                    class: TrafficClass::Interactive,
+                })
+                .await
+                .expect("open after drain"),
+            ServerUdpSessionOutcome::Active
+        ));
+        assert!(!session.attached_streams.contains(&StreamId(124)));
+        assert!(matches!(
+            session
+                .handle_command(TcpPathSessionCommand::CloseStream(active_stream))
+                .await
+                .expect("close active stream"),
+            ServerUdpSessionOutcome::Closed
+        ));
+        assert!(session.draining);
     }
 
     async fn drive_socks5_echo_client<S>(client: &mut S, target_addr: SocketAddr)

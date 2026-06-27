@@ -1815,14 +1815,17 @@ fn server_tcp_registry_updates_stream_class_without_reopen() {
     let ServerTcpStreamOpen::New(stream) = opened else {
         panic!("expected new stream");
     };
-    let TcpPathStreamOutput::Switchable(binding) = stream.output else {
+    assert_eq!(stream.current_class(), TrafficClass::Interactive);
+    let TcpPathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable binding");
     };
+    let binding = binding.clone();
 
     registry
         .update_class(SessionId(1), StreamId(7), TrafficClass::Bulk)
         .expect("class update");
 
+    assert_eq!(stream.current_class(), TrafficClass::Bulk);
     assert_eq!(binding.class(), TrafficClass::Bulk);
 }
 

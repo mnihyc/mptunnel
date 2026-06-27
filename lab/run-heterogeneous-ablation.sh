@@ -154,6 +154,7 @@ append_download_probe_result() {
   PROBE_STDERR="$probe_stderr" \
   CLIENT_LOG="$client_log" \
   SERVER_LOG="$server_log" \
+  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
@@ -176,7 +177,8 @@ if not row:
         "status": "fail",
         "exit_code": exit_code,
     }
-if row.get("status") != "ok":
+lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
+if row.get("status") != "ok" or lab_diag:
     for env_name, field in (
         ("PROBE_STDERR", "probe_stderr_tail"),
         ("CLIENT_LOG", "client_log_tail"),
@@ -426,6 +428,7 @@ start_target_services() {
 start_server() {
   stop_server
   exec_in server "\
+    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       server \
@@ -470,6 +473,7 @@ start_client_with_netem() {
     apply_netem "$netem_mode"
   fi
   exec_in client "\
+    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
@@ -512,6 +516,7 @@ start_tun_client() {
     stop_client
   fi
   exec_in client "\
+    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \

@@ -1292,6 +1292,19 @@ impl UdpStreamCongestion {
         self.cwnd_bytes.clamp(self.mss_bytes, self.max_bytes)
     }
 
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn diagnostic_state(&self) -> UdpStreamCongestionDiagnostic {
+        UdpStreamCongestionDiagnostic {
+            cwnd_bytes: self.cwnd_bytes,
+            ssthresh_bytes: self.ssthresh_bytes,
+            inflight_limit: self.inflight_limit(),
+            max_bytes: self.max_bytes,
+            mss_bytes: self.mss_bytes,
+            srtt_us: self.srtt.map(|srtt| srtt.as_micros() as u64),
+            pending_samples: self.pending_samples.len(),
+        }
+    }
+
     pub(super) fn repair_budget(&self, repair_bytes: usize) -> usize {
         if repair_bytes == 0 {
             return 0;
@@ -1396,6 +1409,18 @@ impl UdpStreamCongestion {
             None => sample,
         });
     }
+}
+
+#[cfg(feature = "lab-diagnostics")]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct UdpStreamCongestionDiagnostic {
+    pub(super) cwnd_bytes: usize,
+    pub(super) ssthresh_bytes: usize,
+    pub(super) inflight_limit: usize,
+    pub(super) max_bytes: usize,
+    pub(super) mss_bytes: usize,
+    pub(super) srtt_us: Option<u64>,
+    pub(super) pending_samples: usize,
 }
 
 pub(super) fn udp_stream_initial_cwnd_bytes(mss_bytes: usize, max_bytes: usize) -> usize {

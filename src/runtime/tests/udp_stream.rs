@@ -16,6 +16,7 @@ fn udp_stream_congestion_self_clocks_and_cuts_back_on_repair_timeout() {
     assert_eq!(congestion.repair_budget(0), 0);
     assert_eq!(congestion.repair_budget(mss / 2), mss);
 
+    congestion.on_send(mss * 4);
     congestion.on_ack(mss * 4);
     assert!(congestion.inflight_limit() > initial);
 

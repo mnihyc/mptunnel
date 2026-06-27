@@ -44,6 +44,10 @@ impl TcpPathStream {
         }
     }
 
+    pub(super) fn current_class(&self) -> TrafficClass {
+        self.output.current_class(self.class)
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -100,6 +104,13 @@ impl TcpPathStreamOutput {
                     .await;
             }
             Self::Switchable(binding) => binding.close_stream(stream_id).await,
+        }
+    }
+
+    pub(super) fn current_class(&self, fallback: TrafficClass) -> TrafficClass {
+        match self {
+            Self::Fixed(_) => fallback,
+            Self::Switchable(binding) => binding.class(),
         }
     }
 }

@@ -1,5 +1,6 @@
 mod core;
 mod datagram;
+mod diagnostics;
 mod error;
 mod ingress_runtime;
 mod prelude;
@@ -19,6 +20,8 @@ pub use udp_path::handle_server_udp_datagram_path_session;
 
 use core::*;
 use datagram::*;
+#[cfg(feature = "lab-diagnostics")]
+use diagnostics::*;
 use ingress_runtime::*;
 use prelude::*;
 use relay_control::*;

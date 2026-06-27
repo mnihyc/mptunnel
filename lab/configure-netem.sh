@@ -19,6 +19,14 @@ poor_jitter="${MPTUNNEL_LAB_POOR_JITTER:-120ms}"
 poor_loss="${MPTUNNEL_LAB_POOR_LOSS:-3.00%}"
 
 blackhole_loss="${MPTUNNEL_LAB_BLACKHOLE_LOSS:-100%}"
+spike_fat_rate="${MPTUNNEL_LAB_SPIKE_FAT_RATE:-20mbit}"
+spike_fat_delay="${MPTUNNEL_LAB_SPIKE_FAT_DELAY:-900ms}"
+spike_fat_jitter="${MPTUNNEL_LAB_SPIKE_FAT_JITTER:-250ms}"
+spike_fat_loss="${MPTUNNEL_LAB_SPIKE_FAT_LOSS:-0.50%}"
+spike_lowlat_rate="${MPTUNNEL_LAB_SPIKE_LOWLAT_RATE:-10mbit}"
+spike_lowlat_delay="${MPTUNNEL_LAB_SPIKE_LOWLAT_DELAY:-650ms}"
+spike_lowlat_jitter="${MPTUNNEL_LAB_SPIKE_LOWLAT_JITTER:-180ms}"
+spike_lowlat_loss="${MPTUNNEL_LAB_SPIKE_LOWLAT_LOSS:-0.30%}"
 
 interface_for_subnet() {
   local subnet_prefix="$1"
@@ -98,6 +106,12 @@ case "$mode" in
   blackhole-poor)
     blackhole_profile "172.31.30"
     ;;
+  spike-fat)
+    apply_profile "172.31.20" "$spike_fat_rate" "$spike_fat_delay" "$spike_fat_jitter" "$spike_fat_loss"
+    ;;
+  spike-lowlat)
+    apply_profile "172.31.10" "$spike_lowlat_rate" "$spike_lowlat_delay" "$spike_lowlat_jitter" "$spike_lowlat_loss"
+    ;;
   clear)
     clear_profile "172.31.10"
     clear_profile "172.31.20"
@@ -107,7 +121,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|blackhole-fat|blackhole-lowlat|blackhole-poor|clear|show]" >&2
+    echo "usage: $0 [apply|blackhole-fat|blackhole-lowlat|blackhole-poor|spike-fat|spike-lowlat|clear|show]" >&2
     exit 2
     ;;
 esac

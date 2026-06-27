@@ -115,6 +115,16 @@ def percentile(values, rank):
     return ordered[index]
 
 
+def interval_rates_mbps(interval_bytes, interval_seconds):
+    if interval_seconds <= 0 or not interval_bytes:
+        return []
+    last_index = max(interval_bytes)
+    return [
+        round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
+        for index in range(last_index + 1)
+    ]
+
+
 def write_started_file(path):
     if not path:
         return
@@ -169,97 +179,148 @@ def http_get_via_socks(proxy, target, path, timeout, chunk_bytes):
 def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
     try:
         interactive_ready.wait(timeout=min(args.timeout, 5.0))
-        sock, target_host, target_port = connect_socks5(
-            args.proxy, args.http_target, args.timeout
-        )
-        with sock:
-            request = (
-                f"GET {args.bulk_path} HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-            ).encode("ascii")
-            sock.sendall(request)
-            buffer = b""
-            while b"\r\n\r\n" not in buffer:
-                chunk = sock.recv(args.chunk_bytes)
-                if not chunk:
-                    raise OSError("EOF before HTTP headers")
-                buffer += chunk
-            status, content_length, body = parse_http_headers(buffer)
-            bytes_read = 0
-            first_body_s = None
-            last_body_s = None
-            max_read_gap_s = 0.0
-            recovery_gap_s = 0.0
-            bytes_at_failover = None
-            max_gap_start_s = None
-            max_gap_end_s = None
-            max_gap_start_bytes = None
-            max_gap_end_bytes = None
-            recovery_gap_start_s = None
-            recovery_gap_end_s = None
-            recovery_gap_start_bytes = None
-            recovery_gap_end_bytes = None
+        bytes_read = 0
+        first_body_s = None
+        last_body_s = None
+        max_read_gap_s = 0.0
+        recovery_gap_s = 0.0
+        bytes_at_failover = None
+        max_gap_start_s = None
+        max_gap_end_s = None
+        max_gap_start_bytes = None
+        max_gap_end_bytes = None
+        recovery_gap_start_s = None
+        recovery_gap_end_s = None
+        recovery_gap_start_bytes = None
+        recovery_gap_end_bytes = None
+        interval_bytes = {}
+        requests = 0
+        complete_requests = 0
+        partial_requests = 0
+        last_status = None
+        last_content_length = None
+        deadline = started_at + args.load_duration if args.load_duration > 0 else None
 
-            def record_chunk(size):
-                nonlocal bytes_read, first_body_s, last_body_s, max_read_gap_s, recovery_gap_s
-                nonlocal bytes_at_failover
-                nonlocal max_gap_start_s, max_gap_end_s, max_gap_start_bytes, max_gap_end_bytes
-                nonlocal recovery_gap_start_s, recovery_gap_end_s
-                nonlocal recovery_gap_start_bytes, recovery_gap_end_bytes
-                if size <= 0:
-                    return
-                now_s = time.monotonic() - started_at
-                if first_body_s is None:
-                    first_body_s = now_s
-                    bulk_ready.set()
+        def record_chunk(size):
+            nonlocal bytes_read, first_body_s, last_body_s, max_read_gap_s, recovery_gap_s
+            nonlocal bytes_at_failover
+            nonlocal max_gap_start_s, max_gap_end_s, max_gap_start_bytes, max_gap_end_bytes
+            nonlocal recovery_gap_start_s, recovery_gap_end_s
+            nonlocal recovery_gap_start_bytes, recovery_gap_end_bytes
+            if size <= 0:
+                return
+            now_s = time.monotonic() - started_at
+            interval = int(now_s // args.interval_seconds)
+            interval_bytes[interval] = interval_bytes.get(interval, 0) + size
+            if first_body_s is None:
+                first_body_s = now_s
+                bulk_ready.set()
+            if (
+                args.failover_after >= 0
+                and bytes_at_failover is None
+                and now_s >= args.failover_after
+            ):
+                bytes_at_failover = bytes_read
+            if last_body_s is not None:
+                gap = now_s - last_body_s
+                if gap > max_read_gap_s:
+                    max_read_gap_s = gap
+                    max_gap_start_s = last_body_s
+                    max_gap_end_s = now_s
+                    max_gap_start_bytes = bytes_read
+                    max_gap_end_bytes = bytes_read + size
                 if (
                     args.failover_after >= 0
-                    and bytes_at_failover is None
-                    and now_s >= args.failover_after
+                    and (now_s >= args.failover_after or last_body_s >= args.failover_after)
                 ):
-                    bytes_at_failover = bytes_read
-                if last_body_s is not None:
-                    gap = now_s - last_body_s
-                    if gap > max_read_gap_s:
-                        max_read_gap_s = gap
-                        max_gap_start_s = last_body_s
-                        max_gap_end_s = now_s
-                        max_gap_start_bytes = bytes_read
-                        max_gap_end_bytes = bytes_read + size
-                    if (
-                        args.failover_after >= 0
-                        and (now_s >= args.failover_after or last_body_s >= args.failover_after)
-                    ):
-                        if gap > recovery_gap_s:
-                            recovery_gap_s = gap
-                            recovery_gap_start_s = last_body_s
-                            recovery_gap_end_s = now_s
-                            recovery_gap_start_bytes = bytes_read
-                            recovery_gap_end_bytes = bytes_read + size
-                last_body_s = now_s
-                bytes_read += size
+                    if gap > recovery_gap_s:
+                        recovery_gap_s = gap
+                        recovery_gap_start_s = last_body_s
+                        recovery_gap_end_s = now_s
+                        recovery_gap_start_bytes = bytes_read
+                        recovery_gap_end_bytes = bytes_read + size
+            last_body_s = now_s
+            bytes_read += size
 
-            record_chunk(len(body))
-            while content_length is None or bytes_read < content_length:
-                chunk = sock.recv(args.chunk_bytes)
-                if not chunk:
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            requests += 1
+            sock, target_host, target_port = connect_socks5(
+                args.proxy, args.http_target, args.timeout
+            )
+            if deadline is not None:
+                sock.settimeout(min(args.timeout, 1.0))
+            with sock:
+                request = (
+                    f"GET {args.bulk_path} HTTP/1.1\r\n"
+                    f"Host: {target_host}:{target_port}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                sock.sendall(request)
+                buffer = b""
+                while b"\r\n\r\n" not in buffer:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        partial_requests += 1
+                        break
+                    try:
+                        chunk = sock.recv(args.chunk_bytes)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        raise OSError("EOF before HTTP headers")
+                    buffer += chunk
+                if b"\r\n\r\n" not in buffer:
                     break
-                record_chunk(len(chunk))
+                status, content_length, body = parse_http_headers(buffer)
+                last_status = status
+                last_content_length = content_length
+                request_bytes = 0
+                record_chunk(len(body))
+                request_bytes += len(body)
+                while content_length is None or request_bytes < content_length:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        partial_requests += 1
+                        break
+                    try:
+                        chunk = sock.recv(args.chunk_bytes)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    request_bytes += len(chunk)
+                    record_chunk(len(chunk))
+                else:
+                    complete_requests += 1
+            if deadline is None:
+                break
         elapsed = time.monotonic() - started_at
-        if content_length is not None and bytes_read != content_length:
-            raise OSError(f"incomplete bulk body: {bytes_read} of {content_length}")
+        fixed_complete = (
+            last_content_length is None
+            or complete_requests > 0
+            or (deadline is not None and bytes_read > 0)
+        )
+        if deadline is None and not fixed_complete:
+            raise OSError(f"incomplete bulk body: {bytes_read} of {last_content_length}")
         result.update(
             {
-                "bulk_status": "ok" if 200 <= status < 400 else "fail",
-                "bulk_http_code": status,
-                "bulk_content_length": content_length,
+                "bulk_status": "ok" if bytes_read > 0 and (last_status is None or 200 <= last_status < 400) else "fail",
+                "bulk_http_code": last_status,
+                "bulk_content_length": last_content_length,
                 "bulk_bytes": bytes_read,
                 "bulk_time_s": elapsed,
+                "bulk_load_duration_s": args.load_duration,
+                "bulk_requests": requests,
+                "bulk_complete_requests": complete_requests,
+                "bulk_partial_requests": partial_requests,
                 "bulk_goodput_mbps": bytes_read * 8 / elapsed / 1_000_000
                 if elapsed > 0
                 else 0.0,
+                "bulk_interval_seconds": args.interval_seconds,
+                "bulk_interval_goodput_mbps": interval_rates_mbps(
+                    interval_bytes, args.interval_seconds
+                ),
                 "bulk_first_body_s": first_body_s,
                 "bulk_bytes_at_failover": bytes_at_failover,
                 "bulk_max_read_gap_s": max_read_gap_s,
@@ -283,8 +344,13 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
 def small_http_worker(args, bulk_ready, result):
     latencies = []
     failures = 0
+    attempts = 0
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
-    for _ in range(args.small_count):
+    deadline = time.monotonic() + args.load_duration if args.load_duration > 0 else None
+    while (deadline is not None and time.monotonic() < deadline) or (
+        deadline is None and attempts < args.small_count
+    ):
+        attempts += 1
         started = time.monotonic()
         try:
             status, _, _ = http_get_via_socks(
@@ -304,7 +370,7 @@ def small_http_worker(args, bulk_ready, result):
             time.sleep(args.small_interval_ms / 1000.0)
     result.update(
         {
-            "small_count": args.small_count,
+            "small_count": attempts,
             "small_ok": len(latencies),
             "small_fail": failures,
             "small_p50_ms": percentile(latencies, 0.50),
@@ -334,7 +400,11 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
         connected = True
         with sock:
             sock.settimeout(timeout)
-            for index in range(args.tcp_echo_count):
+            deadline = started_at + args.load_duration if args.load_duration > 0 else None
+            index = 0
+            while (deadline is not None and time.monotonic() < deadline) or (
+                deadline is None and index < args.tcp_echo_count
+            ):
                 payload = (
                     struct.pack("!I", index)
                     + bytes([index % 251]) * (payload_len - 4)
@@ -376,6 +446,7 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
                 )
                 if remaining_interval > 0:
                     time.sleep(remaining_interval)
+                index += 1
     except Exception as exc:
         result.update({"interactive_error": str(exc)})
     finally:
@@ -384,9 +455,9 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     result.update(
         {
             "interactive_connected": connected,
-            "interactive_count": args.tcp_echo_count,
+            "interactive_count": len(latencies) + failures,
             "interactive_ok": len(latencies),
-            "interactive_fail": failures + max(0, args.tcp_echo_count - len(latencies) - failures),
+            "interactive_fail": failures,
             "interactive_p50_ms": percentile(latencies, 0.50),
             "interactive_p95_ms": percentile(latencies, 0.95),
             "interactive_max_ms": max(latencies) if latencies else None,
@@ -408,6 +479,7 @@ def udp_worker(args, started_at, bulk_ready, result):
     max_after_failover_start_s = None
     max_after_failover_end_s = None
     received = 0
+    attempted = 0
     probe_deadline = started_at + args.timeout
     deadline_hit = False
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
@@ -436,13 +508,17 @@ def udp_worker(args, started_at, bulk_ready, result):
                     target_host, target_port
                 )
                 body_len = max(4, args.udp_payload_bytes)
-                for index in range(args.udp_count):
+                index = 0
+                while (args.load_duration > 0 and time.monotonic() < probe_deadline) or (
+                    args.load_duration <= 0 and index < args.udp_count
+                ):
                     if time.monotonic() >= probe_deadline:
                         deadline_hit = True
                         break
                     payload = struct.pack("!I", index) + bytes([index % 251]) * (
                         body_len - 4
                     )
+                    attempted += 1
                     started = time.monotonic()
                     started_s = started - started_at
                     udp.sendto(target_prefix + payload, (relay_host, relay_port))
@@ -489,6 +565,7 @@ def udp_worker(args, started_at, bulk_ready, result):
                         time.sleep(args.udp_interval_ms / 1000.0)
                     if deadline_hit:
                         break
+                    index += 1
         result.update(
             {
                 "udp_error": (
@@ -501,12 +578,12 @@ def udp_worker(args, started_at, bulk_ready, result):
     except Exception as exc:
         result.update({"udp_error": str(exc)})
     result.update(
-        {
-            "udp_count": args.udp_count,
-            "udp_received": received,
-            "udp_loss_rate": (args.udp_count - received) / args.udp_count
-            if args.udp_count
-            else 0.0,
+            {
+                "udp_count": attempted,
+                "udp_received": received,
+                "udp_loss_rate": (attempted - received) / attempted
+                if attempted
+                else 0.0,
             "udp_p50_ms": percentile(latencies, 0.50),
             "udp_p95_ms": percentile(latencies, 0.95),
             "udp_max_ms": max_latency_ms,
@@ -562,6 +639,8 @@ def main():
     parser.add_argument("--failover-after", type=float, default=-1.0)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
+    parser.add_argument("--load-duration", type=float, default=0.0)
+    parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--small-count", type=int, default=20)
     parser.add_argument("--small-interval-ms", type=int, default=100)
     parser.add_argument("--udp-count", type=int, default=60)

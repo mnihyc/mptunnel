@@ -23,6 +23,9 @@ jobs:
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --check
+      - name: Maintainability line-count warning
+        if: runner.os == 'Linux'
+        run: scripts/check-line-counts.sh
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test

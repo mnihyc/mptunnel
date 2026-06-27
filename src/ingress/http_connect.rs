@@ -7,6 +7,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub struct ConnectRequest {
     pub target: TargetAddr,
     pub header_len: usize,
+    pub proxy_authorization: Option<String>,
 }
 
 pub fn parse_connect_request(input: &[u8]) -> Result<ConnectRequest, HttpConnectError> {
@@ -34,9 +35,11 @@ pub fn parse_connect_request(input: &[u8]) -> Result<ConnectRequest, HttpConnect
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
         return Err(HttpConnectError::UnsupportedVersion(version.to_string()));
     }
+    let proxy_authorization = proxy_authorization_header(request);
     Ok(ConnectRequest {
         target: parse_authority(authority)?,
         header_len: header_end,
+        proxy_authorization,
     })
 }
 
@@ -51,7 +54,18 @@ pub fn error_response(status: HttpStatus) -> &'static [u8] {
         HttpStatus::MethodNotAllowed => {
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
         }
+        HttpStatus::ProxyAuthenticationRequired => {
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"mptunnel\"\r\nContent-Length: 0\r\n\r\n"
+        }
     }
+}
+
+fn proxy_authorization_header(request: &str) -> Option<String> {
+    request.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("Proxy-Authorization")
+            .then(|| value.trim().to_string())
+    })
 }
 
 fn find_header_end(input: &[u8]) -> Option<usize> {
@@ -105,6 +119,7 @@ pub enum HttpStatus {
     BadRequest,
     BadGateway,
     MethodNotAllowed,
+    ProxyAuthenticationRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +166,7 @@ mod tests {
             .map(|pos| pos + 4)
             .expect("header delimiter");
         assert_eq!(request.header_len, expected_header_len);
+        assert_eq!(request.proxy_authorization, None);
         assert_eq!(
             request.target,
             TargetAddr::Domain {
@@ -158,6 +174,16 @@ mod tests {
                 port: 443
             }
         );
+    }
+
+    #[test]
+    fn parses_proxy_authorization_header_case_insensitively() {
+        let request = parse_connect_request(
+            b"CONNECT example.com:443 HTTP/1.1\r\nproxy-authorization: Basic abc\r\n\r\n",
+        )
+        .expect("connect");
+
+        assert_eq!(request.proxy_authorization.as_deref(), Some("Basic abc"));
     }
 
     #[test]
@@ -202,6 +228,11 @@ mod tests {
         assert_eq!(
             error_response(HttpStatus::BadGateway),
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            std::str::from_utf8(error_response(HttpStatus::ProxyAuthenticationRequired))
+                .expect("response")
+                .contains("407 Proxy Authentication Required")
         );
     }
 }

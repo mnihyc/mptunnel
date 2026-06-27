@@ -1,14 +1,14 @@
+use crate::config::CipherSuite;
 use crate::protocol::Frame;
 use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
+use crate::transport::aead::{AEAD_TAG_LEN, TransportAead};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 const MAGIC: &[u8; 4] = b"MPTE";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 18;
-const TAG_LEN: usize = 16;
+const TAG_LEN: usize = AEAD_TAG_LEN;
 const DIR_CLIENT_TO_SERVER: u8 = 1;
 const DIR_SERVER_TO_CLIENT: u8 = 2;
 
@@ -36,7 +36,7 @@ impl PeerRole {
 
 pub struct EncryptedFramedStream<S> {
     stream: S,
-    cipher: ChaCha20Poly1305,
+    cipher: TransportAead,
     limits: CodecLimits,
     send_direction: u8,
     recv_direction: u8,
@@ -46,7 +46,7 @@ pub struct EncryptedFramedStream<S> {
 
 pub struct EncryptedFramedReader<R> {
     stream: R,
-    cipher: ChaCha20Poly1305,
+    cipher: TransportAead,
     limits: CodecLimits,
     recv_direction: u8,
     recv_counter: u64,
@@ -54,7 +54,7 @@ pub struct EncryptedFramedReader<R> {
 
 pub struct EncryptedFramedWriter<W> {
     stream: W,
-    cipher: ChaCha20Poly1305,
+    cipher: TransportAead,
     limits: CodecLimits,
     send_direction: u8,
     send_counter: u64,
@@ -75,10 +75,20 @@ impl<S: std::fmt::Debug> std::fmt::Debug for EncryptedFramedStream<S> {
 
 impl<S> EncryptedFramedStream<S> {
     pub fn new(stream: S, secret: &[u8], role: PeerRole, limits: CodecLimits) -> Self {
-        let key = derive_key(secret);
+        Self::with_cipher_suite(stream, secret, role, limits, CipherSuite::default())
+    }
+
+    pub fn with_cipher_suite(
+        stream: S,
+        secret: &[u8],
+        role: PeerRole,
+        limits: CodecLimits,
+        cipher_suite: CipherSuite,
+    ) -> Self {
+        let key = derive_key(secret, cipher_suite);
         Self {
             stream,
-            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            cipher: TransportAead::new(cipher_suite, &key),
             limits,
             send_direction: role.send_direction(),
             recv_direction: role.recv_direction(),
@@ -212,7 +222,7 @@ where
 
 async fn read_frame_from<R>(
     stream: &mut R,
-    cipher: &ChaCha20Poly1305,
+    cipher: &TransportAead,
     limits: CodecLimits,
     recv_direction: u8,
     recv_counter: &mut u64,
@@ -250,12 +260,7 @@ where
     encrypted.truncate(tag_start);
     let nonce = build_nonce(direction, counter);
     cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(&nonce),
-            &header,
-            &mut encrypted,
-            Tag::from_slice(&tag_bytes),
-        )
+        .decrypt_in_place_detached(&nonce, &header, &mut encrypted, &tag_bytes)
         .map_err(|_| EncryptedFramedTransportError::Crypto)?;
     *recv_counter = recv_counter
         .checked_add(1)
@@ -265,7 +270,7 @@ where
 
 async fn write_frame_to<W>(
     stream: &mut W,
-    cipher: &ChaCha20Poly1305,
+    cipher: &TransportAead,
     limits: CodecLimits,
     send_direction: u8,
     send_counter: &mut u64,
@@ -283,7 +288,7 @@ where
     let header = encode_header(send_direction, *send_counter, ciphertext_len)?;
     let nonce = build_nonce(send_direction, *send_counter);
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut payload)
+        .encrypt_in_place_detached(&nonce, &header, &mut payload)
         .map_err(|_| EncryptedFramedTransportError::Crypto)?;
     stream.write_all(&header).await?;
     stream.write_all(&payload).await?;
@@ -363,9 +368,10 @@ fn validate_encrypted_len(
     Ok(())
 }
 
-fn derive_key(secret: &[u8]) -> [u8; 32] {
+fn derive_key(secret: &[u8], cipher_suite: CipherSuite) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"mptunnel encrypted framed v1");
+    hasher.update(cipher_suite.key_context());
     hasher.update(secret);
     hasher.finalize().into()
 }
@@ -470,6 +476,66 @@ mod tests {
         client.flush().await.expect("flush");
 
         assert_eq!(server.read_frame().await.expect("read"), frame);
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_supports_explicit_chacha20_poly1305() {
+        let (client, server) = duplex(2048);
+        let limits = CodecLimits::default();
+        let mut client = EncryptedFramedStream::with_cipher_suite(
+            client,
+            b"0123456789abcdef",
+            PeerRole::Client,
+            limits,
+            CipherSuite::Chacha20Poly1305,
+        );
+        let mut server = EncryptedFramedStream::with_cipher_suite(
+            server,
+            b"0123456789abcdef",
+            PeerRole::Server,
+            limits,
+            CipherSuite::Chacha20Poly1305,
+        );
+        let frame = Frame::SessionHello {
+            session_id: SessionId(43),
+        };
+
+        client.write_frame(&frame).await.expect("write");
+        client.flush().await.expect("flush");
+
+        assert_eq!(server.read_frame().await.expect("read"), frame);
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_rejects_mismatched_cipher_suite() {
+        let (client, server) = duplex(2048);
+        let limits = CodecLimits::default();
+        let mut client = EncryptedFramedStream::with_cipher_suite(
+            client,
+            b"0123456789abcdef",
+            PeerRole::Client,
+            limits,
+            CipherSuite::Aes256Gcm,
+        );
+        let mut server = EncryptedFramedStream::with_cipher_suite(
+            server,
+            b"0123456789abcdef",
+            PeerRole::Server,
+            limits,
+            CipherSuite::Chacha20Poly1305,
+        );
+
+        client
+            .write_frame(&Frame::SessionHello {
+                session_id: SessionId(44),
+            })
+            .await
+            .expect("write");
+
+        assert!(matches!(
+            server.read_frame().await,
+            Err(EncryptedFramedTransportError::Crypto)
+        ));
     }
 
     #[tokio::test]

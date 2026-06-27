@@ -130,10 +130,12 @@ fn encode_payload(
         Frame::SessionAuth {
             session_id,
             nonce,
+            issued_at_unix_secs,
             auth_tag,
         } => {
             put_u64(out, session_id.0);
             encode_nonce(out, *nonce);
+            put_u64(out, *issued_at_unix_secs);
             encode_auth_tag(out, *auth_tag);
             Ok(FrameKind::SessionAuth)
         }
@@ -147,6 +149,7 @@ fn encode_payload(
             path_id,
             underlay,
             nonce,
+            issued_at_unix_secs,
             capabilities,
             auth_tag,
         } => {
@@ -154,6 +157,7 @@ fn encode_payload(
             put_u16(out, path_id.0);
             put_u8(out, underlay_to_u8(*underlay));
             encode_nonce(out, *nonce);
+            put_u64(out, *issued_at_unix_secs);
             encode_path_capabilities(out, *capabilities);
             encode_auth_tag(out, *auth_tag);
             Ok(FrameKind::PathJoin)
@@ -233,6 +237,11 @@ fn encode_payload(
             put_u8(out, traffic_class_to_u8(*class));
             Ok(FrameKind::OpenStream)
         }
+        Frame::StreamClass { stream_id, class } => {
+            put_u64(out, stream_id.0);
+            put_u8(out, traffic_class_to_u8(*class));
+            Ok(FrameKind::StreamClass)
+        }
         Frame::StreamData {
             stream_id,
             offset,
@@ -276,8 +285,12 @@ fn encode_payload(
             put_u64(out, *max_offset);
             Ok(FrameKind::StreamMaxData)
         }
-        Frame::StreamFin { stream_id } => {
+        Frame::StreamFin {
+            stream_id,
+            final_offset,
+        } => {
             put_u64(out, stream_id.0);
+            put_u64(out, *final_offset);
             Ok(FrameKind::StreamFin)
         }
         Frame::StreamDetach { stream_id } => {
@@ -372,6 +385,7 @@ fn decode_payload(
         FrameKind::SessionAuth => Ok(Frame::SessionAuth {
             session_id: SessionId(reader.get_u64()?),
             nonce: decode_nonce(reader)?,
+            issued_at_unix_secs: reader.get_u64()?,
             auth_tag: decode_auth_tag(reader)?,
         }),
         FrameKind::SessionReady => Ok(Frame::SessionReady),
@@ -383,6 +397,7 @@ fn decode_payload(
             path_id: PathId(reader.get_u16()?),
             underlay: underlay_from_u8(reader.get_u8()?)?,
             nonce: decode_nonce(reader)?,
+            issued_at_unix_secs: reader.get_u64()?,
             capabilities: decode_path_capabilities(reader)?,
             auth_tag: decode_auth_tag(reader)?,
         }),
@@ -433,6 +448,10 @@ fn decode_payload(
             outbound: decode_outbound(reader, limits)?,
             class: traffic_class_from_u8(reader.get_u8()?)?,
         }),
+        FrameKind::StreamClass => Ok(Frame::StreamClass {
+            stream_id: StreamId(reader.get_u64()?),
+            class: traffic_class_from_u8(reader.get_u8()?)?,
+        }),
         FrameKind::StreamData => {
             let stream_id = StreamId(reader.get_u64()?);
             let offset = reader.get_u64()?;
@@ -471,6 +490,7 @@ fn decode_payload(
         }),
         FrameKind::StreamFin => Ok(Frame::StreamFin {
             stream_id: StreamId(reader.get_u64()?),
+            final_offset: reader.get_u64()?,
         }),
         FrameKind::StreamDetach => Ok(Frame::StreamDetach {
             stream_id: StreamId(reader.get_u64()?),
@@ -971,6 +991,7 @@ enum FrameKind {
     PathMtuProbe = 28,
     PathMtuAck = 29,
     StreamDetach = 30,
+    StreamClass = 31,
 }
 
 impl FrameKind {
@@ -1006,6 +1027,7 @@ impl FrameKind {
             28 => Ok(Self::PathMtuProbe),
             29 => Ok(Self::PathMtuAck),
             30 => Ok(Self::StreamDetach),
+            31 => Ok(Self::StreamClass),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1208,6 +1230,10 @@ mod tests {
             outbound: OutboundPolicy::Direct,
             class: TrafficClass::Interactive,
         });
+        round_trip(Frame::StreamClass {
+            stream_id: StreamId(7),
+            class: TrafficClass::Bulk,
+        });
         round_trip(Frame::StreamData {
             stream_id: StreamId(7),
             offset: 1024,
@@ -1226,6 +1252,7 @@ mod tests {
         });
         round_trip(Frame::StreamFin {
             stream_id: StreamId(7),
+            final_offset: 1234,
         });
         round_trip(Frame::StreamDetach {
             stream_id: StreamId(7),
@@ -1273,6 +1300,7 @@ mod tests {
         round_trip(Frame::SessionAuth {
             session_id: SessionId(42),
             nonce,
+            issued_at_unix_secs: 1_735_689_600,
             auth_tag,
         });
         round_trip(Frame::PathJoin {
@@ -1280,6 +1308,7 @@ mod tests {
             path_id: PathId(3),
             underlay: UnderlayProtocol::Udp,
             nonce,
+            issued_at_unix_secs: 1_735_689_600,
             capabilities: caps,
             auth_tag,
         });
@@ -1398,11 +1427,12 @@ mod tests {
             path_id: PathId(1),
             underlay: UnderlayProtocol::Tcp,
             nonce: AuthNonce([0; 16]),
+            issued_at_unix_secs: 1_735_689_600,
             capabilities: PathCapabilities::default(),
             auth_tag: AuthTag([0; 32]),
         };
         let mut encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
-        let capability_offset = FRAME_HEADER_LEN + 8 + 2 + 1 + 16;
+        let capability_offset = FRAME_HEADER_LEN + 8 + 2 + 1 + 16 + 8;
         encoded[capability_offset] = 0x80;
 
         assert_eq!(

@@ -1,8 +1,8 @@
+use crate::config::CipherSuite;
 use crate::protocol::Frame;
 use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame};
+use crate::transport::aead::{AEAD_TAG_LEN, TransportAead};
 use crate::transport::encrypted::PeerRole;
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -12,13 +12,13 @@ use tokio::net::UdpSocket;
 const MAGIC: &[u8; 4] = b"MPTU";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 18;
-const TAG_LEN: usize = 16;
+const TAG_LEN: usize = AEAD_TAG_LEN;
 const DIR_CLIENT_TO_SERVER: u8 = 1;
 const DIR_SERVER_TO_CLIENT: u8 = 2;
 
 pub struct EncryptedUdpSocket {
     socket: Arc<UdpSocket>,
-    cipher: ChaCha20Poly1305,
+    cipher: TransportAead,
     limits: CodecLimits,
     send_direction: u8,
     recv_direction: u8,
@@ -43,16 +43,36 @@ impl EncryptedUdpSocket {
         Self::from_shared(Arc::new(socket), secret, role, limits)
     }
 
+    pub fn new_with_cipher_suite(
+        socket: UdpSocket,
+        secret: &[u8],
+        role: PeerRole,
+        limits: CodecLimits,
+        cipher_suite: CipherSuite,
+    ) -> Self {
+        Self::from_shared_with_cipher_suite(Arc::new(socket), secret, role, limits, cipher_suite)
+    }
+
     pub fn from_shared(
         socket: Arc<UdpSocket>,
         secret: &[u8],
         role: PeerRole,
         limits: CodecLimits,
     ) -> Self {
-        let key = derive_key(secret);
+        Self::from_shared_with_cipher_suite(socket, secret, role, limits, CipherSuite::default())
+    }
+
+    pub fn from_shared_with_cipher_suite(
+        socket: Arc<UdpSocket>,
+        secret: &[u8],
+        role: PeerRole,
+        limits: CodecLimits,
+        cipher_suite: CipherSuite,
+    ) -> Self {
+        let key = derive_key(secret, cipher_suite);
         Self {
             socket,
-            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            cipher: TransportAead::new(cipher_suite, &key),
             limits,
             send_direction: send_direction(role),
             recv_direction: recv_direction(role),
@@ -123,7 +143,7 @@ impl EncryptedUdpSocket {
         let nonce = build_nonce(self.send_direction, self.send_counter);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut payload)
+            .encrypt_in_place_detached(&nonce, &header, &mut payload)
             .map_err(|_| EncryptedUdpTransportError::Crypto)?;
         let mut datagram = Vec::with_capacity(HEADER_LEN + ciphertext_len);
         datagram.extend_from_slice(&header);
@@ -174,12 +194,7 @@ impl EncryptedUdpSocket {
         let mut payload = encrypted[..tag_start].to_vec();
         let nonce = build_nonce(direction, counter);
         self.cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &header,
-                &mut payload,
-                Tag::from_slice(&tag_bytes),
-            )
+            .decrypt_in_place_detached(&nonce, &header, &mut payload, &tag_bytes)
             .map_err(|_| EncryptedUdpTransportError::Crypto)?;
         self.replay.insert(counter);
         Ok(decode_frame(&payload, self.limits)?)
@@ -273,9 +288,10 @@ fn max_datagram_bytes(limits: CodecLimits) -> Result<usize, EncryptedUdpTranspor
         .ok_or(EncryptedUdpTransportError::LengthOverflow)
 }
 
-fn derive_key(secret: &[u8]) -> [u8; 32] {
+fn derive_key(secret: &[u8], cipher_suite: CipherSuite) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"mptunnel encrypted udp datagram v1");
+    hasher.update(cipher_suite.key_context());
     hasher.update(secret);
     hasher.finalize().into()
 }
@@ -446,6 +462,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_udp_supports_explicit_chacha20_poly1305() {
+        let (client, server) = connected_raw_pair().await;
+        let limits = CodecLimits::default();
+        let mut client = EncryptedUdpSocket::new_with_cipher_suite(
+            client,
+            b"0123456789abcdef",
+            PeerRole::Client,
+            limits,
+            CipherSuite::Chacha20Poly1305,
+        );
+        let mut server = EncryptedUdpSocket::new_with_cipher_suite(
+            server,
+            b"0123456789abcdef",
+            PeerRole::Server,
+            limits,
+            CipherSuite::Chacha20Poly1305,
+        );
+        let frame = Frame::Ping { nonce: 77 };
+
+        client.send_frame(&frame).await.expect("send");
+        let mut buffer = vec![0u8; server.max_datagram_bytes().expect("max")];
+
+        assert_eq!(server.recv_frame(&mut buffer).await.expect("recv"), frame);
+    }
+
+    #[tokio::test]
+    async fn encrypted_udp_rejects_mismatched_cipher_suite() {
+        let (client, server) = connected_raw_pair().await;
+        let limits = CodecLimits::default();
+        let mut client = EncryptedUdpSocket::new_with_cipher_suite(
+            client,
+            b"0123456789abcdef",
+            PeerRole::Client,
+            limits,
+            CipherSuite::Aes256Gcm,
+        );
+        let mut server = EncryptedUdpSocket::new_with_cipher_suite(
+            server,
+            b"0123456789abcdef",
+            PeerRole::Server,
+            limits,
+            CipherSuite::Chacha20Poly1305,
+        );
+
+        client
+            .send_frame(&Frame::Ping { nonce: 78 })
+            .await
+            .expect("send");
+        let mut buffer = vec![0u8; server.max_datagram_bytes().expect("max")];
+
+        assert!(matches!(
+            server.recv_frame(&mut buffer).await,
+            Err(EncryptedUdpTransportError::Crypto)
+        ));
+    }
+
+    #[tokio::test]
     async fn encrypted_udp_rejects_wrong_secret() {
         let (mut client, mut server) = connected_pair(
             b"0123456789abcdef",
@@ -592,15 +665,20 @@ mod tests {
         server_role: PeerRole,
         limits: CodecLimits,
     ) -> (EncryptedUdpSocket, EncryptedUdpSocket) {
+        let (client, server) = connected_raw_pair().await;
+        (
+            EncryptedUdpSocket::new(client, client_secret, client_role, limits),
+            EncryptedUdpSocket::new(server, server_secret, server_role, limits),
+        )
+    }
+
+    async fn connected_raw_pair() -> (UdpSocket, UdpSocket) {
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
         let server = UdpSocket::bind("127.0.0.1:0").await.expect("server bind");
         let client_addr = client.local_addr().expect("client addr");
         let server_addr = server.local_addr().expect("server addr");
         client.connect(server_addr).await.expect("client connect");
         server.connect(client_addr).await.expect("server connect");
-        (
-            EncryptedUdpSocket::new(client, client_secret, client_role, limits),
-            EncryptedUdpSocket::new(server, server_secret, server_role, limits),
-        )
+        (client, server)
     }
 }

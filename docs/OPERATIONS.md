@@ -10,6 +10,16 @@ mptunnel platform
 
 It prints the current OS/architecture, the TUN backend, privilege expectations, current TUN device status when it can be detected safely, the native service manager, and the release target matrix.
 
+## Maintainability Gate
+
+Run the warning-only line-count check before expanding large modules:
+
+```bash
+scripts/check-line-counts.sh
+```
+
+The threshold is 2,000 lines for tracked source and public documentation files. Files above the threshold should be split by cohesive ownership, with narrow module visibility, instead of accumulating unrelated runtime, test, or documentation concerns in one place.
+
 ## Privileges
 
 SOCKS5 and HTTP CONNECT ingress can run as an ordinary user when binding unprivileged local ports. TUN mode needs elevated network privileges because it creates/configures a virtual network device.
@@ -54,7 +64,6 @@ Configure IPv4 and IPv6 listeners explicitly instead of depending on operating-s
 
 ```bash
 mptunnel client \
-  --ingress socks5 \
   --listen 127.0.0.1:1080 \
   --listen '[::1]:1080'
 ```
@@ -65,7 +74,25 @@ mptunnel client \
 MPTUNNEL_LISTEN=127.0.0.1:1080,[::1]:1080
 ```
 
+When SOCKS5 and HTTP CONNECT ingress run in the same client process, use the HTTP-specific listener flag and keep `--listen`/`--socks5-listen` for SOCKS5:
+
+```bash
+mptunnel client \
+  --socks5-listen 127.0.0.1:1080 \
+  --http-listen 127.0.0.1:8080
+```
+
+The matching environment variables are `MPTUNNEL_SOCKS5_LISTEN` and `MPTUNNEL_HTTP_LISTEN`.
+
+Local proxy authentication is off by default. To require browser/tool authentication, set both `--proxy-username` and `--proxy-password`; service deployments can use `MPTUNNEL_PROXY_USERNAME` and `MPTUNNEL_PROXY_PASSWORD`. SOCKS5 uses username/password negotiation, and HTTP CONNECT uses Basic proxy authentication.
+
 Server path bindings use the same explicit model through repeated or comma-separated `--bind-path` values, for example `tcp://0.0.0.0:443`, `tcp://[::]:443`, `udp://0.0.0.0:443`, and `udp://[::]:443`.
+
+UDP targets are not limited to UDP underlay. mptunnel prefers UDP-target relay over encrypted UDP underlay when schedulable UDP paths exist, but it can carry UDP-target datagram flow frames over encrypted TCP underlay as best-effort relay. Use UDP underlay for the lowest latency and fastest packet-level recovery; keep TCP underlay available when reachability is more important than datagram-native behavior.
+
+## Encryption
+
+Encrypted transport is the default and uses `aes-256-gcm` unless `--cipher chacha20-poly1305` or `MPTUNNEL_CIPHER=chacha20-poly1305` is set on both peers. Cipher suites are not negotiated; client and server must be configured consistently. `--secret` / `MPTUNNEL_SECRET` must be a random UUID or at least 32 bytes of high-entropy secret text. Runtime transport and HMAC keys are derived from that secret with mptunnel-specific context separation. Authenticated session/path control frames carry issue times and are rejected outside `--auth-freshness-window-seconds` / `MPTUNNEL_AUTH_FRESHNESS_WINDOW_SECONDS`, default `300`.
 
 ## Packaging
 

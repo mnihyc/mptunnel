@@ -7,7 +7,10 @@
 ```bash
 cargo build
 cargo test
+scripts/check-line-counts.sh
 ```
+
+`scripts/check-line-counts.sh` is a warning-only maintainability gate. It reports tracked source and public documentation files above 2,000 lines so large modules are split by cohesive ownership before they become harder to maintain.
 
 Cross-platform release archives are produced by the packaging scripts:
 
@@ -41,14 +44,13 @@ Docker-only heterogeneous network lab:
 lab/run-heterogeneous-ablation.sh
 ```
 
-The lab emulates low-latency, cross-continent high-bandwidth, and poor-Internet paths at the same time, then records direct, single-path, multipath, UDP, and failover comparison results under `lab/results/`. It mutates Docker network namespaces only.
+The lab emulates low-latency, balanced, cross-continent high-bandwidth, harsh poor-Internet, saturated-link, flapping-link, ideal 0%-loss, controlled 2^3 bandwidth/latency/loss matrix, UDP, and failover scenarios, then records direct, single-path, multipath, and mixed-workload comparison results under `lab/results/`. It mutates Docker network namespaces only.
 
 Client-side proxy ingress:
 
 ```bash
 mptunnel --check-config client \
   --secret replace-with-shared-secret \
-  --ingress socks5 \
   --listen 127.0.0.1:1080 \
   --listen '[::1]:1080' \
   --path tcp://203.0.113.10:443 \
@@ -58,12 +60,23 @@ mptunnel --check-config client \
 
 Proxy ingress accepts repeated or comma-separated `--listen` addresses, so IPv4 and IPv6 listeners can be configured explicitly without relying on platform-specific dual-stack socket defaults.
 
+Multiple ingress types can run in one client process. Use per-ingress listener flags when more than one proxy ingress is enabled:
+
+```bash
+mptunnel --check-config client \
+  --secret replace-with-shared-secret \
+  --socks5-listen 127.0.0.1:1080 \
+  --http-listen 127.0.0.1:8080 \
+  --path tcp://203.0.113.10:443 \
+  --path udp://203.0.113.10:443
+```
+
 Client-side TUN L4 ingress with dual-stack addressing and explicit DNS forwarding:
 
 ```bash
 mptunnel --check-config client \
   --secret replace-with-shared-secret \
-  --ingress tun-l4 \
+  --tun \
   --tun-name mptun0 \
   --tun-ipv4 10.88.0.1 \
   --tun-ipv4-prefix 24 \
@@ -78,6 +91,18 @@ mptunnel --check-config client \
 
 For IPv6-only TUN ingress, add `--tun-disable-ipv4` and provide `--tun-ipv6`.
 TUN L4 can be launched with TCP paths, UDP paths, or both; TCP flows use the reliable-stream layer over the configured carrier set, while TUN UDP flows require at least one UDP path to carry datagrams.
+
+Local proxy authentication is disabled by default. Set both `--proxy-username` and `--proxy-password` to require SOCKS5 username/password authentication and HTTP CONNECT Basic proxy authentication:
+
+```bash
+mptunnel --check-config client \
+  --secret replace-with-shared-secret \
+  --proxy-username operator \
+  --proxy-password replace-with-proxy-password \
+  --listen 127.0.0.1:1080 \
+  --http-listen 127.0.0.1:8080 \
+  --path tcp://203.0.113.10:443
+```
 
 Server-side path listener and direct outbound:
 
@@ -107,11 +132,13 @@ mptunnel --check-config server \
   --upstream-http 127.0.0.1:8080
 ```
 
-Internal transport is encrypted by default. Plaintext lab mode requires an explicit security mode and acknowledgement. It removes confidentiality for lab use only; session/path integrity remains authenticated:
+Internal transport is encrypted by default with `aes-256-gcm`. `--secret` must be either a random UUID or at least 32 bytes of high-entropy secret text; mptunnel derives domain-separated 256-bit transport/auth material from it before use. Session and path authentication frames carry authenticated issue times and are rejected outside `--auth-freshness-window-seconds` to reduce replay value for saved traffic. Operators can select `--cipher chacha20-poly1305` on both client and server when that is a better fit for their CPU or deployment. Plaintext lab mode requires an explicit security mode and acknowledgement. It removes confidentiality for lab use only; session/path integrity remains authenticated:
 
 ```bash
 mptunnel --check-config \
   --secret replace-with-shared-secret \
+  --cipher aes-256-gcm \
+  --auth-freshness-window-seconds 300 \
   --security plaintext-lab \
   --i-understand-this-is-insecure \
   client \
@@ -160,6 +187,8 @@ Common environment variables:
 - `MPTUNNEL_LOG`
 - `MPTUNNEL_SECURITY`
 - `MPTUNNEL_SECRET`
+- `MPTUNNEL_CIPHER`
+- `MPTUNNEL_AUTH_FRESHNESS_WINDOW_SECONDS`
 - `MPTUNNEL_CHECK_CONFIG`
 - `MPTUNNEL_SERVICE_MODE`
 - `MPTUNNEL_SUPERVISE`
@@ -168,8 +197,12 @@ Common environment variables:
 - `MPTUNNEL_MAX_RESTARTS`
 - `MPTUNNEL_PATHS`
 - `MPTUNNEL_BIND_PATHS`
-- `MPTUNNEL_INGRESS`
 - `MPTUNNEL_LISTEN`
+- `MPTUNNEL_SOCKS5_LISTEN`
+- `MPTUNNEL_HTTP_LISTEN`
+- `MPTUNNEL_PROXY_USERNAME`
+- `MPTUNNEL_PROXY_PASSWORD`
+- `MPTUNNEL_TUN`
 - `MPTUNNEL_TUN_NAME`
 - `MPTUNNEL_TUN_IPV4`
 - `MPTUNNEL_TUN_DISABLE_IPV4`
@@ -206,15 +239,17 @@ Common environment variables:
 
 ## Current Runtime Scope
 
-The current runtime exposes local SOCKS5, HTTP CONNECT, and TUN L4 ingress.
+The current runtime exposes local SOCKS5, HTTP CONNECT, and TUN L4 ingress. A client can run multiple ingress entries in one process; all entries share the same encrypted multipath path set and adaptive scheduler.
 
-SOCKS5 and HTTP CONNECT ingress support explicit IPv4/IPv6 dual-stack operation through repeated `--listen` values such as `127.0.0.1:1080` and `[::1]:1080`. TUN, server bind paths, outbound DNS resolvers, upstream proxy endpoints, and direct target addresses all preserve IPv4 and IPv6 socket addresses; DNS resolution order is controlled by `--outbound-dns-strategy`.
+SOCKS5 and HTTP CONNECT ingress support explicit IPv4/IPv6 dual-stack operation through repeated `--listen`, `--socks5-listen`, or `--http-listen` values such as `127.0.0.1:1080` and `[::1]:1080`. TUN, server bind paths, outbound DNS resolvers, upstream proxy endpoints, and direct target addresses all preserve IPv4 and IPv6 socket addresses; DNS resolution order is controlled by `--outbound-dns-strategy`.
 
 TCP ingress uses encrypted TCP-underlay paths and can reach remote TCP targets through direct outbound, bind-source-IP direct outbound, upstream SOCKS5 CONNECT, upstream HTTP CONNECT, or `http-connect-udp` using ordinary CONNECT for TCP targets. Each configured TCP path is managed as a lazy persistent encrypted path session, and multiple local SOCKS5/HTTP CONNECT streams can multiplex over the same authenticated TCP path instead of creating a fresh internal TCP connection for every proxy stream. When several TCP paths are configured, stream setup starts in Auto latency-first mode, then uses scheduler ETA scoring from path hints, current path health, observed delivery rate, active stream load, and live demand. Auto promotes sustained flows to bulk from live BDP/resource observations, can detach and reattach the same logical stream to a better bulk path without closing the remote TCP target, and returns to repair/latency-sensitive behavior for stalls, failures, and tails. It retries the next schedulable path after path-level open failures. Active TCP streams use one logical stream ID across TCP path sessions; when a path fails, the client can re-open that logical stream on a survivor path and replay unacknowledged data from the reliable-stream repair cache, while the server reattaches the same outbound TCP connection through its shared stream registry. Successful opens feed measured latency and live load back into later path choices; completed relays feed measured payload delivery rate after enough useful payload has been observed and release that load, while failed opens put the path into a short cooldown before probing resumes. The relay caps unacknowledged TCP-underlay stream payload with `--max-tcp-path-inflight-bytes`, and uses adaptive effective inflight/chunk budgets under that cap from live BDP, queue, jitter, loss, and Auto's current internal class, so local reads pause until end-to-end tunnel ACKs free budget instead of burying unlimited data in a kernel TCP send buffer. TCP path sessions send encrypted internal `PING`/`PONG` heartbeats using `--tcp-path-heartbeat-interval-ms` and `--tcp-path-heartbeat-timeout-ms`; a heartbeat timeout fails the path, releases live stream load, and lets later scheduling avoid that path until probes recover it. The TCP path-session reader is isolated from writer/heartbeat scheduling so encrypted frame reads are not cancelled mid-frame. The client also runs bounded authenticated path probes on the configured interval, using `PING`/`PONG` after `PATH_JOIN` so TCP path health can recover without opening remote target connections.
 
 When a client is launched with both `tcp://` and `udp://` endpoint paths, mixed underlay is treated as its own Auto track. The same process can use TCP-underlay reliable streams, UDP-underlay reliable streams, and UDP datagram flows together for browsing, SSH-like streams, video/game-like UDP, downloads, and failover. Auto may move an ordered reliable stream across TCP and UDP carriers only from live or configured ETA evidence; after that promotion, ordinary repair stays with the current carrier cohort until that cohort fails or is exhausted. This avoids blind same-stream TCP+UDP striping while still allowing mixed-carrier recovery and future measured cooperative aggregation without adding a manual transmission mode.
 
-SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted UDP path sessions. It opens compact internal datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. Datagrams are acknowledged with internal `DGRAM_FEEDBACK` ranges; client-side ACK observations update UDP path RTT, jitter, loss, and delivery-rate inputs for later scheduling, while response datagrams are acknowledged back to the server. When several UDP paths are configured, one local UDP association can use multiple encrypted UDP path sessions under one logical session ID, but realtime datagrams prefer the ready lowest-ETA path instead of spraying ordinary probes across high-RTT paths. It opens survivor paths for retry, MTU probing, pacing pressure, and failure recovery, uses a BBR-style runtime model from observed delivery rate, RTT, jitter, and loss to pace sends and set response timeouts, probes encrypted UDP path MTU before sending larger datagrams, records measured MTU in path health, and retries a timed-out datagram on a survivor path. Request blackholes mark the path failed; ACKed request/response-loss timeouts record packet loss without declaring the whole path dead. UDP session setup still uses scheduler inputs, adaptive health records, datagram freshness TTL, observed delivery rate, measured MTU, and active association load, then retries after path-level handshake failures. Closed associations feed measured datagram delivery rate after enough useful payload has been observed and release their scheduler load. The same bounded authenticated probe loop exercises UDP path handshakes and `PING`/`PONG` without opening datagram flows. Server UDP listeners demux peers on one bound socket into bounded per-peer encrypted session tasks.
+SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted datagram flows per target, then sends repeated datagrams with flow ID, datagram ID, TTL, and payload without repeating target metadata. UDP targets prefer encrypted UDP underlay when a schedulable UDP path exists, because it preserves packet-level pacing, MTU probing, ACK feedback, and fast survivor-path retry. If only TCP underlay is configured, or a UDP underlay attempt fails in a retryable path-level way while TCP paths exist, mptunnel carries the same datagram flow frames over encrypted TCP underlay as best-effort UDP-target relay. TCP-underlay datagram relay is intentionally best-effort because TCP can add head-of-line blocking for datagrams, but it keeps the product model consistent for any ingress x any underlay x any outbound x TCP/UDP target.
+
+Datagrams are acknowledged with internal `DGRAM_FEEDBACK` ranges; client-side ACK observations update UDP path RTT, jitter, loss, and delivery-rate inputs for later scheduling, while response datagrams are acknowledged back to the server. When several UDP paths are configured, one local UDP association can use multiple encrypted UDP path sessions under one logical session ID, but realtime datagrams prefer the ready lowest-ETA path instead of spraying ordinary probes across high-RTT paths. It opens survivor paths for retry, MTU probing, pacing pressure, and failure recovery, uses a BBR-style runtime model from observed delivery rate, RTT, jitter, and loss to pace sends and set response timeouts, probes encrypted UDP path MTU before sending larger datagrams, records measured MTU in path health, and retries a timed-out datagram on a survivor path. Request blackholes mark the path failed; ACKed request/response-loss timeouts record packet loss without declaring the whole path dead. UDP session setup still uses scheduler inputs, adaptive health records, datagram freshness TTL, observed delivery rate, measured MTU, and active association load, then retries after path-level handshake failures. Closed associations feed measured datagram delivery rate after enough useful payload has been observed and release their scheduler load. The same bounded authenticated probe loop exercises UDP path handshakes and `PING`/`PONG` without opening datagram flows. Server UDP listeners demux peers on one bound socket into bounded encrypted session tasks and can re-route a live session to a new peer address after a fresh authenticated control frame, allowing NAT rebinding, CGNAT, and Wi-Fi changes to recover without immediately terminating the logical session.
 
 TUN L4 ingress uses `tun-rs` for cross-platform TUN device creation and `netstack-smoltcp` for user-space TCP/UDP flow translation. TCP packets accepted from the TUN stack become encrypted internal reliable streams with `IngressKind::TunTcp` over TCP, UDP, or mixed reliable underlays. UDP packets are demuxed by local/remote socket pair into bounded per-flow tasks and sent as encrypted internal datagram flows with `IngressKind::TunUdp` when UDP underlay paths are configured. TUN supports IPv4, IPv6, or dual-stack addressing. UDP port 53 traffic can be explicitly remapped to configured `--tun-dns-resolver` addresses while responses are written back to the TUN client as if they came from the original DNS destination, so DNS traffic can pass through TUN without relying on host resolver defaults.
 

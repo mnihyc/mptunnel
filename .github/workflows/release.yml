@@ -20,6 +20,8 @@ jobs:
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --check
+      - name: Maintainability line-count warning
+        run: scripts/check-line-counts.sh
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test

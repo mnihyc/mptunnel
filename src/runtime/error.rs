@@ -32,6 +32,7 @@ pub enum RuntimeError {
     TaskJoin(tokio::task::JoinError),
     NoTcpPath,
     NoUdpPath,
+    NoDatagramPath,
     NoSchedulableTcpPath,
     NoSchedulableUdpPath,
     PathIdOverflow,
@@ -145,6 +146,12 @@ impl std::fmt::Display for RuntimeError {
             Self::TaskJoin(err) => write!(f, "runtime task failed: {err}"),
             Self::NoTcpPath => write!(f, "runtime operation requires at least one TCP path"),
             Self::NoUdpPath => write!(f, "runtime operation requires at least one UDP path"),
+            Self::NoDatagramPath => {
+                write!(
+                    f,
+                    "runtime operation requires at least one TCP or UDP path for datagram relay"
+                )
+            }
             Self::NoSchedulableTcpPath => {
                 write!(f, "no configured TCP path is schedulable for this flow")
             }
@@ -185,6 +192,7 @@ impl std::error::Error for RuntimeError {
             Self::TaskJoin(err) => Some(err),
             Self::NoTcpPath
             | Self::NoUdpPath
+            | Self::NoDatagramPath
             | Self::NoSchedulableTcpPath
             | Self::NoSchedulableUdpPath
             | Self::PathIdOverflow

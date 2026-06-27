@@ -3,7 +3,9 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const VERSION: u8 = 0x05;
+const USERNAME_PASSWORD_VERSION: u8 = 0x01;
 const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USERNAME_PASSWORD: u8 = 0x02;
 const METHOD_NO_ACCEPTABLE: u8 = 0xff;
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -20,6 +22,16 @@ impl AuthRequest {
     pub fn supports_no_auth(&self) -> bool {
         self.methods.contains(&METHOD_NO_AUTH)
     }
+
+    pub fn supports_username_password(&self) -> bool {
+        self.methods.contains(&METHOD_USERNAME_PASSWORD)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsernamePasswordAuthRequest {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +88,54 @@ pub fn no_auth_response() -> [u8; 2] {
     [VERSION, METHOD_NO_AUTH]
 }
 
+pub fn username_password_method_response() -> [u8; 2] {
+    [VERSION, METHOD_USERNAME_PASSWORD]
+}
+
+pub fn username_password_auth_response(success: bool) -> [u8; 2] {
+    [USERNAME_PASSWORD_VERSION, u8::from(!success)]
+}
+
 pub fn no_acceptable_methods_response() -> [u8; 2] {
     [VERSION, METHOD_NO_ACCEPTABLE]
+}
+
+pub fn parse_username_password_auth_request(
+    input: &[u8],
+) -> Result<(UsernamePasswordAuthRequest, usize), Socks5Error> {
+    if input.len() < 2 {
+        return Err(Socks5Error::Incomplete);
+    }
+    if input[0] != USERNAME_PASSWORD_VERSION {
+        return Err(Socks5Error::UnsupportedAuthVersion(input[0]));
+    }
+    let username_len = input[1] as usize;
+    let password_len_offset = 2usize
+        .checked_add(username_len)
+        .ok_or(Socks5Error::MessageTooLong)?;
+    if input.len() <= password_len_offset {
+        return Err(Socks5Error::Incomplete);
+    }
+    let password_len = input[password_len_offset] as usize;
+    let total_len = password_len_offset
+        .checked_add(1)
+        .and_then(|value| value.checked_add(password_len))
+        .ok_or(Socks5Error::MessageTooLong)?;
+    if input.len() < total_len {
+        return Err(Socks5Error::Incomplete);
+    }
+    let username = std::str::from_utf8(&input[2..password_len_offset])
+        .map_err(|_| Socks5Error::InvalidAuthEncoding)?;
+    let password_start = password_len_offset + 1;
+    let password = std::str::from_utf8(&input[password_start..total_len])
+        .map_err(|_| Socks5Error::InvalidAuthEncoding)?;
+    Ok((
+        UsernamePasswordAuthRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+        },
+        total_len,
+    ))
 }
 
 pub fn parse_connect_request(input: &[u8]) -> Result<(ConnectRequest, usize), Socks5Error> {
@@ -312,6 +370,8 @@ pub enum Socks5Error {
     InvalidReservedByte,
     InvalidPort,
     InvalidDomain,
+    UnsupportedAuthVersion(u8),
+    InvalidAuthEncoding,
     UnsupportedFragment(u8),
     MessageTooLong,
 }
@@ -330,6 +390,10 @@ impl std::fmt::Display for Socks5Error {
             Self::InvalidReservedByte => write!(f, "invalid SOCKS5 reserved byte"),
             Self::InvalidPort => write!(f, "SOCKS5 target port must be greater than zero"),
             Self::InvalidDomain => write!(f, "invalid SOCKS5 domain"),
+            Self::UnsupportedAuthVersion(version) => {
+                write!(f, "unsupported SOCKS5 auth version {version}")
+            }
+            Self::InvalidAuthEncoding => write!(f, "invalid SOCKS5 username/password encoding"),
             Self::UnsupportedFragment(fragment) => {
                 write!(f, "SOCKS5 UDP fragment {fragment} is not supported")
             }
@@ -350,8 +414,25 @@ mod tests {
 
         assert_eq!(consumed, 4);
         assert!(request.supports_no_auth());
+        assert!(request.supports_username_password());
         assert_eq!(no_auth_response(), [0x05, 0x00]);
+        assert_eq!(username_password_method_response(), [0x05, 0x02]);
+        assert_eq!(username_password_auth_response(true), [0x01, 0x00]);
+        assert_eq!(username_password_auth_response(false), [0x01, 0x01]);
         assert_eq!(no_acceptable_methods_response(), [0x05, 0xff]);
+    }
+
+    #[test]
+    fn parses_username_password_auth_request() {
+        let input = [
+            0x01, 0x04, b'u', b's', b'e', b'r', 0x06, b's', b'e', b'c', b'r', b'e', b't',
+        ];
+        let (request, consumed) =
+            parse_username_password_auth_request(&input).expect("auth request");
+
+        assert_eq!(consumed, input.len());
+        assert_eq!(request.username, "user");
+        assert_eq!(request.password, "secret");
     }
 
     #[test]

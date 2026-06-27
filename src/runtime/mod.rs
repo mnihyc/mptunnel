@@ -2539,6 +2539,17 @@ fn tcp_path_command_queue(mux_limits: MuxLimits) -> usize {
         .clamp(4, tcp_path_session_frame_queue(mux_limits).max(4))
 }
 
+fn udp_stream_path_command_queue(mux_limits: MuxLimits) -> usize {
+    let frame_payload = udp_stream_frame_payload_bytes(mux_limits).max(1);
+    let inflight_frames = mux_limits
+        .max_tcp_path_inflight_bytes
+        .saturating_add(frame_payload - 1)
+        / frame_payload;
+    inflight_frames
+        .saturating_add(4)
+        .clamp(16, tcp_path_session_frame_queue(mux_limits).max(16))
+}
+
 fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
     tcp_stream_frame_queue(mux_limits)
         .saturating_mul(4)
@@ -4339,7 +4350,7 @@ async fn open_remote_stream_on_udp_path(
     };
 
     let (commands, receivers) =
-        tcp_path_session_command_channels(tcp_path_command_queue(context.mux_limits));
+        tcp_path_session_command_channels(udp_stream_path_command_queue(context.mux_limits));
     let (frames_tx, frames_rx) = mpsc::channel(tcp_stream_frame_queue(context.mux_limits));
     tokio::spawn(run_client_udp_stream_path_session(
         encrypted,
@@ -8449,7 +8460,7 @@ impl ServerUdpPathSession {
             context.codec_limits,
         );
         let (commands_tx, commands_rx) =
-            tcp_path_session_command_channels(tcp_server_session_command_queue(&context));
+            tcp_path_session_command_channels(udp_stream_path_command_queue(context.mux_limits));
         Ok(Self {
             peer,
             encrypted,
@@ -10069,6 +10080,30 @@ mod tests {
             ..ResourceLimits::default()
         };
         assert_eq!(tcp_session_command_queue(resources), 20);
+    }
+
+    #[test]
+    fn udp_stream_path_command_queue_tracks_udp_frame_budget() {
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 1024 * 1024,
+            max_ack_ranges: 256,
+            max_stream_window_bytes: 16 * 1024 * 1024,
+            max_repair_bytes: 16 * 1024 * 1024,
+            max_reorder_bytes: 16 * 1024 * 1024,
+            max_datagram_queue_bytes: 4 * 1024 * 1024,
+            max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+            max_tcp_relay_chunk_bytes: 256 * 1024,
+            tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+            tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        };
+        let udp_queue = udp_stream_path_command_queue(mux_limits);
+
+        assert!(udp_queue > tcp_path_command_queue(mux_limits));
+        assert_eq!(udp_queue, tcp_path_session_frame_queue(mux_limits));
+        assert!(
+            udp_queue * udp_stream_frame_payload_bytes(mux_limits)
+                >= mux_limits.max_tcp_relay_chunk_bytes
+        );
     }
 
     #[test]

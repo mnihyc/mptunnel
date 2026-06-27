@@ -475,7 +475,7 @@ async fn handle_tun_udp_flow(
         let ttl_ms = tun_udp_ttl_ms(key.remote, &tun);
         let payload = Bytes::from(payload);
         let response = match association
-            .send_to(TargetAddr::Ip(target), payload.clone(), ttl_ms)
+            .send_to_with_adaptive_retries(TargetAddr::Ip(target), payload, ttl_ms)
             .await
         {
             Ok(response) => response,
@@ -484,19 +484,7 @@ async fn handle_tun_udp_flow(
                     "warning: TUN UDP datagram {} -> {} failed: {err}",
                     key.local, key.remote
                 );
-                match association
-                    .send_to(TargetAddr::Ip(target), payload, ttl_ms)
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(err) => {
-                        eprintln!(
-                            "warning: TUN UDP datagram retry {} -> {} failed: {err}",
-                            key.local, key.remote
-                        );
-                        continue;
-                    }
-                }
+                continue;
             }
         };
         responses
@@ -3085,8 +3073,10 @@ impl UdpPathRuntimeModel {
         let loss_backoff = (1.0 - snapshot.loss_rate.clamp(0.0, 1.0)).clamp(0.25, 1.0);
         let pacing_rate_bps = (snapshot.delivery_rate_bps * UDP_BBR_PACING_GAIN * loss_backoff)
             .max(UDP_MIN_PACING_RATE_BPS);
+        let timeout_loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
         let model_timeout = Duration::from_secs_f64(
-            ((snapshot.srtt_ms + snapshot.jitter_ms.mul_add(4.0, 25.0)) / 1000.0)
+            (((snapshot.srtt_ms + snapshot.jitter_ms.mul_add(4.0, 25.0)) * timeout_loss_gain)
+                / 1000.0)
                 .max(UDP_MIN_RESPONSE_TIMEOUT.as_secs_f64()),
         );
         let ttl_timeout = Duration::from_millis(u64::from(ttl_ms));
@@ -4414,25 +4404,14 @@ where
                 }
                 let target = datagram.target.clone();
                 let payload = datagram.payload;
-                let response = udp_association
-                    .send_to(target.clone(), payload.clone(), DEFAULT_SOCKS5_UDP_TTL_MS)
-                    .await;
-                let response = match response {
+                let response = match udp_association
+                    .send_to_with_adaptive_retries(target.clone(), payload, DEFAULT_SOCKS5_UDP_TTL_MS)
+                    .await
+                {
                     Ok(response) => response,
                     Err(err) => {
                         eprintln!("warning: SOCKS5 UDP datagram to {target:?} failed: {err}");
-                        match udp_association
-                            .send_to(target.clone(), payload, DEFAULT_SOCKS5_UDP_TTL_MS)
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(err) => {
-                                eprintln!(
-                                    "warning: SOCKS5 UDP datagram retry to {target:?} failed: {err}"
-                                );
-                                continue;
-                            }
-                        }
+                        continue;
                     }
                 };
                 let response_packet = match socks5::udp_datagram(&target, &response) {
@@ -6935,6 +6914,7 @@ impl UdpDatagramClientAssociation {
 
         self.prune_suppressed_paths();
         let mut attempted = HashSet::new();
+        let mut retried_acked_timeout = HashSet::new();
         let mut last_retryable_error = None;
         while let Some(path_index) =
             self.select_path_candidate(&candidates, &attempted, payload.len(), ttl_ms)
@@ -6968,6 +6948,43 @@ impl UdpDatagramClientAssociation {
                     path_was_acked,
                     response_timeout,
                 }) => {
+                    if path_was_acked
+                        && retried_acked_timeout.insert(path_index)
+                        && self.path_session_is_open(path_index)
+                    {
+                        self.context.mark_udp_path_feedback(
+                            path_index,
+                            UdpDatagramPathObservation {
+                                rtt: response_timeout,
+                                jitter: Duration::ZERO,
+                                loss_rate: 1.0,
+                                rate_sample: None,
+                            },
+                        );
+                        attempted.remove(&path_index);
+                        last_retryable_error =
+                            Some(RuntimeError::Protocol("UDP datagram response timed out"));
+                        continue;
+                    }
+                    if path_was_acked
+                        && self.path_session_is_open(path_index)
+                        && !self.has_validated_udp_retry_alternative(
+                            &candidates,
+                            &attempted,
+                            path_index,
+                        )
+                    {
+                        self.context.mark_udp_path_feedback(
+                            path_index,
+                            UdpDatagramPathObservation {
+                                rtt: response_timeout,
+                                jitter: Duration::ZERO,
+                                loss_rate: 1.0,
+                                rate_sample: None,
+                            },
+                        );
+                        return Err(RuntimeError::Protocol("UDP datagram response timed out"));
+                    }
                     self.remove_path(path_index).await;
                     self.suppress_path_after_timeout(path_index, response_timeout, ttl_ms);
                     if !path_was_acked {
@@ -6998,6 +7015,63 @@ impl UdpDatagramClientAssociation {
             }
         }
         Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath))
+    }
+
+    async fn send_to_with_adaptive_retries(
+        &mut self,
+        target: TargetAddr,
+        payload: Bytes,
+        ttl_ms: u32,
+    ) -> Result<Bytes, RuntimeError> {
+        let started_at = Instant::now();
+        loop {
+            match self.send_to(target.clone(), payload.clone(), ttl_ms).await {
+                Ok(response) => return Ok(response),
+                Err(err) if udp_datagram_error_is_path_retryable(&err) => {
+                    if started_at.elapsed() >= self.adaptive_retry_budget(payload.len(), ttl_ms) {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn adaptive_retry_budget(&self, payload_bytes: usize, ttl_ms: u32) -> Duration {
+        let ttl = Duration::from_millis(u64::from(ttl_ms));
+        let response_timeout = self
+            .context
+            .ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms)
+            .into_iter()
+            .filter_map(|candidate| {
+                self.context
+                    .udp_path_runtime_model(candidate.path_index, ttl_ms)
+                    .map(|model| model.response_timeout)
+            })
+            .min()
+            .unwrap_or(UDP_MAX_RESPONSE_TIMEOUT);
+        Duration::from_secs_f64(response_timeout.as_secs_f64() * 4.0)
+            .max(UDP_MIN_RESPONSE_TIMEOUT)
+            .min(ttl)
+    }
+
+    fn path_session_is_open(&self, path_index: usize) -> bool {
+        self.paths
+            .iter()
+            .any(|path| path.session.path_index == path_index)
+    }
+
+    fn has_validated_udp_retry_alternative(
+        &self,
+        candidates: &[UdpPathCandidate],
+        attempted: &HashSet<usize>,
+        current_path_index: usize,
+    ) -> bool {
+        candidates.iter().any(|candidate| {
+            candidate.path_index != current_path_index
+                && !attempted.contains(&candidate.path_index)
+                && self.path_has_datagram_feedback_or_hint(candidate.path_index)
+        })
     }
 
     async fn close(&mut self) -> Result<(), RuntimeError> {
@@ -7789,8 +7863,105 @@ pub async fn handle_server_udp_datagram_path_session(
 
 struct ServerUdpDatagramFlow {
     flow_id: DatagramFlowId,
-    outbound_socket: outbound::OutboundUdpSocket,
-    response_flow: DatagramFlow,
+    requests: mpsc::Sender<ServerUdpDatagramRequest>,
+}
+
+struct ServerUdpDatagramRequest {
+    ttl_ms: u32,
+    payload: Bytes,
+}
+
+fn server_udp_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
+    let unit = mux_limits.max_payload_bytes.max(1);
+    mux_limits
+        .max_datagram_queue_bytes
+        .saturating_div(unit)
+        .clamp(1, 1024)
+}
+
+fn spawn_server_udp_datagram_flow_worker(
+    flow_id: DatagramFlowId,
+    mut outbound_socket: outbound::OutboundUdpSocket,
+    commands: TcpPathSessionCommandSender,
+    mux_limits: MuxLimits,
+) -> mpsc::Sender<ServerUdpDatagramRequest> {
+    let (requests_tx, mut requests_rx) = mpsc::channel::<ServerUdpDatagramRequest>(
+        server_udp_datagram_request_queue_len(mux_limits),
+    );
+    tokio::spawn(async move {
+        let mut response_flow = DatagramFlow::new(flow_id, mux_limits);
+        let mut response_buffer = vec![0u8; mux_limits.max_payload_bytes.min(64 * 1024)];
+        let mut pending_ttls = VecDeque::<(Instant, u32)>::new();
+        loop {
+            prune_server_udp_pending_ttls(&mut pending_ttls);
+            tokio::select! {
+                request = requests_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    if request.ttl_ms == 0 {
+                        continue;
+                    }
+                    match outbound_socket.send(&request.payload).await {
+                        Ok(_) => {
+                            pending_ttls.push_back((
+                                Instant::now() + Duration::from_millis(u64::from(request.ttl_ms)),
+                                request.ttl_ms,
+                            ));
+                        }
+                        Err(err) => {
+                            eprintln!("warning: UDP outbound send failed: {err}");
+                        }
+                    }
+                }
+                received = outbound_socket.recv(&mut response_buffer) => {
+                    let len = match received {
+                        Ok(len) => len,
+                        Err(err) => {
+                            eprintln!("warning: UDP outbound receive failed: {err}");
+                            let _ = commands
+                                .send_frame(Frame::DatagramClose { flow_id }, TrafficClass::RealtimeDatagram)
+                                .await;
+                            break;
+                        }
+                    };
+                    let ttl_ms = server_udp_next_response_ttl(&mut pending_ttls)
+                        .unwrap_or(DEFAULT_SOCKS5_UDP_TTL_MS);
+                    let response = Bytes::copy_from_slice(&response_buffer[..len]);
+                    if let Err(err) = response_flow.enqueue(0, ttl_ms, response) {
+                        eprintln!("warning: UDP response enqueue failed: {err}");
+                        continue;
+                    }
+                    let Some(frame) = response_flow.pop_frame(0) else {
+                        continue;
+                    };
+                    if commands
+                        .send_frame(frame, TrafficClass::RealtimeDatagram)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    requests_tx
+}
+
+fn prune_server_udp_pending_ttls(pending_ttls: &mut VecDeque<(Instant, u32)>) {
+    let now = Instant::now();
+    while pending_ttls
+        .front()
+        .is_some_and(|(deadline, _)| *deadline <= now)
+    {
+        pending_ttls.pop_front();
+    }
+}
+
+fn server_udp_next_response_ttl(pending_ttls: &mut VecDeque<(Instant, u32)>) -> Option<u32> {
+    prune_server_udp_pending_ttls(pending_ttls);
+    pending_ttls.pop_front().map(|(_, ttl_ms)| ttl_ms)
 }
 
 struct ServerUdpPathSession {
@@ -8226,11 +8397,13 @@ impl ServerUdpPathSession {
                         return Err(RuntimeError::OutboundConnect(err));
                     }
                 };
-                self.flows.push(ServerUdpDatagramFlow {
+                let requests = spawn_server_udp_datagram_flow_worker(
                     flow_id,
                     outbound_socket,
-                    response_flow: DatagramFlow::new(flow_id, self.context.mux_limits),
-                });
+                    self.commands_tx.clone(),
+                    self.context.mux_limits,
+                );
+                self.flows.push(ServerUdpDatagramFlow { flow_id, requests });
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (
@@ -8250,36 +8423,34 @@ impl ServerUdpPathSession {
                     .iter()
                     .position(|flow| flow.flow_id == flow_id)
                     .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?;
-                self.encrypted
-                    .send_frame_to(
-                        &Frame::DatagramFeedback {
-                            flow_id,
-                            received: vec![datagram_ack_range(datagram_id)?],
-                        },
-                        self.peer,
-                    )
-                    .await?;
-                let flow = self
+                let requests = self
                     .flows
-                    .get_mut(flow_index)
-                    .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?;
-                flow.outbound_socket.send(&payload).await?;
-                let mut response =
-                    vec![0u8; self.context.mux_limits.max_payload_bytes.min(64 * 1024)];
-                let len = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    flow.outbound_socket.recv(&mut response),
-                )
-                .await
-                .map_err(|_| RuntimeError::Protocol("UDP outbound response timed out"))??;
-                response.truncate(len);
-                flow.response_flow
-                    .enqueue(0, ttl_ms, Bytes::from(response))?;
-                let frame = flow
-                    .response_flow
-                    .pop_frame(0)
-                    .ok_or(RuntimeError::Protocol("UDP response expired before send"))?;
-                self.encrypted.send_frame_to(&frame, self.peer).await?;
+                    .get(flow_index)
+                    .ok_or(RuntimeError::Protocol("unknown UDP datagram flow"))?
+                    .requests
+                    .clone();
+                match requests.try_send(ServerUdpDatagramRequest { ttl_ms, payload }) {
+                    Ok(()) => {
+                        self.encrypted
+                            .send_frame_to(
+                                &Frame::DatagramFeedback {
+                                    flow_id,
+                                    received: vec![datagram_ack_range(datagram_id)?],
+                                },
+                                self.peer,
+                            )
+                            .await?;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        eprintln!("warning: UDP datagram worker queue full; dropping request");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.flows.retain(|flow| flow.flow_id != flow_id);
+                        self.encrypted
+                            .send_frame_to(&Frame::DatagramClose { flow_id }, self.peer)
+                            .await?;
+                    }
+                }
                 Ok(ServerUdpSessionOutcome::Active)
             }
             (ServerUdpPathState::Established, Frame::DatagramFeedback { .. }) => {
@@ -8778,6 +8949,20 @@ mod tests {
                 assert_eq!(&buf[..len], b"ping");
                 socket.send_to(b"pong", peer).await.expect("target send");
             }
+        });
+        (addr, handle)
+    }
+
+    async fn spawn_udp_drop_first_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
+        let addr = socket.local_addr().expect("target addr");
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (len, _peer) = socket.recv_from(&mut buf).await.expect("first recv");
+            assert_eq!(&buf[..len], b"ping");
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("retry recv");
+            assert_eq!(&buf[..len], b"ping");
+            socket.send_to(b"pong", peer).await.expect("target send");
         });
         (addr, handle)
     }
@@ -11082,6 +11267,65 @@ mod tests {
     }
 
     #[test]
+    fn udp_acked_timeout_migration_requires_validated_alternative() {
+        let proven_path = "udp://127.0.0.1:10033"
+            .parse::<PathSpec>()
+            .expect("proven path");
+        let endpoint_only_alternative = "udp://127.0.0.1:10034"
+            .parse::<PathSpec>()
+            .expect("endpoint-only alternative");
+        let hinted_alternative = "udp://127.0.0.1:10035?srtt-ms=80&rate-mbps=30"
+            .parse::<PathSpec>()
+            .expect("hinted alternative");
+        let context = ClientPathContext::new(
+            vec![proven_path, endpoint_only_alternative, hinted_alternative],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("ctx");
+        context.mark_udp_path_feedback(
+            0,
+            UdpDatagramPathObservation {
+                rtt: Duration::from_millis(40),
+                jitter: Duration::from_millis(4),
+                loss_rate: 0.0,
+                rate_sample: None,
+            },
+        );
+        let association = UdpDatagramClientAssociation::new(context).expect("assoc");
+        let attempted = HashSet::from([0]);
+
+        assert!(!association.has_validated_udp_retry_alternative(
+            &[
+                UdpPathCandidate {
+                    path_index: 0,
+                    eta_ms: 40.0,
+                },
+                UdpPathCandidate {
+                    path_index: 1,
+                    eta_ms: 80.0,
+                },
+            ],
+            &attempted,
+            0,
+        ));
+        assert!(association.has_validated_udp_retry_alternative(
+            &[
+                UdpPathCandidate {
+                    path_index: 0,
+                    eta_ms: 40.0,
+                },
+                UdpPathCandidate {
+                    path_index: 2,
+                    eta_ms: 80.0,
+                },
+            ],
+            &attempted,
+            0,
+        ));
+    }
+
+    #[test]
     fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
         let mut model = UdpPathRuntimeModel {
             pacing_rate_bps: UDP_MIN_PACING_RATE_BPS,
@@ -11129,6 +11373,56 @@ mod tests {
             udp_datagram_path_open_timeout(false, false, model, 250),
             Duration::from_millis(250)
         );
+    }
+
+    #[test]
+    fn udp_runtime_model_backs_off_response_timeout_after_loss() {
+        let stable = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, 30_000_000.0);
+        let mut lossy = stable;
+        lossy.loss_rate = 0.5;
+
+        let stable_model = UdpPathRuntimeModel::from_snapshot(
+            stable,
+            DEFAULT_SOCKS5_UDP_TTL_MS,
+            UDP_DEFAULT_MTU_PAYLOAD_BYTES,
+            true,
+            UDP_MAX_MTU_PAYLOAD_BYTES,
+        );
+        let lossy_model = UdpPathRuntimeModel::from_snapshot(
+            lossy,
+            DEFAULT_SOCKS5_UDP_TTL_MS,
+            UDP_DEFAULT_MTU_PAYLOAD_BYTES,
+            true,
+            UDP_MAX_MTU_PAYLOAD_BYTES,
+        );
+
+        assert!(lossy_model.response_timeout > stable_model.response_timeout);
+        assert!(lossy_model.response_timeout <= UDP_MAX_RESPONSE_TIMEOUT);
+        assert!(lossy_model.pacing_rate_bps < stable_model.pacing_rate_bps);
+    }
+
+    #[test]
+    fn udp_association_retry_budget_tracks_live_loss_model() {
+        let path = "udp://127.0.0.1:10036?srtt-ms=80&rate-mbps=30"
+            .parse::<PathSpec>()
+            .expect("path");
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+        let stable_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+
+        context.mark_udp_path_feedback(
+            0,
+            UdpDatagramPathObservation {
+                rtt: Duration::from_millis(120),
+                jitter: Duration::from_millis(0),
+                loss_rate: 1.0,
+                rate_sample: None,
+            },
+        );
+
+        let lossy_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+        assert!(lossy_budget > stable_budget);
     }
 
     #[test]
@@ -12739,6 +13033,44 @@ mod tests {
             .await
             .expect("survivor join")
             .expect("survivor path");
+        target.await.expect("target join");
+    }
+
+    #[tokio::test]
+    async fn udp_association_retries_acked_timeout_on_same_open_path() {
+        let (target_addr, target) = spawn_udp_drop_first_echo_target().await;
+        let path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
+        let socket = udp::bind_socket(&path).await.expect("bind udp path");
+        let server = tokio::spawn(handle_server_udp_datagram_path_session(
+            socket,
+            server_context(OutboundConfig::Direct),
+        ));
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+
+        let response = association
+            .send_to(
+                TargetAddr::Ip(target_addr),
+                Bytes::from_static(b"ping"),
+                1000,
+            )
+            .await
+            .expect("same path retry response");
+
+        assert_eq!(response, Bytes::from_static(b"pong"));
+        {
+            let health = context.health.lock().expect("health lock");
+            assert_eq!(health.udp[0].state, SchedulerPathState::Active);
+            assert_eq!(health.udp[0].active_flows, 1);
+            assert!(
+                health.udp[0]
+                    .measured_loss_rate
+                    .is_some_and(|loss| loss > 0.0)
+            );
+        }
+        association.close().await.expect("close association");
+        server.await.expect("server join").expect("server");
         target.await.expect("target join");
     }
 

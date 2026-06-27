@@ -6345,12 +6345,20 @@ fn tcp_relay_auto_bulk_discovery_payload_bytes(
     attach_payload.max(mux_limits.max_tcp_path_inflight_bytes.min(stream_window))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct UdpStreamCongestion {
     cwnd_bytes: usize,
     ssthresh_bytes: usize,
     max_bytes: usize,
     mss_bytes: usize,
+    srtt: Option<Duration>,
+    pending_samples: VecDeque<UdpStreamSentSample>,
+}
+
+#[derive(Debug)]
+struct UdpStreamSentSample {
+    sent_at: Instant,
+    bytes: usize,
 }
 
 impl UdpStreamCongestion {
@@ -6370,23 +6378,38 @@ impl UdpStreamCongestion {
             ssthresh_bytes: max_bytes,
             max_bytes,
             mss_bytes,
+            srtt: None,
+            pending_samples: VecDeque::new(),
         }
     }
 
-    fn inflight_limit(self) -> usize {
+    fn inflight_limit(&self) -> usize {
         self.cwnd_bytes.clamp(self.mss_bytes, self.max_bytes)
     }
 
-    fn repair_budget(self, repair_bytes: usize) -> usize {
+    fn repair_budget(&self, repair_bytes: usize) -> usize {
         if repair_bytes == 0 {
             return 0;
         }
         repair_bytes.min(self.inflight_limit()).max(self.mss_bytes)
     }
 
+    fn on_send(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.pending_samples.push_back(UdpStreamSentSample {
+            sent_at: Instant::now(),
+            bytes,
+        });
+    }
+
     fn on_ack(&mut self, released_bytes: usize) {
         if released_bytes == 0 {
             return;
+        }
+        if let Some(sample) = self.ack_sample(released_bytes) {
+            self.observe_rtt(sample);
         }
         if self.cwnd_bytes < self.ssthresh_bytes {
             self.cwnd_bytes = self.cwnd_bytes.saturating_add(released_bytes);
@@ -6405,6 +6428,47 @@ impl UdpStreamCongestion {
             .max(udp_stream_min_cwnd_bytes(self.mss_bytes))
             .min(self.max_bytes);
         self.cwnd_bytes = self.ssthresh_bytes;
+    }
+
+    fn repair_replay_interval(&self, repair_bytes: usize, mux_limits: MuxLimits) -> Duration {
+        let fallback = udp_stream_repair_replay_interval(repair_bytes, mux_limits);
+        let Some(srtt) = self.srtt else {
+            return fallback;
+        };
+        Duration::from_secs_f64(srtt.as_secs_f64().mul_add(2.0, 0.025))
+            .max(fallback)
+            .min(TCP_STREAM_STALL_MAX_TIMEOUT)
+    }
+
+    fn ack_sample(&mut self, released_bytes: usize) -> Option<Duration> {
+        let now = Instant::now();
+        let mut remaining = released_bytes;
+        let mut sample = None;
+        while remaining > 0 {
+            let Some(front) = self.pending_samples.front_mut() else {
+                break;
+            };
+            sample.get_or_insert_with(|| now.saturating_duration_since(front.sent_at));
+            let consumed = remaining.min(front.bytes);
+            remaining -= consumed;
+            front.bytes -= consumed;
+            if front.bytes == 0 {
+                self.pending_samples.pop_front();
+            }
+        }
+        sample
+    }
+
+    fn observe_rtt(&mut self, sample: Duration) {
+        let sample = sample.max(MIN_RATE_SAMPLE_DURATION);
+        self.srtt = Some(match self.srtt {
+            Some(previous) => Duration::from_secs_f64(
+                previous
+                    .as_secs_f64()
+                    .mul_add(0.875, sample.as_secs_f64() * 0.125),
+            ),
+            None => sample,
+        });
     }
 }
 
@@ -6819,8 +6883,8 @@ where
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
             break Ok(stats);
         }
-        let repair_replay_interval = if udp_congestion.is_some() {
-            udp_stream_repair_replay_interval(send_stream.repair_bytes(), mux_limits)
+        let repair_replay_interval = if let Some(congestion) = &udp_congestion {
+            congestion.repair_replay_interval(send_stream.repair_bytes(), mux_limits)
         } else {
             tcp_relay_repair_replay_interval(send_stream.repair_bytes(), mux_limits)
         };
@@ -6830,6 +6894,17 @@ where
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(None, path_stream.class),
         );
+        let inflight_limit = udp_congestion
+            .as_ref()
+            .map(|congestion| congestion.inflight_limit())
+            .unwrap_or(mux_limits.max_tcp_path_inflight_bytes);
+        let can_read_local =
+            local_open && tcp_relay_can_read_with_limit(&send_stream, inflight_limit);
+        let read_budget = if can_read_local {
+            tcp_relay_read_budget_with_limit(&send_stream, mux_limits, inflight_limit, buf.len())
+        } else {
+            0
+        };
 
         tokio::select! {
             biased;
@@ -6886,6 +6961,7 @@ where
                     } => {
                         if path_stream.underlay == UnderlayProtocol::Udp {
                             let budget = udp_congestion
+                                .as_ref()
                                 .map(|congestion| {
                                     congestion.repair_budget(send_stream.repair_bytes())
                                 })
@@ -6918,6 +6994,7 @@ where
                     congestion.on_repair_timeout();
                 }
                 let budget = udp_congestion
+                    .as_ref()
                     .map(|congestion| congestion.repair_budget(send_stream.repair_bytes()))
                     .unwrap_or_else(|| send_stream.repair_bytes());
                 replay_tcp_repair_cache_limited(&path_stream, &send_stream, false, budget).await?;
@@ -6928,23 +7005,7 @@ where
                 send_tcp_recv_progress(&path_stream, &recv_stream).await?;
                 last_recv_progress_sent_at = Instant::now();
             }
-            read = async {
-                let inflight_limit = udp_congestion
-                    .map(|congestion| congestion.inflight_limit())
-                    .unwrap_or(mux_limits.max_tcp_path_inflight_bytes);
-                let read_budget = tcp_relay_read_budget_with_limit(
-                    &send_stream,
-                    mux_limits,
-                    inflight_limit,
-                    buf.len(),
-                );
-                local.read(&mut buf[..read_budget]).await
-            }, if local_open && tcp_relay_can_read_with_limit(
-                &send_stream,
-                udp_congestion
-                    .map(|congestion| congestion.inflight_limit())
-                    .unwrap_or(mux_limits.max_tcp_path_inflight_bytes),
-            ) => {
+            read = local.read(&mut buf[..read_budget]), if can_read_local => {
                 let read = read?;
                 if read == 0 {
                     if path_stream.underlay == UnderlayProtocol::Udp
@@ -6964,6 +7025,9 @@ where
                         StreamFlags::NONE,
                     )?;
                     path_stream.send_frame(frame).await?;
+                    if let Some(congestion) = &mut udp_congestion {
+                        congestion.on_send(read);
+                    }
                     stats.record_payload_bytes(read);
                 }
             }
@@ -10154,6 +10218,36 @@ mod tests {
         congestion.on_repair_timeout();
         assert!(congestion.inflight_limit() < 64 * 1024);
         assert!(congestion.inflight_limit() >= udp_stream_min_cwnd_bytes(mss).min(64 * 1024));
+    }
+
+    #[test]
+    fn udp_stream_repair_replay_uses_measured_ack_rtt() {
+        let mux_limits = MuxLimits::default();
+        let mss = udp_stream_frame_payload_bytes(mux_limits);
+        let mut congestion = UdpStreamCongestion::new(mux_limits);
+        let fallback =
+            udp_stream_repair_replay_interval(mux_limits.max_tcp_path_inflight_bytes, mux_limits);
+
+        assert_eq!(
+            congestion.repair_replay_interval(mux_limits.max_tcp_path_inflight_bytes, mux_limits),
+            fallback
+        );
+
+        congestion.on_send(mss);
+        let sample = congestion
+            .pending_samples
+            .front_mut()
+            .expect("pending sample");
+        sample.sent_at = sample
+            .sent_at
+            .checked_sub(Duration::from_millis(360))
+            .expect("past sample");
+        congestion.on_ack(mss);
+
+        let high_rtt_interval =
+            congestion.repair_replay_interval(mux_limits.max_tcp_path_inflight_bytes, mux_limits);
+        assert!(high_rtt_interval > fallback);
+        assert!(high_rtt_interval <= TCP_STREAM_STALL_MAX_TIMEOUT);
     }
 
     #[test]

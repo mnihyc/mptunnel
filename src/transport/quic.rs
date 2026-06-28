@@ -1,4 +1,5 @@
 use crate::mux::MuxLimits;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::{
@@ -15,11 +16,12 @@ use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub const ALPN: &[u8] = b"mptunnel-quic-v1";
-pub const SERVER_NAME: &str = "mptunnel.internal";
+pub const CONNECT_SERVER_NAME: &str = "localhost";
 
 const CERT_KEY_CONTEXT: &[u8] = b"mptunnel quic ed25519 certificate key v1";
 const CERT_SERIAL_CONTEXT: &[u8] = b"mptunnel quic certificate serial v1";
+const PRIVATE_ALPN_CONTEXT: &[u8] = b"mptunnel quic private alpn v1";
+const PRIVATE_ALPN_SEED_BYTES: usize = 16;
 const QUIC_INITIAL_MTU_BYTES: u16 = 1_200;
 const QUIC_MIN_MTU_BYTES: u16 = 1_200;
 const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -93,6 +95,14 @@ pub fn client_config(
     secret: &[u8],
     mux_limits: MuxLimits,
 ) -> Result<ClientConfig, QuicTransportError> {
+    let tls = client_tls_config(secret)?;
+    let crypto = QuicClientConfig::try_from(tls)?;
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport_config(mux_limits)?));
+    Ok(config)
+}
+
+fn client_tls_config(secret: &[u8]) -> Result<rustls::ClientConfig, QuicTransportError> {
     let credential = derive_credential(secret)?;
     let verifier = Arc::new(PinnedCertificateVerifier::new(
         credential.fingerprint_sha256,
@@ -105,19 +115,24 @@ pub fn client_config(
     .dangerous()
     .with_custom_certificate_verifier(verifier)
     .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.enable_sni = false;
+    tls.alpn_protocols = vec![derive_private_alpn(secret)?];
     tls.enable_early_data = true;
-
-    let crypto = QuicClientConfig::try_from(tls)?;
-    let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config(mux_limits)?));
-    Ok(config)
+    Ok(tls)
 }
 
 pub fn server_config(
     secret: &[u8],
     mux_limits: MuxLimits,
 ) -> Result<ServerConfig, QuicTransportError> {
+    let tls = server_tls_config(secret)?;
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(Arc::new(transport_config(mux_limits)?));
+    Ok(config)
+}
+
+fn server_tls_config(secret: &[u8]) -> Result<rustls::ServerConfig, QuicTransportError> {
     let credential = derive_credential(secret)?;
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -125,13 +140,9 @@ pub fn server_config(
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
     .with_single_cert(vec![credential.cert_der.clone()], credential.clone_key())?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = vec![derive_private_alpn(secret)?];
     tls.max_early_data_size = u32::MAX;
-
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
-    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config(mux_limits)?));
-    Ok(config)
+    Ok(tls)
 }
 
 pub fn transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicTransportError> {
@@ -169,7 +180,7 @@ pub fn derive_credential(secret: &[u8]) -> Result<QuicCredential, QuicTransportE
 
     let key = PrivatePkcs8KeyDer::from(pkcs8.clone());
     let signing_key = KeyPair::from_pkcs8_der_and_sign_algo(&key, &rcgen::PKCS_ED25519)?;
-    let mut params = CertificateParams::new(vec![SERVER_NAME.to_string()])?;
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
     params.not_before = date_time_ymd(2026, 1, 1);
     params.not_after = date_time_ymd(2126, 1, 1);
     params.serial_number = Some(certificate_serial(secret)?);
@@ -186,6 +197,13 @@ pub fn derive_credential(secret: &[u8]) -> Result<QuicCredential, QuicTransportE
 
 pub fn certificate_fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
     Sha256::digest(cert.as_ref()).into()
+}
+
+pub fn derive_private_alpn(secret: &[u8]) -> Result<Vec<u8>, QuicTransportError> {
+    let seed = derive_seed(secret, PRIVATE_ALPN_CONTEXT)?;
+    Ok(URL_SAFE_NO_PAD
+        .encode(&seed[..PRIVATE_ALPN_SEED_BYTES])
+        .into_bytes())
 }
 
 fn derive_seed(secret: &[u8], context: &[u8]) -> Result<[u8; 32], QuicTransportError> {
@@ -298,6 +316,7 @@ mod tests {
     use super::*;
 
     const SECRET: &[u8] = b"mptunnel integration test secret with enough entropy";
+    const VISIBLE_PRODUCT_TOKENS: &[&[u8]] = &[b"mptunnel", b"mptun", b"quic-v1"];
 
     #[test]
     fn credentials_are_secret_derived_and_stable() {
@@ -335,6 +354,46 @@ mod tests {
     }
 
     #[test]
+    fn certificate_does_not_expose_product_metadata() {
+        let credential = derive_credential(SECRET).expect("credential");
+        for token in VISIBLE_PRODUCT_TOKENS {
+            assert!(
+                !credential
+                    .cert_der
+                    .as_ref()
+                    .windows(token.len())
+                    .any(|window| window == *token),
+                "certificate should not expose {:?}",
+                String::from_utf8_lossy(token)
+            );
+        }
+    }
+
+    #[test]
+    fn tls_configs_do_not_advertise_product_protocol_metadata() {
+        let client = client_tls_config(SECRET).expect("client tls config");
+        let server = server_tls_config(SECRET).expect("server tls config");
+        let alpn = derive_private_alpn(SECRET).expect("private alpn");
+
+        assert!(!client.enable_sni);
+        assert_eq!(client.alpn_protocols, vec![alpn.clone()]);
+        assert_eq!(server.alpn_protocols, vec![alpn.clone()]);
+        assert_ne!(
+            alpn,
+            derive_private_alpn(b"other high entropy test secret").expect("other private alpn")
+        );
+        for token in VISIBLE_PRODUCT_TOKENS {
+            assert!(
+                !alpn
+                    .windows(token.len())
+                    .any(|window| window.eq_ignore_ascii_case(token)),
+                "private alpn should not expose {:?}",
+                String::from_utf8_lossy(token)
+            );
+        }
+    }
+
+    #[test]
     fn pinned_verifier_accepts_only_derived_certificate() {
         let credential = derive_credential(SECRET).expect("credential");
         let verifier = PinnedCertificateVerifier::new(
@@ -347,7 +406,7 @@ mod tests {
             .verify_server_cert(
                 &credential.cert_der,
                 &[],
-                &ServerName::try_from(SERVER_NAME).expect("server name"),
+                &ServerName::try_from(CONNECT_SERVER_NAME).expect("server name"),
                 &[],
                 UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
             )
@@ -357,7 +416,7 @@ mod tests {
                 .verify_server_cert(
                     &other.cert_der,
                     &[],
-                    &ServerName::try_from(SERVER_NAME).expect("server name"),
+                    &ServerName::try_from(CONNECT_SERVER_NAME).expect("server name"),
                     &[],
                     UnixTime::since_unix_epoch(Duration::from_secs(1_800_000_000)),
                 )

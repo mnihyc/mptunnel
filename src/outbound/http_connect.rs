@@ -110,12 +110,12 @@ pub fn datagram_capsule(payload: &[u8]) -> Result<Vec<u8>, HttpConnectClientErro
         });
     }
     let mut http_datagram_payload = Vec::with_capacity(1 + payload.len());
-    encode_quic_varint(UDP_CONTEXT_ID, &mut http_datagram_payload)?;
+    encode_capsule_varint(UDP_CONTEXT_ID, &mut http_datagram_payload)?;
     http_datagram_payload.extend_from_slice(payload);
 
     let mut capsule = Vec::with_capacity(2 + http_datagram_payload.len());
-    encode_quic_varint(DATAGRAM_CAPSULE_TYPE, &mut capsule)?;
-    encode_quic_varint(http_datagram_payload.len() as u64, &mut capsule)?;
+    encode_capsule_varint(DATAGRAM_CAPSULE_TYPE, &mut capsule)?;
+    encode_capsule_varint(http_datagram_payload.len() as u64, &mut capsule)?;
     capsule.extend_from_slice(&http_datagram_payload);
     Ok(capsule)
 }
@@ -125,8 +125,8 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        let capsule_type = read_quic_varint(reader).await?.into_inner();
-        let capsule_len = read_quic_varint(reader).await?.into_inner();
+        let capsule_type = read_capsule_varint(reader).await?.into_inner();
+        let capsule_len = read_capsule_varint(reader).await?.into_inner();
         if capsule_len > MAX_CONNECT_UDP_CAPSULE_PAYLOAD_BYTES as u64 {
             return Err(HttpConnectClientError::CapsuleTooLarge {
                 actual: capsule_len,
@@ -139,7 +139,7 @@ where
         }
         let mut payload = vec![0u8; capsule_len as usize];
         reader.read_exact(&mut payload).await?;
-        let (context_id, consumed) = decode_quic_varint(&payload)?;
+        let (context_id, consumed) = decode_capsule_varint(&payload)?;
         if context_id.into_inner() != UDP_CONTEXT_ID {
             continue;
         }
@@ -231,20 +231,20 @@ fn connect_udp_target_host(target: &TargetAddr) -> String {
     }
 }
 
-fn encode_quic_varint(value: u64, out: &mut Vec<u8>) -> Result<(), HttpConnectClientError> {
+fn encode_capsule_varint(value: u64, out: &mut Vec<u8>) -> Result<(), HttpConnectClientError> {
     let value = VarInt::from_u64(value).map_err(|_| HttpConnectClientError::InvalidVarint)?;
     value.encode(out);
     Ok(())
 }
 
-fn decode_quic_varint(input: &[u8]) -> Result<(VarInt, usize), HttpConnectClientError> {
+fn decode_capsule_varint(input: &[u8]) -> Result<(VarInt, usize), HttpConnectClientError> {
     let original_len = input.len();
     let mut cursor = input;
     let value = VarInt::decode(&mut cursor).map_err(|_| HttpConnectClientError::InvalidVarint)?;
     Ok((value, original_len - cursor.len()))
 }
 
-async fn read_quic_varint<R>(reader: &mut R) -> Result<VarInt, HttpConnectClientError>
+async fn read_capsule_varint<R>(reader: &mut R) -> Result<VarInt, HttpConnectClientError>
 where
     R: AsyncRead + Unpin,
 {
@@ -256,7 +256,7 @@ where
     if len > 1 {
         reader.read_exact(&mut buf[1..len]).await?;
     }
-    Ok(decode_quic_varint(&buf[..len])?.0)
+    Ok(decode_capsule_varint(&buf[..len])?.0)
 }
 
 async fn discard_exact<R>(reader: &mut R, mut len: usize) -> Result<(), HttpConnectClientError>

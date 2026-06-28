@@ -50,7 +50,7 @@ Interpretation:
 
 - High `transport.tcp.*.socket_wait` with low CPU components points at TCP carrier/network limits.
 - High `transport.*.encrypt`, `decrypt`, `encode_frame`, or `decode_frame` points at per-frame CPU or allocation cost.
-- High `relay.path_recv_frame_wait` on UDP carrier rows now points at carrier/network wait, remote-side backpressure, or QUIC scheduling/congestion behavior rather than mptunnel overlay pacing.
+- High `relay.path_recv_frame_wait` on UDP carrier rows now points at carrier/network wait, remote-side backpressure, or UDP-engine scheduling/congestion behavior rather than mptunnel overlay pacing.
 - High `runtime.path_queue.*` or route-frame time means internal queues/backpressure are limiting throughput.
 - High `mux.receive_data` or `mux.retransmit_*` under loss means reorder/repair work is the hot path.
 
@@ -161,4 +161,4 @@ Use one experiment, one reflection, and one core improvement at a time:
 5. Make one essential implementation change guided by that bottleneck.
 6. Re-run the same case and then a broader normal/mixed/matrix/failover set to prove the fix did not overfit one condition.
 
-This mirrors the useful lessons from mature transports: MPTCP-style reinjection must be checked against head-of-line cost, Hysteria2/QUIC-style UDP control must be checked against pacing and loss recovery cost, and BBR/BBRv3-style model changes must be checked against delivered rate, queue growth, and latency instead of final throughput alone.
+This mirrors the useful lessons from mature transports: MPTCP-style reinjection must be checked against head-of-line cost, Hysteria2-style UDP control must be checked against pacing and loss recovery cost, and BBR/BBRv3-style model changes must be checked against delivered rate, queue growth, and latency instead of final throughput alone.

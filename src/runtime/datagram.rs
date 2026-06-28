@@ -158,10 +158,10 @@ fn udp_datagram_should_try_tcp_underlay(err: &RuntimeError, context: &ClientPath
                 | RuntimeError::NoSchedulableUdpPath
                 | RuntimeError::Io(_)
                 | RuntimeError::Udp(_)
-                | RuntimeError::QuicTransport(_)
-                | RuntimeError::QuicFrame(_)
-                | RuntimeError::QuicConnect(_)
-                | RuntimeError::QuicConnection(_)
+                | RuntimeError::UdpCarrierTransport(_)
+                | RuntimeError::UdpCarrierFrame(_)
+                | RuntimeError::UdpCarrierConnect(_)
+                | RuntimeError::UdpCarrierConnection(_)
                 | RuntimeError::Auth(_)
                 | RuntimeError::RemoteClosed(_)
                 | RuntimeError::Protocol(_)
@@ -1142,10 +1142,10 @@ fn udp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
         err,
         RuntimeError::Io(_)
             | RuntimeError::Udp(_)
-            | RuntimeError::QuicTransport(_)
-            | RuntimeError::QuicFrame(_)
-            | RuntimeError::QuicConnect(_)
-            | RuntimeError::QuicConnection(_)
+            | RuntimeError::UdpCarrierTransport(_)
+            | RuntimeError::UdpCarrierFrame(_)
+            | RuntimeError::UdpCarrierConnect(_)
+            | RuntimeError::UdpCarrierConnection(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
@@ -1325,39 +1325,35 @@ impl UdpDatagramClientSession {
                     ttl: Duration::from_millis(u64::from(ttl_ms)),
                 },
             );
-            quic_transport::write_frame(
+            udp_carrier::write_frame(
                 &mut self.stream.send,
                 &frame,
                 self.stream.runtime.codec_limits,
             )
             .await
-            .map_err(|err| UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)))?;
+            .map_err(|err| UdpPathSendError::Runtime(RuntimeError::UdpCarrierFrame(err)))?;
             loop {
-                let received = match tokio::time::timeout(
-                    response_timeout,
-                    quic_transport::read_frame(
-                        &mut self.stream.recv,
-                        self.stream.runtime.codec_limits,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(frame)) => frame,
-                    Ok(Err(err)) => {
-                        return Err(UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)));
-                    }
-                    Err(_) if !retransmitted && self.last_feedback_observation.is_some() => {
-                        observed_response_timeout = true;
-                        retransmitted = true;
-                        break;
-                    }
-                    Err(_) => {
-                        return Err(UdpPathSendError::Timeout {
-                            path_was_acked: self.last_feedback_observation.is_some(),
-                            response_timeout,
-                        });
-                    }
-                };
+                let received =
+                    match tokio::time::timeout(response_timeout, self.stream.frames.recv()).await {
+                        Ok(Some(Ok(frame))) => frame,
+                        Ok(Some(Err(err))) => return Err(UdpPathSendError::Runtime(err)),
+                        Ok(None) => {
+                            return Err(UdpPathSendError::Runtime(
+                                RuntimeError::TcpPathSessionClosed,
+                            ));
+                        }
+                        Err(_) if !retransmitted && self.last_feedback_observation.is_some() => {
+                            observed_response_timeout = true;
+                            retransmitted = true;
+                            break;
+                        }
+                        Err(_) => {
+                            return Err(UdpPathSendError::Timeout {
+                                path_was_acked: self.last_feedback_observation.is_some(),
+                                response_timeout,
+                            });
+                        }
+                    };
                 match received {
                     Frame::DatagramFeedback { flow_id, received } => {
                         self.handle_datagram_feedback(flow_id, &received)
@@ -1373,7 +1369,7 @@ impl UdpDatagramClientSession {
                             .map_err(UdpPathSendError::Runtime)?;
                         self.handle_datagram_feedback(flow_id, &[request_ack])
                             .map_err(UdpPathSendError::Runtime)?;
-                        quic_transport::write_frame(
+                        udp_carrier::write_frame(
                             &mut self.stream.send,
                             &Frame::DatagramFeedback {
                                 flow_id,
@@ -1385,7 +1381,9 @@ impl UdpDatagramClientSession {
                             self.stream.runtime.codec_limits,
                         )
                         .await
-                        .map_err(|err| UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)))?;
+                        .map_err(|err| {
+                            UdpPathSendError::Runtime(RuntimeError::UdpCarrierFrame(err))
+                        })?;
                         self.stats.record_payload_bytes(request_len);
                         self.stats.record_payload_bytes(payload.len());
                         if observed_response_timeout {
@@ -1403,7 +1401,7 @@ impl UdpDatagramClientSession {
                         datagram_id,
                         ..
                     } if response_flow_id == flow_id => {
-                        quic_transport::write_frame(
+                        udp_carrier::write_frame(
                             &mut self.stream.send,
                             &Frame::DatagramFeedback {
                                 flow_id,
@@ -1415,7 +1413,9 @@ impl UdpDatagramClientSession {
                             self.stream.runtime.codec_limits,
                         )
                         .await
-                        .map_err(|err| UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)))?;
+                        .map_err(|err| {
+                            UdpPathSendError::Runtime(RuntimeError::UdpCarrierFrame(err))
+                        })?;
                     }
                     Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                         self.observe_remote_path_metrics(metrics);
@@ -1453,7 +1453,7 @@ impl UdpDatagramClientSession {
             .next_flow_id
             .checked_add(1)
             .ok_or(RuntimeError::Protocol("UDP datagram flow id overflow"))?;
-        quic_transport::write_frame(
+        udp_carrier::write_frame(
             &mut self.stream.send,
             &Frame::OpenDatagramFlow {
                 flow_id,
@@ -1475,7 +1475,7 @@ impl UdpDatagramClientSession {
 
     pub(super) async fn close(&mut self) -> Result<(), RuntimeError> {
         for flow in &self.flows {
-            quic_transport::write_frame(
+            udp_carrier::write_frame(
                 &mut self.stream.send,
                 &Frame::DatagramClose {
                     flow_id: flow.flow_id,
@@ -1485,24 +1485,22 @@ impl UdpDatagramClientSession {
             .await?;
         }
         self.flows.clear();
-        let _ = quic_transport::finish_stream(&mut self.stream.send);
+        let _ = udp_carrier::finish_stream(&mut self.stream.send);
         Ok(())
     }
 
     pub(super) async fn ping(&mut self, probe_timeout: Duration) -> Result<(), RuntimeError> {
         let nonce = random_u64()?;
-        quic_transport::write_frame(
+        udp_carrier::write_frame(
             &mut self.stream.send,
             &Frame::Ping { nonce },
             self.stream.runtime.codec_limits,
         )
         .await?;
-        match tokio::time::timeout(
-            probe_timeout,
-            quic_transport::read_frame(&mut self.stream.recv, self.stream.runtime.codec_limits),
-        )
-        .await
-        .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??
+        match tokio::time::timeout(probe_timeout, self.stream.frames.recv())
+            .await
+            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))?
+            .ok_or(RuntimeError::TcpPathSessionClosed)??
         {
             Frame::Pong {
                 nonce: received_nonce,
@@ -1513,7 +1511,7 @@ impl UdpDatagramClientSession {
     }
 
     pub(super) async fn close_session(&mut self) -> Result<(), RuntimeError> {
-        quic_transport::write_frame(
+        udp_carrier::write_frame(
             &mut self.stream.send,
             &Frame::SessionClose {
                 reason: CloseReason::Normal,
@@ -1521,7 +1519,7 @@ impl UdpDatagramClientSession {
             self.stream.runtime.codec_limits,
         )
         .await?;
-        let _ = quic_transport::finish_stream(&mut self.stream.send);
+        let _ = udp_carrier::finish_stream(&mut self.stream.send);
         Ok(())
     }
 

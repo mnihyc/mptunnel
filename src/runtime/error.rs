@@ -8,9 +8,9 @@ use crate::protocol::auth::AuthError;
 use crate::protocol::{CloseReason, ResetReason};
 use crate::transport::PathSpecParseError;
 use crate::transport::encrypted::EncryptedFramedTransportError;
-use crate::transport::quic::{QuicFrameError, QuicTransportError};
 use crate::transport::tcp::TcpTransportError;
 use crate::transport::udp::UdpTransportError;
+use crate::transport::udp_carrier::{UdpCarrierFrameError, UdpCarrierTransportError};
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -18,10 +18,10 @@ pub enum RuntimeError {
     Tcp(TcpTransportError),
     Udp(UdpTransportError),
     Encrypted(EncryptedFramedTransportError),
-    QuicTransport(QuicTransportError),
-    QuicFrame(QuicFrameError),
-    QuicConnect(quinn::ConnectError),
-    QuicConnection(quinn::ConnectionError),
+    UdpCarrierTransport(UdpCarrierTransportError),
+    UdpCarrierFrame(UdpCarrierFrameError),
+    UdpCarrierConnect(quinn::ConnectError),
+    UdpCarrierConnection(quinn::ConnectionError),
     Auth(AuthError),
     Random(getrandom::Error),
     Socks5(Socks5Error),
@@ -70,27 +70,27 @@ impl From<EncryptedFramedTransportError> for RuntimeError {
     }
 }
 
-impl From<QuicTransportError> for RuntimeError {
-    fn from(value: QuicTransportError) -> Self {
-        Self::QuicTransport(value)
+impl From<UdpCarrierTransportError> for RuntimeError {
+    fn from(value: UdpCarrierTransportError) -> Self {
+        Self::UdpCarrierTransport(value)
     }
 }
 
-impl From<QuicFrameError> for RuntimeError {
-    fn from(value: QuicFrameError) -> Self {
-        Self::QuicFrame(value)
+impl From<UdpCarrierFrameError> for RuntimeError {
+    fn from(value: UdpCarrierFrameError) -> Self {
+        Self::UdpCarrierFrame(value)
     }
 }
 
 impl From<quinn::ConnectError> for RuntimeError {
     fn from(value: quinn::ConnectError) -> Self {
-        Self::QuicConnect(value)
+        Self::UdpCarrierConnect(value)
     }
 }
 
 impl From<quinn::ConnectionError> for RuntimeError {
     fn from(value: quinn::ConnectionError) -> Self {
-        Self::QuicConnection(value)
+        Self::UdpCarrierConnection(value)
     }
 }
 
@@ -149,10 +149,10 @@ impl std::fmt::Display for RuntimeError {
             Self::Tcp(err) => write!(f, "{err}"),
             Self::Udp(err) => write!(f, "{err}"),
             Self::Encrypted(err) => write!(f, "{err}"),
-            Self::QuicTransport(err) => write!(f, "{err}"),
-            Self::QuicFrame(err) => write!(f, "{err}"),
-            Self::QuicConnect(err) => write!(f, "{err}"),
-            Self::QuicConnection(err) => write!(f, "{err}"),
+            Self::UdpCarrierTransport(err) => write!(f, "{err}"),
+            Self::UdpCarrierFrame(err) => write!(f, "{err}"),
+            Self::UdpCarrierConnect(err) => write!(f, "{err}"),
+            Self::UdpCarrierConnection(err) => write!(f, "{err}"),
             Self::Auth(err) => write!(f, "{err}"),
             Self::Random(err) => write!(f, "random source failed: {err}"),
             Self::Socks5(err) => write!(f, "{err}"),
@@ -202,10 +202,10 @@ impl std::error::Error for RuntimeError {
             Self::Tcp(err) => Some(err),
             Self::Udp(err) => Some(err),
             Self::Encrypted(err) => Some(err),
-            Self::QuicTransport(err) => Some(err),
-            Self::QuicFrame(err) => Some(err),
-            Self::QuicConnect(err) => Some(err),
-            Self::QuicConnection(err) => Some(err),
+            Self::UdpCarrierTransport(err) => Some(err),
+            Self::UdpCarrierFrame(err) => Some(err),
+            Self::UdpCarrierConnect(err) => Some(err),
+            Self::UdpCarrierConnection(err) => Some(err),
             Self::Auth(err) => Some(err),
             Self::Random(_) => None,
             Self::Socks5(err) => Some(err),

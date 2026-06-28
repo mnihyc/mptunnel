@@ -25,30 +25,30 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const CONNECT_SERVER_NAME: &str = "localhost";
 
-const CERT_KEY_CONTEXT: &[u8] = b"mptunnel quic ed25519 certificate key v1";
-const CERT_SERIAL_CONTEXT: &[u8] = b"mptunnel quic certificate serial v1";
-const PRIVATE_ALPN_CONTEXT: &[u8] = b"mptunnel quic private alpn v1";
+const CERT_KEY_CONTEXT: &[u8] = b"mptunnel udp carrier ed25519 certificate key v1";
+const CERT_SERIAL_CONTEXT: &[u8] = b"mptunnel udp carrier certificate serial v1";
+const PRIVATE_ALPN_CONTEXT: &[u8] = b"mptunnel udp carrier private alpn v1";
 const PRIVATE_ALPN_SEED_BYTES: usize = 16;
-const QUIC_INITIAL_MTU_BYTES: u16 = 1_200;
-const QUIC_MIN_MTU_BYTES: u16 = 1_200;
-const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
-const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_CARRIER_INITIAL_MTU_BYTES: u16 = 1_200;
+const UDP_CARRIER_MIN_MTU_BYTES: u16 = 1_200;
+const UDP_CARRIER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const UDP_CARRIER_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
-pub struct QuicCredential {
+pub struct UdpCarrierCredential {
     pub cert_der: CertificateDer<'static>,
     pub key_der: PrivateKeyDer<'static>,
     pub fingerprint_sha256: [u8; 32],
 }
 
-impl QuicCredential {
+impl UdpCarrierCredential {
     fn clone_key(&self) -> PrivateKeyDer<'static> {
         self.key_der.clone_key()
     }
 }
 
 #[derive(Debug)]
-pub enum QuicTransportError {
+pub enum UdpCarrierTransportError {
     EmptySecret,
     Certificate(rcgen::Error),
     PrivateKeyRejected,
@@ -57,43 +57,45 @@ pub enum QuicTransportError {
     VarInt(quinn::VarIntBoundsExceeded),
 }
 
-impl fmt::Display for QuicTransportError {
+impl fmt::Display for UdpCarrierTransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptySecret => write!(f, "QUIC shared secret must not be empty"),
-            Self::Certificate(err) => write!(f, "failed to build QUIC certificate: {err}"),
-            Self::PrivateKeyRejected => write!(f, "failed to build QUIC Ed25519 private key"),
-            Self::Tls(err) => write!(f, "failed to build QUIC TLS config: {err}"),
-            Self::InitialCipherSuite(err) => {
-                write!(f, "failed to build QUIC initial cipher suite: {err}")
+            Self::EmptySecret => write!(f, "UDP carrier shared secret must not be empty"),
+            Self::Certificate(err) => write!(f, "failed to build UDP carrier certificate: {err}"),
+            Self::PrivateKeyRejected => {
+                write!(f, "failed to build UDP carrier Ed25519 private key")
             }
-            Self::VarInt(err) => write!(f, "QUIC transport limit is out of range: {err}"),
+            Self::Tls(err) => write!(f, "failed to build UDP carrier TLS config: {err}"),
+            Self::InitialCipherSuite(err) => {
+                write!(f, "failed to build UDP carrier initial cipher suite: {err}")
+            }
+            Self::VarInt(err) => write!(f, "UDP carrier transport limit is out of range: {err}"),
         }
     }
 }
 
-impl Error for QuicTransportError {}
+impl Error for UdpCarrierTransportError {}
 
 #[derive(Debug)]
-pub enum QuicFrameError {
+pub enum UdpCarrierFrameError {
     Read(quinn::ReadExactError),
     Write(quinn::WriteError),
     Finish(quinn::ClosedStream),
     Codec(CodecError),
 }
 
-impl fmt::Display for QuicFrameError {
+impl fmt::Display for UdpCarrierFrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read(err) => write!(f, "failed to read QUIC frame: {err}"),
-            Self::Write(err) => write!(f, "failed to write QUIC frame: {err}"),
-            Self::Finish(err) => write!(f, "failed to finish QUIC stream: {err}"),
-            Self::Codec(err) => write!(f, "failed to encode/decode QUIC frame: {err}"),
+            Self::Read(err) => write!(f, "failed to read UDP carrier frame: {err}"),
+            Self::Write(err) => write!(f, "failed to write UDP carrier frame: {err}"),
+            Self::Finish(err) => write!(f, "failed to finish UDP carrier stream: {err}"),
+            Self::Codec(err) => write!(f, "failed to encode/decode UDP carrier frame: {err}"),
         }
     }
 }
 
-impl Error for QuicFrameError {
+impl Error for UdpCarrierFrameError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Read(err) => Some(err),
@@ -104,49 +106,49 @@ impl Error for QuicFrameError {
     }
 }
 
-impl From<quinn::ReadExactError> for QuicFrameError {
+impl From<quinn::ReadExactError> for UdpCarrierFrameError {
     fn from(value: quinn::ReadExactError) -> Self {
         Self::Read(value)
     }
 }
 
-impl From<quinn::WriteError> for QuicFrameError {
+impl From<quinn::WriteError> for UdpCarrierFrameError {
     fn from(value: quinn::WriteError) -> Self {
         Self::Write(value)
     }
 }
 
-impl From<quinn::ClosedStream> for QuicFrameError {
+impl From<quinn::ClosedStream> for UdpCarrierFrameError {
     fn from(value: quinn::ClosedStream) -> Self {
         Self::Finish(value)
     }
 }
 
-impl From<CodecError> for QuicFrameError {
+impl From<CodecError> for UdpCarrierFrameError {
     fn from(value: CodecError) -> Self {
         Self::Codec(value)
     }
 }
 
-impl From<rcgen::Error> for QuicTransportError {
+impl From<rcgen::Error> for UdpCarrierTransportError {
     fn from(value: rcgen::Error) -> Self {
         Self::Certificate(value)
     }
 }
 
-impl From<rustls::Error> for QuicTransportError {
+impl From<rustls::Error> for UdpCarrierTransportError {
     fn from(value: rustls::Error) -> Self {
         Self::Tls(value)
     }
 }
 
-impl From<quinn::crypto::rustls::NoInitialCipherSuite> for QuicTransportError {
+impl From<quinn::crypto::rustls::NoInitialCipherSuite> for UdpCarrierTransportError {
     fn from(value: quinn::crypto::rustls::NoInitialCipherSuite) -> Self {
         Self::InitialCipherSuite(value)
     }
 }
 
-impl From<quinn::VarIntBoundsExceeded> for QuicTransportError {
+impl From<quinn::VarIntBoundsExceeded> for UdpCarrierTransportError {
     fn from(value: quinn::VarIntBoundsExceeded) -> Self {
         Self::VarInt(value)
     }
@@ -155,7 +157,7 @@ impl From<quinn::VarIntBoundsExceeded> for QuicTransportError {
 pub fn client_config(
     secret: &[u8],
     mux_limits: MuxLimits,
-) -> Result<ClientConfig, QuicTransportError> {
+) -> Result<ClientConfig, UdpCarrierTransportError> {
     let tls = client_tls_config(secret)?;
     let crypto = QuicClientConfig::try_from(tls)?;
     let mut config = ClientConfig::new(Arc::new(crypto));
@@ -163,7 +165,7 @@ pub fn client_config(
     Ok(config)
 }
 
-fn client_tls_config(secret: &[u8]) -> Result<rustls::ClientConfig, QuicTransportError> {
+fn client_tls_config(secret: &[u8]) -> Result<rustls::ClientConfig, UdpCarrierTransportError> {
     let credential = derive_credential(secret)?;
     let verifier = Arc::new(PinnedCertificateVerifier::new(
         credential.fingerprint_sha256,
@@ -185,7 +187,7 @@ fn client_tls_config(secret: &[u8]) -> Result<rustls::ClientConfig, QuicTranspor
 pub fn server_config(
     secret: &[u8],
     mux_limits: MuxLimits,
-) -> Result<ServerConfig, QuicTransportError> {
+) -> Result<ServerConfig, UdpCarrierTransportError> {
     let tls = server_tls_config(secret)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
@@ -193,7 +195,7 @@ pub fn server_config(
     Ok(config)
 }
 
-fn server_tls_config(secret: &[u8]) -> Result<rustls::ServerConfig, QuicTransportError> {
+fn server_tls_config(secret: &[u8]) -> Result<rustls::ServerConfig, UdpCarrierTransportError> {
     let credential = derive_credential(secret)?;
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -206,7 +208,9 @@ fn server_tls_config(secret: &[u8]) -> Result<rustls::ServerConfig, QuicTranspor
     Ok(tls)
 }
 
-pub fn transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicTransportError> {
+pub fn transport_config(
+    mux_limits: MuxLimits,
+) -> Result<TransportConfig, UdpCarrierTransportError> {
     let mut config = TransportConfig::default();
     let stream_window = varint(mux_limits.max_stream_window_bytes)?;
     let connection_window = varint(mux_limits.max_stream_window_bytes.saturating_mul(2))?;
@@ -222,10 +226,10 @@ pub fn transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicTr
         .receive_window(connection_window)
         .send_window(mux_limits.max_stream_window_bytes.saturating_mul(2))
         .send_fairness(true)
-        .initial_mtu(QUIC_INITIAL_MTU_BYTES)
-        .min_mtu(QUIC_MIN_MTU_BYTES)
-        .keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL))
-        .max_idle_timeout(Some(QUIC_MAX_IDLE_TIMEOUT.try_into()?))
+        .initial_mtu(UDP_CARRIER_INITIAL_MTU_BYTES)
+        .min_mtu(UDP_CARRIER_MIN_MTU_BYTES)
+        .keep_alive_interval(Some(UDP_CARRIER_KEEP_ALIVE_INTERVAL))
+        .max_idle_timeout(Some(UDP_CARRIER_MAX_IDLE_TIMEOUT.try_into()?))
         .datagram_receive_buffer_size(Some(datagram_queue))
         .datagram_send_buffer_size(datagram_queue)
         .congestion_controller_factory(Arc::new(congestion::BbrConfig::default()))
@@ -234,11 +238,11 @@ pub fn transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicTr
     Ok(config)
 }
 
-pub fn derive_credential(secret: &[u8]) -> Result<QuicCredential, QuicTransportError> {
+pub fn derive_credential(secret: &[u8]) -> Result<UdpCarrierCredential, UdpCarrierTransportError> {
     let seed = derive_seed(secret, CERT_KEY_CONTEXT)?;
     let pkcs8 = ed25519_pkcs8_from_seed(&seed);
     Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8)
-        .map_err(|_| QuicTransportError::PrivateKeyRejected)?;
+        .map_err(|_| UdpCarrierTransportError::PrivateKeyRejected)?;
 
     let key = PrivatePkcs8KeyDer::from(pkcs8.clone());
     let signing_key = KeyPair::from_pkcs8_der_and_sign_algo(&key, &rcgen::PKCS_ED25519)?;
@@ -250,7 +254,7 @@ pub fn derive_credential(secret: &[u8]) -> Result<QuicCredential, QuicTransportE
     let cert_der = cert.der().clone();
     let fingerprint_sha256 = certificate_fingerprint(&cert_der);
 
-    Ok(QuicCredential {
+    Ok(UdpCarrierCredential {
         cert_der,
         key_der: PrivateKeyDer::from(PrivatePkcs8KeyDer::from(pkcs8)),
         fingerprint_sha256,
@@ -261,7 +265,7 @@ pub fn certificate_fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
     Sha256::digest(cert.as_ref()).into()
 }
 
-pub fn derive_private_alpn(secret: &[u8]) -> Result<Vec<u8>, QuicTransportError> {
+pub fn derive_private_alpn(secret: &[u8]) -> Result<Vec<u8>, UdpCarrierTransportError> {
     let seed = derive_seed(secret, PRIVATE_ALPN_CONTEXT)?;
     Ok(URL_SAFE_NO_PAD
         .encode(&seed[..PRIVATE_ALPN_SEED_BYTES])
@@ -271,7 +275,7 @@ pub fn derive_private_alpn(secret: &[u8]) -> Result<Vec<u8>, QuicTransportError>
 pub async fn read_frame(
     recv: &mut RecvStream,
     limits: CodecLimits,
-) -> Result<Frame, QuicFrameError> {
+) -> Result<Frame, UdpCarrierFrameError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     recv.read_exact(&mut header).await?;
     let payload_len = decode_payload_len_from_header(&header, limits)?;
@@ -286,26 +290,26 @@ pub async fn write_frame(
     send: &mut SendStream,
     frame: &Frame,
     limits: CodecLimits,
-) -> Result<(), QuicFrameError> {
+) -> Result<(), UdpCarrierFrameError> {
     let encoded = encode_frame(frame, limits)?;
     send.write_all(&encoded).await?;
     Ok(())
 }
 
-pub fn finish_stream(send: &mut SendStream) -> Result<(), QuicFrameError> {
+pub fn finish_stream(send: &mut SendStream) -> Result<(), UdpCarrierFrameError> {
     Ok(send.finish()?)
 }
 
-fn derive_seed(secret: &[u8], context: &[u8]) -> Result<[u8; 32], QuicTransportError> {
+fn derive_seed(secret: &[u8], context: &[u8]) -> Result<[u8; 32], UdpCarrierTransportError> {
     if secret.is_empty() {
-        return Err(QuicTransportError::EmptySecret);
+        return Err(UdpCarrierTransportError::EmptySecret);
     }
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts keys of any length");
     mac.update(context);
     Ok(mac.finalize().into_bytes().into())
 }
 
-fn certificate_serial(secret: &[u8]) -> Result<SerialNumber, QuicTransportError> {
+fn certificate_serial(secret: &[u8]) -> Result<SerialNumber, UdpCarrierTransportError> {
     let mut serial = derive_seed(secret, CERT_SERIAL_CONTEXT)?;
     serial[0] &= 0x7f;
     if serial.iter().all(|byte| *byte == 0) {
@@ -324,7 +328,7 @@ fn ed25519_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
     der
 }
 
-fn varint(value: u64) -> Result<VarInt, QuicTransportError> {
+fn varint(value: u64) -> Result<VarInt, UdpCarrierTransportError> {
     Ok(VarInt::from_u64(value)?)
 }
 
@@ -406,7 +410,7 @@ mod tests {
     use super::*;
 
     const SECRET: &[u8] = b"mptunnel integration test secret with enough entropy";
-    const VISIBLE_PRODUCT_TOKENS: &[&[u8]] = &[b"mptunnel", b"mptun", b"quic-v1"];
+    const VISIBLE_PRODUCT_TOKENS: &[&[u8]] = &[b"mptunnel", b"mptun", b"quic", b"udp-carrier"];
 
     #[test]
     fn credentials_are_secret_derived_and_stable() {
@@ -424,7 +428,7 @@ mod tests {
     fn empty_secret_is_rejected() {
         assert!(matches!(
             derive_credential(b""),
-            Err(QuicTransportError::EmptySecret)
+            Err(UdpCarrierTransportError::EmptySecret)
         ));
     }
 

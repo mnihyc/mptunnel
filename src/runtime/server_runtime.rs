@@ -29,7 +29,7 @@ pub(super) async fn run_server(
             }
             UnderlayProtocol::Udp => {
                 let endpoint = bind_server_udp_endpoint(&path, &context).await?;
-                bound.push(BoundServerPath::UdpQuic(endpoint));
+                bound.push(BoundServerPath::Udp(endpoint));
             }
         }
     }
@@ -40,7 +40,7 @@ pub(super) async fn run_server(
                 let context = context.clone();
                 listeners.spawn(async move { run_server_tcp_listener(listener, context).await });
             }
-            BoundServerPath::UdpQuic(endpoint) => {
+            BoundServerPath::Udp(endpoint) => {
                 let context = context.clone();
                 listeners.spawn(async move { run_server_udp_listener(endpoint, context).await });
             }
@@ -58,7 +58,7 @@ pub(super) async fn run_server(
 
 pub(super) enum BoundServerPath {
     Tcp(TcpListener),
-    UdpQuic(quinn::Endpoint),
+    Udp(quinn::Endpoint),
 }
 
 pub(super) async fn run_server_tcp_listener(

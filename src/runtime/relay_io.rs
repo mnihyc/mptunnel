@@ -423,6 +423,7 @@ where
     let mut next_udp_send_at = Instant::now();
     let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
+    let mut udp_proactive_repair_credit = 0usize;
     #[cfg(feature = "lab-diagnostics")]
     let mut udp_diag_next_progress_bytes = 0_u64;
     #[cfg(feature = "lab-diagnostics")]
@@ -776,6 +777,49 @@ where
                     if let Some(congestion) = &mut udp_congestion {
                         congestion.on_send(read);
                     }
+                    if path_stream.underlay == UnderlayProtocol::Udp {
+                        // Spend a small adaptive repair budget to reduce ordered-stream holes before timeout.
+                        udp_proactive_repair_credit = udp_proactive_repair_credit
+                            .saturating_add(read)
+                            .min(udp_stream_proactive_repair_interval_bytes(
+                                send_stream.repair_bytes(),
+                                inflight_limit,
+                                mux_limits,
+                            ));
+                        if udp_stream_should_send_proactive_repair(
+                            udp_proactive_repair_credit,
+                            send_stream.repair_bytes(),
+                            inflight_limit,
+                            mux_limits,
+                        ) {
+                            udp_proactive_repair_credit = 0;
+                            if let Some(frame) = send_stream
+                                .retransmission_frames_limited(udp_stream_frame_payload_bytes(
+                                    mux_limits,
+                                ))
+                                .into_iter()
+                                .next()
+                            {
+                                pace_udp_stream_frame(
+                                    udp_congestion.as_ref(),
+                                    &frame,
+                                    &mut next_udp_send_at,
+                                )
+                                .await;
+                                #[cfg(feature = "lab-diagnostics")]
+                                let proactive_started = Instant::now();
+                                #[cfg(feature = "lab-diagnostics")]
+                                let proactive_bytes = frame_pacing_bytes(&frame);
+                                path_stream.send_frame(frame).await?;
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_perf_record(
+                                    "relay.udp_proactive_repair_send",
+                                    proactive_started.elapsed(),
+                                    proactive_bytes,
+                                );
+                            }
+                        }
+                    }
                     stats.record_payload_bytes(read);
                     #[cfg(feature = "lab-diagnostics")]
                     if let Some(congestion) = &udp_congestion
@@ -827,6 +871,33 @@ pub(super) fn udp_stream_repair_replay_interval(
     tcp_relay_repair_replay_interval(repair_bytes, mux_limits)
         .min(TCP_STREAM_STALL_MIN_TIMEOUT)
         .max(UDP_MIN_RESPONSE_TIMEOUT)
+}
+
+pub(super) fn udp_stream_proactive_repair_interval_bytes(
+    repair_bytes: usize,
+    inflight_limit: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let mss = udp_stream_frame_payload_bytes(mux_limits).max(1);
+    let base_interval = mss.saturating_mul(128).max(1);
+    let pressure_threshold = inflight_limit.saturating_div(2).max(mss.saturating_mul(16));
+    if repair_bytes >= pressure_threshold {
+        mss.saturating_mul(100).max(1)
+    } else {
+        base_interval
+    }
+}
+
+pub(super) fn udp_stream_should_send_proactive_repair(
+    credit_bytes: usize,
+    repair_bytes: usize,
+    inflight_limit: usize,
+    mux_limits: MuxLimits,
+) -> bool {
+    let mss = udp_stream_frame_payload_bytes(mux_limits).max(1);
+    repair_bytes >= mss.saturating_mul(2)
+        && credit_bytes
+            >= udp_stream_proactive_repair_interval_bytes(repair_bytes, inflight_limit, mux_limits)
 }
 
 pub(super) fn tcp_relay_can_read_with_limit(

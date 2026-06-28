@@ -74,6 +74,47 @@ fn udp_stream_ack_gap_repair_budget_is_bounded_to_path_burst() {
 }
 
 #[test]
+fn udp_stream_proactive_repair_spends_small_adaptive_budget() {
+    let mux_limits = MuxLimits {
+        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_tcp_relay_chunk_bytes: 256 * 1024,
+        ..MuxLimits::default()
+    };
+    let mss = udp_stream_frame_payload_bytes(mux_limits);
+    let inflight = mux_limits.max_tcp_path_inflight_bytes;
+    let stable_interval = udp_stream_proactive_repair_interval_bytes(mss * 8, inflight, mux_limits);
+    let pressured_interval =
+        udp_stream_proactive_repair_interval_bytes(inflight, inflight, mux_limits);
+
+    assert_eq!(stable_interval, mss * 128);
+    assert_eq!(pressured_interval, mss * 100);
+    assert!(!udp_stream_should_send_proactive_repair(
+        stable_interval,
+        mss,
+        inflight,
+        mux_limits
+    ));
+    assert!(!udp_stream_should_send_proactive_repair(
+        stable_interval - 1,
+        mss * 8,
+        inflight,
+        mux_limits
+    ));
+    assert!(udp_stream_should_send_proactive_repair(
+        stable_interval,
+        mss * 8,
+        inflight,
+        mux_limits
+    ));
+    assert!(udp_stream_should_send_proactive_repair(
+        pressured_interval,
+        inflight,
+        inflight,
+        mux_limits
+    ));
+}
+
+#[test]
 fn udp_stream_congestion_paces_after_rtt_evidence() {
     let mux_limits = MuxLimits::default();
     let mss = udp_stream_frame_payload_bytes(mux_limits);

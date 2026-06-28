@@ -100,18 +100,22 @@ impl ReliableSendStream {
     }
 
     pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
+        let ranges = normalized_offset_ranges(ranges);
         let mut released_bytes = 0usize;
         let mut released_chunks = 0usize;
-        let acked_offsets = self
-            .repair_cache
-            .iter()
-            .filter_map(|(offset, chunk)| {
-                ranges
-                    .iter()
-                    .any(|range| range_covers_chunk(*range, chunk))
-                    .then_some(*offset)
-            })
-            .collect::<Vec<_>>();
+        let mut acked_offsets = Vec::new();
+        for range in &ranges {
+            for (offset, chunk) in self.repair_cache.range(range.start..) {
+                if *offset >= range.end {
+                    break;
+                }
+                if range_covers_chunk(*range, chunk) {
+                    acked_offsets.push(*offset);
+                }
+            }
+        }
+        acked_offsets.sort_unstable();
+        acked_offsets.dedup();
 
         for offset in acked_offsets {
             if let Some(chunk) = self.repair_cache.remove(&offset) {
@@ -125,18 +129,6 @@ impl ReliableSendStream {
             released_chunks,
             remaining_repair_bytes: self.repair_bytes,
         }
-    }
-
-    pub fn retransmission_frames(&self) -> Vec<Frame> {
-        self.repair_cache
-            .values()
-            .map(|chunk| Frame::StreamData {
-                stream_id: self.stream_id,
-                offset: chunk.offset,
-                flags: chunk.flags,
-                payload: chunk.payload.clone(),
-            })
-            .collect()
     }
 
     pub fn retransmission_frames_limited(&self, byte_limit: usize) -> Vec<Frame> {
@@ -169,18 +161,26 @@ impl ReliableSendStream {
         if byte_limit == 0 {
             return Vec::new();
         }
+        let ranges = normalized_offset_ranges(ranges);
         let Some(largest_acked_end) = ranges.iter().map(|range| range.end).max() else {
             return Vec::new();
         };
 
         let mut frames = Vec::new();
         let mut emitted_bytes = 0usize;
+        let mut range_index = 0usize;
         for chunk in self.repair_cache.values() {
             let end = chunk.offset.saturating_add(chunk.payload.len() as u64);
             if end > largest_acked_end {
                 break;
             }
-            if ranges.iter().any(|range| range_covers_chunk(*range, chunk)) {
+            while range_index < ranges.len() && ranges[range_index].end <= chunk.offset {
+                range_index += 1;
+            }
+            if ranges
+                .get(range_index)
+                .is_some_and(|range| range_covers_chunk(*range, chunk))
+            {
                 continue;
             }
             if emitted_bytes >= byte_limit {
@@ -196,6 +196,24 @@ impl ReliableSendStream {
         }
         frames
     }
+}
+
+fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
+    let mut ranges = ranges.to_vec();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<OffsetRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.start >= range.end {
+            continue;
+        }
+        match merged.last_mut() {
+            Some(previous) if previous.end >= range.start => {
+                previous.end = previous.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 fn range_covers_chunk(range: OffsetRange, chunk: &SentChunk) -> bool {
@@ -520,7 +538,10 @@ mod tests {
             .expect("send");
 
         assert_eq!(stream.repair_bytes(), 5);
-        assert_eq!(stream.retransmission_frames(), vec![frame]);
+        assert_eq!(
+            stream.retransmission_frames_limited(usize::MAX),
+            vec![frame]
+        );
 
         let outcome = stream.apply_ack(&[OffsetRange::new(0, 5).expect("range")]);
         assert_eq!(
@@ -531,7 +552,7 @@ mod tests {
                 remaining_repair_bytes: 0
             }
         );
-        assert!(stream.retransmission_frames().is_empty());
+        assert!(stream.retransmission_frames_limited(usize::MAX).is_empty());
     }
 
     #[test]

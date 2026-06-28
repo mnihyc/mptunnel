@@ -214,6 +214,24 @@ impl TcpRelayRemoteSet {
         context: &ClientPathContext,
         frame: Frame,
     ) -> Result<RelayPathKey, RuntimeError> {
+        self.send_frame_with_avoid(context, frame, &[]).await
+    }
+
+    pub(super) async fn send_repair_frame(
+        &mut self,
+        context: &ClientPathContext,
+        frame: Frame,
+        avoid_keys: &[RelayPathKey],
+    ) -> Result<RelayPathKey, RuntimeError> {
+        self.send_frame_with_avoid(context, frame, avoid_keys).await
+    }
+
+    async fn send_frame_with_avoid(
+        &mut self,
+        context: &ClientPathContext,
+        frame: Frame,
+        avoid_keys: &[RelayPathKey],
+    ) -> Result<RelayPathKey, RuntimeError> {
         let mut last_error = None;
         let stream_lane = self
             .paths
@@ -223,12 +241,13 @@ impl TcpRelayRemoteSet {
         let prefer_current_data_path =
             tcp_relay_frame_prefers_current_data_path(&frame, stream_lane);
         while !self.paths.is_empty() {
-            if let Some(position) = choose_bulk_relay_path(
+            if let Some(position) = choose_bulk_relay_path_avoiding(
                 context,
                 &self.paths,
                 stream_lane,
                 &frame,
                 self.next_send_index,
+                avoid_keys,
             ) {
                 self.next_send_index = position;
             } else if prefer_current_data_path
@@ -242,6 +261,14 @@ impl TcpRelayRemoteSet {
                 self.next_send_index = self.paths.len() - 1;
             }
             self.next_send_index %= self.paths.len();
+            if avoid_keys.contains(&self.paths[self.next_send_index].key())
+                && let Some(position) = self
+                    .paths
+                    .iter()
+                    .position(|path| !avoid_keys.contains(&path.key()))
+            {
+                self.next_send_index = position;
+            }
             let instance = self.paths[self.next_send_index].instance();
             match self.paths[self.next_send_index]
                 .stream
@@ -403,6 +430,7 @@ impl TcpRelayRemoteSet {
         instance: RelayPathInstance,
         send_stream: &ReliableSendStream,
         resend_fin: bool,
+        byte_limit: usize,
     ) -> Result<bool, RuntimeError> {
         let Some(position) = self
             .paths
@@ -411,7 +439,7 @@ impl TcpRelayRemoteSet {
         else {
             return Ok(false);
         };
-        for frame in send_stream.retransmission_frames() {
+        for frame in send_stream.retransmission_frames_limited(byte_limit) {
             self.paths[position].stream.send_frame(frame).await?;
         }
         if resend_fin {

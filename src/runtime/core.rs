@@ -9,6 +9,8 @@ use super::server_runtime::*;
 use super::tcp_path::*;
 use super::tun_l4::*;
 use super::udp_path::*;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
@@ -817,6 +819,7 @@ impl ClientPathContext {
                     index,
                 },
                 eta_ms,
+                bulk_candidate_has_evidence(path, observation),
             ))
         })
         .chain(
@@ -837,15 +840,25 @@ impl ClientPathContext {
                         index,
                     },
                     eta_ms + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
+                    bulk_candidate_has_evidence(path, observation),
                 ))
             }),
         )
         .collect::<Vec<_>>();
+        if candidates.iter().any(|(_, _, has_evidence)| *has_evidence) {
+            candidates.retain(|(_, _, has_evidence)| *has_evidence);
+        }
         candidates.sort_by(|left, right| {
             left.1
                 .total_cmp(&right.1)
                 .then_with(|| relay_path_key_order(left.0, right.0))
         });
+        let candidates = bulk_striping_eta_cohort(
+            candidates
+                .into_iter()
+                .map(|(key, eta, _)| (key, eta))
+                .collect(),
+        );
         candidates.into_iter().map(|(key, _)| key).collect()
     }
 
@@ -1648,6 +1661,34 @@ pub(super) fn ordered_path_scores(
     scores
 }
 
+fn bulk_striping_eta_cohort(candidates: Vec<(RelayPathKey, f64)>) -> Vec<(RelayPathKey, f64)> {
+    let Some(best_eta_ms) = candidates.first().map(|(_, eta_ms)| *eta_ms) else {
+        return candidates;
+    };
+    let eta_slack_ms = bulk_striping_eta_slack_ms(best_eta_ms);
+    let cutoff_eta_ms = best_eta_ms + eta_slack_ms;
+    let mut selected = Vec::new();
+    for (key, eta_ms) in candidates {
+        if selected.is_empty() || eta_ms <= cutoff_eta_ms {
+            selected.push((key, eta_ms));
+        } else {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "bulk_striping_candidate_suppressed",
+                format_args!(
+                    "path_underlay={:?} path_index={} eta_ms={:.3} best_eta_ms={:.3} cutoff_eta_ms={:.3}",
+                    key.underlay, key.index, eta_ms, best_eta_ms, cutoff_eta_ms,
+                ),
+            );
+        }
+    }
+    selected
+}
+
+fn bulk_striping_eta_slack_ms(best_eta_ms: f64) -> f64 {
+    best_eta_ms.max(100.0) * 1.5
+}
+
 pub(super) fn path_snapshot(
     path: &PathSpec,
     index: usize,
@@ -1760,6 +1801,19 @@ pub(super) fn path_can_be_auto_discovered(
         && !path.metadata.capabilities.backup
         && !path.metadata.capabilities.probe_only
         && path.metadata.capabilities.bulk_allowed
+}
+
+fn bulk_candidate_has_evidence(path: &PathSpec, observation: ClientPathObservation) -> bool {
+    observation.delivery_samples > 0
+        || observation.last_success_at.is_some()
+        || observation.last_delivery_at.is_some()
+        || observation.measured_srtt_ms.is_some()
+        || observation.measured_jitter_ms.is_some()
+        || observation.measured_rate_bps.is_some()
+        || observation.measured_loss_rate.is_some()
+        || path.metadata.initial_srtt_ms.is_some()
+        || path.metadata.initial_jitter_ms.is_some()
+        || path.metadata.initial_rate != RateHint::Unknown
 }
 
 pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(

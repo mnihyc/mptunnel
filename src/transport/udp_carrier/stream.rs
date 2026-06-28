@@ -3,6 +3,7 @@ use super::error::UdpCarrierFrameError;
 use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::Frame;
 use crate::protocol::codec::{CodecLimits, decode_frame, encode_frame};
+use bytes::Bytes;
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -14,7 +15,7 @@ pub(super) enum StreamCommand {
         reliable: bool,
         stream_id: u64,
         frame_id: u64,
-        encoded: Vec<u8>,
+        encoded: Bytes,
     },
     Finish,
 }
@@ -29,7 +30,7 @@ pub struct SendStream {
 
 #[derive(Debug)]
 pub struct RecvStream {
-    pub(super) frames: mpsc::Receiver<Vec<u8>>,
+    pub(super) frames: mpsc::Receiver<Bytes>,
 }
 
 impl SendStream {
@@ -44,7 +45,7 @@ impl SendStream {
 
     async fn send_encoded(
         &mut self,
-        encoded: Vec<u8>,
+        encoded: Bytes,
         ordered: bool,
         reliable: bool,
     ) -> Result<(), UdpCarrierFrameError> {
@@ -75,7 +76,7 @@ impl SendStream {
 }
 
 impl RecvStream {
-    pub(super) fn new(frames: mpsc::Receiver<Vec<u8>>) -> Self {
+    pub(super) fn new(frames: mpsc::Receiver<Bytes>) -> Self {
         Self { frames }
     }
 }
@@ -126,7 +127,7 @@ pub async fn write_frame(
     let total_started = Instant::now();
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = Instant::now();
-    let encoded = encode_frame(frame, limits)?;
+    let encoded = Bytes::from(encode_frame(frame, limits)?);
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.udp_carrier.encode_frame",

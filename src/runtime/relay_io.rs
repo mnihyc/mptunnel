@@ -1,16 +1,17 @@
 use super::*;
 
-pub(super) async fn replay_tcp_repair_cache(
+pub(super) async fn replay_tcp_repair_flight(
     path_stream: &TcpPathStream,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
+    byte_limit: usize,
 ) -> Result<(), RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let retransmit_started = Instant::now();
-    let frames = send_stream.retransmission_frames();
+    let frames = send_stream.retransmission_frames_limited(byte_limit);
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
-        "mux.retransmit_all",
+        "mux.repair_flight",
         retransmit_started.elapsed(),
         frames.iter().map(frame_pacing_bytes).sum(),
     );
@@ -517,6 +518,14 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         path_stream.release_acked_ranges(&ranges);
+                        let repair_limit =
+                            adaptive_tcp_relay_inflight_bytes(None, relay_lane, mux_limits);
+                        let repair_frames =
+                            send_stream.retransmission_frames_for_ack_gaps(&ranges, repair_limit);
+                        for frame in repair_frames {
+                            path_stream.send_frame(frame).await?;
+                            last_repair_replay_at = Instant::now();
+                        }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
                         if send_stream.repair_bytes() < previous_repair_bytes {
@@ -542,7 +551,10 @@ where
                         status: crate::protocol::PathStatus::Active,
                         ..
                     } => {
-                        replay_tcp_repair_cache(&path_stream, &send_stream, false).await?;
+                        let repair_limit =
+                            adaptive_tcp_relay_inflight_bytes(None, relay_lane, mux_limits);
+                        replay_tcp_repair_flight(&path_stream, &send_stream, false, repair_limit)
+                            .await?;
                         last_repair_replay_at = Instant::now();
                     }
                     Frame::StreamFin {
@@ -570,7 +582,8 @@ where
                 }
             }
             _ = tokio::time::sleep_until(repair_replay_deadline), if send_stream.repair_bytes() > 0 => {
-                replay_tcp_repair_cache(&path_stream, &send_stream, false).await?;
+                let repair_limit = adaptive_tcp_relay_inflight_bytes(None, relay_lane, mux_limits);
+                replay_tcp_repair_flight(&path_stream, &send_stream, false, repair_limit).await?;
                 last_repair_replay_at = Instant::now();
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
@@ -700,11 +713,13 @@ mod tests {
 
     #[test]
     fn tcp_relay_read_budget_respects_stream_flow_control_credit() {
-        let mut limits = MuxLimits::default();
-        limits.max_stream_window_bytes = 4;
-        limits.max_repair_bytes = 16;
-        limits.max_tcp_path_inflight_bytes = 16;
-        limits.max_tcp_relay_chunk_bytes = 16;
+        let limits = MuxLimits {
+            max_stream_window_bytes: 4,
+            max_repair_bytes: 16,
+            max_tcp_path_inflight_bytes: 16,
+            max_tcp_relay_chunk_bytes: 16,
+            ..MuxLimits::default()
+        };
         let mut send_stream = ReliableSendStream::new(StreamId(7), limits);
         send_stream
             .send_data(Bytes::from_static(b"data"), StreamFlags::NONE)

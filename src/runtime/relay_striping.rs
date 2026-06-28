@@ -28,21 +28,21 @@ impl RelayPathFlightLedger {
         if ranges.is_empty() || self.flights.is_empty() {
             return Vec::new();
         }
+        let ranges = normalized_offset_ranges(ranges);
         let mut released = Vec::new();
-        let acked_offsets = self
-            .flights
-            .iter()
-            .filter_map(|(offset, flights)| {
-                flights
-                    .iter()
-                    .any(|flight| {
-                        ranges
-                            .iter()
-                            .any(|range| range.start <= *offset && range.end >= flight.end)
-                    })
-                    .then_some(*offset)
-            })
-            .collect::<Vec<_>>();
+        let mut acked_offsets = Vec::new();
+        for range in &ranges {
+            for (offset, flights) in self.flights.range(range.start..) {
+                if *offset >= range.end {
+                    break;
+                }
+                if flights.iter().any(|flight| range.end >= flight.end) {
+                    acked_offsets.push(*offset);
+                }
+            }
+        }
+        acked_offsets.sort_unstable();
+        acked_offsets.dedup();
         for offset in acked_offsets {
             if let Some(flights) = self.flights.remove(&offset) {
                 for flight in flights {
@@ -68,6 +68,39 @@ impl RelayPathFlightLedger {
         }
         released
     }
+
+    pub(super) fn sent_keys_for_frame(&self, frame: &Frame) -> Vec<RelayPathKey> {
+        let Some((offset, end, _)) = reliable_stream_frame_extent(frame) else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        if let Some(flights) = self.flights.get(&offset) {
+            for flight in flights {
+                if flight.end >= end && !keys.contains(&flight.key) {
+                    keys.push(flight.key);
+                }
+            }
+        }
+        keys
+    }
+}
+
+fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
+    let mut ranges = ranges.to_vec();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<OffsetRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.start >= range.end {
+            continue;
+        }
+        match merged.last_mut() {
+            Some(previous) if previous.end >= range.start => {
+                previous.end = previous.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,12 +137,13 @@ pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> 
     relay_lane_is_bulk(lane) && matches!(frame, Frame::StreamData { .. })
 }
 
-pub(super) fn choose_bulk_relay_path(
+pub(super) fn choose_bulk_relay_path_avoiding(
     context: &ClientPathContext,
     paths: &[TcpRelayRemotePath],
     lane: FlowLane,
     frame: &Frame,
     cursor: usize,
+    avoid_keys: &[RelayPathKey],
 ) -> Option<usize> {
     if paths.len() <= 1 || !relay_frame_is_bulk_stream_data(frame, lane) {
         return None;
@@ -118,6 +152,11 @@ pub(super) fn choose_bulk_relay_path(
     let policy = SchedulerPolicy::default();
     let mut best: Option<(usize, f64, usize)> = None;
     for (position, path) in paths.iter().enumerate() {
+        if avoid_keys.contains(&path.key())
+            && paths.iter().any(|path| !avoid_keys.contains(&path.key()))
+        {
+            continue;
+        }
         let snapshot = relay_path_snapshot(context, path.key())?;
         let score = scheduler::score_path(snapshot, lane, payload_bytes, policy)?;
         let cursor_distance = path_cursor_distance(position, cursor, paths.len());

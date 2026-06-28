@@ -883,7 +883,7 @@ fn endpoint_only_tcp_bulk_striping_uses_all_healthy_paths_without_hints() {
 }
 
 #[test]
-fn endpoint_only_tcp_bulk_striping_survives_bulk_promotion_without_hints() {
+fn endpoint_only_tcp_bulk_striping_waits_for_probe_evidence_after_bulk_promotion() {
     let low_latency_path = "tcp://127.0.0.1:10162"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -910,7 +910,7 @@ fn endpoint_only_tcp_bulk_striping_survives_bulk_promotion_without_hints() {
 
     assert_eq!(
         tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes),
-        vec![0, 1, 2]
+        vec![0]
     );
 }
 
@@ -949,7 +949,7 @@ fn bulk_promotion_changes_active_path_lane_load_without_leaking_flow_accounting(
 }
 
 #[test]
-fn endpoint_only_tcp_bulk_striping_ignores_unrelated_latency_demand() {
+fn endpoint_only_tcp_bulk_striping_keeps_unknown_paths_out_of_measured_bulk_cohort() {
     let low_latency_path = "tcp://127.0.0.1:10146"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -966,7 +966,7 @@ fn endpoint_only_tcp_bulk_striping_ignores_unrelated_latency_demand() {
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     assert_eq!(
         tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes),
-        vec![0, 1]
+        vec![0]
     );
 }
 
@@ -1094,7 +1094,7 @@ fn mixed_endpoint_only_bulk_striping_keeps_udp_eligible_under_tcp_pressure() {
 }
 
 #[test]
-fn mixed_endpoint_only_bulk_striping_keeps_tcp_and_udp_under_udp_pressure() {
+fn mixed_endpoint_only_bulk_striping_keeps_measured_udp_without_unmeasured_tcp() {
     let tcp_path = "tcp://127.0.0.1:10136"
         .parse::<PathSpec>()
         .expect("tcp path");
@@ -1114,9 +1114,11 @@ fn mixed_endpoint_only_bulk_striping_keeps_tcp_and_udp_under_udp_pressure() {
         reliable_bulk_striping_path_keys(
             &context,
             MuxLimits::default().max_tcp_path_inflight_bytes
-        )
-        .len(),
-        2
+        ),
+        vec![RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        }]
     );
 }
 
@@ -1253,7 +1255,7 @@ fn mixed_bulk_striping_orders_better_udp_before_tcp() {
 }
 
 #[test]
-fn mixed_bulk_striping_keeps_worse_udp_later_in_candidate_set() {
+fn mixed_bulk_striping_suppresses_catastrophically_worse_udp_candidate() {
     let tcp_path = "tcp://127.0.0.1:10140?srtt-ms=20&rate-mbps=300"
         .parse::<PathSpec>()
         .expect("tcp path");
@@ -1272,16 +1274,10 @@ fn mixed_bulk_striping_keeps_worse_udp_later_in_candidate_set() {
             &context,
             MuxLimits::default().max_tcp_path_inflight_bytes
         ),
-        vec![
-            RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: 0,
-            },
-            RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index: 0,
-            },
-        ]
+        vec![RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        }]
     );
 }
 
@@ -1687,7 +1683,7 @@ async fn mixed_relay_path_status_active_replays_repair_cache_on_instance() {
 
     assert!(
         remotes
-            .replay_repair_cache_to_instance(instance, &send_stream, false)
+            .replay_repair_cache_to_instance(instance, &send_stream, false, usize::MAX)
             .await
             .expect("replay")
     );

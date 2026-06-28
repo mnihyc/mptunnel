@@ -1,6 +1,7 @@
 use super::crypto::{DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, PacketCipher};
 use super::error::UdpCarrierFrameError;
 use crate::transport::aead::AEAD_TAG_LEN;
+use bytes::Bytes;
 
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 18;
@@ -13,7 +14,8 @@ const ACK_PREFIX_LEN: usize = 3;
 const ACK_RANGE_LEN: usize = 16;
 const FRAME_FRAGMENT_PREFIX_LEN: usize = 25;
 const CLOSE_STREAM_LEN: usize = 9;
-const TARGET_DATAGRAM_BYTES: usize = 1_200;
+pub(super) const SAFE_TARGET_DATAGRAM_BYTES: usize = 1_200;
+pub(super) const MAX_PROBED_DATAGRAM_BYTES: usize = 1_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PacketHeader {
@@ -34,7 +36,7 @@ pub(super) enum PacketPayload {
         frame_id: u64,
         offset: u32,
         total_len: u32,
-        payload: Vec<u8>,
+        payload: Bytes,
     },
     CloseStream {
         stream_id: u64,
@@ -48,7 +50,11 @@ pub(super) struct PacketAckRange {
 }
 
 pub(super) fn max_frame_fragment_payload() -> usize {
-    TARGET_DATAGRAM_BYTES
+    max_frame_fragment_payload_for_datagram(SAFE_TARGET_DATAGRAM_BYTES)
+}
+
+pub(super) fn max_frame_fragment_payload_for_datagram(datagram_bytes: usize) -> usize {
+    datagram_bytes
         .saturating_sub(HEADER_LEN)
         .saturating_sub(AEAD_TAG_LEN)
         .saturating_sub(FRAME_FRAGMENT_PREFIX_LEN)
@@ -248,7 +254,7 @@ fn decode_payload(payload: &[u8]) -> Result<PacketPayload, UdpCarrierFrameError>
                 frame_id: u64::from_be_bytes(payload[9..17].try_into().expect("slice length")),
                 offset: u32::from_be_bytes(payload[17..21].try_into().expect("slice length")),
                 total_len: u32::from_be_bytes(payload[21..25].try_into().expect("slice length")),
-                payload: payload[25..].to_vec(),
+                payload: Bytes::copy_from_slice(&payload[25..]),
             })
         }
         KIND_CLOSE_STREAM => {
@@ -290,7 +296,7 @@ mod tests {
                 frame_id: 2,
                 offset: 0,
                 total_len: 5,
-                payload: b"hello".to_vec(),
+                payload: Bytes::from_static(b"hello"),
             },
         )
         .expect("encode");
@@ -310,7 +316,7 @@ mod tests {
                 frame_id: 2,
                 offset: 0,
                 total_len: 5,
-                payload: b"hello".to_vec(),
+                payload: Bytes::from_static(b"hello"),
             }
         );
     }

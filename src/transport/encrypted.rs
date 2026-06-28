@@ -363,9 +363,11 @@ where
     let written_bytes = HEADER_LEN + payload.len() + tag.len();
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
-    stream.write_all(&header).await?;
-    stream.write_all(&payload).await?;
-    stream.write_all(&tag).await?;
+    let mut encrypted_frame = Vec::with_capacity(HEADER_LEN + payload.len() + tag.len());
+    encrypted_frame.extend_from_slice(&header);
+    encrypted_frame.extend_from_slice(&payload);
+    encrypted_frame.extend_from_slice(&tag);
+    stream.write_all(&encrypted_frame).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.tcp.write_socket_wait",

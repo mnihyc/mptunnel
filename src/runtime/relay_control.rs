@@ -27,13 +27,22 @@ impl TcpRelayFlowSignals {
 pub(super) struct TcpRelayFlowDemandTracker {
     current: FlowLane,
     rebalance_attempted: bool,
+    started_at: Instant,
+    last_refresh_at: Instant,
+    last_observed_bytes: u64,
+    send_rate_bps: f64,
 }
 
 impl TcpRelayFlowDemandTracker {
     pub(super) fn new() -> Self {
+        let now = Instant::now();
         Self {
             current: FlowLane::Latency,
             rebalance_attempted: false,
+            started_at: now,
+            last_refresh_at: now,
+            last_observed_bytes: 0,
+            send_rate_bps: 0.0,
         }
     }
 
@@ -43,12 +52,48 @@ impl TcpRelayFlowDemandTracker {
         path: Option<PathSnapshot>,
         mux_limits: MuxLimits,
     ) -> TcpRelayFlowDecision {
+        let now = Instant::now();
+        let observed_bytes = signals.observed_bytes();
+        let delta_bytes = observed_bytes.saturating_sub(self.last_observed_bytes);
+        let elapsed = now.duration_since(self.last_refresh_at);
+        if delta_bytes > 0 || elapsed >= Duration::from_millis(1) {
+            let sample_rate = delta_bytes as f64 * 8.0 / elapsed.as_secs_f64().max(0.001);
+            self.send_rate_bps = if self.send_rate_bps <= 0.0 {
+                sample_rate
+            } else {
+                self.send_rate_bps * 0.75 + sample_rate * 0.25
+            };
+        }
+        self.last_refresh_at = now;
+        self.last_observed_bytes = observed_bytes;
         let previous = self.current;
-        let demand = FlowDemand::reliable_stream(
-            signals.observed_bytes(),
-            signals.repair_bytes as u64,
-            tcp_auto_bulk_threshold_bytes(path, mux_limits),
-        );
+        let threshold = tcp_auto_bulk_threshold_bytes(path, mux_limits);
+        let demand =
+            FlowDemand::reliable_stream(observed_bytes, signals.repair_bytes as u64, threshold);
+        let mut demand = demand;
+        let flow_age = now.duration_since(self.started_at);
+        let idle_gap = delta_bytes == 0 && elapsed >= tcp_auto_interactive_idle_gap(path);
+        let rate_threshold = tcp_auto_bulk_rate_threshold_bps(path, mux_limits);
+        let sustained_bulk = observed_bytes >= threshold
+            && (self.send_rate_bps >= rate_threshold
+                || flow_age >= tcp_auto_interactive_idle_gap(path) * 2);
+        if self.current == FlowLane::Throughput && !idle_gap {
+            demand.lane = FlowLane::Throughput;
+            demand.throughput_weight_ppm = demand
+                .throughput_weight_ppm
+                .max(FlowDemand::PPM_MAX / 2 + 1);
+            demand.latency_weight_ppm =
+                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
+        } else if !sustained_bulk {
+            demand.lane = FlowLane::Latency;
+            demand.throughput_weight_ppm =
+                demand.throughput_weight_ppm.min(FlowDemand::PPM_MAX / 2);
+            demand.latency_weight_ppm =
+                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
+            if idle_gap {
+                self.rebalance_attempted = false;
+            }
+        }
         self.current = demand.lane;
         TcpRelayFlowDecision {
             demand,
@@ -65,6 +110,18 @@ impl TcpRelayFlowDemandTracker {
     pub(super) fn mark_rebalance_attempted(&mut self) {
         self.rebalance_attempted = true;
     }
+}
+
+fn tcp_auto_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxLimits) -> f64 {
+    path.map_or_else(
+        || tcp_relay_buffer_len(mux_limits) as f64 * 8.0 * 4.0,
+        |path| path.delivery_rate_bps.max(1.0) * 0.125,
+    )
+}
+
+fn tcp_auto_interactive_idle_gap(path: Option<PathSnapshot>) -> Duration {
+    let srtt_ms = path.map_or(100.0, |path| path.srtt_ms.max(1.0));
+    Duration::from_secs_f64((srtt_ms / 1000.0 * 4.0).clamp(0.05, 2.0))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -785,6 +842,63 @@ where
                                 ),
                             );
                         }
+                        let repair_limit =
+                            adaptive_tcp_relay_inflight_bytes(None, relay_lane, context.mux_limits);
+                        let repair_frames =
+                            send_stream.retransmission_frames_for_ack_gaps(&ranges, repair_limit);
+                        let mut repair_error = None;
+                        for frame in repair_frames {
+                            let sent_frame = frame.clone();
+                            let avoid_keys = path_flights.sent_keys_for_frame(&sent_frame);
+                            match remotes
+                                .send_repair_frame(context, frame, &avoid_keys)
+                                .await
+                            {
+                                Ok(path_key) => {
+                                    path_flights.record_frame(path_key, &sent_frame);
+                                    #[cfg(feature = "lab-diagnostics")]
+                                    lab_diagnostic(
+                                        "repair",
+                                        format_args!(
+                                            "stream_id={} path_underlay={:?} path_index={} cause=ack_gap",
+                                            stream_id.0,
+                                            path_key.underlay,
+                                            path_key.index,
+                                        ),
+                                    );
+                                }
+                                Err(err) if tcp_relay_error_is_migratable(&err) => {
+                                    match attach_tcp_relay_paths(
+                                        context,
+                                        &spec,
+                                        relay_lane,
+                                        &mut remotes,
+                                        &send_stream,
+                                        !local_open,
+                                        TcpRelayAttachMode::Any,
+                                    )
+                                    .await
+                                    {
+                                        Ok(attached) if attached > 0 => {}
+                                        Ok(_) => {
+                                            repair_error = Some(err);
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            repair_error = Some(err);
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    repair_error = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(err) = repair_error {
+                            break Err(err);
+                        }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
                         last_stream_progress_at = Instant::now();
@@ -866,6 +980,16 @@ where
                                 instance,
                                 &send_stream,
                                 pending_local_fin,
+                                tcp_relay_attach_payload_bytes(
+                                    &send_stream,
+                                    relay_lane,
+                                    context.mux_limits,
+                                )
+                                .max(adaptive_tcp_relay_inflight_bytes(
+                                    None,
+                                    relay_lane,
+                                    context.mux_limits,
+                                )),
                             )
                             .await
                         {
@@ -998,8 +1122,23 @@ pub(super) async fn attach_relay_path_candidates(
         {
             Ok(opened) => {
                 let replay_result = if request.replay_repair_cache {
-                    replay_tcp_repair_cache(&opened.stream, request.send_stream, request.resend_fin)
-                        .await
+                    let repair_limit = tcp_relay_attach_payload_bytes(
+                        request.send_stream,
+                        request.lane,
+                        context.mux_limits,
+                    )
+                    .max(adaptive_tcp_relay_inflight_bytes(
+                        None,
+                        request.lane,
+                        context.mux_limits,
+                    ));
+                    replay_tcp_repair_flight(
+                        &opened.stream,
+                        request.send_stream,
+                        request.resend_fin,
+                        repair_limit,
+                    )
+                    .await
                 } else {
                     Ok(())
                 };
@@ -1254,7 +1393,18 @@ pub(super) async fn attach_udp_relay_paths(
         .await
         {
             Ok(opened) => {
-                match replay_tcp_repair_cache(&opened.stream, send_stream, resend_fin).await {
+                let repair_limit =
+                    tcp_relay_attach_payload_bytes(send_stream, lane, context.mux_limits).max(
+                        adaptive_tcp_relay_inflight_bytes(None, lane, context.mux_limits),
+                    );
+                match replay_tcp_repair_flight(
+                    &opened.stream,
+                    send_stream,
+                    resend_fin,
+                    repair_limit,
+                )
+                .await
+                {
                     Ok(()) => {
                         if race_repair {
                             remotes.attach_for_repair(opened);

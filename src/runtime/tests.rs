@@ -37,12 +37,12 @@ fn tcp_auto_bulk_discovery_indices(
 
 fn udp_stream_path_indices(
     context: &ClientPathContext,
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
     let observations =
         health_observations(&mut context.health.lock().expect("client path health lock").udp);
-    ordered_reliable_path_indices(&context.udp_paths, &observations, class, payload_bytes)
+    ordered_reliable_path_indices(&context.udp_paths, &observations, lane, payload_bytes)
 }
 
 fn server_context(outbound: OutboundConfig) -> ServerPathContext {
@@ -642,7 +642,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
 }
 
 #[test]
-fn auto_tcp_class_promotes_after_runtime_bdp_threshold() {
+fn auto_tcp_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     let mux_limits = MuxLimits::default();
     let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
     let threshold = tcp_auto_bulk_threshold_bytes(Some(path), mux_limits);
@@ -650,35 +650,40 @@ fn auto_tcp_class_promotes_after_runtime_bdp_threshold() {
     let high_bdp_threshold = tcp_auto_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
     let high_bdp =
         ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0)).ceil() as u64;
-    let mut state = TcpRelayFlowClassifier::new();
+    let mut state = TcpRelayFlowDemandTracker::new();
 
     assert!(threshold >= (tcp_relay_buffer_len(mux_limits) as u64).saturating_mul(2));
     assert!(high_bdp_threshold < high_bdp / 4);
     assert!(high_bdp_threshold >= high_bdp / 8);
 
     let before = state.refresh(
-        TcpRelayFlowSignals::new(threshold.saturating_sub(1), 0, 0),
+        TcpRelayFlowSignals::new(threshold / 2, 0, 0),
         Some(path),
         mux_limits,
     );
-    assert_eq!(before.class, TrafficClass::Interactive);
-    assert!(!before.promoted_to_bulk);
+    assert_eq!(before.demand.lane, FlowLane::Latency);
+    assert!(!before.promoted_to_throughput);
+    assert!(before.demand.latency_weight_ppm > 0);
+    assert!(before.demand.throughput_weight_ppm < FlowDemand::PPM_MAX);
 
     let after = state.refresh(
         TcpRelayFlowSignals::new(threshold, 0, 0),
         Some(path),
         mux_limits,
     );
-    assert_eq!(after.class, TrafficClass::Bulk);
-    assert!(after.promoted_to_bulk);
+    assert_eq!(after.demand.lane, FlowLane::Throughput);
+    assert!(after.promoted_to_throughput);
+    assert_eq!(after.demand.latency_weight_ppm, 0);
+    assert_eq!(after.demand.throughput_weight_ppm, FlowDemand::PPM_MAX);
 
     let steady = state.refresh(
         TcpRelayFlowSignals::new(threshold.saturating_mul(2), 0, 0),
         Some(path),
         mux_limits,
     );
-    assert_eq!(steady.class, TrafficClass::Bulk);
-    assert!(!steady.promoted_to_bulk);
+    assert_eq!(steady.demand.lane, FlowLane::Throughput);
+    assert!(!steady.promoted_to_throughput);
+    assert_eq!(steady.demand.throughput_weight_ppm, FlowDemand::PPM_MAX);
 }
 
 #[test]
@@ -694,19 +699,19 @@ fn adaptive_tcp_budgets_expand_for_bulk_and_shrink_under_instability() {
     unstable.queue_bytes = 8 * 1024 * 1024;
 
     let interactive_chunk =
-        adaptive_tcp_relay_chunk_bytes(Some(stable), TrafficClass::Interactive, mux_limits);
-    let bulk_chunk = adaptive_tcp_relay_chunk_bytes(Some(stable), TrafficClass::Bulk, mux_limits);
+        adaptive_tcp_relay_chunk_bytes(Some(stable), FlowLane::Latency, mux_limits);
+    let bulk_chunk = adaptive_tcp_relay_chunk_bytes(Some(stable), FlowLane::Throughput, mux_limits);
     let unstable_bulk_chunk =
-        adaptive_tcp_relay_chunk_bytes(Some(unstable), TrafficClass::Bulk, mux_limits);
+        adaptive_tcp_relay_chunk_bytes(Some(unstable), FlowLane::Throughput, mux_limits);
     assert!(bulk_chunk > interactive_chunk);
     assert!(unstable_bulk_chunk < bulk_chunk);
 
     let interactive_inflight =
-        adaptive_tcp_relay_inflight_bytes(Some(stable), TrafficClass::Interactive, mux_limits);
+        adaptive_tcp_relay_inflight_bytes(Some(stable), FlowLane::Latency, mux_limits);
     let bulk_inflight =
-        adaptive_tcp_relay_inflight_bytes(Some(stable), TrafficClass::Bulk, mux_limits);
+        adaptive_tcp_relay_inflight_bytes(Some(stable), FlowLane::Throughput, mux_limits);
     let unstable_bulk_inflight =
-        adaptive_tcp_relay_inflight_bytes(Some(unstable), TrafficClass::Bulk, mux_limits);
+        adaptive_tcp_relay_inflight_bytes(Some(unstable), FlowLane::Throughput, mux_limits);
     assert!(bulk_inflight >= interactive_inflight);
     assert!(
         interactive_inflight <= tcp_relay_buffer_len(mux_limits),
@@ -727,11 +732,11 @@ fn tcp_relay_stall_timeout_is_adaptive_and_bounded_for_fluent_failover() {
     cross_continent.jitter_ms = 400.0;
 
     assert_eq!(
-        tcp_relay_stall_timeout(Some(low_latency), TrafficClass::Interactive),
+        tcp_relay_stall_timeout(Some(low_latency), FlowLane::Latency),
         TCP_STREAM_STALL_MIN_TIMEOUT
     );
     assert!(
-        tcp_relay_stall_timeout(Some(cross_continent), TrafficClass::Bulk)
+        tcp_relay_stall_timeout(Some(cross_continent), FlowLane::Throughput)
             <= TCP_STREAM_STALL_MAX_TIMEOUT
     );
     assert!(TCP_STREAM_STALL_MAX_TIMEOUT < Duration::from_secs(5));
@@ -752,10 +757,9 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
     assert!(tcp_relay_recv_progress_resend_active(&recv_stream, true));
     assert!(!tcp_relay_recv_progress_resend_active(&recv_stream, false));
 
-    let low_interval =
-        reliable_stream_recv_progress_interval(Some(low_latency), TrafficClass::Interactive);
+    let low_interval = reliable_stream_recv_progress_interval(Some(low_latency), FlowLane::Latency);
     let high_interval =
-        reliable_stream_recv_progress_interval(Some(cross_continent), TrafficClass::Bulk);
+        reliable_stream_recv_progress_interval(Some(cross_continent), FlowLane::Throughput);
     assert!(low_interval >= UDP_MIN_RESPONSE_TIMEOUT);
     assert!(low_interval <= TCP_STREAM_STALL_MIN_TIMEOUT);
     assert!(high_interval >= low_interval);
@@ -829,7 +833,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         false,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         false,
         mux_limits
     ));
@@ -837,7 +841,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         false,
         mux_limits
     ));
@@ -849,7 +853,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         false,
         mux_limits
     ));
@@ -858,7 +862,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         false,
         mux_limits
     ));
@@ -866,7 +870,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         true,
         mux_limits
     ));
@@ -878,7 +882,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         false,
         mux_limits
     ));
@@ -886,7 +890,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         false,
         mux_limits
     ));
@@ -894,7 +898,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         false,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         true,
         mux_limits
     ));
@@ -928,7 +932,7 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         &send_stream,
         &recv_stream,
         true,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         false,
         mux_limits
     ));
@@ -948,7 +952,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             last_delivery,
             &recv_stream,
             true,
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             mux_limits,
         ),
         control_progress
@@ -970,7 +974,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             last_delivery,
             &recv_stream,
             true,
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             mux_limits,
         ),
         last_delivery
@@ -984,7 +988,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             repair_progress,
             &recv_stream,
             true,
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             mux_limits,
         ),
         repair_progress
@@ -1048,7 +1052,7 @@ fn tcp_receive_hole_victim_prefers_worst_score_then_stale_delivery() {
         tcp_relay_receive_hole_victim(
             &context,
             &[key(0), key(1), key(2)],
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             64 * 1024,
             &path_last_delivery_at
         ),
@@ -1062,7 +1066,7 @@ fn tcp_receive_hole_victim_prefers_worst_score_then_stale_delivery() {
         tcp_relay_receive_hole_victim(
             &context,
             &[key(0), key(1)],
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             64 * 1024,
             &path_last_delivery_at
         ),
@@ -1072,7 +1076,7 @@ fn tcp_receive_hole_victim_prefers_worst_score_then_stale_delivery() {
         tcp_relay_receive_hole_victim(
             &context,
             &[key(3)],
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             64 * 1024,
             &path_last_delivery_at
         ),
@@ -1086,32 +1090,28 @@ fn tcp_relay_attach_scoring_keeps_interactive_repairs_small() {
     let send_stream = ReliableSendStream::new(StreamId(12), mux_limits);
 
     assert_eq!(
-        tcp_relay_attach_payload_bytes(&send_stream, TrafficClass::Interactive, mux_limits),
+        tcp_relay_attach_payload_bytes(&send_stream, FlowLane::Latency, mux_limits),
         PATH_OPEN_SCORE_BYTES
     );
     assert_eq!(
-        tcp_relay_attach_payload_bytes(&send_stream, TrafficClass::Bulk, mux_limits),
+        tcp_relay_attach_payload_bytes(&send_stream, FlowLane::Throughput, mux_limits),
         tcp_relay_buffer_len(mux_limits)
     );
 }
 
 #[test]
-fn tcp_path_sessions_are_dedicated_for_latency_sensitive_classes() {
-    assert!(tcp_path_class_uses_dedicated_session(
-        TrafficClass::Interactive
+fn tcp_path_sessions_are_dedicated_for_latency_sensitive_lanes() {
+    assert!(tcp_path_lane_uses_dedicated_session(FlowLane::Latency));
+    assert!(tcp_path_lane_uses_dedicated_session(FlowLane::Control));
+    assert!(tcp_path_lane_uses_dedicated_session(
+        FlowLane::RealtimeDatagram
     ));
-    assert!(tcp_path_class_uses_dedicated_session(TrafficClass::Control));
-    assert!(tcp_path_class_uses_dedicated_session(
-        TrafficClass::RealtimeDatagram
-    ));
-    assert!(!tcp_path_class_uses_dedicated_session(TrafficClass::Bulk));
-    assert!(!tcp_path_class_uses_dedicated_session(
-        TrafficClass::Background
-    ));
+    assert!(!tcp_path_lane_uses_dedicated_session(FlowLane::Throughput));
+    assert!(!tcp_path_lane_uses_dedicated_session(FlowLane::Background));
 }
 
 #[test]
-fn switchable_stream_class_updates_from_local_sender_metrics() {
+fn switchable_stream_demand_updates_from_local_sender_metrics() {
     let registry = ServerTcpStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _rx) = tcp_path_session_command_channels(4);
@@ -1121,7 +1121,7 @@ fn switchable_stream_class_updates_from_local_sender_metrics() {
                 session_id: SessionId(1),
                 stream_id: StreamId(7),
                 target: &target,
-                class: TrafficClass::Interactive,
+                lane: FlowLane::Latency,
                 attachment: ServerTcpPathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
@@ -1138,33 +1138,29 @@ fn switchable_stream_class_updates_from_local_sender_metrics() {
         ServerTcpStreamOpen::New(stream) => stream,
         ServerTcpStreamOpen::Existing => panic!("expected new stream"),
     };
-    assert_eq!(stream.current_class(), TrafficClass::Interactive);
+    assert_eq!(stream.current_lane(), FlowLane::Latency);
     let TcpPathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable binding");
     };
     let binding = binding.clone();
 
-    stream.set_class(TrafficClass::Bulk);
+    stream.set_lane(FlowLane::Throughput);
 
-    assert_eq!(stream.current_class(), TrafficClass::Bulk);
-    assert_eq!(binding.class(), TrafficClass::Bulk);
+    assert_eq!(stream.current_lane(), FlowLane::Throughput);
+    assert_eq!(binding.lane(), FlowLane::Throughput);
 }
 
 #[tokio::test]
 async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        tcp_tx,
-        TrafficClass::Interactive,
-    );
+    let binding =
+        ServerTcpStreamBinding::new(UnderlayProtocol::Tcp, PathId(0), tcp_tx, FlowLane::Latency);
     let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
     binding.attach(
         UnderlayProtocol::Udp,
         PathId(0),
         udp_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         StreamOpenRole::Active,
     );
 

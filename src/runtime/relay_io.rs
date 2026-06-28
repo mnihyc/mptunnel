@@ -117,9 +117,9 @@ pub(super) fn tcp_relay_recv_progress_resend_active(
 
 pub(super) fn reliable_stream_recv_progress_interval(
     path: Option<PathSnapshot>,
-    class: TrafficClass,
+    lane: FlowLane,
 ) -> Duration {
-    tcp_relay_stall_timeout(path, class)
+    tcp_relay_stall_timeout(path, lane)
         .div_f64(2.0)
         .max(UDP_MIN_RESPONSE_TIMEOUT)
         .min(TCP_STREAM_STALL_MIN_TIMEOUT)
@@ -203,43 +203,43 @@ pub(super) fn pending_stream_fin_ready(
 
 pub(super) fn adaptive_tcp_relay_chunk_bytes(
     path: Option<PathSnapshot>,
-    class: TrafficClass,
+    lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> usize {
     let cap = tcp_relay_buffer_len(mux_limits);
-    let floor = tcp_class_min_chunk_bytes(class, mux_limits).min(cap).max(1);
+    let floor = tcp_lane_min_chunk_bytes(lane, mux_limits).min(cap).max(1);
     let Some(path) = path else {
-        return tcp_class_startup_chunk_bytes(class, mux_limits)
+        return tcp_lane_startup_chunk_bytes(lane, mux_limits)
             .min(cap)
             .max(floor);
     };
 
     let bdp_bytes = tcp_path_bdp_bytes(path);
-    let class_gain = tcp_class_chunk_gain(class);
+    let lane_gain = tcp_lane_chunk_gain(lane);
     let stability = tcp_path_stability_factor(path);
     let queue_factor = tcp_path_queue_factor(path, bdp_bytes);
-    let target = (bdp_bytes * class_gain * stability * queue_factor).ceil() as usize;
+    let target = (bdp_bytes * lane_gain * stability * queue_factor).ceil() as usize;
     target.clamp(floor, cap)
 }
 
 pub(super) fn adaptive_tcp_relay_inflight_bytes(
     path: Option<PathSnapshot>,
-    class: TrafficClass,
+    lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> usize {
     let cap = mux_limits.max_tcp_path_inflight_bytes.max(1);
-    let floor = tcp_class_min_inflight_bytes(class, mux_limits)
+    let floor = tcp_lane_min_inflight_bytes(lane, mux_limits)
         .min(cap)
         .max(1);
     let Some(path) = path else {
-        return tcp_class_startup_inflight_bytes(class, mux_limits)
+        return tcp_lane_startup_inflight_bytes(lane, mux_limits)
             .min(cap)
             .max(floor);
     };
 
     let bdp_bytes = tcp_path_bdp_bytes(path);
     let target = bdp_bytes
-        * tcp_class_inflight_gain(class)
+        * tcp_lane_inflight_gain(lane)
         * tcp_path_stability_factor(path)
         * tcp_path_queue_factor(path, bdp_bytes);
     (target.ceil() as usize).clamp(floor, cap)
@@ -249,85 +249,78 @@ pub(super) fn tcp_path_bdp_bytes(path: PathSnapshot) -> f64 {
     (path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)
 }
 
-pub(super) fn tcp_class_chunk_gain(class: TrafficClass) -> f64 {
-    match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => 1.0 / 256.0,
-        TrafficClass::Interactive => 1.0 / 128.0,
-        TrafficClass::Bulk => 1.0 / 4.0,
-        TrafficClass::Background => 1.0 / 16.0,
+pub(super) fn tcp_lane_chunk_gain(lane: FlowLane) -> f64 {
+    match lane {
+        FlowLane::Control | FlowLane::RealtimeDatagram => 1.0 / 256.0,
+        FlowLane::Latency => 1.0 / 128.0,
+        FlowLane::Throughput => 1.0 / 4.0,
+        FlowLane::Background => 1.0 / 16.0,
     }
 }
 
-pub(super) fn tcp_class_min_chunk_bytes(class: TrafficClass, mux_limits: MuxLimits) -> usize {
+pub(super) fn tcp_lane_min_chunk_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let cap = tcp_relay_buffer_len(mux_limits).max(1);
-    match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => {
-            PATH_OPEN_SCORE_BYTES.min(cap).max(1)
-        }
-        TrafficClass::Interactive => cap
+    match lane {
+        FlowLane::Control | FlowLane::RealtimeDatagram => PATH_OPEN_SCORE_BYTES.min(cap).max(1),
+        FlowLane::Latency => cap
             .saturating_div(16)
             .max(PATH_OPEN_SCORE_BYTES.min(cap))
             .max(1),
-        TrafficClass::Bulk => cap
+        FlowLane::Throughput => cap
             .saturating_div(4)
             .max(PATH_OPEN_SCORE_BYTES.min(cap))
             .max(1),
-        TrafficClass::Background => cap
+        FlowLane::Background => cap
             .saturating_div(8)
             .max(PATH_OPEN_SCORE_BYTES.min(cap))
             .max(1),
     }
 }
 
-pub(super) fn tcp_class_startup_chunk_bytes(class: TrafficClass, mux_limits: MuxLimits) -> usize {
+pub(super) fn tcp_lane_startup_chunk_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let cap = tcp_relay_buffer_len(mux_limits).max(1);
-    let floor = tcp_class_min_chunk_bytes(class, mux_limits);
-    match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => floor,
-        TrafficClass::Interactive => cap.saturating_div(8).max(floor),
-        TrafficClass::Bulk => cap,
-        TrafficClass::Background => cap.saturating_div(4).max(floor),
+    let floor = tcp_lane_min_chunk_bytes(lane, mux_limits);
+    match lane {
+        FlowLane::Control | FlowLane::RealtimeDatagram => floor,
+        FlowLane::Latency => cap.saturating_div(8).max(floor),
+        FlowLane::Throughput => cap,
+        FlowLane::Background => cap.saturating_div(4).max(floor),
     }
 }
 
-pub(super) fn tcp_class_inflight_gain(class: TrafficClass) -> f64 {
-    match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => 0.0625,
-        TrafficClass::Interactive => 0.125,
-        TrafficClass::Bulk => 2.0,
-        TrafficClass::Background => 1.0,
+pub(super) fn tcp_lane_inflight_gain(lane: FlowLane) -> f64 {
+    match lane {
+        FlowLane::Control | FlowLane::RealtimeDatagram => 0.0625,
+        FlowLane::Latency => 0.125,
+        FlowLane::Throughput => 2.0,
+        FlowLane::Background => 1.0,
     }
 }
 
-pub(super) fn tcp_class_min_inflight_bytes(class: TrafficClass, mux_limits: MuxLimits) -> usize {
+pub(super) fn tcp_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let chunk = tcp_relay_buffer_len(mux_limits).max(1);
-    match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => {
-            PATH_OPEN_SCORE_BYTES.min(chunk).max(1)
-        }
-        TrafficClass::Interactive => chunk
+    match lane {
+        FlowLane::Control | FlowLane::RealtimeDatagram => PATH_OPEN_SCORE_BYTES.min(chunk).max(1),
+        FlowLane::Latency => chunk
             .saturating_div(4)
             .max(PATH_OPEN_SCORE_BYTES.min(chunk))
             .max(1),
-        TrafficClass::Bulk => chunk,
-        TrafficClass::Background => chunk
+        FlowLane::Throughput => chunk,
+        FlowLane::Background => chunk
             .saturating_div(2)
             .max(PATH_OPEN_SCORE_BYTES.min(chunk))
             .max(1),
     }
 }
 
-pub(super) fn tcp_class_startup_inflight_bytes(
-    class: TrafficClass,
-    mux_limits: MuxLimits,
-) -> usize {
-    let floor = tcp_class_min_inflight_bytes(class, mux_limits);
+pub(super) fn tcp_lane_startup_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
+    let floor = tcp_lane_min_inflight_bytes(lane, mux_limits);
     let chunk = tcp_relay_buffer_len(mux_limits).max(1);
-    match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => floor,
-        TrafficClass::Interactive => chunk,
-        TrafficClass::Bulk => mux_limits.max_tcp_path_inflight_bytes.max(chunk),
-        TrafficClass::Background => mux_limits
+    match lane {
+        FlowLane::Control | FlowLane::RealtimeDatagram => floor,
+        FlowLane::Latency => chunk,
+        FlowLane::Throughput => mux_limits.max_tcp_path_inflight_bytes.max(chunk),
+        FlowLane::Background => mux_limits
             .max_tcp_path_inflight_bytes
             .saturating_div(2)
             .max(chunk),
@@ -346,14 +339,11 @@ pub(super) fn tcp_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     (bdp_bytes / (bdp_bytes + queued.max(0.0))).clamp(0.125, 1.0)
 }
 
-pub(super) fn tcp_sender_effective_relay_class(
-    local: TrafficClass,
-    peer: TrafficClass,
-) -> TrafficClass {
-    if local == TrafficClass::Bulk || peer == TrafficClass::Bulk {
-        TrafficClass::Bulk
-    } else if local == TrafficClass::Background || peer == TrafficClass::Background {
-        TrafficClass::Background
+pub(super) fn tcp_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -> FlowLane {
+    if local == FlowLane::Throughput || peer == FlowLane::Throughput {
+        FlowLane::Throughput
+    } else if local == FlowLane::Background || peer == FlowLane::Background {
+        FlowLane::Background
     } else {
         peer
     }
@@ -371,7 +361,7 @@ where
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(path_stream.max_offset);
     let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
-    let chunk_size = adaptive_tcp_relay_chunk_bytes(None, TrafficClass::Interactive, mux_limits)
+    let chunk_size = adaptive_tcp_relay_chunk_bytes(None, FlowLane::Latency, mux_limits)
         .min(path_stream.max_frame_payload_bytes)
         .max(1);
     let mut buf = vec![0u8; chunk_size];
@@ -384,16 +374,16 @@ where
     let mut last_repair_replay_at = Instant::now();
     let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
-    let mut flow_classifier = TcpRelayFlowClassifier::new();
+    let mut flow_demand = TcpRelayFlowDemandTracker::new();
     #[cfg(feature = "lab-diagnostics")]
-    let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
+    let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
 
     let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
             break Ok(stats);
         }
-        let peer_class = path_stream.current_class();
-        let class_update = flow_classifier.refresh(
+        let peer_lane = path_stream.current_lane();
+        let demand_update = flow_demand.refresh(
             TcpRelayFlowSignals::new(
                 send_stream.next_offset(),
                 recv_stream.next_offset(),
@@ -402,19 +392,22 @@ where
             None,
             mux_limits,
         );
-        let relay_class = tcp_sender_effective_relay_class(class_update.class, peer_class);
-        if relay_class != peer_class {
-            path_stream.set_class(relay_class);
+        let relay_demand = demand_update.demand;
+        let relay_lane = tcp_sender_effective_relay_lane(relay_demand.lane, peer_lane);
+        if relay_lane != peer_lane {
+            path_stream.set_lane(relay_lane);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "server_stream_class_promoted_local",
+                "server_stream_lane_promoted_local",
                 format_args!(
-                    "stream_id={} previous={:?} local_class={:?} peer_class={:?} class={:?} sent_offset={} received_offset={} repair_bytes={}",
+                    "stream_id={} previous={:?} local_lane={:?} peer_lane={:?} lane={:?} latency_weight_ppm={} throughput_weight_ppm={} sent_offset={} received_offset={} repair_bytes={}",
                     stream_id.0,
-                    class_update.previous_class,
-                    class_update.class,
-                    peer_class,
-                    relay_class,
+                    demand_update.previous_lane,
+                    demand_update.demand.lane,
+                    peer_lane,
+                    relay_lane,
+                    demand_update.demand.latency_weight_ppm,
+                    demand_update.demand.throughput_weight_ppm,
                     send_stream.next_offset(),
                     recv_stream.next_offset(),
                     send_stream.repair_bytes(),
@@ -426,28 +419,28 @@ where
         let repair_replay_deadline =
             tokio::time::Instant::from_std(last_repair_replay_at + repair_replay_interval);
         let recv_progress_deadline = tokio::time::Instant::from_std(
-            last_recv_progress_sent_at + reliable_stream_recv_progress_interval(None, relay_class),
+            last_recv_progress_sent_at + reliable_stream_recv_progress_interval(None, relay_lane),
         );
-        let adaptive_chunk = adaptive_tcp_relay_chunk_bytes(None, relay_class, mux_limits)
+        let adaptive_chunk = adaptive_tcp_relay_chunk_bytes(None, relay_lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes)
             .max(1);
         resize_tcp_relay_buffer(&mut buf, adaptive_chunk);
-        let inflight_limit = adaptive_tcp_relay_inflight_bytes(None, relay_class, mux_limits);
+        let inflight_limit = adaptive_tcp_relay_inflight_bytes(None, relay_lane, mux_limits);
         #[cfg(feature = "lab-diagnostics")]
-        if last_reported_budget != Some((relay_class, adaptive_chunk, inflight_limit)) {
+        if last_reported_budget != Some((relay_lane, adaptive_chunk, inflight_limit)) {
             lab_diagnostic(
                 "server_relay_budget",
                 format_args!(
-                    "stream_id={} underlay={:?} class={:?} chunk_bytes={} inflight_bytes={} max_frame_payload_bytes={}",
+                    "stream_id={} underlay={:?} lane={:?} chunk_bytes={} inflight_bytes={} max_frame_payload_bytes={}",
                     stream_id.0,
                     path_stream.underlay,
-                    relay_class,
+                    relay_lane,
                     adaptive_chunk,
                     inflight_limit,
                     path_stream.max_frame_payload_bytes,
                 ),
             );
-            last_reported_budget = Some((relay_class, adaptive_chunk, inflight_limit));
+            last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
         let can_read_local =
             local_open && tcp_relay_can_read_with_limit(&send_stream, inflight_limit);
@@ -704,22 +697,22 @@ mod tests {
     }
 
     #[test]
-    fn sender_effective_class_promotes_from_local_or_peer_bulk_evidence() {
+    fn sender_effective_lane_promotes_from_local_or_peer_bulk_evidence() {
         assert_eq!(
-            tcp_sender_effective_relay_class(TrafficClass::Interactive, TrafficClass::Interactive),
-            TrafficClass::Interactive
+            tcp_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Latency),
+            FlowLane::Latency
         );
         assert_eq!(
-            tcp_sender_effective_relay_class(TrafficClass::Bulk, TrafficClass::Interactive),
-            TrafficClass::Bulk
+            tcp_sender_effective_relay_lane(FlowLane::Throughput, FlowLane::Latency),
+            FlowLane::Throughput
         );
         assert_eq!(
-            tcp_sender_effective_relay_class(TrafficClass::Interactive, TrafficClass::Bulk),
-            TrafficClass::Bulk
+            tcp_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Throughput),
+            FlowLane::Throughput
         );
         assert_eq!(
-            tcp_sender_effective_relay_class(TrafficClass::Interactive, TrafficClass::Background),
-            TrafficClass::Background
+            tcp_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Background),
+            FlowLane::Background
         );
     }
 }

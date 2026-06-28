@@ -3,7 +3,7 @@ use super::*;
 pub(super) struct TcpPathStream {
     pub(super) stream_id: StreamId,
     pub(super) max_offset: u64,
-    pub(super) class: TrafficClass,
+    pub(super) lane: FlowLane,
     pub(super) underlay: UnderlayProtocol,
     pub(super) max_frame_payload_bytes: usize,
     pub(super) output: TcpPathStreamOutput,
@@ -21,7 +21,7 @@ impl TcpPathStream {
             TcpPathStreamHandle {
                 stream_id: self.stream_id,
                 max_offset: self.max_offset,
-                class: self.class,
+                lane: self.lane,
                 underlay: self.underlay,
                 max_frame_payload_bytes: self.max_frame_payload_bytes,
                 output: self.output,
@@ -32,7 +32,7 @@ impl TcpPathStream {
 
     pub(super) async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
         self.output
-            .send_frame(self.stream_id, self.class, frame)
+            .send_frame(self.stream_id, self.lane, frame)
             .await
     }
 
@@ -44,13 +44,13 @@ impl TcpPathStream {
         }
     }
 
-    pub(super) fn current_class(&self) -> TrafficClass {
-        self.output.current_class(self.class)
+    pub(super) fn current_lane(&self) -> FlowLane {
+        self.output.current_lane(self.lane)
     }
 
-    pub(super) fn set_class(&mut self, class: TrafficClass) {
-        self.class = class;
-        self.output.set_class(class);
+    pub(super) fn set_lane(&mut self, lane: FlowLane) {
+        self.lane = lane;
+        self.output.set_lane(lane);
     }
 
     pub(super) async fn close(&self) {
@@ -61,7 +61,7 @@ impl TcpPathStream {
 pub(super) struct TcpPathStreamHandle {
     pub(super) stream_id: StreamId,
     pub(super) max_offset: u64,
-    pub(super) class: TrafficClass,
+    pub(super) lane: FlowLane,
     pub(super) underlay: UnderlayProtocol,
     pub(super) max_frame_payload_bytes: usize,
     pub(super) output: TcpPathStreamOutput,
@@ -70,7 +70,7 @@ pub(super) struct TcpPathStreamHandle {
 impl TcpPathStreamHandle {
     pub(super) async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
         self.output
-            .send_frame(self.stream_id, self.class, frame)
+            .send_frame(self.stream_id, self.lane, frame)
             .await
     }
 
@@ -89,12 +89,12 @@ impl TcpPathStreamOutput {
     pub(super) async fn send_frame(
         &self,
         stream_id: StreamId,
-        class: TrafficClass,
+        lane: FlowLane,
         frame: Frame,
     ) -> Result<(), RuntimeError> {
         match self {
-            Self::Fixed(commands) => commands.send_frame(frame, class).await,
-            Self::Switchable(binding) => binding.send_frame(stream_id, class, frame).await,
+            Self::Fixed(commands) => commands.send_frame(frame, lane).await,
+            Self::Switchable(binding) => binding.send_frame(stream_id, lane, frame).await,
         }
     }
 
@@ -102,7 +102,7 @@ impl TcpPathStreamOutput {
         match self {
             Self::Fixed(commands) => {
                 let _ = commands
-                    .send_frame(Frame::StreamDetach { stream_id }, TrafficClass::Control)
+                    .send_frame(Frame::StreamDetach { stream_id }, FlowLane::Control)
                     .await;
                 let _ = commands
                     .send_control(TcpPathSessionCommand::CloseStream(stream_id))
@@ -112,22 +112,22 @@ impl TcpPathStreamOutput {
         }
     }
 
-    pub(super) fn current_class(&self, fallback: TrafficClass) -> TrafficClass {
+    pub(super) fn current_lane(&self, fallback: FlowLane) -> FlowLane {
         match self {
             Self::Fixed(_) => fallback,
-            Self::Switchable(binding) => binding.class(),
+            Self::Switchable(binding) => binding.lane(),
         }
     }
 
-    pub(super) fn set_class(&self, class: TrafficClass) {
+    pub(super) fn set_lane(&self, lane: FlowLane) {
         if let Self::Switchable(binding) = self {
-            binding.set_class(class);
+            binding.set_lane(lane);
         }
     }
 }
 
 pub(super) struct ServerTcpStreamBinding {
-    class: Mutex<TrafficClass>,
+    lane: Mutex<FlowLane>,
     outputs: Mutex<ServerTcpStreamOutputs>,
     version: watch::Sender<u64>,
 }
@@ -137,11 +137,11 @@ impl ServerTcpStreamBinding {
         underlay: UnderlayProtocol,
         path_id: PathId,
         commands: TcpPathSessionCommandSender,
-        class: TrafficClass,
+        lane: FlowLane,
     ) -> Arc<Self> {
         let (version, _) = watch::channel(0);
         Arc::new(Self {
-            class: Mutex::new(class),
+            lane: Mutex::new(lane),
             outputs: Mutex::new(ServerTcpStreamOutputs {
                 next_index: 0,
                 entries: vec![ServerTcpStreamOutputEntry {
@@ -158,10 +158,10 @@ impl ServerTcpStreamBinding {
         underlay: UnderlayProtocol,
         path_id: PathId,
         commands: TcpPathSessionCommandSender,
-        class: TrafficClass,
+        lane: FlowLane,
         role: StreamOpenRole,
     ) {
-        *self.class.lock().expect("server TCP stream class lock") = class;
+        *self.lane.lock().expect("server TCP stream lane lock") = lane;
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let key = ServerTcpPathKey { underlay, path_id };
         let mut was_active = false;
@@ -174,7 +174,7 @@ impl ServerTcpStreamBinding {
             } else {
                 ServerTcpStreamOutputEntry { key, commands }
             };
-        let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role, class)
+        let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role, lane)
             || was_active
             || outputs.entries.is_empty();
         if promote_or_keep_active_slot {
@@ -188,12 +188,12 @@ impl ServerTcpStreamBinding {
         self.notify_update();
     }
 
-    pub(super) fn class(&self) -> TrafficClass {
-        *self.class.lock().expect("server TCP stream class lock")
+    pub(super) fn lane(&self) -> FlowLane {
+        *self.lane.lock().expect("server TCP stream lane lock")
     }
 
-    pub(super) fn set_class(&self, class: TrafficClass) {
-        *self.class.lock().expect("server TCP stream class lock") = class;
+    pub(super) fn set_lane(&self, lane: FlowLane) {
+        *self.lane.lock().expect("server TCP stream lane lock") = lane;
         self.notify_update();
     }
 
@@ -234,7 +234,7 @@ impl ServerTcpStreamBinding {
     pub(super) async fn send_frame(
         &self,
         _stream_id: StreamId,
-        _class: TrafficClass,
+        _lane: FlowLane,
         frame: Frame,
     ) -> Result<(), RuntimeError> {
         let mut updates = self.version.subscribe();
@@ -245,9 +245,9 @@ impl ServerTcpStreamBinding {
                 self.next_commands()
             };
             if let Some((key, commands)) = selected {
-                let class = self.class();
+                let lane = self.lane();
                 tokio::select! {
-                    result = commands.send_frame(frame.clone(), class) => {
+                    result = commands.send_frame(frame.clone(), lane) => {
                         match result {
                             Ok(()) => return Ok(()),
                             Err(_) => self.detach(key, &commands),
@@ -291,12 +291,9 @@ fn server_frame_prefers_current_data_path(frame: &Frame) -> bool {
     matches!(frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
 }
 
-fn server_stream_open_role_promotes_data_path(role: StreamOpenRole, class: TrafficClass) -> bool {
+fn server_stream_open_role_promotes_data_path(role: StreamOpenRole, lane: FlowLane) -> bool {
     role == StreamOpenRole::Active
-        || !matches!(
-            class,
-            TrafficClass::Control | TrafficClass::RealtimeDatagram
-        )
+        || !matches!(lane, FlowLane::Control | FlowLane::RealtimeDatagram)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -330,7 +327,7 @@ impl std::fmt::Debug for ServerTcpStreamRegistry {
 
 struct ServerTcpStreamEntry {
     target: TargetAddr,
-    class: TrafficClass,
+    lane: FlowLane,
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
     binding: Arc<ServerTcpStreamBinding>,
 }
@@ -347,7 +344,7 @@ pub(super) struct ServerTcpStreamOpenRequest<'a> {
     pub(super) session_id: SessionId,
     pub(super) stream_id: StreamId,
     pub(super) target: &'a TargetAddr,
-    pub(super) class: TrafficClass,
+    pub(super) lane: FlowLane,
     pub(super) attachment: ServerTcpPathAttachment,
 }
 
@@ -376,7 +373,7 @@ impl ServerTcpStreamRegistry {
             session_id,
             stream_id,
             target,
-            class,
+            lane,
             attachment,
         } = request;
         let max_frame_payload_bytes = attachment.max_frame_payload_bytes;
@@ -391,12 +388,12 @@ impl ServerTcpStreamRegistry {
                     "TCP stream migration target does not match original stream",
                 ));
             }
-            entry.class = class;
+            entry.lane = lane;
             entry.binding.attach(
                 underlay,
                 attachment.path_id,
                 attachment.commands,
-                class,
+                lane,
                 attachment.role,
             );
             return Ok(ServerTcpStreamOpen::Existing);
@@ -408,12 +405,12 @@ impl ServerTcpStreamRegistry {
 
         let (frames_tx, frames_rx) = mpsc::channel(tcp_stream_frame_queue(mux_limits));
         let binding =
-            ServerTcpStreamBinding::new(underlay, attachment.path_id, attachment.commands, class);
+            ServerTcpStreamBinding::new(underlay, attachment.path_id, attachment.commands, lane);
         streams.insert(
             (session_id, stream_id),
             ServerTcpStreamEntry {
                 target: target.clone(),
-                class,
+                lane,
                 frames: frames_tx,
                 binding: binding.clone(),
             },
@@ -421,7 +418,7 @@ impl ServerTcpStreamRegistry {
         Ok(ServerTcpStreamOpen::New(TcpPathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
-            class,
+            lane,
             underlay,
             max_frame_payload_bytes,
             output: TcpPathStreamOutput::Switchable(binding),
@@ -553,17 +550,17 @@ impl ClientTcpPathSessionHandle {
         stream_id: StreamId,
         target: TargetAddr,
         ingress: IngressKind,
-        class: TrafficClass,
+        lane: FlowLane,
         role: StreamOpenRole,
     ) -> Result<TcpPathStream, RuntimeError> {
-        let commands = self.ensure_session(class);
+        let commands = self.ensure_session(lane);
         let (response_tx, response_rx) = oneshot::channel();
         commands
             .send_control(TcpPathSessionCommand::OpenStream {
                 stream_id,
                 target,
                 ingress,
-                class,
+                lane,
                 role,
                 session_commands: commands.clone(),
                 response: response_tx,
@@ -575,15 +572,15 @@ impl ClientTcpPathSessionHandle {
             .map_err(|_| RuntimeError::TcpPathSessionClosed)?
     }
 
-    pub(super) fn ensure_session(&self, class: TrafficClass) -> TcpPathSessionCommandSender {
-        if tcp_path_class_uses_dedicated_session(class) && !self.runtime.reuse_latency_session {
+    pub(super) fn ensure_session(&self, lane: FlowLane) -> TcpPathSessionCommandSender {
+        if tcp_path_lane_uses_dedicated_session(lane) && !self.runtime.reuse_latency_session {
             let (commands, receivers) =
                 tcp_path_session_command_channels(self.runtime.command_queue);
             tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receivers));
             return commands;
         }
 
-        let lane = if tcp_path_class_uses_dedicated_session(class) {
+        let lane = if tcp_path_lane_uses_dedicated_session(lane) {
             &self.latency_commands
         } else {
             &self.commands
@@ -602,10 +599,10 @@ impl ClientTcpPathSessionHandle {
     }
 }
 
-pub(super) fn tcp_path_class_uses_dedicated_session(class: TrafficClass) -> bool {
+pub(super) fn tcp_path_lane_uses_dedicated_session(lane: FlowLane) -> bool {
     matches!(
-        class,
-        TrafficClass::Control | TrafficClass::Interactive | TrafficClass::RealtimeDatagram
+        lane,
+        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
@@ -638,11 +635,11 @@ impl TcpPathSessionCommandSender {
     pub(super) async fn send_frame(
         &self,
         frame: Frame,
-        class: TrafficClass,
+        lane: FlowLane,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
         let bytes = frame_pacing_bytes(&frame);
-        let queue = if tcp_path_frame_uses_priority_queue(class) {
+        let queue = if tcp_path_frame_uses_priority_queue(lane) {
             &self.priority
         } else {
             &self.data
@@ -655,7 +652,7 @@ impl TcpPathSessionCommandSender {
             .map_err(|_| RuntimeError::TcpPathSessionClosed);
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record(
-            if tcp_path_frame_uses_priority_queue(class) {
+            if tcp_path_frame_uses_priority_queue(lane) {
                 "runtime.path_queue.priority_send"
             } else {
                 "runtime.path_queue.data_send"
@@ -677,10 +674,10 @@ impl TcpPathSessionCommandSender {
     }
 }
 
-pub(super) fn tcp_path_frame_uses_priority_queue(class: TrafficClass) -> bool {
+pub(super) fn tcp_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
     matches!(
-        class,
-        TrafficClass::Control | TrafficClass::Interactive | TrafficClass::RealtimeDatagram
+        lane,
+        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
@@ -763,7 +760,7 @@ pub(super) enum TcpPathSessionCommand {
         stream_id: StreamId,
         target: TargetAddr,
         ingress: IngressKind,
-        class: TrafficClass,
+        lane: FlowLane,
         role: StreamOpenRole,
         session_commands: TcpPathSessionCommandSender,
         response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
@@ -792,7 +789,7 @@ pub(super) struct ClientTcpPendingOpen {
     response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
     session_commands: TcpPathSessionCommandSender,
-    class: TrafficClass,
+    lane: FlowLane,
 }
 
 #[derive(Clone)]
@@ -819,7 +816,7 @@ struct ClientTcpOpenStreamRequest {
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
     role: StreamOpenRole,
     session_commands: TcpPathSessionCommandSender,
     response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
@@ -970,7 +967,7 @@ async fn handle_disconnected_client_tcp_command(
             stream_id,
             target,
             ingress,
-            class,
+            lane,
             role,
             session_commands,
             response,
@@ -989,7 +986,7 @@ async fn handle_disconnected_client_tcp_command(
                     stream_id,
                     target,
                     ingress,
-                    class,
+                    lane,
                     role,
                     session_commands,
                     response,
@@ -1029,7 +1026,7 @@ async fn handle_connected_client_tcp_command(
             stream_id,
             target,
             ingress,
-            class,
+            lane,
             role,
             session_commands,
             response,
@@ -1038,7 +1035,7 @@ async fn handle_connected_client_tcp_command(
                 stream_id,
                 target,
                 ingress,
-                class,
+                lane,
                 role,
                 session_commands,
                 response,
@@ -1143,7 +1140,7 @@ async fn open_client_tcp_stream_on_connection(
                 response: open.response,
                 frames: Some(frames_rx),
                 session_commands: open.session_commands,
-                class: open.class,
+                lane: open.lane,
             }),
         },
     );
@@ -1154,7 +1151,6 @@ async fn open_client_tcp_stream_on_connection(
             target: open.target,
             ingress: open.ingress,
             outbound: OutboundPolicy::Direct,
-            class: open.class,
             role: open.role,
         })
         .await?;
@@ -1186,7 +1182,7 @@ async fn handle_client_tcp_path_frame(
                 let stream = TcpPathStream {
                     stream_id,
                     max_offset,
-                    class: pending.class,
+                    lane: pending.lane,
                     underlay: UnderlayProtocol::Tcp,
                     max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
                     output: TcpPathStreamOutput::Fixed(pending.session_commands),

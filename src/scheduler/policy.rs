@@ -1,4 +1,5 @@
-use crate::protocol::{PathCapabilities, PathId, TrafficClass, UnderlayProtocol};
+use super::FlowLane;
+use crate::protocol::{PathCapabilities, PathId, UnderlayProtocol};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,13 +123,13 @@ pub struct PathScore {
 
 pub fn choose_path(
     paths: &[PathSnapshot],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
     policy: SchedulerPolicy,
 ) -> Option<PathScore> {
     paths
         .iter()
-        .filter_map(|path| score_path(*path, class, payload_bytes, policy))
+        .filter_map(|path| score_path(*path, lane, payload_bytes, policy))
         .min_by(|left, right| left.eta_ms.total_cmp(&right.eta_ms))
 }
 
@@ -144,7 +145,7 @@ pub enum SchedulingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnqueueRequest {
     pub flow_id: FlowId,
-    pub class: TrafficClass,
+    pub lane: FlowLane,
     pub payload_bytes: usize,
     pub remaining_flow_bytes: usize,
     pub duplicate_eligible: bool,
@@ -153,8 +154,8 @@ pub struct EnqueueRequest {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SchedulerDecision {
     pub flow_id: FlowId,
-    pub class: TrafficClass,
-    pub scheduled_class: TrafficClass,
+    pub lane: FlowLane,
+    pub scheduled_lane: FlowLane,
     pub mode: SchedulingMode,
     pub payload_bytes: usize,
     pub path_id: PathId,
@@ -164,7 +165,7 @@ pub struct SchedulerDecision {
 
 #[derive(Debug, Default)]
 pub struct HeterogeneousScheduler {
-    classes: Vec<ClassQueue>,
+    lanes: Vec<LaneQueue>,
     path_queues: Vec<PathQueue>,
 }
 
@@ -173,9 +174,9 @@ impl HeterogeneousScheduler {
         if request.payload_bytes == 0 {
             return;
         }
-        let class_index = self.class_index(request.class);
-        let class_queue = &mut self.classes[class_index];
-        if let Some(flow) = class_queue
+        let lane_index = self.lane_index(request.lane);
+        let lane_queue = &mut self.lanes[lane_index];
+        if let Some(flow) = lane_queue
             .flows
             .iter_mut()
             .find(|flow| flow.flow_id == request.flow_id)
@@ -189,13 +190,13 @@ impl HeterogeneousScheduler {
             packets: VecDeque::new(),
         };
         flow.packets.push_back(request);
-        class_queue.flows.push_back(flow);
+        lane_queue.flows.push_back(flow);
     }
 
     pub fn has_queued(&self) -> bool {
-        self.classes
+        self.lanes
             .iter()
-            .any(|class| class.flows.iter().any(|flow| !flow.packets.is_empty()))
+            .any(|lane| lane.flows.iter().any(|flow| !flow.packets.is_empty()))
     }
 
     pub fn queued_path_bytes(&self, path_id: PathId) -> u64 {
@@ -210,43 +211,43 @@ impl HeterogeneousScheduler {
         paths: &[PathSnapshot],
         policy: SchedulerPolicy,
     ) -> Option<SchedulerDecision> {
-        for class in priority_order() {
-            let class_index = self.class_index(class);
-            let flow_count = self.classes[class_index].flows.len();
+        for lane in priority_order() {
+            let lane_index = self.lane_index(lane);
+            let flow_count = self.lanes[lane_index].flows.len();
             if flow_count == 0 {
                 continue;
             }
-            self.classes[class_index].deficit_bytes = self.classes[class_index]
+            self.lanes[lane_index].deficit_bytes = self.lanes[lane_index]
                 .deficit_bytes
-                .saturating_add(class_quantum_bytes(class));
+                .saturating_add(lane_quantum_bytes(lane));
 
             for _ in 0..flow_count {
-                let mut flow = self.classes[class_index]
+                let mut flow = self.lanes[lane_index]
                     .flows
                     .pop_front()
                     .expect("flow exists");
-                flow.deficit_bytes = flow.deficit_bytes.saturating_add(flow_quantum_bytes(class));
+                flow.deficit_bytes = flow.deficit_bytes.saturating_add(flow_quantum_bytes(lane));
                 let Some(packet) = flow.packets.front().copied() else {
                     continue;
                 };
-                let charge_bytes = deficit_charge_bytes(packet.class, packet.payload_bytes);
-                if charge_bytes > self.classes[class_index].deficit_bytes
+                let charge_bytes = deficit_charge_bytes(packet.lane, packet.payload_bytes);
+                if charge_bytes > self.lanes[lane_index].deficit_bytes
                     || charge_bytes > flow.deficit_bytes
                 {
-                    self.classes[class_index].flows.push_back(flow);
+                    self.lanes[lane_index].flows.push_back(flow);
                     continue;
                 }
                 let Some(decision) = self.choose_packet_paths(packet, paths, policy) else {
-                    self.classes[class_index].flows.push_front(flow);
+                    self.lanes[lane_index].flows.push_front(flow);
                     return None;
                 };
-                self.classes[class_index].deficit_bytes = self.classes[class_index]
+                self.lanes[lane_index].deficit_bytes = self.lanes[lane_index]
                     .deficit_bytes
                     .saturating_sub(charge_bytes);
                 flow.deficit_bytes = flow.deficit_bytes.saturating_sub(charge_bytes);
                 flow.packets.pop_front();
                 if !flow.packets.is_empty() {
-                    self.classes[class_index].flows.push_back(flow);
+                    self.lanes[lane_index].flows.push_back(flow);
                 }
                 self.add_path_queue(decision.path_id, packet.payload_bytes as u64);
                 if let Some(path_id) = decision.duplicate_path_id {
@@ -280,16 +281,16 @@ impl HeterogeneousScheduler {
         self.path_queues.retain(|queue| queue.path_id != path_id);
     }
 
-    fn class_index(&mut self, class: TrafficClass) -> usize {
-        if let Some(index) = self.classes.iter().position(|queue| queue.class == class) {
+    fn lane_index(&mut self, lane: FlowLane) -> usize {
+        if let Some(index) = self.lanes.iter().position(|queue| queue.lane == lane) {
             return index;
         }
-        self.classes.push(ClassQueue {
-            class,
+        self.lanes.push(LaneQueue {
+            lane,
             deficit_bytes: 0,
             flows: VecDeque::new(),
         });
-        self.classes.len() - 1
+        self.lanes.len() - 1
     }
 
     fn choose_packet_paths(
@@ -299,14 +300,14 @@ impl HeterogeneousScheduler {
         policy: SchedulerPolicy,
     ) -> Option<SchedulerDecision> {
         let mode = scheduling_mode(packet, policy);
-        let scheduled_class = scheduled_class(packet.class, mode);
-        let scored = self.scored_paths(paths, scheduled_class, packet.payload_bytes, mode, policy);
+        let scheduled_lane = scheduled_lane(packet.lane, mode);
+        let scored = self.scored_paths(paths, scheduled_lane, packet.payload_bytes, mode, policy);
         let primary = scored.first().copied()?;
         let duplicate_path_id = duplicate_path(packet, primary, &scored, policy);
         Some(SchedulerDecision {
             flow_id: packet.flow_id,
-            class: packet.class,
-            scheduled_class,
+            lane: packet.lane,
+            scheduled_lane,
             mode,
             payload_bytes: packet.payload_bytes,
             path_id: primary.path_id,
@@ -318,7 +319,7 @@ impl HeterogeneousScheduler {
     fn scored_paths(
         &self,
         paths: &[PathSnapshot],
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
         mode: SchedulingMode,
         policy: SchedulerPolicy,
@@ -330,7 +331,7 @@ impl HeterogeneousScheduler {
                 path.queue_bytes = path
                     .queue_bytes
                     .saturating_add(self.queued_path_bytes(path.id));
-                score_path(path, class, payload_bytes, policy).map(|mut score| {
+                score_path(path, lane, payload_bytes, policy).map(|mut score| {
                     score.eta_ms += shared_bottleneck_penalty(path, paths, policy);
                     if mode == SchedulingMode::TailAvoidance {
                         score.eta_ms += path.srtt_ms * policy.tail_avoidance_rtt_penalty_scale;
@@ -357,8 +358,8 @@ impl HeterogeneousScheduler {
 }
 
 #[derive(Debug)]
-struct ClassQueue {
-    class: TrafficClass,
+struct LaneQueue {
+    lane: FlowLane,
     deficit_bytes: u64,
     flows: VecDeque<FlowQueue>,
 }
@@ -378,11 +379,11 @@ struct PathQueue {
 
 pub fn score_path(
     path: PathSnapshot,
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
     policy: SchedulerPolicy,
 ) -> Option<PathScore> {
-    if !path_is_schedulable(path, class) {
+    if !path_is_schedulable(path, lane) {
         return None;
     }
 
@@ -397,7 +398,7 @@ pub fn score_path(
     eta_ms += path.loss_rate.clamp(0.0, 1.0) * policy.loss_penalty_scale_ms;
 
     if path.state == PathState::Suspect {
-        eta_ms += suspect_penalty_ms(class, policy);
+        eta_ms += suspect_penalty_ms(lane, policy);
     }
     if path.flags.backup {
         eta_ms += policy.backup_penalty_ms;
@@ -405,10 +406,10 @@ pub fn score_path(
     if path.flags.expensive {
         eta_ms += policy.expensive_penalty_ms;
     }
-    if path.underlay == UnderlayProtocol::Tcp && prefers_low_reorder(class) {
+    if path.underlay == UnderlayProtocol::Tcp && prefers_low_reorder(lane) {
         eta_ms += policy.tcp_reorder_penalty_ms;
     }
-    if class == TrafficClass::Control && path.flags.low_latency {
+    if lane == FlowLane::Control && path.flags.low_latency {
         eta_ms -= path.srtt_ms.min(10.0) * 0.25;
     }
 
@@ -418,45 +419,45 @@ pub fn score_path(
     })
 }
 
-fn priority_order() -> [TrafficClass; 5] {
+fn priority_order() -> [FlowLane; 5] {
     [
-        TrafficClass::Control,
-        TrafficClass::RealtimeDatagram,
-        TrafficClass::Interactive,
-        TrafficClass::Bulk,
-        TrafficClass::Background,
+        FlowLane::Control,
+        FlowLane::RealtimeDatagram,
+        FlowLane::Latency,
+        FlowLane::Throughput,
+        FlowLane::Background,
     ]
 }
 
-fn class_quantum_bytes(class: TrafficClass) -> u64 {
-    match class {
-        TrafficClass::Control => 128 * 1024,
-        TrafficClass::RealtimeDatagram => 96 * 1024,
-        TrafficClass::Interactive => 96 * 1024,
-        TrafficClass::Bulk => 512 * 1024,
-        TrafficClass::Background => 64 * 1024,
+fn lane_quantum_bytes(lane: FlowLane) -> u64 {
+    match lane {
+        FlowLane::Control => 128 * 1024,
+        FlowLane::RealtimeDatagram => 96 * 1024,
+        FlowLane::Latency => 96 * 1024,
+        FlowLane::Throughput => 512 * 1024,
+        FlowLane::Background => 64 * 1024,
     }
 }
 
-fn flow_quantum_bytes(class: TrafficClass) -> u64 {
-    match class {
-        TrafficClass::Control => 64 * 1024,
-        TrafficClass::RealtimeDatagram => 64 * 1024,
-        TrafficClass::Interactive => 64 * 1024,
-        TrafficClass::Bulk => 256 * 1024,
-        TrafficClass::Background => 32 * 1024,
+fn flow_quantum_bytes(lane: FlowLane) -> u64 {
+    match lane {
+        FlowLane::Control => 64 * 1024,
+        FlowLane::RealtimeDatagram => 64 * 1024,
+        FlowLane::Latency => 64 * 1024,
+        FlowLane::Throughput => 256 * 1024,
+        FlowLane::Background => 32 * 1024,
     }
 }
 
-fn deficit_charge_bytes(class: TrafficClass, payload_bytes: usize) -> u64 {
+fn deficit_charge_bytes(lane: FlowLane, payload_bytes: usize) -> u64 {
     // DRR fairness assumes bounded transport frames; callers may model a larger logical chunk.
     // Path scoring and queue pressure still use the actual payload bytes.
     let payload_bytes = payload_bytes as u64;
-    payload_bytes.min(flow_quantum_bytes(class)).max(1)
+    payload_bytes.min(flow_quantum_bytes(lane)).max(1)
 }
 
 fn scheduling_mode(packet: EnqueueRequest, policy: SchedulerPolicy) -> SchedulingMode {
-    if packet.class == TrafficClass::Bulk
+    if packet.lane == FlowLane::Throughput
         && packet.remaining_flow_bytes <= policy.tail_avoidance_threshold_bytes
     {
         SchedulingMode::TailAvoidance
@@ -465,10 +466,10 @@ fn scheduling_mode(packet: EnqueueRequest, policy: SchedulerPolicy) -> Schedulin
     }
 }
 
-fn scheduled_class(class: TrafficClass, mode: SchedulingMode) -> TrafficClass {
-    match (class, mode) {
-        (TrafficClass::Bulk, SchedulingMode::TailAvoidance) => TrafficClass::Interactive,
-        _ => class,
+fn scheduled_lane(lane: FlowLane, mode: SchedulingMode) -> FlowLane {
+    match (lane, mode) {
+        (FlowLane::Throughput, SchedulingMode::TailAvoidance) => FlowLane::Latency,
+        _ => lane,
     }
 }
 
@@ -480,10 +481,7 @@ fn duplicate_path(
 ) -> Option<PathId> {
     if !packet.duplicate_eligible
         || packet.payload_bytes > policy.duplication_max_payload_bytes
-        || !matches!(
-            packet.class,
-            TrafficClass::Control | TrafficClass::RealtimeDatagram
-        )
+        || !matches!(packet.lane, FlowLane::Control | FlowLane::RealtimeDatagram)
     {
         return None;
     }
@@ -515,34 +513,34 @@ fn shared_bottleneck_penalty(
     }
 }
 
-fn path_is_schedulable(path: PathSnapshot, class: TrafficClass) -> bool {
+fn path_is_schedulable(path: PathSnapshot, lane: FlowLane) -> bool {
     if matches!(path.state, PathState::Failed | PathState::Draining) {
         return false;
     }
-    if path.flags.probe_only && class != TrafficClass::Control {
+    if path.flags.probe_only && lane != FlowLane::Control {
         return false;
     }
-    if class == TrafficClass::Bulk && !path.flags.bulk_allowed {
+    if lane == FlowLane::Throughput && !path.flags.bulk_allowed {
         return false;
     }
-    if class == TrafficClass::RealtimeDatagram && path.flags.no_udp {
+    if lane == FlowLane::RealtimeDatagram && path.flags.no_udp {
         return false;
     }
     true
 }
 
-fn suspect_penalty_ms(class: TrafficClass, policy: SchedulerPolicy) -> f64 {
-    if prefers_low_reorder(class) {
+fn suspect_penalty_ms(lane: FlowLane, policy: SchedulerPolicy) -> f64 {
+    if prefers_low_reorder(lane) {
         0.0
     } else {
         policy.suspect_penalty_ms
     }
 }
 
-fn prefers_low_reorder(class: TrafficClass) -> bool {
+fn prefers_low_reorder(lane: FlowLane) -> bool {
     matches!(
-        class,
-        TrafficClass::Control | TrafficClass::Interactive | TrafficClass::RealtimeDatagram
+        lane,
+        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
@@ -566,7 +564,7 @@ mod tests {
 
         let choice = choose_path(
             &[low_latency, high_bandwidth, unstable],
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             2 * 1024,
             SchedulerPolicy::default(),
         );
@@ -585,7 +583,7 @@ mod tests {
 
         let choice = choose_path(
             &[low_latency, high_bandwidth, unstable],
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             4 * 1024 * 1024,
             SchedulerPolicy::default(),
         );
@@ -603,7 +601,7 @@ mod tests {
 
         let choice = choose_path(
             &[failed, draining, active],
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             512,
             SchedulerPolicy::default(),
         );
@@ -621,13 +619,13 @@ mod tests {
 
         let interactive = choose_path(
             &[low_latency, active_high_latency],
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             512,
             SchedulerPolicy::default(),
         );
         let bulk = choose_path(
             &[low_latency, active_high_latency],
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             4 * 1024 * 1024,
             SchedulerPolicy::default(),
         );
@@ -645,14 +643,14 @@ mod tests {
         let mut scheduler = HeterogeneousScheduler::default();
         scheduler.enqueue(EnqueueRequest {
             flow_id: FlowId(1),
-            class: TrafficClass::Bulk,
+            lane: FlowLane::Throughput,
             payload_bytes: 128 * 1024,
             remaining_flow_bytes: 8 * 1024 * 1024,
             duplicate_eligible: false,
         });
         scheduler.enqueue(EnqueueRequest {
             flow_id: FlowId(2),
-            class: TrafficClass::Control,
+            lane: FlowLane::Control,
             payload_bytes: 512,
             remaining_flow_bytes: 512,
             duplicate_eligible: true,
@@ -662,7 +660,7 @@ mod tests {
             .schedule_next(&paths, SchedulerPolicy::default())
             .expect("decision");
 
-        assert_eq!(decision.class, TrafficClass::Control);
+        assert_eq!(decision.lane, FlowLane::Control);
         assert_eq!(decision.flow_id, FlowId(2));
     }
 
@@ -678,7 +676,7 @@ mod tests {
         for flow_id in [FlowId(1), FlowId(2)] {
             scheduler.enqueue(EnqueueRequest {
                 flow_id,
-                class: TrafficClass::Bulk,
+                lane: FlowLane::Throughput,
                 payload_bytes: 128 * 1024,
                 remaining_flow_bytes: 4 * 1024 * 1024,
                 duplicate_eligible: false,
@@ -706,7 +704,7 @@ mod tests {
         let mut scheduler = HeterogeneousScheduler::default();
         scheduler.enqueue(EnqueueRequest {
             flow_id: FlowId(3),
-            class: TrafficClass::Bulk,
+            lane: FlowLane::Throughput,
             payload_bytes: 16 * 1024 * 1024,
             remaining_flow_bytes: 16 * 1024 * 1024,
             duplicate_eligible: false,
@@ -728,7 +726,7 @@ mod tests {
         let mut scheduler = HeterogeneousScheduler::default();
         scheduler.enqueue(EnqueueRequest {
             flow_id: FlowId(7),
-            class: TrafficClass::Bulk,
+            lane: FlowLane::Throughput,
             payload_bytes: 128 * 1024,
             remaining_flow_bytes: 128 * 1024,
             duplicate_eligible: false,
@@ -739,7 +737,7 @@ mod tests {
             .expect("decision");
 
         assert_eq!(decision.mode, SchedulingMode::TailAvoidance);
-        assert_eq!(decision.scheduled_class, TrafficClass::Interactive);
+        assert_eq!(decision.scheduled_lane, FlowLane::Latency);
         assert_eq!(decision.path_id, PathId(0));
     }
 
@@ -750,7 +748,7 @@ mod tests {
         let mut scheduler = HeterogeneousScheduler::default();
         scheduler.enqueue(EnqueueRequest {
             flow_id: FlowId(9),
-            class: TrafficClass::Control,
+            lane: FlowLane::Control,
             payload_bytes: 512,
             remaining_flow_bytes: 512,
             duplicate_eligible: true,
@@ -775,7 +773,7 @@ mod tests {
         let mut scheduler = HeterogeneousScheduler::default();
         scheduler.enqueue(EnqueueRequest {
             flow_id: FlowId(10),
-            class: TrafficClass::Interactive,
+            lane: FlowLane::Latency,
             payload_bytes: 1024,
             remaining_flow_bytes: 1024,
             duplicate_eligible: false,

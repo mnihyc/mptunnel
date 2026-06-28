@@ -1,7 +1,7 @@
-use crate::protocol::{PathId, TrafficClass};
+use crate::protocol::PathId;
 use crate::scheduler::{
-    EnqueueRequest, FlowId, HeterogeneousScheduler, PathSnapshot, PathState, SchedulerPolicy,
-    SchedulingMode,
+    EnqueueRequest, FlowId, FlowLane, HeterogeneousScheduler, PathSnapshot, PathState,
+    SchedulerPolicy, SchedulingMode,
 };
 use std::collections::BTreeMap;
 
@@ -30,8 +30,8 @@ pub struct SimulatedSend {
     pub flow_id: FlowId,
     pub path_id: PathId,
     pub duplicate_path_id: Option<PathId>,
-    pub class: TrafficClass,
-    pub scheduled_class: TrafficClass,
+    pub lane: FlowLane,
+    pub scheduled_lane: FlowLane,
     pub mode: SchedulingMode,
     pub payload_bytes: usize,
     pub queued_bytes_after: u64,
@@ -41,7 +41,7 @@ pub struct SimulatedSend {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimulatedChunkAttempt {
     pub path_id: PathId,
-    pub class: TrafficClass,
+    pub lane: FlowLane,
     pub payload_bytes: usize,
     pub scheduled_at_ms: f64,
     pub estimated_completion_ms: f64,
@@ -51,7 +51,7 @@ pub struct SimulatedChunkAttempt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulatedTransfer {
-    pub class: TrafficClass,
+    pub lane: FlowLane,
     pub total_bytes: usize,
     pub chunk_bytes: usize,
     pub start_ms: f64,
@@ -154,21 +154,21 @@ impl Simulator {
         &self.paths
     }
 
-    pub fn route(&mut self, class: TrafficClass, payload_bytes: usize) -> Option<SimulatedSend> {
+    pub fn route(&mut self, lane: FlowLane, payload_bytes: usize) -> Option<SimulatedSend> {
         let flow_id = self.allocate_flow_id();
         self.route_flow(
             flow_id,
-            class,
+            lane,
             payload_bytes,
             payload_bytes,
-            duplicate_default(class),
+            duplicate_default(lane),
         )
     }
 
     pub fn route_flow(
         &mut self,
         flow_id: FlowId,
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
         remaining_flow_bytes: usize,
         duplicate_eligible: bool,
@@ -176,7 +176,7 @@ impl Simulator {
         self.apply_failures();
         self.scheduler.enqueue(EnqueueRequest {
             flow_id,
-            class,
+            lane,
             payload_bytes,
             remaining_flow_bytes,
             duplicate_eligible,
@@ -187,8 +187,8 @@ impl Simulator {
             flow_id: decision.flow_id,
             path_id: decision.path_id,
             duplicate_path_id: decision.duplicate_path_id,
-            class,
-            scheduled_class: decision.scheduled_class,
+            lane,
+            scheduled_lane: decision.scheduled_lane,
             mode: decision.mode,
             payload_bytes,
             queued_bytes_after: self.scheduler.queued_path_bytes(decision.path_id),
@@ -198,7 +198,7 @@ impl Simulator {
 
     pub fn schedule_transfer(
         &mut self,
-        class: TrafficClass,
+        lane: FlowLane,
         total_bytes: usize,
         chunk_bytes: usize,
     ) -> Option<SimulatedTransfer> {
@@ -213,10 +213,10 @@ impl Simulator {
         while remaining > 0 {
             let payload_bytes = remaining.min(chunk_bytes);
             let scheduled_at_ms = self.now_ms;
-            let send = self.route_flow(flow_id, class, payload_bytes, remaining, false)?;
+            let send = self.route_flow(flow_id, lane, payload_bytes, remaining, false)?;
             attempts.push(SimulatedChunkAttempt {
                 path_id: send.path_id,
-                class,
+                lane,
                 payload_bytes,
                 scheduled_at_ms,
                 estimated_completion_ms: send.estimated_completion_ms,
@@ -227,7 +227,7 @@ impl Simulator {
         }
         let completion_ms = transfer_completion_ms(&attempts).unwrap_or(start_ms);
         Some(SimulatedTransfer {
-            class,
+            lane,
             total_bytes,
             chunk_bytes,
             start_ms,
@@ -241,14 +241,14 @@ impl Simulator {
 
     pub fn schedule_transfer_with_repair(
         &mut self,
-        class: TrafficClass,
+        lane: FlowLane,
         total_bytes: usize,
         chunk_bytes: usize,
         repair_delay_ms: f64,
     ) -> Option<SimulatedTransfer> {
         let start_ms = self.now_ms;
         let start_capacity_bps = self.healthy_capacity_bps();
-        let mut transfer = self.schedule_transfer(class, total_bytes, chunk_bytes)?;
+        let mut transfer = self.schedule_transfer(lane, total_bytes, chunk_bytes)?;
         transfer.start_capacity_bps = start_capacity_bps;
         let mut repair_attempt = 0u32;
         let mut first_failure_ms = None;
@@ -288,10 +288,10 @@ impl Simulator {
             self.advance_to(failure_ms + repair_delay_ms.max(0.0));
             for (_, _, payload_bytes) in lost {
                 let scheduled_at_ms = self.now_ms;
-                let send = self.route(class, payload_bytes)?;
+                let send = self.route(lane, payload_bytes)?;
                 transfer.attempts.push(SimulatedChunkAttempt {
                     path_id: send.path_id,
-                    class,
+                    lane,
                     payload_bytes,
                     scheduled_at_ms,
                     estimated_completion_ms: send.estimated_completion_ms,
@@ -319,7 +319,7 @@ impl Simulator {
         let mut sends = Vec::with_capacity(count);
         for _ in 0..count {
             let started_at_ms = self.now_ms;
-            let mut send = self.route(TrafficClass::Interactive, request_bytes)?;
+            let mut send = self.route(FlowLane::Latency, request_bytes)?;
             send.estimated_completion_ms -= started_at_ms;
             sends.push(send);
             self.advance_to(started_at_ms + spacing_ms.max(0.0));
@@ -388,11 +388,8 @@ impl Simulator {
     }
 }
 
-fn duplicate_default(class: TrafficClass) -> bool {
-    matches!(
-        class,
-        TrafficClass::Control | TrafficClass::RealtimeDatagram
-    )
+fn duplicate_default(lane: FlowLane) -> bool {
+    matches!(lane, FlowLane::Control | FlowLane::RealtimeDatagram)
 }
 
 fn transfer_completion_ms(attempts: &[SimulatedChunkAttempt]) -> Option<f64> {
@@ -454,10 +451,10 @@ mod tests {
         );
 
         let bulk = simulator
-            .route(TrafficClass::Bulk, 16 * 1024 * 1024)
+            .route(FlowLane::Throughput, 16 * 1024 * 1024)
             .expect("bulk route");
         let interactive = simulator
-            .route(TrafficClass::Interactive, 1024)
+            .route(FlowLane::Latency, 1024)
             .expect("interactive route");
 
         assert_eq!(bulk.path_id, PathId(1));
@@ -478,7 +475,7 @@ mod tests {
 
         simulator.advance_to(100.0);
         let send = simulator
-            .route(TrafficClass::Interactive, 512)
+            .route(FlowLane::Latency, 512)
             .expect("survivor route");
 
         assert_eq!(send.path_id, PathId(1));
@@ -500,7 +497,7 @@ mod tests {
         );
 
         let transfer = simulator
-            .schedule_transfer(TrafficClass::Bulk, 64 * 1024 * 1024, 1024 * 1024)
+            .schedule_transfer(FlowLane::Throughput, 64 * 1024 * 1024, 1024 * 1024)
             .expect("bulk transfer");
         let path_bytes = transfer.path_bytes();
 
@@ -522,7 +519,7 @@ mod tests {
         );
 
         let transfer = simulator
-            .schedule_transfer_with_repair(TrafficClass::Bulk, 4 * 1024 * 1024, 256 * 1024, 10.0)
+            .schedule_transfer_with_repair(FlowLane::Throughput, 4 * 1024 * 1024, 256 * 1024, 10.0)
             .expect("repaired transfer");
         let gap = transfer.failover_gap_ms.expect("failover gap");
 
@@ -552,7 +549,7 @@ mod tests {
         );
 
         simulator
-            .schedule_transfer(TrafficClass::Bulk, 64 * 1024 * 1024, 1024 * 1024)
+            .schedule_transfer(FlowLane::Throughput, 64 * 1024 * 1024, 1024 * 1024)
             .expect("bulk transfer");
         let burst = simulator
             .route_interactive_burst(1024, 20, 5.0)
@@ -577,7 +574,7 @@ mod tests {
         );
 
         let transfer = simulator
-            .schedule_transfer(TrafficClass::Bulk, 32 * 1024 * 1024, 512 * 1024)
+            .schedule_transfer(FlowLane::Throughput, 32 * 1024 * 1024, 512 * 1024)
             .expect("bulk transfer");
 
         assert_between(transfer.bulk_tail_penalty_ms(), 0.0, 250.0);
@@ -593,7 +590,7 @@ mod tests {
         );
 
         let send = simulator
-            .route(TrafficClass::Control, 512)
+            .route(FlowLane::Control, 512)
             .expect("control route");
 
         assert_eq!(send.path_id, PathId(0));
@@ -616,7 +613,7 @@ mod tests {
         let send = simulator
             .route_flow(
                 FlowId(77),
-                TrafficClass::Bulk,
+                FlowLane::Throughput,
                 128 * 1024,
                 128 * 1024,
                 false,
@@ -624,7 +621,7 @@ mod tests {
             .expect("tail route");
 
         assert_eq!(send.mode, SchedulingMode::TailAvoidance);
-        assert_eq!(send.scheduled_class, TrafficClass::Interactive);
+        assert_eq!(send.scheduled_lane, FlowLane::Latency);
         assert_eq!(send.path_id, PathId(0));
     }
 
@@ -644,7 +641,7 @@ mod tests {
         );
 
         let send = simulator
-            .route(TrafficClass::Interactive, 1024)
+            .route(FlowLane::Latency, 1024)
             .expect("interactive route");
 
         assert_eq!(send.path_id, PathId(2));

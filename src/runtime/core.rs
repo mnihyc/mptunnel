@@ -271,24 +271,19 @@ impl ClientPathHealthRecord {
         });
     }
 
-    pub(super) fn mark_open_success(
-        &mut self,
-        elapsed: Duration,
-        load_bytes: u64,
-        class: TrafficClass,
-    ) {
+    pub(super) fn mark_open_success(&mut self, elapsed: Duration, load_bytes: u64, lane: FlowLane) {
         self.mark_success(elapsed);
         self.active_flows = self.active_flows.saturating_add(1);
-        if tcp_relay_expects_interactive_response(class) {
+        if tcp_relay_expects_interactive_response(lane) {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
         self.load_bytes = self.load_bytes.saturating_add(load_bytes);
     }
 
-    pub(super) fn reserve_load(&mut self, load_bytes: u64, class: TrafficClass) {
+    pub(super) fn reserve_load(&mut self, load_bytes: u64, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_add(1);
-        if tcp_relay_expects_interactive_response(class) {
+        if tcp_relay_expects_interactive_response(lane) {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
@@ -299,16 +294,16 @@ impl ClientPathHealthRecord {
         self.mark_success(elapsed);
     }
 
-    pub(super) fn release_load(&mut self, load_bytes: u64, class: TrafficClass) {
+    pub(super) fn release_load(&mut self, load_bytes: u64, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_sub(1);
-        if tcp_relay_expects_interactive_response(class) {
+        if tcp_relay_expects_interactive_response(lane) {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_sub(1);
         }
         self.load_bytes = self.load_bytes.saturating_sub(load_bytes);
     }
 
-    pub(super) fn reclassify_load(&mut self, from: TrafficClass, to: TrafficClass) {
+    pub(super) fn change_lane_load(&mut self, from: FlowLane, to: FlowLane) {
         if tcp_relay_expects_interactive_response(from)
             && !tcp_relay_expects_interactive_response(to)
         {
@@ -580,34 +575,34 @@ impl ClientPathContext {
 
     pub(super) fn ordered_tcp_path_indices(
         &self,
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<usize> {
-        let observations = self.tcp_health_observations_for_class(class);
+        let observations = self.tcp_health_observations_for_lane(lane);
         if reliable_stream_latency_startup_should_use_configured_order(
             &self.tcp_paths,
             &observations,
-            class,
+            lane,
         ) {
             return configured_order_path_indices(
                 &self.tcp_paths,
                 &observations,
-                class,
+                lane,
                 payload_bytes,
             );
         }
-        ordered_reliable_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
+        ordered_reliable_path_indices(&self.tcp_paths, &observations, lane, payload_bytes)
     }
 
     pub(super) fn reserve_tcp_stream_path(
         &self,
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
         excluded: &[usize],
     ) -> Option<usize> {
         let mut health = self.health.lock().expect("client path health lock");
         let mut observations = health_observations(&mut health.tcp);
-        apply_tcp_bulk_isolation(&mut observations, class, self.mux_limits);
+        apply_tcp_bulk_isolation(&mut observations, lane, self.mux_limits);
         let active_udp_work = health
             .udp
             .iter()
@@ -615,17 +610,17 @@ impl ClientPathContext {
         let indices = if endpoint_only_tcp_startup_should_spread_bulk_load(
             &self.tcp_paths,
             &observations,
-            class,
+            lane,
             active_udp_work,
         ) {
             endpoint_only_reliable_startup_path_indices(
                 &self.tcp_paths,
                 &observations,
-                class,
+                lane,
                 payload_bytes,
             )
         } else {
-            ordered_reliable_path_indices(&self.tcp_paths, &observations, class, payload_bytes)
+            ordered_reliable_path_indices(&self.tcp_paths, &observations, lane, payload_bytes)
         };
         let index = indices
             .into_iter()
@@ -633,11 +628,11 @@ impl ClientPathContext {
         health
             .tcp
             .get_mut(index)?
-            .reserve_load(TCP_STREAM_LOAD_BYTES, class);
+            .reserve_load(TCP_STREAM_LOAD_BYTES, lane);
         Some(index)
     }
 
-    pub(super) fn reserve_tcp_path_load(&self, index: usize, class: TrafficClass) {
+    pub(super) fn reserve_tcp_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .health
             .lock()
@@ -645,30 +640,30 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.reserve_load(TCP_STREAM_LOAD_BYTES, class);
+            current.reserve_load(TCP_STREAM_LOAD_BYTES, lane);
         }
     }
 
     pub(super) fn reserve_udp_stream_path(
         &self,
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
         excluded: &[usize],
     ) -> Option<usize> {
         let mut health = self.health.lock().expect("client path health lock");
         let observations = health_observations(&mut health.udp);
         let index =
-            ordered_reliable_path_indices(&self.udp_paths, &observations, class, payload_bytes)
+            ordered_reliable_path_indices(&self.udp_paths, &observations, lane, payload_bytes)
                 .into_iter()
                 .find(|index| !excluded.contains(index))?;
         health
             .udp
             .get_mut(index)?
-            .reserve_load(TCP_STREAM_LOAD_BYTES, class);
+            .reserve_load(TCP_STREAM_LOAD_BYTES, lane);
         Some(index)
     }
 
-    pub(super) fn reserve_udp_stream_path_load(&self, index: usize, class: TrafficClass) {
+    pub(super) fn reserve_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .health
             .lock()
@@ -676,23 +671,23 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.reserve_load(TCP_STREAM_LOAD_BYTES, class);
+            current.reserve_load(TCP_STREAM_LOAD_BYTES, lane);
         }
     }
 
     pub(super) fn ordered_tcp_repair_path_indices(
         &self,
         current_path_index: Option<usize>,
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<usize> {
         let scores = ordered_path_scores(
             &self.tcp_paths,
-            &self.tcp_health_observations_for_class(class),
-            class,
+            &self.tcp_health_observations_for_lane(lane),
+            lane,
             payload_bytes,
         );
-        if !matches!(class, TrafficClass::Bulk | TrafficClass::Background) {
+        if !matches!(lane, FlowLane::Throughput | FlowLane::Background) {
             return scores.into_iter().map(|(index, _)| index).collect();
         }
         let current_eta = current_path_index.and_then(|current_path_index| {
@@ -724,7 +719,7 @@ impl ClientPathContext {
     pub(super) fn ordered_udp_stream_repair_path_indices(
         &self,
         current_path_index: Option<usize>,
-        class: TrafficClass,
+        lane: FlowLane,
         payload_bytes: usize,
         require_delivery_evidence: bool,
     ) -> Vec<usize> {
@@ -733,11 +728,11 @@ impl ClientPathContext {
         let scores = if reliable_stream_latency_startup_should_use_configured_order(
             &self.udp_paths,
             &observations,
-            class,
+            lane,
         ) {
-            configured_order_path_scores(&self.udp_paths, &observations, class, payload_bytes)
+            configured_order_path_scores(&self.udp_paths, &observations, lane, payload_bytes)
         } else {
-            ordered_path_scores(&self.udp_paths, &observations, class, payload_bytes)
+            ordered_path_scores(&self.udp_paths, &observations, lane, payload_bytes)
         };
         scores
             .into_iter()
@@ -846,7 +841,7 @@ impl ClientPathContext {
             relay_path_snapshot(self, key).and_then(|snapshot| {
                 scheduler::score_path(
                     snapshot,
-                    TrafficClass::Bulk,
+                    FlowLane::Throughput,
                     payload_bytes,
                     SchedulerPolicy::default(),
                 )
@@ -861,7 +856,7 @@ impl ClientPathContext {
         current_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<(usize, f64)> {
-        let observations = self.tcp_health_observations_for_class(TrafficClass::Bulk);
+        let observations = self.tcp_health_observations_for_lane(FlowLane::Throughput);
         let any_measured_delivery = observations
             .iter()
             .any(|observation| observation.measured_rate_bps.is_some());
@@ -871,7 +866,7 @@ impl ClientPathContext {
         let scores = ordered_path_scores(
             &self.tcp_paths,
             &observations,
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             payload_bytes,
         );
         reliable_auto_bulk_discovery_scores(
@@ -905,7 +900,7 @@ impl ClientPathContext {
         let scores = ordered_path_scores(
             &self.udp_paths,
             &observations,
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             payload_bytes,
         );
         let candidate_is_allowed: fn(&PathSpec, ClientPathObservation) -> bool =
@@ -931,13 +926,13 @@ impl ClientPathContext {
             .any(|observation| observation.active_flows > 0 || observation.load_bytes > 0)
     }
 
-    pub(super) fn tcp_health_observations_for_class(
+    pub(super) fn tcp_health_observations_for_lane(
         &self,
-        class: TrafficClass,
+        lane: FlowLane,
     ) -> Vec<ClientPathObservation> {
         let mut observations =
             health_observations(&mut self.health.lock().expect("client path health lock").tcp);
-        apply_tcp_bulk_isolation(&mut observations, class, self.mux_limits);
+        apply_tcp_bulk_isolation(&mut observations, lane, self.mux_limits);
         observations
     }
 
@@ -984,7 +979,7 @@ impl ClientPathContext {
             return configured_order_path_indices(
                 &self.udp_paths,
                 &observations,
-                TrafficClass::RealtimeDatagram,
+                FlowLane::RealtimeDatagram,
                 payload_bytes,
             )
             .into_iter()
@@ -993,7 +988,7 @@ impl ClientPathContext {
                 let observation = observations.get(path_index).copied()?;
                 let eta_ms = scheduler::score_path(
                     path_snapshot(path, path_index, observation),
-                    TrafficClass::RealtimeDatagram,
+                    FlowLane::RealtimeDatagram,
                     payload_bytes,
                     SchedulerPolicy::default(),
                 )?
@@ -1006,7 +1001,7 @@ impl ClientPathContext {
         let mut candidates = ordered_path_scores_for_ttl(
             &self.udp_paths,
             &observations,
-            TrafficClass::RealtimeDatagram,
+            FlowLane::RealtimeDatagram,
             payload_bytes,
             ttl_ms,
         )
@@ -1064,7 +1059,7 @@ impl ClientPathContext {
         }
         let score = scheduler::score_path(
             path_snapshot(path, index, observation),
-            TrafficClass::RealtimeDatagram,
+            FlowLane::RealtimeDatagram,
             payload_bytes,
             SchedulerPolicy::default(),
         )?;
@@ -1091,7 +1086,7 @@ impl ClientPathContext {
         let snapshot = path_snapshot(path, index, observation);
         scheduler::score_path(
             snapshot,
-            TrafficClass::RealtimeDatagram,
+            FlowLane::RealtimeDatagram,
             1,
             SchedulerPolicy::default(),
         )?;
@@ -1108,7 +1103,7 @@ impl ClientPathContext {
         &self,
         index: usize,
         elapsed: Duration,
-        class: TrafficClass,
+        lane: FlowLane,
     ) {
         if let Some(current) = self
             .health
@@ -1117,7 +1112,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_open_success(elapsed, TCP_STREAM_LOAD_BYTES, class);
+            current.mark_open_success(elapsed, TCP_STREAM_LOAD_BYTES, lane);
         }
     }
 
@@ -1156,7 +1151,7 @@ impl ClientPathContext {
             })
     }
 
-    pub(super) fn release_tcp_path_load(&self, index: usize, class: TrafficClass) {
+    pub(super) fn release_tcp_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .health
             .lock()
@@ -1164,7 +1159,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.release_load(TCP_STREAM_LOAD_BYTES, class);
+            current.release_load(TCP_STREAM_LOAD_BYTES, lane);
         }
     }
 
@@ -1180,7 +1175,7 @@ impl ClientPathContext {
         }
     }
 
-    pub(super) fn release_udp_stream_path_load(&self, index: usize, class: TrafficClass) {
+    pub(super) fn release_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .health
             .lock()
@@ -1188,7 +1183,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.release_load(TCP_STREAM_LOAD_BYTES, class);
+            current.release_load(TCP_STREAM_LOAD_BYTES, lane);
         }
     }
 
@@ -1203,20 +1198,20 @@ impl ClientPathContext {
         &self,
         underlay: UnderlayProtocol,
         index: usize,
-        class: TrafficClass,
+        lane: FlowLane,
     ) {
         match underlay {
-            UnderlayProtocol::Tcp => self.release_tcp_path_load(index, class),
-            UnderlayProtocol::Udp => self.release_udp_stream_path_load(index, class),
+            UnderlayProtocol::Tcp => self.release_tcp_path_load(index, lane),
+            UnderlayProtocol::Udp => self.release_udp_stream_path_load(index, lane),
         }
     }
 
-    pub(super) fn reclassify_relay_path_load(
+    pub(super) fn change_relay_path_lane_load(
         &self,
         underlay: UnderlayProtocol,
         index: usize,
-        from: TrafficClass,
-        to: TrafficClass,
+        from: FlowLane,
+        to: FlowLane,
     ) {
         if from == to {
             return;
@@ -1225,12 +1220,12 @@ impl ClientPathContext {
         match underlay {
             UnderlayProtocol::Tcp => {
                 if let Some(current) = health.tcp.get_mut(index) {
-                    current.reclassify_load(from, to);
+                    current.change_lane_load(from, to);
                 }
             }
             UnderlayProtocol::Udp => {
                 if let Some(current) = health.udp.get_mut(index) {
-                    current.reclassify_load(from, to);
+                    current.change_lane_load(from, to);
                 }
             }
         }
@@ -1281,11 +1276,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.mark_open_success(
-                elapsed,
-                UDP_SESSION_LOAD_BYTES,
-                TrafficClass::RealtimeDatagram,
-            );
+            current.mark_open_success(elapsed, UDP_SESSION_LOAD_BYTES, FlowLane::RealtimeDatagram);
         }
     }
 
@@ -1320,7 +1311,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.release_load(UDP_SESSION_LOAD_BYTES, TrafficClass::RealtimeDatagram);
+            current.release_load(UDP_SESSION_LOAD_BYTES, FlowLane::RealtimeDatagram);
         }
     }
 
@@ -1477,10 +1468,10 @@ pub(super) fn path_observation_is_idle_for_probe(observation: ClientPathObservat
 
 pub(super) fn apply_tcp_bulk_isolation(
     observations: &mut [ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     mux_limits: MuxLimits,
 ) {
-    if !matches!(class, TrafficClass::Bulk | TrafficClass::Background) {
+    if !matches!(lane, FlowLane::Throughput | FlowLane::Background) {
         return;
     }
     if !observations
@@ -1490,7 +1481,7 @@ pub(super) fn apply_tcp_bulk_isolation(
         return;
     }
     let isolation_bytes =
-        adaptive_tcp_relay_inflight_bytes(None, TrafficClass::Interactive, mux_limits) as u64;
+        adaptive_tcp_relay_inflight_bytes(None, FlowLane::Latency, mux_limits) as u64;
     for observation in observations {
         let latency_flows = u64::from(observation.active_latency_sensitive_flows);
         observation.load_bytes = observation
@@ -1502,9 +1493,9 @@ pub(super) fn apply_tcp_bulk_isolation(
 pub(super) fn reliable_stream_latency_startup_should_use_configured_order(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
 ) -> bool {
-    tcp_relay_expects_interactive_response(class)
+    tcp_relay_expects_interactive_response(lane)
         && paths.iter().all(path_is_endpoint_only)
         && (!endpoint_only_startup_has_latency_sensitive_load(observations)
             || endpoint_only_startup_has_bulk_load(observations))
@@ -1513,9 +1504,9 @@ pub(super) fn reliable_stream_latency_startup_should_use_configured_order(
 pub(super) fn reliable_stream_latency_startup_should_use_load_balanced_order(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
 ) -> bool {
-    tcp_relay_expects_interactive_response(class)
+    tcp_relay_expects_interactive_response(lane)
         && paths.iter().all(path_is_endpoint_only)
         && endpoint_only_startup_has_latency_sensitive_load(observations)
         && !endpoint_only_startup_has_bulk_load(observations)
@@ -1544,10 +1535,10 @@ pub(super) fn endpoint_only_startup_has_bulk_load(observations: &[ClientPathObse
 pub(super) fn endpoint_only_tcp_startup_should_spread_bulk_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     active_udp_work: bool,
 ) -> bool {
-    tcp_relay_expects_interactive_response(class)
+    tcp_relay_expects_interactive_response(lane)
         && paths.iter().all(path_is_endpoint_only)
         && endpoint_only_startup_has_any_load(observations)
         && endpoint_only_startup_has_bulk_load(observations)
@@ -1558,27 +1549,27 @@ pub(super) fn endpoint_only_tcp_startup_should_spread_bulk_load(
 pub(super) fn ordered_reliable_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
-    if reliable_stream_latency_startup_should_use_configured_order(paths, observations, class) {
-        return configured_order_path_indices(paths, observations, class, payload_bytes);
+    if reliable_stream_latency_startup_should_use_configured_order(paths, observations, lane) {
+        return configured_order_path_indices(paths, observations, lane, payload_bytes);
     }
-    if reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, class) {
+    if reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, lane) {
         return endpoint_only_reliable_startup_path_indices(
             paths,
             observations,
-            class,
+            lane,
             payload_bytes,
         );
     }
-    ordered_path_indices(paths, observations, class, payload_bytes)
+    ordered_path_indices(paths, observations, lane, payload_bytes)
 }
 
 pub(super) fn endpoint_only_reliable_startup_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
     let observations = observations
@@ -1593,7 +1584,7 @@ pub(super) fn endpoint_only_reliable_startup_path_indices(
             ..observation
         })
         .collect::<Vec<_>>();
-    ordered_path_indices(paths, &observations, class, payload_bytes)
+    ordered_path_indices(paths, &observations, lane, payload_bytes)
 }
 
 pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {
@@ -1606,10 +1597,10 @@ pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {
 pub(super) fn configured_order_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
-    configured_order_path_scores(paths, observations, class, payload_bytes)
+    configured_order_path_scores(paths, observations, lane, payload_bytes)
         .into_iter()
         .map(|(index, _)| index)
         .collect()
@@ -1618,7 +1609,7 @@ pub(super) fn configured_order_path_indices(
 pub(super) fn configured_order_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
     paths
@@ -1641,7 +1632,7 @@ pub(super) fn configured_order_path_scores(
                 });
             scheduler::score_path(
                 path_snapshot(path, index, observation),
-                class,
+                lane,
                 payload_bytes,
                 SchedulerPolicy::default(),
             )
@@ -1653,10 +1644,10 @@ pub(super) fn configured_order_path_scores(
 pub(super) fn ordered_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
-    ordered_path_scores(paths, observations, class, payload_bytes)
+    ordered_path_scores(paths, observations, lane, payload_bytes)
         .into_iter()
         .map(|(index, _)| index)
         .collect()
@@ -1665,11 +1656,11 @@ pub(super) fn ordered_path_indices(
 pub(super) fn ordered_path_scores_for_ttl(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
     ttl_ms: u32,
 ) -> Vec<(usize, f64)> {
-    let scores = ordered_path_scores(paths, observations, class, payload_bytes);
+    let scores = ordered_path_scores(paths, observations, lane, payload_bytes);
     let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
     scores
         .iter()
@@ -1681,7 +1672,7 @@ pub(super) fn ordered_path_scores_for_ttl(
 pub(super) fn ordered_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    class: TrafficClass,
+    lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
     let mut scores = paths
@@ -1704,7 +1695,7 @@ pub(super) fn ordered_path_scores(
                 });
             scheduler::score_path(
                 path_snapshot(path, index, observation),
-                class,
+                lane,
                 payload_bytes,
                 SchedulerPolicy::default(),
             )

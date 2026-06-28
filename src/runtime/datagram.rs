@@ -181,7 +181,7 @@ impl TcpDatagramClientAssociation {
             return Err(RuntimeError::NoTcpPath);
         }
         let candidates = context.ordered_tcp_path_indices(
-            TrafficClass::RealtimeDatagram,
+            FlowLane::RealtimeDatagram,
             payload_bytes.max(PATH_OPEN_SCORE_BYTES),
         );
         if candidates.is_empty() {
@@ -195,7 +195,7 @@ impl TcpDatagramClientAssociation {
                     context.mark_tcp_path_open_success(
                         path_index,
                         started_at.elapsed(),
-                        TrafficClass::RealtimeDatagram,
+                        FlowLane::RealtimeDatagram,
                     );
                     return Ok(Self { context, session });
                 }
@@ -249,7 +249,7 @@ impl TcpDatagramClientAssociation {
         self.context
             .mark_tcp_path_delivery(self.session.path_index, self.session.delivery_stats());
         self.context
-            .release_tcp_path_load(self.session.path_index, TrafficClass::RealtimeDatagram);
+            .release_tcp_path_load(self.session.path_index, FlowLane::RealtimeDatagram);
         close_result
     }
 }
@@ -445,7 +445,6 @@ impl TcpDatagramClientSession {
                 target: target.clone(),
                 ingress: IngressKind::Socks5,
                 outbound: OutboundPolicy::Direct,
-                class: TrafficClass::RealtimeDatagram,
             })
             .await?;
         self.connection.writer.flush().await?;
@@ -1458,7 +1457,6 @@ impl UdpDatagramClientSession {
                 target: target.clone(),
                 ingress: IngressKind::Socks5,
                 outbound: OutboundPolicy::Direct,
-                class: TrafficClass::RealtimeDatagram,
             },
             self.stream.runtime.codec_limits,
         )

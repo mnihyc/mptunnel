@@ -38,7 +38,7 @@ async fn path_probe_skips_tcp_path_with_active_stream_load() {
     let path = reserve_tcp_path().await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    context.mark_tcp_path_open_success(0, Duration::from_millis(5), TrafficClass::Bulk);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(5), FlowLane::Throughput);
 
     probe_client_paths(&context, Duration::from_millis(20)).await;
 
@@ -81,7 +81,7 @@ async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     }
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+            .ordered_tcp_path_indices(FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(0)
@@ -97,7 +97,7 @@ async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     }
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+            .ordered_tcp_path_indices(FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(0)

@@ -26,7 +26,7 @@ fn mixed_auto_bulk_discovery_probes_unmeasured_endpoint_only_udp_under_udp_press
             )
             .is_empty()
     );
-    context.reserve_udp_stream_path_load(0, TrafficClass::RealtimeDatagram);
+    context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
 
     assert_eq!(
         context.ordered_reliable_auto_bulk_discovery_path_keys(
@@ -567,19 +567,19 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(1), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(1), FlowLane::Latency);
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+            .ordered_tcp_path_indices(FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(1)
     );
 
-    context.release_tcp_path_load(0, TrafficClass::Interactive);
+    context.release_tcp_path_load(0, FlowLane::Latency);
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+            .ordered_tcp_path_indices(FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(0)
@@ -604,7 +604,7 @@ fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     context.mark_tcp_path_delivery(
         1,
         PathDeliveryStats {
@@ -616,14 +616,14 @@ fn active_interactive_tcp_flow_pushes_bulk_to_other_path() {
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Bulk, 4 * 1024 * 1024)
+            .ordered_tcp_path_indices(FlowLane::Throughput, 4 * 1024 * 1024)
             .first()
             .copied(),
         Some(1)
     );
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES)
+            .ordered_tcp_path_indices(FlowLane::Latency, PATH_OPEN_SCORE_BYTES)
             .first()
             .copied(),
         Some(0)
@@ -647,7 +647,7 @@ fn endpoint_only_tcp_startup_preserves_configured_order_on_equal_scores() {
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES)
+            .ordered_tcp_path_indices(FlowLane::Latency, PATH_OPEN_SCORE_BYTES)
             .first()
             .copied(),
         Some(0)
@@ -673,13 +673,13 @@ fn endpoint_only_tcp_realtime_datagrams_preserve_configured_order() {
     context.mark_tcp_path_probe_success(1, Duration::from_millis(1));
 
     assert_eq!(
-        context.ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, PATH_OPEN_SCORE_BYTES),
+        context.ordered_tcp_path_indices(FlowLane::RealtimeDatagram, PATH_OPEN_SCORE_BYTES),
         vec![0, 1]
     );
 
     context.mark_tcp_path_failure(0);
     assert_eq!(
-        context.ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, PATH_OPEN_SCORE_BYTES),
+        context.ordered_tcp_path_indices(FlowLane::RealtimeDatagram, PATH_OPEN_SCORE_BYTES),
         vec![1]
     );
 }
@@ -703,13 +703,13 @@ fn endpoint_only_tcp_startup_validates_order_before_noisy_probe_scores() {
     context.mark_tcp_path_probe_success(1, Duration::from_millis(1));
 
     assert_eq!(
-        context.ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        context.ordered_tcp_path_indices(FlowLane::Latency, PATH_OPEN_SCORE_BYTES),
         vec![0, 1]
     );
 
     context.mark_tcp_path_failure(0);
     assert_eq!(
-        context.ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        context.ordered_tcp_path_indices(FlowLane::Latency, PATH_OPEN_SCORE_BYTES),
         vec![1]
     );
 }
@@ -732,11 +732,11 @@ fn endpoint_only_tcp_interactive_opens_spread_active_load_without_probe_noise() 
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
     assert_eq!(
-        context.ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        context.ordered_tcp_path_indices(FlowLane::Latency, PATH_OPEN_SCORE_BYTES),
         vec![1, 2, 0]
     );
 }
@@ -762,10 +762,10 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
     let first = context
-        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("first reservation");
     let second = context
-        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("second reservation");
 
     assert_eq!(first, 0);
@@ -773,8 +773,8 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
 
     context.mark_tcp_path_reserved_open_success(first, Duration::from_millis(20));
     context.mark_tcp_path_reserved_open_success(second, Duration::from_millis(80));
-    context.release_tcp_path_load(first, TrafficClass::Interactive);
-    context.release_tcp_path_load(second, TrafficClass::Interactive);
+    context.release_tcp_path_load(first, FlowLane::Latency);
+    context.release_tcp_path_load(second, FlowLane::Latency);
 
     let health = context.health.lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
@@ -798,16 +798,16 @@ fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
-    context.reclassify_relay_path_load(
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
+    context.change_relay_path_lane_load(
         UnderlayProtocol::Tcp,
         0,
-        TrafficClass::Interactive,
-        TrafficClass::Bulk,
+        FlowLane::Latency,
+        FlowLane::Throughput,
     );
 
     let reserved = context
-        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
     assert_eq!(reserved, 1);
 }
@@ -830,17 +830,17 @@ fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
-    context.reclassify_relay_path_load(
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
+    context.change_relay_path_lane_load(
         UnderlayProtocol::Tcp,
         0,
-        TrafficClass::Interactive,
-        TrafficClass::Bulk,
+        FlowLane::Latency,
+        FlowLane::Throughput,
     );
     context.mark_udp_path_open_success(0, Duration::from_millis(30));
 
     let reserved = context
-        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
     assert_eq!(reserved, 0);
 }
@@ -860,17 +860,17 @@ fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_late
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
-    context.reclassify_relay_path_load(
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
+    context.change_relay_path_lane_load(
         UnderlayProtocol::Tcp,
         0,
-        TrafficClass::Interactive,
-        TrafficClass::Bulk,
+        FlowLane::Latency,
+        FlowLane::Throughput,
     );
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
 
     let reserved = context
-        .reserve_tcp_stream_path(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
     assert_eq!(reserved, 0);
 }
@@ -892,7 +892,7 @@ fn hinted_tcp_startup_uses_configured_metrics_before_order() {
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES)
+            .ordered_tcp_path_indices(FlowLane::Latency, PATH_OPEN_SCORE_BYTES)
             .first()
             .copied(),
         Some(1)

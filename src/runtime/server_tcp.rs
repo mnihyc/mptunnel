@@ -120,7 +120,6 @@ pub(super) async fn handle_server_path(
                 Frame::OpenStream {
                     stream_id,
                     target,
-                    class,
                     role,
                     ..
                 } if !draining => {
@@ -131,7 +130,7 @@ pub(super) async fn handle_server_path(
                             session_id,
                             stream_id,
                             target: &target,
-                            class,
+                            lane: FlowLane::Latency,
                             attachment: ServerTcpPathAttachment {
                                 path_id,
                                 underlay: UnderlayProtocol::Tcp,

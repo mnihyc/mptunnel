@@ -14,10 +14,10 @@ pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{
     AuthNonce, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
     OutboundPolicy, PathCapabilities, PathId, RateHint, ResetReason, SessionId, StreamFlags,
-    StreamId, StreamOpenRole, TargetAddr, TrafficClass, UnderlayProtocol,
+    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
 pub(super) use crate::scheduler::{
-    self, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
+    self, FlowDemand, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };
 pub(super) use crate::transport::PathSpec;
 pub(super) use crate::transport::encrypted::{

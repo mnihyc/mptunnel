@@ -106,7 +106,7 @@ where
                 &context,
                 target.clone(),
                 IngressKind::Socks5,
-                TrafficClass::Interactive,
+                FlowLane::Latency,
             )
             .await
             {
@@ -181,7 +181,7 @@ where
         &context,
         target.clone(),
         IngressKind::HttpConnect,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
     )
     .await
     {

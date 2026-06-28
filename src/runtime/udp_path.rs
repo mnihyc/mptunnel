@@ -28,7 +28,7 @@ impl ClientUdpPathSessionHandle {
         stream_id: StreamId,
         target: TargetAddr,
         ingress: IngressKind,
-        class: TrafficClass,
+        lane: FlowLane,
         role: StreamOpenRole,
     ) -> Result<TcpPathStream, RuntimeError> {
         let connection = self.ensure_connection().await?;
@@ -37,7 +37,7 @@ impl ClientUdpPathSessionHandle {
             stream_id,
             target.clone(),
             ingress,
-            class,
+            lane,
             role,
             self.runtime.clone(),
         )
@@ -52,7 +52,7 @@ impl ClientUdpPathSessionHandle {
                     stream_id,
                     target,
                     ingress,
-                    class,
+                    lane,
                     role,
                     self.runtime.clone(),
                 )
@@ -228,7 +228,7 @@ async fn open_client_udp_stream_on_connection(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
     role: StreamOpenRole,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<TcpPathStream, RuntimeError> {
@@ -238,7 +238,6 @@ async fn open_client_udp_stream_on_connection(
         target,
         ingress,
         outbound: OutboundPolicy::Direct,
-        class,
         role,
     };
     udp_carrier::write_frame(&mut send, &open, runtime.codec_limits).await?;
@@ -276,7 +275,7 @@ async fn open_client_udp_stream_on_connection(
     Ok(TcpPathStream {
         stream_id,
         max_offset,
-        class,
+        lane,
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: udp_carrier::max_stream_payload_bytes(
             runtime.codec_limits,
@@ -528,7 +527,6 @@ async fn handle_server_udp_bidi_stream(
         Frame::OpenStream {
             stream_id,
             target,
-            class,
             role,
             ..
         } => {
@@ -542,17 +540,14 @@ async fn handle_server_udp_bidi_stream(
                     capabilities,
                     stream_id,
                     target,
-                    class,
+                    lane: FlowLane::Latency,
                     role,
                 },
             )
             .await
         }
         Frame::OpenDatagramFlow {
-            flow_id,
-            target,
-            class,
-            ..
+            flow_id, target, ..
         } => {
             handle_server_udp_datagram_stream(
                 send,
@@ -561,7 +556,7 @@ async fn handle_server_udp_bidi_stream(
                 ServerUdpDatagramStreamContext {
                     flow_id,
                     target,
-                    class,
+                    lane: FlowLane::RealtimeDatagram,
                 },
             )
             .await
@@ -584,7 +579,7 @@ struct ServerUdpReliableStreamContext {
     capabilities: PathCapabilities,
     stream_id: StreamId,
     target: TargetAddr,
-    class: TrafficClass,
+    lane: FlowLane,
     role: StreamOpenRole,
 }
 
@@ -600,7 +595,7 @@ async fn handle_server_udp_reliable_stream(
         capabilities,
         stream_id,
         target,
-        class,
+        lane,
         role,
     } = stream_context;
     outbound::validate_target(&target)?;
@@ -612,7 +607,7 @@ async fn handle_server_udp_reliable_stream(
             session_id,
             stream_id,
             target: &target,
-            class,
+            lane,
             attachment: ServerTcpPathAttachment {
                 path_id,
                 underlay: UnderlayProtocol::Udp,
@@ -787,7 +782,7 @@ async fn run_server_udp_reliable_stream_loop(
 struct ServerUdpDatagramStreamContext {
     flow_id: DatagramFlowId,
     target: TargetAddr,
-    class: TrafficClass,
+    lane: FlowLane,
 }
 
 async fn handle_server_udp_datagram_stream(
@@ -812,7 +807,7 @@ async fn handle_server_udp_datagram_stream(
         &mut flows,
         stream_context.flow_id,
         stream_context.target,
-        stream_context.class,
+        stream_context.lane,
     )
     .await?;
     loop {
@@ -820,7 +815,7 @@ async fn handle_server_udp_datagram_stream(
         tokio::select! {
             frame = carrier_frames.recv() => {
                 match frame {
-                    Some(Ok(Frame::OpenDatagramFlow { flow_id, target, class, .. })) => {
+                    Some(Ok(Frame::OpenDatagramFlow { flow_id, target, .. })) => {
                         open_server_udp_datagram_flow(
                             &context,
                             &commands_tx,
@@ -828,7 +823,7 @@ async fn handle_server_udp_datagram_stream(
                             &mut flows,
                             flow_id,
                             target,
-                            class,
+                            FlowLane::RealtimeDatagram,
                         ).await?;
                     }
                     Some(Ok(Frame::DatagramData { flow_id, datagram_id, ttl_ms, payload })) => {
@@ -912,7 +907,7 @@ async fn open_server_udp_datagram_flow(
     flows: &mut Vec<ServerUdpDatagramFlow>,
     flow_id: DatagramFlowId,
     target: TargetAddr,
-    _class: TrafficClass,
+    _lane: FlowLane,
 ) -> Result<(), RuntimeError> {
     if flows.iter().any(|flow| flow.flow_id == flow_id) {
         return Err(RuntimeError::Protocol(

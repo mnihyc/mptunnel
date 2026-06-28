@@ -60,7 +60,7 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                         Err(err) => {
                             eprintln!("warning: UDP outbound receive failed: {err}");
                             let _ = commands
-                                .send_frame(Frame::DatagramClose { flow_id }, TrafficClass::RealtimeDatagram)
+                                .send_frame(Frame::DatagramClose { flow_id }, FlowLane::RealtimeDatagram)
                                 .await;
                             break;
                         }
@@ -77,7 +77,7 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                         payload: Bytes::copy_from_slice(&response_buffer[..len]),
                     };
                     if commands
-                        .send_frame(frame, TrafficClass::RealtimeDatagram)
+                        .send_frame(frame, FlowLane::RealtimeDatagram)
                         .await
                         .is_err()
                     {
@@ -171,9 +171,7 @@ fn frame_subject(frame: &Frame) -> String {
         Frame::PathClose { path_id, reason } => {
             format!("path_id={} reason={reason:?}", path_id.0)
         }
-        Frame::OpenStream {
-            stream_id, class, ..
-        } => format!("stream_id={} class={class:?}", stream_id.0),
+        Frame::OpenStream { stream_id, .. } => format!("stream_id={}", stream_id.0),
         Frame::StreamData {
             stream_id,
             offset,
@@ -198,9 +196,7 @@ fn frame_subject(frame: &Frame) -> String {
         Frame::StreamReset { stream_id, reason } => {
             format!("stream_id={} reason={reason:?}", stream_id.0)
         }
-        Frame::OpenDatagramFlow { flow_id, class, .. } => {
-            format!("flow_id={} class={class:?}", flow_id.0)
-        }
+        Frame::OpenDatagramFlow { flow_id, .. } => format!("flow_id={}", flow_id.0),
         Frame::DatagramData {
             flow_id,
             datagram_id,

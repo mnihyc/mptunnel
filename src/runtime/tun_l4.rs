@@ -90,7 +90,7 @@ where
         &context,
         target.clone(),
         IngressKind::TunTcp,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
     )
     .await?;
     relay_migrating_tcp_stream(

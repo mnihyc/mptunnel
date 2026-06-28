@@ -1,7 +1,7 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
     OutboundPolicy, PathCapabilities, PathId, PathMetrics, PathStatus, RateHint, ResetReason,
-    SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr, TrafficClass, UnderlayProtocol,
+    SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -228,14 +228,12 @@ fn encode_payload(
             target,
             ingress,
             outbound,
-            class,
             role,
         } => {
             put_u64(out, stream_id.0);
             encode_target(out, target, limits)?;
             put_u8(out, ingress_to_u8(*ingress));
             encode_outbound(out, outbound, limits)?;
-            put_u8(out, traffic_class_to_u8(*class));
             put_u8(out, stream_open_role_to_u8(*role));
             Ok(FrameKind::OpenStream)
         }
@@ -304,13 +302,11 @@ fn encode_payload(
             target,
             ingress,
             outbound,
-            class,
         } => {
             put_u64(out, flow_id.0);
             encode_target(out, target, limits)?;
             put_u8(out, ingress_to_u8(*ingress));
             encode_outbound(out, outbound, limits)?;
-            put_u8(out, traffic_class_to_u8(*class));
             Ok(FrameKind::OpenDatagramFlow)
         }
         Frame::DatagramData {
@@ -433,7 +429,6 @@ fn decode_payload(
             target: decode_target(reader, limits)?,
             ingress: ingress_from_u8(reader.get_u8()?)?,
             outbound: decode_outbound(reader, limits)?,
-            class: traffic_class_from_u8(reader.get_u8()?)?,
             role: stream_open_role_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::StreamData => {
@@ -488,7 +483,6 @@ fn decode_payload(
             target: decode_target(reader, limits)?,
             ingress: ingress_from_u8(reader.get_u8()?)?,
             outbound: decode_outbound(reader, limits)?,
-            class: traffic_class_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::DatagramData => {
             let flow_id = DatagramFlowId(reader.get_u64()?);
@@ -1061,27 +1055,6 @@ fn ingress_from_u8(value: u8) -> Result<IngressKind, CodecError> {
     }
 }
 
-fn traffic_class_to_u8(value: TrafficClass) -> u8 {
-    match value {
-        TrafficClass::Control => 1,
-        TrafficClass::Interactive => 2,
-        TrafficClass::Bulk => 3,
-        TrafficClass::RealtimeDatagram => 4,
-        TrafficClass::Background => 5,
-    }
-}
-
-fn traffic_class_from_u8(value: u8) -> Result<TrafficClass, CodecError> {
-    match value {
-        1 => Ok(TrafficClass::Control),
-        2 => Ok(TrafficClass::Interactive),
-        3 => Ok(TrafficClass::Bulk),
-        4 => Ok(TrafficClass::RealtimeDatagram),
-        5 => Ok(TrafficClass::Background),
-        _ => Err(CodecError::InvalidEnum),
-    }
-}
-
 fn stream_open_role_to_u8(value: StreamOpenRole) -> u8 {
     match value {
         StreamOpenRole::Active => 1,
@@ -1218,7 +1191,6 @@ mod tests {
             },
             ingress: IngressKind::Socks5,
             outbound: OutboundPolicy::Direct,
-            class: TrafficClass::Interactive,
             role: StreamOpenRole::Active,
         });
         round_trip(Frame::StreamData {
@@ -1255,7 +1227,6 @@ mod tests {
             outbound: OutboundPolicy::Socks5 {
                 proxy: "127.0.0.1:1080".parse().expect("proxy"),
             },
-            class: TrafficClass::RealtimeDatagram,
         });
         let data = Frame::DatagramData {
             flow_id: DatagramFlowId(9),

@@ -40,15 +40,6 @@ pub enum IngressKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrafficClass {
-    Control,
-    Interactive,
-    Bulk,
-    RealtimeDatagram,
-    Background,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOpenRole {
     Active,
     Repair,
@@ -285,7 +276,6 @@ pub enum Frame {
         target: TargetAddr,
         ingress: IngressKind,
         outbound: OutboundPolicy,
-        class: TrafficClass,
         role: StreamOpenRole,
     },
     StreamData {
@@ -318,7 +308,6 @@ pub enum Frame {
         target: TargetAddr,
         ingress: IngressKind,
         outbound: OutboundPolicy,
-        class: TrafficClass,
     },
     DatagramData {
         flow_id: DatagramFlowId,

@@ -22,18 +22,18 @@ fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSession
 #[tokio::test]
 async fn tcp_path_latency_lane_reuse_depends_on_topology() {
     let single_path = ClientTcpPathSessionHandle::new(test_tcp_session_runtime(false));
-    let first_single = single_path.ensure_session(TrafficClass::Interactive);
-    let second_single = single_path.ensure_session(TrafficClass::Interactive);
+    let first_single = single_path.ensure_session(FlowLane::Latency);
+    let second_single = single_path.ensure_session(FlowLane::Latency);
     assert!(!first_single.same_channel(&second_single));
 
     let multipath = ClientTcpPathSessionHandle::new(test_tcp_session_runtime(true));
-    let first_latency = multipath.ensure_session(TrafficClass::Interactive);
-    let second_latency = multipath.ensure_session(TrafficClass::Interactive);
-    let realtime_latency = multipath.ensure_session(TrafficClass::RealtimeDatagram);
+    let first_latency = multipath.ensure_session(FlowLane::Latency);
+    let second_latency = multipath.ensure_session(FlowLane::Latency);
+    let realtime_latency = multipath.ensure_session(FlowLane::RealtimeDatagram);
     assert!(first_latency.same_channel(&second_latency));
     assert!(first_latency.same_channel(&realtime_latency));
 
-    let bulk = multipath.ensure_session(TrafficClass::Bulk);
+    let bulk = multipath.ensure_session(FlowLane::Throughput);
     assert!(!first_latency.same_channel(&bulk));
 }
 
@@ -47,7 +47,7 @@ async fn tcp_path_control_command_bypasses_saturated_data_queue() {
             flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"queued-data"),
         },
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
     )
     .await
     .expect("fill data queue");
@@ -76,7 +76,7 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
             flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
     )
     .await
     .expect("fill bulk data queue");
@@ -90,7 +90,7 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
                 flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"i"),
             },
-            TrafficClass::Interactive,
+            FlowLane::Latency,
         ),
     )
     .await
@@ -118,7 +118,7 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
             flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
     )
     .await
     .expect("fill bulk output command queue");
@@ -211,7 +211,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
                 session_id,
                 stream_id,
                 target: &target,
-                class: TrafficClass::Interactive,
+                lane: FlowLane::Latency,
                 attachment: ServerTcpPathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
@@ -265,22 +265,18 @@ async fn server_tcp_binding_reselects_blocked_data_send_after_path_update() {
                 flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"fill"),
             },
-            TrafficClass::Interactive,
+            FlowLane::Latency,
         )
         .await
         .expect("fill old path priority command queue");
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        old_tx,
-        TrafficClass::Interactive,
-    );
+    let binding =
+        ServerTcpStreamBinding::new(UnderlayProtocol::Tcp, PathId(0), old_tx, FlowLane::Latency);
     let send_binding = binding.clone();
     let send_task = tokio::spawn(async move {
         send_binding
             .send_frame(
                 StreamId(7),
-                TrafficClass::Bulk,
+                FlowLane::Throughput,
                 Frame::StreamData {
                     stream_id: StreamId(7),
                     offset: 0,
@@ -298,10 +294,10 @@ async fn server_tcp_binding_reselects_blocked_data_send_after_path_update() {
         UnderlayProtocol::Tcp,
         PathId(1),
         new_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         StreamOpenRole::Active,
     );
-    assert_eq!(binding.class(), TrafficClass::Bulk);
+    assert_eq!(binding.lane(), FlowLane::Throughput);
     send_task
         .await
         .expect("binding send join")
@@ -327,14 +323,14 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_initial_tx,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
     );
     let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
     binding.attach(
         UnderlayProtocol::Tcp,
         PathId(1),
         path1_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         StreamOpenRole::Active,
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
@@ -342,14 +338,14 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_repair_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         StreamOpenRole::Active,
     );
 
     binding
         .send_frame(
             StreamId(7),
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             Frame::StreamData {
                 stream_id: StreamId(7),
                 offset: 0,
@@ -386,14 +382,14 @@ async fn server_tcp_binding_bulk_repair_reattach_promotes_for_throughput() {
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_initial_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
     );
     let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
     binding.attach(
         UnderlayProtocol::Tcp,
         PathId(1),
         path1_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         StreamOpenRole::Active,
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
@@ -401,14 +397,14 @@ async fn server_tcp_binding_bulk_repair_reattach_promotes_for_throughput() {
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_repair_tx,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         StreamOpenRole::Repair,
     );
 
     binding
         .send_frame(
             StreamId(7),
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             Frame::StreamData {
                 stream_id: StreamId(7),
                 offset: 0,
@@ -445,14 +441,14 @@ async fn server_tcp_binding_interactive_repair_reattach_promotes_for_auto_ramp()
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_initial_tx,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
     );
     let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
     binding.attach(
         UnderlayProtocol::Tcp,
         PathId(1),
         path1_tx,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         StreamOpenRole::Active,
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
@@ -460,14 +456,14 @@ async fn server_tcp_binding_interactive_repair_reattach_promotes_for_auto_ramp()
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_repair_tx,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
         StreamOpenRole::Repair,
     );
 
     binding
         .send_frame(
             StreamId(7),
-            TrafficClass::Interactive,
+            FlowLane::Latency,
             Frame::StreamData {
                 stream_id: StreamId(7),
                 offset: 0,
@@ -504,14 +500,14 @@ async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_initial_tx,
-        TrafficClass::Interactive,
+        FlowLane::Latency,
     );
     let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
     binding.attach(
         UnderlayProtocol::Tcp,
         PathId(1),
         path1_tx,
-        TrafficClass::RealtimeDatagram,
+        FlowLane::RealtimeDatagram,
         StreamOpenRole::Active,
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
@@ -519,14 +515,14 @@ async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
         UnderlayProtocol::Tcp,
         PathId(0),
         path0_repair_tx,
-        TrafficClass::RealtimeDatagram,
+        FlowLane::RealtimeDatagram,
         StreamOpenRole::Repair,
     );
 
     binding
         .send_frame(
             StreamId(7),
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             Frame::StreamData {
                 stream_id: StreamId(7),
                 offset: 0,
@@ -568,7 +564,7 @@ async fn server_tcp_relay_replays_response_repair_cache_on_path_reattach() {
         TcpPathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
-            class: TrafficClass::Interactive,
+            lane: FlowLane::Latency,
             underlay: UnderlayProtocol::Tcp,
             max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
             output: TcpPathStreamOutput::Fixed(commands_tx),
@@ -652,23 +648,23 @@ fn client_path_health_suppresses_failed_paths_until_cooldown() {
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+            .ordered_tcp_path_indices(FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(0)
     );
     context.mark_tcp_path_failure(0);
-    let suspect_order = context.ordered_tcp_path_indices(TrafficClass::Interactive, 512);
+    let suspect_order = context.ordered_tcp_path_indices(FlowLane::Latency, 512);
     assert_eq!(suspect_order, vec![0, 1]);
     context.mark_tcp_path_failure(0);
-    let failed_order = context.ordered_tcp_path_indices(TrafficClass::Interactive, 512);
+    let failed_order = context.ordered_tcp_path_indices(FlowLane::Latency, 512);
     assert_eq!(failed_order, vec![1]);
 
     {
         let mut health = context.health.lock().expect("health lock");
         health.tcp[0].failed_until = Some(Instant::now() - Duration::from_millis(1));
     }
-    let recovered_order = context.ordered_tcp_path_indices(TrafficClass::Interactive, 512);
+    let recovered_order = context.ordered_tcp_path_indices(FlowLane::Latency, 512);
     assert!(recovered_order.contains(&0));
 }
 
@@ -682,7 +678,7 @@ fn single_path_failure_stays_probeable_without_alternative() {
     tcp_context.mark_tcp_path_failure(0);
     tcp_context.mark_tcp_path_failure(0);
     assert_eq!(
-        tcp_context.ordered_tcp_path_indices(TrafficClass::Interactive, 512),
+        tcp_context.ordered_tcp_path_indices(FlowLane::Latency, 512),
         vec![0]
     );
 
@@ -694,7 +690,7 @@ fn single_path_failure_stays_probeable_without_alternative() {
     udp_context.mark_udp_path_failure(0);
     udp_context.mark_udp_path_failure(0);
     assert_eq!(
-        udp_stream_path_indices(&udp_context, TrafficClass::Interactive, 512),
+        udp_stream_path_indices(&udp_context, FlowLane::Latency, 512),
         vec![0]
     );
 }
@@ -714,12 +710,12 @@ fn measured_path_latency_updates_next_scheduling_order() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(120), TrafficClass::Interactive);
-    context.mark_tcp_path_open_success(1, Duration::from_millis(5), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(120), FlowLane::Latency);
+    context.mark_tcp_path_open_success(1, Duration::from_millis(5), FlowLane::Latency);
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Interactive, 512)
+            .ordered_tcp_path_indices(FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(1)
@@ -743,7 +739,7 @@ fn measured_tcp_delivery_rate_updates_next_bulk_order() {
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Bulk, 4 * 1024 * 1024)
+            .ordered_tcp_path_indices(FlowLane::Throughput, 4 * 1024 * 1024)
             .first()
             .copied(),
         Some(1)
@@ -760,7 +756,7 @@ fn measured_tcp_delivery_rate_updates_next_bulk_order() {
 
     assert_eq!(
         context
-            .ordered_tcp_path_indices(TrafficClass::Bulk, 4 * 1024 * 1024)
+            .ordered_tcp_path_indices(FlowLane::Throughput, 4 * 1024 * 1024)
             .first()
             .copied(),
         Some(0)
@@ -836,16 +832,16 @@ fn bulk_repair_does_not_attach_worse_path_when_current_path_is_best() {
 
     assert!(
         context
-            .ordered_tcp_repair_path_indices(Some(0), TrafficClass::Bulk, 4 * 1024 * 1024)
+            .ordered_tcp_repair_path_indices(Some(0), FlowLane::Throughput, 4 * 1024 * 1024)
             .is_empty()
     );
     assert_eq!(
-        context.ordered_tcp_repair_path_indices(Some(1), TrafficClass::Bulk, 4 * 1024 * 1024),
+        context.ordered_tcp_repair_path_indices(Some(1), FlowLane::Throughput, 4 * 1024 * 1024),
         vec![0]
     );
     assert_eq!(
         context
-            .ordered_tcp_repair_path_indices(Some(0), TrafficClass::Interactive, 512)
+            .ordered_tcp_repair_path_indices(Some(0), FlowLane::Latency, 512)
             .first()
             .copied(),
         Some(0)
@@ -870,7 +866,7 @@ fn endpoint_only_tcp_bulk_discovery_waits_for_delivery_evidence_before_probe_noi
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
     assert!(
@@ -920,12 +916,12 @@ fn endpoint_only_tcp_bulk_discovery_still_requires_delivery_after_bulk_promotion
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
-    context.reclassify_relay_path_load(
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
+    context.change_relay_path_lane_load(
         UnderlayProtocol::Tcp,
         0,
-        TrafficClass::Interactive,
-        TrafficClass::Bulk,
+        FlowLane::Latency,
+        FlowLane::Throughput,
     );
 
     assert!(
@@ -939,12 +935,12 @@ fn endpoint_only_tcp_bulk_discovery_still_requires_delivery_after_bulk_promotion
 }
 
 #[test]
-fn bulk_promotion_reclassifies_active_path_load_without_leaking_flow_accounting() {
+fn bulk_promotion_changes_active_path_lane_load_without_leaking_flow_accounting() {
     let path = "tcp://127.0.0.1:10165".parse::<PathSpec>().expect("path");
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     {
         let health = context.health.lock().expect("client path health lock");
         assert_eq!(health.tcp[0].active_flows, 1);
@@ -952,11 +948,11 @@ fn bulk_promotion_reclassifies_active_path_load_without_leaking_flow_accounting(
         assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
     }
 
-    context.reclassify_relay_path_load(
+    context.change_relay_path_lane_load(
         UnderlayProtocol::Tcp,
         0,
-        TrafficClass::Interactive,
-        TrafficClass::Bulk,
+        FlowLane::Latency,
+        FlowLane::Throughput,
     );
     {
         let health = context.health.lock().expect("client path health lock");
@@ -965,7 +961,7 @@ fn bulk_promotion_reclassifies_active_path_load_without_leaking_flow_accounting(
         assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
     }
 
-    context.release_relay_path_load(UnderlayProtocol::Tcp, 0, TrafficClass::Bulk);
+    context.release_relay_path_load(UnderlayProtocol::Tcp, 0, FlowLane::Throughput);
     let health = context.health.lock().expect("client path health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
     assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
@@ -987,7 +983,7 @@ fn endpoint_only_tcp_bulk_discovery_requires_delivery_under_concurrent_latency_d
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     assert!(
         tcp_auto_bulk_discovery_indices(
             &context,
@@ -997,7 +993,7 @@ fn endpoint_only_tcp_bulk_discovery_requires_delivery_under_concurrent_latency_d
         .is_empty()
     );
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(20), TrafficClass::Interactive);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     let now = Instant::now();
     context.mark_tcp_path_delivery(
         1,
@@ -1036,13 +1032,13 @@ fn endpoint_only_udp_stream_startup_preserves_configured_order_on_probe_noise() 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
 
     assert_eq!(
-        udp_stream_path_indices(&context, TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        udp_stream_path_indices(&context, FlowLane::Latency, PATH_OPEN_SCORE_BYTES),
         vec![0, 1]
     );
 
     context.mark_udp_path_failure(0);
     assert_eq!(
-        udp_stream_path_indices(&context, TrafficClass::Interactive, PATH_OPEN_SCORE_BYTES),
+        udp_stream_path_indices(&context, FlowLane::Latency, PATH_OPEN_SCORE_BYTES),
         vec![1]
     );
 }
@@ -1144,7 +1140,7 @@ fn mixed_endpoint_only_auto_bulk_discovery_ignores_ambiguous_tcp_pressure() {
         ResourceLimits::default(),
     )
     .expect("context");
-    context.reserve_tcp_path_load(0, TrafficClass::Interactive);
+    context.reserve_tcp_path_load(0, FlowLane::Latency);
 
     assert!(
         context
@@ -1172,7 +1168,7 @@ fn mixed_endpoint_only_auto_bulk_discovery_probes_udp_under_udp_pressure() {
     )
     .expect("context");
     context.mark_udp_path_probe_success(0, Duration::from_millis(1));
-    context.reserve_udp_stream_path_load(0, TrafficClass::RealtimeDatagram);
+    context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
 
     assert_eq!(
         context.ordered_reliable_auto_bulk_discovery_path_keys(
@@ -1210,7 +1206,7 @@ fn mixed_udp_repair_waits_for_delivery_evidence_on_active_tcp_stream() {
         context
             .ordered_udp_stream_repair_path_indices(
                 None,
-                TrafficClass::Bulk,
+                FlowLane::Throughput,
                 MuxLimits::default().max_tcp_path_inflight_bytes,
                 true,
             )
@@ -1220,7 +1216,7 @@ fn mixed_udp_repair_waits_for_delivery_evidence_on_active_tcp_stream() {
         context
             .ordered_udp_stream_repair_path_indices(
                 None,
-                TrafficClass::Bulk,
+                FlowLane::Throughput,
                 MuxLimits::default().max_tcp_path_inflight_bytes,
                 false,
             )
@@ -1242,7 +1238,7 @@ fn mixed_udp_repair_waits_for_delivery_evidence_on_active_tcp_stream() {
     assert_eq!(
         context.ordered_udp_stream_repair_path_indices(
             None,
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             MuxLimits::default().max_tcp_path_inflight_bytes,
             true,
         ),
@@ -1270,7 +1266,7 @@ fn udp_repair_waits_for_delivery_evidence_on_active_endpoint_only_stream() {
         context
             .ordered_udp_stream_repair_path_indices(
                 Some(0),
-                TrafficClass::Bulk,
+                FlowLane::Throughput,
                 MuxLimits::default().max_tcp_path_inflight_bytes,
                 true,
             )
@@ -1280,7 +1276,7 @@ fn udp_repair_waits_for_delivery_evidence_on_active_endpoint_only_stream() {
         context
             .ordered_udp_stream_repair_path_indices(
                 Some(0),
-                TrafficClass::Bulk,
+                FlowLane::Throughput,
                 MuxLimits::default().max_tcp_path_inflight_bytes,
                 false,
             )
@@ -1302,7 +1298,7 @@ fn udp_repair_waits_for_delivery_evidence_on_active_endpoint_only_stream() {
     assert_eq!(
         context.ordered_udp_stream_repair_path_indices(
             Some(0),
-            TrafficClass::Bulk,
+            FlowLane::Throughput,
             MuxLimits::default().max_tcp_path_inflight_bytes,
             true,
         ),
@@ -1471,7 +1467,7 @@ fn opened_relay_stream_for_test(
             stream: TcpPathStream {
                 stream_id,
                 max_offset: mux_limits.max_stream_window_bytes,
-                class: TrafficClass::Bulk,
+                lane: FlowLane::Throughput,
                 underlay,
                 max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
                 output: TcpPathStreamOutput::Fixed(commands),
@@ -1612,7 +1608,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         &context,
         remotes.active_path_key(),
         fast_instance.key,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         64 * 1024,
     ));
     assert!(remotes.promote_path_instance_to_active(fast_instance));
@@ -1660,7 +1656,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         &context,
         remotes.active_path_key(),
         worse_path,
-        TrafficClass::Bulk,
+        FlowLane::Throughput,
         64 * 1024,
     ));
 }
@@ -1676,7 +1672,7 @@ async fn mixed_relay_path_status_active_replays_repair_cache_on_instance() {
         stream: TcpPathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
-            class: TrafficClass::Bulk,
+            lane: FlowLane::Throughput,
             underlay: UnderlayProtocol::Udp,
             max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
             output: TcpPathStreamOutput::Fixed(commands),

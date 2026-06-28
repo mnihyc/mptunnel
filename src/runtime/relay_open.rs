@@ -105,9 +105,9 @@ impl TcpRelayRemoteSet {
         self.paths.iter().map(TcpRelayRemotePath::key).collect()
     }
 
-    pub(super) fn set_class(&mut self, class: TrafficClass) {
+    pub(super) fn set_lane(&mut self, lane: FlowLane) {
         for path in &mut self.paths {
-            path.stream.class = class;
+            path.stream.lane = lane;
         }
     }
 
@@ -221,7 +221,7 @@ impl TcpRelayRemoteSet {
                 || self
                     .paths
                     .last()
-                    .is_some_and(|path| tcp_path_frame_uses_priority_queue(path.stream.class))
+                    .is_some_and(|path| tcp_path_frame_uses_priority_queue(path.stream.lane))
             {
                 self.next_send_index = self.paths.len() - 1;
             }
@@ -235,7 +235,7 @@ impl TcpRelayRemoteSet {
                 Ok(()) => {
                     if !prefer_current_data_path
                         && !tcp_path_frame_uses_priority_queue(
-                            self.paths[self.next_send_index].stream.class,
+                            self.paths[self.next_send_index].stream.lane,
                         )
                     {
                         self.next_send_index = (self.next_send_index + 1) % self.paths.len();
@@ -255,24 +255,23 @@ impl TcpRelayRemoteSet {
         &mut self,
         context: &ClientPathContext,
         spec: &TcpRelayOpenSpec,
-        class: TrafficClass,
+        lane: FlowLane,
     ) -> Result<(), RuntimeError> {
         let Some(position) = self.paths.len().checked_sub(1) else {
             return Err(RuntimeError::TcpPathSessionClosed);
         };
         let instance = self.paths[position].instance();
         let output = self.paths[position].stream.output.clone();
-        self.paths[position].stream.class = class;
+        self.paths[position].stream.lane = lane;
         let frame = Frame::OpenStream {
             stream_id: self.stream_id,
             target: spec.target.clone(),
             ingress: spec.ingress,
             outbound: OutboundPolicy::Direct,
-            class,
             role: StreamOpenRole::Active,
         };
         match output
-            .send_frame(self.stream_id, TrafficClass::Control, frame)
+            .send_frame(self.stream_id, FlowLane::Control, frame)
             .await
         {
             Ok(()) => Ok(()),
@@ -300,7 +299,7 @@ impl TcpRelayRemoteSet {
             return false;
         };
         context.mark_relay_path_failure(path.stream.underlay, path.path_index);
-        context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.class);
+        context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
         path.stream.close().await;
         true
     }
@@ -314,7 +313,7 @@ impl TcpRelayRemoteSet {
             return false;
         };
         context.mark_relay_path_failure(path.stream.underlay, path.path_index);
-        context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.class);
+        context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
         path.stream.close().await;
         true
     }
@@ -426,10 +425,10 @@ pub(super) async fn open_remote_stream(
     context: &ClientPathContext,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let stream_id = context.allocate_tcp_stream_id()?;
-    open_remote_stream_with_id(context, stream_id, target, ingress, class).await
+    open_remote_stream_with_id(context, stream_id, target, ingress, lane).await
 }
 
 pub(super) async fn open_remote_stream_with_id(
@@ -437,17 +436,17 @@ pub(super) async fn open_remote_stream_with_id(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     if context.tcp_paths.is_empty() {
-        return open_remote_stream_with_id_over_udp(context, stream_id, target, ingress, class)
+        return open_remote_stream_with_id_over_udp(context, stream_id, target, ingress, lane)
             .await;
     }
     let mut attempted = Vec::new();
     let mut last_retryable_error = None;
     while attempted.len() < context.tcp_paths.len() {
         let Some(path_index) =
-            context.reserve_tcp_stream_path(class, PATH_OPEN_SCORE_BYTES, &attempted)
+            context.reserve_tcp_stream_path(lane, PATH_OPEN_SCORE_BYTES, &attempted)
         else {
             break;
         };
@@ -457,7 +456,7 @@ pub(super) async fn open_remote_stream_with_id(
             stream_id,
             target.clone(),
             ingress,
-            class,
+            lane,
             path_index,
             StreamOpenRole::Active,
         )
@@ -465,12 +464,12 @@ pub(super) async fn open_remote_stream_with_id(
         {
             Ok(opened) => return Ok(opened),
             Err(err) if stream_open_error_is_path_retryable(&err) => {
-                context.release_tcp_path_load(path_index, class);
+                context.release_tcp_path_load(path_index, lane);
                 context.mark_tcp_path_failure(path_index);
                 last_retryable_error = Some(err);
             }
             Err(err) => {
-                context.release_tcp_path_load(path_index, class);
+                context.release_tcp_path_load(path_index, lane);
                 return Err(err);
             }
         }
@@ -483,19 +482,19 @@ pub(super) async fn open_remote_stream_on_path(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
     path_index: usize,
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    context.reserve_tcp_path_load(path_index, class);
+    context.reserve_tcp_path_load(path_index, lane);
     match open_remote_stream_on_reserved_path(
-        context, stream_id, target, ingress, class, path_index, role,
+        context, stream_id, target, ingress, lane, path_index, role,
     )
     .await
     {
         Ok(opened) => Ok(opened),
         Err(err) => {
-            context.release_tcp_path_load(path_index, class);
+            context.release_tcp_path_load(path_index, lane);
             Err(err)
         }
     }
@@ -506,7 +505,7 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
     path_index: usize,
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
@@ -514,10 +513,10 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     lab_diagnostic(
         "reliable_stream_open_attempt",
         format_args!(
-            "stream_id={} underlay=tcp path_index={} class={:?} role={:?} wait_for_accept=true tcp_paths={} udp_paths={}",
+            "stream_id={} underlay=tcp path_index={} lane={:?} role={:?} wait_for_accept=true tcp_paths={} udp_paths={}",
             stream_id.0,
             path_index,
-            class,
+            lane,
             role,
             context.tcp_paths.len(),
             context.udp_paths.len(),
@@ -528,7 +527,7 @@ pub(super) async fn open_remote_stream_on_reserved_path(
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream(stream_id, target, ingress, class, role)
+        .open_stream(stream_id, target, ingress, lane, role)
         .await?;
     let elapsed = started_at.elapsed();
     context.mark_tcp_path_reserved_open_success(path_index, elapsed);
@@ -536,10 +535,10 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     lab_diagnostic(
         "reliable_stream_open_success",
         format_args!(
-            "stream_id={} underlay=tcp path_index={} class={:?} role={:?} elapsed_ms={:.3}",
+            "stream_id={} underlay=tcp path_index={} lane={:?} role={:?} elapsed_ms={:.3}",
             stream_id.0,
             path_index,
-            class,
+            lane,
             role,
             elapsed.as_secs_f64() * 1000.0,
         ),
@@ -552,7 +551,7 @@ pub(super) async fn open_remote_stream_with_id_over_udp(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     if context.udp_paths.is_empty() {
         return Err(RuntimeError::NoTcpPath);
@@ -561,7 +560,7 @@ pub(super) async fn open_remote_stream_with_id_over_udp(
     let mut last_retryable_error = None;
     while attempted.len() < context.udp_paths.len() {
         let Some(path_index) =
-            context.reserve_udp_stream_path(class, PATH_OPEN_SCORE_BYTES, &attempted)
+            context.reserve_udp_stream_path(lane, PATH_OPEN_SCORE_BYTES, &attempted)
         else {
             break;
         };
@@ -571,7 +570,7 @@ pub(super) async fn open_remote_stream_with_id_over_udp(
             stream_id,
             target.clone(),
             ingress,
-            class,
+            lane,
             path_index,
             UdpStreamOpenOptions::ACTIVE_WAIT,
         )
@@ -579,12 +578,12 @@ pub(super) async fn open_remote_stream_with_id_over_udp(
         {
             Ok(opened) => return Ok(opened),
             Err(err) if udp_stream_open_error_is_path_retryable(&err) => {
-                context.release_udp_stream_path_load(path_index, class);
+                context.release_udp_stream_path_load(path_index, lane);
                 context.mark_udp_path_failure(path_index);
                 last_retryable_error = Some(err);
             }
             Err(err) => {
-                context.release_udp_stream_path_load(path_index, class);
+                context.release_udp_stream_path_load(path_index, lane);
                 return Err(err);
             }
         }
@@ -597,22 +596,22 @@ pub(super) async fn open_remote_stream_on_udp_path(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
     path_index: usize,
     options: UdpStreamOpenOptions,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     if context.udp_paths.get(path_index).is_none() {
         return Err(RuntimeError::NoSchedulableUdpPath);
     }
-    context.reserve_udp_stream_path_load(path_index, class);
+    context.reserve_udp_stream_path_load(path_index, lane);
     match open_remote_stream_on_reserved_udp_path(
-        context, stream_id, target, ingress, class, path_index, options,
+        context, stream_id, target, ingress, lane, path_index, options,
     )
     .await
     {
         Ok(opened) => Ok(opened),
         Err(err) => {
-            context.release_udp_stream_path_load(path_index, class);
+            context.release_udp_stream_path_load(path_index, lane);
             Err(err)
         }
     }
@@ -623,7 +622,7 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
-    class: TrafficClass,
+    lane: FlowLane,
     path_index: usize,
     options: UdpStreamOpenOptions,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
@@ -635,10 +634,10 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
     lab_diagnostic(
         "reliable_stream_open_attempt",
         format_args!(
-            "stream_id={} underlay=udp path_index={} class={:?} role={:?} wait_for_accept={} tcp_paths={} udp_paths={}",
+            "stream_id={} underlay=udp path_index={} lane={:?} role={:?} wait_for_accept={} tcp_paths={} udp_paths={}",
             stream_id.0,
             path_index,
-            class,
+            lane,
             role,
             wait_for_accept,
             context.tcp_paths.len(),
@@ -651,7 +650,7 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
-        .open_stream(stream_id, target, ingress, class, role)
+        .open_stream(stream_id, target, ingress, lane, role)
         .await?;
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed);
@@ -659,10 +658,10 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
     lab_diagnostic(
         "reliable_stream_open_success",
         format_args!(
-            "stream_id={} underlay=udp path_index={} class={:?} role={:?} wait_for_accept={} elapsed_ms={:.3}",
+            "stream_id={} underlay=udp path_index={} lane={:?} role={:?} wait_for_accept={} elapsed_ms={:.3}",
             stream_id.0,
             path_index,
-            class,
+            lane,
             role,
             wait_for_accept,
             elapsed.as_secs_f64() * 1000.0,

@@ -158,7 +158,10 @@ fn udp_datagram_should_try_tcp_underlay(err: &RuntimeError, context: &ClientPath
                 | RuntimeError::NoSchedulableUdpPath
                 | RuntimeError::Io(_)
                 | RuntimeError::Udp(_)
-                | RuntimeError::EncryptedUdp(_)
+                | RuntimeError::QuicTransport(_)
+                | RuntimeError::QuicFrame(_)
+                | RuntimeError::QuicConnect(_)
+                | RuntimeError::QuicConnection(_)
                 | RuntimeError::Auth(_)
                 | RuntimeError::RemoteClosed(_)
                 | RuntimeError::Protocol(_)
@@ -1139,7 +1142,10 @@ fn udp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
         err,
         RuntimeError::Io(_)
             | RuntimeError::Udp(_)
-            | RuntimeError::EncryptedUdp(_)
+            | RuntimeError::QuicTransport(_)
+            | RuntimeError::QuicFrame(_)
+            | RuntimeError::QuicConnect(_)
+            | RuntimeError::QuicConnection(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
@@ -1170,8 +1176,8 @@ pub(super) fn udp_datagram_path_open_timeout(
 }
 
 pub(super) struct UdpDatagramClientSession {
-    encrypted: EncryptedUdpSocket,
-    buffer: Vec<u8>,
+    _path_session: ClientUdpPathSessionHandle,
+    stream: ClientUdpDatagramStream,
     flows: Vec<UdpDatagramClientFlow>,
     next_flow_id: u64,
     mux_limits: MuxLimits,
@@ -1228,52 +1234,31 @@ impl UdpDatagramClientSession {
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
-        let socket = udp::connect_path(
-            path,
-            crate::transport::udp::UdpConnectOptions {
-                timeout: handshake_timeout,
-                ..crate::transport::udp::UdpConnectOptions::default()
-            },
-        )
-        .await?;
-        let mut encrypted = EncryptedUdpSocket::new_with_cipher_suite(
-            socket,
-            security.secret.as_bytes(),
-            PeerRole::Client,
-            codec_limits,
-            security.cipher,
-        );
-        let path_id = PathId(path_index as u16);
-        let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
-            &security,
-            path,
-            path_id,
-            UnderlayProtocol::Udp,
+        let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
+            path: path.clone(),
+            path_index,
             session_id,
-        )?;
+            security,
+            codec_limits,
+            mux_limits,
+            stream_frame_queue: tcp_stream_frame_queue(mux_limits),
+        });
+        Self::open_from_udp_session(path_session, path_index, mux_limits, handshake_timeout).await
+    }
 
-        encrypted.send_frame(&session_hello).await?;
-        encrypted.send_frame(&session_auth).await?;
-        encrypted.send_frame(&path_join).await?;
-
-        let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
-        let mut session_ready = false;
-        let mut path_active = false;
-        while !session_ready || !path_active {
-            match tokio::time::timeout(handshake_timeout, encrypted.recv_frame(&mut buffer))
-                .await
-                .map_err(|_| RuntimeError::Protocol("UDP path handshake timed out"))??
-            {
-                Frame::SessionReady => session_ready = true,
-                Frame::PathStatus { .. } => path_active = true,
-                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-                _ => return Err(RuntimeError::Protocol("unexpected UDP handshake frame")),
-            }
-        }
-
+    pub(super) async fn open_from_udp_session(
+        path_session: ClientUdpPathSessionHandle,
+        path_index: usize,
+        mux_limits: MuxLimits,
+        handshake_timeout: Duration,
+    ) -> Result<Self, RuntimeError> {
+        let stream = tokio::time::timeout(handshake_timeout, path_session.open_datagram_stream())
+            .await
+            .map_err(|_| RuntimeError::Protocol("UDP carrier datagram stream open timed out"))??;
+        let path_id = stream.path_id;
         Ok(Self {
-            encrypted,
-            buffer,
+            _path_session: path_session,
+            stream,
             flows: Vec::new(),
             next_flow_id: 0,
             mux_limits,
@@ -1283,7 +1268,7 @@ impl UdpDatagramClientSession {
             sent_datagrams: HashMap::new(),
             last_datagram_rtt: None,
             last_feedback_observation: None,
-            mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
+            mtu_payload_bytes: mux_limits.max_payload_bytes,
         })
     }
 
@@ -1340,20 +1325,26 @@ impl UdpDatagramClientSession {
                     ttl: Duration::from_millis(u64::from(ttl_ms)),
                 },
             );
-            self.encrypted
-                .send_frame(&frame)
-                .await
-                .map_err(|err| UdpPathSendError::Runtime(RuntimeError::EncryptedUdp(err)))?;
+            quic_transport::write_frame(
+                &mut self.stream.send,
+                &frame,
+                self.stream.runtime.codec_limits,
+            )
+            .await
+            .map_err(|err| UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)))?;
             loop {
                 let received = match tokio::time::timeout(
                     response_timeout,
-                    self.encrypted.recv_frame(&mut self.buffer),
+                    quic_transport::read_frame(
+                        &mut self.stream.recv,
+                        self.stream.runtime.codec_limits,
+                    ),
                 )
                 .await
                 {
                     Ok(Ok(frame)) => frame,
                     Ok(Err(err)) => {
-                        return Err(UdpPathSendError::Runtime(RuntimeError::EncryptedUdp(err)));
+                        return Err(UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)));
                     }
                     Err(_) if !retransmitted && self.last_feedback_observation.is_some() => {
                         observed_response_timeout = true;
@@ -1382,18 +1373,19 @@ impl UdpDatagramClientSession {
                             .map_err(UdpPathSendError::Runtime)?;
                         self.handle_datagram_feedback(flow_id, &[request_ack])
                             .map_err(UdpPathSendError::Runtime)?;
-                        self.encrypted
-                            .send_frame(&Frame::DatagramFeedback {
+                        quic_transport::write_frame(
+                            &mut self.stream.send,
+                            &Frame::DatagramFeedback {
                                 flow_id,
                                 received: vec![
                                     datagram_ack_range(datagram_id)
                                         .map_err(UdpPathSendError::Runtime)?,
                                 ],
-                            })
-                            .await
-                            .map_err(|err| {
-                                UdpPathSendError::Runtime(RuntimeError::EncryptedUdp(err))
-                            })?;
+                            },
+                            self.stream.runtime.codec_limits,
+                        )
+                        .await
+                        .map_err(|err| UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)))?;
                         self.stats.record_payload_bytes(request_len);
                         self.stats.record_payload_bytes(payload.len());
                         if observed_response_timeout {
@@ -1411,18 +1403,19 @@ impl UdpDatagramClientSession {
                         datagram_id,
                         ..
                     } if response_flow_id == flow_id => {
-                        self.encrypted
-                            .send_frame(&Frame::DatagramFeedback {
+                        quic_transport::write_frame(
+                            &mut self.stream.send,
+                            &Frame::DatagramFeedback {
                                 flow_id,
                                 received: vec![
                                     datagram_ack_range(datagram_id)
                                         .map_err(UdpPathSendError::Runtime)?,
                                 ],
-                            })
-                            .await
-                            .map_err(|err| {
-                                UdpPathSendError::Runtime(RuntimeError::EncryptedUdp(err))
-                            })?;
+                            },
+                            self.stream.runtime.codec_limits,
+                        )
+                        .await
+                        .map_err(|err| UdpPathSendError::Runtime(RuntimeError::QuicFrame(err)))?;
                     }
                     Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                         self.observe_remote_path_metrics(metrics);
@@ -1460,15 +1453,18 @@ impl UdpDatagramClientSession {
             .next_flow_id
             .checked_add(1)
             .ok_or(RuntimeError::Protocol("UDP datagram flow id overflow"))?;
-        self.encrypted
-            .send_frame(&Frame::OpenDatagramFlow {
+        quic_transport::write_frame(
+            &mut self.stream.send,
+            &Frame::OpenDatagramFlow {
                 flow_id,
                 target: target.clone(),
                 ingress: IngressKind::Socks5,
                 outbound: OutboundPolicy::Direct,
                 class: TrafficClass::RealtimeDatagram,
-            })
-            .await?;
+            },
+            self.stream.runtime.codec_limits,
+        )
+        .await?;
         self.flows.push(UdpDatagramClientFlow {
             target,
             flow: DatagramFlow::new(flow_id, self.mux_limits),
@@ -1479,22 +1475,34 @@ impl UdpDatagramClientSession {
 
     pub(super) async fn close(&mut self) -> Result<(), RuntimeError> {
         for flow in &self.flows {
-            self.encrypted
-                .send_frame(&Frame::DatagramClose {
+            quic_transport::write_frame(
+                &mut self.stream.send,
+                &Frame::DatagramClose {
                     flow_id: flow.flow_id,
-                })
-                .await?;
+                },
+                self.stream.runtime.codec_limits,
+            )
+            .await?;
         }
         self.flows.clear();
+        let _ = quic_transport::finish_stream(&mut self.stream.send);
         Ok(())
     }
 
     pub(super) async fn ping(&mut self, probe_timeout: Duration) -> Result<(), RuntimeError> {
         let nonce = random_u64()?;
-        self.encrypted.send_frame(&Frame::Ping { nonce }).await?;
-        match tokio::time::timeout(probe_timeout, self.encrypted.recv_frame(&mut self.buffer))
-            .await
-            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??
+        quic_transport::write_frame(
+            &mut self.stream.send,
+            &Frame::Ping { nonce },
+            self.stream.runtime.codec_limits,
+        )
+        .await?;
+        match tokio::time::timeout(
+            probe_timeout,
+            quic_transport::read_frame(&mut self.stream.recv, self.stream.runtime.codec_limits),
+        )
+        .await
+        .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??
         {
             Frame::Pong {
                 nonce: received_nonce,
@@ -1505,11 +1513,15 @@ impl UdpDatagramClientSession {
     }
 
     pub(super) async fn close_session(&mut self) -> Result<(), RuntimeError> {
-        self.encrypted
-            .send_frame(&Frame::SessionClose {
+        quic_transport::write_frame(
+            &mut self.stream.send,
+            &Frame::SessionClose {
                 reason: CloseReason::Normal,
-            })
-            .await?;
+            },
+            self.stream.runtime.codec_limits,
+        )
+        .await?;
+        let _ = quic_transport::finish_stream(&mut self.stream.send);
         Ok(())
     }
 
@@ -1522,43 +1534,14 @@ impl UdpDatagramClientSession {
     }
 
     pub(super) async fn probe_mtu(&mut self, payload_bytes: usize) -> Result<usize, RuntimeError> {
-        if payload_bytes <= self.mtu_payload_bytes {
-            return Ok(self.mtu_payload_bytes);
-        }
         if payload_bytes > self.mux_limits.max_payload_bytes {
             return Err(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                 actual: payload_bytes,
                 limit: self.mux_limits.max_payload_bytes,
             }));
         }
-        let probe_id = random_u64()?;
-        self.encrypted
-            .send_frame(&Frame::PathMtuProbe {
-                path_id: self.path_id,
-                probe_id,
-                payload: Bytes::from(vec![0u8; payload_bytes]),
-            })
-            .await?;
-        loop {
-            match self.encrypted.recv_frame(&mut self.buffer).await? {
-                Frame::PathMtuAck {
-                    path_id,
-                    probe_id: received_probe_id,
-                    payload_bytes: received_payload_bytes,
-                } if path_id == self.path_id && received_probe_id == probe_id => {
-                    let payload_bytes = received_payload_bytes as usize;
-                    self.mtu_payload_bytes = payload_bytes;
-                    return Ok(payload_bytes);
-                }
-                Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
-                    self.observe_remote_path_metrics(metrics);
-                }
-                Frame::SessionReady => {}
-                Frame::RxRateHint { path_id, .. } if path_id == self.path_id => {}
-                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-                _ => return Err(RuntimeError::Protocol("unexpected UDP MTU probe frame")),
-            }
-        }
+        self.mtu_payload_bytes = self.mux_limits.max_payload_bytes;
+        Ok(self.mtu_payload_bytes)
     }
 
     fn take_feedback_observation(&mut self) -> Option<UdpDatagramPathObservation> {

@@ -22,9 +22,9 @@ pub fn run(cli: Cli) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_worker_threads())
+        .enable_all()
         .build()
         .map_err(AppError::BuildRuntime)?;
     if config.service.service_mode {
@@ -36,6 +36,18 @@ pub fn run(cli: Cli) -> Result<(), AppError> {
         runtime.block_on(crate::runtime::run(config))?;
     }
     Ok(())
+}
+
+fn runtime_worker_threads() -> usize {
+    std::env::var("MPTUNNEL_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(1)
+        })
 }
 
 async fn run_supervised(config: AppConfig) -> Result<(), crate::runtime::RuntimeError> {

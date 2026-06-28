@@ -627,10 +627,6 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
     path_index: usize,
     options: UdpStreamOpenOptions,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    let path = context
-        .udp_paths
-        .get(path_index)
-        .ok_or(RuntimeError::NoSchedulableUdpPath)?;
     let UdpStreamOpenOptions {
         wait_for_accept,
         role,
@@ -650,155 +646,13 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         ),
     );
     let started_at = Instant::now();
-    let socket = udp::connect_path(
-        path,
-        crate::transport::udp::UdpConnectOptions {
-            timeout: UDP_PATH_HANDSHAKE_TIMEOUT,
-            ..crate::transport::udp::UdpConnectOptions::default()
-        },
-    )
-    .await?;
-    let mut encrypted = EncryptedUdpSocket::new_with_cipher_suite(
-        socket,
-        context.security.secret.as_bytes(),
-        PeerRole::Client,
-        context.codec_limits,
-        context.security.cipher,
-    );
-    let path_id = PathId(path_index as u16);
-    let session_id = random_session_id()?;
-    let handshake_frames = {
-        let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
-            &context.security,
-            path,
-            path_id,
-            UnderlayProtocol::Udp,
-            session_id,
-        )?;
-        [session_hello, session_auth, path_join]
-    };
-
-    for frame in &handshake_frames {
-        encrypted.send_frame(frame).await?;
-    }
-
-    let mut buffer = vec![0u8; encrypted.max_datagram_bytes()?];
-    let control_retry_interval = udp_stream_control_retry_interval(context, path_index);
-    let handshake_started_at = Instant::now();
-    let mut session_ready = false;
-    let mut path_active = false;
-    while !session_ready || !path_active {
-        let elapsed = handshake_started_at.elapsed();
-        if elapsed >= UDP_PATH_HANDSHAKE_TIMEOUT {
-            return Err(RuntimeError::Protocol(
-                "UDP stream path handshake timed out",
-            ));
-        }
-        let remaining = UDP_PATH_HANDSHAKE_TIMEOUT.saturating_sub(elapsed);
-        match tokio::time::timeout(
-            control_retry_interval.min(remaining),
-            encrypted.recv_frame(&mut buffer),
-        )
-        .await
-        {
-            Err(_) => {
-                for frame in &handshake_frames {
-                    encrypted.send_frame(frame).await?;
-                }
-                continue;
-            }
-            Ok(Err(err)) if encrypted_udp_error_is_ignorable(&err) => continue,
-            Ok(Err(err)) => return Err(RuntimeError::EncryptedUdp(err)),
-            Ok(Ok(Frame::SessionReady)) => session_ready = true,
-            Ok(Ok(Frame::PathStatus {
-                status: crate::protocol::PathStatus::Active,
-                ..
-            })) => path_active = true,
-            Ok(Ok(Frame::PathStatus { .. })) => {
-                return Err(RuntimeError::Protocol(
-                    "UDP stream path did not become active",
-                ));
-            }
-            Ok(Ok(Frame::SessionClose { reason })) => {
-                return Err(RuntimeError::RemoteClosed(reason));
-            }
-            Ok(Ok(_)) => {
-                return Err(RuntimeError::Protocol(
-                    "unexpected UDP stream handshake frame",
-                ));
-            }
-        }
-    }
-
-    let open_frame = Frame::OpenStream {
-        stream_id,
-        target,
-        ingress,
-        outbound: OutboundPolicy::Direct,
-        class,
-        role,
-    };
-    encrypted.send_frame(&open_frame).await?;
-
-    let open_started_at = Instant::now();
-    let open_retry_interval = control_retry_interval;
-    let mut pending_open_retry = None;
-    let max_offset = if wait_for_accept {
-        loop {
-            let elapsed = open_started_at.elapsed();
-            if elapsed >= UDP_PATH_HANDSHAKE_TIMEOUT {
-                return Err(RuntimeError::Protocol("UDP stream open timed out"));
-            }
-            let remaining = UDP_PATH_HANDSHAKE_TIMEOUT.saturating_sub(elapsed);
-            match tokio::time::timeout(
-                open_retry_interval.min(remaining),
-                encrypted.recv_frame(&mut buffer),
-            )
-            .await
-            {
-                Err(_) => {
-                    encrypted.send_frame(&open_frame).await?;
-                    continue;
-                }
-                Ok(Err(err)) if encrypted_udp_error_is_ignorable(&err) => continue,
-                Ok(Err(err)) => return Err(RuntimeError::EncryptedUdp(err)),
-                Ok(Ok(frame)) => match frame {
-                    Frame::StreamMaxData {
-                        stream_id: max_stream_id,
-                        max_offset,
-                    } if max_stream_id == stream_id => break max_offset,
-                    Frame::StreamReset {
-                        stream_id: reset_stream_id,
-                        reason,
-                    } if reset_stream_id == stream_id => {
-                        return Err(RuntimeError::RemoteReset(reason));
-                    }
-                    Frame::SessionClose { reason } => {
-                        return Err(RuntimeError::RemoteClosed(reason));
-                    }
-                    Frame::SessionReady => {}
-                    Frame::PathStatus { .. } => {}
-                    _ => return Err(RuntimeError::Protocol("unexpected UDP stream open frame")),
-                },
-            }
-        }
-    } else {
-        pending_open_retry = Some((open_frame.clone(), open_retry_interval));
-        context.mux_limits.max_stream_window_bytes
-    };
-
-    let (commands, receivers) =
-        tcp_path_session_command_channels(udp_stream_path_command_queue(context.mux_limits));
-    let (frames_tx, frames_rx) = mpsc::channel(tcp_stream_frame_queue(context.mux_limits));
-    tokio::spawn(run_client_udp_stream_path_session(
-        encrypted,
-        buffer,
-        stream_id,
-        path_id,
-        receivers,
-        frames_tx,
-        pending_open_retry,
-    ));
+    let _udp_open_waits_for_accept = wait_for_accept;
+    let stream = context
+        .udp_sessions
+        .get(path_index)
+        .ok_or(RuntimeError::NoSchedulableUdpPath)?
+        .open_stream(stream_id, target, ingress, class, role)
+        .await?;
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed);
     #[cfg(feature = "lab-diagnostics")]
@@ -814,134 +668,7 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
             elapsed.as_secs_f64() * 1000.0,
         ),
     );
-    Ok(OpenedRemoteStream {
-        stream: TcpPathStream {
-            stream_id,
-            max_offset,
-            class,
-            underlay: UnderlayProtocol::Udp,
-            max_frame_payload_bytes: udp_stream_frame_payload_bytes(context.mux_limits),
-            output: TcpPathStreamOutput::Fixed(commands),
-            frames: frames_rx,
-        },
-        path_index,
-    })
-}
-
-pub(super) async fn run_client_udp_stream_path_session(
-    mut encrypted: EncryptedUdpSocket,
-    mut buffer: Vec<u8>,
-    stream_id: StreamId,
-    _path_id: PathId,
-    mut commands: TcpPathSessionCommandReceivers,
-    frames: mpsc::Sender<Result<Frame, RuntimeError>>,
-    pending_open_retry: Option<(Frame, Duration)>,
-) {
-    let mut pending_open_retry = pending_open_retry
-        .map(|(frame, interval)| (frame, interval, tokio::time::Instant::now() + interval));
-    loop {
-        let command_may_recv = !tcp_path_receivers_closed(&commands);
-        if !command_may_recv {
-            let _ = encrypted
-                .send_frame(&Frame::SessionClose {
-                    reason: CloseReason::Normal,
-                })
-                .await;
-            return;
-        }
-        tokio::select! {
-            biased;
-            _ = async {
-                if let Some((_, _, deadline)) = &pending_open_retry {
-                    tokio::time::sleep_until(*deadline).await;
-                }
-            }, if pending_open_retry.is_some() => {
-                if let Some((frame, interval, deadline)) = &mut pending_open_retry
-                    && tokio::time::Instant::now() >= *deadline
-                {
-                    if let Err(err) = encrypted.send_frame(frame).await {
-                        let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
-                        return;
-                    }
-                    *deadline = tokio::time::Instant::now() + *interval;
-                }
-            }
-            frame = encrypted.recv_frame(&mut buffer) => {
-                match frame {
-                    Ok(Frame::Ping { nonce }) => {
-                        if let Err(err) = encrypted.send_frame(&Frame::Pong { nonce }).await {
-                            let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
-                            return;
-                        }
-                    }
-                    Ok(Frame::SessionReady) => {}
-                    Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
-                        | Frame::StreamAck { stream_id: received_stream_id, .. }
-                        | Frame::StreamMaxData { stream_id: received_stream_id, .. }
-                        | Frame::StreamFin { stream_id: received_stream_id, .. }
-                        | Frame::StreamReset { stream_id: received_stream_id, .. }))
-                        if received_stream_id == stream_id =>
-                    {
-                        pending_open_retry = None;
-                        if frames.send(Ok(frame)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(frame @ Frame::PathStatus { .. }) => {
-                        if frames.send(Ok(frame)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(Frame::SessionClose { reason }) => {
-                        let _ = frames.send(Err(RuntimeError::RemoteClosed(reason))).await;
-                        return;
-                    }
-                    Ok(_) => {
-                        let _ = frames
-                            .send(Err(RuntimeError::Protocol(
-                                "unexpected UDP reliable stream frame",
-                            )))
-                            .await;
-                        return;
-                    }
-                    Err(err) if encrypted_udp_error_is_ignorable(&err) => {}
-                    Err(err) => {
-                        let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
-                        return;
-                    }
-                }
-            }
-            command = recv_tcp_path_command(&mut commands), if command_may_recv => {
-                match command {
-                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
-                        if let Err(err) = encrypted.send_frame(&frame).await {
-                            let _ = frames.send(Err(RuntimeError::EncryptedUdp(err))).await;
-                            return;
-                        }
-                    }
-                    Some(TcpPathSessionCommand::CloseStream(close_stream_id)) => {
-                        if close_stream_id == stream_id {
-                            let _ = encrypted
-                                .send_frame(&Frame::SessionClose {
-                                    reason: CloseReason::Normal,
-                                })
-                                .await;
-                            return;
-                        }
-                    }
-                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
-                        let _ = frames
-                            .send(Err(RuntimeError::Protocol(
-                                "client UDP stream path received open command",
-                            )))
-                            .await;
-                        return;
-                    }
-                    None => {}
-                }
-            }
-        }
-    }
+    Ok(OpenedRemoteStream { stream, path_index })
 }
 
 pub(super) fn authenticated_path_join_frames(
@@ -1015,25 +742,14 @@ pub(super) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> boo
         err,
         RuntimeError::Io(_)
             | RuntimeError::Udp(_)
-            | RuntimeError::EncryptedUdp(_)
+            | RuntimeError::QuicTransport(_)
+            | RuntimeError::QuicFrame(_)
+            | RuntimeError::QuicConnect(_)
+            | RuntimeError::QuicConnection(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
     )
-}
-
-pub(super) fn udp_stream_control_retry_interval(
-    context: &ClientPathContext,
-    path_index: usize,
-) -> Duration {
-    let max_retry = UDP_PATH_HANDSHAKE_TIMEOUT.mul_f64(0.5);
-    let Some(snapshot) = context.udp_path_snapshot(path_index) else {
-        return UDP_MIN_PATH_SUPPRESSION.min(max_retry);
-    };
-    let modeled_ms = snapshot.srtt_ms.max(1.0) * 2.0 + snapshot.jitter_ms.max(0.0) * 4.0 + 10.0;
-    Duration::from_secs_f64(modeled_ms / 1000.0)
-        .max(UDP_MIN_RESPONSE_TIMEOUT)
-        .min(max_retry)
 }
 
 pub(super) fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError>) -> bool {

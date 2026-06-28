@@ -58,7 +58,6 @@ fn server_context(outbound: OutboundConfig) -> ServerPathContext {
             path_join_replay_cache_capacity(resources.max_streams),
         ))),
         max_tcp_streams: resources.max_streams,
-        max_udp_sessions: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
     }
 }
@@ -182,38 +181,6 @@ async fn spawn_udp_reordered_echo_target() -> (SocketAddr, tokio::task::JoinHand
         while let Some(result) = delayed.join_next().await {
             result.expect("delayed target response");
         }
-    });
-    (addr, handle)
-}
-
-async fn spawn_udp_drop_first_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
-    let addr = socket.local_addr().expect("target addr");
-    let handle = tokio::spawn(async move {
-        let mut buf = [0u8; 16];
-        let (len, _peer) = socket.recv_from(&mut buf).await.expect("first recv");
-        assert_eq!(&buf[..len], b"ping");
-        let (len, peer) = socket.recv_from(&mut buf).await.expect("retry recv");
-        assert_eq!(&buf[..len], b"ping");
-        socket.send_to(b"pong", peer).await.expect("target send");
-    });
-    (addr, handle)
-}
-
-async fn spawn_udp_payload_target(
-    expected: Bytes,
-    response: Bytes,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
-    let addr = socket.local_addr().expect("target addr");
-    let handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; expected.len().max(16)];
-        let (len, peer) = socket.recv_from(&mut buf).await.expect("target recv");
-        assert_eq!(&buf[..len], expected.as_ref());
-        socket
-            .send_to(response.as_ref(), peer)
-            .await
-            .expect("target send");
     });
     (addr, handle)
 }
@@ -442,586 +409,58 @@ async fn reserve_udp_path() -> PathSpec {
     format!("udp://127.0.0.1:{port}").parse().expect("path")
 }
 
-async fn reserve_udp_path_with_query(query: &str) -> PathSpec {
-    let probe = UdpSocket::bind("127.0.0.1:0").await.expect("reserve port");
-    let port = probe.local_addr().expect("reserved addr").port();
-    drop(probe);
-    format!("udp://127.0.0.1:{port}?{query}")
-        .parse()
-        .expect("path")
+async fn spawn_udp_server_path(
+    outbound: OutboundConfig,
+) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
+    let path = reserve_udp_path().await;
+    let context = server_context(outbound);
+    let endpoint = bind_server_udp_endpoint(&path, &context)
+        .await
+        .expect("bind udp path");
+    let server = tokio::spawn(run_server_udp_listener(endpoint, context));
+    (path, server)
 }
 
-async fn spawn_udp_datagram_blackhole_path(
-    path: PathSpec,
-) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    tokio::spawn(async move {
-        let socket = Arc::new(socket);
-        let probe = EncryptedUdpSocket::from_shared(
-            socket.clone(),
-            security().secret.as_bytes(),
-            PeerRole::Server,
-            CodecLimits::default(),
-        );
-        let mut buffer = vec![0u8; probe.max_datagram_bytes()?];
-        let mut session = None;
-        loop {
-            let (len, peer) = socket.recv_from(&mut buffer).await?;
-            if session.is_none() {
-                session = Some(ServerUdpPathSession::new(
-                    socket.clone(),
-                    peer,
-                    server_context(OutboundConfig::Direct),
-                )?);
-            }
-            let session_ref = session
-                .as_mut()
-                .ok_or(RuntimeError::Protocol("missing UDP path session"))?;
-            let frame = session_ref.open_frame(&buffer[..len])?;
-            if session_ref.peer != peer {
-                session_ref.peer = peer;
-            }
-            if matches!(frame, Frame::DatagramData { .. }) {
-                return Ok(());
-            }
-            match session_ref.handle_frame(frame).await? {
-                ServerUdpSessionOutcome::Active => {}
-                ServerUdpSessionOutcome::Closed => return Ok(()),
-            }
-        }
-    })
-}
-
-async fn spawn_udp_datagram_ack_then_drop_path(
-    path: PathSpec,
-) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    tokio::spawn(async move {
-        let socket = Arc::new(socket);
-        let probe = EncryptedUdpSocket::from_shared(
-            socket.clone(),
-            security().secret.as_bytes(),
-            PeerRole::Server,
-            CodecLimits::default(),
-        );
-        let mut buffer = vec![0u8; probe.max_datagram_bytes()?];
-        let mut session = None;
-        loop {
-            let (len, peer) = socket.recv_from(&mut buffer).await?;
-            if session.is_none() {
-                session = Some(ServerUdpPathSession::new(
-                    socket.clone(),
-                    peer,
-                    server_context(OutboundConfig::Direct),
-                )?);
-            }
-            let session_ref = session
-                .as_mut()
-                .ok_or(RuntimeError::Protocol("missing UDP path session"))?;
-            let frame = session_ref.open_frame(&buffer[..len])?;
-            if session_ref.peer != peer {
-                session_ref.peer = peer;
-            }
-            match frame {
-                Frame::DatagramData {
-                    flow_id,
-                    datagram_id,
-                    ..
-                } => {
-                    session_ref
-                        .encrypted
-                        .send_frame_to(
-                            &Frame::DatagramFeedback {
-                                flow_id,
-                                received: vec![datagram_ack_range(datagram_id)?],
-                            },
-                            session_ref.peer,
-                        )
-                        .await?;
-                }
-                frame => match session_ref.handle_frame(frame).await? {
-                    ServerUdpSessionOutcome::Active => {}
-                    ServerUdpSessionOutcome::Closed => return Ok(()),
-                },
-            }
-        }
-    })
-}
-
-async fn spawn_udp_datagram_stale_then_matching_response_path(
-    path: PathSpec,
-) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    tokio::spawn(async move {
-        let socket = Arc::new(socket);
-        let probe = EncryptedUdpSocket::from_shared(
-            socket.clone(),
-            security().secret.as_bytes(),
-            PeerRole::Server,
-            CodecLimits::default(),
-        );
-        let mut buffer = vec![0u8; probe.max_datagram_bytes()?];
-        let mut session = None;
-        let mut sent_response_pair = false;
-        loop {
-            let (len, peer) = socket.recv_from(&mut buffer).await?;
-            if session.is_none() {
-                session = Some(ServerUdpPathSession::new(
-                    socket.clone(),
-                    peer,
-                    server_context(OutboundConfig::Direct),
-                )?);
-            }
-            let session_ref = session
-                .as_mut()
-                .ok_or(RuntimeError::Protocol("missing UDP path session"))?;
-            let frame = session_ref.open_frame(&buffer[..len])?;
-            if session_ref.peer != peer {
-                session_ref.peer = peer;
-            }
-            match frame {
-                Frame::DatagramData {
-                    flow_id,
-                    datagram_id,
-                    ..
-                } if !sent_response_pair => {
-                    let stale_datagram_id = DatagramId(if datagram_id.0 == u64::MAX {
-                        datagram_id.0 - 1
-                    } else {
-                        datagram_id.0 + 1
-                    });
-                    sent_response_pair = true;
-                    session_ref
-                        .encrypted
-                        .send_frame_to(
-                            &Frame::DatagramFeedback {
-                                flow_id,
-                                received: vec![datagram_ack_range(datagram_id)?],
-                            },
-                            session_ref.peer,
-                        )
-                        .await?;
-                    session_ref
-                        .encrypted
-                        .send_frame_to(
-                            &Frame::DatagramData {
-                                flow_id,
-                                datagram_id: stale_datagram_id,
-                                ttl_ms: DEFAULT_SOCKS5_UDP_TTL_MS,
-                                payload: Bytes::from_static(b"stale"),
-                            },
-                            session_ref.peer,
-                        )
-                        .await?;
-                    session_ref
-                        .encrypted
-                        .send_frame_to(
-                            &Frame::DatagramData {
-                                flow_id,
-                                datagram_id,
-                                ttl_ms: DEFAULT_SOCKS5_UDP_TTL_MS,
-                                payload: Bytes::from_static(b"pong"),
-                            },
-                            session_ref.peer,
-                        )
-                        .await?;
-                }
-                frame => match session_ref.handle_frame(frame).await? {
-                    ServerUdpSessionOutcome::Active => {}
-                    ServerUdpSessionOutcome::Closed => return Ok(()),
-                },
-            }
-        }
-    })
-}
-
-#[tokio::test]
-async fn server_udp_path_tolerates_duplicate_established_handshake_frames() {
-    let socket = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("server udp bind"),
-    );
-    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
-    let peer_addr = peer.local_addr().expect("peer addr");
+#[tokio::test(flavor = "multi_thread")]
+async fn server_udp_listener_accepts_probe_after_noise() {
+    let bind_path = reserve_udp_path().await;
     let context = server_context(OutboundConfig::Direct);
-    let mut session =
-        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
-    let path = "udp://127.0.0.1:7443".parse::<PathSpec>().expect("path");
-    let session_id = SessionId(77);
-    let path_id = PathId(2);
-    let (hello, auth, join) = authenticated_path_join_frames_for_session(
-        &security(),
-        &path,
-        path_id,
-        UnderlayProtocol::Udp,
-        session_id,
-    )
-    .expect("auth frames");
-
-    session.handle_frame(hello.clone()).await.expect("hello");
-    session.handle_frame(auth.clone()).await.expect("auth");
-    session.handle_frame(join.clone()).await.expect("join");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-    assert_eq!(session.session_id, Some(session_id));
-    assert_eq!(session.path_id, Some(path_id));
-
-    session
-        .handle_frame(hello)
+    let endpoint = bind_server_udp_endpoint(&bind_path, &context)
         .await
-        .expect("duplicate hello should be idempotent");
-    session
-        .handle_frame(auth)
-        .await
-        .expect("duplicate auth should be idempotent");
-    session
-        .handle_frame(join)
-        .await
-        .expect("duplicate join should be idempotent");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-    assert_eq!(session.session_id, Some(session_id));
-    assert_eq!(session.path_id, Some(path_id));
-}
+        .expect("bind udp");
+    let server_addr = endpoint.local_addr().expect("udp server addr");
+    let server = tokio::spawn(run_server_udp_listener(endpoint, context));
 
-#[tokio::test]
-async fn server_udp_path_accepts_session_auth_before_hello() {
-    let socket = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("server udp bind"),
-    );
-    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
-    let peer_addr = peer.local_addr().expect("peer addr");
-    let context = server_context(OutboundConfig::Direct);
-    let mut session =
-        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
-    let path = "udp://127.0.0.1:7443".parse::<PathSpec>().expect("path");
-    let session_id = SessionId(78);
-    let path_id = PathId(3);
-    let (hello, auth, join) = authenticated_path_join_frames_for_session(
-        &security(),
-        &path,
-        path_id,
-        UnderlayProtocol::Udp,
-        session_id,
-    )
-    .expect("auth frames");
-
-    session
-        .handle_frame(auth)
+    let noise = UdpSocket::bind("127.0.0.1:0")
         .await
-        .expect("auth first should advance handshake");
-    assert!(matches!(session.state, ServerUdpPathState::AwaitPathJoin));
-
-    session
-        .handle_frame(hello)
+        .expect("noise udp bind");
+    noise
+        .send_to(b"not a udp carrier packet", server_addr)
         .await
-        .expect("late hello should stay recoverable");
-    session
-        .handle_frame(join)
-        .await
-        .expect("join should establish after reordered auth");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-    assert_eq!(session.session_id, Some(session_id));
-    assert_eq!(session.path_id, Some(path_id));
-}
-
-#[tokio::test]
-async fn server_udp_path_accepts_path_join_before_session_frames() {
-    let socket = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("server udp bind"),
-    );
-    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
-    let peer_addr = peer.local_addr().expect("peer addr");
-    let context = server_context(OutboundConfig::Direct);
-    let mut session =
-        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
-    let path = "udp://127.0.0.1:7443".parse::<PathSpec>().expect("path");
-    let session_id = SessionId(79);
-    let path_id = PathId(4);
-    let (hello, auth, join) = authenticated_path_join_frames_for_session(
-        &security(),
-        &path,
-        path_id,
-        UnderlayProtocol::Udp,
-        session_id,
-    )
-    .expect("auth frames");
-
-    session
-        .handle_frame(join)
-        .await
-        .expect("authenticated join should establish without ordered prelude");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-    assert_eq!(session.session_id, Some(session_id));
-    assert_eq!(session.path_id, Some(path_id));
-
-    session
-        .handle_frame(hello)
-        .await
-        .expect("late hello should be idempotent");
-    session
-        .handle_frame(auth)
-        .await
-        .expect("late auth should be idempotent");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-    assert_eq!(session.session_id, Some(session_id));
-    assert_eq!(session.path_id, Some(path_id));
-}
-
-#[tokio::test]
-async fn server_udp_path_drops_early_stream_frame_before_reordered_handshake() {
-    let socket = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("server udp bind"),
-    );
-    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
-    let peer_addr = peer.local_addr().expect("peer addr");
-    let context = server_context(OutboundConfig::Direct);
-    let mut session =
-        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
-    let early = Frame::OpenStream {
-        stream_id: StreamId(9),
-        target: TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
-        ingress: IngressKind::Socks5,
-        outbound: OutboundPolicy::Direct,
-        class: TrafficClass::Interactive,
-        role: StreamOpenRole::Active,
-    };
-    assert!(matches!(
-        session
-            .handle_frame(early)
-            .await
-            .expect("early frame should be dropped"),
-        ServerUdpSessionOutcome::Active
-    ));
-    assert!(matches!(
-        session.state,
-        ServerUdpPathState::AwaitSessionHello
-    ));
-
-    let path = "udp://127.0.0.1:7443".parse::<PathSpec>().expect("path");
-    let session_id = SessionId(80);
-    let path_id = PathId(5);
-    let (hello, auth, join) = authenticated_path_join_frames_for_session(
-        &security(),
-        &path,
-        path_id,
-        UnderlayProtocol::Udp,
-        session_id,
-    )
-    .expect("auth frames");
-
-    session.handle_frame(auth).await.expect("auth");
-    session.handle_frame(hello).await.expect("late hello");
-    session.handle_frame(join).await.expect("join");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-    assert_eq!(session.session_id, Some(session_id));
-    assert_eq!(session.path_id, Some(path_id));
-}
-
-#[tokio::test]
-async fn server_udp_listener_requires_control_before_unknown_peer_session() {
-    let server_socket = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("server udp bind");
-    let server_addr = server_socket.local_addr().expect("server addr");
-    let server = tokio::spawn(run_server_udp_listener(
-        server_socket,
-        server_context(OutboundConfig::Direct),
-    ));
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("client udp bind");
-    client_socket
-        .connect(server_addr)
-        .await
-        .expect("client udp connect");
-    let security = security();
-    let resources = ResourceLimits::default();
-    let mut encrypted = EncryptedUdpSocket::new_with_cipher_suite(
-        client_socket,
-        security.secret.as_bytes(),
-        PeerRole::Client,
-        resources.into(),
-        security.cipher,
-    );
-
-    encrypted
-        .send_frame(&Frame::OpenStream {
-            stream_id: StreamId(11),
-            target: TargetAddr::Ip("127.0.0.1:80".parse().expect("target")),
-            ingress: IngressKind::Socks5,
-            outbound: OutboundPolicy::Direct,
-            class: TrafficClass::Interactive,
-            role: StreamOpenRole::Active,
-        })
-        .await
-        .expect("early open");
+        .expect("send noise");
 
     let path = format!("udp://{server_addr}")
         .parse::<PathSpec>()
-        .expect("path");
-    let session_id = SessionId(81);
-    let path_id = PathId(6);
-    let (hello, auth, join) = authenticated_path_join_frames_for_session(
-        &security,
+        .expect("client path");
+    let resources = ResourceLimits::default();
+    let mut session = UdpDatagramClientSession::open(
         &path,
-        path_id,
-        UnderlayProtocol::Udp,
-        session_id,
+        0,
+        security(),
+        resources.into(),
+        resources.into(),
+        Duration::from_secs(2),
     )
-    .expect("auth frames");
-    encrypted.send_frame(&hello).await.expect("hello");
-    encrypted.send_frame(&auth).await.expect("auth");
-    encrypted.send_frame(&join).await.expect("join");
-
-    let mut buffer = vec![0u8; encrypted.max_datagram_bytes().expect("datagram size")];
-    let mut session_ready = false;
-    let mut path_active = false;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !session_ready || !path_active {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for UDP path establishment"
-        );
-        match tokio::time::timeout(remaining, encrypted.recv_frame(&mut buffer))
-            .await
-            .expect("establish timeout")
-            .expect("establish frame")
-        {
-            Frame::SessionReady => session_ready = true,
-            Frame::PathStatus {
-                path_id: active_path,
-                status: crate::protocol::PathStatus::Active,
-                ..
-            } if active_path == path_id => path_active = true,
-            frame => panic!("unexpected establishment frame: {frame:?}"),
-        }
-    }
+    .await
+    .expect("open udp datagram session");
+    session
+        .ping(Duration::from_secs(2))
+        .await
+        .expect("udp ping");
+    let _ = session.close_session().await;
 
     server.abort();
     let _ = server.await;
-}
-
-#[tokio::test]
-async fn server_udp_path_handles_idempotent_control_and_drain() {
-    let socket = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("server udp bind"),
-    );
-    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer udp bind");
-    let peer_addr = peer.local_addr().expect("peer addr");
-    let context = server_context(OutboundConfig::Direct);
-    let mut session =
-        ServerUdpPathSession::new(socket, peer_addr, context).expect("server udp path session");
-    let path = "udp://127.0.0.1:7444".parse::<PathSpec>().expect("path");
-    let session_id = SessionId(78);
-    let path_id = PathId(3);
-    let (hello, auth, join) = authenticated_path_join_frames_for_session(
-        &security(),
-        &path,
-        path_id,
-        UnderlayProtocol::Udp,
-        session_id,
-    )
-    .expect("auth frames");
-
-    session.handle_frame(hello).await.expect("hello");
-    session.handle_frame(auth).await.expect("auth");
-    session.handle_frame(join).await.expect("join");
-    assert!(matches!(session.state, ServerUdpPathState::Established));
-
-    assert!(matches!(
-        session
-            .handle_frame(Frame::PathChallenge { path_id, nonce: 99 })
-            .await
-            .expect("path challenge"),
-        ServerUdpSessionOutcome::Active
-    ));
-    assert!(matches!(
-        session
-            .handle_frame(Frame::PathStatus {
-                path_id,
-                status: crate::protocol::PathStatus::Active,
-                capabilities: crate::protocol::PathCapabilities::default(),
-            })
-            .await
-            .expect("path status"),
-        ServerUdpSessionOutcome::Active
-    ));
-    assert!(matches!(
-        session
-            .handle_frame(Frame::PathMetrics {
-                metrics: crate::protocol::PathMetrics {
-                    path_id,
-                    min_rtt_us: 1_000,
-                    srtt_us: 2_000,
-                    rttvar_us: 500,
-                    jitter_us: 250,
-                    delivery_rate_bps: 10_000_000,
-                    loss_ppm: 1_000,
-                    ecn_ppm: 0,
-                    bytes_in_flight: 1024,
-                    queue_bytes: 2048,
-                },
-            })
-            .await
-            .expect("path metrics"),
-        ServerUdpSessionOutcome::Active
-    ));
-    assert!(matches!(
-        session
-            .handle_frame(Frame::RxRateHint {
-                path_id,
-                hint: RateHint::BitsPerSecond(10_000_000),
-            })
-            .await
-            .expect("rate hint"),
-        ServerUdpSessionOutcome::Active
-    ));
-    let active_stream = StreamId(123);
-    session.attached_streams.insert(active_stream);
-    assert!(matches!(
-        session
-            .handle_frame(Frame::PathDrain { path_id })
-            .await
-            .expect("path drain"),
-        ServerUdpSessionOutcome::Active
-    ));
-    assert!(session.draining);
-    assert!(matches!(
-        session
-            .handle_frame(Frame::OpenStream {
-                stream_id: StreamId(124),
-                target: TargetAddr::Domain {
-                    host: "example.com".to_string(),
-                    port: 443,
-                },
-                ingress: IngressKind::Socks5,
-                outbound: OutboundPolicy::Direct,
-                class: TrafficClass::Interactive,
-                role: StreamOpenRole::Active,
-            })
-            .await
-            .expect("open after drain"),
-        ServerUdpSessionOutcome::Active
-    ));
-    assert!(!session.attached_streams.contains(&StreamId(124)));
-    assert!(matches!(
-        session
-            .handle_command(TcpPathSessionCommand::CloseStream(active_stream))
-            .await
-            .expect("close active stream"),
-        ServerUdpSessionOutcome::Closed
-    ));
-    assert!(session.draining);
 }
 
 async fn drive_socks5_echo_client<S>(client: &mut S, target_addr: SocketAddr)
@@ -1068,6 +507,7 @@ fn tcp_relay_read_budget_is_ack_gated() {
     let mut mux_limits = MuxLimits {
         max_payload_bytes: 64 * 1024,
         max_ack_ranges: 256,
+        max_streams: 1024,
         max_stream_window_bytes: 1024 * 1024,
         max_repair_bytes: 1024 * 1024,
         max_reorder_bytes: 1024 * 1024,
@@ -1158,6 +598,7 @@ fn tcp_stream_frame_queue_tracks_relay_chunk_byte_budget() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
+        max_streams: 1024,
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
@@ -1179,6 +620,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
+        max_streams: 1024,
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
@@ -1197,30 +639,6 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         ..ResourceLimits::default()
     };
     assert_eq!(tcp_session_command_queue(resources), 20);
-}
-
-#[test]
-fn udp_stream_path_command_queue_tracks_udp_frame_budget() {
-    let mux_limits = MuxLimits {
-        max_payload_bytes: 1024 * 1024,
-        max_ack_ranges: 256,
-        max_stream_window_bytes: 16 * 1024 * 1024,
-        max_repair_bytes: 16 * 1024 * 1024,
-        max_reorder_bytes: 16 * 1024 * 1024,
-        max_datagram_queue_bytes: 4 * 1024 * 1024,
-        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
-        max_tcp_relay_chunk_bytes: 256 * 1024,
-        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
-        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
-    };
-    let udp_queue = udp_stream_path_command_queue(mux_limits);
-
-    assert!(udp_queue > tcp_path_command_queue(mux_limits));
-    assert_eq!(udp_queue, tcp_path_session_frame_queue(mux_limits));
-    assert!(
-        udp_queue * udp_stream_frame_payload_bytes(mux_limits)
-            >= mux_limits.max_tcp_relay_chunk_bytes
-    );
 }
 
 #[test]
@@ -1360,13 +778,10 @@ fn tcp_relay_repair_replay_interval_tracks_inflight_pressure() {
     let mux_limits = MuxLimits::default();
     let light = tcp_relay_repair_replay_interval(PATH_OPEN_SCORE_BYTES, mux_limits);
     let full = tcp_relay_repair_replay_interval(mux_limits.max_tcp_path_inflight_bytes, mux_limits);
-    let udp_full =
-        udp_stream_repair_replay_interval(mux_limits.max_tcp_path_inflight_bytes, mux_limits);
 
     assert!(light >= TCP_STREAM_STALL_MIN_TIMEOUT);
     assert!(light < full);
     assert_eq!(full, TCP_STREAM_STALL_MAX_TIMEOUT);
-    assert_eq!(udp_full, TCP_STREAM_STALL_MIN_TIMEOUT);
     assert!(full < Duration::from_secs(5));
 }
 
@@ -1756,4 +1171,3 @@ mod datagram;
 mod integration;
 mod security;
 mod tcp_path;
-mod udp_stream;

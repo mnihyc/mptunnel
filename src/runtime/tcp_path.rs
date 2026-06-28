@@ -1501,17 +1501,6 @@ pub(super) fn tcp_path_command_queue(mux_limits: MuxLimits) -> usize {
         .clamp(4, tcp_path_session_frame_queue(mux_limits).max(4))
 }
 
-pub(super) fn udp_stream_path_command_queue(mux_limits: MuxLimits) -> usize {
-    let frame_payload = udp_stream_frame_payload_bytes(mux_limits).max(1);
-    let inflight_frames = mux_limits
-        .max_tcp_path_inflight_bytes
-        .saturating_add(frame_payload - 1)
-        / frame_payload;
-    inflight_frames
-        .saturating_add(4)
-        .clamp(16, tcp_path_session_frame_queue(mux_limits).max(16))
-}
-
 pub(super) fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
     tcp_stream_frame_queue(mux_limits)
         .saturating_mul(4)

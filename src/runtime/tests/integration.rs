@@ -18,18 +18,14 @@ async fn path_probe_refreshes_tcp_health_without_stream_load() {
 
 #[tokio::test]
 async fn path_probe_refreshes_udp_health_without_association_load() {
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
 
     probe_client_paths(&context, Duration::from_secs(1)).await;
 
-    server.await.expect("server join").expect("server probe");
+    server.abort();
+    let _ = server.await;
     let health = context.health.lock().expect("health lock");
     assert_eq!(health.udp[0].state, SchedulerPathState::Active);
     assert!(health.udp[0].measured_srtt_ms.is_some());
@@ -267,14 +263,9 @@ async fn socks5_ingress_rejects_wrong_username_password_auth() {
 }
 
 #[tokio::test]
-async fn socks5_ingress_relays_tcp_payload_over_encrypted_udp_stream_path() {
+async fn socks5_ingress_relays_tcp_payload_over_udp_stream_path() {
     let (target_addr, target) = spawn_echo_target().await;
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server_path = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
+    let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
     let (mut client, server) = duplex(4096);
@@ -312,10 +303,8 @@ async fn socks5_ingress_relays_tcp_payload_over_encrypted_udp_stream_path() {
     assert_eq!(&payload, b"pong");
 
     handler.await.expect("join").expect("handler");
-    server_path
-        .await
-        .expect("server join")
-        .expect("server path");
+    server_path.abort();
+    let _ = server_path.await;
     target.await.expect("target join");
 }
 
@@ -973,14 +962,9 @@ async fn http_connect_ingress_rejects_missing_basic_proxy_auth() {
 }
 
 #[tokio::test]
-async fn http_connect_ingress_relays_tcp_payload_over_encrypted_udp_stream_path() {
+async fn http_connect_ingress_relays_tcp_payload_over_udp_stream_path() {
     let (target_addr, target) = spawn_echo_target().await;
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server_path = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
+    let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
     let (mut client, server) = duplex(4096);
@@ -1003,10 +987,8 @@ async fn http_connect_ingress_relays_tcp_payload_over_encrypted_udp_stream_path(
     assert_eq!(&payload, b"pong");
 
     handler.await.expect("join").expect("handler");
-    server_path
-        .await
-        .expect("server join")
-        .expect("server path");
+    server_path.abort();
+    let _ = server_path.await;
     target.await.expect("target join");
 }
 
@@ -1070,14 +1052,9 @@ async fn send_socks5_udp_ping(relay_addr: SocketAddr, target_addr: SocketAddr) {
 }
 
 #[tokio::test]
-async fn encrypted_udp_datagram_path_relays_direct_udp_target() {
+async fn udp_datagram_path_relays_direct_udp_target() {
     let (target_addr, target) = spawn_udp_echo_target().await;
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
 
     let response = client_udp_datagram_round_trip(
         &path,
@@ -1091,19 +1068,15 @@ async fn encrypted_udp_datagram_path_relays_direct_udp_target() {
     .expect("round trip");
 
     assert_eq!(response, Bytes::from_static(b"pong"));
-    server.await.expect("server join").expect("server");
+    server.abort();
+    let _ = server.await;
     target.await.expect("target join");
 }
 
 #[tokio::test]
-async fn encrypted_udp_datagram_path_relays_upstream_socks5_udp_target() {
+async fn udp_datagram_path_relays_upstream_socks5_udp_target() {
     let (proxy, proxy_task) = spawn_socks5_udp_proxy_once().await;
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Socks5 { proxy }),
-    ));
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Socks5 { proxy }).await;
 
     let response = client_udp_datagram_round_trip(
         &path,
@@ -1120,7 +1093,8 @@ async fn encrypted_udp_datagram_path_relays_upstream_socks5_udp_target() {
     .expect("round trip");
 
     assert_eq!(response, Bytes::from_static(b"pong"));
-    server.await.expect("server join").expect("server");
+    server.abort();
+    let _ = server.await;
     proxy_task.await.expect("proxy join");
 }
 
@@ -1201,14 +1175,9 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
 }
 
 #[tokio::test]
-async fn socks5_udp_associate_relays_datagram_over_encrypted_udp_path() {
+async fn socks5_udp_associate_relays_datagram_over_udp_path() {
     let (target_addr, target) = spawn_udp_echo_target_count(2).await;
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
     let health_context = context.clone();
@@ -1229,7 +1198,8 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_udp_path() {
         assert!(health.udp[0].measured_jitter_ms.is_some());
         assert_eq!(health.udp[0].measured_loss_rate, Some(0.0));
     }
-    server.await.expect("server join").expect("server");
+    server.abort();
+    let _ = server.await;
     target.await.expect("target join");
 }
 
@@ -1344,438 +1314,6 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
 }
 
 #[tokio::test]
-async fn socks5_udp_associate_prefers_ready_low_latency_path() {
-    let (target_addr, target) = spawn_udp_echo_target_count(2).await;
-    let first_path = reserve_udp_path_with_query("srtt-ms=10&rate-mbps=10").await;
-    let second_path = reserve_udp_path_with_query("srtt-ms=10&rate-mbps=10").await;
-    let first_socket = udp::bind_socket(&first_path)
-        .await
-        .expect("bind first udp path");
-    let first_server = tokio::spawn(handle_server_udp_datagram_path_session(
-        first_socket,
-        server_context(OutboundConfig::Direct),
-    ));
-    let context = ClientPathContext::new(
-        vec![first_path, second_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    let health_context = context.clone();
-    let (mut control_client, control_server) = duplex(4096);
-    let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
-
-    control_client
-        .write_all(&[0x05, 0x01, 0x00])
-        .await
-        .expect("auth request");
-    let mut auth_response = [0u8; 2];
-    control_client
-        .read_exact(&mut auth_response)
-        .await
-        .expect("auth response");
-    assert_eq!(auth_response, [0x05, 0x00]);
-    control_client
-        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
-        .expect("udp associate");
-    let mut associate_response = [0u8; 10];
-    control_client
-        .read_exact(&mut associate_response)
-        .await
-        .expect("associate response");
-    let relay_addr = SocketAddr::from((
-        [
-            associate_response[4],
-            associate_response[5],
-            associate_response[6],
-            associate_response[7],
-        ],
-        u16::from_be_bytes([associate_response[8], associate_response[9]]),
-    ));
-
-    let udp_client = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("udp client bind");
-    let request = socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"ping").expect("udp request");
-    for _ in 0..2 {
-        udp_client
-            .send_to(&request, relay_addr)
-            .await
-            .expect("send udp request");
-        let mut response = [0u8; 128];
-        let (len, _) = udp_client
-            .recv_from(&mut response)
-            .await
-            .expect("recv udp response");
-        let (datagram, consumed) = socks5::parse_udp_datagram(&response[..len]).expect("datagram");
-        assert_eq!(consumed, len);
-        assert_eq!(datagram.target, TargetAddr::Ip(target_addr));
-        assert_eq!(datagram.payload, Bytes::from_static(b"pong"));
-    }
-    {
-        let health = health_context.health.lock().expect("health lock");
-        assert_eq!(health.udp[0].active_flows, 1);
-        assert_eq!(health.udp[1].active_flows, 0);
-        assert_eq!(health.udp[1].state, SchedulerPathState::Active);
-        assert_eq!(health.udp[1].consecutive_failures, 0);
-    }
-    control_client.shutdown().await.expect("control shutdown");
-
-    handler.await.expect("handler join").expect("handler");
-    {
-        let health = health_context.health.lock().expect("health lock");
-        assert_eq!(health.udp[0].active_flows, 0);
-        assert_eq!(health.udp[1].active_flows, 0);
-    }
-    first_server
-        .await
-        .expect("first server join")
-        .expect("first server");
-    target.await.expect("target join");
-}
-
-#[tokio::test]
-async fn udp_association_scores_pacer_delay_against_path_eta() {
-    let (target_addr, target) = spawn_udp_echo_target().await;
-    let low_latency_path = reserve_udp_path_with_query("srtt-ms=10&rate-mbps=100").await;
-    let slower_path = reserve_udp_path_with_query("srtt-ms=120&rate-mbps=100").await;
-    let low_latency_socket = udp::bind_socket(&low_latency_path)
-        .await
-        .expect("bind low latency udp path");
-    let low_latency_server = tokio::spawn(handle_server_udp_datagram_path_session(
-        low_latency_socket,
-        server_context(OutboundConfig::Direct),
-    ));
-    let context = ClientPathContext::new(
-        vec![low_latency_path, slower_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    let observed_context = context.clone();
-    let mut association = UdpDatagramClientAssociation::new(context).expect("assoc");
-
-    let response = association
-        .send_to(
-            TargetAddr::Ip(target_addr),
-            Bytes::from_static(b"ping"),
-            1000,
-        )
-        .await
-        .expect("initial response");
-
-    assert_eq!(response, Bytes::from_static(b"pong"));
-    association
-        .paths
-        .iter_mut()
-        .find(|path| path.session.path_index == 0)
-        .expect("low latency path session")
-        .pacer
-        .next_send_at = Instant::now() + Duration::from_millis(30);
-
-    assert_eq!(
-        association.select_path_candidate(
-            &[
-                UdpPathCandidate {
-                    path_index: 0,
-                    eta_ms: 10.0,
-                },
-                UdpPathCandidate {
-                    path_index: 1,
-                    eta_ms: 120.0,
-                },
-            ],
-            &HashSet::new(),
-            512,
-            1000,
-        ),
-        Some(0)
-    );
-    observed_context.mark_udp_path_probe_success(1, Duration::from_millis(20));
-    assert_eq!(
-        association.select_path_candidate(
-            &[
-                UdpPathCandidate {
-                    path_index: 0,
-                    eta_ms: 10.0,
-                },
-                UdpPathCandidate {
-                    path_index: 1,
-                    eta_ms: 25.0,
-                },
-            ],
-            &HashSet::new(),
-            512,
-            1000,
-        ),
-        Some(0)
-    );
-
-    association.suppress_path_after_timeout(0, Duration::from_millis(250), 1000);
-    assert_eq!(
-        association.select_path_candidate(
-            &[
-                UdpPathCandidate {
-                    path_index: 0,
-                    eta_ms: 10.0,
-                },
-                UdpPathCandidate {
-                    path_index: 1,
-                    eta_ms: 25.0,
-                },
-            ],
-            &HashSet::new(),
-            512,
-            1000,
-        ),
-        Some(1)
-    );
-
-    association.close().await.expect("close association");
-    low_latency_server
-        .await
-        .expect("low latency server join")
-        .expect("low latency server");
-    target.await.expect("target join");
-}
-
-#[tokio::test]
-async fn udp_association_retries_datagram_on_survivor_path_after_timeout() {
-    let (target_addr, target) = spawn_udp_echo_target().await;
-    let blackhole_path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
-    let survivor_path = reserve_udp_path_with_query("srtt-ms=20&rate-mbps=100").await;
-    let blackhole = spawn_udp_datagram_blackhole_path(blackhole_path.clone()).await;
-    let survivor_socket = udp::bind_socket(&survivor_path)
-        .await
-        .expect("bind survivor udp path");
-    let survivor = tokio::spawn(handle_server_udp_datagram_path_session(
-        survivor_socket,
-        server_context(OutboundConfig::Direct),
-    ));
-    let context = ClientPathContext::new(
-        vec![blackhole_path, survivor_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
-
-    let response = association
-        .send_to(
-            TargetAddr::Ip(target_addr),
-            Bytes::from_static(b"ping"),
-            1000,
-        )
-        .await
-        .expect("retry response");
-
-    assert_eq!(response, Bytes::from_static(b"pong"));
-    {
-        let health = context.health.lock().expect("health lock");
-        assert_eq!(health.udp[0].state, SchedulerPathState::Suspect);
-        assert_eq!(health.udp[0].active_flows, 0);
-        assert_eq!(health.udp[1].state, SchedulerPathState::Active);
-        assert_eq!(health.udp[1].active_flows, 1);
-    }
-    association.close().await.expect("close association");
-    blackhole
-        .await
-        .expect("blackhole join")
-        .expect("blackhole path");
-    survivor
-        .await
-        .expect("survivor join")
-        .expect("survivor path");
-    target.await.expect("target join");
-}
-
-#[tokio::test]
-async fn udp_association_probes_mtu_before_large_datagram() {
-    let payload = Bytes::from(vec![0x5a; UDP_DEFAULT_MTU_PAYLOAD_BYTES + 256]);
-    let (target_addr, target) =
-        spawn_udp_payload_target(payload.clone(), Bytes::from_static(b"pong")).await;
-    let path = reserve_udp_path().await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
-
-    let response = association
-        .send_to(TargetAddr::Ip(target_addr), payload.clone(), 1000)
-        .await
-        .expect("large datagram");
-
-    assert_eq!(response, Bytes::from_static(b"pong"));
-    {
-        let health = context.health.lock().expect("health lock");
-        assert_eq!(
-            health.udp[0].measured_mtu_payload_bytes,
-            Some(payload.len())
-        );
-    }
-    association.close().await.expect("close association");
-    server.await.expect("server join").expect("server");
-    target.await.expect("target join");
-}
-
-#[test]
-fn udp_measured_mtu_skips_oversized_path_candidate() {
-    let low_mtu_path = "udp://127.0.0.1:12001?srtt-ms=5&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("low mtu path");
-    let probeable_path = "udp://127.0.0.1:12002?srtt-ms=20&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("probeable path");
-    let context = ClientPathContext::new(
-        vec![low_mtu_path, probeable_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    context.mark_udp_path_mtu(0, UDP_DEFAULT_MTU_PAYLOAD_BYTES);
-    let association = UdpDatagramClientAssociation::new(context).expect("assoc");
-
-    assert_eq!(
-        association.select_path_candidate(
-            &[
-                UdpPathCandidate {
-                    path_index: 0,
-                    eta_ms: 5.0,
-                },
-                UdpPathCandidate {
-                    path_index: 1,
-                    eta_ms: 20.0,
-                },
-            ],
-            &HashSet::new(),
-            UDP_DEFAULT_MTU_PAYLOAD_BYTES + 256,
-            1000,
-        ),
-        Some(1)
-    );
-}
-
-#[tokio::test]
-async fn udp_association_retries_after_acked_response_loss_without_failing_path() {
-    let (target_addr, target) = spawn_udp_echo_target().await;
-    let drop_path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
-    let survivor_path = reserve_udp_path_with_query("srtt-ms=20&rate-mbps=100").await;
-    let drop_server = spawn_udp_datagram_ack_then_drop_path(drop_path.clone()).await;
-    let survivor_socket = udp::bind_socket(&survivor_path)
-        .await
-        .expect("bind survivor udp path");
-    let survivor = tokio::spawn(handle_server_udp_datagram_path_session(
-        survivor_socket,
-        server_context(OutboundConfig::Direct),
-    ));
-    let context = ClientPathContext::new(
-        vec![drop_path, survivor_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
-
-    let response = association
-        .send_to(
-            TargetAddr::Ip(target_addr),
-            Bytes::from_static(b"ping"),
-            1000,
-        )
-        .await
-        .expect("retry response");
-
-    assert_eq!(response, Bytes::from_static(b"pong"));
-    {
-        let health = context.health.lock().expect("health lock");
-        assert_eq!(health.udp[0].state, SchedulerPathState::Active);
-        assert!(
-            health.udp[0]
-                .measured_loss_rate
-                .is_some_and(|loss| loss > 0.0)
-        );
-        assert_eq!(health.udp[1].state, SchedulerPathState::Active);
-    }
-    association.close().await.expect("close association");
-    drop_server
-        .await
-        .expect("drop server join")
-        .expect("drop server");
-    survivor
-        .await
-        .expect("survivor join")
-        .expect("survivor path");
-    target.await.expect("target join");
-}
-
-#[tokio::test]
-async fn udp_association_retries_acked_timeout_on_same_open_path() {
-    let (target_addr, target) = spawn_udp_drop_first_echo_target().await;
-    let path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
-    let socket = udp::bind_socket(&path).await.expect("bind udp path");
-    let server = tokio::spawn(handle_server_udp_datagram_path_session(
-        socket,
-        server_context(OutboundConfig::Direct),
-    ));
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
-
-    let response = association
-        .send_to(
-            TargetAddr::Ip(target_addr),
-            Bytes::from_static(b"ping"),
-            1000,
-        )
-        .await
-        .expect("same path retry response");
-
-    assert_eq!(response, Bytes::from_static(b"pong"));
-    {
-        let health = context.health.lock().expect("health lock");
-        assert_eq!(health.udp[0].state, SchedulerPathState::Active);
-        assert_eq!(health.udp[0].active_flows, 1);
-        assert!(
-            health.udp[0]
-                .measured_loss_rate
-                .is_some_and(|loss| loss > 0.0)
-        );
-    }
-    association.close().await.expect("close association");
-    server.await.expect("server join").expect("server");
-    target.await.expect("target join");
-}
-
-#[tokio::test]
-async fn udp_association_ignores_stale_response_datagram_id() {
-    let target_socket = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
-    let target_addr = target_socket.local_addr().expect("target addr");
-    let path = reserve_udp_path_with_query("srtt-ms=5&rate-mbps=100").await;
-    let server = spawn_udp_datagram_stale_then_matching_response_path(path.clone()).await;
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context).expect("assoc");
-
-    let response = association
-        .send_to(
-            TargetAddr::Ip(target_addr),
-            Bytes::from_static(b"ping"),
-            1000,
-        )
-        .await
-        .expect("matched response");
-
-    assert_eq!(response, Bytes::from_static(b"pong"));
-    association.close().await.expect("close association");
-    server.await.expect("server join").expect("server");
-}
-
-#[tokio::test]
 async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
     let path = reserve_tcp_path().await;
     let listener = bind_listener(&path).await.expect("bind");
@@ -1797,7 +1335,6 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
                     path_join_replay_cache_capacity(ResourceLimits::default().max_streams),
                 ))),
                 max_tcp_streams: ResourceLimits::default().max_streams,
-                max_udp_sessions: ResourceLimits::default().max_streams,
                 max_udp_flows_per_session: ResourceLimits::default().max_streams,
             },
         )

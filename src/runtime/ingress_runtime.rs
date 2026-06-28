@@ -337,17 +337,16 @@ pub(super) async fn open_udp_datagram_session_on_path(
     session_id: SessionId,
     handshake_timeout: Duration,
 ) -> Result<UdpDatagramClientSession, RuntimeError> {
-    let path = context
-        .udp_paths
+    let path_session = context
+        .udp_sessions
         .get(path_index)
+        .cloned()
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+    let _ = session_id;
     let started_at = Instant::now();
-    let session = UdpDatagramClientSession::open_for_session(
-        path,
+    let session = UdpDatagramClientSession::open_from_udp_session(
+        path_session,
         path_index,
-        session_id,
-        context.security.clone(),
-        context.codec_limits,
         context.mux_limits,
         handshake_timeout,
     )
@@ -438,23 +437,22 @@ pub(super) async fn probe_udp_client_path(
     path_index: usize,
     timeout: Duration,
 ) -> Result<Duration, RuntimeError> {
-    let path = context
-        .udp_paths
+    let path_session = context
+        .udp_sessions
         .get(path_index)
+        .cloned()
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
     let started_at = Instant::now();
     tokio::time::timeout(timeout, async {
-        let mut session = UdpDatagramClientSession::open(
-            path,
+        let mut session = UdpDatagramClientSession::open_from_udp_session(
+            path_session,
             path_index,
-            context.security.clone(),
-            context.codec_limits,
             context.mux_limits,
             timeout,
         )
         .await?;
         session.ping(timeout).await?;
-        session.close_session().await?;
+        let _ = session.close_session().await;
         Ok::<(), RuntimeError>(())
     })
     .await

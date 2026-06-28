@@ -1,4 +1,9 @@
 use crate::mux::MuxLimits;
+use crate::protocol::Frame;
+use crate::protocol::codec::{
+    CodecError, CodecLimits, FRAME_HEADER_LEN, decode_frame, decode_payload_len_from_header,
+    encode_frame,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -8,7 +13,9 @@ use quinn::rustls::{
     crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
-use quinn::{ClientConfig, ServerConfig, TransportConfig, VarInt, congestion};
+use quinn::{
+    ClientConfig, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt, congestion,
+};
 use rcgen::{CertificateParams, KeyPair, SerialNumber, date_time_ymd};
 use ring::signature::Ed25519KeyPair;
 use sha2::{Digest, Sha256};
@@ -66,6 +73,60 @@ impl fmt::Display for QuicTransportError {
 }
 
 impl Error for QuicTransportError {}
+
+#[derive(Debug)]
+pub enum QuicFrameError {
+    Read(quinn::ReadExactError),
+    Write(quinn::WriteError),
+    Finish(quinn::ClosedStream),
+    Codec(CodecError),
+}
+
+impl fmt::Display for QuicFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(err) => write!(f, "failed to read QUIC frame: {err}"),
+            Self::Write(err) => write!(f, "failed to write QUIC frame: {err}"),
+            Self::Finish(err) => write!(f, "failed to finish QUIC stream: {err}"),
+            Self::Codec(err) => write!(f, "failed to encode/decode QUIC frame: {err}"),
+        }
+    }
+}
+
+impl Error for QuicFrameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(err) => Some(err),
+            Self::Write(err) => Some(err),
+            Self::Finish(err) => Some(err),
+            Self::Codec(err) => Some(err),
+        }
+    }
+}
+
+impl From<quinn::ReadExactError> for QuicFrameError {
+    fn from(value: quinn::ReadExactError) -> Self {
+        Self::Read(value)
+    }
+}
+
+impl From<quinn::WriteError> for QuicFrameError {
+    fn from(value: quinn::WriteError) -> Self {
+        Self::Write(value)
+    }
+}
+
+impl From<quinn::ClosedStream> for QuicFrameError {
+    fn from(value: quinn::ClosedStream) -> Self {
+        Self::Finish(value)
+    }
+}
+
+impl From<CodecError> for QuicFrameError {
+    fn from(value: CodecError) -> Self {
+        Self::Codec(value)
+    }
+}
 
 impl From<rcgen::Error> for QuicTransportError {
     fn from(value: rcgen::Error) -> Self {
@@ -149,12 +210,13 @@ pub fn transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicTr
     let mut config = TransportConfig::default();
     let stream_window = varint(mux_limits.max_stream_window_bytes)?;
     let connection_window = varint(mux_limits.max_stream_window_bytes.saturating_mul(2))?;
+    let max_bidi_streams = mux_limits.max_streams.min(u32::MAX as usize) as u32;
     let datagram_queue = mux_limits
         .max_datagram_queue_bytes
         .max(mux_limits.max_payload_bytes);
 
     config
-        .max_concurrent_bidi_streams(VarInt::from_u32(u32::MAX))
+        .max_concurrent_bidi_streams(VarInt::from_u32(max_bidi_streams))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .stream_receive_window(stream_window)
         .receive_window(connection_window)
@@ -167,7 +229,7 @@ pub fn transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicTr
         .datagram_receive_buffer_size(Some(datagram_queue))
         .datagram_send_buffer_size(datagram_queue)
         .congestion_controller_factory(Arc::new(congestion::BbrConfig::default()))
-        .enable_segmentation_offload(true);
+        .enable_segmentation_offload(false);
 
     Ok(config)
 }
@@ -204,6 +266,34 @@ pub fn derive_private_alpn(secret: &[u8]) -> Result<Vec<u8>, QuicTransportError>
     Ok(URL_SAFE_NO_PAD
         .encode(&seed[..PRIVATE_ALPN_SEED_BYTES])
         .into_bytes())
+}
+
+pub async fn read_frame(
+    recv: &mut RecvStream,
+    limits: CodecLimits,
+) -> Result<Frame, QuicFrameError> {
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    recv.read_exact(&mut header).await?;
+    let payload_len = decode_payload_len_from_header(&header, limits)?;
+    let mut encoded = Vec::with_capacity(FRAME_HEADER_LEN + payload_len);
+    encoded.extend_from_slice(&header);
+    encoded.resize(FRAME_HEADER_LEN + payload_len, 0);
+    recv.read_exact(&mut encoded[FRAME_HEADER_LEN..]).await?;
+    Ok(decode_frame(&encoded, limits)?)
+}
+
+pub async fn write_frame(
+    send: &mut SendStream,
+    frame: &Frame,
+    limits: CodecLimits,
+) -> Result<(), QuicFrameError> {
+    let encoded = encode_frame(frame, limits)?;
+    send.write_all(&encoded).await?;
+    Ok(())
+}
+
+pub fn finish_stream(send: &mut SendStream) -> Result<(), QuicFrameError> {
+    Ok(send.finish()?)
 }
 
 fn derive_seed(secret: &[u8], context: &[u8]) -> Result<[u8; 32], QuicTransportError> {

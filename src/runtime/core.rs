@@ -7,6 +7,7 @@ use super::relay_open::*;
 use super::server_runtime::*;
 use super::tcp_path::*;
 use super::tun_l4::*;
+use super::udp_path::*;
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
@@ -176,6 +177,7 @@ pub struct ClientPathContext {
     pub(super) tcp_paths: Arc<Vec<PathSpec>>,
     pub(super) udp_paths: Arc<Vec<PathSpec>>,
     pub(super) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
+    pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
     pub(super) next_tcp_stream_id: Arc<Mutex<u64>>,
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
     pub(super) codec_limits: CodecLimits,
@@ -510,6 +512,7 @@ impl ClientPathContext {
         let codec_limits = resources.into();
         let mux_limits = resources.into();
         let tcp_session_id = random_session_id()?;
+        let udp_session_id = random_session_id()?;
         let reuse_tcp_latency_sessions = tcp_paths.len() > 1;
         let tcp_sessions = tcp_paths
             .iter()
@@ -532,10 +535,27 @@ impl ClientPathContext {
                 })
             })
             .collect::<Vec<_>>();
+        let udp_sessions = udp_paths
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(path_index, path)| {
+                ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
+                    path,
+                    path_index,
+                    session_id: udp_session_id,
+                    security: security.clone(),
+                    codec_limits,
+                    mux_limits,
+                    stream_frame_queue: tcp_stream_frame_queue(mux_limits),
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(Self {
             tcp_paths: Arc::new(tcp_paths),
             udp_paths: Arc::new(udp_paths),
             tcp_sessions: Arc::new(tcp_sessions),
+            udp_sessions: Arc::new(udp_sessions),
             next_tcp_stream_id: Arc::new(Mutex::new(0)),
             health: Arc::new(Mutex::new(health)),
             codec_limits,
@@ -1843,7 +1863,6 @@ pub struct ServerPathContext {
     pub(super) tcp_streams: Arc<ServerTcpStreamRegistry>,
     pub(super) path_join_replay: Arc<Mutex<RecentIdCache<PathJoinReplayKey>>>,
     pub(super) max_tcp_streams: usize,
-    pub(super) max_udp_sessions: usize,
     pub(super) max_udp_flows_per_session: usize,
 }
 

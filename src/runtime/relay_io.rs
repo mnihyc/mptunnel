@@ -28,34 +28,7 @@ pub(super) async fn replay_tcp_repair_cache(
     Ok(())
 }
 
-pub(super) async fn pace_udp_stream_frame(
-    congestion: Option<&UdpStreamCongestion>,
-    frame: &Frame,
-    next_send_at: &mut Instant,
-) {
-    let Some(congestion) = congestion else {
-        return;
-    };
-    let bytes = frame_pacing_bytes(frame);
-    let Some(interval) = congestion.pacing_interval(bytes) else {
-        return;
-    };
-    let now = Instant::now();
-    if *next_send_at > now {
-        #[cfg(feature = "lab-diagnostics")]
-        let wait_started = Instant::now();
-        tokio::time::sleep_until(tokio::time::Instant::from_std(*next_send_at)).await;
-        #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record("relay.udp_pacing_wait", wait_started.elapsed(), bytes);
-    }
-    let anchor = if *next_send_at > now {
-        *next_send_at
-    } else {
-        now
-    };
-    *next_send_at = anchor + interval;
-}
-
+#[cfg(feature = "lab-diagnostics")]
 pub(super) fn frame_pacing_bytes(frame: &Frame) -> usize {
     match frame {
         Frame::StreamData { payload, .. } => payload.len().max(1),
@@ -66,110 +39,6 @@ pub(super) fn frame_pacing_bytes(frame: &Frame) -> usize {
         | Frame::StreamDetach { .. } => 1,
         _ => 0,
     }
-}
-
-#[cfg(feature = "lab-diagnostics")]
-fn log_udp_stream_progress(
-    event: &str,
-    stream_id: StreamId,
-    class: TrafficClass,
-    repair_bytes: usize,
-    stats_bytes: u64,
-    congestion: &UdpStreamCongestion,
-) {
-    let diagnostic = congestion.diagnostic_state();
-    lab_diagnostic(
-        event,
-        format_args!(
-            "stream_id={} class={:?} repair_bytes={} stats_bytes={} cwnd_bytes={} ssthresh_bytes={} inflight_limit={} max_bytes={} mss_bytes={} srtt_us={} pending_samples={}",
-            stream_id.0,
-            class,
-            repair_bytes,
-            stats_bytes,
-            diagnostic.cwnd_bytes,
-            diagnostic.ssthresh_bytes,
-            diagnostic.inflight_limit,
-            diagnostic.max_bytes,
-            diagnostic.mss_bytes,
-            diagnostic
-                .srtt_us
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            diagnostic.pending_samples,
-        ),
-    );
-}
-
-pub(super) async fn replay_tcp_repair_cache_limited_paced(
-    path_stream: &TcpPathStream,
-    send_stream: &ReliableSendStream,
-    resend_fin: bool,
-    byte_limit: usize,
-    congestion: Option<&UdpStreamCongestion>,
-    next_send_at: &mut Instant,
-) -> Result<(), RuntimeError> {
-    #[cfg(feature = "lab-diagnostics")]
-    let retransmit_started = Instant::now();
-    let frames = send_stream.retransmission_frames_limited(byte_limit);
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "mux.retransmit_limited",
-        retransmit_started.elapsed(),
-        frames.iter().map(frame_pacing_bytes).sum(),
-    );
-    for frame in frames {
-        pace_udp_stream_frame(congestion, &frame, next_send_at).await;
-        path_stream.send_frame(frame).await?;
-    }
-    if resend_fin {
-        let frame = Frame::StreamFin {
-            stream_id: path_stream.stream_id,
-            final_offset: send_stream.next_offset(),
-        };
-        pace_udp_stream_frame(congestion, &frame, next_send_at).await;
-        path_stream.send_frame(frame).await?;
-    }
-    Ok(())
-}
-
-pub(super) async fn replay_tcp_repair_ack_gaps_limited_paced(
-    path_stream: &TcpPathStream,
-    send_stream: &ReliableSendStream,
-    ranges: &[OffsetRange],
-    byte_limit: usize,
-    congestion: Option<&UdpStreamCongestion>,
-    next_send_at: &mut Instant,
-) -> Result<bool, RuntimeError> {
-    #[cfg(feature = "lab-diagnostics")]
-    let retransmit_started = Instant::now();
-    let frames = send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit);
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "mux.retransmit_ack_gaps",
-        retransmit_started.elapsed(),
-        frames.iter().map(frame_pacing_bytes).sum(),
-    );
-    let replayed = !frames.is_empty();
-    for frame in frames {
-        pace_udp_stream_frame(congestion, &frame, next_send_at).await;
-        path_stream.send_frame(frame).await?;
-    }
-    Ok(replayed)
-}
-
-pub(super) fn udp_stream_ack_gap_repair_budget(
-    repair_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    if repair_bytes == 0 {
-        return 0;
-    }
-    let floor = udp_stream_frame_payload_bytes(mux_limits).max(1);
-    let burst = mux_limits
-        .max_tcp_path_inflight_bytes
-        .saturating_div(4)
-        .clamp(floor, mux_limits.max_tcp_path_inflight_bytes.max(floor));
-    repair_bytes.min(burst).max(floor)
 }
 
 pub(super) fn tcp_relay_error_is_migratable(err: &RuntimeError) -> bool {
@@ -316,14 +185,6 @@ pub(super) fn pending_stream_fin_ready(
     pending_final_offset.is_some_and(|final_offset| recv_stream.next_offset() >= final_offset)
 }
 
-pub(super) fn udp_stream_frame_payload_bytes(mux_limits: MuxLimits) -> usize {
-    UDP_DEFAULT_MTU_PAYLOAD_BYTES
-        .saturating_sub(128)
-        .clamp(UDP_MIN_MTU_PAYLOAD_BYTES, UDP_DEFAULT_MTU_PAYLOAD_BYTES)
-        .min(tcp_relay_buffer_len(mux_limits))
-        .max(1)
-}
-
 pub(super) fn adaptive_tcp_relay_chunk_bytes(
     path: Option<PathSnapshot>,
     class: TrafficClass,
@@ -418,45 +279,22 @@ where
     let mut pending_local_fin = false;
     let mut pending_remote_fin_offset = None;
     let mut last_repair_replay_at = Instant::now();
-    let mut udp_congestion = (path_stream.underlay == UnderlayProtocol::Udp)
-        .then(|| UdpStreamCongestion::new(mux_limits));
-    let mut next_udp_send_at = Instant::now();
     let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
-    let mut udp_proactive_repair_credit = 0usize;
-    #[cfg(feature = "lab-diagnostics")]
-    let mut udp_diag_next_progress_bytes = 0_u64;
-    #[cfg(feature = "lab-diagnostics")]
-    if let Some(congestion) = &udp_congestion {
-        log_udp_stream_progress(
-            "udp_stream_open",
-            stream_id,
-            path_stream.current_class(),
-            send_stream.repair_bytes(),
-            stats.payload_bytes,
-            congestion,
-        );
-    }
 
     let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
             break Ok(stats);
         }
         let relay_class = path_stream.current_class();
-        let repair_replay_interval = if let Some(congestion) = &udp_congestion {
-            congestion.repair_replay_interval(send_stream.repair_bytes(), mux_limits)
-        } else {
-            tcp_relay_repair_replay_interval(send_stream.repair_bytes(), mux_limits)
-        };
+        let repair_replay_interval =
+            tcp_relay_repair_replay_interval(send_stream.repair_bytes(), mux_limits);
         let repair_replay_deadline =
             tokio::time::Instant::from_std(last_repair_replay_at + repair_replay_interval);
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at + reliable_stream_recv_progress_interval(None, relay_class),
         );
-        let inflight_limit = udp_congestion
-            .as_ref()
-            .map(|congestion| congestion.inflight_limit())
-            .unwrap_or(mux_limits.max_tcp_path_inflight_bytes);
+        let inflight_limit = mux_limits.max_tcp_path_inflight_bytes;
         let can_read_local =
             local_open && tcp_relay_can_read_with_limit(&send_stream, inflight_limit);
         let read_budget = if can_read_local {
@@ -498,21 +336,6 @@ where
                             local.write_all(&chunk).await?;
                             #[cfg(feature = "lab-diagnostics")]
                             lab_perf_record("relay.local_write_wait", write_started.elapsed(), chunk.len());
-                            #[cfg(feature = "lab-diagnostics")]
-                            if let Some(congestion) = &udp_congestion
-                                && stats.payload_bytes >= udp_diag_next_progress_bytes
-                            {
-                                log_udp_stream_progress(
-                                    "udp_stream_deliver",
-                                    stream_id,
-                                    relay_class,
-                                    send_stream.repair_bytes(),
-                                    stats.payload_bytes,
-                                    congestion,
-                                );
-                                udp_diag_next_progress_bytes =
-                                    stats.payload_bytes.saturating_add(256 * 1024);
-                            }
                         }
                         #[cfg(feature = "lab-diagnostics")]
                         let flush_started = Instant::now();
@@ -546,70 +369,16 @@ where
                         let ack = send_stream.apply_ack(&ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        if let Some(congestion) = &mut udp_congestion {
-                            congestion.on_ack(ack.released_bytes);
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "udp_stream_ack",
-                                format_args!(
-                                    "stream_id={} class={:?} released_bytes={} repair_before={} repair_after={} ranges={} cwnd_bytes={} ssthresh_bytes={} inflight_limit={} srtt_us={} pending_samples={}",
-                                    stream_id.0,
-                                    relay_class,
-                                    ack.released_bytes,
-                                    previous_repair_bytes,
-                                    send_stream.repair_bytes(),
-                                    ranges.len(),
-                                    congestion.diagnostic_state().cwnd_bytes,
-                                    congestion.diagnostic_state().ssthresh_bytes,
-                                    congestion.diagnostic_state().inflight_limit,
-                                    congestion
-                                        .diagnostic_state()
-                                        .srtt_us
-                                        .map(|value| value.to_string())
-                                        .unwrap_or_else(|| "none".to_string()),
-                                    congestion.diagnostic_state().pending_samples,
-                                ),
-                            );
-                        }
+                        #[cfg(not(feature = "lab-diagnostics"))]
+                        let _ = ack;
                         if send_stream.repair_bytes() < previous_repair_bytes {
                             last_repair_replay_at = Instant::now();
-                        }
-                        if path_stream.underlay == UnderlayProtocol::Udp {
-                            let budget = udp_congestion
-                                .as_ref()
-                                .map(|congestion| {
-                                    congestion.repair_budget(send_stream.repair_bytes())
-                                })
-                                .unwrap_or_else(|| {
-                                    udp_stream_ack_gap_repair_budget(
-                                        send_stream.repair_bytes(),
-                                        mux_limits,
-                                    )
-                                });
-                            let replayed = replay_tcp_repair_ack_gaps_limited_paced(
-                                &path_stream,
-                                &send_stream,
-                                &ranges,
-                                budget,
-                                udp_congestion.as_ref(),
-                                &mut next_udp_send_at,
-                            )
-                            .await?;
-                            if replayed {
-                                last_repair_replay_at = Instant::now();
-                            }
                         }
                         if pending_local_fin && send_stream.repair_bytes() == 0 {
                             let frame = Frame::StreamFin {
                                 stream_id,
                                 final_offset: send_stream.next_offset(),
                             };
-                            pace_udp_stream_frame(
-                                udp_congestion.as_ref(),
-                                &frame,
-                                &mut next_udp_send_at,
-                            )
-                            .await;
                             path_stream.send_frame(frame).await?;
                             close_sent = true;
                             pending_local_fin = false;
@@ -620,45 +389,12 @@ where
                         max_offset,
                     } if max_stream_id == stream_id => {
                         send_stream.update_max_offset(max_offset);
-                        #[cfg(feature = "lab-diagnostics")]
-                        if let Some(congestion) = &udp_congestion {
-                            lab_diagnostic(
-                                "udp_stream_max_data",
-                                format_args!(
-                                    "stream_id={} class={:?} max_offset={} repair_bytes={} cwnd_bytes={} inflight_limit={}",
-                                    stream_id.0,
-                                    relay_class,
-                                    max_offset,
-                                    send_stream.repair_bytes(),
-                                    congestion.diagnostic_state().cwnd_bytes,
-                                    congestion.diagnostic_state().inflight_limit,
-                                ),
-                            );
-                        }
                     }
                     Frame::PathStatus {
                         status: crate::protocol::PathStatus::Active,
                         ..
                     } => {
-                        if path_stream.underlay == UnderlayProtocol::Udp {
-                            let budget = udp_congestion
-                                .as_ref()
-                                .map(|congestion| {
-                                    congestion.repair_budget(send_stream.repair_bytes())
-                                })
-                                .unwrap_or_else(|| send_stream.repair_bytes());
-                            replay_tcp_repair_cache_limited_paced(
-                                &path_stream,
-                                &send_stream,
-                                false,
-                                budget,
-                                udp_congestion.as_ref(),
-                                &mut next_udp_send_at,
-                            )
-                            .await?;
-                        } else {
-                            replay_tcp_repair_cache(&path_stream, &send_stream, false).await?;
-                        }
+                        replay_tcp_repair_cache(&path_stream, &send_stream, false).await?;
                         last_repair_replay_at = Instant::now();
                     }
                     Frame::StreamFin {
@@ -686,31 +422,7 @@ where
                 }
             }
             _ = tokio::time::sleep_until(repair_replay_deadline), if send_stream.repair_bytes() > 0 => {
-                if let Some(congestion) = &mut udp_congestion {
-                    congestion.on_repair_timeout();
-                    #[cfg(feature = "lab-diagnostics")]
-                    log_udp_stream_progress(
-                        "udp_stream_repair_timeout",
-                        stream_id,
-                        relay_class,
-                        send_stream.repair_bytes(),
-                        stats.payload_bytes,
-                        congestion,
-                    );
-                }
-                let budget = udp_congestion
-                    .as_ref()
-                    .map(|congestion| congestion.repair_budget(send_stream.repair_bytes()))
-                    .unwrap_or_else(|| send_stream.repair_bytes());
-                replay_tcp_repair_cache_limited_paced(
-                    &path_stream,
-                    &send_stream,
-                    false,
-                    budget,
-                    udp_congestion.as_ref(),
-                    &mut next_udp_send_at,
-                )
-                .await?;
+                replay_tcp_repair_cache(&path_stream, &send_stream, false).await?;
                 last_repair_replay_at = Instant::now();
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
@@ -746,12 +458,6 @@ where
                                 stream_id,
                                 final_offset: send_stream.next_offset(),
                             };
-                            pace_udp_stream_frame(
-                                udp_congestion.as_ref(),
-                                &frame,
-                                &mut next_udp_send_at,
-                            )
-                            .await;
                             path_stream.send_frame(frame).await?;
                             close_sent = true;
                         }
@@ -767,75 +473,8 @@ where
                     let frame = send_stream.send_data(payload, StreamFlags::NONE)?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
-                    pace_udp_stream_frame(
-                        udp_congestion.as_ref(),
-                        &frame,
-                        &mut next_udp_send_at,
-                    )
-                    .await;
                     path_stream.send_frame(frame).await?;
-                    if let Some(congestion) = &mut udp_congestion {
-                        congestion.on_send(read);
-                    }
-                    if path_stream.underlay == UnderlayProtocol::Udp {
-                        // Spend a small adaptive repair budget to reduce ordered-stream holes before timeout.
-                        udp_proactive_repair_credit = udp_proactive_repair_credit
-                            .saturating_add(read)
-                            .min(udp_stream_proactive_repair_interval_bytes(
-                                send_stream.repair_bytes(),
-                                inflight_limit,
-                                mux_limits,
-                            ));
-                        if udp_stream_should_send_proactive_repair(
-                            udp_proactive_repair_credit,
-                            send_stream.repair_bytes(),
-                            inflight_limit,
-                            mux_limits,
-                        ) {
-                            udp_proactive_repair_credit = 0;
-                            if let Some(frame) = send_stream
-                                .retransmission_frames_limited(udp_stream_frame_payload_bytes(
-                                    mux_limits,
-                                ))
-                                .into_iter()
-                                .next()
-                            {
-                                pace_udp_stream_frame(
-                                    udp_congestion.as_ref(),
-                                    &frame,
-                                    &mut next_udp_send_at,
-                                )
-                                .await;
-                                #[cfg(feature = "lab-diagnostics")]
-                                let proactive_started = Instant::now();
-                                #[cfg(feature = "lab-diagnostics")]
-                                let proactive_bytes = frame_pacing_bytes(&frame);
-                                path_stream.send_frame(frame).await?;
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_perf_record(
-                                    "relay.udp_proactive_repair_send",
-                                    proactive_started.elapsed(),
-                                    proactive_bytes,
-                                );
-                            }
-                        }
-                    }
                     stats.record_payload_bytes(read);
-                    #[cfg(feature = "lab-diagnostics")]
-                    if let Some(congestion) = &udp_congestion
-                        && stats.payload_bytes >= udp_diag_next_progress_bytes
-                    {
-                        log_udp_stream_progress(
-                            "udp_stream_send",
-                            stream_id,
-                            relay_class,
-                            send_stream.repair_bytes(),
-                            stats.payload_bytes,
-                            congestion,
-                        );
-                        udp_diag_next_progress_bytes =
-                            stats.payload_bytes.saturating_add(256 * 1024);
-                    }
                 }
             }
             else => break Ok(stats),
@@ -862,42 +501,6 @@ pub(super) fn tcp_relay_repair_replay_interval(
     let min = TCP_STREAM_STALL_MIN_TIMEOUT.as_secs_f64();
     let max = TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64();
     Duration::from_secs_f64(min + (max - min) * pressure)
-}
-
-pub(super) fn udp_stream_repair_replay_interval(
-    repair_bytes: usize,
-    mux_limits: MuxLimits,
-) -> Duration {
-    tcp_relay_repair_replay_interval(repair_bytes, mux_limits)
-        .min(TCP_STREAM_STALL_MIN_TIMEOUT)
-        .max(UDP_MIN_RESPONSE_TIMEOUT)
-}
-
-pub(super) fn udp_stream_proactive_repair_interval_bytes(
-    repair_bytes: usize,
-    inflight_limit: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    let mss = udp_stream_frame_payload_bytes(mux_limits).max(1);
-    let base_interval = mss.saturating_mul(128).max(1);
-    let pressure_threshold = inflight_limit.saturating_div(2).max(mss.saturating_mul(16));
-    if repair_bytes >= pressure_threshold {
-        mss.saturating_mul(100).max(1)
-    } else {
-        base_interval
-    }
-}
-
-pub(super) fn udp_stream_should_send_proactive_repair(
-    credit_bytes: usize,
-    repair_bytes: usize,
-    inflight_limit: usize,
-    mux_limits: MuxLimits,
-) -> bool {
-    let mss = udp_stream_frame_payload_bytes(mux_limits).max(1);
-    repair_bytes >= mss.saturating_mul(2)
-        && credit_bytes
-            >= udp_stream_proactive_repair_interval_bytes(repair_bytes, inflight_limit, mux_limits)
 }
 
 pub(super) fn tcp_relay_can_read_with_limit(

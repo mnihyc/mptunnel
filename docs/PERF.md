@@ -38,22 +38,19 @@ Internal component timing is interval and cumulative. Each line starts with `mpt
 Important component groups:
 
 - `transport.tcp.*`: encrypted TCP frame encode/decode, AEAD encrypt/decrypt, socket read/write wait, and flush wait.
-- `transport.udp.*`: encrypted UDP datagram encode/decode, AEAD encrypt/decrypt, socket send/receive wait, seal/open totals.
 - `runtime.path_queue.*`: queue send time before frames reach path-session writers.
 - `runtime.tcp_reader.queue_send`: time to route encrypted TCP reader output into runtime queues.
 - `runtime.server_stream.route_frame` and `runtime.tcp_stream.route_frame`: per-stream frame routing queue time.
-- `runtime.udp_server.recv_from_wait`: server UDP socket receive wait for roaming-capable UDP paths.
 - `relay.local_read_wait`, `relay.local_write_wait`, `relay.local_flush_wait`: local ingress/egress I/O wait.
 - `relay.copy_local_chunk`: payload copy cost from local socket buffers into frame payloads.
-- `relay.path_recv_frame_wait`: relay wait for a path frame to arrive.
-- `relay.udp_pacing_wait`: intentional UDP pacing sleep.
+- `relay.path_recv_frame_wait`: relay wait for a TCP path frame or UDP carrier stream frame to arrive.
 - `mux.send_data`, `mux.receive_data`, `mux.apply_ack`, `mux.ack_frames`, `mux.retransmit_*`: reliable-stream bookkeeping, ACK generation, and repair-frame generation.
 
 Interpretation:
 
-- High `transport.*.socket_wait` with low CPU components points at carrier/network/pacing limits.
+- High `transport.tcp.*.socket_wait` with low CPU components points at TCP carrier/network limits.
 - High `transport.*.encrypt`, `decrypt`, `encode_frame`, or `decode_frame` points at per-frame CPU or allocation cost.
-- High `relay.udp_pacing_wait` means the adaptive pacer is intentionally limiting send rate.
+- High `relay.path_recv_frame_wait` on UDP carrier rows now points at carrier/network wait, remote-side backpressure, or QUIC scheduling/congestion behavior rather than mptunnel overlay pacing.
 - High `runtime.path_queue.*` or route-frame time means internal queues/backpressure are limiting throughput.
 - High `mux.receive_data` or `mux.retransmit_*` under loss means reorder/repair work is the hot path.
 
@@ -149,7 +146,7 @@ perf record -F 99 -g -p <host-pid> -- sleep 20
 perf report
 ```
 
-If `perf` is unavailable or the host denies access to performance counters, keep using `mptunnel_lab_perf` plus Docker stats; those are sufficient to distinguish network wait, internal queue wait, pacing wait, transport CPU, and mux/repair CPU without privileged host changes.
+If `perf` is unavailable or the host denies access to performance counters, keep using `mptunnel_lab_perf` plus Docker stats; those are sufficient to distinguish network wait, internal queue wait, carrier wait, transport CPU, and mux/repair CPU without privileged host changes.
 
 If `cargo flamegraph` is already installed on the machine, it can be used with the same optimized diagnostic build settings. Do not add flamegraph generation to release CI or build scripts.
 
@@ -160,7 +157,7 @@ Use one experiment, one reflection, and one core improvement at a time:
 1. Run the fixed-duration release or diagnostic row.
 2. Compare mptunnel against direct, VMess, Hysteria2, and MPTCP baselines where the case supports them.
 3. Inspect `component_summary` and Docker stats.
-4. Decide whether the limiting component is carrier wait, pacing, queueing, transport CPU, mux repair/reorder, or local I/O.
+4. Decide whether the limiting component is carrier wait, queueing, transport CPU, mux repair/reorder, or local I/O.
 5. Make one essential implementation change guided by that bottleneck.
 6. Re-run the same case and then a broader normal/mixed/matrix/failover set to prove the fix did not overfit one condition.
 

@@ -496,6 +496,7 @@ mod tests {
         MuxLimits {
             max_payload_bytes: 1024,
             max_ack_ranges: 8,
+            max_streams: 1024,
             max_stream_window_bytes: 4096,
             max_repair_bytes: 2048,
             max_reorder_bytes: 2048,

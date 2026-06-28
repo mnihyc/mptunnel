@@ -33,6 +33,10 @@ impl ReliableSendStream {
         self.next_offset
     }
 
+    pub fn send_credit_bytes(&self) -> usize {
+        usize::try_from(self.max_offset.saturating_sub(self.next_offset)).unwrap_or(usize::MAX)
+    }
+
     pub fn repair_bytes(&self) -> usize {
         self.repair_bytes
     }

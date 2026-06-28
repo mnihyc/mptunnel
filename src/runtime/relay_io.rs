@@ -516,6 +516,7 @@ where
                         let ack = send_stream.apply_ack(&ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
+                        path_stream.release_acked_ranges(&ranges);
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
                         if send_stream.repair_bytes() < previous_repair_bytes {
@@ -654,7 +655,7 @@ pub(super) fn tcp_relay_can_read_with_limit(
     send_stream: &ReliableSendStream,
     inflight_limit: usize,
 ) -> bool {
-    send_stream.repair_bytes() < inflight_limit.max(1)
+    send_stream.repair_bytes() < inflight_limit.max(1) && send_stream.send_credit_bytes() > 0
 }
 
 pub(super) fn tcp_relay_read_budget_with_limit(
@@ -667,6 +668,7 @@ pub(super) fn tcp_relay_read_budget_with_limit(
         .max(1)
         .min(mux_limits.max_tcp_path_inflight_bytes)
         .saturating_sub(send_stream.repair_bytes())
+        .min(send_stream.send_credit_bytes())
         .min(buffer_len)
 }
 
@@ -694,6 +696,32 @@ mod tests {
             .expect("tail data");
 
         assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
+    }
+
+    #[test]
+    fn tcp_relay_read_budget_respects_stream_flow_control_credit() {
+        let mut limits = MuxLimits::default();
+        limits.max_stream_window_bytes = 4;
+        limits.max_repair_bytes = 16;
+        limits.max_tcp_path_inflight_bytes = 16;
+        limits.max_tcp_relay_chunk_bytes = 16;
+        let mut send_stream = ReliableSendStream::new(StreamId(7), limits);
+        send_stream
+            .send_data(Bytes::from_static(b"data"), StreamFlags::NONE)
+            .expect("initial window payload");
+
+        assert!(!tcp_relay_can_read_with_limit(&send_stream, 16));
+        assert_eq!(
+            tcp_relay_read_budget_with_limit(&send_stream, limits, 16, 16),
+            0
+        );
+
+        send_stream.update_max_offset(6);
+        assert!(tcp_relay_can_read_with_limit(&send_stream, 16));
+        assert_eq!(
+            tcp_relay_read_budget_with_limit(&send_stream, limits, 16, 16),
+            2
+        );
     }
 
     #[test]

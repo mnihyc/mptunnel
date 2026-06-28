@@ -23,16 +23,19 @@ fn udp_candidate_indices(
         .collect()
 }
 
-fn tcp_auto_bulk_discovery_indices(
-    context: &ClientPathContext,
-    current_path_index: Option<usize>,
-    payload_bytes: usize,
-) -> Vec<usize> {
+fn tcp_bulk_striping_indices(context: &ClientPathContext, payload_bytes: usize) -> Vec<usize> {
     context
-        .ordered_tcp_auto_bulk_discovery_scores(current_path_index, payload_bytes)
+        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
         .into_iter()
-        .map(|(index, _)| index)
+        .filter_map(|key| (key.underlay == UnderlayProtocol::Tcp).then_some(key.index))
         .collect()
+}
+
+fn reliable_bulk_striping_path_keys(
+    context: &ClientPathContext,
+    payload_bytes: usize,
+) -> Vec<RelayPathKey> {
+    context.ordered_reliable_bulk_striping_path_keys(payload_bytes)
 }
 
 fn udp_stream_path_indices(

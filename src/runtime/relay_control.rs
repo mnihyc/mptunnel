@@ -114,6 +114,7 @@ where
     let mut pending_remote_fin_offset = None;
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
+    let mut path_flights = RelayPathFlightLedger::default();
     let mut flow_demand = TcpRelayFlowDemandTracker::new();
     let mut last_stream_progress_at = Instant::now();
     let mut last_delivery_progress_at = Instant::now();
@@ -181,7 +182,7 @@ where
                 &mut remotes,
                 &send_stream,
                 !local_open,
-                TcpRelayAttachMode::AutoBulkDiscovery,
+                TcpRelayAttachMode::BulkStriping,
             )
             .await
             {
@@ -523,6 +524,7 @@ where
                     };
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
+                    let sent_frame = frame.clone();
                     match remotes.send_frame(context, frame).await {
                         Ok(path_key) => {
                             last_stream_progress_at = Instant::now();
@@ -531,6 +533,7 @@ where
                                 .entry(path_key)
                                 .or_default()
                                 .record_payload_bytes(read);
+                            path_flights.record_frame(path_key, &sent_frame);
                         }
                         Err(err) if tcp_relay_error_is_migratable(&err) => {
                             match attach_tcp_relay_paths(
@@ -764,6 +767,24 @@ where
                         let ack = send_stream.apply_ack(&ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
+                        for release in path_flights.release_acked_ranges(&ranges) {
+                            context.release_relay_path_inflight(
+                                release.key.underlay,
+                                release.key.index,
+                                release.bytes,
+                            );
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "path_model",
+                                format_args!(
+                                    "stream_id={} path_underlay={:?} path_index={} released_bytes={} cause=stream_ack",
+                                    stream_id.0,
+                                    release.key.underlay,
+                                    release.key.index,
+                                    release.bytes,
+                                ),
+                            );
+                        }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
                         last_stream_progress_at = Instant::now();
@@ -893,6 +914,9 @@ where
     if result.is_ok() {
         remotes.close_all().await;
     }
+    for release in path_flights.drain_all() {
+        context.release_relay_path_inflight(release.key.underlay, release.key.index, release.bytes);
+    }
     for (key, lane) in remaining_paths {
         if relay_error_is_tcp_path_failure(&result) {
             context.mark_relay_path_failure(key.underlay, key.index);
@@ -921,8 +945,9 @@ pub(super) async fn switch_tcp_relay_to_best_path(
     Ok(true)
 }
 
-pub(super) fn tcp_relay_frame_prefers_current_data_path(frame: &Frame) -> bool {
-    matches!(frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
+pub(super) fn tcp_relay_frame_prefers_current_data_path(frame: &Frame, lane: FlowLane) -> bool {
+    matches!(frame, Frame::StreamFin { .. })
+        || (matches!(frame, Frame::StreamData { .. }) && !relay_lane_is_bulk(lane))
 }
 
 pub(super) struct RelayPathAttachRequest<'a> {
@@ -933,6 +958,8 @@ pub(super) struct RelayPathAttachRequest<'a> {
     candidates: Vec<RelayPathKey>,
     race_repair: bool,
     allow_mixed_carrier: bool,
+    replay_repair_cache: bool,
+    attach_all_candidates: bool,
 }
 
 pub(super) async fn attach_relay_path_candidates(
@@ -970,13 +997,13 @@ pub(super) async fn attach_relay_path_candidates(
         .await
         {
             Ok(opened) => {
-                match replay_tcp_repair_cache(
-                    &opened.stream,
-                    request.send_stream,
-                    request.resend_fin,
-                )
-                .await
-                {
+                let replay_result = if request.replay_repair_cache {
+                    replay_tcp_repair_cache(&opened.stream, request.send_stream, request.resend_fin)
+                        .await
+                } else {
+                    Ok(())
+                };
+                match replay_result {
                     Ok(()) => {
                         if request.race_repair {
                             remotes.attach_for_repair(opened);
@@ -984,7 +1011,7 @@ pub(super) async fn attach_relay_path_candidates(
                             remotes.attach(opened);
                         }
                         attached += 1;
-                        if !request.race_repair {
+                        if !request.race_repair && !request.attach_all_candidates {
                             return Ok(attached);
                         }
                     }
@@ -1078,16 +1105,12 @@ pub(super) async fn attach_tcp_relay_paths(
         TcpRelayAttachMode::Any => {
             tcp_relay_attach_payload_bytes(send_stream, lane, context.mux_limits)
         }
-        TcpRelayAttachMode::AutoBulkDiscovery => {
-            tcp_relay_auto_bulk_discovery_payload_bytes(send_stream, context.mux_limits)
+        TcpRelayAttachMode::BulkStriping => {
+            tcp_relay_bulk_striping_payload_bytes(send_stream, context.mux_limits)
         }
     };
-    if matches!(mode, TcpRelayAttachMode::AutoBulkDiscovery) {
-        let candidates = context.ordered_reliable_auto_bulk_discovery_path_keys(
-            remotes.active_path_index_for(UnderlayProtocol::Tcp),
-            remotes.active_path_index_for(UnderlayProtocol::Udp),
-            payload_bytes,
-        );
+    if matches!(mode, TcpRelayAttachMode::BulkStriping) {
+        let candidates = context.ordered_reliable_bulk_striping_path_keys(payload_bytes);
         return attach_relay_path_candidates(
             context,
             remotes,
@@ -1099,6 +1122,8 @@ pub(super) async fn attach_tcp_relay_paths(
                 candidates,
                 race_repair: false,
                 allow_mixed_carrier: true,
+                replay_repair_cache: false,
+                attach_all_candidates: true,
             },
         )
         .await;
@@ -1134,6 +1159,8 @@ pub(super) async fn attach_tcp_relay_paths(
                 .collect(),
             race_repair,
             allow_mixed_carrier: false,
+            replay_repair_cache: true,
+            attach_all_candidates: false,
         },
     )
     .await?;
@@ -1164,8 +1191,8 @@ pub(super) async fn attach_udp_relay_paths(
         TcpRelayAttachMode::Any => {
             tcp_relay_attach_payload_bytes(send_stream, lane, context.mux_limits)
         }
-        TcpRelayAttachMode::AutoBulkDiscovery => {
-            tcp_relay_auto_bulk_discovery_payload_bytes(send_stream, context.mux_limits)
+        TcpRelayAttachMode::BulkStriping => {
+            tcp_relay_bulk_striping_payload_bytes(send_stream, context.mux_limits)
         }
     };
     let mut candidates = match mode {
@@ -1179,16 +1206,16 @@ pub(super) async fn attach_udp_relay_paths(
                 require_delivery_evidence,
             )
         }
-        TcpRelayAttachMode::AutoBulkDiscovery => context
-            .ordered_udp_stream_auto_bulk_discovery_indices(
-                remotes.active_path_index_for(UnderlayProtocol::Udp),
-                payload_bytes,
-            ),
+        TcpRelayAttachMode::BulkStriping => context
+            .ordered_reliable_bulk_striping_path_keys(payload_bytes)
+            .into_iter()
+            .filter_map(|key| (key.underlay == UnderlayProtocol::Udp).then_some(key.index))
+            .collect(),
     };
     if candidates.is_empty() && remotes.is_empty() {
         candidates = (0..context.udp_paths.len()).collect();
     }
-    if matches!(mode, TcpRelayAttachMode::AutoBulkDiscovery) {
+    if matches!(mode, TcpRelayAttachMode::BulkStriping) {
         candidates.retain(|path_index| {
             !remotes.contains_path_key(RelayPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -1306,7 +1333,7 @@ pub(super) fn tcp_relay_attach_payload_bytes(
     repair_bytes.min(stream_window)
 }
 
-pub(super) fn tcp_relay_auto_bulk_discovery_payload_bytes(
+pub(super) fn tcp_relay_bulk_striping_payload_bytes(
     send_stream: &ReliableSendStream,
     mux_limits: MuxLimits,
 ) -> usize {

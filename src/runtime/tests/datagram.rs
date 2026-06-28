@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn mixed_auto_bulk_discovery_probes_unmeasured_endpoint_only_udp_under_udp_pressure() {
+fn mixed_bulk_striping_includes_unmeasured_endpoint_only_udp() {
     let tcp_path = "tcp://127.0.0.1:10142"
         .parse::<PathSpec>()
         .expect("tcp path");
@@ -19,25 +19,13 @@ fn mixed_auto_bulk_discovery_probes_unmeasured_endpoint_only_udp_under_udp_press
 
     assert!(
         context
-            .ordered_reliable_auto_bulk_discovery_path_keys(
-                Some(0),
-                None,
-                MuxLimits::default().max_tcp_path_inflight_bytes,
+            .ordered_reliable_bulk_striping_path_keys(
+                MuxLimits::default().max_tcp_path_inflight_bytes
             )
-            .is_empty()
-    );
-    context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
-
-    assert_eq!(
-        context.ordered_reliable_auto_bulk_discovery_path_keys(
-            Some(0),
-            None,
-            MuxLimits::default().max_tcp_path_inflight_bytes,
-        ),
-        vec![RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 0,
-        }]
+            .contains(&RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            })
     );
 }
 

@@ -7,6 +7,7 @@ mod prelude;
 mod relay_control;
 mod relay_io;
 mod relay_open;
+mod relay_striping;
 mod server_runtime;
 mod server_tcp;
 mod tcp_path;
@@ -27,6 +28,7 @@ use prelude::*;
 use relay_control::*;
 use relay_io::*;
 use relay_open::*;
+use relay_striping::*;
 #[cfg(test)]
 use server_runtime::run_server;
 use server_tcp::*;

@@ -202,10 +202,15 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) measured_rate_bps: Option<f64>,
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
+    pub(super) delivery_samples: u32,
+    pub(super) last_success_at: Option<Instant>,
+    pub(super) last_delivery_at: Option<Instant>,
     pub(super) failed_until: Option<Instant>,
     pub(super) active_flows: u32,
     pub(super) active_latency_sensitive_flows: u32,
     pub(super) load_bytes: u64,
+    pub(super) relay_bytes_in_flight: u64,
+    pub(super) relay_queue_bytes: u64,
 }
 
 impl Default for ClientPathHealthRecord {
@@ -218,10 +223,15 @@ impl Default for ClientPathHealthRecord {
             measured_rate_bps: None,
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
+            delivery_samples: 0,
+            last_success_at: None,
+            last_delivery_at: None,
             failed_until: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
             load_bytes: 0,
+            relay_bytes_in_flight: 0,
+            relay_queue_bytes: 0,
         }
     }
 }
@@ -234,9 +244,35 @@ pub(super) struct ClientPathObservation {
     pub(super) measured_rate_bps: Option<f64>,
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
+    pub(super) delivery_samples: u32,
+    pub(super) last_success_at: Option<Instant>,
+    pub(super) last_delivery_at: Option<Instant>,
     pub(super) active_flows: u32,
     pub(super) active_latency_sensitive_flows: u32,
     pub(super) load_bytes: u64,
+    pub(super) relay_bytes_in_flight: u64,
+    pub(super) relay_queue_bytes: u64,
+}
+
+impl Default for ClientPathObservation {
+    fn default() -> Self {
+        Self {
+            state: SchedulerPathState::Suspect,
+            measured_srtt_ms: None,
+            measured_jitter_ms: None,
+            measured_rate_bps: None,
+            measured_loss_rate: None,
+            measured_mtu_payload_bytes: None,
+            delivery_samples: 0,
+            last_success_at: None,
+            last_delivery_at: None,
+            active_flows: 0,
+            active_latency_sensitive_flows: 0,
+            load_bytes: 0,
+            relay_bytes_in_flight: 0,
+            relay_queue_bytes: 0,
+        }
+    }
 }
 
 impl ClientPathHealthRecord {
@@ -254,9 +290,14 @@ impl ClientPathHealthRecord {
             measured_rate_bps: self.measured_rate_bps,
             measured_loss_rate: self.measured_loss_rate,
             measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
+            delivery_samples: self.delivery_samples,
+            last_success_at: self.last_success_at,
+            last_delivery_at: self.last_delivery_at,
             active_flows: self.active_flows,
             active_latency_sensitive_flows: self.active_latency_sensitive_flows,
             load_bytes: self.load_bytes,
+            relay_bytes_in_flight: self.relay_bytes_in_flight,
+            relay_queue_bytes: self.relay_queue_bytes,
         }
     }
 
@@ -264,6 +305,7 @@ impl ClientPathHealthRecord {
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
+        self.last_success_at = Some(Instant::now());
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
         self.measured_srtt_ms = Some(match self.measured_srtt_ms {
             Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
@@ -321,6 +363,8 @@ impl ClientPathHealthRecord {
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
+        self.delivery_samples = self.delivery_samples.saturating_add(1);
+        self.last_delivery_at = Some(Instant::now());
         let sample_bps = sample.rate_bps();
         self.measured_rate_bps = Some(match self.measured_rate_bps {
             Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
@@ -350,6 +394,8 @@ impl ClientPathHealthRecord {
 
     pub(super) fn mark_failure(&mut self, now: Instant, has_schedulable_alternative: bool) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.relay_bytes_in_flight = 0;
+        self.relay_queue_bytes = 0;
         if self.consecutive_failures == 1 || !has_schedulable_alternative {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
@@ -357,6 +403,14 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Failed;
             self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
         }
+    }
+
+    pub(super) fn record_relay_send(&mut self, bytes: usize) {
+        self.relay_bytes_in_flight = self.relay_bytes_in_flight.saturating_add(bytes as u64);
+    }
+
+    pub(super) fn release_relay_inflight(&mut self, bytes: usize) {
+        self.relay_bytes_in_flight = self.relay_bytes_in_flight.saturating_sub(bytes as u64);
     }
 }
 
@@ -705,17 +759,6 @@ impl ClientPathContext {
             .collect()
     }
 
-    pub(super) fn ordered_udp_stream_auto_bulk_discovery_indices(
-        &self,
-        current_path_index: Option<usize>,
-        payload_bytes: usize,
-    ) -> Vec<usize> {
-        self.ordered_udp_stream_auto_bulk_discovery_scores(current_path_index, payload_bytes, false)
-            .into_iter()
-            .map(|(index, _)| index)
-            .collect()
-    }
-
     pub(super) fn ordered_udp_stream_repair_path_indices(
         &self,
         current_path_index: Option<usize>,
@@ -744,186 +787,66 @@ impl ClientPathContext {
                 let Some(path) = self.udp_paths.get(*index) else {
                     return false;
                 };
-                let observation =
-                    observations
-                        .get(*index)
-                        .copied()
-                        .unwrap_or(ClientPathObservation {
-                            state: SchedulerPathState::Suspect,
-                            measured_srtt_ms: None,
-                            measured_jitter_ms: None,
-                            measured_rate_bps: None,
-                            measured_loss_rate: None,
-                            measured_mtu_payload_bytes: None,
-                            active_flows: 0,
-                            active_latency_sensitive_flows: 0,
-                            load_bytes: 0,
-                        });
-                udp_stream_path_can_be_auto_discovered(path, observation)
+                let observation = observations.get(*index).copied().unwrap_or_default();
+                path_can_be_auto_discovered(path, observation)
             })
             .map(|(index, _)| index)
             .collect()
     }
 
-    pub(super) fn ordered_reliable_auto_bulk_discovery_path_keys(
+    pub(super) fn ordered_reliable_bulk_striping_path_keys(
         &self,
-        current_tcp_path_index: Option<usize>,
-        current_udp_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
-        let allow_udp_startup_probe = self.reliable_auto_bulk_udp_startup_probe_should_run();
-        let mut candidates = self
-            .ordered_tcp_auto_bulk_discovery_scores(current_tcp_path_index, payload_bytes)
+        let mut health = self.health.lock().expect("client path health lock");
+        let tcp_observations = health_observations(&mut health.tcp);
+        let udp_observations = health_observations(&mut health.udp);
+        let mut candidates = ordered_path_scores(
+            &self.tcp_paths,
+            &tcp_observations,
+            FlowLane::Throughput,
+            payload_bytes,
+        )
+        .into_iter()
+        .filter_map(|(index, eta_ms)| {
+            let path = self.tcp_paths.get(index)?;
+            let observation = tcp_observations.get(index).copied().unwrap_or_default();
+            path_can_be_auto_discovered(path, observation).then_some((
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index,
+                },
+                eta_ms,
+            ))
+        })
+        .chain(
+            ordered_path_scores(
+                &self.udp_paths,
+                &udp_observations,
+                FlowLane::Throughput,
+                payload_bytes,
+            )
             .into_iter()
-            .map(|(index, eta_ms)| {
-                (
+            .filter_map(|(index, eta_ms)| {
+                let path = self.udp_paths.get(index)?;
+                let observation = udp_observations.get(index).copied().unwrap_or_default();
+                let snapshot = path_snapshot(path, index, observation);
+                path_can_be_auto_discovered(path, observation).then_some((
                     RelayPathKey {
-                        underlay: UnderlayProtocol::Tcp,
+                        underlay: UnderlayProtocol::Udp,
                         index,
                     },
-                    eta_ms,
-                )
-            })
-            .chain(
-                self.ordered_udp_stream_auto_bulk_discovery_scores(
-                    current_udp_path_index,
-                    payload_bytes,
-                    allow_udp_startup_probe,
-                )
-                .into_iter()
-                .filter_map(|(index, eta_ms)| {
-                    let snapshot = self.udp_path_snapshot(index)?;
-                    Some((
-                        RelayPathKey {
-                            underlay: UnderlayProtocol::Udp,
-                            index,
-                        },
-                        eta_ms
-                            + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
-                    ))
-                }),
-            )
-            .collect::<Vec<_>>();
-        if let Some(current_eta_ms) = self.reliable_stream_current_eta_ms(
-            current_tcp_path_index,
-            current_udp_path_index,
-            payload_bytes,
-        ) {
-            candidates.retain(|(_, eta_ms)| *eta_ms < current_eta_ms);
-        }
+                    eta_ms + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
+                ))
+            }),
+        )
+        .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             left.1
                 .total_cmp(&right.1)
                 .then_with(|| relay_path_key_order(left.0, right.0))
         });
         candidates.into_iter().map(|(key, _)| key).collect()
-    }
-
-    pub(super) fn reliable_stream_current_eta_ms(
-        &self,
-        current_tcp_path_index: Option<usize>,
-        current_udp_path_index: Option<usize>,
-        payload_bytes: usize,
-    ) -> Option<f64> {
-        [
-            current_tcp_path_index.map(|index| RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index,
-            }),
-            current_udp_path_index.map(|index| RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index,
-            }),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|key| {
-            relay_path_snapshot(self, key).and_then(|snapshot| {
-                scheduler::score_path(
-                    snapshot,
-                    FlowLane::Throughput,
-                    payload_bytes,
-                    SchedulerPolicy::default(),
-                )
-                .map(|score| score.eta_ms)
-            })
-        })
-        .min_by(|left, right| left.total_cmp(right))
-    }
-
-    pub(super) fn ordered_tcp_auto_bulk_discovery_scores(
-        &self,
-        current_path_index: Option<usize>,
-        payload_bytes: usize,
-    ) -> Vec<(usize, f64)> {
-        let observations = self.tcp_health_observations_for_lane(FlowLane::Throughput);
-        let any_measured_delivery = observations
-            .iter()
-            .any(|observation| observation.measured_rate_bps.is_some());
-        if !any_measured_delivery && self.tcp_paths.iter().all(path_is_endpoint_only) {
-            return Vec::new();
-        }
-        let scores = ordered_path_scores(
-            &self.tcp_paths,
-            &observations,
-            FlowLane::Throughput,
-            payload_bytes,
-        );
-        reliable_auto_bulk_discovery_scores(
-            &self.tcp_paths,
-            &observations,
-            scores,
-            current_path_index,
-            path_can_be_auto_discovered,
-        )
-    }
-
-    pub(super) fn ordered_udp_stream_auto_bulk_discovery_scores(
-        &self,
-        current_path_index: Option<usize>,
-        payload_bytes: usize,
-        allow_endpoint_only_startup_probe: bool,
-    ) -> Vec<(usize, f64)> {
-        let observations =
-            health_observations(&mut self.health.lock().expect("client path health lock").udp);
-        let any_measured_delivery = observations
-            .iter()
-            .any(|observation| observation.measured_rate_bps.is_some());
-        let all_endpoint_only = self.udp_paths.iter().all(path_is_endpoint_only);
-        let allow_startup_probe = allow_endpoint_only_startup_probe
-            && current_path_index.is_none()
-            && !any_measured_delivery
-            && all_endpoint_only;
-        if !any_measured_delivery && all_endpoint_only && !allow_startup_probe {
-            return Vec::new();
-        }
-        let scores = ordered_path_scores(
-            &self.udp_paths,
-            &observations,
-            FlowLane::Throughput,
-            payload_bytes,
-        );
-        let candidate_is_allowed: fn(&PathSpec, ClientPathObservation) -> bool =
-            if allow_startup_probe {
-                path_can_be_auto_discovered
-            } else {
-                udp_stream_path_can_be_auto_discovered
-            };
-        reliable_auto_bulk_discovery_scores(
-            &self.udp_paths,
-            &observations,
-            scores,
-            current_path_index,
-            candidate_is_allowed,
-        )
-    }
-
-    pub(super) fn reliable_auto_bulk_udp_startup_probe_should_run(&self) -> bool {
-        let mut health = self.health.lock().expect("client path health lock");
-        let udp_observations = health_observations(&mut health.udp);
-        udp_observations
-            .iter()
-            .any(|observation| observation.active_flows > 0 || observation.load_bytes > 0)
     }
 
     pub(super) fn tcp_health_observations_for_lane(
@@ -1203,6 +1126,44 @@ impl ClientPathContext {
         match underlay {
             UnderlayProtocol::Tcp => self.release_tcp_path_load(index, lane),
             UnderlayProtocol::Udp => self.release_udp_stream_path_load(index, lane),
+        }
+    }
+
+    pub(super) fn record_relay_path_send(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        bytes: usize,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(current) = records.get_mut(index) {
+            current.record_relay_send(bytes);
+        }
+    }
+
+    pub(super) fn release_relay_path_inflight(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        bytes: usize,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(current) = records.get_mut(index) {
+            current.release_relay_inflight(bytes);
         }
     }
 
@@ -1581,6 +1542,9 @@ pub(super) fn endpoint_only_reliable_startup_path_indices(
             measured_rate_bps: None,
             measured_loss_rate: None,
             measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
+            delivery_samples: 0,
+            last_success_at: None,
+            last_delivery_at: None,
             ..observation
         })
         .collect::<Vec<_>>();
@@ -1616,20 +1580,7 @@ pub(super) fn configured_order_path_scores(
         .iter()
         .enumerate()
         .filter_map(|(index, path)| {
-            let observation = observations
-                .get(index)
-                .copied()
-                .unwrap_or(ClientPathObservation {
-                    state: SchedulerPathState::Suspect,
-                    measured_srtt_ms: None,
-                    measured_jitter_ms: None,
-                    measured_rate_bps: None,
-                    measured_loss_rate: None,
-                    measured_mtu_payload_bytes: None,
-                    active_flows: 0,
-                    active_latency_sensitive_flows: 0,
-                    load_bytes: 0,
-                });
+            let observation = observations.get(index).copied().unwrap_or_default();
             scheduler::score_path(
                 path_snapshot(path, index, observation),
                 lane,
@@ -1679,20 +1630,7 @@ pub(super) fn ordered_path_scores(
         .iter()
         .enumerate()
         .filter_map(|(index, path)| {
-            let observation = observations
-                .get(index)
-                .copied()
-                .unwrap_or(ClientPathObservation {
-                    state: SchedulerPathState::Suspect,
-                    measured_srtt_ms: None,
-                    measured_jitter_ms: None,
-                    measured_rate_bps: None,
-                    measured_loss_rate: None,
-                    measured_mtu_payload_bytes: None,
-                    active_flows: 0,
-                    active_latency_sensitive_flows: 0,
-                    load_bytes: 0,
-                });
+            let observation = observations.get(index).copied().unwrap_or_default();
             scheduler::score_path(
                 path_snapshot(path, index, observation),
                 lane,
@@ -1724,24 +1662,74 @@ pub(super) fn path_snapshot(
         .measured_rate_bps
         .unwrap_or(hinted_delivery_rate_bps)
         .max(1.0);
+    let confidence = path_model_confidence(observation);
+    let bdp_bytes = (delivery_rate_bps / 8.0 * path_model_srtt_ms(path, observation).max(1.0)
+        / 1000.0)
+        .ceil()
+        .max(PATH_OPEN_SCORE_BYTES as f64) as u64;
+    let pacing_rate_bps = delivery_rate_bps
+        * (1.0
+            - observation
+                .measured_loss_rate
+                .unwrap_or(0.0)
+                .clamp(0.0, 0.75)
+                * 0.5)
+            .clamp(0.25, 1.0);
     PathSnapshot {
         id: PathId(index as u16),
         underlay: path.underlay,
         state: observation.state,
         flags: path.metadata.capabilities.into(),
-        srtt_ms: observation.measured_srtt_ms.unwrap_or_else(|| {
-            path.metadata
-                .initial_srtt_ms
-                .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
-        }),
+        srtt_ms: path_model_srtt_ms(path, observation),
         jitter_ms: observation
             .measured_jitter_ms
             .unwrap_or_else(|| f64::from(path.metadata.initial_jitter_ms.unwrap_or(0))),
         delivery_rate_bps,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
-        queue_bytes: observation.load_bytes,
-        bytes_in_flight: u64::from(observation.active_flows) * PATH_OPEN_SCORE_BYTES as u64,
+        queue_bytes: observation
+            .load_bytes
+            .saturating_add(observation.relay_queue_bytes),
+        bytes_in_flight: observation.relay_bytes_in_flight,
+        pacing_rate_bps,
+        inflight_limit_bytes: bdp_bytes
+            .saturating_mul(2)
+            .max(PATH_OPEN_SCORE_BYTES as u64),
+        confidence,
+        app_limited: observation.relay_bytes_in_flight == 0,
     }
+}
+
+pub(super) fn path_model_srtt_ms(path: &PathSpec, observation: ClientPathObservation) -> f64 {
+    observation.measured_srtt_ms.unwrap_or_else(|| {
+        path.metadata
+            .initial_srtt_ms
+            .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
+    })
+}
+
+pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
+    let delivery_confidence = (f64::from(observation.delivery_samples) / 8.0).clamp(0.0, 1.0);
+    let rtt_confidence = if observation.measured_srtt_ms.is_some() {
+        0.35
+    } else {
+        0.0
+    };
+    let freshness_confidence = observation
+        .last_delivery_at
+        .or(observation.last_success_at)
+        .map(|seen| {
+            let age = Instant::now().saturating_duration_since(seen).as_secs_f64();
+            (1.0 - age / 30.0).clamp(0.0, 1.0) * 0.25
+        })
+        .unwrap_or(0.0);
+    (delivery_confidence + rtt_confidence + freshness_confidence).clamp(
+        if observation.active_flows > 0 {
+            0.25
+        } else {
+            0.1
+        },
+        1.0,
+    )
 }
 
 pub(super) fn udp_path_has_realtime_model(
@@ -1764,62 +1752,6 @@ pub(super) fn udp_observation_has_datagram_feedback(observation: &ClientPathObse
         || observation.measured_mtu_payload_bytes.is_some()
 }
 
-pub(super) fn reliable_auto_bulk_discovery_scores(
-    paths: &[PathSpec],
-    observations: &[ClientPathObservation],
-    scores: Vec<(usize, f64)>,
-    current_path_index: Option<usize>,
-    candidate_is_allowed: fn(&PathSpec, ClientPathObservation) -> bool,
-) -> Vec<(usize, f64)> {
-    let current_eta = current_path_index.and_then(|current_path_index| {
-        scores
-            .iter()
-            .find_map(|(index, eta)| (*index == current_path_index).then_some(*eta))
-    });
-    let improves_current = |index: usize, eta: f64| {
-        Some(index) != current_path_index && current_eta.is_none_or(|current| eta < current)
-    };
-    let measured = scores
-        .iter()
-        .copied()
-        .filter(|(index, eta)| {
-            improves_current(*index, *eta)
-                && observations.get(*index).is_some_and(|observation| {
-                    observation.measured_rate_bps.is_some()
-                        && paths
-                            .get(*index)
-                            .is_some_and(|path| candidate_is_allowed(path, *observation))
-                })
-        })
-        .collect::<Vec<_>>();
-    if !measured.is_empty() {
-        return measured;
-    }
-    scores
-        .into_iter()
-        .filter(|(index, eta)| {
-            let Some(path) = paths.get(*index) else {
-                return false;
-            };
-            let observation = observations
-                .get(*index)
-                .copied()
-                .unwrap_or(ClientPathObservation {
-                    state: SchedulerPathState::Suspect,
-                    measured_srtt_ms: None,
-                    measured_jitter_ms: None,
-                    measured_rate_bps: None,
-                    measured_loss_rate: None,
-                    measured_mtu_payload_bytes: None,
-                    active_flows: 0,
-                    active_latency_sensitive_flows: 0,
-                    load_bytes: 0,
-                });
-            improves_current(*index, *eta) && candidate_is_allowed(path, observation)
-        })
-        .collect()
-}
-
 pub(super) fn path_can_be_auto_discovered(
     path: &PathSpec,
     _observation: ClientPathObservation,
@@ -1828,15 +1760,6 @@ pub(super) fn path_can_be_auto_discovered(
         && !path.metadata.capabilities.backup
         && !path.metadata.capabilities.probe_only
         && path.metadata.capabilities.bulk_allowed
-}
-
-pub(super) fn udp_stream_path_can_be_auto_discovered(
-    path: &PathSpec,
-    observation: ClientPathObservation,
-) -> bool {
-    path_can_be_auto_discovered(path, observation)
-        && (observation.measured_rate_bps.is_some()
-            || path.metadata.initial_rate != RateHint::Unknown)
 }
 
 pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
@@ -1857,8 +1780,7 @@ pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
 
 pub(super) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
     match underlay {
-        UnderlayProtocol::Tcp => 50.0,
-        UnderlayProtocol::Udp => 40.0,
+        UnderlayProtocol::Tcp | UnderlayProtocol::Udp => 50.0,
     }
 }
 

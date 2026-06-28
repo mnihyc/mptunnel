@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 pub(super) struct TcpPathStream {
     pub(super) stream_id: StreamId,
@@ -31,8 +32,19 @@ impl TcpPathStream {
     }
 
     pub(super) async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
+        self.send_frame_tracked(frame).await.map(|_| ())
+    }
+
+    pub(super) async fn send_frame_tracked(
+        &self,
+        frame: Frame,
+    ) -> Result<Option<ServerTcpPathKey>, RuntimeError> {
         self.output
-            .send_frame(self.stream_id, self.lane, frame)
+            .send_frame(
+                self.stream_id,
+                tcp_path_effective_frame_lane(&frame, self.lane),
+                frame,
+            )
             .await
     }
 
@@ -53,6 +65,10 @@ impl TcpPathStream {
         self.output.set_lane(lane);
     }
 
+    pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+        self.output.release_acked_ranges(ranges);
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -70,8 +86,13 @@ pub(super) struct TcpPathStreamHandle {
 impl TcpPathStreamHandle {
     pub(super) async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
         self.output
-            .send_frame(self.stream_id, self.lane, frame)
+            .send_frame(
+                self.stream_id,
+                tcp_path_effective_frame_lane(&frame, self.lane),
+                frame,
+            )
             .await
+            .map(|_| ())
     }
 
     pub(super) async fn close(&self) {
@@ -91,9 +112,12 @@ impl TcpPathStreamOutput {
         stream_id: StreamId,
         lane: FlowLane,
         frame: Frame,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Option<ServerTcpPathKey>, RuntimeError> {
         match self {
-            Self::Fixed(commands) => commands.send_frame(frame, lane).await,
+            Self::Fixed(commands) => {
+                commands.send_frame(frame, lane).await?;
+                Ok(None)
+            }
             Self::Switchable(binding) => binding.send_frame(stream_id, lane, frame).await,
         }
     }
@@ -124,11 +148,18 @@ impl TcpPathStreamOutput {
             binding.set_lane(lane);
         }
     }
+
+    pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+        if let Self::Switchable(binding) = self {
+            binding.release_acked_ranges(ranges);
+        }
+    }
 }
 
 pub(super) struct ServerTcpStreamBinding {
     lane: Mutex<FlowLane>,
     outputs: Mutex<ServerTcpStreamOutputs>,
+    flights: Mutex<BTreeMap<u64, Vec<ServerTcpPathFlight>>>,
     version: watch::Sender<u64>,
 }
 
@@ -147,8 +178,13 @@ impl ServerTcpStreamBinding {
                 entries: vec![ServerTcpStreamOutputEntry {
                     key: ServerTcpPathKey { underlay, path_id },
                     commands,
+                    bytes_in_flight: 0,
+                    delivery_rate_bps: None,
+                    delivery_samples: 0,
+                    last_delivery_at: None,
                 }],
             }),
+            flights: Mutex::new(BTreeMap::new()),
             version,
         })
     }
@@ -172,7 +208,14 @@ impl ServerTcpStreamBinding {
                 entry.commands = commands;
                 entry
             } else {
-                ServerTcpStreamOutputEntry { key, commands }
+                ServerTcpStreamOutputEntry {
+                    key,
+                    commands,
+                    bytes_in_flight: 0,
+                    delivery_rate_bps: None,
+                    delivery_samples: 0,
+                    last_delivery_at: None,
+                }
             };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role, lane)
             || was_active
@@ -210,46 +253,36 @@ impl ServerTcpStreamBinding {
         }
     }
 
-    fn next_commands(&self) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
-        let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
-        if outputs.entries.is_empty() {
-            return None;
-        }
-        outputs.next_index %= outputs.entries.len();
-        let entry = outputs.entries[outputs.next_index].clone();
-        outputs.next_index = (outputs.next_index + 1) % outputs.entries.len();
-        Some((entry.key, entry.commands))
-    }
-
-    fn data_commands(&self) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
-        self.outputs
-            .lock()
-            .expect("server TCP stream binding lock")
-            .entries
-            .last()
-            .cloned()
-            .map(|entry| (entry.key, entry.commands))
-    }
-
     pub(super) async fn send_frame(
         &self,
         _stream_id: StreamId,
         _lane: FlowLane,
         frame: Frame,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Option<ServerTcpPathKey>, RuntimeError> {
         let mut updates = self.version.subscribe();
         loop {
-            let selected = if server_frame_prefers_current_data_path(&frame) {
-                self.data_commands()
-            } else {
-                self.next_commands()
+            let stream_lane = self.lane();
+            let selected = {
+                let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
+                if server_frame_prefers_current_data_path(&frame, stream_lane) {
+                    outputs.data_commands()
+                } else if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
+                    outputs.bulk_commands(reliable_stream_frame_payload_bytes(&frame))
+                } else {
+                    outputs.next_commands()
+                }
             };
             if let Some((key, commands)) = selected {
-                let lane = self.lane();
+                let lane = tcp_path_effective_frame_lane(&frame, stream_lane);
                 tokio::select! {
                     result = commands.send_frame(frame.clone(), lane) => {
                         match result {
-                            Ok(()) => return Ok(()),
+                            Ok(()) => {
+                                if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
+                                    self.record_flight(key, &frame);
+                                }
+                                return Ok(Some(key));
+                            }
                             Err(_) => self.detach(key, &commands),
                         }
                     }
@@ -264,6 +297,81 @@ impl ServerTcpStreamBinding {
                     .map_err(|_| RuntimeError::TcpPathSessionClosed)?;
             }
         }
+    }
+
+    pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+        if ranges.is_empty() {
+            return;
+        }
+        let mut flights = self.flights.lock().expect("server TCP stream flight lock");
+        let acked_offsets = flights
+            .iter()
+            .filter_map(|(offset, path_flights)| {
+                path_flights
+                    .iter()
+                    .any(|flight| {
+                        ranges
+                            .iter()
+                            .any(|range| range.start <= *offset && range.end >= flight.end)
+                    })
+                    .then_some(*offset)
+            })
+            .collect::<Vec<_>>();
+        if acked_offsets.is_empty() {
+            return;
+        }
+        let mut released = Vec::new();
+        for offset in acked_offsets {
+            if let Some(path_flights) = flights.remove(&offset) {
+                released.extend(path_flights);
+            }
+        }
+        drop(flights);
+
+        let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        let now = Instant::now();
+        for flight in released {
+            if let Some(entry) = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == flight.key)
+            {
+                entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
+                entry.delivery_samples = entry.delivery_samples.saturating_add(1);
+                entry.last_delivery_at = Some(now);
+                let elapsed = now.saturating_duration_since(flight.sent_at).as_secs_f64();
+                if elapsed > f64::EPSILON {
+                    let sample = flight.bytes as f64 * 8.0 / elapsed;
+                    entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
+                        Some(previous) => previous.mul_add(0.75, sample * 0.25),
+                        None => sample,
+                    });
+                }
+            }
+        }
+    }
+
+    fn record_flight(&self, key: ServerTcpPathKey, frame: &Frame) {
+        let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
+            return;
+        };
+        {
+            let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
+            if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
+                entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
+            }
+        }
+        self.flights
+            .lock()
+            .expect("server TCP stream flight lock")
+            .entry(offset)
+            .or_default()
+            .push(ServerTcpPathFlight {
+                key,
+                end,
+                bytes,
+                sent_at: Instant::now(),
+            });
     }
 
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
@@ -287,8 +395,9 @@ impl ServerTcpStreamBinding {
     }
 }
 
-fn server_frame_prefers_current_data_path(frame: &Frame) -> bool {
-    matches!(frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
+fn server_frame_prefers_current_data_path(frame: &Frame, lane: FlowLane) -> bool {
+    matches!(frame, Frame::StreamFin { .. })
+        || (matches!(frame, Frame::StreamData { .. }) && !relay_lane_is_bulk(lane))
 }
 
 fn server_stream_open_role_promotes_data_path(role: StreamOpenRole, lane: FlowLane) -> bool {
@@ -297,7 +406,7 @@ fn server_stream_open_role_promotes_data_path(role: StreamOpenRole, lane: FlowLa
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ServerTcpPathKey {
+pub(super) struct ServerTcpPathKey {
     underlay: UnderlayProtocol,
     path_id: PathId,
 }
@@ -306,11 +415,102 @@ struct ServerTcpPathKey {
 struct ServerTcpStreamOutputEntry {
     key: ServerTcpPathKey,
     commands: TcpPathSessionCommandSender,
+    bytes_in_flight: u64,
+    delivery_rate_bps: Option<f64>,
+    delivery_samples: u32,
+    last_delivery_at: Option<Instant>,
 }
 
 struct ServerTcpStreamOutputs {
     entries: Vec<ServerTcpStreamOutputEntry>,
     next_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerTcpPathFlight {
+    key: ServerTcpPathKey,
+    end: u64,
+    bytes: usize,
+    sent_at: Instant,
+}
+
+impl ServerTcpStreamOutputs {
+    fn next_commands(&mut self) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.next_index %= self.entries.len();
+        let entry = self.entries[self.next_index].clone();
+        self.next_index = (self.next_index + 1) % self.entries.len();
+        Some((entry.key, entry.commands))
+    }
+
+    fn data_commands(&self) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
+        self.entries
+            .last()
+            .cloned()
+            .map(|entry| (entry.key, entry.commands))
+    }
+
+    fn bulk_commands(
+        &mut self,
+        payload_bytes: usize,
+    ) -> Option<(ServerTcpPathKey, TcpPathSessionCommandSender)> {
+        let active_key = self.entries.last().map(|entry| entry.key);
+        let now = Instant::now();
+        let (position, _) = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| {
+                (
+                    position,
+                    server_bulk_output_eta_ms(entry, active_key, payload_bytes, now),
+                )
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))?;
+        let entry = self.entries[position].clone();
+        self.next_index = (position + 1) % self.entries.len().max(1);
+        Some((entry.key, entry.commands))
+    }
+}
+
+fn server_bulk_output_eta_ms(
+    entry: &ServerTcpStreamOutputEntry,
+    active_key: Option<ServerTcpPathKey>,
+    payload_bytes: usize,
+    now: Instant,
+) -> f64 {
+    let srtt_ms = default_path_srtt_ms(entry.key.underlay);
+    let rate_bps = entry
+        .delivery_rate_bps
+        .unwrap_or_else(|| default_path_rate_bps(entry.key.underlay))
+        .max(1.0);
+    let queued_bits = entry.bytes_in_flight.saturating_mul(8) as f64;
+    let payload_bits = payload_bytes as f64 * 8.0;
+    let confidence = server_output_confidence(entry, now);
+    let mut eta_ms = srtt_ms / 2.0;
+    eta_ms += (queued_bits + payload_bits) / rate_bps * 1000.0;
+    eta_ms += (1.0 - confidence) * srtt_ms;
+    if Some(entry.key) != active_key && confidence < 0.5 {
+        eta_ms += srtt_ms;
+        if entry.bytes_in_flight > 0 {
+            eta_ms += srtt_ms;
+        }
+    }
+    eta_ms
+}
+
+fn server_output_confidence(entry: &ServerTcpStreamOutputEntry, now: Instant) -> f64 {
+    let delivery_confidence = (f64::from(entry.delivery_samples) / 8.0).clamp(0.0, 1.0);
+    let freshness_confidence = entry
+        .last_delivery_at
+        .map(|seen| {
+            let age = now.saturating_duration_since(seen).as_secs_f64();
+            (1.0 - age / 30.0).clamp(0.0, 1.0) * 0.25
+        })
+        .unwrap_or(0.0);
+    (delivery_confidence + freshness_confidence).clamp(0.1, 1.0)
 }
 
 pub(super) struct ServerTcpStreamRegistry {
@@ -679,6 +879,14 @@ pub(super) fn tcp_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
+}
+
+pub(super) fn tcp_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane) -> FlowLane {
+    match frame {
+        Frame::StreamData { .. } | Frame::StreamFin { .. } => stream_lane,
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } => FlowLane::RealtimeDatagram,
+        _ => FlowLane::Control,
+    }
 }
 
 pub(super) fn tcp_path_session_command_channels(

@@ -215,13 +215,29 @@ impl TcpRelayRemoteSet {
         frame: Frame,
     ) -> Result<RelayPathKey, RuntimeError> {
         let mut last_error = None;
-        let prefer_current_data_path = tcp_relay_frame_prefers_current_data_path(&frame);
+        let stream_lane = self
+            .paths
+            .last()
+            .map(|path| path.stream.lane)
+            .unwrap_or(FlowLane::Latency);
+        let prefer_current_data_path =
+            tcp_relay_frame_prefers_current_data_path(&frame, stream_lane);
         while !self.paths.is_empty() {
-            if prefer_current_data_path
-                || self
-                    .paths
-                    .last()
-                    .is_some_and(|path| tcp_path_frame_uses_priority_queue(path.stream.lane))
+            if let Some(position) = choose_bulk_relay_path(
+                context,
+                &self.paths,
+                stream_lane,
+                &frame,
+                self.next_send_index,
+            ) {
+                self.next_send_index = position;
+            } else if prefer_current_data_path
+                || self.paths.last().is_some_and(|path| {
+                    tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
+                        &frame,
+                        path.stream.lane,
+                    ))
+                })
             {
                 self.next_send_index = self.paths.len() - 1;
             }
@@ -233,10 +249,31 @@ impl TcpRelayRemoteSet {
                 .await
             {
                 Ok(()) => {
+                    let sent_bytes = reliable_stream_frame_payload_bytes(&frame);
+                    if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
+                        context.record_relay_path_send(
+                            instance.key.underlay,
+                            instance.key.index,
+                            sent_bytes,
+                        );
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "scheduler_decision",
+                            format_args!(
+                                "stream_id={} lane={:?} path_underlay={:?} path_index={} payload_bytes={} reason=bulk_stripe",
+                                self.stream_id.0,
+                                stream_lane,
+                                instance.key.underlay,
+                                instance.key.index,
+                                sent_bytes,
+                            ),
+                        );
+                    }
                     if !prefer_current_data_path
-                        && !tcp_path_frame_uses_priority_queue(
+                        && !tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
+                            &frame,
                             self.paths[self.next_send_index].stream.lane,
-                        )
+                        ))
                     {
                         self.next_send_index = (self.next_send_index + 1) % self.paths.len();
                     }
@@ -274,7 +311,7 @@ impl TcpRelayRemoteSet {
             .send_frame(self.stream_id, FlowLane::Control, frame)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(err) => {
                 self.fail_path_instance(context, instance).await;
                 Err(err)
@@ -405,7 +442,7 @@ pub(super) struct TcpRelayOpenSpec {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TcpRelayAttachMode {
     Any,
-    AutoBulkDiscovery,
+    BulkStriping,
 }
 
 #[derive(Debug, Clone, Copy)]

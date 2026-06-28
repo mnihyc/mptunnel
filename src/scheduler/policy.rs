@@ -58,6 +58,10 @@ pub struct PathSnapshot {
     pub loss_rate: f64,
     pub queue_bytes: u64,
     pub bytes_in_flight: u64,
+    pub pacing_rate_bps: f64,
+    pub inflight_limit_bytes: u64,
+    pub confidence: f64,
+    pub app_limited: bool,
 }
 
 impl PathSnapshot {
@@ -78,6 +82,10 @@ impl PathSnapshot {
             loss_rate: 0.0,
             queue_bytes: 0,
             bytes_in_flight: 0,
+            pacing_rate_bps: delivery_rate_bps,
+            inflight_limit_bytes: 0,
+            confidence: 1.0,
+            app_limited: false,
         }
     }
 }
@@ -95,6 +103,7 @@ pub struct SchedulerPolicy {
     pub shared_bottleneck_rtt_window_ms: f64,
     pub shared_bottleneck_queue_penalty_ms: f64,
     pub tail_avoidance_rtt_penalty_scale: f64,
+    pub low_confidence_penalty_ms: f64,
 }
 
 impl Default for SchedulerPolicy {
@@ -111,6 +120,7 @@ impl Default for SchedulerPolicy {
             shared_bottleneck_rtt_window_ms: 8.0,
             shared_bottleneck_queue_penalty_ms: 20.0,
             tail_avoidance_rtt_penalty_scale: 0.75,
+            low_confidence_penalty_ms: 25.0,
         }
     }
 }
@@ -387,8 +397,14 @@ pub fn score_path(
         return None;
     }
 
-    let rate = path.delivery_rate_bps.max(1.0);
-    let queued_bits = path.queue_bytes.saturating_add(path.bytes_in_flight) as f64 * 8.0;
+    let rate = path.pacing_rate_bps.max(path.delivery_rate_bps).max(1.0);
+    let effective_inflight = if path.inflight_limit_bytes > 0 {
+        path.bytes_in_flight
+            .min(path.inflight_limit_bytes.saturating_mul(2))
+    } else {
+        path.bytes_in_flight
+    };
+    let queued_bits = path.queue_bytes.saturating_add(effective_inflight) as f64 * 8.0;
     let payload_bits = payload_bytes as f64 * 8.0;
 
     let mut eta_ms = path.srtt_ms / 2.0;
@@ -396,6 +412,7 @@ pub fn score_path(
     eta_ms += payload_bits / rate * 1000.0;
     eta_ms += path.jitter_ms;
     eta_ms += path.loss_rate.clamp(0.0, 1.0) * policy.loss_penalty_scale_ms;
+    eta_ms += (1.0 - path.confidence.clamp(0.0, 1.0)) * policy.low_confidence_penalty_ms;
 
     if path.state == PathState::Suspect {
         eta_ms += suspect_penalty_ms(lane, policy);

@@ -134,6 +134,26 @@ build_mptunnel_binary() {
   fi
 }
 
+mptunnel_resource_env_prefix() {
+  local env_name
+  local -a env_names=(
+    MPTUNNEL_MAX_FRAME_BYTES
+    MPTUNNEL_MAX_PAYLOAD_BYTES
+    MPTUNNEL_MAX_ACK_RANGES
+    MPTUNNEL_MAX_STREAM_WINDOW_BYTES
+    MPTUNNEL_MAX_REPAIR_BYTES
+    MPTUNNEL_MAX_REORDER_BYTES
+    MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES
+    MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES
+    MPTUNNEL_MAX_TCP_RELAY_CHUNK_BYTES
+  )
+  for env_name in "${env_names[@]}"; do
+    if [[ -n "${!env_name:-}" ]]; then
+      printf '%s=%q ' "$env_name" "${!env_name}"
+    fi
+  done
+}
+
 append_skipped_result() {
   local case_name="$1"
   local protocol="$2"
@@ -447,6 +467,7 @@ start_target_services() {
 start_server() {
   stop_server
   exec_in server "\
+    $(mptunnel_resource_env_prefix) \
     MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
     MPTUNNEL_LAB_PERF='${lab_perf}' \
     MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
@@ -494,6 +515,7 @@ start_client_with_netem() {
     apply_netem "$netem_mode"
   fi
   exec_in client "\
+    $(mptunnel_resource_env_prefix) \
     MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
     MPTUNNEL_LAB_PERF='${lab_perf}' \
     MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \

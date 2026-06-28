@@ -744,7 +744,6 @@ pub(super) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> boo
             | RuntimeError::Udp(_)
             | RuntimeError::UdpCarrierTransport(_)
             | RuntimeError::UdpCarrierFrame(_)
-            | RuntimeError::UdpCarrierConnect(_)
             | RuntimeError::UdpCarrierConnection(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)

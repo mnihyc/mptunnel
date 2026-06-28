@@ -10,7 +10,9 @@ use crate::transport::PathSpecParseError;
 use crate::transport::encrypted::EncryptedFramedTransportError;
 use crate::transport::tcp::TcpTransportError;
 use crate::transport::udp::UdpTransportError;
-use crate::transport::udp_carrier::{UdpCarrierFrameError, UdpCarrierTransportError};
+use crate::transport::udp_carrier::{
+    UdpCarrierConnectionError, UdpCarrierFrameError, UdpCarrierTransportError,
+};
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -20,8 +22,7 @@ pub enum RuntimeError {
     Encrypted(EncryptedFramedTransportError),
     UdpCarrierTransport(UdpCarrierTransportError),
     UdpCarrierFrame(UdpCarrierFrameError),
-    UdpCarrierConnect(quinn::ConnectError),
-    UdpCarrierConnection(quinn::ConnectionError),
+    UdpCarrierConnection(UdpCarrierConnectionError),
     Auth(AuthError),
     Random(getrandom::Error),
     Socks5(Socks5Error),
@@ -82,14 +83,8 @@ impl From<UdpCarrierFrameError> for RuntimeError {
     }
 }
 
-impl From<quinn::ConnectError> for RuntimeError {
-    fn from(value: quinn::ConnectError) -> Self {
-        Self::UdpCarrierConnect(value)
-    }
-}
-
-impl From<quinn::ConnectionError> for RuntimeError {
-    fn from(value: quinn::ConnectionError) -> Self {
+impl From<UdpCarrierConnectionError> for RuntimeError {
+    fn from(value: UdpCarrierConnectionError) -> Self {
         Self::UdpCarrierConnection(value)
     }
 }
@@ -151,7 +146,6 @@ impl std::fmt::Display for RuntimeError {
             Self::Encrypted(err) => write!(f, "{err}"),
             Self::UdpCarrierTransport(err) => write!(f, "{err}"),
             Self::UdpCarrierFrame(err) => write!(f, "{err}"),
-            Self::UdpCarrierConnect(err) => write!(f, "{err}"),
             Self::UdpCarrierConnection(err) => write!(f, "{err}"),
             Self::Auth(err) => write!(f, "{err}"),
             Self::Random(err) => write!(f, "random source failed: {err}"),
@@ -204,7 +198,6 @@ impl std::error::Error for RuntimeError {
             Self::Encrypted(err) => Some(err),
             Self::UdpCarrierTransport(err) => Some(err),
             Self::UdpCarrierFrame(err) => Some(err),
-            Self::UdpCarrierConnect(err) => Some(err),
             Self::UdpCarrierConnection(err) => Some(err),
             Self::Auth(err) => Some(err),
             Self::Random(_) => None,

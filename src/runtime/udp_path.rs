@@ -77,23 +77,21 @@ impl ClientUdpPathSessionHandle {
         }
     }
 
-    async fn ensure_connection(&self) -> Result<quinn::Connection, RuntimeError> {
+    async fn ensure_connection(&self) -> Result<udp_carrier::Connection, RuntimeError> {
         let mut current = self.connection.lock().await;
         if let Some(connection) = current.as_ref() {
             return Ok(connection.connection.clone());
         }
         let connection = connect_client_udp_path(&self.runtime).await?;
-        let quinn_connection = connection.connection.clone();
+        let carrier_connection = connection.connection.clone();
         *current = Some(connection);
-        Ok(quinn_connection)
+        Ok(carrier_connection)
     }
 
     async fn drop_connection(&self) {
         let mut current = self.connection.lock().await;
         if let Some(connection) = current.take() {
-            connection
-                .connection
-                .close(0_u32.into(), b"mptunnel path reconnect");
+            connection.connection.close();
         }
     }
 }
@@ -109,14 +107,13 @@ pub(super) struct ClientUdpPathSessionRuntime {
     pub(super) stream_frame_queue: usize,
 }
 
-#[derive(Clone)]
 struct ClientUdpPathConnection {
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    _endpoint: udp_carrier::Endpoint,
+    connection: udp_carrier::Connection,
 }
 
 pub(super) struct ClientUdpDatagramStream {
-    pub(super) send: quinn::SendStream,
+    pub(super) send: udp_carrier::SendStream,
     pub(super) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
     pub(super) runtime: ClientUdpPathSessionRuntime,
     pub(super) path_id: PathId,
@@ -125,50 +122,30 @@ pub(super) struct ClientUdpDatagramStream {
 pub(super) async fn bind_server_udp_endpoint(
     path: &PathSpec,
     context: &ServerPathContext,
-) -> Result<quinn::Endpoint, RuntimeError> {
+) -> Result<udp_carrier::Endpoint, RuntimeError> {
     let addr = resolve_first_socket_addr(path).await?;
-    Ok(quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(udp_carrier::server_config(
-            context.security.secret.as_bytes(),
-            context.mux_limits,
-        )?),
-        std::net::UdpSocket::bind(addr)?,
-        Arc::new(quinn::TokioRuntime),
-    )?)
-}
-
-fn bind_client_udp_endpoint(local_addr: SocketAddr) -> Result<quinn::Endpoint, RuntimeError> {
-    Ok(quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        std::net::UdpSocket::bind(local_addr)?,
-        Arc::new(quinn::TokioRuntime),
-    )?)
+    Ok(udp_carrier::Endpoint::bind_server(
+        addr,
+        context.security.secret.as_bytes(),
+        context.security.cipher,
+        context.mux_limits,
+        context.codec_limits,
+    )
+    .await?)
 }
 
 pub(super) async fn run_server_udp_listener(
-    endpoint: quinn::Endpoint,
+    endpoint: udp_carrier::Endpoint,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
     loop {
-        let Some(incoming) = endpoint.accept().await else {
+        let Some(connection) = endpoint.accept().await else {
             return Err(RuntimeError::Protocol("UDP carrier endpoint closed"));
         };
         let context = context.clone();
         tokio::spawn(async move {
-            match incoming.await {
-                Ok(connection) => {
-                    if let Err(err) = handle_server_udp_connection(connection, context).await {
-                        warn_unexpected_udp_runtime_error(
-                            "server UDP carrier connection failed",
-                            &err,
-                        );
-                    }
-                }
-                Err(err) => {
-                    eprintln!("warning: server UDP carrier accept failed: {err}");
-                }
+            if let Err(err) = handle_server_udp_connection(connection, context).await {
+                warn_unexpected_udp_runtime_error("server UDP carrier connection failed", &err);
             }
         });
     }
@@ -187,13 +164,15 @@ async fn connect_client_udp_path(
             .parse()
             .expect("static IPv6 unspecified socket addr")
     };
-    let mut endpoint = bind_client_udp_endpoint(local_addr)?;
-    endpoint.set_default_client_config(udp_carrier::client_config(
+    let endpoint = udp_carrier::Endpoint::bind_client(
+        local_addr,
         runtime.security.secret.as_bytes(),
+        runtime.security.cipher,
         runtime.mux_limits,
-    )?);
-    let connecting = endpoint.connect(remote_addr, udp_carrier::CONNECT_SERVER_NAME)?;
-    let connection = connecting.await?;
+        runtime.codec_limits,
+    )
+    .await?;
+    let connection = endpoint.connect(remote_addr).await?;
     perform_client_udp_path_handshake(&connection, runtime).await?;
     Ok(ClientUdpPathConnection {
         _endpoint: endpoint,
@@ -202,7 +181,7 @@ async fn connect_client_udp_path(
 }
 
 async fn perform_client_udp_path_handshake(
-    connection: &quinn::Connection,
+    connection: &udp_carrier::Connection,
     runtime: &ClientUdpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -245,7 +224,7 @@ async fn perform_client_udp_path_handshake(
 }
 
 async fn open_client_udp_stream_on_connection(
-    connection: quinn::Connection,
+    connection: udp_carrier::Connection,
     stream_id: StreamId,
     target: TargetAddr,
     ingress: IngressKind,
@@ -299,14 +278,14 @@ async fn open_client_udp_stream_on_connection(
         max_offset,
         class,
         underlay: UnderlayProtocol::Udp,
-        max_frame_payload_bytes: tcp_relay_buffer_len(runtime.mux_limits),
+        max_frame_payload_bytes: udp_carrier::max_stream_payload_bytes(runtime.codec_limits),
         output: TcpPathStreamOutput::Fixed(commands),
         frames: frames_rx,
     })
 }
 
 async fn open_client_udp_datagram_stream(
-    connection: quinn::Connection,
+    connection: udp_carrier::Connection,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<ClientUdpDatagramStream, RuntimeError> {
     let (send, recv) = connection.open_bi().await?;
@@ -320,7 +299,7 @@ async fn open_client_udp_datagram_stream(
 }
 
 fn spawn_udp_carrier_reader(
-    mut recv: quinn::RecvStream,
+    mut recv: udp_carrier::RecvStream,
     codec_limits: CodecLimits,
     queue_size: usize,
 ) -> mpsc::Receiver<Result<Frame, RuntimeError>> {
@@ -344,8 +323,8 @@ fn spawn_udp_carrier_reader(
 }
 
 async fn run_client_udp_stream(
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    mut send: udp_carrier::SendStream,
+    recv: udp_carrier::RecvStream,
     stream_id: StreamId,
     codec_limits: CodecLimits,
     reader_queue_size: usize,
@@ -432,7 +411,7 @@ async fn run_client_udp_stream(
 }
 
 async fn handle_server_udp_connection(
-    connection: quinn::Connection,
+    connection: udp_carrier::Connection,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
     let (session_id, path_id, capabilities) =
@@ -440,7 +419,6 @@ async fn handle_server_udp_connection(
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
-            Err(err) if udp_carrier_connection_error_is_expected_shutdown(&err) => return Ok(()),
             Err(err) => return Err(RuntimeError::UdpCarrierConnection(err)),
         };
         let context = context.clone();
@@ -462,7 +440,7 @@ async fn handle_server_udp_connection(
 }
 
 async fn accept_server_udp_path_handshake(
-    connection: &quinn::Connection,
+    connection: &udp_carrier::Connection,
     context: &ServerPathContext,
 ) -> Result<(SessionId, PathId, PathCapabilities), RuntimeError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
@@ -536,8 +514,8 @@ async fn accept_server_udp_path_handshake(
 }
 
 async fn handle_server_udp_bidi_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: udp_carrier::SendStream,
+    mut recv: udp_carrier::RecvStream,
     context: ServerPathContext,
     session_id: SessionId,
     path_id: PathId,
@@ -608,8 +586,8 @@ struct ServerUdpReliableStreamContext {
 }
 
 async fn handle_server_udp_reliable_stream(
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    mut send: udp_carrier::SendStream,
+    recv: udp_carrier::RecvStream,
     context: ServerPathContext,
     stream_context: ServerUdpReliableStreamContext,
 ) -> Result<(), RuntimeError> {
@@ -636,7 +614,9 @@ async fn handle_server_udp_reliable_stream(
                 path_id,
                 underlay: UnderlayProtocol::Udp,
                 commands: commands_tx.clone(),
-                max_frame_payload_bytes: tcp_relay_buffer_len(context.mux_limits),
+                max_frame_payload_bytes: udp_carrier::max_stream_payload_bytes(
+                    context.codec_limits,
+                ),
                 role,
             },
         },
@@ -702,8 +682,8 @@ struct ServerUdpReliableStreamLoop {
 }
 
 async fn run_server_udp_reliable_stream_loop(
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    mut send: udp_carrier::SendStream,
+    recv: udp_carrier::RecvStream,
     stream_context: ServerUdpReliableStreamLoop,
 ) -> Result<(), RuntimeError> {
     let ServerUdpReliableStreamLoop {
@@ -805,8 +785,8 @@ struct ServerUdpDatagramStreamContext {
 }
 
 async fn handle_server_udp_datagram_stream(
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    send: udp_carrier::SendStream,
+    recv: udp_carrier::RecvStream,
     context: ServerPathContext,
     stream_context: ServerUdpDatagramStreamContext,
 ) -> Result<(), RuntimeError> {
@@ -922,7 +902,7 @@ async fn handle_server_udp_datagram_stream(
 async fn open_server_udp_datagram_flow(
     context: &ServerPathContext,
     commands_tx: &TcpPathSessionCommandSender,
-    send: &mut quinn::SendStream,
+    send: &mut udp_carrier::SendStream,
     flows: &mut Vec<ServerUdpDatagramFlow>,
     flow_id: DatagramFlowId,
     target: TargetAddr,
@@ -974,25 +954,12 @@ async fn open_server_udp_datagram_flow(
 }
 
 fn udp_carrier_frame_finished(err: &udp_carrier::UdpCarrierFrameError) -> bool {
-    matches!(
-        err,
-        udp_carrier::UdpCarrierFrameError::Read(quinn::ReadExactError::FinishedEarly(_))
-            | udp_carrier::UdpCarrierFrameError::Read(quinn::ReadExactError::ReadError(
-                quinn::ReadError::ClosedStream
-            ))
-    ) || matches!(
-        err,
-        udp_carrier::UdpCarrierFrameError::Read(quinn::ReadExactError::ReadError(
-            quinn::ReadError::ConnectionLost(connection)
-        )) if udp_carrier_connection_error_is_expected_shutdown(connection)
-    )
+    matches!(err, udp_carrier::UdpCarrierFrameError::Closed)
 }
 
 fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
     match err {
-        RuntimeError::UdpCarrierConnection(err) => {
-            udp_carrier_connection_error_is_expected_shutdown(err)
-        }
+        RuntimeError::UdpCarrierConnection(udp_carrier::UdpCarrierConnectionError::Closed) => true,
         RuntimeError::UdpCarrierFrame(err) => udp_carrier_frame_finished(err),
         RuntimeError::RemoteClosed(CloseReason::Normal) => true,
         _ => false,
@@ -1005,13 +972,6 @@ fn warn_unexpected_udp_runtime_error(message: &str, err: &RuntimeError) {
     }
 }
 
-fn udp_carrier_connection_error_is_expected_shutdown(err: &quinn::ConnectionError) -> bool {
-    matches!(
-        err,
-        quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed
-    )
-}
-
 fn udp_carrier_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,
@@ -1019,7 +979,6 @@ fn udp_carrier_open_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::Udp(_)
             | RuntimeError::UdpCarrierTransport(_)
             | RuntimeError::UdpCarrierFrame(_)
-            | RuntimeError::UdpCarrierConnect(_)
             | RuntimeError::UdpCarrierConnection(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)

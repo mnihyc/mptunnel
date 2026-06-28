@@ -58,7 +58,7 @@ pub(super) async fn run_server(
 
 pub(super) enum BoundServerPath {
     Tcp(TcpListener),
-    Udp(quinn::Endpoint),
+    Udp(udp_carrier::Endpoint),
 }
 
 pub(super) async fn run_server_tcp_listener(

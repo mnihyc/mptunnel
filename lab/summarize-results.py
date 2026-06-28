@@ -111,6 +111,51 @@ def udp_rows(by_case):
     return rows
 
 
+def upload_rows(by_case):
+    rows = []
+    for case, records in by_case.items():
+        if not any(str(record.get("protocol", "")).endswith("-upload") for record in records):
+            continue
+        accepted = [
+            record for record in records if record.get("status") in ("ok", "loss")
+        ]
+        rows.append(
+            {
+                "case": case,
+                "runs": len(records),
+                "ok": sum(1 for record in records if record.get("status") == "ok"),
+                "loss": sum(1 for record in records if record.get("status") == "loss"),
+                "fail": sum(
+                    1 for record in records if record.get("status") not in ("ok", "loss")
+                ),
+                "median_goodput": median(
+                    [record.get("upload_goodput_mbps") for record in accepted]
+                ),
+                "best_goodput": max(
+                    [
+                        record.get("upload_goodput_mbps")
+                        for record in accepted
+                        if isinstance(record.get("upload_goodput_mbps"), (int, float))
+                    ],
+                    default=None,
+                ),
+                "median_time": median([record.get("time_s") for record in accepted]),
+                "median_recovery_gap": median(
+                    [record.get("recovery_gap_s") for record in accepted]
+                ),
+                "max_recovery_gap": max(
+                    [
+                        record.get("recovery_gap_s")
+                        for record in accepted
+                        if isinstance(record.get("recovery_gap_s"), (int, float))
+                    ],
+                    default=None,
+                ),
+            }
+        )
+    return rows
+
+
 def mixed_rows(by_case):
     rows = []
     for case, records in by_case.items():
@@ -323,6 +368,31 @@ def render_markdown(records):
     lines.extend(
         [
             "",
+            "## TCP Uploads",
+            "",
+            "| case | runs | ok | loss | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in upload_rows(by_case):
+        lines.append(
+            "| {case} | {runs} | {ok} | {loss} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} |".format(
+                case=row["case"],
+                runs=row["runs"],
+                ok=row["ok"],
+                loss=row["loss"],
+                fail=row["fail"],
+                median_goodput=fmt_float(row["median_goodput"]),
+                best_goodput=fmt_float(row["best_goodput"]),
+                median_time=fmt_float(row["median_time"]),
+                median_recovery_gap=fmt_float(row["median_recovery_gap"]),
+                max_recovery_gap=fmt_float(row["max_recovery_gap"]),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
             "## Mixed Workloads",
             "",
             "| case | runs | ok | loss | fail | median bulk Mbps | max bulk recovery gap s | median small p95 ms | max small ms | median interactive ok | median interactive count | median interactive p95 ms | max interactive failover gap s | avg UDP loss | median UDP p95 ms | max UDP ms |",
@@ -396,6 +466,7 @@ def render_json(records):
         "sources": len(by_source(records)),
         "tcp": tcp_rows(by_case),
         "udp": udp_rows(by_case),
+        "upload": upload_rows(by_case),
         "mixed": mixed_rows(by_case),
         "comparisons": source_comparisons(records),
     }

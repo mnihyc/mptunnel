@@ -14,8 +14,12 @@ pub const DEFAULT_PATH_PROBE_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_INTERVAL_MS);
 pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
-pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
-pub const DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES: usize = 256 * 1024;
+pub const DEFAULT_STREAM_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_REPAIR_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_REORDER_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_DATAGRAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES: usize = 512 * 1024;
 pub const MIN_UDP_REPLAY_WINDOW_PACKETS: u64 = 1_024;
 pub const MAX_UDP_REPLAY_WINDOW_PACKETS: u64 = 65_536;
 pub const UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES: usize = 512;
@@ -174,10 +178,10 @@ impl Default for ResourceLimits {
             max_ack_ranges: 256,
             max_paths: 64,
             max_streams: 65_536,
-            max_stream_window_bytes: 16 * 1024 * 1024,
-            max_repair_bytes: 16 * 1024 * 1024,
-            max_reorder_bytes: 16 * 1024 * 1024,
-            max_datagram_queue_bytes: 4 * 1024 * 1024,
+            max_stream_window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
+            max_repair_bytes: DEFAULT_REPAIR_BYTES,
+            max_reorder_bytes: DEFAULT_REORDER_BYTES,
+            max_datagram_queue_bytes: DEFAULT_DATAGRAM_QUEUE_BYTES,
             max_tcp_path_inflight_bytes: DEFAULT_TCP_PATH_INFLIGHT_BYTES,
             max_tcp_relay_chunk_bytes: DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
@@ -581,7 +585,7 @@ mod tests {
         );
         assert_eq!(
             udp_replay_window_packets_for_inflight(DEFAULT_TCP_PATH_INFLIGHT_BYTES),
-            16_384
+            MAX_UDP_REPLAY_WINDOW_PACKETS
         );
         assert_eq!(
             udp_replay_window_packets_for_inflight(usize::MAX),

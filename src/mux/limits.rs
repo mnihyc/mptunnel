@@ -1,4 +1,7 @@
-use crate::config::ResourceLimits;
+use crate::config::{
+    DEFAULT_DATAGRAM_QUEUE_BYTES, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
+    DEFAULT_STREAM_WINDOW_BYTES, ResourceLimits,
+};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,10 +25,10 @@ impl Default for MuxLimits {
             max_payload_bytes: 1_048_512,
             max_ack_ranges: 256,
             max_streams: 65_536,
-            max_stream_window_bytes: 16 * 1024 * 1024,
-            max_repair_bytes: 16 * 1024 * 1024,
-            max_reorder_bytes: 16 * 1024 * 1024,
-            max_datagram_queue_bytes: 4 * 1024 * 1024,
+            max_stream_window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
+            max_repair_bytes: DEFAULT_REPAIR_BYTES,
+            max_reorder_bytes: DEFAULT_REORDER_BYTES,
+            max_datagram_queue_bytes: DEFAULT_DATAGRAM_QUEUE_BYTES,
             max_tcp_path_inflight_bytes: crate::config::DEFAULT_TCP_PATH_INFLIGHT_BYTES,
             max_tcp_relay_chunk_bytes: crate::config::DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,

@@ -278,7 +278,10 @@ async fn open_client_udp_stream_on_connection(
         max_offset,
         class,
         underlay: UnderlayProtocol::Udp,
-        max_frame_payload_bytes: udp_carrier::max_stream_payload_bytes(runtime.codec_limits),
+        max_frame_payload_bytes: udp_carrier::max_stream_payload_bytes(
+            runtime.codec_limits,
+            runtime.mux_limits,
+        ),
         output: TcpPathStreamOutput::Fixed(commands),
         frames: frames_rx,
     })
@@ -616,6 +619,7 @@ async fn handle_server_udp_reliable_stream(
                 commands: commands_tx.clone(),
                 max_frame_payload_bytes: udp_carrier::max_stream_payload_bytes(
                     context.codec_limits,
+                    context.mux_limits,
                 ),
                 role,
             },
@@ -705,11 +709,6 @@ async fn run_server_udp_reliable_stream_loop(
         tokio::select! {
             frame = carrier_frames.recv() => {
                 match frame {
-                    Some(Ok(Frame::StreamClass { stream_id: received_stream_id, class }))
-                        if received_stream_id == stream_id =>
-                    {
-                        context.tcp_streams.update_class(session_id, stream_id, class)?;
-                    }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
                         | Frame::StreamMaxData { stream_id: received_stream_id, .. }
@@ -736,7 +735,14 @@ async fn run_server_udp_reliable_stream_loop(
                         udp_carrier::write_frame(&mut send, &Frame::Pong { nonce }, context.codec_limits).await?;
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
-                    Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server UDP carrier reliable stream frame")),
+                    Some(Ok(frame)) => {
+                        log_unexpected_stream_relay_frame(
+                            "server UDP carrier reliable",
+                            stream_id,
+                            &frame,
+                        );
+                        return Err(RuntimeError::Protocol("unexpected server UDP carrier reliable stream frame"));
+                    }
                     Some(Err(RuntimeError::TcpPathSessionClosed)) | None => {
                         context.tcp_streams.detach_path(
                             session_id,

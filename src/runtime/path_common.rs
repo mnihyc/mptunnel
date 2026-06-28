@@ -125,7 +125,6 @@ fn frame_kind_name(frame: &Frame) -> &'static str {
         Frame::PathMtuProbe { .. } => "PATH_MTU_PROBE",
         Frame::PathMtuAck { .. } => "PATH_MTU_ACK",
         Frame::OpenStream { .. } => "OPEN_STREAM",
-        Frame::StreamClass { .. } => "STREAM_CLASS",
         Frame::StreamData { .. } => "STREAM_DATA",
         Frame::StreamAck { .. } => "STREAM_ACK",
         Frame::StreamMaxData { .. } => "STREAM_MAX_DATA",
@@ -175,9 +174,6 @@ fn frame_subject(frame: &Frame) -> String {
         Frame::OpenStream {
             stream_id, class, ..
         } => format!("stream_id={} class={class:?}", stream_id.0),
-        Frame::StreamClass { stream_id, class } => {
-            format!("stream_id={} class={class:?}", stream_id.0)
-        }
         Frame::StreamData {
             stream_id,
             offset,

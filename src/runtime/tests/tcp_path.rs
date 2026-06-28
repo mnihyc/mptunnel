@@ -1095,6 +1095,99 @@ fn endpoint_only_udp_stream_auto_bulk_discovery_waits_for_delivery_evidence() {
 }
 
 #[test]
+fn mixed_endpoint_only_auto_bulk_discovery_waits_without_mixed_pressure() {
+    let tcp_path = "tcp://127.0.0.1:10136"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let udp_path = "udp://127.0.0.1:10137"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context = ClientPathContext::new(
+        vec![tcp_path, udp_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert!(
+        context
+            .ordered_reliable_auto_bulk_discovery_path_keys(
+                Some(0),
+                None,
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+            )
+            .is_empty()
+    );
+
+    assert!(
+        context
+            .ordered_udp_stream_auto_bulk_discovery_indices(
+                Some(0),
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+            )
+            .is_empty(),
+        "UDP-only expansion still waits for UDP delivery evidence"
+    );
+}
+
+#[test]
+fn mixed_endpoint_only_auto_bulk_discovery_ignores_ambiguous_tcp_pressure() {
+    let tcp_path = "tcp://127.0.0.1:10136"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let udp_path = "udp://127.0.0.1:10137"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context = ClientPathContext::new(
+        vec![tcp_path, udp_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.reserve_tcp_path_load(0, TrafficClass::Interactive);
+
+    assert!(
+        context
+            .ordered_reliable_auto_bulk_discovery_path_keys(
+                Some(0),
+                None,
+                MuxLimits::default().max_tcp_path_inflight_bytes,
+            )
+            .is_empty()
+    );
+}
+
+#[test]
+fn mixed_endpoint_only_auto_bulk_discovery_probes_udp_under_udp_pressure() {
+    let tcp_path = "tcp://127.0.0.1:10136"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let udp_path = "udp://127.0.0.1:10137"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context = ClientPathContext::new(
+        vec![tcp_path, udp_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_udp_path_probe_success(0, Duration::from_millis(1));
+    context.reserve_udp_stream_path_load(0, TrafficClass::RealtimeDatagram);
+
+    assert_eq!(
+        context.ordered_reliable_auto_bulk_discovery_path_keys(
+            Some(0),
+            None,
+            MuxLimits::default().max_tcp_path_inflight_bytes,
+        ),
+        vec![RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        }]
+    );
+}
+
+#[test]
 fn mixed_udp_repair_waits_for_delivery_evidence_on_active_tcp_stream() {
     let tcp_path = "tcp://127.0.0.1:10157"
         .parse::<PathSpec>()

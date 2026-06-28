@@ -43,10 +43,10 @@ It creates four simultaneous client/server path networks plus a server/target ne
 
 | Network | Client | Server | Target | Profile |
 | --- | --- | --- | --- | --- |
-| `path_lowlat` | `172.31.10.10` | `172.31.10.20` | `172.31.10.30` | 20 ms, 30 Mbps, 1% loss |
-| `path_balanced` | `172.31.15.10` | `172.31.15.20` | `172.31.15.30` | 80 ms, 120 Mbps, 1% loss |
-| `path_fat` | `172.31.20.10` | `172.31.20.20` | `172.31.20.30` | 180 ms, 300 Mbps, 1% loss |
-| `path_poor` | `172.31.30.10` | `172.31.30.20` | `172.31.30.30` | 420 ms, 8 Mbps, 10% loss, high jitter |
+| `path_lowlat` | `172.31.10.10` | `172.31.10.20` | `172.31.10.30` | 20 ms, 80 Mbps, 1% loss |
+| `path_balanced` | `172.31.15.10` | `172.31.15.20` | `172.31.15.30` | 80 ms, 200 Mbps, 1% loss |
+| `path_fat` | `172.31.20.10` | `172.31.20.20` | `172.31.20.30` | 180 ms, 500 Mbps, 1% loss |
+| `path_poor` | `172.31.30.10` | `172.31.30.20` | `172.31.30.30` | 420 ms, 50 Mbps, 10% loss, high jitter |
 | `target_net` | none | `172.31.40.20` | `172.31.40.30` | server outbound network |
 
 `lab/configure-netem.sh` applies Linux `tc netem` inside each container namespace. The real-profile suite intentionally keeps low-latency, balanced, high-throughput high-RTT, and unstable poor-Internet paths available at the same time. These profiles emulate plausible Internet paths and stay separate from the controlled 2^3 ablation matrix.
@@ -61,6 +61,7 @@ It records:
 - Plain VMess-over-TCP, Hysteria2-over-UDP, and kernel MPTCP baselines when the external tools/kernel support are available in the lab containers.
 - mptunnel SOCKS5 HTTP downloads over each single TCP underlay path.
 - mptunnel SOCKS5 HTTP download with all TCP underlay paths configured.
+- mptunnel SOCKS5 sustained TCP uploads over single TCP, single UDP reliable-stream, mixed, multipath, and TUN-mode underlay combinations.
 - mptunnel TUN L4 HTTP downloads over TCP, UDP reliable-stream, and mixed underlay paths.
 - mptunnel SOCKS5 UDP ASSOCIATE probes over each single UDP underlay path.
 - mptunnel SOCKS5 UDP ASSOCIATE probes with all UDP underlay paths configured.
@@ -68,11 +69,11 @@ It records:
 - mptunnel mixed workload while path states randomly flap between normal, spiked, and blackholed profiles.
 - mptunnel TCP multipath download while the high-bandwidth path is blackholed during transfer.
 - mptunnel mixed-workload ideal comparisons where one selected path is forced to 0% loss.
-- mptunnel controlled matrix cases over one TCP+UDP path where bandwidth, latency, and loss each toggle between good and poor values.
+- mptunnel controlled matrix download and upload cases over one TCP+UDP path where bandwidth, latency, and loss each toggle between good and poor values.
 
-Download cases use a sparse 1 GiB HTTP object by default and run for a fixed duration, so a valid measurement is usually a partial HTTP body at the end of the test window rather than a completed small file. Mixed cases run several workloads for the same fixed window: a sustained large-object download, repeated small-object HTTP requests for browsing latency, one persistent TCP echo stream with periodic payloads for SSH-like interaction, and duration-driven UDP datagrams for realtime traffic. The harness should not finish early just because one request completed.
+Download cases use a sparse 1 GiB HTTP object by default and run for a fixed duration, so a valid measurement is usually a partial HTTP body at the end of the test window rather than a completed small file. Upload cases use persistent TCP streams to a lab sink for the same fixed duration, so they measure client-to-server sender behavior instead of repeated short transfers. Mixed cases run several workloads for the same fixed window: a sustained large-object download, repeated small-object HTTP requests for browsing latency, one persistent TCP echo stream with periodic payloads for SSH-like interaction, and duration-driven UDP datagrams for realtime traffic. The harness should not finish early just because one request completed.
 
-The HTTP and mixed cases record wall time, HTTP status, goodput Mbps, first-body time, max read gap, recovery gap, and one-second interval goodput samples during sustained load windows. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
+The HTTP, upload, and mixed cases record wall time, goodput Mbps, startup timing, max transfer gap, recovery gap, and one-second interval goodput samples during sustained load windows. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
 
 ## Controls
 
@@ -85,7 +86,7 @@ Useful environment variables:
 - `MPTUNNEL_LAB_SMALL_HTTP_PATH`: small-object URL path, default `/small.bin`.
 - `MPTUNNEL_LAB_LOAD_DURATION_SECONDS`: sustained workload duration for download and mixed probes, default `30`.
 - `LOAD_DURATION_MATRIX`: space-separated sustained workload duration matrix for `lab/run-exhaustive-experiments.sh`.
-- `MPTUNNEL_LAB_BULK_CONNECTIONS`: parallel pure-download connections for capacity tests, default `2`.
+- `MPTUNNEL_LAB_BULK_CONNECTIONS`: parallel pure-download or pure-upload connections for capacity tests, default `2`.
 - `BULK_CONNECTIONS_MATRIX`: space-separated bulk connection-count matrix for `lab/run-exhaustive-experiments.sh`.
 - `CURL_TIMEOUT_SECONDS`: per-download timeout, default `120`.
 - `UDP_PAYLOAD_BYTES`: UDP probe payload size, default `512`.
@@ -103,7 +104,7 @@ Useful environment variables:
 - `MPTUNNEL_LAB_FAT_RATE`, `MPTUNNEL_LAB_FAT_DELAY`, `MPTUNNEL_LAB_FAT_JITTER`, `MPTUNNEL_LAB_FAT_LOSS`: high-bandwidth path netem values. The default loss is `1.00%`.
 - `MPTUNNEL_LAB_POOR_RATE`, `MPTUNNEL_LAB_POOR_DELAY`, `MPTUNNEL_LAB_POOR_JITTER`, `MPTUNNEL_LAB_POOR_LOSS`: poor-Internet path netem values. The default loss is `10.00%`.
 - `MPTUNNEL_LAB_IDEAL_LOSS`: loss value for ideal comparison cases, default `0.00%`.
-- `MPTUNNEL_LAB_MATRIX_GOOD_RATE`, `MPTUNNEL_LAB_MATRIX_POOR_RATE`: controlled matrix bandwidth values, default `200mbit` and `25mbit`.
+- `MPTUNNEL_LAB_MATRIX_GOOD_RATE`, `MPTUNNEL_LAB_MATRIX_POOR_RATE`: controlled matrix bandwidth values, default `500mbit` and `50mbit`.
 - `MPTUNNEL_LAB_MATRIX_GOOD_DELAY`, `MPTUNNEL_LAB_MATRIX_POOR_DELAY`: controlled matrix latency values, default `50ms` and `250ms`.
 - `MPTUNNEL_LAB_MATRIX_GOOD_JITTER`, `MPTUNNEL_LAB_MATRIX_POOR_JITTER`: controlled matrix jitter values, default `5ms` and `60ms`.
 - `MPTUNNEL_LAB_MATRIX_GOOD_LOSS`, `MPTUNNEL_LAB_MATRIX_POOR_LOSS`: controlled matrix loss values, default `1.00%` and `15.00%`.

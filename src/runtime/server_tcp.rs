@@ -200,11 +200,6 @@ pub(super) async fn handle_server_path(
                         return Ok(());
                     }
                 }
-                Frame::StreamClass { stream_id, class } => {
-                    context
-                        .tcp_streams
-                        .update_class(session_id, stream_id, class)?;
-                }
                 Frame::OpenDatagramFlow {
                     flow_id, target, ..
                 } if !draining => {

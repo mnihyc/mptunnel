@@ -156,6 +156,22 @@ pub(super) fn tcp_relay_buffer_len(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
+pub(super) fn resize_tcp_relay_buffer(buffer: &mut Vec<u8>, target_len: usize) {
+    let target_len = target_len.max(1);
+    if buffer.len() == target_len {
+        return;
+    }
+    if target_len > buffer.len() {
+        buffer.resize(target_len, 0);
+        return;
+    }
+    buffer.truncate(target_len);
+    let shrink_threshold = target_len.saturating_mul(4).max(64 * 1024);
+    if buffer.capacity() > shrink_threshold {
+        buffer.shrink_to(target_len);
+    }
+}
+
 pub(super) fn receive_stream_fin(
     recv_stream: &ReliableRecvStream,
     pending_final_offset: &mut Option<u64>,
@@ -191,8 +207,11 @@ pub(super) fn adaptive_tcp_relay_chunk_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     let cap = tcp_relay_buffer_len(mux_limits);
+    let floor = tcp_class_min_chunk_bytes(class, mux_limits).min(cap).max(1);
     let Some(path) = path else {
-        return cap;
+        return tcp_class_startup_chunk_bytes(class, mux_limits)
+            .min(cap)
+            .max(floor);
     };
 
     let bdp_bytes = tcp_path_bdp_bytes(path);
@@ -200,7 +219,7 @@ pub(super) fn adaptive_tcp_relay_chunk_bytes(
     let stability = tcp_path_stability_factor(path);
     let queue_factor = tcp_path_queue_factor(path, bdp_bytes);
     let target = (bdp_bytes * class_gain * stability * queue_factor).ceil() as usize;
-    target.clamp(1, cap)
+    target.clamp(floor, cap)
 }
 
 pub(super) fn adaptive_tcp_relay_inflight_bytes(
@@ -209,9 +228,13 @@ pub(super) fn adaptive_tcp_relay_inflight_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     let cap = mux_limits.max_tcp_path_inflight_bytes.max(1);
-    let floor = tcp_relay_buffer_len(mux_limits).min(cap).max(1);
+    let floor = tcp_class_min_inflight_bytes(class, mux_limits)
+        .min(cap)
+        .max(1);
     let Some(path) = path else {
-        return cap;
+        return tcp_class_startup_inflight_bytes(class, mux_limits)
+            .min(cap)
+            .max(floor);
     };
 
     let bdp_bytes = tcp_path_bdp_bytes(path);
@@ -228,19 +251,86 @@ pub(super) fn tcp_path_bdp_bytes(path: PathSnapshot) -> f64 {
 
 pub(super) fn tcp_class_chunk_gain(class: TrafficClass) -> f64 {
     match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => 1.0 / 64.0,
-        TrafficClass::Interactive => 1.0 / 16.0,
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => 1.0 / 256.0,
+        TrafficClass::Interactive => 1.0 / 128.0,
         TrafficClass::Bulk => 1.0 / 4.0,
-        TrafficClass::Background => 1.0 / 8.0,
+        TrafficClass::Background => 1.0 / 16.0,
+    }
+}
+
+pub(super) fn tcp_class_min_chunk_bytes(class: TrafficClass, mux_limits: MuxLimits) -> usize {
+    let cap = tcp_relay_buffer_len(mux_limits).max(1);
+    match class {
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => {
+            PATH_OPEN_SCORE_BYTES.min(cap).max(1)
+        }
+        TrafficClass::Interactive => cap
+            .saturating_div(16)
+            .max(PATH_OPEN_SCORE_BYTES.min(cap))
+            .max(1),
+        TrafficClass::Bulk => cap
+            .saturating_div(4)
+            .max(PATH_OPEN_SCORE_BYTES.min(cap))
+            .max(1),
+        TrafficClass::Background => cap
+            .saturating_div(8)
+            .max(PATH_OPEN_SCORE_BYTES.min(cap))
+            .max(1),
+    }
+}
+
+pub(super) fn tcp_class_startup_chunk_bytes(class: TrafficClass, mux_limits: MuxLimits) -> usize {
+    let cap = tcp_relay_buffer_len(mux_limits).max(1);
+    let floor = tcp_class_min_chunk_bytes(class, mux_limits);
+    match class {
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => floor,
+        TrafficClass::Interactive => cap.saturating_div(8).max(floor),
+        TrafficClass::Bulk => cap,
+        TrafficClass::Background => cap.saturating_div(4).max(floor),
     }
 }
 
 pub(super) fn tcp_class_inflight_gain(class: TrafficClass) -> f64 {
     match class {
-        TrafficClass::Control | TrafficClass::RealtimeDatagram => 0.5,
-        TrafficClass::Interactive => 1.0,
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => 0.0625,
+        TrafficClass::Interactive => 0.125,
         TrafficClass::Bulk => 2.0,
         TrafficClass::Background => 1.0,
+    }
+}
+
+pub(super) fn tcp_class_min_inflight_bytes(class: TrafficClass, mux_limits: MuxLimits) -> usize {
+    let chunk = tcp_relay_buffer_len(mux_limits).max(1);
+    match class {
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => {
+            PATH_OPEN_SCORE_BYTES.min(chunk).max(1)
+        }
+        TrafficClass::Interactive => chunk
+            .saturating_div(4)
+            .max(PATH_OPEN_SCORE_BYTES.min(chunk))
+            .max(1),
+        TrafficClass::Bulk => chunk,
+        TrafficClass::Background => chunk
+            .saturating_div(2)
+            .max(PATH_OPEN_SCORE_BYTES.min(chunk))
+            .max(1),
+    }
+}
+
+pub(super) fn tcp_class_startup_inflight_bytes(
+    class: TrafficClass,
+    mux_limits: MuxLimits,
+) -> usize {
+    let floor = tcp_class_min_inflight_bytes(class, mux_limits);
+    let chunk = tcp_relay_buffer_len(mux_limits).max(1);
+    match class {
+        TrafficClass::Control | TrafficClass::RealtimeDatagram => floor,
+        TrafficClass::Interactive => chunk,
+        TrafficClass::Bulk => mux_limits.max_tcp_path_inflight_bytes.max(chunk),
+        TrafficClass::Background => mux_limits
+            .max_tcp_path_inflight_bytes
+            .saturating_div(2)
+            .max(chunk),
     }
 }
 
@@ -256,6 +346,19 @@ pub(super) fn tcp_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     (bdp_bytes / (bdp_bytes + queued.max(0.0))).clamp(0.125, 1.0)
 }
 
+pub(super) fn tcp_sender_effective_relay_class(
+    local: TrafficClass,
+    peer: TrafficClass,
+) -> TrafficClass {
+    if local == TrafficClass::Bulk || peer == TrafficClass::Bulk {
+        TrafficClass::Bulk
+    } else if local == TrafficClass::Background || peer == TrafficClass::Background {
+        TrafficClass::Background
+    } else {
+        peer
+    }
+}
+
 pub(super) async fn relay_tcp_stream<S>(
     mut local: S,
     mut path_stream: TcpPathStream,
@@ -268,7 +371,7 @@ where
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(path_stream.max_offset);
     let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
-    let chunk_size = tcp_relay_buffer_len(mux_limits)
+    let chunk_size = adaptive_tcp_relay_chunk_bytes(None, TrafficClass::Interactive, mux_limits)
         .min(path_stream.max_frame_payload_bytes)
         .max(1);
     let mut buf = vec![0u8; chunk_size];
@@ -281,12 +384,43 @@ where
     let mut last_repair_replay_at = Instant::now();
     let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
+    let mut flow_classifier = TcpRelayFlowClassifier::new();
+    #[cfg(feature = "lab-diagnostics")]
+    let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
 
     let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
             break Ok(stats);
         }
-        let relay_class = path_stream.current_class();
+        let peer_class = path_stream.current_class();
+        let class_update = flow_classifier.refresh(
+            TcpRelayFlowSignals::new(
+                send_stream.next_offset(),
+                recv_stream.next_offset(),
+                send_stream.repair_bytes(),
+            ),
+            None,
+            mux_limits,
+        );
+        let relay_class = tcp_sender_effective_relay_class(class_update.class, peer_class);
+        if relay_class != peer_class {
+            path_stream.set_class(relay_class);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "server_stream_class_promoted_local",
+                format_args!(
+                    "stream_id={} previous={:?} local_class={:?} peer_class={:?} class={:?} sent_offset={} received_offset={} repair_bytes={}",
+                    stream_id.0,
+                    class_update.previous_class,
+                    class_update.class,
+                    peer_class,
+                    relay_class,
+                    send_stream.next_offset(),
+                    recv_stream.next_offset(),
+                    send_stream.repair_bytes(),
+                ),
+            );
+        }
         let repair_replay_interval =
             tcp_relay_repair_replay_interval(send_stream.repair_bytes(), mux_limits);
         let repair_replay_deadline =
@@ -294,7 +428,27 @@ where
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at + reliable_stream_recv_progress_interval(None, relay_class),
         );
-        let inflight_limit = mux_limits.max_tcp_path_inflight_bytes;
+        let adaptive_chunk = adaptive_tcp_relay_chunk_bytes(None, relay_class, mux_limits)
+            .min(path_stream.max_frame_payload_bytes)
+            .max(1);
+        resize_tcp_relay_buffer(&mut buf, adaptive_chunk);
+        let inflight_limit = adaptive_tcp_relay_inflight_bytes(None, relay_class, mux_limits);
+        #[cfg(feature = "lab-diagnostics")]
+        if last_reported_budget != Some((relay_class, adaptive_chunk, inflight_limit)) {
+            lab_diagnostic(
+                "server_relay_budget",
+                format_args!(
+                    "stream_id={} underlay={:?} class={:?} chunk_bytes={} inflight_bytes={} max_frame_payload_bytes={}",
+                    stream_id.0,
+                    path_stream.underlay,
+                    relay_class,
+                    adaptive_chunk,
+                    inflight_limit,
+                    path_stream.max_frame_payload_bytes,
+                ),
+            );
+            last_reported_budget = Some((relay_class, adaptive_chunk, inflight_limit));
+        }
         let can_read_local =
             local_open && tcp_relay_can_read_with_limit(&send_stream, inflight_limit);
         let read_budget = if can_read_local {
@@ -547,5 +701,25 @@ mod tests {
             .expect("tail data");
 
         assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
+    }
+
+    #[test]
+    fn sender_effective_class_promotes_from_local_or_peer_bulk_evidence() {
+        assert_eq!(
+            tcp_sender_effective_relay_class(TrafficClass::Interactive, TrafficClass::Interactive),
+            TrafficClass::Interactive
+        );
+        assert_eq!(
+            tcp_sender_effective_relay_class(TrafficClass::Bulk, TrafficClass::Interactive),
+            TrafficClass::Bulk
+        );
+        assert_eq!(
+            tcp_sender_effective_relay_class(TrafficClass::Interactive, TrafficClass::Bulk),
+            TrafficClass::Bulk
+        );
+        assert_eq!(
+            tcp_sender_effective_relay_class(TrafficClass::Interactive, TrafficClass::Background),
+            TrafficClass::Background
+        );
     }
 }

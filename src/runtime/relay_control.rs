@@ -1,12 +1,35 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayClassState {
+pub(super) struct TcpRelayFlowSignals {
+    sent_offset: u64,
+    received_offset: u64,
+    repair_bytes: usize,
+}
+
+impl TcpRelayFlowSignals {
+    pub(super) fn new(sent_offset: u64, received_offset: u64, repair_bytes: usize) -> Self {
+        Self {
+            sent_offset,
+            received_offset,
+            repair_bytes,
+        }
+    }
+
+    pub(super) fn observed_bytes(self) -> u64 {
+        self.sent_offset
+            .max(self.received_offset)
+            .saturating_add(self.repair_bytes as u64)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TcpRelayFlowClassifier {
     current: TrafficClass,
     rebalance_attempted: bool,
 }
 
-impl TcpRelayClassState {
+impl TcpRelayFlowClassifier {
     pub(super) fn new() -> Self {
         Self {
             current: TrafficClass::Interactive,
@@ -16,29 +39,25 @@ impl TcpRelayClassState {
 
     pub(super) fn refresh(
         &mut self,
+        signals: TcpRelayFlowSignals,
         path: Option<PathSnapshot>,
-        sent_offset: u64,
-        received_offset: u64,
-        repair_bytes: usize,
         mux_limits: MuxLimits,
-    ) -> TcpRelayClassUpdate {
-        let observed_bytes = sent_offset
-            .max(received_offset)
-            .saturating_add(repair_bytes as u64);
+    ) -> TcpRelayFlowDecision {
         let previous = self.current;
-        self.current = if observed_bytes >= tcp_auto_bulk_threshold_bytes(path, mux_limits) {
-            TrafficClass::Bulk
-        } else {
-            TrafficClass::Interactive
-        };
-        TcpRelayClassUpdate {
+        self.current =
+            if signals.observed_bytes() >= tcp_auto_bulk_threshold_bytes(path, mux_limits) {
+                TrafficClass::Bulk
+            } else {
+                TrafficClass::Interactive
+            };
+        TcpRelayFlowDecision {
             class: self.current,
             previous_class: previous,
             promoted_to_bulk: previous != TrafficClass::Bulk && self.current == TrafficClass::Bulk,
         }
     }
 
-    pub(super) fn should_rebalance(self, update: TcpRelayClassUpdate) -> bool {
+    pub(super) fn should_rebalance(self, update: TcpRelayFlowDecision) -> bool {
         update.promoted_to_bulk && !self.rebalance_attempted
     }
 
@@ -48,7 +67,7 @@ impl TcpRelayClassState {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayClassUpdate {
+pub(super) struct TcpRelayFlowDecision {
     pub(super) class: TrafficClass,
     pub(super) previous_class: TrafficClass,
     pub(super) promoted_to_bulk: bool,
@@ -86,7 +105,8 @@ where
     let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
     send_stream.update_max_offset(remotes.max_offset());
     let mut recv_stream = ReliableRecvStream::new(stream_id, context.mux_limits);
-    let chunk_size = tcp_relay_buffer_len(context.mux_limits);
+    let chunk_size =
+        adaptive_tcp_relay_chunk_bytes(None, TrafficClass::Interactive, context.mux_limits);
     let mut buf = vec![0u8; chunk_size];
     let mut local_open = true;
     let mut remote_open = true;
@@ -94,7 +114,7 @@ where
     let mut pending_remote_fin_offset = None;
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
-    let mut class_state = TcpRelayClassState::new();
+    let mut flow_classifier = TcpRelayFlowClassifier::new();
     let mut last_stream_progress_at = Instant::now();
     let mut last_delivery_progress_at = Instant::now();
     let mut last_response_stall_repair_at = Instant::now();
@@ -105,6 +125,8 @@ where
     let mut interactive_response_pending = false;
     let mut recv_progress = ReliableRecvProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
+    #[cfg(feature = "lab-diagnostics")]
+    let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
 
     let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
@@ -113,27 +135,30 @@ where
         let path_snapshot = remotes
             .primary_path_key()
             .and_then(|key| relay_path_snapshot(context, key));
-        let class_update = class_state.refresh(
+        let class_update = flow_classifier.refresh(
+            TcpRelayFlowSignals::new(
+                send_stream.next_offset(),
+                recv_stream.next_offset(),
+                send_stream.repair_bytes(),
+            ),
             path_snapshot,
-            send_stream.next_offset(),
-            recv_stream.next_offset(),
-            send_stream.repair_bytes(),
             context.mux_limits,
         );
         let relay_class = class_update.class;
         if class_update.promoted_to_bulk {
-            if let Err(err) = remotes
-                .send_frame(
-                    context,
-                    Frame::StreamClass {
-                        stream_id,
-                        class: relay_class,
-                    },
-                )
-                .await
-            {
-                eprintln!("warning: TCP stream class update failed: {err}");
-            }
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "client_stream_class_promoted",
+                format_args!(
+                    "stream_id={} previous={:?} class={:?} sent_offset={} received_offset={} repair_bytes={}",
+                    stream_id.0,
+                    class_update.previous_class,
+                    relay_class,
+                    send_stream.next_offset(),
+                    recv_stream.next_offset(),
+                    send_stream.repair_bytes(),
+                ),
+            );
             for key in remotes.path_keys() {
                 context.reclassify_relay_path_load(
                     key.underlay,
@@ -144,8 +169,8 @@ where
             }
             remotes.set_class(relay_class);
         }
-        if class_state.should_rebalance(class_update) {
-            class_state.mark_rebalance_attempted();
+        if flow_classifier.should_rebalance(class_update) {
+            flow_classifier.mark_rebalance_attempted();
             if let Err(err) = switch_tcp_relay_to_best_path(
                 context,
                 &spec,
@@ -165,9 +190,26 @@ where
         }
         let adaptive_chunk =
             adaptive_tcp_relay_chunk_bytes(path_snapshot, relay_class, context.mux_limits)
-                .min(remotes.max_frame_payload_bytes(context.mux_limits));
+                .min(remotes.max_frame_payload_bytes(context.mux_limits))
+                .max(1);
+        resize_tcp_relay_buffer(&mut buf, adaptive_chunk);
         let adaptive_inflight =
             adaptive_tcp_relay_inflight_bytes(path_snapshot, relay_class, context.mux_limits);
+        #[cfg(feature = "lab-diagnostics")]
+        if last_reported_budget != Some((relay_class, adaptive_chunk, adaptive_inflight)) {
+            lab_diagnostic(
+                "client_relay_budget",
+                format_args!(
+                    "stream_id={} class={:?} chunk_bytes={} inflight_bytes={} path_snapshot={}",
+                    stream_id.0,
+                    relay_class,
+                    adaptive_chunk,
+                    adaptive_inflight,
+                    path_snapshot.is_some(),
+                ),
+            );
+            last_reported_budget = Some((relay_class, adaptive_chunk, adaptive_inflight));
+        }
         let stall_watch_active = tcp_relay_stall_watch_active(
             &send_stream,
             &recv_stream,

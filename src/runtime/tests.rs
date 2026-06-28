@@ -650,21 +650,33 @@ fn auto_tcp_class_promotes_after_runtime_bdp_threshold() {
     let high_bdp_threshold = tcp_auto_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
     let high_bdp =
         ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0)).ceil() as u64;
-    let mut state = TcpRelayClassState::new();
+    let mut state = TcpRelayFlowClassifier::new();
 
     assert!(threshold >= (tcp_relay_buffer_len(mux_limits) as u64).saturating_mul(2));
     assert!(high_bdp_threshold < high_bdp / 4);
     assert!(high_bdp_threshold >= high_bdp / 8);
 
-    let before = state.refresh(Some(path), threshold.saturating_sub(1), 0, 0, mux_limits);
+    let before = state.refresh(
+        TcpRelayFlowSignals::new(threshold.saturating_sub(1), 0, 0),
+        Some(path),
+        mux_limits,
+    );
     assert_eq!(before.class, TrafficClass::Interactive);
     assert!(!before.promoted_to_bulk);
 
-    let after = state.refresh(Some(path), threshold, 0, 0, mux_limits);
+    let after = state.refresh(
+        TcpRelayFlowSignals::new(threshold, 0, 0),
+        Some(path),
+        mux_limits,
+    );
     assert_eq!(after.class, TrafficClass::Bulk);
     assert!(after.promoted_to_bulk);
 
-    let steady = state.refresh(Some(path), threshold.saturating_mul(2), 0, 0, mux_limits);
+    let steady = state.refresh(
+        TcpRelayFlowSignals::new(threshold.saturating_mul(2), 0, 0),
+        Some(path),
+        mux_limits,
+    );
     assert_eq!(steady.class, TrafficClass::Bulk);
     assert!(!steady.promoted_to_bulk);
 }
@@ -696,6 +708,14 @@ fn adaptive_tcp_budgets_expand_for_bulk_and_shrink_under_instability() {
     let unstable_bulk_inflight =
         adaptive_tcp_relay_inflight_bytes(Some(unstable), TrafficClass::Bulk, mux_limits);
     assert!(bulk_inflight >= interactive_inflight);
+    assert!(
+        interactive_inflight <= tcp_relay_buffer_len(mux_limits),
+        "interactive streams should not inherit the bulk path ceiling"
+    );
+    assert!(
+        bulk_inflight >= interactive_inflight.saturating_mul(8),
+        "bulk transfer should be able to ramp far beyond interactive budget on high-BDP paths"
+    );
     assert!(unstable_bulk_inflight < bulk_inflight);
 }
 
@@ -1091,11 +1111,11 @@ fn tcp_path_sessions_are_dedicated_for_latency_sensitive_classes() {
 }
 
 #[test]
-fn server_tcp_registry_updates_stream_class_without_reopen() {
+fn switchable_stream_class_updates_from_local_sender_metrics() {
     let registry = ServerTcpStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _rx) = tcp_path_session_command_channels(4);
-    let opened = registry
+    let mut stream = match registry
         .open_or_attach(
             ServerTcpStreamOpenRequest {
                 session_id: SessionId(1),
@@ -1113,9 +1133,10 @@ fn server_tcp_registry_updates_stream_class_without_reopen() {
             MuxLimits::default(),
             ResourceLimits::default().max_streams,
         )
-        .expect("open stream");
-    let ServerTcpStreamOpen::New(stream) = opened else {
-        panic!("expected new stream");
+        .expect("open stream")
+    {
+        ServerTcpStreamOpen::New(stream) => stream,
+        ServerTcpStreamOpen::Existing => panic!("expected new stream"),
     };
     assert_eq!(stream.current_class(), TrafficClass::Interactive);
     let TcpPathStreamOutput::Switchable(binding) = &stream.output else {
@@ -1123,9 +1144,7 @@ fn server_tcp_registry_updates_stream_class_without_reopen() {
     };
     let binding = binding.clone();
 
-    registry
-        .update_class(SessionId(1), StreamId(7), TrafficClass::Bulk)
-        .expect("class update");
+    stream.set_class(TrafficClass::Bulk);
 
     assert_eq!(stream.current_class(), TrafficClass::Bulk);
     assert_eq!(binding.class(), TrafficClass::Bulk);

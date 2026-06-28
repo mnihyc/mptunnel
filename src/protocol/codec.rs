@@ -239,11 +239,6 @@ fn encode_payload(
             put_u8(out, stream_open_role_to_u8(*role));
             Ok(FrameKind::OpenStream)
         }
-        Frame::StreamClass { stream_id, class } => {
-            put_u64(out, stream_id.0);
-            put_u8(out, traffic_class_to_u8(*class));
-            Ok(FrameKind::StreamClass)
-        }
         Frame::StreamData {
             stream_id,
             offset,
@@ -440,10 +435,6 @@ fn decode_payload(
             outbound: decode_outbound(reader, limits)?,
             class: traffic_class_from_u8(reader.get_u8()?)?,
             role: stream_open_role_from_u8(reader.get_u8()?)?,
-        }),
-        FrameKind::StreamClass => Ok(Frame::StreamClass {
-            stream_id: StreamId(reader.get_u64()?),
-            class: traffic_class_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::StreamData => {
             let stream_id = StreamId(reader.get_u64()?);
@@ -978,7 +969,6 @@ enum FrameKind {
     PathMtuProbe = 28,
     PathMtuAck = 29,
     StreamDetach = 30,
-    StreamClass = 31,
 }
 
 impl FrameKind {
@@ -1013,7 +1003,6 @@ impl FrameKind {
             28 => Ok(Self::PathMtuProbe),
             29 => Ok(Self::PathMtuAck),
             30 => Ok(Self::StreamDetach),
-            31 => Ok(Self::StreamClass),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1231,10 +1220,6 @@ mod tests {
             outbound: OutboundPolicy::Direct,
             class: TrafficClass::Interactive,
             role: StreamOpenRole::Active,
-        });
-        round_trip(Frame::StreamClass {
-            stream_id: StreamId(7),
-            class: TrafficClass::Bulk,
         });
         round_trip(Frame::StreamData {
             stream_id: StreamId(7),

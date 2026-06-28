@@ -48,6 +48,11 @@ impl TcpPathStream {
         self.output.current_class(self.class)
     }
 
+    pub(super) fn set_class(&mut self, class: TrafficClass) {
+        self.class = class;
+        self.output.set_class(class);
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -111,6 +116,12 @@ impl TcpPathStreamOutput {
         match self {
             Self::Fixed(_) => fallback,
             Self::Switchable(binding) => binding.class(),
+        }
+    }
+
+    pub(super) fn set_class(&self, class: TrafficClass) {
+        if let Self::Switchable(binding) = self {
+            binding.set_class(class);
         }
     }
 }
@@ -481,35 +492,6 @@ impl ServerTcpStreamRegistry {
             bytes,
         );
         result
-    }
-
-    pub(super) fn update_class(
-        &self,
-        session_id: SessionId,
-        stream_id: StreamId,
-        class: TrafficClass,
-    ) -> Result<(), RuntimeError> {
-        let mut streams = self
-            .streams
-            .lock()
-            .expect("server TCP stream registry lock");
-        let Some(entry) = streams.get_mut(&(session_id, stream_id)) else {
-            let closed_key = (session_id, stream_id);
-            if self
-                .closed_streams
-                .lock()
-                .expect("server TCP stream closed cache lock")
-                .contains(&closed_key)
-            {
-                return Ok(());
-            }
-            return Err(RuntimeError::Protocol(
-                "class update for unknown server TCP stream",
-            ));
-        };
-        entry.class = class;
-        entry.binding.set_class(class);
-        Ok(())
     }
 
     pub(super) fn close(&self, session_id: SessionId, stream_id: StreamId) {

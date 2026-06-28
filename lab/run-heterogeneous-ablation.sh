@@ -27,6 +27,7 @@ udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
 tcp_echo_payload_bytes="${TCP_ECHO_PAYLOAD_BYTES:-64}"
 tcp_echo_timeout_ms="${TCP_ECHO_TIMEOUT_MS:-5000}"
 tcp_echo_interval_ms="${TCP_ECHO_INTERVAL_MS:-500}"
+tcp_upload_target_port="${TCP_UPLOAD_TARGET_PORT:-10023}"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
@@ -57,10 +58,10 @@ baseline_uuid="${BASELINE_UUID:-$(SECRET="$secret" python3 -c 'import os, uuid; 
 saturate_protocol="${MPTUNNEL_LAB_SATURATE_PROTOCOL:-udp}"
 saturate_udp_packet_bytes="${MPTUNNEL_LAB_SATURATE_UDP_PACKET_BYTES:-1200}"
 saturate_tcp_parallel="${MPTUNNEL_LAB_SATURATE_TCP_PARALLEL:-4}"
-saturate_lowlat_bandwidth="${MPTUNNEL_LAB_SATURATE_LOWLAT_BANDWIDTH:-40M}"
-saturate_balanced_bandwidth="${MPTUNNEL_LAB_SATURATE_BALANCED_BANDWIDTH:-160M}"
-saturate_fat_bandwidth="${MPTUNNEL_LAB_SATURATE_FAT_BANDWIDTH:-400M}"
-saturate_poor_bandwidth="${MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH:-12M}"
+saturate_lowlat_bandwidth="${MPTUNNEL_LAB_SATURATE_LOWLAT_BANDWIDTH:-70M}"
+saturate_balanced_bandwidth="${MPTUNNEL_LAB_SATURATE_BALANCED_BANDWIDTH:-180M}"
+saturate_fat_bandwidth="${MPTUNNEL_LAB_SATURATE_FAT_BANDWIDTH:-450M}"
+saturate_poor_bandwidth="${MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH:-45M}"
 flap_min_seconds="${MPTUNNEL_LAB_FLAP_MIN_SECONDS:-1}"
 flap_max_seconds="${MPTUNNEL_LAB_FLAP_MAX_SECONDS:-4}"
 flap_modes="${MPTUNNEL_LAB_FLAP_MODES:-apply-lowlat,apply-balanced,apply-fat,apply-poor,spike-lowlat,spike-balanced,spike-fat,spike-poor,blackhole-lowlat,blackhole-balanced,blackhole-fat,blackhole-poor}"
@@ -81,25 +82,25 @@ exec_netem() {
   local service="$1"
   local mode="$2"
   compose exec -T \
-    -e MPTUNNEL_LAB_LOWLAT_RATE="${MPTUNNEL_LAB_LOWLAT_RATE:-30mbit}" \
+    -e MPTUNNEL_LAB_LOWLAT_RATE="${MPTUNNEL_LAB_LOWLAT_RATE:-80mbit}" \
     -e MPTUNNEL_LAB_LOWLAT_DELAY="${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms}" \
     -e MPTUNNEL_LAB_LOWLAT_JITTER="${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms}" \
     -e MPTUNNEL_LAB_LOWLAT_LOSS="${MPTUNNEL_LAB_LOWLAT_LOSS:-1.00%}" \
-    -e MPTUNNEL_LAB_BALANCED_RATE="${MPTUNNEL_LAB_BALANCED_RATE:-120mbit}" \
+    -e MPTUNNEL_LAB_BALANCED_RATE="${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}" \
     -e MPTUNNEL_LAB_BALANCED_DELAY="${MPTUNNEL_LAB_BALANCED_DELAY:-80ms}" \
     -e MPTUNNEL_LAB_BALANCED_JITTER="${MPTUNNEL_LAB_BALANCED_JITTER:-10ms}" \
     -e MPTUNNEL_LAB_BALANCED_LOSS="${MPTUNNEL_LAB_BALANCED_LOSS:-1.00%}" \
-    -e MPTUNNEL_LAB_FAT_RATE="${MPTUNNEL_LAB_FAT_RATE:-300mbit}" \
+    -e MPTUNNEL_LAB_FAT_RATE="${MPTUNNEL_LAB_FAT_RATE:-500mbit}" \
     -e MPTUNNEL_LAB_FAT_DELAY="${MPTUNNEL_LAB_FAT_DELAY:-180ms}" \
     -e MPTUNNEL_LAB_FAT_JITTER="${MPTUNNEL_LAB_FAT_JITTER:-20ms}" \
     -e MPTUNNEL_LAB_FAT_LOSS="${MPTUNNEL_LAB_FAT_LOSS:-1.00%}" \
-    -e MPTUNNEL_LAB_POOR_RATE="${MPTUNNEL_LAB_POOR_RATE:-8mbit}" \
+    -e MPTUNNEL_LAB_POOR_RATE="${MPTUNNEL_LAB_POOR_RATE:-50mbit}" \
     -e MPTUNNEL_LAB_POOR_DELAY="${MPTUNNEL_LAB_POOR_DELAY:-420ms}" \
     -e MPTUNNEL_LAB_POOR_JITTER="${MPTUNNEL_LAB_POOR_JITTER:-120ms}" \
     -e MPTUNNEL_LAB_POOR_LOSS="${MPTUNNEL_LAB_POOR_LOSS:-10.00%}" \
     -e MPTUNNEL_LAB_IDEAL_LOSS="${MPTUNNEL_LAB_IDEAL_LOSS:-0.00%}" \
-    -e MPTUNNEL_LAB_MATRIX_GOOD_RATE="${MPTUNNEL_LAB_MATRIX_GOOD_RATE:-200mbit}" \
-    -e MPTUNNEL_LAB_MATRIX_POOR_RATE="${MPTUNNEL_LAB_MATRIX_POOR_RATE:-25mbit}" \
+    -e MPTUNNEL_LAB_MATRIX_GOOD_RATE="${MPTUNNEL_LAB_MATRIX_GOOD_RATE:-500mbit}" \
+    -e MPTUNNEL_LAB_MATRIX_POOR_RATE="${MPTUNNEL_LAB_MATRIX_POOR_RATE:-50mbit}" \
     -e MPTUNNEL_LAB_MATRIX_GOOD_DELAY="${MPTUNNEL_LAB_MATRIX_GOOD_DELAY:-50ms}" \
     -e MPTUNNEL_LAB_MATRIX_POOR_DELAY="${MPTUNNEL_LAB_MATRIX_POOR_DELAY:-250ms}" \
     -e MPTUNNEL_LAB_MATRIX_GOOD_JITTER="${MPTUNNEL_LAB_MATRIX_GOOD_JITTER:-5ms}" \
@@ -258,6 +259,94 @@ run_tcp_download_probe_case() {
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
   append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+}
+
+append_upload_probe_result() {
+  local case_name="$1"
+  local exit_code="$2"
+  local output="$3"
+  local probe_stderr="$4"
+  local client_log server_log
+
+  client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
+  server_log="$(exec_in server "tail -n '${log_tail_lines}' /tmp/mptunnel-server.log 2>/dev/null | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
+
+  ROW="$output" \
+  EXIT_CODE="$exit_code" \
+  PROBE_STDERR="$probe_stderr" \
+  CLIENT_LOG="$client_log" \
+  SERVER_LOG="$server_log" \
+  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+  LOG_TAIL_BYTES="$log_tail_bytes" \
+  python3 - "$case_name" <<'PY' >> "$result_file"
+import json
+import os
+import sys
+
+case = sys.argv[1]
+raw = os.environ.get("ROW", "")
+try:
+    row = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+    row = {"raw_output": raw}
+if not row:
+    try:
+        exit_code = int(os.environ.get("EXIT_CODE", "124"))
+    except ValueError:
+        exit_code = 124
+    row = {
+        "case": case,
+        "protocol": "tcp-upload",
+        "status": "fail",
+        "exit_code": exit_code,
+    }
+lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
+lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
+try:
+    log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
+except ValueError:
+    log_tail_bytes = 4000
+if row.get("status") != "ok" or lab_diag or lab_perf:
+    for env_name, field in (
+        ("PROBE_STDERR", "probe_stderr_tail"),
+        ("CLIENT_LOG", "client_log_tail"),
+        ("SERVER_LOG", "server_log_tail"),
+    ):
+        value = os.environ.get(env_name, "")
+        if value:
+            row[field] = value[-log_tail_bytes:]
+print(json.dumps(row, sort_keys=True))
+PY
+}
+
+run_unproxied_upload_probe_case() {
+  local case_name="$1"
+  local target="$2"
+  local out_file="/tmp/mptunnel-upload-${case_name}.out"
+  local err_file="/tmp/mptunnel-upload-${case_name}.err"
+  set +e
+  local output probe_stderr
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  local exit_code="$?"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  set -e
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+}
+
+run_tcp_upload_probe_case() {
+  local case_name="$1"
+  local out_file="/tmp/mptunnel-upload-${case_name}.out"
+  local err_file="/tmp/mptunnel-upload-${case_name}.err"
+  set +e
+  local output probe_stderr
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  local exit_code="$?"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  set -e
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
 }
 
 stop_process() {
@@ -459,9 +548,11 @@ start_target_services() {
   exec_in target "if [ -f /tmp/mptunnel-http.pid ]; then kill \$(cat /tmp/mptunnel-http.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-http.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-udp-echo.pid ]; then kill \$(cat /tmp/mptunnel-udp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-udp-echo.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-tcp-echo.pid ]; then kill \$(cat /tmp/mptunnel-tcp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-tcp-echo.pid; fi"
+  exec_in target "if [ -f /tmp/mptunnel-tcp-sink.pid ]; then kill \$(cat /tmp/mptunnel-tcp-sink.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-tcp-sink.pid; fi"
   exec_in target "python3 -m http.server 8080 --bind 0.0.0.0 --directory /tmp/mptunnel-lab >/tmp/mptunnel-http.log 2>&1 & echo \$! >/tmp/mptunnel-http.pid"
   exec_in target "python3 /workspace/lab/udp_echo.py --bind 0.0.0.0:9090 >/tmp/mptunnel-udp-echo.log 2>&1 & echo \$! >/tmp/mptunnel-udp-echo.pid"
   exec_in target "python3 /workspace/lab/tcp_echo.py --bind 0.0.0.0:10022 >/tmp/mptunnel-tcp-echo.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-echo.pid"
+  exec_in target "python3 /workspace/lab/tcp_sink.py --bind 0.0.0.0:${tcp_upload_target_port} >/tmp/mptunnel-tcp-sink.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-sink.pid"
 }
 
 start_server() {
@@ -587,6 +678,13 @@ run_tun_download_case() {
   run_unproxied_download_probe_case "$case_name" "tun" "172.31.40.30:8080"
 }
 
+run_tun_upload_case() {
+  local case_name="$1"
+  shift
+  start_tun_client "$case_name" "$@"
+  run_unproxied_upload_probe_case "$case_name" "172.31.40.30:${tcp_upload_target_port}"
+}
+
 run_udp_case() {
   local case_name="$1"
   shift
@@ -645,6 +743,22 @@ PY
   fi
 }
 
+run_baseline_upload_probe_case() {
+  local case_name="$1"
+  local protocol="$2"
+  local proxy_port_arg="$3"
+  local out_file="/tmp/mptunnel-baseline-upload-${case_name}.out"
+  local err_file="/tmp/mptunnel-baseline-upload-${case_name}.err"
+  local output probe_stderr exit_code
+  set +e
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exit_code="$?"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  set -e
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+}
+
 ensure_baseline_tool() {
   local service="$1"
   local tool="$2"
@@ -674,6 +788,29 @@ run_vmess_baseline_case() {
   stop_baselines
 }
 
+run_vmess_baseline_upload_case() {
+  local case_name="$1"
+  local server_ip="$2"
+  prepare_baseline_case apply
+  if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
+    append_skipped_result "$case_name" "vmess-upload" "xray baseline binary unavailable"
+    return 0
+  fi
+  exec_in server "bash /workspace/lab/baseline-tools.sh write-xray-server '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}'"
+  exec_in client "bash /workspace/lab/baseline-tools.sh write-xray-client '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}' 127.0.0.1 '${baseline_proxy_port}'"
+  exec_in server "bash /workspace/lab/baseline-tools.sh run-xray-server >/tmp/mptunnel-baseline-vmess-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-server.pid"
+  exec_in client "bash /workspace/lab/baseline-tools.sh run-xray-client >/tmp/mptunnel-baseline-vmess-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-client.pid"
+  sleep 1
+  if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-server.pid)" || \
+     ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-client.pid)"; then
+    append_skipped_result "$case_name" "vmess-upload" "xray baseline failed to start"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_upload_probe_case "$case_name" "vmess" "$baseline_proxy_port"
+  stop_baselines
+}
+
 run_hysteria2_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
@@ -697,6 +834,32 @@ run_hysteria2_baseline_case() {
     return 0
   fi
   run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port"
+  stop_baselines
+}
+
+run_hysteria2_baseline_upload_case() {
+  local case_name="$1"
+  local server_ip="$2"
+  prepare_baseline_case apply
+  if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
+    append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 baseline binary unavailable"
+    return 0
+  fi
+  if ! exec_in server "bash /workspace/lab/baseline-tools.sh write-hysteria-server '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}'"; then
+    append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 TLS certificate generation unavailable"
+    return 0
+  fi
+  exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}'"
+  exec_in server "bash /workspace/lab/baseline-tools.sh run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
+  exec_in client "bash /workspace/lab/baseline-tools.sh run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
+  sleep 1
+  if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-server.pid)" || \
+     ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-client.pid)"; then
+    append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 baseline failed to start"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_upload_probe_case "$case_name" "hysteria2" "$baseline_proxy_port"
   stop_baselines
 }
 
@@ -894,6 +1057,17 @@ run_matrix_case() {
   apply_netem apply
 }
 
+run_matrix_upload_case() {
+  local bits="$1"
+  local base_name case_name
+  base_name="$(matrix_case_name "$bits")"
+  case_name="${base_name}_upload"
+
+  start_client_with_netem "$case_name" "matrix-b${bits}" "$tcp_lowlat $udp_lowlat"
+  run_tcp_upload_probe_case "$case_name"
+  apply_netem apply
+}
+
 run_mixed_failover_case() {
   local case_name="mptunnel_mixed_multipath_failover_blackhole_fat"
   local output exit_code
@@ -959,6 +1133,29 @@ run_failover_case() {
   apply_netem apply
 }
 
+run_upload_failover_case() {
+  local case_name="mptunnel_tcp_multipath_failover_blackhole_fat_upload"
+  local output exit_code
+  local started_file="/tmp/mptunnel-upload-failover.started"
+  start_client "$case_name" "$tcp_all"
+  exec_in client "rm -f /tmp/mptunnel-upload-failover.out /tmp/mptunnel-upload-failover.status /tmp/mptunnel-upload-failover.pid '${started_file}'"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
+  exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
+  sleep "$failover_after"
+  apply_failover_blackhole
+  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-upload-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-failover.status ]; then echo 124 >/tmp/mptunnel-upload-failover.status; fi"
+  output="$(exec_in client "cat /tmp/mptunnel-upload-failover.out 2>/dev/null || true")"
+  exit_code="$(exec_in client "cat /tmp/mptunnel-upload-failover.status 2>/dev/null || echo 124")"
+  if [[ "$exit_code" == "0" && -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    local probe_stderr
+    probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-failover.err 2>/dev/null | tail -c 4000 || true")"
+    append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  fi
+  apply_netem apply
+}
+
 run_latency_spike_case() {
   local case_name="mptunnel_tcp_multipath_latency_spike_fat"
   local output exit_code
@@ -982,6 +1179,29 @@ run_latency_spike_case() {
   apply_netem apply
 }
 
+run_upload_latency_spike_case() {
+  local case_name="mptunnel_tcp_multipath_latency_spike_fat_upload"
+  local output exit_code
+  local started_file="/tmp/mptunnel-upload-spike.started"
+  start_client "$case_name" "$tcp_all"
+  exec_in client "rm -f /tmp/mptunnel-upload-spike.out /tmp/mptunnel-upload-spike.status /tmp/mptunnel-upload-spike.pid '${started_file}'"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
+  exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
+  sleep "$failover_after"
+  apply_latency_spike_fat
+  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-upload-spike.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-spike.status ]; then echo 124 >/tmp/mptunnel-upload-spike.status; fi"
+  output="$(exec_in client "cat /tmp/mptunnel-upload-spike.out 2>/dev/null || true")"
+  exit_code="$(exec_in client "cat /tmp/mptunnel-upload-spike.status 2>/dev/null || echo 124")"
+  if [[ "$exit_code" == "0" && -n "$output" ]]; then
+    printf '%s\n' "$output" >> "$result_file"
+  else
+    local probe_stderr
+    probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-spike.err 2>/dev/null | tail -c 4000 || true")"
+    append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  fi
+  apply_netem apply
+}
+
 mkdir -p "$result_dir"
 : > "$result_file"
 
@@ -1000,14 +1220,14 @@ apply_netem apply
 start_server
 
 if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
-  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=30&low-latency=true'"
-  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=120'"
-  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
-  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
-  udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=30&low-latency=true'"
-  udp_balanced="--path 'udp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=120'"
-  udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=300'"
-  udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=8&expensive=true'"
+  tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80&low-latency=true'"
+  tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
+  tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
+  tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
+  udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80&low-latency=true'"
+  udp_balanced="--path 'udp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
+  udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
+  udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
 else
   tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
   tcp_balanced="--path 'tcp://172.31.15.20:${server_port}'"
@@ -1033,13 +1253,49 @@ fi
 if should_run_case "direct_poor_internet"; then
   run_unproxied_download_probe_case "direct_poor_internet" "tcp" "172.31.30.30:8080"
 fi
+if should_run_case "direct_upload_low_latency"; then
+  run_unproxied_upload_probe_case "direct_upload_low_latency" "172.31.10.30:${tcp_upload_target_port}"
+fi
+if should_run_case "direct_upload_balanced"; then
+  run_unproxied_upload_probe_case "direct_upload_balanced" "172.31.15.30:${tcp_upload_target_port}"
+fi
+if should_run_case "direct_upload_cross_continent_high_bandwidth"; then
+  run_unproxied_upload_probe_case "direct_upload_cross_continent_high_bandwidth" "172.31.20.30:${tcp_upload_target_port}"
+fi
+if should_run_case "direct_upload_poor_internet"; then
+  run_unproxied_upload_probe_case "direct_upload_poor_internet" "172.31.30.30:${tcp_upload_target_port}"
+fi
 
 if should_run_case "baseline_vmess_tcp_single_balanced"; then
   run_vmess_baseline_case "baseline_vmess_tcp_single_balanced" "172.31.15.20"
 fi
 
+if should_run_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth"; then
+  run_vmess_baseline_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth" "172.31.20.20"
+fi
+
+if should_run_case "baseline_vmess_tcp_single_balanced_upload"; then
+  run_vmess_baseline_upload_case "baseline_vmess_tcp_single_balanced_upload" "172.31.15.20"
+fi
+
+if should_run_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth_upload"; then
+  run_vmess_baseline_upload_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth_upload" "172.31.20.20"
+fi
+
 if should_run_case "baseline_hysteria2_udp_single_balanced"; then
   run_hysteria2_baseline_case "baseline_hysteria2_udp_single_balanced" "172.31.15.20"
+fi
+
+if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth"; then
+  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth" "172.31.20.20"
+fi
+
+if should_run_case "baseline_hysteria2_udp_single_balanced_upload"; then
+  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_balanced_upload" "172.31.15.20"
+fi
+
+if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload"; then
+  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload" "172.31.20.20"
 fi
 
 if should_run_case "baseline_mptcp_tcp_multipath_all"; then
@@ -1116,6 +1372,76 @@ if should_run_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat"; then
   run_tcp_download_probe_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat"
 fi
 
+if should_run_case "mptunnel_tcp_single_low_latency_upload"; then
+  start_client "tcp_single_low_latency_upload" "$tcp_lowlat"
+  run_tcp_upload_probe_case "mptunnel_tcp_single_low_latency_upload"
+fi
+
+if should_run_case "mptunnel_tcp_single_balanced_upload"; then
+  start_client "tcp_single_balanced_upload" "$tcp_balanced"
+  run_tcp_upload_probe_case "mptunnel_tcp_single_balanced_upload"
+fi
+
+if should_run_case "mptunnel_tcp_single_cross_continent_high_bandwidth_upload"; then
+  start_client "tcp_single_cross_continent_high_bandwidth_upload" "$tcp_fat"
+  run_tcp_upload_probe_case "mptunnel_tcp_single_cross_continent_high_bandwidth_upload"
+fi
+
+if should_run_case "mptunnel_tcp_single_poor_internet_upload"; then
+  start_client "tcp_single_poor_internet_upload" "$tcp_poor"
+  run_tcp_upload_probe_case "mptunnel_tcp_single_poor_internet_upload"
+fi
+
+if should_run_case "mptunnel_tcp_multipath_all_upload"; then
+  start_client "tcp_multipath_all_upload" "$tcp_all"
+  run_tcp_upload_probe_case "mptunnel_tcp_multipath_all_upload"
+fi
+
+if should_run_case "mptunnel_udp_stream_single_low_latency_upload"; then
+  start_client "udp_stream_single_low_latency_upload" "$udp_lowlat"
+  run_tcp_upload_probe_case "mptunnel_udp_stream_single_low_latency_upload"
+fi
+
+if should_run_case "mptunnel_udp_stream_single_balanced_upload"; then
+  start_client "udp_stream_single_balanced_upload" "$udp_balanced"
+  run_tcp_upload_probe_case "mptunnel_udp_stream_single_balanced_upload"
+fi
+
+if should_run_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth_upload"; then
+  start_client "udp_stream_single_cross_continent_high_bandwidth_upload" "$udp_fat"
+  run_tcp_upload_probe_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth_upload"
+fi
+
+if should_run_case "mptunnel_udp_stream_multipath_all_upload"; then
+  start_client "udp_stream_multipath_all_upload" "$udp_all"
+  run_tcp_upload_probe_case "mptunnel_udp_stream_multipath_all_upload"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_single_low_latency_upload"; then
+  start_client "reliable_mixed_single_low_latency_upload" "$tcp_lowlat $udp_lowlat"
+  run_tcp_upload_probe_case "mptunnel_reliable_mixed_single_low_latency_upload"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_single_balanced_upload"; then
+  start_client "reliable_mixed_single_balanced_upload" "$tcp_balanced $udp_balanced"
+  run_tcp_upload_probe_case "mptunnel_reliable_mixed_single_balanced_upload"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_multipath_all_upload"; then
+  start_client "reliable_mixed_multipath_all_upload" "$tcp_all $udp_all"
+  run_tcp_upload_probe_case "mptunnel_reliable_mixed_multipath_all_upload"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_upload"; then
+  start_client "reliable_mixed_tcp_lowlat_udp_fat_upload" "$tcp_lowlat $udp_fat"
+  run_tcp_upload_probe_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_upload"
+fi
+
+if should_run_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat_upload"; then
+  start_client "reliable_mixed_tcp_fat_udp_lowlat_upload" "$tcp_fat $udp_lowlat"
+  run_tcp_upload_probe_case "mptunnel_reliable_mixed_tcp_fat_udp_lowlat_upload"
+fi
+
 if should_run_case "mptunnel_tun_tcp_single_low_latency"; then
   run_tun_download_case "mptunnel_tun_tcp_single_low_latency" "$tcp_lowlat"
 fi
@@ -1134,6 +1460,26 @@ fi
 
 if should_run_case "mptunnel_tun_mixed_multipath_all"; then
   run_tun_download_case "mptunnel_tun_mixed_multipath_all" "$tcp_all $udp_all"
+fi
+
+if should_run_case "mptunnel_tun_tcp_single_low_latency_upload"; then
+  run_tun_upload_case "mptunnel_tun_tcp_single_low_latency_upload" "$tcp_lowlat"
+fi
+
+if should_run_case "mptunnel_tun_tcp_single_balanced_upload"; then
+  run_tun_upload_case "mptunnel_tun_tcp_single_balanced_upload" "$tcp_balanced"
+fi
+
+if should_run_case "mptunnel_tun_udp_stream_single_low_latency_upload"; then
+  run_tun_upload_case "mptunnel_tun_udp_stream_single_low_latency_upload" "$udp_lowlat"
+fi
+
+if should_run_case "mptunnel_tun_udp_stream_single_balanced_upload"; then
+  run_tun_upload_case "mptunnel_tun_udp_stream_single_balanced_upload" "$udp_balanced"
+fi
+
+if should_run_case "mptunnel_tun_mixed_multipath_all_upload"; then
+  run_tun_upload_case "mptunnel_tun_mixed_multipath_all_upload" "$tcp_all $udp_all"
 fi
 
 if should_run_case "mptunnel_udp_single_low_latency"; then
@@ -1212,13 +1558,23 @@ for matrix_bits in 000 001 010 011 100 101 110 111; do
   if should_run_case "$matrix_case"; then
     run_matrix_case "$matrix_bits"
   fi
+  matrix_upload_case="${matrix_case}_upload"
+  if should_run_case "$matrix_upload_case"; then
+    run_matrix_upload_case "$matrix_bits"
+  fi
 done
 
 if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat"; then
   run_failover_case
 fi
+if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat_upload"; then
+  run_upload_failover_case
+fi
 if should_run_case "mptunnel_tcp_multipath_latency_spike_fat"; then
   run_latency_spike_case
+fi
+if should_run_case "mptunnel_tcp_multipath_latency_spike_fat_upload"; then
+  run_upload_latency_spike_case
 fi
 
 echo "$result_file"

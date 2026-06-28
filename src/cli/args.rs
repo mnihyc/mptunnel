@@ -1,10 +1,11 @@
 use crate::config::{
     AppConfig, CipherSuite, ClientConfig, CommandConfig, DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS,
-    DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
-    DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits, SecurityConfig, ServerConfig, ServiceConfig,
-    SharedSecret,
+    DEFAULT_DATAGRAM_QUEUE_BYTES, DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
+    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES,
+    DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
+    DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits,
+    SecurityConfig, ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
@@ -194,7 +195,7 @@ pub struct ResourceArgs {
         long,
         global = true,
         env = "MPTUNNEL_MAX_STREAM_WINDOW_BYTES",
-        default_value_t = 16 * 1024 * 1024
+        default_value_t = DEFAULT_STREAM_WINDOW_BYTES
     )]
     pub max_stream_window_bytes: u64,
 
@@ -202,7 +203,7 @@ pub struct ResourceArgs {
         long,
         global = true,
         env = "MPTUNNEL_MAX_REPAIR_BYTES",
-        default_value_t = 16 * 1024 * 1024
+        default_value_t = DEFAULT_REPAIR_BYTES
     )]
     pub max_repair_bytes: usize,
 
@@ -210,7 +211,7 @@ pub struct ResourceArgs {
         long,
         global = true,
         env = "MPTUNNEL_MAX_REORDER_BYTES",
-        default_value_t = 16 * 1024 * 1024
+        default_value_t = DEFAULT_REORDER_BYTES
     )]
     pub max_reorder_bytes: usize,
 
@@ -218,7 +219,7 @@ pub struct ResourceArgs {
         long,
         global = true,
         env = "MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES",
-        default_value_t = 4 * 1024 * 1024
+        default_value_t = DEFAULT_DATAGRAM_QUEUE_BYTES
     )]
     pub max_datagram_queue_bytes: usize,
 

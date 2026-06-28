@@ -288,10 +288,6 @@ pub enum Frame {
         class: TrafficClass,
         role: StreamOpenRole,
     },
-    StreamClass {
-        stream_id: StreamId,
-        class: TrafficClass,
-    },
     StreamData {
         stream_id: StreamId,
         offset: u64,

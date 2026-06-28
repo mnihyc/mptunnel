@@ -3,6 +3,7 @@ use super::error::RuntimeError;
 use super::ingress_runtime::*;
 use super::prelude::*;
 use super::relay_control::*;
+use super::relay_io::*;
 use super::relay_open::*;
 use super::server_runtime::*;
 use super::tcp_path::*;
@@ -714,7 +715,7 @@ impl ClientPathContext {
         current_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<usize> {
-        self.ordered_udp_stream_auto_bulk_discovery_scores(current_path_index, payload_bytes)
+        self.ordered_udp_stream_auto_bulk_discovery_scores(current_path_index, payload_bytes, false)
             .into_iter()
             .map(|(index, _)| index)
             .collect()
@@ -775,6 +776,7 @@ impl ClientPathContext {
         current_udp_path_index: Option<usize>,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
+        let allow_udp_startup_probe = self.reliable_auto_bulk_udp_startup_probe_should_run();
         let mut candidates = self
             .ordered_tcp_auto_bulk_discovery_scores(current_tcp_path_index, payload_bytes)
             .into_iter()
@@ -791,6 +793,7 @@ impl ClientPathContext {
                 self.ordered_udp_stream_auto_bulk_discovery_scores(
                     current_udp_path_index,
                     payload_bytes,
+                    allow_udp_startup_probe,
                 )
                 .into_iter()
                 .filter_map(|(index, eta_ms)| {
@@ -884,13 +887,19 @@ impl ClientPathContext {
         &self,
         current_path_index: Option<usize>,
         payload_bytes: usize,
+        allow_endpoint_only_startup_probe: bool,
     ) -> Vec<(usize, f64)> {
         let observations =
             health_observations(&mut self.health.lock().expect("client path health lock").udp);
         let any_measured_delivery = observations
             .iter()
             .any(|observation| observation.measured_rate_bps.is_some());
-        if !any_measured_delivery && self.udp_paths.iter().all(path_is_endpoint_only) {
+        let all_endpoint_only = self.udp_paths.iter().all(path_is_endpoint_only);
+        let allow_startup_probe = allow_endpoint_only_startup_probe
+            && current_path_index.is_none()
+            && !any_measured_delivery
+            && all_endpoint_only;
+        if !any_measured_delivery && all_endpoint_only && !allow_startup_probe {
             return Vec::new();
         }
         let scores = ordered_path_scores(
@@ -899,13 +908,27 @@ impl ClientPathContext {
             TrafficClass::Bulk,
             payload_bytes,
         );
+        let candidate_is_allowed: fn(&PathSpec, ClientPathObservation) -> bool =
+            if allow_startup_probe {
+                path_can_be_auto_discovered
+            } else {
+                udp_stream_path_can_be_auto_discovered
+            };
         reliable_auto_bulk_discovery_scores(
             &self.udp_paths,
             &observations,
             scores,
             current_path_index,
-            udp_stream_path_can_be_auto_discovered,
+            candidate_is_allowed,
         )
+    }
+
+    pub(super) fn reliable_auto_bulk_udp_startup_probe_should_run(&self) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        let udp_observations = health_observations(&mut health.udp);
+        udp_observations
+            .iter()
+            .any(|observation| observation.active_flows > 0 || observation.load_bytes > 0)
     }
 
     pub(super) fn tcp_health_observations_for_class(
@@ -1466,7 +1489,8 @@ pub(super) fn apply_tcp_bulk_isolation(
     {
         return;
     }
-    let isolation_bytes = mux_limits.max_tcp_path_inflight_bytes as u64;
+    let isolation_bytes =
+        adaptive_tcp_relay_inflight_bytes(None, TrafficClass::Interactive, mux_limits) as u64;
     for observation in observations {
         let latency_flows = u64::from(observation.active_latency_sensitive_flows);
         observation.load_bytes = observation

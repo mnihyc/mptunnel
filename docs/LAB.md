@@ -116,6 +116,9 @@ Useful environment variables:
 - `RESULT_ROOT`: output directory for matrix runs.
 - `CASE_FILTER`: comma-separated case names or shell globs for targeted reruns, for example `mptunnel_tcp_single_*,mptunnel_tcp_multipath_all`.
 - `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_DIAG=1`: build the optimized `lab-diagnostics` binary and emit internal diagnostic lines into the client/server `/tmp/mptunnel-*.log` files, including reliable-stream path open attempts/successes and UDP stream congestion state. Successful download rows also keep bounded client/server log tails when this is enabled. Use this only for investigation; release comparisons should run without diagnostic instrumentation.
+- `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_PERF=1`: build the optimized `lab-diagnostics` binary and emit interval/cumulative per-component timing lines prefixed with `mptunnel_lab_perf`. `MPTUNNEL_LAB_PERF_INTERVAL_MS` controls the flush interval, default `1000`. `MPTUNNEL_LAB_LOG_TAIL_BYTES` and `MPTUNNEL_LAB_LOG_TAIL_LINES` control retained diagnostic log tails.
+
+For a repeatable component/process profiling workflow, use `lab/run-perf-diagnostics.sh` and see `docs/PERF.md`.
 
 Matrix case names use `mptunnel_matrix_bw_{good,poor}_lat_{good,poor}_loss_{good,poor}`. The controlled matrix applies those values only to `path_lowlat` and starts one TCP plus one UDP underlay endpoint on that path, so the eight cells isolate bandwidth, latency, and loss without changing topology or path count. The default loss axis is intentionally harsh: `loss_good` is a realistic non-perfect 1% path and `loss_poor` is a severe 15% path. Ideal 0% loss remains available only in separate ideal comparison cases.
 

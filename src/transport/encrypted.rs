@@ -1,4 +1,6 @@
 use crate::config::CipherSuite;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::Frame;
 use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame};
 use crate::transport::aead::{AEAD_TAG_LEN, TransportAead};
@@ -174,7 +176,11 @@ where
     }
 
     pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let started = std::time::Instant::now();
         self.stream.flush().await?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record("transport.tcp.flush_wait", started.elapsed(), 0);
         Ok(())
     }
 }
@@ -215,7 +221,11 @@ where
     }
 
     pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let started = std::time::Instant::now();
         self.stream.flush().await?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record("transport.tcp.flush_wait", started.elapsed(), 0);
         Ok(())
     }
 }
@@ -230,8 +240,18 @@ async fn read_frame_from<R>(
 where
     R: AsyncRead + Unpin,
 {
+    #[cfg(feature = "lab-diagnostics")]
+    let total_started = std::time::Instant::now();
     let mut header = [0u8; HEADER_LEN];
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
     stream.read_exact(&mut header).await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.read_header_wait",
+        stage_started.elapsed(),
+        HEADER_LEN,
+    );
     let Header {
         direction,
         counter,
@@ -251,7 +271,15 @@ where
     }
 
     let mut encrypted = vec![0u8; ciphertext_len];
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
     stream.read_exact(&mut encrypted).await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.read_payload_wait",
+        stage_started.elapsed(),
+        ciphertext_len,
+    );
     let tag_start = encrypted
         .len()
         .checked_sub(TAG_LEN)
@@ -259,13 +287,36 @@ where
     let tag_bytes: [u8; TAG_LEN] = encrypted[tag_start..].try_into().expect("tag slice length");
     encrypted.truncate(tag_start);
     let nonce = build_nonce(direction, counter);
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
     cipher
         .decrypt_in_place_detached(&nonce, &header, &mut encrypted, &tag_bytes)
         .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.decrypt",
+        stage_started.elapsed(),
+        encrypted.len(),
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
+    let frame = decode_frame(&encrypted, limits)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.decode_frame",
+        stage_started.elapsed(),
+        encrypted.len(),
+    );
     *recv_counter = recv_counter
         .checked_add(1)
         .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
-    Ok(decode_frame(&encrypted, limits)?)
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.read_frame_total",
+        total_started.elapsed(),
+        HEADER_LEN + ciphertext_len,
+    );
+    Ok(frame)
 }
 
 async fn write_frame_to<W>(
@@ -279,7 +330,17 @@ async fn write_frame_to<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    #[cfg(feature = "lab-diagnostics")]
+    let total_started = std::time::Instant::now();
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
     let mut payload = encode_frame(frame, limits)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.encode_frame",
+        stage_started.elapsed(),
+        payload.len(),
+    );
     let ciphertext_len = payload
         .len()
         .checked_add(TAG_LEN)
@@ -287,15 +348,39 @@ where
     validate_encrypted_len(ciphertext_len, limits)?;
     let header = encode_header(send_direction, *send_counter, ciphertext_len)?;
     let nonce = build_nonce(send_direction, *send_counter);
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
     let tag = cipher
         .encrypt_in_place_detached(&nonce, &header, &mut payload)
         .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.encrypt",
+        stage_started.elapsed(),
+        payload.len(),
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    let written_bytes = HEADER_LEN + payload.len() + tag.len();
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
     stream.write_all(&header).await?;
     stream.write_all(&payload).await?;
     stream.write_all(&tag).await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.write_socket_wait",
+        stage_started.elapsed(),
+        written_bytes,
+    );
     *send_counter = send_counter
         .checked_add(1)
         .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.write_frame_total",
+        total_started.elapsed(),
+        written_bytes,
+    );
     Ok(())
 }
 

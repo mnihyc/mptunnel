@@ -443,6 +443,8 @@ impl ServerTcpStreamRegistry {
         stream_id: StreamId,
         frame: Frame,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let bytes = frame_pacing_bytes(&frame);
         let stream = {
             let streams = self
                 .streams
@@ -466,10 +468,19 @@ impl ServerTcpStreamRegistry {
                 "frame for unknown server TCP stream",
             ));
         };
-        stream
+        #[cfg(feature = "lab-diagnostics")]
+        let started = Instant::now();
+        let result = stream
             .send(Ok(frame))
             .await
-            .map_err(|_| RuntimeError::TcpPathSessionClosed)
+            .map_err(|_| RuntimeError::TcpPathSessionClosed);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "runtime.server_stream.route_frame",
+            started.elapsed(),
+            bytes,
+        );
+        result
     }
 
     pub(super) fn update_class(
@@ -634,7 +645,12 @@ impl TcpPathSessionCommandSender {
         &self,
         command: TcpPathSessionCommand,
     ) -> Result<(), mpsc::error::SendError<TcpPathSessionCommand>> {
-        self.control.send(command).await
+        #[cfg(feature = "lab-diagnostics")]
+        let started = Instant::now();
+        let result = self.control.send(command).await;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record("runtime.path_queue.control_send", started.elapsed(), 0);
+        result
     }
 
     pub(super) async fn send_frame(
@@ -642,15 +658,30 @@ impl TcpPathSessionCommandSender {
         frame: Frame,
         class: TrafficClass,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let bytes = frame_pacing_bytes(&frame);
         let queue = if tcp_path_frame_uses_priority_queue(class) {
             &self.priority
         } else {
             &self.data
         };
-        queue
+        #[cfg(feature = "lab-diagnostics")]
+        let started = Instant::now();
+        let result = queue
             .send(TcpPathSessionCommand::SendFrame(frame))
             .await
-            .map_err(|_| RuntimeError::TcpPathSessionClosed)
+            .map_err(|_| RuntimeError::TcpPathSessionClosed);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            if tcp_path_frame_uses_priority_queue(class) {
+                "runtime.path_queue.priority_send"
+            } else {
+                "runtime.path_queue.data_send"
+            },
+            started.elapsed(),
+            bytes,
+        );
+        result
     }
 
     pub(super) fn is_closed(&self) -> bool {
@@ -1335,10 +1366,16 @@ pub(super) async fn route_client_tcp_stream_frame(
         }
         return Err(RuntimeError::Protocol("frame for unknown TCP stream"));
     };
+    #[cfg(feature = "lab-diagnostics")]
+    let bytes = frame_pacing_bytes(&frame);
+    #[cfg(feature = "lab-diagnostics")]
+    let started = Instant::now();
     if state.frames.send(Ok(frame)).await.is_err() {
         streams.remove(&stream_id);
         closed_streams.insert(stream_id);
     }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record("runtime.tcp_stream.route_frame", started.elapsed(), bytes);
     Ok(())
 }
 
@@ -1431,7 +1468,14 @@ pub(super) fn spawn_encrypted_tcp_reader(
         loop {
             let frame = reader.read_frame().await;
             let done = frame.is_err();
-            if frames_tx.send(frame).await.is_err() || done {
+            #[cfg(feature = "lab-diagnostics")]
+            let bytes = frame.as_ref().ok().map(frame_pacing_bytes).unwrap_or(0);
+            #[cfg(feature = "lab-diagnostics")]
+            let started = Instant::now();
+            let send_result = frames_tx.send(frame).await;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_perf_record("runtime.tcp_reader.queue_send", started.elapsed(), bytes);
+            if send_result.is_err() || done {
                 break;
             }
         }

@@ -31,7 +31,19 @@ failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
+lab_perf="${MPTUNNEL_LAB_PERF:-0}"
+lab_perf_interval_ms="${MPTUNNEL_LAB_PERF_INTERVAL_MS:-1000}"
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
+case "$lab_perf" in
+  1|true|TRUE|yes|YES)
+    log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-16000}"
+    log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-240}"
+    ;;
+  *)
+    log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-4000}"
+    log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
+    ;;
+esac
 case_filter="${CASE_FILTER:-}"
 client_settle_seconds="${CLIENT_SETTLE_SECONDS:-2}"
 isolate_cases="${ISOLATE_CASES:-1}"
@@ -146,8 +158,8 @@ append_download_probe_result() {
   local probe_stderr="$4"
   local client_log server_log
 
-  client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n 80 \"\$file\"; done | tail -c 4000" 2>/dev/null || true)"
-  server_log="$(exec_in server "tail -n 120 /tmp/mptunnel-server.log 2>/dev/null | tail -c 4000" 2>/dev/null || true)"
+  client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
+  server_log="$(exec_in server "tail -n '${log_tail_lines}' /tmp/mptunnel-server.log 2>/dev/null | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
 
   ROW="$output" \
   EXIT_CODE="$exit_code" \
@@ -155,6 +167,8 @@ append_download_probe_result() {
   CLIENT_LOG="$client_log" \
   SERVER_LOG="$server_log" \
   LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+  LOG_TAIL_BYTES="$log_tail_bytes" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
@@ -178,7 +192,12 @@ if not row:
         "exit_code": exit_code,
     }
 lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
-if row.get("status") != "ok" or lab_diag:
+lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
+try:
+    log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
+except ValueError:
+    log_tail_bytes = 4000
+if row.get("status") != "ok" or lab_diag or lab_perf:
     for env_name, field in (
         ("PROBE_STDERR", "probe_stderr_tail"),
         ("CLIENT_LOG", "client_log_tail"),
@@ -186,7 +205,7 @@ if row.get("status") != "ok" or lab_diag:
     ):
         value = os.environ.get(env_name, "")
         if value:
-            row[field] = value[-4000:]
+            row[field] = value[-log_tail_bytes:]
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -429,6 +448,8 @@ start_server() {
   stop_server
   exec_in server "\
     MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
+    MPTUNNEL_LAB_PERF='${lab_perf}' \
+    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       server \
@@ -474,6 +495,8 @@ start_client_with_netem() {
   fi
   exec_in client "\
     MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
+    MPTUNNEL_LAB_PERF='${lab_perf}' \
+    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
@@ -517,6 +540,8 @@ start_tun_client() {
   fi
   exec_in client "\
     MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
+    MPTUNNEL_LAB_PERF='${lab_perf}' \
+    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
@@ -705,15 +730,57 @@ run_mptcp_baseline_case() {
 record_mixed_probe_case() {
   local case_name="$1"
   set +e
-  local output
+  local output client_log server_log
   output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
   local exit_code="$?"
+  client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
+  server_log="$(exec_in server "tail -n '${log_tail_lines}' /tmp/mptunnel-server.log 2>/dev/null | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
   set -e
-  if [[ -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
-  else
-    printf '{"case":"%s","protocol":"mixed","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
-  fi
+  ROW="$output" \
+  EXIT_CODE="$exit_code" \
+  CLIENT_LOG="$client_log" \
+  SERVER_LOG="$server_log" \
+  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+  LOG_TAIL_BYTES="$log_tail_bytes" \
+  python3 - "$case_name" <<'PY' >> "$result_file"
+import json
+import os
+import sys
+
+case = sys.argv[1]
+raw = os.environ.get("ROW", "")
+try:
+    row = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+    row = {"case": case, "protocol": "mixed", "status": "fail", "raw_output": raw}
+if not row:
+    try:
+        exit_code = int(os.environ.get("EXIT_CODE", "124"))
+    except ValueError:
+        exit_code = 124
+    row = {
+        "case": case,
+        "protocol": "mixed",
+        "status": "fail",
+        "exit_code": exit_code,
+    }
+lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
+lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
+try:
+    log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
+except ValueError:
+    log_tail_bytes = 4000
+if row.get("status") != "ok" or lab_diag or lab_perf:
+    for env_name, field in (
+        ("CLIENT_LOG", "client_log_tail"),
+        ("SERVER_LOG", "server_log_tail"),
+    ):
+        value = os.environ.get(env_name, "")
+        if value:
+            row[field] = value[-log_tail_bytes:]
+print(json.dumps(row, sort_keys=True))
+PY
 }
 
 run_mixed_case() {

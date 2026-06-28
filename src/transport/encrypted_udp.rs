@@ -1,4 +1,6 @@
 use crate::config::CipherSuite;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::Frame;
 use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame};
 use crate::transport::aead::{AEAD_TAG_LEN, TransportAead};
@@ -93,8 +95,26 @@ impl EncryptedUdpSocket {
     }
 
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<usize, EncryptedUdpTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let total_started = std::time::Instant::now();
         let datagram = self.seal_frame(frame)?;
-        Ok(self.socket.send(&datagram).await?)
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
+        let sent = self.socket.send(&datagram).await?;
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            lab_perf_record(
+                "transport.udp.send_socket_wait",
+                stage_started.elapsed(),
+                sent,
+            );
+            lab_perf_record(
+                "transport.udp.send_frame_total",
+                total_started.elapsed(),
+                sent,
+            );
+        }
+        Ok(sent)
     }
 
     pub async fn send_frame_to(
@@ -102,26 +122,77 @@ impl EncryptedUdpSocket {
         frame: &Frame,
         peer: SocketAddr,
     ) -> Result<usize, EncryptedUdpTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let total_started = std::time::Instant::now();
         let datagram = self.seal_frame(frame)?;
-        Ok(self.socket.send_to(&datagram, peer).await?)
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
+        let sent = self.socket.send_to(&datagram, peer).await?;
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            lab_perf_record(
+                "transport.udp.send_to_socket_wait",
+                stage_started.elapsed(),
+                sent,
+            );
+            lab_perf_record(
+                "transport.udp.send_frame_to_total",
+                total_started.elapsed(),
+                sent,
+            );
+        }
+        Ok(sent)
     }
 
     pub async fn recv_frame(
         &mut self,
         buffer: &mut [u8],
     ) -> Result<Frame, EncryptedUdpTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let total_started = std::time::Instant::now();
         self.ensure_buffer_capacity(buffer)?;
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
         let len = self.socket.recv(buffer).await?;
-        self.open_datagram(&buffer[..len])
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.recv_socket_wait",
+            stage_started.elapsed(),
+            len,
+        );
+        let frame = self.open_datagram(&buffer[..len])?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.recv_frame_total",
+            total_started.elapsed(),
+            len,
+        );
+        Ok(frame)
     }
 
     pub async fn recv_frame_from(
         &mut self,
         buffer: &mut [u8],
     ) -> Result<(Frame, SocketAddr), EncryptedUdpTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let total_started = std::time::Instant::now();
         self.ensure_buffer_capacity(buffer)?;
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
         let (len, peer) = self.socket.recv_from(buffer).await?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.recv_from_socket_wait",
+            stage_started.elapsed(),
+            len,
+        );
         let frame = self.open_datagram(&buffer[..len])?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.recv_frame_from_total",
+            total_started.elapsed(),
+            len,
+        );
         Ok((frame, peer))
     }
 
@@ -133,7 +204,17 @@ impl EncryptedUdpSocket {
     }
 
     fn seal_frame(&mut self, frame: &Frame) -> Result<Vec<u8>, EncryptedUdpTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let total_started = std::time::Instant::now();
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
         let mut payload = encode_frame(frame, self.limits)?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.encode_frame",
+            stage_started.elapsed(),
+            payload.len(),
+        );
         let ciphertext_len = payload
             .len()
             .checked_add(TAG_LEN)
@@ -141,10 +222,18 @@ impl EncryptedUdpSocket {
         validate_ciphertext_len(ciphertext_len, self.limits)?;
         let header = encode_header(self.send_direction, self.send_counter, ciphertext_len)?;
         let nonce = build_nonce(self.send_direction, self.send_counter);
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
         let tag = self
             .cipher
             .encrypt_in_place_detached(&nonce, &header, &mut payload)
             .map_err(|_| EncryptedUdpTransportError::Crypto)?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.encrypt",
+            stage_started.elapsed(),
+            payload.len(),
+        );
         let mut datagram = Vec::with_capacity(HEADER_LEN + ciphertext_len);
         datagram.extend_from_slice(&header);
         datagram.extend_from_slice(&payload);
@@ -153,10 +242,18 @@ impl EncryptedUdpSocket {
             .send_counter
             .checked_add(1)
             .ok_or(EncryptedUdpTransportError::CounterOverflow)?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.seal_total",
+            total_started.elapsed(),
+            datagram.len(),
+        );
         Ok(datagram)
     }
 
     fn open_datagram(&mut self, datagram: &[u8]) -> Result<Frame, EncryptedUdpTransportError> {
+        #[cfg(feature = "lab-diagnostics")]
+        let total_started = std::time::Instant::now();
         if datagram.len() < HEADER_LEN {
             return Err(EncryptedUdpTransportError::UnexpectedEof);
         }
@@ -193,11 +290,35 @@ impl EncryptedUdpSocket {
         let tag_bytes: [u8; TAG_LEN] = encrypted[tag_start..].try_into().expect("tag slice length");
         let mut payload = encrypted[..tag_start].to_vec();
         let nonce = build_nonce(direction, counter);
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
         self.cipher
             .decrypt_in_place_detached(&nonce, &header, &mut payload, &tag_bytes)
             .map_err(|_| EncryptedUdpTransportError::Crypto)?;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record(
+            "transport.udp.decrypt",
+            stage_started.elapsed(),
+            payload.len(),
+        );
         self.replay.insert(counter);
-        Ok(decode_frame(&payload, self.limits)?)
+        #[cfg(feature = "lab-diagnostics")]
+        let stage_started = std::time::Instant::now();
+        let frame = decode_frame(&payload, self.limits)?;
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            lab_perf_record(
+                "transport.udp.decode_frame",
+                stage_started.elapsed(),
+                payload.len(),
+            );
+            lab_perf_record(
+                "transport.udp.open_total",
+                total_started.elapsed(),
+                datagram.len(),
+            );
+        }
+        Ok(frame)
     }
 
     fn ensure_buffer_capacity(&self, buffer: &[u8]) -> Result<(), EncryptedUdpTransportError> {

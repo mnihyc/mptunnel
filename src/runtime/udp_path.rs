@@ -17,7 +17,15 @@ pub async fn handle_server_udp_datagram_path_session(
     let mut session = None;
     loop {
         if session.is_none() {
+            #[cfg(feature = "lab-diagnostics")]
+            let recv_started = Instant::now();
             let (len, peer) = socket.recv_from(&mut buffer).await?;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_perf_record(
+                "runtime.udp_server.recv_from_wait",
+                recv_started.elapsed(),
+                len,
+            );
             session = Some(ServerUdpPathSession::new(
                 socket.clone(),
                 peer,
@@ -43,7 +51,16 @@ pub async fn handle_server_udp_datagram_path_session(
             .ok_or(RuntimeError::Protocol("missing UDP path session"))?;
         let command_may_recv = !tcp_path_receivers_closed(&session_ref.commands_rx);
         tokio::select! {
-            received = socket.recv_from(&mut buffer) => {
+            received = async {
+                #[cfg(feature = "lab-diagnostics")]
+                let recv_started = Instant::now();
+                let result = socket.recv_from(&mut buffer).await;
+                #[cfg(feature = "lab-diagnostics")]
+                if let Ok((len, _)) = &result {
+                    lab_perf_record("runtime.udp_server.recv_from_wait", recv_started.elapsed(), *len);
+                }
+                result
+            } => {
                 let (len, peer) = received?;
                 let frame = match session_ref.open_frame(&buffer[..len]) {
                     Ok(frame) => frame,

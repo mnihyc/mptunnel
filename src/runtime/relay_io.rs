@@ -5,7 +5,16 @@ pub(super) async fn replay_tcp_repair_cache(
     send_stream: &ReliableSendStream,
     resend_fin: bool,
 ) -> Result<(), RuntimeError> {
-    for frame in send_stream.retransmission_frames() {
+    #[cfg(feature = "lab-diagnostics")]
+    let retransmit_started = Instant::now();
+    let frames = send_stream.retransmission_frames();
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "mux.retransmit_all",
+        retransmit_started.elapsed(),
+        frames.iter().map(frame_pacing_bytes).sum(),
+    );
+    for frame in frames {
         path_stream.send_frame(frame).await?;
     }
     if resend_fin {
@@ -33,7 +42,11 @@ pub(super) async fn pace_udp_stream_frame(
     };
     let now = Instant::now();
     if *next_send_at > now {
+        #[cfg(feature = "lab-diagnostics")]
+        let wait_started = Instant::now();
         tokio::time::sleep_until(tokio::time::Instant::from_std(*next_send_at)).await;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record("relay.udp_pacing_wait", wait_started.elapsed(), bytes);
     }
     let anchor = if *next_send_at > now {
         *next_send_at
@@ -95,7 +108,16 @@ pub(super) async fn replay_tcp_repair_cache_limited_paced(
     congestion: Option<&UdpStreamCongestion>,
     next_send_at: &mut Instant,
 ) -> Result<(), RuntimeError> {
-    for frame in send_stream.retransmission_frames_limited(byte_limit) {
+    #[cfg(feature = "lab-diagnostics")]
+    let retransmit_started = Instant::now();
+    let frames = send_stream.retransmission_frames_limited(byte_limit);
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "mux.retransmit_limited",
+        retransmit_started.elapsed(),
+        frames.iter().map(frame_pacing_bytes).sum(),
+    );
+    for frame in frames {
         pace_udp_stream_frame(congestion, &frame, next_send_at).await;
         path_stream.send_frame(frame).await?;
     }
@@ -118,7 +140,15 @@ pub(super) async fn replay_tcp_repair_ack_gaps_limited_paced(
     congestion: Option<&UdpStreamCongestion>,
     next_send_at: &mut Instant,
 ) -> Result<bool, RuntimeError> {
+    #[cfg(feature = "lab-diagnostics")]
+    let retransmit_started = Instant::now();
     let frames = send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit);
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "mux.retransmit_ack_gaps",
+        retransmit_started.elapsed(),
+        frames.iter().map(frame_pacing_bytes).sum(),
+    );
     let replayed = !frames.is_empty();
     for frame in frames {
         pace_udp_stream_frame(congestion, &frame, next_send_at).await;
@@ -195,7 +225,12 @@ pub(super) async fn send_tcp_recv_progress(
     mux_limits: MuxLimits,
     force_max_data: bool,
 ) -> Result<(), RuntimeError> {
-    for frame in recv_stream.ack_frames() {
+    #[cfg(feature = "lab-diagnostics")]
+    let ack_started = Instant::now();
+    let ack_frames = recv_stream.ack_frames();
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
+    for frame in ack_frames {
         path_stream.send_frame(frame).await?;
     }
     if progress.should_send_max_data(recv_stream, mux_limits, force_max_data) {
@@ -228,7 +263,12 @@ pub(super) async fn send_tcp_recv_progress_remote_set(
     progress: &mut ReliableRecvProgress,
     force_max_data: bool,
 ) -> Result<(), RuntimeError> {
-    for frame in recv_stream.ack_frames() {
+    #[cfg(feature = "lab-diagnostics")]
+    let ack_started = Instant::now();
+    let ack_frames = recv_stream.ack_frames();
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
+    for frame in ack_frames {
         remotes.send_frame(context, frame).await?;
     }
     if progress.should_send_max_data(recv_stream, context.mux_limits, force_max_data) {
@@ -426,7 +466,16 @@ where
 
         tokio::select! {
             biased;
-            frame = path_stream.recv_frame(), if remote_open || send_stream.repair_bytes() > 0 => {
+            frame = async {
+                #[cfg(feature = "lab-diagnostics")]
+                let recv_started = Instant::now();
+                let result = path_stream.recv_frame().await;
+                #[cfg(feature = "lab-diagnostics")]
+                if let Ok(frame) = &result {
+                    lab_perf_record("relay.path_recv_frame_wait", recv_started.elapsed(), frame_pacing_bytes(frame));
+                }
+                result
+            }, if remote_open || send_stream.repair_bytes() > 0 => {
                 match frame? {
                     Frame::StreamData {
                         stream_id: received_stream_id,
@@ -434,10 +483,20 @@ where
                         flags,
                         payload,
                     } if received_stream_id == stream_id && remote_open => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        let payload_len = payload.len();
+                        #[cfg(feature = "lab-diagnostics")]
+                        let mux_started = Instant::now();
                         let outcome = recv_stream.receive_data(offset, payload, flags)?;
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
                         for chunk in outcome.delivered {
                             stats.record_payload_bytes(chunk.len());
+                            #[cfg(feature = "lab-diagnostics")]
+                            let write_started = Instant::now();
                             local.write_all(&chunk).await?;
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_perf_record("relay.local_write_wait", write_started.elapsed(), chunk.len());
                             #[cfg(feature = "lab-diagnostics")]
                             if let Some(congestion) = &udp_congestion
                                 && stats.payload_bytes >= udp_diag_next_progress_bytes
@@ -454,7 +513,11 @@ where
                                     stats.payload_bytes.saturating_add(256 * 1024);
                             }
                         }
+                        #[cfg(feature = "lab-diagnostics")]
+                        let flush_started = Instant::now();
                         local.flush().await?;
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
                         send_tcp_recv_progress(
                             &path_stream,
                             &recv_stream,
@@ -477,7 +540,11 @@ where
                         ranges,
                     } if ack_stream_id == stream_id => {
                         let previous_repair_bytes = send_stream.repair_bytes();
+                        #[cfg(feature = "lab-diagnostics")]
+                        let mux_started = Instant::now();
                         let ack = send_stream.apply_ack(&ranges);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         if let Some(congestion) = &mut udp_congestion {
                             congestion.on_ack(ack.released_bytes);
                             #[cfg(feature = "lab-diagnostics")]
@@ -657,7 +724,16 @@ where
                 .await?;
                 last_recv_progress_sent_at = Instant::now();
             }
-            read = local.read(&mut buf[..read_budget]), if can_read_local => {
+            read = async {
+                #[cfg(feature = "lab-diagnostics")]
+                let read_started = Instant::now();
+                let result = local.read(&mut buf[..read_budget]).await;
+                #[cfg(feature = "lab-diagnostics")]
+                if let Ok(read) = &result {
+                    lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
+                }
+                result
+            }, if can_read_local => {
                 let read = read?;
                 if read == 0 {
                     if path_stream.underlay == UnderlayProtocol::Udp
@@ -680,10 +756,16 @@ where
                         }
                     local_open = false;
                 } else {
-                    let frame = send_stream.send_data(
-                        Bytes::copy_from_slice(&buf[..read]),
-                        StreamFlags::NONE,
-                    )?;
+                    #[cfg(feature = "lab-diagnostics")]
+                    let copy_started = Instant::now();
+                    let payload = Bytes::copy_from_slice(&buf[..read]);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                    #[cfg(feature = "lab-diagnostics")]
+                    let mux_started = Instant::now();
+                    let frame = send_stream.send_data(payload, StreamFlags::NONE)?;
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record("mux.send_data", mux_started.elapsed(), read);
                     pace_udp_stream_frame(
                         udp_congestion.as_ref(),
                         &frame,
@@ -719,6 +801,8 @@ where
     if !close_sent {
         path_stream.close().await;
     }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_flush("stream_close");
     result
 }
 

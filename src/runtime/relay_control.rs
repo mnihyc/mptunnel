@@ -411,7 +411,14 @@ where
                     adaptive_inflight,
                     adaptive_chunk.min(buf.len()),
                 );
-                local.read(&mut buf[..read_budget]).await
+                #[cfg(feature = "lab-diagnostics")]
+                let read_started = Instant::now();
+                let result = local.read(&mut buf[..read_budget]).await;
+                #[cfg(feature = "lab-diagnostics")]
+                if let Ok(read) = &result {
+                    lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
+                }
+                result
             }, if local_open && tcp_relay_can_read_with_limit(&send_stream, adaptive_inflight) => {
                 let read = match read {
                     Ok(read) => read,
@@ -458,13 +465,19 @@ where
                     if tcp_relay_expects_interactive_response(relay_class) && remote_open {
                         interactive_response_pending = true;
                     }
-                    let frame = match send_stream.send_data(
-                        Bytes::copy_from_slice(&buf[..read]),
-                        StreamFlags::NONE,
-                    ) {
+                    #[cfg(feature = "lab-diagnostics")]
+                    let copy_started = Instant::now();
+                    let payload = Bytes::copy_from_slice(&buf[..read]);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                    #[cfg(feature = "lab-diagnostics")]
+                    let mux_started = Instant::now();
+                    let frame = match send_stream.send_data(payload, StreamFlags::NONE) {
                         Ok(frame) => frame,
                         Err(err) => break Err(RuntimeError::Stream(err)),
                     };
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record("mux.send_data", mux_started.elapsed(), read);
                     match remotes.send_frame(context, frame).await {
                         Ok(path_key) => {
                             last_stream_progress_at = Instant::now();
@@ -498,7 +511,16 @@ where
                     }
                 }
             }
-            frame = remotes.recv_frame(), if remote_open || send_stream.repair_bytes() > 0 => {
+            frame = async {
+                #[cfg(feature = "lab-diagnostics")]
+                let recv_started = Instant::now();
+                let result = remotes.recv_frame().await;
+                #[cfg(feature = "lab-diagnostics")]
+                if let Ok(TcpRelayRemoteFrame { frame: Ok(frame), .. }) = &result {
+                    lab_perf_record("relay.path_recv_frame_wait", recv_started.elapsed(), frame_pacing_bytes(frame));
+                }
+                result
+            }, if remote_open || send_stream.repair_bytes() > 0 => {
                 let TcpRelayRemoteFrame { instance, frame } = match frame {
                     Ok(frame) => frame,
                     Err(err) if tcp_relay_error_is_migratable(&err) => {
@@ -583,10 +605,16 @@ where
                         payload,
                     } if received_stream_id == stream_id && remote_open => {
                         let previous_remote_offset = recv_stream.next_offset();
+                        #[cfg(feature = "lab-diagnostics")]
+                        let payload_len = payload.len();
+                        #[cfg(feature = "lab-diagnostics")]
+                        let mux_started = Instant::now();
                         let outcome = match recv_stream.receive_data(offset, payload, flags) {
                             Ok(outcome) => outcome,
                             Err(err) => break Err(RuntimeError::Stream(err)),
                         };
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
                         last_stream_progress_at = Instant::now();
                         let delivered_progress = recv_stream.next_offset() > previous_remote_offset;
                         if delivered_progress {
@@ -616,17 +644,25 @@ where
                                 .entry(path_key)
                                 .or_default()
                                 .record_payload_bytes(chunk.len());
+                            #[cfg(feature = "lab-diagnostics")]
+                            let write_started = Instant::now();
                             if let Err(err) = local.write_all(&chunk).await {
                                 write_error = Some(err);
                                 break;
                             }
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_perf_record("relay.local_write_wait", write_started.elapsed(), chunk.len());
                         }
                         if let Some(err) = write_error {
                             break Err(RuntimeError::Io(err));
                         }
+                        #[cfg(feature = "lab-diagnostics")]
+                        let flush_started = Instant::now();
                         if let Err(err) = local.flush().await {
                             break Err(RuntimeError::Io(err));
                         }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
                         if delivered_progress {
                             interactive_response_pending = false;
                         }
@@ -678,7 +714,13 @@ where
                         stream_id: ack_stream_id,
                         ranges,
                     } if ack_stream_id == stream_id => {
-                        send_stream.apply_ack(&ranges);
+                        #[cfg(feature = "lab-diagnostics")]
+                        let mux_started = Instant::now();
+                        let ack = send_stream.apply_ack(&ranges);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
+                        #[cfg(not(feature = "lab-diagnostics"))]
+                        let _ = ack;
                         last_stream_progress_at = Instant::now();
                         if remotes.active_carrier_underlay() == Some(UnderlayProtocol::Udp) {
                             let gap_budget = udp_stream_ack_gap_repair_budget(
@@ -686,9 +728,17 @@ where
                                 context.mux_limits,
                             );
                             let mut gap_replay_error = None;
-                            for frame in send_stream
-                                .retransmission_frames_for_ack_gaps(&ranges, gap_budget)
-                            {
+                            #[cfg(feature = "lab-diagnostics")]
+                            let retransmit_started = Instant::now();
+                            let gap_frames =
+                                send_stream.retransmission_frames_for_ack_gaps(&ranges, gap_budget);
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_perf_record(
+                                "mux.retransmit_ack_gaps",
+                                retransmit_started.elapsed(),
+                                gap_frames.iter().map(frame_pacing_bytes).sum(),
+                            );
+                            for frame in gap_frames {
                                 match remotes.send_frame(context, frame).await {
                                     Ok(_) => {
                                         last_response_stall_repair_at = Instant::now();
@@ -861,6 +911,8 @@ where
         }
         context.release_relay_path_load(key.underlay, key.index, class);
     }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_flush("multipath_stream_close");
     result
 }
 

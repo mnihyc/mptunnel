@@ -10,6 +10,7 @@ fi
 
 status=0
 while IFS= read -r file; do
+  [[ -f "$file" ]] || continue
   lines="$(wc -l < "$file")"
   if (( lines > limit )); then
     printf 'warning: %s has %s lines, above %s-line maintainability warning threshold\n' \

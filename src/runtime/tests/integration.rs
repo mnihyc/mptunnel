@@ -13,7 +13,7 @@ async fn path_probe_refreshes_tcp_health_without_stream_load() {
     assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
     assert!(health.tcp[0].measured_srtt_ms.is_some());
     assert_eq!(health.tcp[0].active_flows, 0);
-    assert_eq!(health.tcp[0].load_bytes, 0);
+    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
 }
 
 #[tokio::test]
@@ -30,11 +30,11 @@ async fn path_probe_refreshes_udp_health_without_association_load() {
     assert_eq!(health.udp[0].state, SchedulerPathState::Active);
     assert!(health.udp[0].measured_srtt_ms.is_some());
     assert_eq!(health.udp[0].active_flows, 0);
-    assert_eq!(health.udp[0].load_bytes, 0);
+    assert_eq!(health.udp[0].relay_bytes_in_flight, 0);
 }
 
 #[tokio::test]
-async fn path_probe_skips_tcp_path_with_active_stream_load() {
+async fn path_probe_skips_tcp_path_with_active_stream() {
     let path = reserve_tcp_path().await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
@@ -46,11 +46,11 @@ async fn path_probe_skips_tcp_path_with_active_stream_load() {
     assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
     assert_eq!(health.tcp[0].consecutive_failures, 0);
     assert_eq!(health.tcp[0].active_flows, 1);
-    assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
+    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
 }
 
 #[tokio::test]
-async fn path_probe_skips_udp_path_with_active_session_load() {
+async fn path_probe_skips_udp_path_with_active_session() {
     let path = reserve_udp_path().await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
@@ -62,7 +62,7 @@ async fn path_probe_skips_udp_path_with_active_session_load() {
     assert_eq!(health.udp[0].state, SchedulerPathState::Active);
     assert_eq!(health.udp[0].consecutive_failures, 0);
     assert_eq!(health.udp[0].active_flows, 1);
-    assert_eq!(health.udp[0].load_bytes, UDP_SESSION_LOAD_BYTES);
+    assert_eq!(health.udp[0].relay_bytes_in_flight, 0);
 }
 
 #[tokio::test]
@@ -1108,6 +1108,7 @@ async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
         DnsConfig::default(),
         security(),
         ResourceLimits::default(),
+        ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1139,6 +1140,7 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
         DnsConfig::default(),
         security(),
         ResourceLimits::default(),
+        ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1242,6 +1244,7 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
         DnsConfig::default(),
         security(),
         ResourceLimits::default(),
+        ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
     let context =
@@ -1317,11 +1320,15 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
 async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
     let path = reserve_tcp_path().await;
     let listener = bind_listener(&path).await.expect("bind");
+    let server_path = path.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
         handle_server_path(
             stream,
             ServerPathContext {
+                tag: None,
+                route_target: None,
+                server_paths: Arc::new(vec![server_path]),
                 outbound: OutboundConfig::Direct,
                 outbound_dns: DnsConfig::default(),
                 codec_limits: CodecLimits::default(),

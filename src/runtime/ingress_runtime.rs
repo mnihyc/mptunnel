@@ -3,6 +3,7 @@ use super::*;
 pub(super) async fn run_socks5_client_ingress(
     listen: Vec<SocketAddr>,
     context: ClientPathContext,
+    proxy_auth: ProxyAuthConfig,
 ) -> Result<(), RuntimeError> {
     let mut bound = Vec::with_capacity(listen.len());
     for addr in listen {
@@ -16,7 +17,9 @@ pub(super) async fn run_socks5_client_ingress(
     let mut listeners = tokio::task::JoinSet::new();
     for listener in bound {
         let context = context.clone();
-        listeners.spawn(async move { run_socks5_client_listener(listener, context).await });
+        let proxy_auth = proxy_auth.clone();
+        listeners
+            .spawn(async move { run_socks5_client_listener(listener, context, proxy_auth).await });
     }
     wait_for_ingress_listener_failure(listeners, "SOCKS5").await
 }
@@ -24,12 +27,16 @@ pub(super) async fn run_socks5_client_ingress(
 pub(super) async fn run_socks5_client_listener(
     listener: TcpListener,
     context: ClientPathContext,
+    proxy_auth: ProxyAuthConfig,
 ) -> Result<(), RuntimeError> {
     loop {
         let (stream, _) = listener.accept().await?;
         let context = context.clone();
+        let proxy_auth = proxy_auth.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_socks5_client_stream(stream, context).await {
+            if let Err(err) =
+                handle_socks5_client_stream_with_auth(stream, context, proxy_auth).await
+            {
                 eprintln!("warning: SOCKS5 client handler failed: {err}");
             }
         });
@@ -39,6 +46,7 @@ pub(super) async fn run_socks5_client_listener(
 pub(super) async fn run_http_connect_client_ingress(
     listen: Vec<SocketAddr>,
     context: ClientPathContext,
+    proxy_auth: ProxyAuthConfig,
 ) -> Result<(), RuntimeError> {
     let mut bound = Vec::with_capacity(listen.len());
     for addr in listen {
@@ -52,7 +60,10 @@ pub(super) async fn run_http_connect_client_ingress(
     let mut listeners = tokio::task::JoinSet::new();
     for listener in bound {
         let context = context.clone();
-        listeners.spawn(async move { run_http_connect_client_listener(listener, context).await });
+        let proxy_auth = proxy_auth.clone();
+        listeners.spawn(async move {
+            run_http_connect_client_listener(listener, context, proxy_auth).await
+        });
     }
     wait_for_ingress_listener_failure(listeners, "HTTP CONNECT").await
 }
@@ -60,12 +71,16 @@ pub(super) async fn run_http_connect_client_ingress(
 pub(super) async fn run_http_connect_client_listener(
     listener: TcpListener,
     context: ClientPathContext,
+    proxy_auth: ProxyAuthConfig,
 ) -> Result<(), RuntimeError> {
     loop {
         let (stream, _) = listener.accept().await?;
         let context = context.clone();
+        let proxy_auth = proxy_auth.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_http_connect_client_stream(stream, context).await {
+            if let Err(err) =
+                handle_http_connect_client_stream_with_auth(stream, context, proxy_auth).await
+            {
                 eprintln!("warning: HTTP CONNECT client handler failed: {err}");
             }
         });
@@ -90,14 +105,27 @@ pub(super) async fn wait_for_ingress_listener_failure(
     }))
 }
 
+#[cfg(test)]
 pub(super) async fn handle_socks5_client_stream<S>(
-    mut stream: S,
+    stream: S,
     context: ClientPathContext,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    authenticate_socks5_client(&mut stream, &context.proxy_auth).await?;
+    let proxy_auth = context.proxy_auth.clone();
+    handle_socks5_client_stream_with_auth(stream, context, proxy_auth).await
+}
+
+pub(super) async fn handle_socks5_client_stream_with_auth<S>(
+    mut stream: S,
+    context: ClientPathContext,
+    proxy_auth: ProxyAuthConfig,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    authenticate_socks5_client(&mut stream, &proxy_auth).await?;
     let request = read_socks5_command(&mut stream).await?;
     match request.command {
         socks5::Socks5Command::Connect => {
@@ -156,18 +184,29 @@ where
     }
 }
 
+#[cfg(test)]
 pub(super) async fn handle_http_connect_client_stream<S>(
-    mut stream: S,
+    stream: S,
     context: ClientPathContext,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let proxy_auth = context.proxy_auth.clone();
+    handle_http_connect_client_stream_with_auth(stream, context, proxy_auth).await
+}
+
+pub(super) async fn handle_http_connect_client_stream_with_auth<S>(
+    mut stream: S,
+    context: ClientPathContext,
+    proxy_auth: ProxyAuthConfig,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request = read_http_connect(&mut stream).await?;
-    if context.proxy_auth.is_required()
-        && !context
-            .proxy_auth
-            .verify_basic_header(request.proxy_authorization.as_deref())
+    if proxy_auth.is_required()
+        && !proxy_auth.verify_basic_header(request.proxy_authorization.as_deref())
     {
         stream
             .write_all(http_connect::error_response(
@@ -364,6 +403,7 @@ pub(super) async fn probe_tcp_client_path(
         .tcp_paths
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+    let security = context.tcp_path_security(path_index)?;
     let started_at = Instant::now();
     tokio::time::timeout(timeout, async {
         let tcp_stream = tcp::connect_path(
@@ -376,18 +416,14 @@ pub(super) async fn probe_tcp_client_path(
         .await?;
         let mut framed = EncryptedFramedStream::with_cipher_suite(
             tcp_stream,
-            context.security.secret.as_bytes(),
+            security.secret.as_bytes(),
             PeerRole::Client,
             context.codec_limits,
-            context.security.cipher,
+            security.cipher,
         );
         let path_id = PathId(path_index as u16);
-        let (session_hello, session_auth, path_join) = authenticated_path_join_frames(
-            &context.security,
-            path,
-            path_id,
-            UnderlayProtocol::Tcp,
-        )?;
+        let (session_hello, session_auth, path_join) =
+            authenticated_path_join_frames(security, path, path_id, UnderlayProtocol::Tcp)?;
         let nonce = random_u64()?;
 
         framed.write_frame(&session_hello).await?;

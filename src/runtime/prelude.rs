@@ -1,5 +1,6 @@
 pub(super) use crate::config::{
-    AppConfig, ClientConfig, CommandConfig, ResourceLimits, SecurityConfig,
+    AppConfig, ClientConfig, ClientPathConfig, CommandConfig, ManagementConfig, NodeConfig,
+    ResourceLimits, RouteTarget, RouteTargetKind, SecurityConfig,
 };
 pub(super) use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 pub(super) use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
@@ -13,19 +14,21 @@ pub(super) use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, Sess
 pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{
     AuthNonce, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
-    OutboundPolicy, PathCapabilities, PathId, RateHint, ResetReason, SessionId, StreamFlags,
-    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    OutboundPolicy, PathCapabilities, PathId, PathMetricDirection, PathMetrics, RateHint,
+    ResetReason, SessionId, StreamDemandHint, StreamFlags, StreamId, StreamOpenRole, TargetAddr,
+    UnderlayProtocol,
 };
 pub(super) use crate::scheduler::{
     self, FlowDemand, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };
-pub(super) use crate::transport::PathSpec;
 pub(super) use crate::transport::encrypted::{
     EncryptedFramedReader, EncryptedFramedStream, EncryptedFramedTransportError,
     EncryptedFramedWriter, PeerRole,
 };
+pub(super) use crate::transport::quic_carrier;
 pub(super) use crate::transport::tcp::{self, TcpConnectOptions};
 pub(super) use crate::transport::udp_carrier;
+pub(super) use crate::transport::{PathSpec, UdpEngine};
 pub(super) use bytes::{Bytes, BytesMut};
 pub(super) use futures::{SinkExt, StreamExt};
 pub(super) use netstack_smoltcp::{

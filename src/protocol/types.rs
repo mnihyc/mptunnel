@@ -32,6 +32,12 @@ pub enum UnderlayProtocol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathMetricDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressKind {
     Socks5,
     HttpConnect,
@@ -43,6 +49,7 @@ pub enum IngressKind {
 pub enum StreamOpenRole {
     Active,
     Repair,
+    Validation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +93,49 @@ impl StreamFlags {
         fin: false,
         early_data: false,
     };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamDemandHint {
+    pub observed_bytes: u64,
+    pub repair_bytes: u64,
+    pub latency_weight_ppm: u32,
+    pub throughput_weight_ppm: u32,
+    pub realtime_weight_ppm: u32,
+}
+
+impl StreamDemandHint {
+    pub const PPM_MAX: u32 = 1_000_000;
+
+    pub const fn latency() -> Self {
+        Self {
+            observed_bytes: 0,
+            repair_bytes: 0,
+            latency_weight_ppm: Self::PPM_MAX,
+            throughput_weight_ppm: 0,
+            realtime_weight_ppm: 0,
+        }
+    }
+
+    pub const fn throughput() -> Self {
+        Self {
+            observed_bytes: 0,
+            repair_bytes: 0,
+            latency_weight_ppm: 0,
+            throughput_weight_ppm: Self::PPM_MAX,
+            realtime_weight_ppm: 0,
+        }
+    }
+
+    pub const fn realtime() -> Self {
+        Self {
+            observed_bytes: 0,
+            repair_bytes: 0,
+            latency_weight_ppm: 0,
+            throughput_weight_ppm: 0,
+            realtime_weight_ppm: Self::PPM_MAX,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,15 +224,26 @@ pub enum PathStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathMetrics {
     pub path_id: PathId,
+    pub underlay: UnderlayProtocol,
+    pub direction: PathMetricDirection,
+    pub metric_epoch: u64,
+    pub metric_age_us: u32,
     pub min_rtt_us: u32,
     pub srtt_us: u32,
     pub rttvar_us: u32,
     pub jitter_us: u32,
     pub delivery_rate_bps: u64,
+    pub pacing_rate_bps: u64,
     pub loss_ppm: u32,
     pub ecn_ppm: u32,
     pub bytes_in_flight: u64,
     pub queue_bytes: u64,
+    pub inflight_limit_bytes: u64,
+    pub inflight_hi_bytes: u64,
+    pub confidence_ppm: u32,
+    pub app_limited: bool,
+    pub has_ack_derived_data_sample: bool,
+    pub data_sample_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +337,7 @@ pub enum Frame {
         target: TargetAddr,
         ingress: IngressKind,
         outbound: OutboundPolicy,
+        demand: StreamDemandHint,
         role: StreamOpenRole,
     },
     StreamData {
@@ -286,6 +348,7 @@ pub enum Frame {
     },
     StreamAck {
         stream_id: StreamId,
+        complete: bool,
         ranges: Vec<OffsetRange>,
     },
     StreamMaxData {

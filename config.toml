@@ -1,0 +1,170 @@
+# mptunnel role-free node configuration.
+#
+# Running `mptunnel` without CLI arguments reads ./config.toml. The runtime
+# model follows a V2Ray-style graph:
+#
+#   inbound(socks5/http/tun) -> outbound(mpp)
+#   inbound(mpp)             -> outbound(direct/socks5/http-connect/...)
+#
+# Each inbound and outbound may have a tag. Tags are display/routing names and
+# are the stable hook for policy-based routing. An inbound selects either one
+# outbound by `outbound = "tag"` or one routing balancer by `balancer = "tag"`.
+# Omit both only when there is exactly one valid target in that protocol class.
+
+# log_level = "info"
+# check_config = false
+
+# Optional service supervision. Leave unset for normal foreground operation.
+# [service]
+# service_mode = false
+# supervise = false
+# restart_backoff_ms = 1000
+# restart_max_backoff_ms = 30000
+# max_restarts = 10
+
+# Optional management API. Disabled when listen is unset.
+# [management]
+# listen = ["127.0.0.1:7600"]
+# token = "replace-with-operator-token"
+
+# Optional resource envelopes. These are adaptive capacity envelopes, not fixed
+# production tuning constants. Leave unset unless the deployment has a specific
+# resource constraint.
+# [resources]
+# max_frame_bytes = 1048576
+# max_payload_bytes = 1048512
+# max_ack_ranges = 256
+# max_paths = 64
+# max_streams = 65536
+# max_stream_window_bytes = 67108864
+# max_repair_bytes = 67108864
+# max_reorder_bytes = 67108864
+# max_datagram_queue_bytes = 16777216
+# max_tcp_path_inflight_bytes = 33554432
+# max_tcp_relay_chunk_bytes = 524288
+# tcp_path_heartbeat_interval_ms = 10000
+# tcp_path_heartbeat_timeout_ms = 30000
+
+[[inbounds]]
+tag = "local-socks"
+protocol = "socks5"
+listen = ["127.0.0.1:1080"]
+outbound = "edge-mpp"
+# [inbounds.auth]
+# username = "operator"
+# password = "replace-with-password"
+
+# [[inbounds]]
+# tag = "local-http"
+# protocol = "http"
+# listen = ["127.0.0.1:8080"]
+# outbound = "edge-mpp"
+# [inbounds.auth]
+# username = "operator"
+# password = "replace-with-password"
+
+# [[inbounds]]
+# tag = "local-tun"
+# protocol = "tun"
+# outbound = "edge-mpp"
+# name = "mptunnel0"
+# ipv4 = "10.66.0.2"
+# ipv4_prefix = 24
+# ipv4_gateway = "10.66.0.1"
+# ipv6 = "fd00:66::2"
+# ipv6_prefix = 64
+# mtu = 1500
+# disable_ipv4 = false
+# disable_icmp = false
+# dns_resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
+# dns_ttl_ms = 30000
+
+[[outbounds]]
+tag = "edge-mpp"
+protocol = "mpp"
+# udp:// uses the production QUIC engine by default. The custom-lab UDP engine
+# is opt-in for experiments only:
+# endpoints = ["udp://edge.example.com:7443?engine=custom-lab"]
+endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
+# path_probe_interval_ms = 10000
+# path_probe_timeout_ms = 2000
+
+[outbounds.security]
+# MPP security is scoped to this MPP outbound, so one node can talk to multiple
+# MPP peers with different secrets.
+# mode = "encrypted"
+secret = "01234567-89ab-cdef-0123-456789abcdef"
+# cipher = "aes-256-gcm"
+# cipher = "chacha20-poly1305"
+# auth_freshness_window_seconds = 300
+# i_understand_this_is_insecure = false
+
+# Uncomment this inbound to make the same process accept MPP paths from other
+# nodes. This is the server-side shape: inbound(mpp) -> outbound(direct).
+# [[inbounds]]
+# tag = "edge-listener"
+# protocol = "mpp"
+# endpoints = ["tcp://0.0.0.0:7443", "udp://0.0.0.0:7443"]
+# outbound = "direct-egress"
+# [inbounds.security]
+# secret = "01234567-89ab-cdef-0123-456789abcdef"
+
+[[outbounds]]
+tag = "direct-egress"
+protocol = "direct"
+# Optional resolver used by this exact egress outbound. Keep DNS policy at the
+# outbound that owns target-name resolution; do not create a broad DNS table
+# detached from a concrete outbound.
+# dns = { resolvers = ["1.1.1.1:53", "8.8.8.8:53", "[2606:4700:4700::1111]:53"], strategy = "ipv4-then-ipv6", timeout_ms = 2000 }
+
+# To chain accepted requests through another proxy, replace or add an egress
+# outbound and point an inbound(mpp).outbound at its tag.
+# [[outbounds]]
+# tag = "socks-chain"
+# protocol = "socks5"
+# proxy = "127.0.0.1:1081"
+# dns = { strategy = "ipv4-and-ipv6" }
+#
+# [[outbounds]]
+# tag = "http-chain"
+# protocol = "http-connect"
+# proxy = "127.0.0.1:8081"
+#
+# [[outbounds]]
+# tag = "http-udp-chain"
+# protocol = "http-connect-udp"
+# proxy = "127.0.0.1:8081"
+#
+# [[outbounds]]
+# tag = "bound-direct"
+# protocol = "direct"
+# bind_ip = "203.0.113.10"
+
+# Optional outbound routing policy. `sequence` and `random` operate on egress
+# outbounds. `combined-mpp` combines several MPP outbounds into one logical MPP
+# outbound, preserving each member path's own MPP security.
+#
+# To enforce a balancer, point an inbound's `balancer` field at the balancer
+# tag. Local SOCKS5/HTTP/TUN inbounds may point at `combined-mpp` balancers, and
+# MPP inbounds may point at egress `sequence` or `random` balancers.
+# Example:
+#   [[inbounds]]
+#   protocol = "socks5"
+#   listen = ["127.0.0.1:1080"]
+#   balancer = "combined-edge"
+# [routing]
+#
+# [[routing.balancers]]
+# tag = "egress-sequence"
+# strategy = "sequence"
+# outbounds = ["direct-egress", "socks-chain"]
+#
+# [[routing.balancers]]
+# tag = "egress-random"
+# strategy = "random"
+# outbounds = ["socks-chain", "http-chain"]
+#
+# [[routing.balancers]]
+# tag = "combined-edge"
+# strategy = "combined-mpp"
+# outbounds = ["edge-mpp", "backup-edge-mpp"]

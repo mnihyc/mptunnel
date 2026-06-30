@@ -101,56 +101,37 @@ impl ReliableSendStream {
 
     pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
         let ranges = normalized_offset_ranges(ranges);
-        let mut released_bytes = 0usize;
-        let mut released_chunks = 0usize;
-        let mut acked_offsets = Vec::new();
-        for range in &ranges {
-            for (offset, chunk) in self.repair_cache.range(range.start..) {
-                if *offset >= range.end {
-                    break;
-                }
-                if range_covers_chunk(*range, chunk) {
-                    acked_offsets.push(*offset);
-                }
-            }
+        if ranges.is_empty() || self.repair_cache.is_empty() {
+            return AckOutcome {
+                released_bytes: 0,
+                released_chunks: 0,
+                remaining_repair_bytes: self.repair_bytes,
+            };
         }
-        acked_offsets.sort_unstable();
-        acked_offsets.dedup();
 
-        for offset in acked_offsets {
-            if let Some(chunk) = self.repair_cache.remove(&offset) {
-                released_bytes = released_bytes.saturating_add(chunk.payload.len());
+        let mut released_chunks = 0usize;
+        let previous_repair_bytes = self.repair_bytes;
+        let mut retained = BTreeMap::new();
+        let mut retained_bytes = 0usize;
+        for chunk in self.repair_cache.values() {
+            let pieces = unacked_chunk_slices(chunk, &ranges);
+            if pieces.is_empty() {
                 released_chunks += 1;
+                continue;
+            }
+            for piece in pieces {
+                retained_bytes = retained_bytes.saturating_add(piece.payload.len());
+                retained.insert(piece.offset, piece);
             }
         }
-        self.repair_bytes = self.repair_bytes.saturating_sub(released_bytes);
+        self.repair_cache = retained;
+        self.repair_bytes = retained_bytes;
+        let released_bytes = previous_repair_bytes.saturating_sub(retained_bytes);
         AckOutcome {
             released_bytes,
             released_chunks,
             remaining_repair_bytes: self.repair_bytes,
         }
-    }
-
-    pub fn retransmission_frames_limited(&self, byte_limit: usize) -> Vec<Frame> {
-        if byte_limit == 0 {
-            return Vec::new();
-        }
-
-        let mut frames = Vec::new();
-        let mut emitted_bytes = 0usize;
-        for chunk in self.repair_cache.values() {
-            if emitted_bytes >= byte_limit {
-                break;
-            }
-            emitted_bytes = emitted_bytes.saturating_add(chunk.payload.len());
-            frames.push(Frame::StreamData {
-                stream_id: self.stream_id,
-                offset: chunk.offset,
-                flags: chunk.flags,
-                payload: chunk.payload.clone(),
-            });
-        }
-        frames
     }
 
     pub fn retransmission_frames_for_ack_gaps(
@@ -168,34 +149,194 @@ impl ReliableSendStream {
 
         let mut frames = Vec::new();
         let mut emitted_bytes = 0usize;
-        let mut range_index = 0usize;
         for chunk in self.repair_cache.values() {
-            let end = chunk.offset.saturating_add(chunk.payload.len() as u64);
-            if end > largest_acked_end {
+            let chunk_start = chunk.offset;
+            let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+            if chunk_start >= largest_acked_end {
                 break;
             }
-            while range_index < ranges.len() && ranges[range_index].end <= chunk.offset {
+            let repair_end = chunk_end.min(largest_acked_end);
+            let mut cursor = chunk_start;
+            let mut range_index = ranges.partition_point(|range| range.end <= chunk_start);
+            while range_index < ranges.len() {
+                let range = ranges[range_index];
+                if range.start >= repair_end {
+                    break;
+                }
+                if range.start > cursor
+                    && !push_retransmission_slice(
+                        &mut frames,
+                        self.stream_id,
+                        chunk,
+                        cursor,
+                        range.start.min(repair_end),
+                        byte_limit,
+                        &mut emitted_bytes,
+                    )
+                {
+                    return frames;
+                }
+                cursor = cursor.max(range.end).min(repair_end);
+                if cursor >= repair_end {
+                    break;
+                }
                 range_index += 1;
             }
-            if ranges
-                .get(range_index)
-                .is_some_and(|range| range_covers_chunk(*range, chunk))
+            if cursor < repair_end
+                && !push_retransmission_slice(
+                    &mut frames,
+                    self.stream_id,
+                    chunk,
+                    cursor,
+                    repair_end,
+                    byte_limit,
+                    &mut emitted_bytes,
+                )
             {
-                continue;
+                return frames;
             }
-            if emitted_bytes >= byte_limit {
-                break;
-            }
-            emitted_bytes = emitted_bytes.saturating_add(chunk.payload.len());
-            frames.push(Frame::StreamData {
-                stream_id: self.stream_id,
-                offset: chunk.offset,
-                flags: chunk.flags,
-                payload: chunk.payload.clone(),
-            });
         }
         frames
     }
+
+    pub fn retransmission_frames_for_ranges(
+        &self,
+        ranges: &[OffsetRange],
+        byte_limit: usize,
+    ) -> Vec<Frame> {
+        if byte_limit == 0 || ranges.is_empty() {
+            return Vec::new();
+        }
+        let ranges = normalized_offset_ranges(ranges);
+        let mut frames = Vec::new();
+        let mut emitted_bytes = 0usize;
+        let mut range_index = 0usize;
+        for chunk in self.repair_cache.values() {
+            while range_index < ranges.len() {
+                let range = ranges[range_index];
+                if range.end <= chunk.offset {
+                    range_index += 1;
+                    continue;
+                }
+                break;
+            }
+            let chunk_start = chunk.offset;
+            let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+            let mut current_index = range_index;
+            while current_index < ranges.len() {
+                let range = ranges[current_index];
+                if range.start >= chunk_end {
+                    break;
+                }
+                if range.end > chunk_start {
+                    let start = range.start.max(chunk_start);
+                    let end = range.end.min(chunk_end);
+                    if !push_retransmission_slice(
+                        &mut frames,
+                        self.stream_id,
+                        chunk,
+                        start,
+                        end,
+                        byte_limit,
+                        &mut emitted_bytes,
+                    ) {
+                        return frames;
+                    }
+                }
+                current_index += 1;
+            }
+        }
+        frames
+    }
+}
+
+fn unacked_chunk_slices(chunk: &SentChunk, ranges: &[OffsetRange]) -> Vec<SentChunk> {
+    let chunk_start = chunk.offset;
+    let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+    let mut cursor = chunk_start;
+    let mut pieces = Vec::new();
+    for range in ranges {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start >= chunk_end {
+            break;
+        }
+        if range.start > cursor {
+            push_sent_chunk_slice(&mut pieces, chunk, cursor, range.start.min(chunk_end));
+        }
+        cursor = cursor.max(range.end.min(chunk_end));
+        if cursor >= chunk_end {
+            break;
+        }
+    }
+    if cursor < chunk_end {
+        push_sent_chunk_slice(&mut pieces, chunk, cursor, chunk_end);
+    }
+    pieces
+}
+
+fn push_sent_chunk_slice(pieces: &mut Vec<SentChunk>, chunk: &SentChunk, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let slice_start = usize::try_from(start.saturating_sub(chunk.offset)).unwrap_or(usize::MAX);
+    let slice_end = usize::try_from(end.saturating_sub(chunk.offset)).unwrap_or(usize::MAX);
+    let slice_end = slice_end.min(chunk.payload.len());
+    if slice_start >= slice_end {
+        return;
+    }
+    let full_chunk = slice_start == 0 && slice_end == chunk.payload.len();
+    pieces.push(SentChunk {
+        offset: start,
+        payload: chunk.payload.slice(slice_start..slice_end),
+        flags: if full_chunk {
+            chunk.flags
+        } else {
+            StreamFlags::NONE
+        },
+    });
+}
+
+fn push_retransmission_slice(
+    frames: &mut Vec<Frame>,
+    stream_id: StreamId,
+    chunk: &SentChunk,
+    start: u64,
+    end: u64,
+    byte_limit: usize,
+    emitted_bytes: &mut usize,
+) -> bool {
+    if start >= end || *emitted_bytes >= byte_limit {
+        return false;
+    }
+    let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+    let start = start.max(chunk.offset).min(chunk_end);
+    let end = end.max(start).min(chunk_end);
+    let available = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX);
+    let remaining = byte_limit.saturating_sub(*emitted_bytes);
+    let len = available.min(remaining);
+    if len == 0 {
+        return false;
+    }
+    let slice_start = usize::try_from(start.saturating_sub(chunk.offset)).unwrap_or(usize::MAX);
+    let slice_end = slice_start.saturating_add(len).min(chunk.payload.len());
+    if slice_start >= slice_end {
+        return false;
+    }
+    let full_chunk = slice_start == 0 && slice_end == chunk.payload.len();
+    frames.push(Frame::StreamData {
+        stream_id,
+        offset: start,
+        flags: if full_chunk {
+            chunk.flags
+        } else {
+            StreamFlags::NONE
+        },
+        payload: chunk.payload.slice(slice_start..slice_end),
+    });
+    *emitted_bytes = (*emitted_bytes).saturating_add(slice_end - slice_start);
+    *emitted_bytes < byte_limit
 }
 
 fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
@@ -214,11 +355,6 @@ fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
         }
     }
     merged
-}
-
-fn range_covers_chunk(range: OffsetRange, chunk: &SentChunk) -> bool {
-    let end = chunk.offset.saturating_add(chunk.payload.len() as u64);
-    range.start <= chunk.offset && range.end >= end
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,38 +461,21 @@ impl ReliableRecvStream {
     }
 
     pub fn ack_ranges_limited(&self, limit: usize) -> Vec<OffsetRange> {
-        let ranges = self.received_ranges.ranges();
-        if ranges.len() <= limit {
-            return ranges;
-        }
         if limit == 0 {
             return Vec::new();
         }
-
-        let early_slots = (limit / 2).max(1).min(limit);
-        let mut limited = ranges.iter().take(early_slots).copied().collect::<Vec<_>>();
-        let remaining_slots = limit.saturating_sub(limited.len());
-        let tail = &ranges[early_slots..];
-        if remaining_slots == 1 {
-            if let Some(range) = tail.last().copied() {
-                limited.push(range);
-            }
-        } else if remaining_slots > 1 && !tail.is_empty() {
-            let max_index = tail.len().saturating_sub(1);
-            for slot in 0..remaining_slots {
-                let index = slot.saturating_mul(max_index) / remaining_slots.saturating_sub(1);
-                limited.push(tail[index]);
-            }
-        }
-        limited.dedup();
+        let mut limited = self.received_ranges.ranges();
         limited.truncate(limit);
         limited
     }
 
     pub fn ack_frame(&self) -> Frame {
+        let mut ranges = self.ack_ranges();
+        ranges.truncate(self.limits.max_ack_ranges);
         Frame::StreamAck {
             stream_id: self.stream_id,
-            ranges: self.ack_ranges_limited(self.limits.max_ack_ranges),
+            complete: true,
+            ranges,
         }
     }
 
@@ -366,13 +485,16 @@ impl ReliableRecvStream {
         if ranges.is_empty() {
             return vec![Frame::StreamAck {
                 stream_id: self.stream_id,
+                complete: true,
                 ranges,
             }];
         }
+        let complete = ranges.len() <= chunk_size;
         ranges
             .chunks(chunk_size)
             .map(|chunk| Frame::StreamAck {
                 stream_id: self.stream_id,
+                complete,
                 ranges: chunk.to_vec(),
             })
             .collect()
@@ -533,15 +655,11 @@ mod tests {
     #[test]
     fn send_stream_keeps_data_until_tunnel_ack() {
         let mut stream = ReliableSendStream::new(StreamId(1), limits());
-        let frame = stream
+        stream
             .send_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
             .expect("send");
 
         assert_eq!(stream.repair_bytes(), 5);
-        assert_eq!(
-            stream.retransmission_frames_limited(usize::MAX),
-            vec![frame]
-        );
 
         let outcome = stream.apply_ack(&[OffsetRange::new(0, 5).expect("range")]);
         assert_eq!(
@@ -552,27 +670,39 @@ mod tests {
                 remaining_repair_bytes: 0
             }
         );
-        assert!(stream.retransmission_frames_limited(usize::MAX).is_empty());
+        assert_eq!(stream.repair_bytes(), 0);
     }
 
     #[test]
-    fn send_stream_limited_retransmission_uses_byte_budget() {
-        let mut stream = ReliableSendStream::new(StreamId(1), limits());
+    fn send_stream_trims_repair_cache_by_ack_subranges() {
+        let mut stream = ReliableSendStream::new(StreamId(2), limits());
         stream
-            .send_data(Bytes::from_static(b"aaaa"), StreamFlags::NONE)
-            .expect("first send");
-        stream
-            .send_data(Bytes::from_static(b"bbbb"), StreamFlags::NONE)
-            .expect("second send");
-        stream
-            .send_data(Bytes::from_static(b"cccc"), StreamFlags::NONE)
-            .expect("third send");
+            .send_data(Bytes::from_static(b"abcdefgh"), StreamFlags::NONE)
+            .expect("send");
 
-        assert!(stream.retransmission_frames_limited(0).is_empty());
-        assert_eq!(stream.retransmission_frames_limited(1).len(), 1);
-        assert_eq!(stream.retransmission_frames_limited(4).len(), 1);
-        assert_eq!(stream.retransmission_frames_limited(5).len(), 2);
-        assert_eq!(stream.retransmission_frames_limited(32).len(), 3);
+        let outcome = stream.apply_ack(&[OffsetRange::new(2, 6).expect("range")]);
+        assert_eq!(
+            outcome,
+            AckOutcome {
+                released_bytes: 4,
+                released_chunks: 0,
+                remaining_repair_bytes: 4,
+            }
+        );
+
+        let frames =
+            stream.retransmission_frames_for_ranges(&[OffsetRange { start: 0, end: 8 }], 8);
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(
+            &frames[0],
+            Frame::StreamData { offset: 0, flags, payload, .. }
+                if *flags == StreamFlags::NONE && payload.as_ref() == b"ab"
+        ));
+        assert!(matches!(
+            &frames[1],
+            Frame::StreamData { offset: 6, flags, payload, .. }
+                if *flags == StreamFlags::NONE && payload.as_ref() == b"gh"
+        ));
     }
 
     #[test]
@@ -602,6 +732,47 @@ mod tests {
                 .retransmission_frames_for_ack_gaps(&[OffsetRange { start: 0, end: 4 }], 1024)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn send_stream_slices_ack_gap_repairs_to_byte_limit() {
+        let mut stream = ReliableSendStream::new(StreamId(8), limits());
+        stream
+            .send_data(Bytes::from_static(b"abcdefgh"), StreamFlags::NONE)
+            .expect("send");
+
+        let frames = stream.retransmission_frames_for_ack_gaps(
+            &[
+                OffsetRange { start: 0, end: 2 },
+                OffsetRange { start: 6, end: 8 },
+            ],
+            3,
+        );
+
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            Frame::StreamData { offset: 2, flags, payload, .. }
+                if *flags == StreamFlags::NONE && payload.as_ref() == b"cde"
+        ));
+    }
+
+    #[test]
+    fn send_stream_slices_path_failure_repairs_to_byte_limit() {
+        let mut stream = ReliableSendStream::new(StreamId(9), limits());
+        stream
+            .send_data(Bytes::from_static(b"abcdefgh"), StreamFlags::NONE)
+            .expect("send");
+
+        let frames =
+            stream.retransmission_frames_for_ranges(&[OffsetRange { start: 2, end: 7 }], 4);
+
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            &frames[0],
+            Frame::StreamData { offset: 2, flags, payload, .. }
+                if *flags == StreamFlags::NONE && payload.as_ref() == b"cdef"
+        ));
     }
 
     #[test]
@@ -660,6 +831,14 @@ mod tests {
             vec![OffsetRange::new(0, 11).expect("range")]
         );
         assert_eq!(
+            stream.ack_frame(),
+            Frame::StreamAck {
+                stream_id: StreamId(7),
+                complete: true,
+                ranges: vec![OffsetRange::new(0, 11).expect("range")]
+            }
+        );
+        assert_eq!(
             stream.max_data_offset(),
             11 + limits().max_stream_window_bytes
         );
@@ -702,11 +881,12 @@ mod tests {
             stream.ack_frame(),
             Frame::StreamAck {
                 stream_id: StreamId(7),
+                complete: true,
                 ranges: vec![
                     OffsetRange::new(0, 1).expect("contiguous range"),
                     OffsetRange::new(10, 11).expect("first repair-adjacent range"),
-                    OffsetRange::new(20, 21).expect("sampled range"),
-                    OffsetRange::new(50, 51).expect("tail range"),
+                    OffsetRange::new(20, 21).expect("third range"),
+                    OffsetRange::new(30, 31).expect("fourth range"),
                 ]
             }
         );
@@ -729,6 +909,7 @@ mod tests {
             vec![
                 Frame::StreamAck {
                     stream_id: StreamId(7),
+                    complete: false,
                     ranges: vec![
                         OffsetRange::new(0, 1).expect("first"),
                         OffsetRange::new(10, 11).expect("second"),
@@ -736,6 +917,7 @@ mod tests {
                 },
                 Frame::StreamAck {
                     stream_id: StreamId(7),
+                    complete: false,
                     ranges: vec![
                         OffsetRange::new(20, 21).expect("third"),
                         OffsetRange::new(30, 31).expect("fourth"),
@@ -743,6 +925,7 @@ mod tests {
                 },
                 Frame::StreamAck {
                     stream_id: StreamId(7),
+                    complete: false,
                     ranges: vec![OffsetRange::new(40, 41).expect("fifth")],
                 },
             ]

@@ -1,9 +1,20 @@
 use crate::cli::{Cli, CliConfigError, Command};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ConfigFileError, DEFAULT_CONFIG_PATH};
+use clap::Parser;
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn build_config(cli: Cli) -> Result<AppConfig, CliConfigError> {
     cli.into_config()
+}
+
+pub fn run_from_env() -> Result<(), AppError> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if let Some(config_file) = config_file_from_args(&args)? {
+        return run_config_file(config_file);
+    }
+    run(Cli::parse_from(args))
 }
 
 pub fn run(cli: Cli) -> Result<(), AppError> {
@@ -15,6 +26,19 @@ pub fn run(cli: Cli) -> Result<(), AppError> {
         return Ok(());
     }
     let config = build_config(cli)?;
+    run_config(config)
+}
+
+pub fn run_config_file(invocation: ConfigFileInvocation) -> Result<(), AppError> {
+    let mut config =
+        crate::config::load_config_toml(&invocation.path).map_err(AppError::ConfigFile)?;
+    if let Some(check_config) = invocation.check_config {
+        config.check_config = check_config;
+    }
+    run_config(config)
+}
+
+fn run_config(config: AppConfig) -> Result<(), AppError> {
     if let Some(warning) = config.security.warning() {
         eprintln!("warning: {warning}");
     }
@@ -36,6 +60,66 @@ pub fn run(cli: Cli) -> Result<(), AppError> {
         runtime.block_on(crate::runtime::run(config))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFileInvocation {
+    pub path: PathBuf,
+    pub check_config: Option<bool>,
+}
+
+fn config_file_from_args(args: &[OsString]) -> Result<Option<ConfigFileInvocation>, AppError> {
+    if args.len() == 1 {
+        return Ok(Some(ConfigFileInvocation {
+            path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            check_config: None,
+        }));
+    }
+    let mut config_path = None;
+    let mut check_config = None;
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == OsStr::new("--config") || arg == OsStr::new("-c") {
+            let Some(path) = args.get(index + 1) else {
+                return Err(AppError::ConfigFileArgumentMissing);
+            };
+            config_path = Some(PathBuf::from(path));
+            index += 2;
+            continue;
+        }
+        if arg == OsStr::new("--check-config") {
+            check_config = Some(true);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--config="))
+        {
+            config_path = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--check-config="))
+        {
+            check_config = Some(parse_bool_flag(value).ok_or(AppError::InvalidCheckConfigFlag)?);
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+    Ok(config_path.map(|path| ConfigFileInvocation { path, check_config }))
+}
+
+fn parse_bool_flag(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn runtime_worker_threads() -> usize {
@@ -81,6 +165,9 @@ fn next_restart_backoff(current: Duration, max: Duration) -> Duration {
 #[derive(Debug)]
 pub enum AppError {
     Config(CliConfigError),
+    ConfigFile(ConfigFileError),
+    ConfigFileArgumentMissing,
+    InvalidCheckConfigFlag,
     Runtime(crate::runtime::RuntimeError),
     BuildRuntime(std::io::Error),
 }
@@ -101,6 +188,9 @@ impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(err) => write!(f, "{err}"),
+            Self::ConfigFile(err) => write!(f, "{err}"),
+            Self::ConfigFileArgumentMissing => write!(f, "--config requires a file path"),
+            Self::InvalidCheckConfigFlag => write!(f, "--check-config value must be true or false"),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::BuildRuntime(err) => write!(f, "failed to build async runtime: {err}"),
         }
@@ -122,6 +212,51 @@ mod tests {
         assert_eq!(
             next_restart_backoff(Duration::from_millis(800), Duration::from_millis(1_000)),
             Duration::from_millis(1_000)
+        );
+    }
+
+    #[test]
+    fn config_file_invocation_defaults_to_config_toml_without_args() {
+        let args = vec![OsString::from("mptunnel")];
+        assert_eq!(
+            config_file_from_args(&args).expect("args"),
+            Some(ConfigFileInvocation {
+                path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                check_config: None,
+            })
+        );
+    }
+
+    #[test]
+    fn config_file_invocation_preserves_check_config_override() {
+        let args = vec![
+            OsString::from("mptunnel"),
+            OsString::from("--config"),
+            OsString::from("edge.toml"),
+            OsString::from("--check-config"),
+        ];
+        assert_eq!(
+            config_file_from_args(&args).expect("args"),
+            Some(ConfigFileInvocation {
+                path: PathBuf::from("edge.toml"),
+                check_config: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn config_file_invocation_accepts_false_check_config_override() {
+        let args = vec![
+            OsString::from("mptunnel"),
+            OsString::from("--check-config=false"),
+            OsString::from("--config=client.toml"),
+        ];
+        assert_eq!(
+            config_file_from_args(&args).expect("args"),
+            Some(ConfigFileInvocation {
+                path: PathBuf::from("client.toml"),
+                check_config: Some(false),
+            })
         );
     }
 }

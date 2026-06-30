@@ -1,5 +1,26 @@
 use super::*;
 
+pub(super) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
+    match lane {
+        FlowLane::Control | FlowLane::Latency => StreamDemandHint::latency(),
+        FlowLane::Throughput | FlowLane::Background => StreamDemandHint::throughput(),
+        FlowLane::RealtimeDatagram => StreamDemandHint::realtime(),
+    }
+}
+
+pub(super) fn flow_lane_from_stream_demand_hint(demand: StreamDemandHint) -> FlowLane {
+    let latency = demand.latency_weight_ppm;
+    let throughput = demand.throughput_weight_ppm;
+    let realtime = demand.realtime_weight_ppm;
+    if realtime > 0 && realtime >= latency && realtime >= throughput {
+        FlowLane::RealtimeDatagram
+    } else if throughput > 0 && throughput >= latency {
+        FlowLane::Throughput
+    } else {
+        FlowLane::Latency
+    }
+}
+
 pub(super) struct ServerUdpDatagramFlow {
     pub(super) flow_id: DatagramFlowId,
     pub(super) requests: mpsc::Sender<ServerUdpDatagramRequest>,
@@ -183,8 +204,17 @@ fn frame_subject(frame: &Frame) -> String {
             offset,
             payload.len()
         ),
-        Frame::StreamAck { stream_id, ranges } => {
-            format!("stream_id={} ranges={}", stream_id.0, ranges.len())
+        Frame::StreamAck {
+            stream_id,
+            complete,
+            ranges,
+        } => {
+            format!(
+                "stream_id={} complete={} ranges={}",
+                stream_id.0,
+                complete,
+                ranges.len()
+            )
         }
         Frame::StreamMaxData {
             stream_id,

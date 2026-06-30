@@ -8,6 +8,7 @@ use crate::protocol::auth::AuthError;
 use crate::protocol::{CloseReason, ResetReason};
 use crate::transport::PathSpecParseError;
 use crate::transport::encrypted::EncryptedFramedTransportError;
+use crate::transport::quic_carrier::QuicCarrierError;
 use crate::transport::tcp::TcpTransportError;
 use crate::transport::udp::UdpTransportError;
 use crate::transport::udp_carrier::{
@@ -23,6 +24,7 @@ pub enum RuntimeError {
     UdpCarrierTransport(UdpCarrierTransportError),
     UdpCarrierFrame(UdpCarrierFrameError),
     UdpCarrierConnection(UdpCarrierConnectionError),
+    QuicCarrier(QuicCarrierError),
     Auth(AuthError),
     Random(getrandom::Error),
     Socks5(Socks5Error),
@@ -40,6 +42,7 @@ pub enum RuntimeError {
     NoSchedulableTcpPath,
     NoSchedulableUdpPath,
     PathIdOverflow,
+    PathOpenTimedOut,
     PathHeartbeatTimeout,
     TcpPathSessionClosed,
     RemoteReset(ResetReason),
@@ -86,6 +89,12 @@ impl From<UdpCarrierFrameError> for RuntimeError {
 impl From<UdpCarrierConnectionError> for RuntimeError {
     fn from(value: UdpCarrierConnectionError) -> Self {
         Self::UdpCarrierConnection(value)
+    }
+}
+
+impl From<QuicCarrierError> for RuntimeError {
+    fn from(value: QuicCarrierError) -> Self {
+        Self::QuicCarrier(value)
     }
 }
 
@@ -147,6 +156,7 @@ impl std::fmt::Display for RuntimeError {
             Self::UdpCarrierTransport(err) => write!(f, "{err}"),
             Self::UdpCarrierFrame(err) => write!(f, "{err}"),
             Self::UdpCarrierConnection(err) => write!(f, "{err}"),
+            Self::QuicCarrier(err) => write!(f, "{err}"),
             Self::Auth(err) => write!(f, "{err}"),
             Self::Random(err) => write!(f, "random source failed: {err}"),
             Self::Socks5(err) => write!(f, "{err}"),
@@ -180,6 +190,7 @@ impl std::fmt::Display for RuntimeError {
                 )
             }
             Self::PathIdOverflow => write!(f, "configured paths exceed protocol path ID space"),
+            Self::PathOpenTimedOut => write!(f, "path stream open timed out"),
             Self::PathHeartbeatTimeout => write!(f, "TCP path heartbeat timed out"),
             Self::TcpPathSessionClosed => write!(f, "TCP path session closed"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
@@ -199,6 +210,7 @@ impl std::error::Error for RuntimeError {
             Self::UdpCarrierTransport(err) => Some(err),
             Self::UdpCarrierFrame(err) => Some(err),
             Self::UdpCarrierConnection(err) => Some(err),
+            Self::QuicCarrier(err) => Some(err),
             Self::Auth(err) => Some(err),
             Self::Random(_) => None,
             Self::Socks5(err) => Some(err),
@@ -216,6 +228,7 @@ impl std::error::Error for RuntimeError {
             | Self::NoSchedulableTcpPath
             | Self::NoSchedulableUdpPath
             | Self::PathIdOverflow
+            | Self::PathOpenTimedOut
             | Self::PathHeartbeatTimeout
             | Self::TcpPathSessionClosed
             | Self::RemoteReset(_)

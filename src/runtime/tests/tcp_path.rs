@@ -37,6 +37,27 @@ async fn tcp_path_latency_lane_reuse_depends_on_topology() {
     assert!(!first_latency.same_channel(&bulk));
 }
 
+#[test]
+fn mixed_reliable_underlays_share_one_logical_session() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11080".parse().expect("tcp path"),
+            "udp://127.0.0.1:11081".parse().expect("udp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert_eq!(context.tcp_sessions.len(), 1);
+    assert_eq!(context.udp_sessions.len(), 1);
+    assert_eq!(
+        context.tcp_sessions[0].session_id(),
+        context.udp_sessions[0].session_id(),
+        "TCP and UDP underlay paths must attach to the same reliable-stream session"
+    );
+}
+
 #[tokio::test]
 async fn tcp_path_control_command_bypasses_saturated_data_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);
@@ -109,6 +130,70 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
 }
 
 #[tokio::test]
+async fn tcp_path_stream_fin_bypasses_saturated_bulk_queue() {
+    let (tx, mut rx) = tcp_path_session_command_channels(1);
+    tx.send_frame(
+        Frame::StreamData {
+            stream_id: StreamId(30),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"bulk"),
+        },
+        FlowLane::Throughput,
+    )
+    .await
+    .expect("fill bulk data queue");
+
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        tx.send_frame(
+            Frame::StreamFin {
+                stream_id: StreamId(30),
+                final_offset: 4,
+            },
+            FlowLane::Throughput,
+        ),
+    )
+    .await
+    .expect("FIN should not wait behind bulk data")
+    .expect("queue FIN");
+
+    match recv_tcp_path_command(&mut rx).await.expect("first command") {
+        TcpPathSessionCommand::SendFrame(Frame::StreamFin {
+            stream_id,
+            final_offset,
+        }) => {
+            assert_eq!(stream_id, StreamId(30));
+            assert_eq!(final_offset, 4);
+        }
+        _ => panic!("expected prioritized stream FIN"),
+    }
+}
+
+#[tokio::test]
+async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
+    let (tx, mut rx) = tcp_path_session_command_channels(2);
+    let frame = Frame::StreamData {
+        stream_id: StreamId(13),
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"queued-bytes"),
+    };
+    let expected = frame_pacing_bytes(&frame) as u64;
+
+    tx.send_frame(frame, FlowLane::Throughput)
+        .await
+        .expect("queue frame");
+    assert_eq!(tx.pending_bytes(), expected);
+
+    assert!(matches!(
+        recv_tcp_path_command(&mut rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert_eq!(tx.pending_bytes(), 0);
+}
+
+#[tokio::test]
 async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
     let (tx, mut commands_rx) = tcp_path_session_command_channels(1);
     tx.send_frame(
@@ -173,6 +258,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
         stream_id,
         Frame::StreamAck {
             stream_id,
+            complete: true,
             ranges: Vec::new(),
         },
     )
@@ -255,323 +341,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
 }
 
 #[tokio::test]
-async fn server_tcp_binding_bulk_uses_active_until_alternate_has_better_eta() {
-    let (old_tx, mut old_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        old_tx,
-        FlowLane::Throughput,
-    );
-    let (new_tx, mut new_rx) = tcp_path_session_command_channels(4);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(1),
-        new_tx,
-        FlowLane::Throughput,
-        StreamOpenRole::Active,
-    );
-    assert_eq!(binding.lane(), FlowLane::Throughput);
-
-    let large_payload = Bytes::from(vec![7u8; 8 * 1024 * 1024]);
-    let large_len = large_payload.len() as u64;
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Throughput,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: large_payload,
-            },
-        )
-        .await
-        .expect("binding send active bulk");
-
-    assert!(matches!(
-        recv_tcp_path_command(&mut new_rx).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            offset: 0,
-            ..
-        }))
-    ));
-
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Throughput,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: large_len,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"bulk"),
-            },
-        )
-        .await
-        .expect("binding send alternate bulk");
-
-    assert!(matches!(
-        recv_tcp_path_command(&mut old_rx).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            offset,
-            ..
-        })) if offset == large_len
-    ));
-}
-
-#[tokio::test]
-async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
-    let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_initial_tx,
-        FlowLane::Latency,
-    );
-    let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(1),
-        path1_tx,
-        FlowLane::Latency,
-        StreamOpenRole::Active,
-    );
-    let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_repair_tx,
-        FlowLane::Latency,
-        StreamOpenRole::Active,
-    );
-
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Latency,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"repair"),
-            },
-        )
-        .await
-        .expect("send on promoted repair path");
-
-    match recv_tcp_path_command(&mut path0_repair_rx)
-        .await
-        .expect("path0 repair command")
-    {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData { payload, .. }) => {
-            assert_eq!(&payload[..], b"repair");
-        }
-        _ => panic!("expected data on promoted repair path"),
-    }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_tcp_path_command(&mut path1_rx)
-        )
-        .await
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn server_tcp_binding_bulk_repair_reattach_uses_alternate_under_pressure() {
-    let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_initial_tx,
-        FlowLane::Throughput,
-    );
-    let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(1),
-        path1_tx,
-        FlowLane::Throughput,
-        StreamOpenRole::Active,
-    );
-    let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_repair_tx,
-        FlowLane::Throughput,
-        StreamOpenRole::Repair,
-    );
-
-    let large_payload = Bytes::from(vec![9u8; 8 * 1024 * 1024]);
-    let large_len = large_payload.len() as u64;
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Throughput,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: large_payload,
-            },
-        )
-        .await
-        .expect("send active bulk frame");
-
-    assert!(matches!(
-        recv_tcp_path_command(&mut path0_repair_rx).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            offset: 0,
-            ..
-        }))
-    ));
-
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Throughput,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: large_len,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"bulk-repair"),
-            },
-        )
-        .await
-        .expect("send repair bulk frame");
-
-    assert!(matches!(
-        recv_tcp_path_command(&mut path1_rx).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            offset,
-            ..
-        })) if offset == large_len
-    ));
-}
-
-#[tokio::test]
-async fn server_tcp_binding_interactive_repair_reattach_promotes_for_auto_ramp() {
-    let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_initial_tx,
-        FlowLane::Latency,
-    );
-    let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(1),
-        path1_tx,
-        FlowLane::Latency,
-        StreamOpenRole::Active,
-    );
-    let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_repair_tx,
-        FlowLane::Latency,
-        StreamOpenRole::Repair,
-    );
-
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Latency,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"auto-ramp"),
-            },
-        )
-        .await
-        .expect("send on promoted interactive repair path");
-
-    match recv_tcp_path_command(&mut path0_repair_rx)
-        .await
-        .expect("interactive repair command")
-    {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData { payload, .. }) => {
-            assert_eq!(&payload[..], b"auto-ramp");
-        }
-        _ => panic!("expected data on promoted interactive repair path"),
-    }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_tcp_path_command(&mut path1_rx)
-        )
-        .await
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
-    let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_initial_tx,
-        FlowLane::Latency,
-    );
-    let (path1_tx, mut path1_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(1),
-        path1_tx,
-        FlowLane::RealtimeDatagram,
-        StreamOpenRole::Active,
-    );
-    let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
-    binding.attach(
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        path0_repair_tx,
-        FlowLane::RealtimeDatagram,
-        StreamOpenRole::Repair,
-    );
-
-    binding
-        .send_frame(
-            StreamId(7),
-            FlowLane::Throughput,
-            Frame::StreamData {
-                stream_id: StreamId(7),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"active"),
-            },
-        )
-        .await
-        .expect("send on active path");
-
-    match recv_tcp_path_command(&mut path1_rx)
-        .await
-        .expect("active path command")
-    {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData { payload, .. }) => {
-            assert_eq!(&payload[..], b"active");
-        }
-        _ => panic!("expected data on active path"),
-    }
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_tcp_path_command(&mut path0_repair_rx)
-        )
-        .await
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn server_tcp_relay_replays_response_repair_cache_on_path_reattach() {
+async fn server_tcp_relay_does_not_replay_whole_repair_cache_on_path_reattach() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(42);
     let (mut target_peer, target_side) = duplex(4096);
@@ -589,6 +359,7 @@ async fn server_tcp_relay_replays_response_repair_cache_on_path_reattach() {
             frames: frames_rx,
         },
         mux_limits,
+        SessionId(1),
     ));
 
     target_peer
@@ -624,26 +395,15 @@ async fn server_tcp_relay_replays_response_repair_cache_on_path_reattach() {
         }))
         .await
         .expect("reattach signal");
-    let replay = tokio::time::timeout(
-        Duration::from_secs(1),
+    let no_replay = tokio::time::timeout(
+        Duration::from_millis(100),
         recv_tcp_path_command(&mut commands_rx),
     )
-    .await
-    .expect("replay frame timeout")
-    .expect("replay frame");
-    match replay {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            stream_id: received_stream_id,
-            offset,
-            payload,
-            ..
-        }) => {
-            assert_eq!(received_stream_id, stream_id);
-            assert_eq!(offset, 0);
-            assert_eq!(&payload[..], b"response");
-        }
-        _ => panic!("expected replayed response stream data"),
-    }
+    .await;
+    assert!(
+        no_replay.is_err(),
+        "reattach without ACK gap must not emit whole-cache repair data"
+    );
 
     relay.abort();
     let _ = relay.await;
@@ -728,8 +488,8 @@ fn measured_path_latency_updates_next_scheduling_order() {
     )
     .expect("context");
 
-    context.mark_tcp_path_open_success(0, Duration::from_millis(120), FlowLane::Latency);
-    context.mark_tcp_path_open_success(1, Duration::from_millis(5), FlowLane::Latency);
+    context.mark_tcp_path_probe_success(0, Duration::from_millis(120));
+    context.mark_tcp_path_probe_success(1, Duration::from_millis(5));
 
     assert_eq!(
         context
@@ -797,7 +557,7 @@ fn bulk_striping_orders_paths_by_bulk_eta() {
     .expect("context");
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes)
+        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
             .first()
             .copied(),
         Some(1)
@@ -820,7 +580,7 @@ fn bulk_striping_skips_expensive_path() {
     .expect("context");
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes),
+        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
         vec![0]
     );
 }
@@ -859,7 +619,123 @@ fn bulk_repair_does_not_attach_worse_path_when_current_path_is_best() {
 }
 
 #[test]
-fn endpoint_only_tcp_bulk_striping_uses_all_healthy_paths_without_hints() {
+fn data_plane_failure_cools_path_for_active_reopen() {
+    let failed_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("failed path");
+    let survivor_path = "tcp://127.0.0.1:10131?srtt-ms=80&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("survivor path");
+    let context = ClientPathContext::new(
+        vec![failed_path, survivor_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_relay_path_data_plane_failure(UnderlayProtocol::Tcp, 0);
+
+    assert_eq!(
+        context.ordered_tcp_path_indices(FlowLane::Throughput, 64 * 1024),
+        vec![1]
+    );
+}
+
+#[test]
+fn data_plane_failure_requires_probe_success_before_bulk_readmission() {
+    let failed_fast_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("failed fast path");
+    let survivor_path = "tcp://127.0.0.1:10131?srtt-ms=80&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("survivor path");
+    let context = ClientPathContext::new(
+        vec![failed_fast_path, survivor_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_relay_path_data_plane_failure(UnderlayProtocol::Tcp, 0);
+    {
+        let mut health = context.health.lock().expect("path health");
+        health.tcp[0].failed_until = Some(Instant::now() - Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        context.ordered_reliable_bulk_striping_path_keys(64 * 1024),
+        vec![RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        }]
+    );
+    assert_eq!(
+        context.ordered_tcp_repair_path_indices(None, FlowLane::Throughput, 64 * 1024),
+        vec![1]
+    );
+
+    context.mark_tcp_path_probe_success(0, Duration::from_millis(20));
+
+    assert_eq!(
+        context
+            .ordered_reliable_bulk_striping_path_keys(64 * 1024)
+            .first()
+            .copied(),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        })
+    );
+}
+
+#[test]
+fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
+    let low_latency_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("low latency path");
+    let high_rtt_path = "tcp://127.0.0.1:10131?srtt-ms=900&jitter-ms=400&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("high rtt path");
+    let context = ClientPathContext::new(
+        vec![low_latency_path, high_rtt_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert_eq!(
+        tcp_relay_attach_open_timeout(
+            &context,
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            FlowLane::Latency,
+        ),
+        TCP_STREAM_STALL_MIN_TIMEOUT
+    );
+    assert!(
+        tcp_relay_attach_open_timeout(
+            &context,
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            },
+            FlowLane::Throughput,
+        ) <= TCP_STREAM_STALL_MAX_TIMEOUT
+    );
+}
+
+#[test]
+fn path_open_timeout_is_a_migratable_retryable_path_failure() {
+    let err = RuntimeError::PathOpenTimedOut;
+    assert!(stream_open_error_is_path_retryable(&err));
+    assert!(tcp_relay_error_is_migratable(&err));
+    assert!(relay_error_is_tcp_path_failure::<()>(&Err(err)));
+}
+
+#[test]
+fn endpoint_only_tcp_bulk_striping_admits_only_best_unmeasured_path() {
     let low_latency_path = "tcp://127.0.0.1:10132"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -877,13 +753,13 @@ fn endpoint_only_tcp_bulk_striping_uses_all_healthy_paths_without_hints() {
     .expect("context");
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes),
-        vec![0, 1, 2]
+        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        vec![0]
     );
 }
 
 #[test]
-fn endpoint_only_tcp_bulk_striping_waits_for_probe_evidence_after_bulk_promotion() {
+fn endpoint_only_tcp_bulk_striping_validates_unmeasured_paths_after_bulk_promotion() {
     let low_latency_path = "tcp://127.0.0.1:10162"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -909,8 +785,54 @@ fn endpoint_only_tcp_bulk_striping_waits_for_probe_evidence_after_bulk_promotion
     );
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes),
+        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
         vec![0]
+    );
+    assert_eq!(
+        context
+            .ordered_reliable_bulk_validation_path_keys(tcp_relay_buffer_len(MuxLimits::default()))
+            .into_iter()
+            .map(|key| key.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn mixed_bulk_validation_prioritizes_udp_path_scoped_proof() {
+    let tcp_active = "tcp://127.0.0.1:10172"
+        .parse::<PathSpec>()
+        .expect("active tcp path");
+    let tcp_probe = "tcp://127.0.0.1:10173"
+        .parse::<PathSpec>()
+        .expect("probe tcp path");
+    let udp_probe = "udp://127.0.0.1:10174"
+        .parse::<PathSpec>()
+        .expect("probe udp path");
+    let context = ClientPathContext::new(
+        vec![tcp_active, tcp_probe, udp_probe],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
+    context.change_relay_path_lane_load(
+        UnderlayProtocol::Tcp,
+        0,
+        FlowLane::Latency,
+        FlowLane::Throughput,
+    );
+
+    let candidates = context
+        .ordered_reliable_bulk_validation_path_keys(tcp_relay_buffer_len(MuxLimits::default()));
+
+    assert_eq!(
+        candidates
+            .into_iter()
+            .map(|key| (key.underlay, key.index))
+            .collect::<Vec<_>>(),
+        vec![(UnderlayProtocol::Udp, 0), (UnderlayProtocol::Tcp, 1)]
     );
 }
 
@@ -925,7 +847,7 @@ fn bulk_promotion_changes_active_path_lane_load_without_leaking_flow_accounting(
         let health = context.health.lock().expect("client path health lock");
         assert_eq!(health.tcp[0].active_flows, 1);
         assert_eq!(health.tcp[0].active_latency_sensitive_flows, 1);
-        assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
+        assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
     }
 
     context.change_relay_path_lane_load(
@@ -938,14 +860,14 @@ fn bulk_promotion_changes_active_path_lane_load_without_leaking_flow_accounting(
         let health = context.health.lock().expect("client path health lock");
         assert_eq!(health.tcp[0].active_flows, 1);
         assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
-        assert_eq!(health.tcp[0].load_bytes, TCP_STREAM_LOAD_BYTES);
+        assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
     }
 
     context.release_relay_path_load(UnderlayProtocol::Tcp, 0, FlowLane::Throughput);
     let health = context.health.lock().expect("client path health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
     assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
-    assert_eq!(health.tcp[0].load_bytes, 0);
+    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
 }
 
 #[test]
@@ -965,7 +887,7 @@ fn endpoint_only_tcp_bulk_striping_keeps_unknown_paths_out_of_measured_bulk_coho
 
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_path_inflight_bytes),
+        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
         vec![0]
     );
 }
@@ -1001,7 +923,7 @@ fn endpoint_only_udp_stream_startup_preserves_configured_order_on_probe_noise() 
 }
 
 #[test]
-fn endpoint_only_udp_stream_bulk_striping_uses_all_healthy_paths_without_hints() {
+fn endpoint_only_udp_stream_bulk_striping_admits_only_best_unmeasured_path() {
     let low_latency_path = "udp://127.0.0.1:10137"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -1019,19 +941,60 @@ fn endpoint_only_udp_stream_bulk_striping_uses_all_healthy_paths_without_hints()
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        )
-        .into_iter()
-        .filter_map(|key| (key.underlay == UnderlayProtocol::Udp).then_some(key.index))
-        .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
+            .into_iter()
+            .filter_map(|key| (key.underlay == UnderlayProtocol::Udp).then_some(key.index))
+            .collect::<Vec<_>>(),
+        vec![0]
     );
 }
 
 #[test]
-fn mixed_endpoint_only_bulk_striping_uses_tcp_and_udp_without_hints() {
+fn udp_bulk_repair_requires_delivery_evidence_when_stream_has_active_path() {
+    let active_path = "udp://127.0.0.1:10140"
+        .parse::<PathSpec>()
+        .expect("active path");
+    let probe_only_path = "udp://127.0.0.1:10141"
+        .parse::<PathSpec>()
+        .expect("probe path");
+    let context = ClientPathContext::new(
+        vec![active_path, probe_only_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_udp_path_probe_success(0, Duration::from_millis(20));
+    context.mark_udp_path_probe_success(1, Duration::from_millis(25));
+
+    assert!(
+        context
+            .ordered_udp_stream_repair_path_indices(Some(0), FlowLane::Throughput, 64 * 1024, true)
+            .is_empty()
+    );
+
+    context.mark_udp_path_delivery(
+        1,
+        PathDeliveryStats {
+            payload_bytes: 1024 * 1024,
+            first_payload_at: Some(Instant::now() - Duration::from_millis(80)),
+            last_payload_at: Some(Instant::now()),
+        },
+    );
+
+    assert_eq!(
+        context.ordered_udp_stream_repair_path_indices(
+            Some(0),
+            FlowLane::Throughput,
+            64 * 1024,
+            true
+        ),
+        vec![1]
+    );
+}
+
+#[test]
+fn mixed_endpoint_only_bulk_striping_admits_only_best_unmeasured_path() {
     let tcp_path = "tcp://127.0.0.1:10136"
         .parse::<PathSpec>()
         .expect("tcp path");
@@ -1046,20 +1009,11 @@ fn mixed_endpoint_only_bulk_striping_uses_tcp_and_udp_without_hints() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        ),
-        vec![
-            RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: 0,
-            },
-            RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index: 0,
-            },
-        ]
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        vec![RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        }]
     );
 }
 
@@ -1080,12 +1034,9 @@ fn mixed_endpoint_only_bulk_striping_keeps_udp_eligible_under_tcp_pressure() {
     context.reserve_tcp_path_load(0, FlowLane::Latency);
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        )
-        .first()
-        .copied(),
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
+            .first()
+            .copied(),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -1111,10 +1062,7 @@ fn mixed_endpoint_only_bulk_striping_keeps_measured_udp_without_unmeasured_tcp()
     context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        ),
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
         vec![RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -1141,17 +1089,15 @@ fn mixed_udp_repair_keeps_healthy_udp_eligible_on_active_tcp_stream() {
     .expect("context");
 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
-    assert_eq!(
+    assert!(
         context
             .ordered_udp_stream_repair_path_indices(
                 None,
                 FlowLane::Throughput,
-                MuxLimits::default().max_tcp_path_inflight_bytes,
+                MuxLimits::default().max_tcp_relay_chunk_bytes,
                 true,
             )
-            .first()
-            .copied(),
-        Some(1)
+            .is_empty()
     );
 
     let now = Instant::now();
@@ -1168,10 +1114,10 @@ fn mixed_udp_repair_keeps_healthy_udp_eligible_on_active_tcp_stream() {
         context.ordered_udp_stream_repair_path_indices(
             None,
             FlowLane::Throughput,
-            MuxLimits::default().max_tcp_path_inflight_bytes,
+            MuxLimits::default().max_tcp_relay_chunk_bytes,
             true,
         ),
-        vec![1, 0]
+        vec![1]
     );
 }
 
@@ -1191,17 +1137,15 @@ fn udp_repair_keeps_healthy_endpoint_only_path_eligible() {
     .expect("context");
 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
-    assert_eq!(
+    assert!(
         context
             .ordered_udp_stream_repair_path_indices(
                 Some(0),
                 FlowLane::Throughput,
-                MuxLimits::default().max_tcp_path_inflight_bytes,
+                MuxLimits::default().max_tcp_relay_chunk_bytes,
                 true,
             )
-            .first()
-            .copied(),
-        Some(1)
+            .is_empty()
     );
 
     let now = Instant::now();
@@ -1218,7 +1162,7 @@ fn udp_repair_keeps_healthy_endpoint_only_path_eligible() {
         context.ordered_udp_stream_repair_path_indices(
             Some(0),
             FlowLane::Throughput,
-            MuxLimits::default().max_tcp_path_inflight_bytes,
+            MuxLimits::default().max_tcp_relay_chunk_bytes,
             true,
         ),
         vec![1]
@@ -1241,12 +1185,9 @@ fn mixed_bulk_striping_orders_better_udp_before_tcp() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        )
-        .first()
-        .copied(),
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
+            .first()
+            .copied(),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -1270,10 +1211,7 @@ fn mixed_bulk_striping_suppresses_catastrophically_worse_udp_candidate() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        ),
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
         vec![RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -1306,12 +1244,9 @@ fn mixed_bulk_striping_penalizes_lossy_high_rtt_udp_carrier() {
     );
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(
-            &context,
-            MuxLimits::default().max_tcp_path_inflight_bytes
-        )
-        .first()
-        .copied(),
+        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
+            .first()
+            .copied(),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -1337,7 +1272,7 @@ fn mixed_bulk_striping_can_choose_best_carrier_without_active_cohort() {
     assert_eq!(
         context
             .ordered_reliable_bulk_striping_path_keys(
-                MuxLimits::default().max_tcp_path_inflight_bytes
+                MuxLimits::default().max_tcp_relay_chunk_bytes
             )
             .first()
             .copied(),
@@ -1500,22 +1435,22 @@ async fn repair_race_attach_preserves_active_data_path() {
 }
 
 #[tokio::test]
-async fn bulk_relay_stripes_stream_data_across_attached_paths() {
+async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
     let stream_id = StreamId(146);
-    let (first_stream, mut first_commands, _first_frames) =
+    let (active_stream, mut active_commands, _active_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = TcpRelayRemoteSet::new(first_stream, 8);
-    let (second_stream, mut second_commands, _second_frames) =
+    let mut remotes = TcpRelayRemoteSet::new(active_stream, 8);
+    let (repair_stream, mut repair_commands, _repair_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
-    remotes.attach(second_stream);
+    remotes.attach_for_repair(repair_stream);
     let context = ClientPathContext::new(
         vec![
             "tcp://127.0.0.1:11146?srtt-ms=40&rate-mbps=100"
                 .parse()
-                .expect("first path"),
+                .expect("active path"),
             "tcp://127.0.0.1:11147?srtt-ms=40&rate-mbps=100"
                 .parse()
-                .expect("second path"),
+                .expect("repair path"),
         ],
         security(),
         ResourceLimits::default(),
@@ -1535,14 +1470,14 @@ async fn bulk_relay_stripes_stream_data_across_attached_paths() {
         )
         .await
         .expect("first send");
-    match recv_tcp_path_command(&mut first_commands)
+    match recv_tcp_path_command(&mut active_commands)
         .await
-        .expect("first path command")
+        .expect("active path first command")
     {
         TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => {
             assert_eq!(offset, 0);
         }
-        _ => panic!("expected first bulk chunk on first path"),
+        _ => panic!("expected first bulk chunk on active path"),
     }
 
     let second_payload = Bytes::from(vec![2u8; 64 * 1024]);
@@ -1558,15 +1493,148 @@ async fn bulk_relay_stripes_stream_data_across_attached_paths() {
         )
         .await
         .expect("second send");
-    match recv_tcp_path_command(&mut second_commands)
+    match recv_tcp_path_command(&mut active_commands)
         .await
-        .expect("second path command")
+        .expect("active path second command")
     {
         TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => {
             assert_eq!(offset, 64 * 1024);
         }
-        _ => panic!("expected second bulk chunk on second path"),
+        _ => panic!("expected second bulk chunk on active path"),
     }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut repair_commands)
+        )
+        .await
+        .is_err(),
+        "repair attachment must not receive ordinary bulk data"
+    );
+}
+
+#[tokio::test]
+async fn bulk_relay_validation_path_can_receive_admitted_probe_data() {
+    let stream_id = StreamId(149);
+    let (active_stream, mut active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = TcpRelayRemoteSet::new(active_stream, 8);
+    let (validation_stream, mut validation_commands, _validation_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
+    remotes.attach_for_validation(validation_stream);
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11160?srtt-ms=180&rate-mbps=40"
+                .parse()
+                .expect("slower active path"),
+            "tcp://127.0.0.1:11161?srtt-ms=20&rate-mbps=200"
+                .parse()
+                .expect("validation path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_tcp_path_open_success(0, Duration::from_millis(180), FlowLane::Throughput);
+    context.mark_tcp_path_open_success(1, Duration::from_millis(20), FlowLane::Throughput);
+
+    remotes
+        .send_frame(
+            &context,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![8u8; 64 * 1024]),
+            },
+        )
+        .await
+        .expect("send admitted validation bulk");
+
+    match tokio::time::timeout(
+        Duration::from_millis(100),
+        recv_tcp_path_command(&mut validation_commands),
+    )
+    .await
+    .expect("validation path timeout")
+    .expect("validation path command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => {
+            assert_eq!(offset, 0);
+        }
+        _ => panic!("expected validation path to receive admitted probe data"),
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut active_commands)
+        )
+        .await
+        .is_err(),
+        "slower active path should not keep validation probe data"
+    );
+}
+
+#[tokio::test]
+async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
+    let stream_id = StreamId(148);
+    let (best_stream, mut best_commands, _best_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = TcpRelayRemoteSet::new(best_stream, 8);
+    let (slow_active_stream, mut slow_active_commands, _slow_active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
+    remotes.attach(slow_active_stream);
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11158?srtt-ms=20&rate-mbps=200"
+                .parse()
+                .expect("better path"),
+            "tcp://127.0.0.1:11159?srtt-ms=180&rate-mbps=40"
+                .parse()
+                .expect("uncompetitive active path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Throughput);
+    context.mark_tcp_path_open_success(1, Duration::from_millis(180), FlowLane::Throughput);
+
+    remotes
+        .send_frame(
+            &context,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![4u8; 64 * 1024]),
+            },
+        )
+        .await
+        .expect("send bulk through ECF-gated peer path");
+
+    match tokio::time::timeout(
+        Duration::from_millis(100),
+        recv_tcp_path_command(&mut best_commands),
+    )
+    .await
+    .expect("best path timeout")
+    .expect("best path command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => {
+            assert_eq!(offset, 0);
+        }
+        _ => panic!("expected measured better path to carry admitted TCP bulk data"),
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut slow_active_commands)
+        )
+        .await
+        .is_err(),
+        "uncompetitive active path should not keep bulk when ECF admits a better path"
+    );
 }
 
 #[tokio::test]
@@ -1598,6 +1666,21 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         .expect("fast repair path")
         .instance();
 
+    assert!(
+        !tcp_relay_delivery_path_should_become_active(
+            &context,
+            remotes.active_path_key(),
+            fast_instance.key,
+            FlowLane::Throughput,
+            64 * 1024,
+        ),
+        "bulk promotion needs measured delivery, not only path hints"
+    );
+    context.mark_relay_path_rate_sample(
+        UnderlayProtocol::Udp,
+        0,
+        PathRateSample::new(512 * 1024, Duration::from_millis(50)).expect("rate sample"),
+    );
     assert!(tcp_relay_delivery_path_should_become_active(
         &context,
         remotes.active_path_key(),
@@ -1656,7 +1739,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
 }
 
 #[tokio::test]
-async fn mixed_relay_path_status_active_replays_repair_cache_on_instance() {
+async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_instance() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(45);
     let (commands, mut command_rx) = tcp_path_session_command_channels(4);
@@ -1682,26 +1765,104 @@ async fn mixed_relay_path_status_active_replays_repair_cache_on_instance() {
         .expect("repair data");
 
     assert!(
-        remotes
-            .replay_repair_cache_to_instance(instance, &send_stream, false, usize::MAX)
+        !remotes
+            .send_attach_control_to_instance(instance, &send_stream, false)
             .await
-            .expect("replay")
+            .expect("repair replay decision"),
+        "reattach without an explicit ACK gap must not emit whole-cache repair data"
     );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            recv_tcp_path_command(&mut command_rx)
+        )
+        .await
+        .is_err(),
+        "repair emission must be gap-targeted instead of whole-cache"
+    );
+}
 
+#[tokio::test]
+async fn server_bulk_output_waits_when_active_path_exceeds_admission_budget() {
+    let mux_limits = MuxLimits {
+        max_tcp_path_inflight_bytes: 16 * 1024,
+        max_reorder_bytes: 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let (commands, mut command_rx) = tcp_path_session_command_channels(8);
+    let binding = ServerTcpStreamBinding::new_with_limits(
+        SessionId(1),
+        UnderlayProtocol::Udp,
+        PathId(0),
+        commands,
+        FlowLane::Throughput,
+        mux_limits,
+    );
+    let stream_id = StreamId(80);
+    let first_payload = Bytes::from(vec![1u8; mux_limits.max_tcp_path_inflight_bytes]);
+    binding
+        .send_frame(
+            stream_id,
+            FlowLane::Throughput,
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: first_payload,
+            },
+        )
+        .await
+        .expect("first bulk send")
+        .expect("selected path");
     match recv_tcp_path_command(&mut command_rx)
         .await
-        .expect("replay command")
+        .expect("first queued command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => assert_eq!(offset, 0),
+        _ => panic!("expected first stream data frame"),
+    }
+
+    let pending_binding = binding.clone();
+    let pending = tokio::spawn(async move {
+        pending_binding
+            .send_frame(
+                stream_id,
+                FlowLane::Throughput,
+                Frame::StreamData {
+                    stream_id,
+                    offset: mux_limits.max_tcp_path_inflight_bytes as u64,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"x"),
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !pending.is_finished(),
+        "bulk send should wait while the active path is over admission budget"
+    );
+
+    binding.release_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: mux_limits.max_tcp_path_inflight_bytes as u64,
+    }]);
+    tokio::time::timeout(Duration::from_millis(200), pending)
+        .await
+        .expect("send should wake after ACK release")
+        .expect("join pending send")
+        .expect("second bulk send")
+        .expect("selected path");
+    match recv_tcp_path_command(&mut command_rx)
+        .await
+        .expect("second queued command")
     {
         TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            stream_id: received_stream_id,
-            offset,
-            payload,
-            ..
+            offset, payload, ..
         }) => {
-            assert_eq!(received_stream_id, stream_id);
-            assert_eq!(offset, 0);
-            assert_eq!(&payload[..], b"repair");
+            assert_eq!(offset, mux_limits.max_tcp_path_inflight_bytes as u64);
+            assert_eq!(payload, Bytes::from_static(b"x"));
         }
-        _ => panic!("expected replayed repair data"),
+        _ => panic!("expected second stream data frame"),
     }
 }

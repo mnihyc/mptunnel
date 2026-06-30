@@ -1,11 +1,12 @@
 use crate::config::{
-    AppConfig, CipherSuite, ClientConfig, CommandConfig, DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS,
-    DEFAULT_DATAGRAM_QUEUE_BYTES, DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
-    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES,
-    DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, ResourceLimits,
-    SecurityConfig, ServerConfig, ServiceConfig, SharedSecret,
+    AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig,
+    DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
+    DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
+    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
+    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
+    DEFAULT_TCP_PATH_INFLIGHT_BYTES, ManagementConfig, ResourceLimits, SecurityConfig,
+    ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
@@ -74,6 +75,9 @@ pub struct Cli {
     #[command(flatten)]
     pub service: ServiceArgs,
 
+    #[command(flatten)]
+    pub management: ManagementArgs,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -87,8 +91,8 @@ impl Cli {
             self.auth_freshness_window_seconds,
         )?;
         let command = match self.command {
-            Command::Client(args) => CommandConfig::Client(args.into_config()?),
-            Command::Server(args) => CommandConfig::Server(args.into_config()?),
+            Command::Client(args) => CommandConfig::Client(args.into_config(security.clone())?),
+            Command::Server(args) => CommandConfig::Server(args.into_config(security.clone())?),
             Command::Platform(_) => return Err(CliConfigError::PlatformCommandNotRuntimeConfig),
         };
         let config = AppConfig {
@@ -96,11 +100,39 @@ impl Cli {
             check_config: self.check_config,
             service: self.service.into_config(),
             resources: self.resources.into_limits(),
+            management: self.management.into_config(),
             security,
             command,
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ManagementArgs {
+    #[arg(
+        long = "management-listen",
+        global = true,
+        env = "MPTUNNEL_MANAGEMENT_LISTEN",
+        value_delimiter = ','
+    )]
+    pub listen: Vec<SocketAddr>,
+
+    #[arg(
+        long = "management-token",
+        global = true,
+        env = "MPTUNNEL_MANAGEMENT_TOKEN"
+    )]
+    pub token: Option<String>,
+}
+
+impl ManagementArgs {
+    fn into_config(self) -> ManagementConfig {
+        ManagementConfig {
+            listen: self.listen,
+            token: self.token,
+        }
     }
 }
 
@@ -429,21 +461,24 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    fn into_config(self) -> Result<ClientConfig, CliConfigError> {
+    fn into_config(self, security: SecurityConfig) -> Result<ClientConfig, CliConfigError> {
         let socks5_listen = combined_socks5_listen(&self);
         let http_connect_enabled = !self.http_listen.is_empty();
         let tun_enabled = tun_requested(&self);
         let socks5_enabled = !socks5_listen.is_empty() || (!http_connect_enabled && !tun_enabled);
+        let proxy_auth = proxy_auth_config(self.proxy_username, self.proxy_password)?;
 
         let mut ingresses = Vec::with_capacity(3);
         if socks5_enabled {
             ingresses.push(IngressConfig::Socks5 {
                 listen: listen_or_default(socks5_listen, 1080),
+                proxy_auth: proxy_auth.clone(),
             });
         }
         if http_connect_enabled {
             ingresses.push(IngressConfig::HttpConnect {
                 listen: self.http_listen.clone(),
+                proxy_auth: proxy_auth.clone(),
             });
         }
         if tun_enabled {
@@ -472,9 +507,18 @@ impl ClientArgs {
             }));
         }
         Ok(ClientConfig {
+            route_target: None,
             ingresses,
-            proxy_auth: proxy_auth_config(self.proxy_username, self.proxy_password)?,
-            paths: self.paths,
+            proxy_auth: ProxyAuthConfig::disabled(),
+            paths: self
+                .paths
+                .into_iter()
+                .map(|spec| ClientPathConfig {
+                    spec,
+                    security: security.clone(),
+                })
+                .collect(),
+            security,
             path_probe_interval: Duration::from_millis(self.path_probe_interval_ms),
             path_probe_timeout: Duration::from_millis(self.path_probe_timeout_ms),
         })
@@ -568,7 +612,7 @@ pub struct ServerArgs {
 }
 
 impl ServerArgs {
-    fn into_config(self) -> Result<ServerConfig, CliConfigError> {
+    fn into_config(self, security: SecurityConfig) -> Result<ServerConfig, CliConfigError> {
         let outbound = match self.outbound {
             OutboundArg::Direct => OutboundConfig::Direct,
             OutboundArg::Bind => OutboundConfig::BindSourceIp(
@@ -592,7 +636,10 @@ impl ServerArgs {
             },
         };
         Ok(ServerConfig {
+            tag: None,
+            route_target: None,
             bind_paths: self.bind_paths,
+            security,
             outbound,
             outbound_dns: DnsConfig {
                 resolvers: self.outbound_dns_resolvers,
@@ -736,7 +783,8 @@ mod tests {
                 assert_eq!(
                     client.ingresses,
                     vec![IngressConfig::Socks5 {
-                        listen: vec!["127.0.0.1:1080".parse().expect("listen")]
+                        listen: vec!["127.0.0.1:1080".parse().expect("listen")],
+                        proxy_auth: ProxyAuthConfig::disabled(),
                     }]
                 );
                 assert_eq!(
@@ -748,7 +796,7 @@ mod tests {
                     crate::config::DEFAULT_PATH_PROBE_TIMEOUT
                 );
             }
-            CommandConfig::Server(_) => panic!("expected client config"),
+            CommandConfig::Server(_) | CommandConfig::Node(_) => panic!("expected client config"),
         }
     }
 
@@ -778,7 +826,8 @@ mod tests {
                 listen: vec![
                     "127.0.0.1:8080".parse().expect("ipv4 listen"),
                     "[::1]:8080".parse().expect("ipv6 listen"),
-                ]
+                ],
+                proxy_auth: ProxyAuthConfig::disabled(),
             }]
         );
     }
@@ -807,10 +856,12 @@ mod tests {
             client.ingresses,
             vec![
                 IngressConfig::Socks5 {
-                    listen: vec!["127.0.0.1:1080".parse().expect("socks listen")]
+                    listen: vec!["127.0.0.1:1080".parse().expect("socks listen")],
+                    proxy_auth: ProxyAuthConfig::disabled(),
                 },
                 IngressConfig::HttpConnect {
-                    listen: vec!["127.0.0.1:8080".parse().expect("http listen")]
+                    listen: vec!["127.0.0.1:8080".parse().expect("http listen")],
+                    proxy_auth: ProxyAuthConfig::disabled(),
                 },
             ]
         );
@@ -836,9 +887,12 @@ mod tests {
         let CommandConfig::Client(client) = config.command else {
             panic!("expected client config");
         };
-        assert!(client.proxy_auth.is_required());
-        assert!(client.proxy_auth.verify("operator", "secret"));
-        assert!(!client.proxy_auth.verify("operator", "wrong"));
+        let [IngressConfig::Socks5 { proxy_auth, .. }] = client.ingresses.as_slice() else {
+            panic!("expected default SOCKS5 ingress");
+        };
+        assert!(proxy_auth.is_required());
+        assert!(proxy_auth.verify("operator", "secret"));
+        assert!(!proxy_auth.verify("operator", "wrong"));
 
         let cli = Cli::try_parse_from([
             "mptunnel",
@@ -881,10 +935,12 @@ mod tests {
             client.ingresses,
             vec![
                 IngressConfig::Socks5 {
-                    listen: vec!["127.0.0.1:1080".parse().expect("socks listen")]
+                    listen: vec!["127.0.0.1:1080".parse().expect("socks listen")],
+                    proxy_auth: ProxyAuthConfig::disabled(),
                 },
                 IngressConfig::HttpConnect {
-                    listen: vec!["127.0.0.1:8080".parse().expect("http listen")]
+                    listen: vec!["127.0.0.1:8080".parse().expect("http listen")],
+                    proxy_auth: ProxyAuthConfig::disabled(),
                 },
             ]
         );
@@ -1158,13 +1214,13 @@ mod tests {
             client
                 .paths
                 .iter()
-                .any(|path| { path.underlay == crate::protocol::UnderlayProtocol::Tcp })
+                .any(|path| { path.spec.underlay == crate::protocol::UnderlayProtocol::Tcp })
         );
         assert!(
             client
                 .paths
                 .iter()
-                .any(|path| { path.underlay == crate::protocol::UnderlayProtocol::Udp })
+                .any(|path| { path.spec.underlay == crate::protocol::UnderlayProtocol::Udp })
         );
     }
 

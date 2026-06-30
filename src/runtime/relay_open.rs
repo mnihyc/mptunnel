@@ -20,6 +20,7 @@ pub(super) struct RelayPathInstance {
 pub(super) struct TcpRelayRemotePath {
     pub(super) path_index: usize,
     pub(super) instance_id: u64,
+    pub(super) placement: RelayPathPlacement,
     pub(super) stream: TcpPathStreamHandle,
 }
 
@@ -78,7 +79,9 @@ impl TcpRelayRemoteSet {
     }
 
     pub(super) fn active_path_instance(&self) -> Option<RelayPathInstance> {
-        self.paths.last().map(TcpRelayRemotePath::instance)
+        self.active_path_position()
+            .and_then(|position| self.paths.get(position))
+            .map(TcpRelayRemotePath::instance)
     }
 
     pub(super) fn active_path_key(&self) -> Option<RelayPathKey> {
@@ -89,12 +92,22 @@ impl TcpRelayRemoteSet {
         self.paths
             .iter()
             .rev()
-            .find(|path| path.stream.underlay == underlay)
+            .find(|path| {
+                path.stream.underlay == underlay && path.placement == RelayPathPlacement::Active
+            })
+            .or_else(|| {
+                self.paths
+                    .iter()
+                    .rev()
+                    .find(|path| path.stream.underlay == underlay)
+            })
             .map(|path| path.path_index)
     }
 
     pub(super) fn active_carrier_underlay(&self) -> Option<UnderlayProtocol> {
-        self.paths.last().map(|path| path.stream.underlay)
+        self.active_path_position()
+            .and_then(|position| self.paths.get(position))
+            .map(|path| path.stream.underlay)
     }
 
     pub(super) fn contains_path_key(&self, key: RelayPathKey) -> bool {
@@ -143,7 +156,11 @@ impl TcpRelayRemoteSet {
     }
 
     pub(super) fn attach_for_repair(&mut self, opened: OpenedRemoteStream) {
-        self.attach_with_placement(opened, RelayPathPlacement::PreserveActive);
+        self.attach_with_placement(opened, RelayPathPlacement::Repair);
+    }
+
+    pub(super) fn attach_for_validation(&mut self, opened: OpenedRemoteStream) {
+        self.attach_with_placement(opened, RelayPathPlacement::Validation);
     }
 
     fn attach_with_placement(&mut self, opened: OpenedRemoteStream, placement: RelayPathPlacement) {
@@ -186,12 +203,17 @@ impl TcpRelayRemoteSet {
         let path = TcpRelayRemotePath {
             path_index,
             instance_id,
+            placement,
             stream,
         };
         let insert_at = match placement {
             RelayPathPlacement::Active => self.paths.len(),
-            RelayPathPlacement::PreserveActive if self.paths.is_empty() => self.paths.len(),
-            RelayPathPlacement::PreserveActive => self.paths.len() - 1,
+            RelayPathPlacement::Repair | RelayPathPlacement::Validation
+                if self.paths.is_empty() =>
+            {
+                self.paths.len()
+            }
+            RelayPathPlacement::Repair | RelayPathPlacement::Validation => self.paths.len() - 1,
         };
         if insert_at < self.paths.len() && self.next_send_index >= insert_at {
             self.next_send_index = self.next_send_index.saturating_add(1);
@@ -214,7 +236,17 @@ impl TcpRelayRemoteSet {
         context: &ClientPathContext,
         frame: Frame,
     ) -> Result<RelayPathKey, RuntimeError> {
-        self.send_frame_with_avoid(context, frame, &[]).await
+        self.send_frame_with_avoid(context, frame, &[], None).await
+    }
+
+    pub(super) async fn send_frame_with_flight_ledger(
+        &mut self,
+        context: &ClientPathContext,
+        frame: Frame,
+        path_flights: &RelayPathFlightLedger,
+    ) -> Result<RelayPathKey, RuntimeError> {
+        self.send_frame_with_avoid(context, frame, &[], Some(path_flights))
+            .await
     }
 
     pub(super) async fn send_repair_frame(
@@ -223,7 +255,27 @@ impl TcpRelayRemoteSet {
         frame: Frame,
         avoid_keys: &[RelayPathKey],
     ) -> Result<RelayPathKey, RuntimeError> {
-        self.send_frame_with_avoid(context, frame, avoid_keys).await
+        self.send_frame_with_avoid(context, frame, avoid_keys, None)
+            .await
+    }
+
+    pub(super) fn bulk_send_ready_for_extent(
+        &self,
+        context: &ClientPathContext,
+        lane: FlowLane,
+        offset: u64,
+        payload_bytes: usize,
+        path_flights: &RelayPathFlightLedger,
+    ) -> bool {
+        bulk_relay_send_ready_for_extent(
+            context,
+            &self.paths,
+            lane,
+            offset,
+            payload_bytes,
+            self.next_send_index,
+            path_flights,
+        )
     }
 
     async fn send_frame_with_avoid(
@@ -231,6 +283,7 @@ impl TcpRelayRemoteSet {
         context: &ClientPathContext,
         frame: Frame,
         avoid_keys: &[RelayPathKey],
+        path_flights: Option<&RelayPathFlightLedger>,
     ) -> Result<RelayPathKey, RuntimeError> {
         let mut last_error = None;
         let stream_lane = self
@@ -241,25 +294,48 @@ impl TcpRelayRemoteSet {
         let prefer_current_data_path =
             tcp_relay_frame_prefers_current_data_path(&frame, stream_lane);
         while !self.paths.is_empty() {
-            if let Some(position) = choose_bulk_relay_path_avoiding(
+            let selected_by_bulk_admission = match choose_bulk_relay_path_avoiding(
                 context,
                 &self.paths,
                 stream_lane,
                 &frame,
                 self.next_send_index,
                 avoid_keys,
+                path_flights,
             ) {
-                self.next_send_index = position;
-            } else if prefer_current_data_path
-                || self.paths.last().is_some_and(|path| {
-                    tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
-                        &frame,
-                        path.stream.lane,
-                    ))
-                })
-            {
-                self.next_send_index = self.paths.len() - 1;
-            }
+                BulkRelayPathChoice::Selected(position) => {
+                    self.next_send_index = position;
+                    true
+                }
+                BulkRelayPathChoice::Blocked => {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "sender_admission_blocked",
+                        format_args!(
+                            "stream_id={} lane={:?} reason=bulk_no_safe_path",
+                            self.stream_id.0, stream_lane,
+                        ),
+                    );
+                    tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                    continue;
+                }
+                BulkRelayPathChoice::NotApplicable
+                    if prefer_current_data_path
+                        || relay_frame_is_bulk_stream_data(&frame, stream_lane)
+                        || self.paths.last().is_some_and(|path| {
+                            tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
+                                &frame,
+                                path.stream.lane,
+                            ))
+                        }) =>
+                {
+                    self.next_send_index = self.paths.len() - 1;
+                    false
+                }
+                BulkRelayPathChoice::NotApplicable => false,
+            };
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = selected_by_bulk_admission;
             self.next_send_index %= self.paths.len();
             if avoid_keys.contains(&self.paths[self.next_send_index].key())
                 && let Some(position) = self
@@ -287,12 +363,17 @@ impl TcpRelayRemoteSet {
                         lab_diagnostic(
                             "scheduler_decision",
                             format_args!(
-                                "stream_id={} lane={:?} path_underlay={:?} path_index={} payload_bytes={} reason=bulk_stripe",
+                                "stream_id={} lane={:?} path_underlay={:?} path_index={} payload_bytes={} reason={}",
                                 self.stream_id.0,
                                 stream_lane,
                                 instance.key.underlay,
                                 instance.key.index,
                                 sent_bytes,
+                                if selected_by_bulk_admission {
+                                    "bulk_admission"
+                                } else {
+                                    "active_or_round_robin"
+                                },
                             ),
                         );
                     }
@@ -332,6 +413,7 @@ impl TcpRelayRemoteSet {
             target: spec.target.clone(),
             ingress: spec.ingress,
             outbound: OutboundPolicy::Direct,
+            demand: stream_demand_hint_for_lane(lane),
             role: StreamOpenRole::Active,
         };
         match output
@@ -362,7 +444,7 @@ impl TcpRelayRemoteSet {
         let Some(path) = self.remove_path_instance(instance) else {
             return false;
         };
-        context.mark_relay_path_failure(path.stream.underlay, path.path_index);
+        context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
         context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
         path.stream.close().await;
         true
@@ -376,7 +458,7 @@ impl TcpRelayRemoteSet {
         let Some(path) = self.remove_path_key(key) else {
             return false;
         };
-        context.mark_relay_path_failure(path.stream.underlay, path.path_index);
+        context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
         context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
         path.stream.close().await;
         true
@@ -419,18 +501,25 @@ impl TcpRelayRemoteSet {
         if position + 1 == self.paths.len() {
             return false;
         }
-        let path = self.paths.remove(position);
+        let mut path = self.paths.remove(position);
+        path.placement = RelayPathPlacement::Active;
         self.paths.push(path);
         self.next_send_index = 0;
         true
     }
 
-    pub(super) async fn replay_repair_cache_to_instance(
+    fn active_path_position(&self) -> Option<usize> {
+        self.paths
+            .iter()
+            .rposition(|path| path.placement == RelayPathPlacement::Active)
+            .or_else(|| self.paths.len().checked_sub(1))
+    }
+
+    pub(super) async fn send_attach_control_to_instance(
         &mut self,
         instance: RelayPathInstance,
         send_stream: &ReliableSendStream,
         resend_fin: bool,
-        byte_limit: usize,
     ) -> Result<bool, RuntimeError> {
         let Some(position) = self
             .paths
@@ -439,9 +528,7 @@ impl TcpRelayRemoteSet {
         else {
             return Ok(false);
         };
-        for frame in send_stream.retransmission_frames_limited(byte_limit) {
-            self.paths[position].stream.send_frame(frame).await?;
-        }
+        let mut sent = false;
         if resend_fin {
             self.paths[position]
                 .stream
@@ -450,15 +537,18 @@ impl TcpRelayRemoteSet {
                     final_offset: send_stream.next_offset(),
                 })
                 .await?;
+            sent = true;
         }
-        Ok(true)
+        let _ = send_stream;
+        Ok(sent)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RelayPathPlacement {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelayPathPlacement {
     Active,
-    PreserveActive,
+    Repair,
+    Validation,
 }
 
 #[derive(Clone)]
@@ -552,17 +642,56 @@ pub(super) async fn open_remote_stream_on_path(
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     context.reserve_tcp_path_load(path_index, lane);
-    match open_remote_stream_on_reserved_path(
-        context, stream_id, target, ingress, lane, path_index, role,
+    let open_timeout = tcp_relay_attach_open_timeout(
+        context,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: path_index,
+        },
+        lane,
+    );
+    let open_result = tokio::time::timeout(
+        open_timeout,
+        open_remote_stream_on_reserved_path(
+            context, stream_id, target, ingress, lane, path_index, role,
+        ),
     )
-    .await
-    {
-        Ok(opened) => Ok(opened),
-        Err(err) => {
+    .await;
+    match open_result {
+        Ok(Ok(opened)) => Ok(opened),
+        Ok(Err(err)) => {
             context.release_tcp_path_load(path_index, lane);
             Err(err)
         }
+        Err(_) => {
+            context.release_tcp_path_load(path_index, lane);
+            context.mark_tcp_path_data_plane_failure(path_index);
+            if let Some(session) = context.tcp_sessions.get(path_index) {
+                session.cancel_stream_open(lane, stream_id).await;
+            }
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "reliable_stream_open_timeout",
+                format_args!(
+                    "stream_id={} underlay=tcp path_index={} lane={:?} role={:?} timeout_ms={}",
+                    stream_id.0,
+                    path_index,
+                    lane,
+                    role,
+                    open_timeout.as_millis(),
+                ),
+            );
+            Err(RuntimeError::PathOpenTimedOut)
+        }
     }
+}
+
+pub(super) fn tcp_relay_attach_open_timeout(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    lane: FlowLane,
+) -> Duration {
+    tcp_relay_stall_timeout(relay_path_snapshot(context, key), lane)
 }
 
 pub(super) async fn open_remote_stream_on_reserved_path(
@@ -596,6 +725,7 @@ pub(super) async fn open_remote_stream_on_reserved_path(
         .await?;
     let elapsed = started_at.elapsed();
     context.mark_tcp_path_reserved_open_success(path_index, elapsed);
+    send_open_path_metrics(context, &stream, UnderlayProtocol::Tcp, path_index).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -719,6 +849,7 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         .await?;
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed);
+    send_open_path_metrics(context, &stream, UnderlayProtocol::Udp, path_index).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -733,6 +864,20 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         ),
     );
     Ok(OpenedRemoteStream { stream, path_index })
+}
+
+async fn send_open_path_metrics(
+    context: &ClientPathContext,
+    stream: &TcpPathStream,
+    underlay: UnderlayProtocol,
+    path_index: usize,
+) -> Result<(), RuntimeError> {
+    let Some(metrics) = context.relay_path_metrics(underlay, path_index) else {
+        return Ok(());
+    };
+    stream
+        .send_frame_with_lane(Frame::PathMetrics { metrics }, FlowLane::Control)
+        .await
 }
 
 pub(super) fn authenticated_path_join_frames(
@@ -797,6 +942,7 @@ pub(super) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::TcpPathSessionClosed
             | RuntimeError::PathHeartbeatTimeout
+            | RuntimeError::PathOpenTimedOut
             | RuntimeError::Protocol(_)
     )
 }
@@ -819,6 +965,7 @@ pub(super) fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError
     matches!(
         result,
         Err(RuntimeError::PathHeartbeatTimeout)
+            | Err(RuntimeError::PathOpenTimedOut)
             | Err(RuntimeError::TcpPathSessionClosed)
             | Err(RuntimeError::Tcp(_))
             | Err(RuntimeError::Encrypted(_))

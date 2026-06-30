@@ -64,12 +64,19 @@ pub struct PathSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpEngine {
+    Quic,
+    CustomLab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathMetadata {
     pub capabilities: PathCapabilities,
     pub initial_srtt_ms: Option<u32>,
     pub initial_jitter_ms: Option<u32>,
     pub initial_rate: RateHint,
     pub initial_mtu_payload_bytes: Option<usize>,
+    pub udp_engine: UdpEngine,
 }
 
 impl Default for PathMetadata {
@@ -80,6 +87,7 @@ impl Default for PathMetadata {
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
             initial_mtu_payload_bytes: None,
+            udp_engine: UdpEngine::Quic,
         }
     }
 }
@@ -99,12 +107,15 @@ impl FromStr for PathSpec {
         let (endpoint, query) = path
             .split_once('?')
             .map_or((path, None), |(endpoint, query)| (endpoint, Some(query)));
-        let metadata = match query {
+        let (metadata, udp_engine_set) = match query {
             Some(query) => parse_path_metadata(query)?,
-            None => PathMetadata::default(),
+            None => (PathMetadata::default(), false),
         };
         if underlay == UnderlayProtocol::Udp && metadata.capabilities.no_udp {
             return Err(PathSpecParseError::NoUdpOnUdpPath);
+        }
+        if underlay == UnderlayProtocol::Tcp && udp_engine_set {
+            return Err(PathSpecParseError::UdpEngineOnTcpPath);
         }
         Ok(Self {
             underlay,
@@ -114,7 +125,7 @@ impl FromStr for PathSpec {
     }
 }
 
-fn parse_path_metadata(query: &str) -> Result<PathMetadata, PathSpecParseError> {
+fn parse_path_metadata(query: &str) -> Result<(PathMetadata, bool), PathSpecParseError> {
     if query.is_empty() {
         return Err(PathSpecParseError::EmptyQuery);
     }
@@ -123,6 +134,7 @@ fn parse_path_metadata(query: &str) -> Result<PathMetadata, PathSpecParseError> 
     let mut jitter_set = false;
     let mut rate_set = false;
     let mut mtu_set = false;
+    let mut engine_set = false;
     for part in query.split('&') {
         if part.is_empty() {
             return Err(PathSpecParseError::EmptyQueryParam);
@@ -185,6 +197,11 @@ fn parse_path_metadata(query: &str) -> Result<PathMetadata, PathSpecParseError> 
                 mtu_set = true;
                 metadata.initial_mtu_payload_bytes = Some(parse_mtu_param(key, value)?);
             }
+            "engine" => {
+                reject_duplicate(engine_set, key)?;
+                engine_set = true;
+                metadata.udp_engine = parse_udp_engine_param(key, value)?;
+            }
             "backup" => metadata.capabilities.backup = parse_bool_param(key, value)?,
             "expensive" => metadata.capabilities.expensive = parse_bool_param(key, value)?,
             "low-latency" => metadata.capabilities.low_latency = parse_bool_param(key, value)?,
@@ -197,7 +214,18 @@ fn parse_path_metadata(query: &str) -> Result<PathMetadata, PathSpecParseError> 
             _ => return Err(PathSpecParseError::UnknownQueryParam(key.to_string())),
         }
     }
-    Ok(metadata)
+    Ok((metadata, engine_set))
+}
+
+fn parse_udp_engine_param(key: &str, value: Option<&str>) -> Result<UdpEngine, PathSpecParseError> {
+    match value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))? {
+        "quic" => Ok(UdpEngine::Quic),
+        "custom-lab" => Ok(UdpEngine::CustomLab),
+        value => Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        )),
+    }
 }
 
 fn reject_duplicate(seen: bool, key: &str) -> Result<(), PathSpecParseError> {
@@ -295,6 +323,7 @@ pub enum PathSpecParseError {
     DuplicateQueryParam(String),
     QueryParamOverflow(String),
     NoUdpOnUdpPath,
+    UdpEngineOnTcpPath,
 }
 
 impl From<EndpointParseError> for PathSpecParseError {
@@ -328,6 +357,7 @@ impl std::fmt::Display for PathSpecParseError {
                 write!(f, "path query parameter {key:?} is too large")
             }
             Self::NoUdpOnUdpPath => write!(f, "udp:// paths cannot set no-udp=true"),
+            Self::UdpEngineOnTcpPath => write!(f, "engine is only valid on udp:// paths"),
         }
     }
 }
@@ -346,6 +376,9 @@ mod tests {
         let udp = "udp://[2001:db8::1]:8443?jitter-ms=5&rate-bps=100000000&mtu=1400"
             .parse::<PathSpec>()
             .expect("udp");
+        let udp_quic = "udp://example.com:8443?engine=quic"
+            .parse::<PathSpec>()
+            .expect("udp quic");
 
         assert_eq!(tcp.underlay, UnderlayProtocol::Tcp);
         assert_eq!(tcp.endpoint.host, "example.com");
@@ -365,6 +398,8 @@ mod tests {
             RateHint::BitsPerSecond(100_000_000)
         );
         assert_eq!(udp.metadata.initial_mtu_payload_bytes, Some(1400));
+        assert_eq!(udp.metadata.udp_engine, UdpEngine::Quic);
+        assert_eq!(udp_quic.metadata.udp_engine, UdpEngine::Quic);
     }
 
     #[test]
@@ -384,5 +419,20 @@ mod tests {
                 .is_err()
         );
         assert!("udp://example.com:443?mtu=100".parse::<PathSpec>().is_err());
+        assert!(
+            "tcp://example.com:443?engine=quic"
+                .parse::<PathSpec>()
+                .is_err()
+        );
+        assert!(
+            "udp://example.com:443?engine=raw"
+                .parse::<PathSpec>()
+                .is_err()
+        );
+        assert!(
+            "udp://example.com:443?engine=quic&engine=custom-lab"
+                .parse::<PathSpec>()
+                .is_err()
+        );
     }
 }

@@ -1,6 +1,8 @@
+use super::bulk_admission::*;
 use super::datagram::*;
 use super::error::RuntimeError;
 use super::ingress_runtime::*;
+use super::management::*;
 use super::prelude::*;
 use super::relay_control::*;
 use super::relay_io::*;
@@ -9,15 +11,11 @@ use super::server_runtime::*;
 use super::tcp_path::*;
 use super::tun_l4::*;
 use super::udp_path::*;
-#[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::lab_diagnostic;
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
 pub(super) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) const PATH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
-pub(super) const TCP_STREAM_LOAD_BYTES: u64 = 256 * 1024;
-pub(super) const UDP_SESSION_LOAD_BYTES: u64 = 64 * 1024;
 pub(super) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 pub(super) const MIN_RATE_SAMPLE_DURATION: Duration = Duration::from_millis(1);
 pub(super) const TCP_STREAM_STALL_MIN_TIMEOUT: Duration = Duration::from_millis(350);
@@ -29,7 +27,6 @@ pub(super) const UDP_MIN_PACING_RATE_BPS: f64 = 64_000.0;
 pub(super) const UDP_MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 pub(super) const UDP_MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
 pub(super) const UDP_MIN_RETRY_BUDGET: Duration = Duration::from_millis(250);
-pub(super) const UDP_MAX_RETRY_BUDGET: Duration = Duration::from_millis(500);
 pub(super) const UDP_MIN_PATH_SUPPRESSION: Duration = Duration::from_millis(250);
 pub(super) const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
 pub(super) const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
@@ -46,51 +43,125 @@ pub(super) fn current_unix_secs() -> Result<u64, RuntimeError> {
 pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     match config.command {
         CommandConfig::Client(client) => {
-            run_client(client, config.security, config.resources).await
+            run_client(client, config.resources, config.management).await
         }
         CommandConfig::Server(server) => {
             run_server(
                 server.bind_paths,
                 server.outbound,
                 server.outbound_dns,
-                config.security,
+                server.security,
                 config.resources,
+                config.management,
             )
             .await
         }
+        CommandConfig::Node(node) => run_node(node, config.resources, config.management).await,
     }
+}
+
+pub(super) async fn run_node(
+    node: NodeConfig,
+    resources: ResourceLimits,
+    management: ManagementConfig,
+) -> Result<(), RuntimeError> {
+    let mut services = tokio::task::JoinSet::new();
+
+    let mut client_contexts = Vec::with_capacity(node.clients.len());
+    for client in node.clients {
+        let context = new_client_path_context(&client, resources)?;
+        start_client_path_probes(
+            context.clone(),
+            client.path_probe_interval,
+            client.path_probe_timeout,
+        );
+        spawn_client_ingresses(client.ingresses, context.clone(), &mut services);
+        client_contexts.push(context);
+    }
+
+    let mut server_contexts = Vec::with_capacity(node.servers.len());
+    for server in node.servers {
+        let context = new_server_path_context_with_identity(
+            server.tag.clone(),
+            server.route_target.clone(),
+            server.bind_paths.clone(),
+            server.outbound,
+            server.outbound_dns,
+            server.security,
+            resources,
+        );
+        let bound = bind_server_paths(server.bind_paths, &context).await?;
+        spawn_server_listeners(bound, context.clone(), &mut services);
+        server_contexts.push(context);
+    }
+
+    if management.enabled() {
+        services.spawn(async move {
+            run_node_management_api(management, client_contexts, server_contexts).await
+        });
+    }
+
+    wait_node_services(services).await
 }
 
 pub(super) async fn run_client(
     client: ClientConfig,
-    security: SecurityConfig,
     resources: ResourceLimits,
+    management: ManagementConfig,
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
-    let context = ClientPathContext::new_with_proxy_auth(
-        client.paths,
-        security,
-        resources,
-        client.proxy_auth,
-    )?;
+    let context = new_client_path_context(&client, resources)?;
     start_client_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
     let mut ingresses = tokio::task::JoinSet::new();
-    for ingress in client.ingresses {
+    if management.enabled() {
+        let context = context.clone();
+        ingresses.spawn(async move { run_client_management_api(management, context).await });
+    }
+    spawn_client_ingresses(client.ingresses, context, &mut ingresses);
+    wait_client_ingresses(ingresses).await
+}
+
+fn new_client_path_context(
+    client: &ClientConfig,
+    resources: ResourceLimits,
+) -> Result<ClientPathContext, RuntimeError> {
+    ClientPathContext::new_with_path_configs_and_target(
+        client.paths.clone(),
+        resources,
+        client.proxy_auth.clone(),
+        client.route_target.clone(),
+    )
+}
+
+fn spawn_client_ingresses(
+    ingresses: Vec<IngressConfig>,
+    context: ClientPathContext,
+    tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+) {
+    for ingress in ingresses {
         let context = context.clone();
         match ingress {
-            IngressConfig::Socks5 { listen } => {
-                ingresses.spawn(async move { run_socks5_client_ingress(listen, context).await });
+            IngressConfig::Socks5 { listen, proxy_auth } => {
+                tasks.spawn(
+                    async move { run_socks5_client_ingress(listen, context, proxy_auth).await },
+                );
             }
-            IngressConfig::HttpConnect { listen } => {
-                ingresses
-                    .spawn(async move { run_http_connect_client_ingress(listen, context).await });
+            IngressConfig::HttpConnect { listen, proxy_auth } => {
+                tasks.spawn(async move {
+                    run_http_connect_client_ingress(listen, context, proxy_auth).await
+                });
             }
             IngressConfig::TunL4(tun) => {
-                ingresses.spawn(async move { run_tun_l4_client(tun, context).await });
+                tasks.spawn(async move { run_tun_l4_client(tun, context).await });
             }
         }
     }
+}
+
+async fn wait_client_ingresses(
+    mut ingresses: tokio::task::JoinSet<Result<(), RuntimeError>>,
+) -> Result<(), RuntimeError> {
     if let Some(result) = ingresses.join_next().await {
         match result {
             Ok(Ok(())) => Err(RuntimeError::Protocol("client ingress exited")),
@@ -99,6 +170,20 @@ pub(super) async fn run_client(
         }
     } else {
         Err(RuntimeError::Protocol("client has no ingress tasks"))
+    }
+}
+
+async fn wait_node_services(
+    mut services: tokio::task::JoinSet<Result<(), RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    if let Some(result) = services.join_next().await {
+        match result {
+            Ok(Ok(())) => Err(RuntimeError::Protocol("node service exited")),
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(RuntimeError::TaskJoin(err)),
+        }
+    } else {
+        Err(RuntimeError::Protocol("node has no runtime services"))
     }
 }
 
@@ -177,15 +262,17 @@ pub(super) async fn probe_client_paths(context: &ClientPathContext, timeout: Dur
 
 #[derive(Debug, Clone)]
 pub struct ClientPathContext {
+    pub(super) route_target: Option<RouteTarget>,
     pub(super) tcp_paths: Arc<Vec<PathSpec>>,
     pub(super) udp_paths: Arc<Vec<PathSpec>>,
+    pub(super) tcp_security: Arc<Vec<SecurityConfig>>,
     pub(super) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
     pub(super) next_tcp_stream_id: Arc<Mutex<u64>>,
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
     pub(super) codec_limits: CodecLimits,
     pub(super) mux_limits: MuxLimits,
-    pub(super) security: SecurityConfig,
+    #[cfg(test)]
     pub(super) proxy_auth: ProxyAuthConfig,
 }
 
@@ -198,6 +285,7 @@ pub(super) struct ClientPathHealth {
 #[derive(Debug, Clone)]
 pub(super) struct ClientPathHealthRecord {
     pub(super) state: SchedulerPathState,
+    pub(super) manual_disabled: bool,
     pub(super) consecutive_failures: u32,
     pub(super) measured_srtt_ms: Option<f64>,
     pub(super) measured_jitter_ms: Option<f64>,
@@ -205,20 +293,28 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
     pub(super) delivery_samples: u32,
-    pub(super) last_success_at: Option<Instant>,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) failed_until: Option<Instant>,
     pub(super) active_flows: u32,
     pub(super) active_latency_sensitive_flows: u32,
-    pub(super) load_bytes: u64,
     pub(super) relay_bytes_in_flight: u64,
     pub(super) relay_queue_bytes: u64,
+    pub(super) carrier_srtt_ms: Option<f64>,
+    pub(super) carrier_rttvar_ms: Option<f64>,
+    pub(super) carrier_delivery_rate_bps: Option<f64>,
+    pub(super) carrier_bytes_in_flight: u64,
+    pub(super) carrier_queue_bytes: u64,
+    pub(super) carrier_inflight_limit_bytes: u64,
+    pub(super) carrier_delivery_samples: u32,
+    pub(super) carrier_last_delivery_at: Option<Instant>,
+    pub(super) carrier_app_limited: bool,
 }
 
 impl Default for ClientPathHealthRecord {
     fn default() -> Self {
         Self {
             state: SchedulerPathState::Active,
+            manual_disabled: false,
             consecutive_failures: 0,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
@@ -226,14 +322,21 @@ impl Default for ClientPathHealthRecord {
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
             delivery_samples: 0,
-            last_success_at: None,
             last_delivery_at: None,
             failed_until: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
-            load_bytes: 0,
             relay_bytes_in_flight: 0,
             relay_queue_bytes: 0,
+            carrier_srtt_ms: None,
+            carrier_rttvar_ms: None,
+            carrier_delivery_rate_bps: None,
+            carrier_bytes_in_flight: 0,
+            carrier_queue_bytes: 0,
+            carrier_inflight_limit_bytes: 0,
+            carrier_delivery_samples: 0,
+            carrier_last_delivery_at: None,
+            carrier_app_limited: true,
         }
     }
 }
@@ -241,44 +344,86 @@ impl Default for ClientPathHealthRecord {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ClientPathObservation {
     pub(super) state: SchedulerPathState,
+    pub(super) manual_disabled: bool,
     pub(super) measured_srtt_ms: Option<f64>,
     pub(super) measured_jitter_ms: Option<f64>,
     pub(super) measured_rate_bps: Option<f64>,
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
     pub(super) delivery_samples: u32,
-    pub(super) last_success_at: Option<Instant>,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) active_flows: u32,
     pub(super) active_latency_sensitive_flows: u32,
-    pub(super) load_bytes: u64,
     pub(super) relay_bytes_in_flight: u64,
     pub(super) relay_queue_bytes: u64,
+    pub(super) carrier_srtt_ms: Option<f64>,
+    pub(super) carrier_rttvar_ms: Option<f64>,
+    pub(super) carrier_delivery_rate_bps: Option<f64>,
+    pub(super) carrier_bytes_in_flight: u64,
+    pub(super) carrier_queue_bytes: u64,
+    pub(super) carrier_inflight_limit_bytes: u64,
+    pub(super) carrier_delivery_samples: u32,
+    pub(super) carrier_last_delivery_at: Option<Instant>,
+    pub(super) carrier_app_limited: bool,
 }
 
 impl Default for ClientPathObservation {
     fn default() -> Self {
         Self {
             state: SchedulerPathState::Suspect,
+            manual_disabled: false,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
             measured_rate_bps: None,
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
             delivery_samples: 0,
-            last_success_at: None,
             last_delivery_at: None,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
-            load_bytes: 0,
             relay_bytes_in_flight: 0,
             relay_queue_bytes: 0,
+            carrier_srtt_ms: None,
+            carrier_rttvar_ms: None,
+            carrier_delivery_rate_bps: None,
+            carrier_bytes_in_flight: 0,
+            carrier_queue_bytes: 0,
+            carrier_inflight_limit_bytes: 0,
+            carrier_delivery_samples: 0,
+            carrier_last_delivery_at: None,
+            carrier_app_limited: true,
         }
     }
 }
 
 impl ClientPathHealthRecord {
     pub(super) fn observe(&mut self, now: Instant) -> ClientPathObservation {
+        if self.manual_disabled {
+            return ClientPathObservation {
+                state: SchedulerPathState::Failed,
+                manual_disabled: true,
+                measured_srtt_ms: self.measured_srtt_ms,
+                measured_jitter_ms: self.measured_jitter_ms,
+                measured_rate_bps: self.measured_rate_bps,
+                measured_loss_rate: self.measured_loss_rate,
+                measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
+                delivery_samples: self.delivery_samples,
+                last_delivery_at: self.last_delivery_at,
+                active_flows: self.active_flows,
+                active_latency_sensitive_flows: self.active_latency_sensitive_flows,
+                relay_bytes_in_flight: self.relay_bytes_in_flight,
+                relay_queue_bytes: self.relay_queue_bytes,
+                carrier_srtt_ms: self.carrier_srtt_ms,
+                carrier_rttvar_ms: self.carrier_rttvar_ms,
+                carrier_delivery_rate_bps: self.carrier_delivery_rate_bps,
+                carrier_bytes_in_flight: self.carrier_bytes_in_flight,
+                carrier_queue_bytes: self.carrier_queue_bytes,
+                carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
+                carrier_delivery_samples: self.carrier_delivery_samples,
+                carrier_last_delivery_at: self.carrier_last_delivery_at,
+                carrier_app_limited: self.carrier_app_limited,
+            };
+        }
         if self.state == SchedulerPathState::Failed
             && self.failed_until.is_some_and(|deadline| now >= deadline)
         {
@@ -287,27 +432,35 @@ impl ClientPathHealthRecord {
         }
         ClientPathObservation {
             state: self.state,
+            manual_disabled: false,
             measured_srtt_ms: self.measured_srtt_ms,
             measured_jitter_ms: self.measured_jitter_ms,
             measured_rate_bps: self.measured_rate_bps,
             measured_loss_rate: self.measured_loss_rate,
             measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
             delivery_samples: self.delivery_samples,
-            last_success_at: self.last_success_at,
             last_delivery_at: self.last_delivery_at,
             active_flows: self.active_flows,
             active_latency_sensitive_flows: self.active_latency_sensitive_flows,
-            load_bytes: self.load_bytes,
             relay_bytes_in_flight: self.relay_bytes_in_flight,
             relay_queue_bytes: self.relay_queue_bytes,
+            carrier_srtt_ms: self.carrier_srtt_ms,
+            carrier_rttvar_ms: self.carrier_rttvar_ms,
+            carrier_delivery_rate_bps: self.carrier_delivery_rate_bps,
+            carrier_bytes_in_flight: self.carrier_bytes_in_flight,
+            carrier_queue_bytes: self.carrier_queue_bytes,
+            carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
+            carrier_delivery_samples: self.carrier_delivery_samples,
+            carrier_last_delivery_at: self.carrier_last_delivery_at,
+            carrier_app_limited: self.carrier_app_limited,
         }
     }
 
     pub(super) fn mark_success(&mut self, elapsed: Duration) {
-        self.state = SchedulerPathState::Active;
-        self.consecutive_failures = 0;
-        self.failed_until = None;
-        self.last_success_at = Some(Instant::now());
+        if self.manual_disabled {
+            return;
+        }
+        self.mark_liveness_success();
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
         self.measured_srtt_ms = Some(match self.measured_srtt_ms {
             Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
@@ -315,36 +468,42 @@ impl ClientPathHealthRecord {
         });
     }
 
-    pub(super) fn mark_open_success(&mut self, elapsed: Duration, load_bytes: u64, lane: FlowLane) {
-        self.mark_success(elapsed);
+    pub(super) fn mark_liveness_success(&mut self) {
+        if self.manual_disabled {
+            return;
+        }
+        self.state = SchedulerPathState::Active;
+        self.consecutive_failures = 0;
+        self.failed_until = None;
+    }
+
+    pub(super) fn mark_open_success(&mut self, _elapsed: Duration, lane: FlowLane) {
+        self.mark_liveness_success();
         self.active_flows = self.active_flows.saturating_add(1);
         if tcp_relay_expects_interactive_response(lane) {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
-        self.load_bytes = self.load_bytes.saturating_add(load_bytes);
     }
 
-    pub(super) fn reserve_load(&mut self, load_bytes: u64, lane: FlowLane) {
+    pub(super) fn reserve_load(&mut self, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_add(1);
         if tcp_relay_expects_interactive_response(lane) {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
-        self.load_bytes = self.load_bytes.saturating_add(load_bytes);
     }
 
-    pub(super) fn mark_reserved_open_success(&mut self, elapsed: Duration) {
-        self.mark_success(elapsed);
+    pub(super) fn mark_reserved_open_success(&mut self, _elapsed: Duration) {
+        self.mark_liveness_success();
     }
 
-    pub(super) fn release_load(&mut self, load_bytes: u64, lane: FlowLane) {
+    pub(super) fn release_load(&mut self, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_sub(1);
         if tcp_relay_expects_interactive_response(lane) {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_sub(1);
         }
-        self.load_bytes = self.load_bytes.saturating_sub(load_bytes);
     }
 
     pub(super) fn change_lane_load(&mut self, from: FlowLane, to: FlowLane) {
@@ -362,6 +521,9 @@ impl ClientPathHealthRecord {
     }
 
     pub(super) fn mark_delivery(&mut self, sample: PathRateSample) {
+        if self.manual_disabled {
+            return;
+        }
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
@@ -394,6 +556,31 @@ impl ClientPathHealthRecord {
         self.measured_mtu_payload_bytes = Some(payload_bytes);
     }
 
+    pub(super) fn mark_udp_carrier_metrics(&mut self, metrics: udp_carrier::UdpCarrierPathMetrics) {
+        if self.manual_disabled {
+            return;
+        }
+        self.state = SchedulerPathState::Active;
+        self.consecutive_failures = 0;
+        self.failed_until = None;
+        if metrics.min_rtt_observed {
+            self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
+            self.carrier_rttvar_ms = Some(metrics.rttvar.as_secs_f64() * 1000.0);
+        }
+        if metrics.delivery_sample_count > 0 {
+            self.carrier_delivery_rate_bps = Some(metrics.delivery_rate_bps.max(1.0));
+            self.carrier_delivery_samples =
+                u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX);
+            self.carrier_last_delivery_at = metrics.last_delivery_sample_at;
+        }
+        self.carrier_bytes_in_flight = metrics.bytes_in_flight as u64;
+        self.carrier_queue_bytes = metrics
+            .pending_bytes
+            .saturating_sub(metrics.bytes_in_flight) as u64;
+        self.carrier_inflight_limit_bytes = metrics.inflight_hi as u64;
+        self.carrier_app_limited = metrics.app_limited;
+    }
+
     pub(super) fn mark_failure(&mut self, now: Instant, has_schedulable_alternative: bool) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
@@ -404,6 +591,23 @@ impl ClientPathHealthRecord {
         } else {
             self.state = SchedulerPathState::Failed;
             self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
+        }
+    }
+
+    pub(super) fn mark_data_plane_failure(
+        &mut self,
+        now: Instant,
+        has_schedulable_alternative: bool,
+    ) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.relay_bytes_in_flight = 0;
+        self.relay_queue_bytes = 0;
+        if has_schedulable_alternative {
+            self.state = SchedulerPathState::Failed;
+            self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
+        } else {
+            self.state = SchedulerPathState::Suspect;
+            self.failed_until = None;
         }
     }
 
@@ -539,32 +743,61 @@ impl ClientPathContext {
         Self::new_with_proxy_auth(paths, security, resources, ProxyAuthConfig::disabled())
     }
 
+    #[cfg(test)]
     pub fn new_with_proxy_auth(
         paths: Vec<PathSpec>,
         security: SecurityConfig,
         resources: ResourceLimits,
         proxy_auth: ProxyAuthConfig,
     ) -> Result<Self, RuntimeError> {
+        let paths = paths
+            .into_iter()
+            .map(|spec| ClientPathConfig {
+                spec,
+                security: security.clone(),
+            })
+            .collect();
+        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None)
+    }
+
+    pub fn new_with_path_configs_and_target(
+        paths: Vec<ClientPathConfig>,
+        resources: ResourceLimits,
+        proxy_auth: ProxyAuthConfig,
+        route_target: Option<RouteTarget>,
+    ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
         let tcp_paths = paths
             .iter()
-            .filter(|path| path.underlay == UnderlayProtocol::Tcp)
-            .cloned()
+            .filter(|path| path.spec.underlay == UnderlayProtocol::Tcp)
+            .map(|path| path.spec.clone())
+            .collect::<Vec<_>>();
+        let tcp_security = paths
+            .iter()
+            .filter(|path| path.spec.underlay == UnderlayProtocol::Tcp)
+            .map(|path| path.security.clone())
             .collect::<Vec<_>>();
         let udp_paths = paths
             .into_iter()
-            .filter(|path| path.underlay == UnderlayProtocol::Udp)
+            .filter(|path| path.spec.underlay == UnderlayProtocol::Udp)
             .collect::<Vec<_>>();
-        let health = ClientPathHealth {
+        let udp_security = udp_paths
+            .iter()
+            .map(|path| path.security.clone())
+            .collect::<Vec<_>>();
+        let udp_paths = udp_paths
+            .into_iter()
+            .map(|path| path.spec)
+            .collect::<Vec<_>>();
+        let health = Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default(); tcp_paths.len()],
             udp: vec![ClientPathHealthRecord::default(); udp_paths.len()],
-        };
+        }));
         let codec_limits = resources.into();
         let mux_limits = resources.into();
-        let tcp_session_id = random_session_id()?;
-        let udp_session_id = random_session_id()?;
+        let session_id = random_session_id()?;
         let reuse_tcp_latency_sessions = tcp_paths.len() > 1;
         let tcp_sessions = tcp_paths
             .iter()
@@ -574,8 +807,8 @@ impl ClientPathContext {
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
                     path,
                     path_index,
-                    session_id: tcp_session_id,
-                    security: security.clone(),
+                    session_id,
+                    security: tcp_security[path_index].clone(),
                     codec_limits,
                     mux_limits,
                     command_queue: tcp_session_command_queue(resources),
@@ -595,26 +828,40 @@ impl ClientPathContext {
                 ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
                     path,
                     path_index,
-                    session_id: udp_session_id,
-                    security: security.clone(),
+                    session_id,
+                    security: udp_security[path_index].clone(),
                     codec_limits,
                     mux_limits,
                     stream_frame_queue: tcp_stream_frame_queue(mux_limits),
+                    health: health.clone(),
                 })
             })
             .collect::<Vec<_>>();
+        #[cfg(not(test))]
+        let _ = proxy_auth;
         Ok(Self {
+            route_target,
             tcp_paths: Arc::new(tcp_paths),
             udp_paths: Arc::new(udp_paths),
+            tcp_security: Arc::new(tcp_security),
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
             next_tcp_stream_id: Arc::new(Mutex::new(0)),
-            health: Arc::new(Mutex::new(health)),
+            health,
             codec_limits,
             mux_limits,
-            security,
+            #[cfg(test)]
             proxy_auth,
         })
+    }
+
+    pub(super) fn tcp_path_security(
+        &self,
+        path_index: usize,
+    ) -> Result<&SecurityConfig, RuntimeError> {
+        self.tcp_security
+            .get(path_index)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
     pub(super) fn allocate_tcp_stream_id(&self) -> Result<StreamId, RuntimeError> {
@@ -659,10 +906,7 @@ impl ClientPathContext {
         let mut health = self.health.lock().expect("client path health lock");
         let mut observations = health_observations(&mut health.tcp);
         apply_tcp_bulk_isolation(&mut observations, lane, self.mux_limits);
-        let active_udp_work = health
-            .udp
-            .iter()
-            .any(|record| record.active_flows > 0 || record.load_bytes > 0);
+        let active_udp_work = health.udp.iter().any(|record| record.active_flows > 0);
         let indices = if endpoint_only_tcp_startup_should_spread_bulk_load(
             &self.tcp_paths,
             &observations,
@@ -681,10 +925,7 @@ impl ClientPathContext {
         let index = indices
             .into_iter()
             .find(|index| !excluded.contains(index))?;
-        health
-            .tcp
-            .get_mut(index)?
-            .reserve_load(TCP_STREAM_LOAD_BYTES, lane);
+        health.tcp.get_mut(index)?.reserve_load(lane);
         Some(index)
     }
 
@@ -696,7 +937,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.reserve_load(TCP_STREAM_LOAD_BYTES, lane);
+            current.reserve_load(lane);
         }
     }
 
@@ -712,10 +953,7 @@ impl ClientPathContext {
             ordered_reliable_path_indices(&self.udp_paths, &observations, lane, payload_bytes)
                 .into_iter()
                 .find(|index| !excluded.contains(index))?;
-        health
-            .udp
-            .get_mut(index)?
-            .reserve_load(TCP_STREAM_LOAD_BYTES, lane);
+        health.udp.get_mut(index)?.reserve_load(lane);
         Some(index)
     }
 
@@ -727,7 +965,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.reserve_load(TCP_STREAM_LOAD_BYTES, lane);
+            current.reserve_load(lane);
         }
     }
 
@@ -737,12 +975,8 @@ impl ClientPathContext {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<usize> {
-        let scores = ordered_path_scores(
-            &self.tcp_paths,
-            &self.tcp_health_observations_for_lane(lane),
-            lane,
-            payload_bytes,
-        );
+        let observations = self.tcp_health_observations_for_lane(lane);
+        let scores = ordered_path_scores(&self.tcp_paths, &observations, lane, payload_bytes);
         if !matches!(lane, FlowLane::Throughput | FlowLane::Background) {
             return scores.into_iter().map(|(index, _)| index).collect();
         }
@@ -751,11 +985,21 @@ impl ClientPathContext {
                 .iter()
                 .find_map(|(index, eta)| (*index == current_path_index).then_some(*eta))
         });
+        let has_active_survivor = scores.iter().any(|(index, _)| {
+            Some(*index) != current_path_index
+                && observations
+                    .get(*index)
+                    .is_some_and(|observation| observation.state == SchedulerPathState::Active)
+        });
         scores
             .into_iter()
             .filter(|(index, eta)| {
                 Some(*index) != current_path_index
                     && current_eta.is_none_or(|current| *eta < current)
+                    && (!has_active_survivor
+                        || observations.get(*index).is_some_and(|observation| {
+                            observation.state == SchedulerPathState::Active
+                        }))
             })
             .map(|(index, _)| index)
             .collect()
@@ -783,6 +1027,19 @@ impl ClientPathContext {
             .into_iter()
             .filter(|(index, _)| Some(*index) != current_path_index)
             .filter(|(index, _)| {
+                !matches!(lane, FlowLane::Throughput | FlowLane::Background)
+                    || !observations
+                        .iter()
+                        .enumerate()
+                        .any(|(candidate, observation)| {
+                            Some(candidate) != current_path_index
+                                && observation.state == SchedulerPathState::Active
+                        })
+                    || observations
+                        .get(*index)
+                        .is_some_and(|observation| observation.state == SchedulerPathState::Active)
+            })
+            .filter(|(index, _)| {
                 if !require_delivery_evidence {
                     return true;
                 }
@@ -791,6 +1048,7 @@ impl ClientPathContext {
                 };
                 let observation = observations.get(*index).copied().unwrap_or_default();
                 path_can_be_auto_discovered(path, observation)
+                    && bulk_candidate_has_delivery_evidence(path, observation)
             })
             .map(|(index, _)| index)
             .collect()
@@ -800,10 +1058,68 @@ impl ClientPathContext {
         &self,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
+        let mut candidates = self.ordered_reliable_bulk_path_candidates(payload_bytes);
+        let has_evidence = candidates.iter().any(|candidate| candidate.has_evidence);
+        let has_active_bulk_work = candidates.iter().any(bulk_candidate_has_active_bulk_work);
+        if has_evidence {
+            candidates.retain(|candidate| candidate.has_evidence);
+        } else if has_active_bulk_work {
+            candidates.retain(bulk_candidate_has_active_bulk_work);
+        } else if !bulk_candidates_span_underlays(&candidates)
+            && candidates
+                .iter()
+                .any(|candidate| candidate.snapshot.active_flows > 0)
+        {
+            candidates.retain(|candidate| candidate.snapshot.active_flows > 0);
+        }
+        candidates.sort_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| relay_path_key_order(left.key, right.key))
+        });
+        if !has_evidence && !has_active_bulk_work {
+            candidates.truncate(1);
+        }
+        bulk_striping_admitted_cohort(candidates, payload_bytes, self.mux_limits)
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect()
+    }
+
+    pub(super) fn ordered_reliable_bulk_validation_path_keys(
+        &self,
+        payload_bytes: usize,
+    ) -> Vec<RelayPathKey> {
+        let payload_bytes = payload_bytes
+            .min(tcp_lane_startup_chunk_bytes(
+                FlowLane::Latency,
+                self.mux_limits,
+            ))
+            .max(PATH_OPEN_SCORE_BYTES);
+        let mut candidates = self.ordered_reliable_bulk_path_candidates(payload_bytes);
+        candidates.sort_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| relay_path_key_order(left.key, right.key))
+        });
+        let admitted = bulk_striping_admitted_cohort(candidates, payload_bytes, self.mux_limits)
+            .into_iter()
+            .filter(|candidate| !candidate.has_evidence && candidate.snapshot.active_flows == 0)
+            .collect::<Vec<_>>();
+        carrier_diverse_bulk_validation_order(admitted)
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect()
+    }
+
+    fn ordered_reliable_bulk_path_candidates(
+        &self,
+        payload_bytes: usize,
+    ) -> Vec<BulkPathCandidate> {
         let mut health = self.health.lock().expect("client path health lock");
         let tcp_observations = health_observations(&mut health.tcp);
         let udp_observations = health_observations(&mut health.udp);
-        let mut candidates = ordered_path_scores(
+        ordered_path_scores(
             &self.tcp_paths,
             &tcp_observations,
             FlowLane::Throughput,
@@ -813,14 +1129,16 @@ impl ClientPathContext {
         .filter_map(|(index, eta_ms)| {
             let path = self.tcp_paths.get(index)?;
             let observation = tcp_observations.get(index).copied().unwrap_or_default();
-            path_can_be_auto_discovered(path, observation).then_some((
-                RelayPathKey {
+            let snapshot = path_snapshot(path, index, observation);
+            path_can_be_auto_discovered(path, observation).then_some(BulkPathCandidate {
+                key: RelayPathKey {
                     underlay: UnderlayProtocol::Tcp,
                     index,
                 },
                 eta_ms,
-                bulk_candidate_has_evidence(path, observation),
-            ))
+                has_evidence: bulk_candidate_has_evidence(path, observation),
+                snapshot,
+            })
         })
         .chain(
             ordered_path_scores(
@@ -834,32 +1152,19 @@ impl ClientPathContext {
                 let path = self.udp_paths.get(index)?;
                 let observation = udp_observations.get(index).copied().unwrap_or_default();
                 let snapshot = path_snapshot(path, index, observation);
-                path_can_be_auto_discovered(path, observation).then_some((
-                    RelayPathKey {
+                path_can_be_auto_discovered(path, observation).then_some(BulkPathCandidate {
+                    key: RelayPathKey {
                         underlay: UnderlayProtocol::Udp,
                         index,
                     },
-                    eta_ms + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
-                    bulk_candidate_has_evidence(path, observation),
-                ))
+                    eta_ms: eta_ms
+                        + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
+                    has_evidence: bulk_candidate_has_evidence(path, observation),
+                    snapshot,
+                })
             }),
         )
-        .collect::<Vec<_>>();
-        if candidates.iter().any(|(_, _, has_evidence)| *has_evidence) {
-            candidates.retain(|(_, _, has_evidence)| *has_evidence);
-        }
-        candidates.sort_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| relay_path_key_order(left.0, right.0))
-        });
-        let candidates = bulk_striping_eta_cohort(
-            candidates
-                .into_iter()
-                .map(|(key, eta, _)| (key, eta))
-                .collect(),
-        );
-        candidates.into_iter().map(|(key, _)| key).collect()
+        .collect::<Vec<_>>()
     }
 
     pub(super) fn tcp_health_observations_for_lane(
@@ -894,6 +1199,43 @@ impl ClientPathContext {
             .get_mut(index)?
             .observe(Instant::now());
         Some(path_snapshot(path, index, observation))
+    }
+
+    pub(super) fn relay_path_metrics(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> Option<PathMetrics> {
+        let (path, observation) = match underlay {
+            UnderlayProtocol::Tcp => {
+                let path = self.tcp_paths.get(index)?;
+                let observation = self
+                    .health
+                    .lock()
+                    .expect("client path health lock")
+                    .tcp
+                    .get_mut(index)?
+                    .observe(Instant::now());
+                (path, observation)
+            }
+            UnderlayProtocol::Udp => {
+                let path = self.udp_paths.get(index)?;
+                let observation = self
+                    .health
+                    .lock()
+                    .expect("client path health lock")
+                    .udp
+                    .get_mut(index)?
+                    .observe(Instant::now());
+                (path, observation)
+            }
+        };
+        let snapshot = path_snapshot(path, index, observation);
+        Some(path_metrics_from_snapshot(
+            snapshot,
+            observation,
+            PathMetricDirection::ClientToServer,
+        ))
     }
 
     pub(super) fn ordered_udp_path_candidates_for_ttl(
@@ -989,9 +1331,6 @@ impl ClientPathContext {
             .observe(Instant::now());
         if discount_open_udp_session {
             observation.active_flows = observation.active_flows.saturating_sub(1);
-            observation.load_bytes = observation
-                .load_bytes
-                .saturating_sub(UDP_SESSION_LOAD_BYTES);
         }
         let score = scheduler::score_path(
             path_snapshot(path, index, observation),
@@ -1048,7 +1387,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_open_success(elapsed, TCP_STREAM_LOAD_BYTES, lane);
+            current.mark_open_success(elapsed, lane);
         }
     }
 
@@ -1095,7 +1434,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.release_load(TCP_STREAM_LOAD_BYTES, lane);
+            current.release_load(lane);
         }
     }
 
@@ -1119,7 +1458,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.release_load(TCP_STREAM_LOAD_BYTES, lane);
+            current.release_load(lane);
         }
     }
 
@@ -1127,6 +1466,17 @@ impl ClientPathContext {
         match underlay {
             UnderlayProtocol::Tcp => self.mark_tcp_path_failure(index),
             UnderlayProtocol::Udp => self.mark_udp_path_failure(index),
+        }
+    }
+
+    pub(super) fn mark_relay_path_data_plane_failure(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) {
+        match underlay {
+            UnderlayProtocol::Tcp => self.mark_tcp_path_data_plane_failure(index),
+            UnderlayProtocol::Udp => self.mark_udp_path_data_plane_failure(index),
         }
     }
 
@@ -1158,6 +1508,40 @@ impl ClientPathContext {
         };
         if let Some(current) = records.get_mut(index) {
             current.record_relay_send(bytes);
+        }
+    }
+
+    pub(super) fn relay_path_has_bulk_model_evidence(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        match underlay {
+            UnderlayProtocol::Tcp => {
+                let Some(path) = self.tcp_paths.get(index) else {
+                    return false;
+                };
+                health
+                    .tcp
+                    .get_mut(index)
+                    .map(|record| {
+                        bulk_candidate_has_delivery_evidence(path, record.observe(Instant::now()))
+                    })
+                    .unwrap_or(false)
+            }
+            UnderlayProtocol::Udp => {
+                let Some(path) = self.udp_paths.get(index) else {
+                    return false;
+                };
+                health
+                    .udp
+                    .get_mut(index)
+                    .map(|record| {
+                        bulk_candidate_has_delivery_evidence(path, record.observe(Instant::now()))
+                    })
+                    .unwrap_or(false)
+            }
         }
     }
 
@@ -1217,6 +1601,37 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn mark_relay_path_rate_sample(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        sample: PathRateSample,
+    ) {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(current) = records.get_mut(index) {
+            current.mark_delivery(sample);
+        }
+    }
+
+    pub(super) fn relay_path_has_delivery_sample(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> bool {
+        let health = self.health.lock().expect("client path health lock");
+        let observation = match underlay {
+            UnderlayProtocol::Tcp => health.tcp.get(index),
+            UnderlayProtocol::Udp => health.udp.get(index),
+        };
+        observation.is_some_and(|record| {
+            record.delivery_samples > 0 || record.carrier_delivery_samples > 0
+        })
+    }
+
     pub(super) fn mark_tcp_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
         let Some(sample) = stats.rate_sample() else {
             return;
@@ -1242,6 +1657,16 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn mark_tcp_path_data_plane_failure(&self, index: usize) {
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(&mut health.tcp, index, now);
+        if let Some(current) = health.tcp.get_mut(index) {
+            current.mark_data_plane_failure(now, has_schedulable_alternative);
+        }
+    }
+
     pub(super) fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .health
@@ -1250,7 +1675,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.mark_open_success(elapsed, UDP_SESSION_LOAD_BYTES, FlowLane::RealtimeDatagram);
+            current.mark_open_success(elapsed, FlowLane::RealtimeDatagram);
         }
     }
 
@@ -1285,7 +1710,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.release_load(UDP_SESSION_LOAD_BYTES, FlowLane::RealtimeDatagram);
+            current.release_load(FlowLane::RealtimeDatagram);
         }
     }
 
@@ -1339,6 +1764,16 @@ impl ClientPathContext {
             path_records_have_schedulable_alternative(&mut health.udp, index, now);
         if let Some(current) = health.udp.get_mut(index) {
             current.mark_failure(now, has_schedulable_alternative);
+        }
+    }
+
+    pub(super) fn mark_udp_path_data_plane_failure(&self, index: usize) {
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(&mut health.udp, index, now);
+        if let Some(current) = health.udp.get_mut(index) {
+            current.mark_data_plane_failure(now, has_schedulable_alternative);
         }
     }
 }
@@ -1437,7 +1872,7 @@ pub(super) fn path_records_have_schedulable_alternative(
 }
 
 pub(super) fn path_observation_is_idle_for_probe(observation: ClientPathObservation) -> bool {
-    observation.active_flows == 0 && observation.load_bytes == 0
+    observation.active_flows == 0
 }
 
 pub(super) fn apply_tcp_bulk_isolation(
@@ -1458,8 +1893,8 @@ pub(super) fn apply_tcp_bulk_isolation(
         adaptive_tcp_relay_inflight_bytes(None, FlowLane::Latency, mux_limits) as u64;
     for observation in observations {
         let latency_flows = u64::from(observation.active_latency_sensitive_flows);
-        observation.load_bytes = observation
-            .load_bytes
+        observation.relay_queue_bytes = observation
+            .relay_queue_bytes
             .saturating_add(latency_flows.saturating_mul(isolation_bytes));
     }
 }
@@ -1497,7 +1932,7 @@ pub(super) fn endpoint_only_startup_has_latency_sensitive_load(
 pub(super) fn endpoint_only_startup_has_any_load(observations: &[ClientPathObservation]) -> bool {
     observations
         .iter()
-        .any(|observation| observation.active_flows > 0 || observation.load_bytes > 0)
+        .any(|observation| observation.active_flows > 0)
 }
 
 pub(super) fn endpoint_only_startup_has_bulk_load(observations: &[ClientPathObservation]) -> bool {
@@ -1556,8 +1991,12 @@ pub(super) fn endpoint_only_reliable_startup_path_indices(
             measured_loss_rate: None,
             measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
             delivery_samples: 0,
-            last_success_at: None,
             last_delivery_at: None,
+            carrier_srtt_ms: None,
+            carrier_rttvar_ms: None,
+            carrier_delivery_rate_bps: None,
+            carrier_delivery_samples: 0,
+            carrier_last_delivery_at: None,
             ..observation
         })
         .collect::<Vec<_>>();
@@ -1661,34 +2100,6 @@ pub(super) fn ordered_path_scores(
     scores
 }
 
-fn bulk_striping_eta_cohort(candidates: Vec<(RelayPathKey, f64)>) -> Vec<(RelayPathKey, f64)> {
-    let Some(best_eta_ms) = candidates.first().map(|(_, eta_ms)| *eta_ms) else {
-        return candidates;
-    };
-    let eta_slack_ms = bulk_striping_eta_slack_ms(best_eta_ms);
-    let cutoff_eta_ms = best_eta_ms + eta_slack_ms;
-    let mut selected = Vec::new();
-    for (key, eta_ms) in candidates {
-        if selected.is_empty() || eta_ms <= cutoff_eta_ms {
-            selected.push((key, eta_ms));
-        } else {
-            #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "bulk_striping_candidate_suppressed",
-                format_args!(
-                    "path_underlay={:?} path_index={} eta_ms={:.3} best_eta_ms={:.3} cutoff_eta_ms={:.3}",
-                    key.underlay, key.index, eta_ms, best_eta_ms, cutoff_eta_ms,
-                ),
-            );
-        }
-    }
-    selected
-}
-
-fn bulk_striping_eta_slack_ms(best_eta_ms: f64) -> f64 {
-    best_eta_ms.max(100.0) * 1.5
-}
-
 pub(super) fn path_snapshot(
     path: &PathSpec,
     index: usize,
@@ -1700,12 +2111,17 @@ pub(super) fn path_snapshot(
         RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     };
     let delivery_rate_bps = observation
-        .measured_rate_bps
+        .carrier_delivery_rate_bps
+        .or(observation.measured_rate_bps)
         .unwrap_or(hinted_delivery_rate_bps)
         .max(1.0);
+    let srtt_ms = path_model_srtt_ms(path, observation);
+    let jitter_ms = observation
+        .carrier_rttvar_ms
+        .or(observation.measured_jitter_ms)
+        .unwrap_or_else(|| f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)));
     let confidence = path_model_confidence(observation);
-    let bdp_bytes = (delivery_rate_bps / 8.0 * path_model_srtt_ms(path, observation).max(1.0)
-        / 1000.0)
+    let bdp_bytes = (delivery_rate_bps / 8.0 * srtt_ms.max(1.0) / 1000.0)
         .ceil()
         .max(PATH_OPEN_SCORE_BYTES as f64) as u64;
     let pacing_rate_bps = delivery_rate_bps
@@ -1716,61 +2132,126 @@ pub(super) fn path_snapshot(
                 .clamp(0.0, 0.75)
                 * 0.5)
             .clamp(0.25, 1.0);
+    let inflight_limit_bytes = if observation.carrier_inflight_limit_bytes > 0 {
+        observation.carrier_inflight_limit_bytes
+    } else {
+        bdp_bytes
+            .saturating_mul(2)
+            .max(PATH_OPEN_SCORE_BYTES as u64)
+    };
     PathSnapshot {
         id: PathId(index as u16),
         underlay: path.underlay,
         state: observation.state,
         flags: path.metadata.capabilities.into(),
-        srtt_ms: path_model_srtt_ms(path, observation),
-        jitter_ms: observation
-            .measured_jitter_ms
-            .unwrap_or_else(|| f64::from(path.metadata.initial_jitter_ms.unwrap_or(0))),
+        srtt_ms,
+        jitter_ms,
         delivery_rate_bps,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
         queue_bytes: observation
-            .load_bytes
-            .saturating_add(observation.relay_queue_bytes),
-        bytes_in_flight: observation.relay_bytes_in_flight,
+            .relay_queue_bytes
+            .saturating_add(observation.carrier_queue_bytes),
+        bytes_in_flight: observation
+            .relay_bytes_in_flight
+            .saturating_add(observation.carrier_bytes_in_flight),
+        product_bytes_in_flight: observation.relay_bytes_in_flight,
+        active_flows: observation.active_flows,
+        active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
         pacing_rate_bps,
-        inflight_limit_bytes: bdp_bytes
-            .saturating_mul(2)
-            .max(PATH_OPEN_SCORE_BYTES as u64),
+        inflight_limit_bytes,
         confidence,
-        app_limited: observation.relay_bytes_in_flight == 0,
+        app_limited: observation.relay_bytes_in_flight == 0
+            && observation.carrier_bytes_in_flight == 0
+            && observation.carrier_app_limited,
     }
 }
 
+pub(super) fn path_metrics_from_snapshot(
+    snapshot: PathSnapshot,
+    observation: ClientPathObservation,
+    direction: PathMetricDirection,
+) -> PathMetrics {
+    let data_sample_count = observation
+        .delivery_samples
+        .saturating_add(observation.carrier_delivery_samples);
+    PathMetrics {
+        path_id: snapshot.id,
+        underlay: snapshot.underlay,
+        direction,
+        metric_epoch: metric_epoch_now(),
+        metric_age_us: 0,
+        min_rtt_us: millis_to_micros_u32(snapshot.srtt_ms),
+        srtt_us: millis_to_micros_u32(snapshot.srtt_ms),
+        rttvar_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
+        jitter_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
+        delivery_rate_bps: snapshot.delivery_rate_bps.max(1.0).round() as u64,
+        pacing_rate_bps: snapshot.pacing_rate_bps.max(1.0).round() as u64,
+        loss_ppm: (snapshot.loss_rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32,
+        ecn_ppm: 0,
+        bytes_in_flight: snapshot.bytes_in_flight,
+        queue_bytes: snapshot.queue_bytes,
+        inflight_limit_bytes: snapshot.inflight_limit_bytes,
+        inflight_hi_bytes: snapshot.inflight_limit_bytes,
+        confidence_ppm: ratio_to_ppm(snapshot.confidence),
+        app_limited: snapshot.app_limited,
+        has_ack_derived_data_sample: data_sample_count > 0,
+        data_sample_count,
+    }
+}
+
+pub(super) fn metric_epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+pub(super) fn ratio_to_ppm(value: f64) -> u32 {
+    (value.clamp(0.0, 1.0) * 1_000_000.0).round() as u32
+}
+
+fn millis_to_micros_u32(ms: f64) -> u32 {
+    let micros = (ms.max(0.0) * 1000.0).round();
+    micros.clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
 pub(super) fn path_model_srtt_ms(path: &PathSpec, observation: ClientPathObservation) -> f64 {
-    observation.measured_srtt_ms.unwrap_or_else(|| {
-        path.metadata
-            .initial_srtt_ms
-            .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
-    })
+    observation
+        .carrier_srtt_ms
+        .or(observation.measured_srtt_ms)
+        .unwrap_or_else(|| {
+            path.metadata
+                .initial_srtt_ms
+                .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
+        })
 }
 
 pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
-    let delivery_confidence = (f64::from(observation.delivery_samples) / 8.0).clamp(0.0, 1.0);
-    let rtt_confidence = if observation.measured_srtt_ms.is_some() {
+    let delivery_confidence = (f64::from(
+        observation
+            .delivery_samples
+            .saturating_add(observation.carrier_delivery_samples),
+    ) / 8.0)
+        .clamp(0.0, 1.0);
+    let rtt_confidence = if observation
+        .carrier_srtt_ms
+        .or(observation.measured_srtt_ms)
+        .is_some()
+    {
         0.35
     } else {
         0.0
     };
     let freshness_confidence = observation
         .last_delivery_at
-        .or(observation.last_success_at)
+        .into_iter()
+        .chain(observation.carrier_last_delivery_at)
+        .max()
         .map(|seen| {
             let age = Instant::now().saturating_duration_since(seen).as_secs_f64();
             (1.0 - age / 30.0).clamp(0.0, 1.0) * 0.25
         })
         .unwrap_or(0.0);
-    (delivery_confidence + rtt_confidence + freshness_confidence).clamp(
-        if observation.active_flows > 0 {
-            0.25
-        } else {
-            0.1
-        },
-        1.0,
-    )
+    (delivery_confidence + rtt_confidence + freshness_confidence).clamp(0.1, 1.0)
 }
 
 pub(super) fn udp_path_has_realtime_model(
@@ -1778,8 +2259,11 @@ pub(super) fn udp_path_has_realtime_model(
     observation: ClientPathObservation,
 ) -> bool {
     observation.measured_srtt_ms.is_some()
+        || observation.carrier_srtt_ms.is_some()
         || observation.measured_jitter_ms.is_some()
+        || observation.carrier_rttvar_ms.is_some()
         || observation.measured_rate_bps.is_some()
+        || observation.carrier_delivery_rate_bps.is_some()
         || observation.measured_loss_rate.is_some()
         || path.metadata.initial_srtt_ms.is_some()
         || path.metadata.initial_jitter_ms.is_some()
@@ -1790,14 +2274,16 @@ pub(super) fn udp_observation_has_datagram_feedback(observation: &ClientPathObse
     observation.measured_jitter_ms.is_some()
         || observation.measured_loss_rate.is_some()
         || observation.measured_rate_bps.is_some()
+        || observation.carrier_delivery_rate_bps.is_some()
         || observation.measured_mtu_payload_bytes.is_some()
 }
 
 pub(super) fn path_can_be_auto_discovered(
     path: &PathSpec,
-    _observation: ClientPathObservation,
+    observation: ClientPathObservation,
 ) -> bool {
-    !path.metadata.capabilities.expensive
+    observation.state == SchedulerPathState::Active
+        && !path.metadata.capabilities.expensive
         && !path.metadata.capabilities.backup
         && !path.metadata.capabilities.probe_only
         && path.metadata.capabilities.bulk_allowed
@@ -1805,15 +2291,65 @@ pub(super) fn path_can_be_auto_discovered(
 
 fn bulk_candidate_has_evidence(path: &PathSpec, observation: ClientPathObservation) -> bool {
     observation.delivery_samples > 0
-        || observation.last_success_at.is_some()
+        || observation.carrier_delivery_samples > 0
         || observation.last_delivery_at.is_some()
+        || observation.carrier_last_delivery_at.is_some()
         || observation.measured_srtt_ms.is_some()
+        || observation.carrier_srtt_ms.is_some()
         || observation.measured_jitter_ms.is_some()
+        || observation.carrier_rttvar_ms.is_some()
         || observation.measured_rate_bps.is_some()
+        || observation.carrier_delivery_rate_bps.is_some()
         || observation.measured_loss_rate.is_some()
         || path.metadata.initial_srtt_ms.is_some()
         || path.metadata.initial_jitter_ms.is_some()
         || path.metadata.initial_rate != RateHint::Unknown
+}
+
+fn bulk_candidate_has_delivery_evidence(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+) -> bool {
+    observation.delivery_samples > 0
+        || observation.carrier_delivery_samples > 0
+        || observation.last_delivery_at.is_some()
+        || observation.carrier_last_delivery_at.is_some()
+        || observation.measured_rate_bps.is_some()
+        || observation.carrier_delivery_rate_bps.is_some()
+        || path.metadata.initial_rate != RateHint::Unknown
+}
+
+fn bulk_candidate_has_active_bulk_work(candidate: &BulkPathCandidate) -> bool {
+    candidate.snapshot.active_flows > candidate.snapshot.active_latency_sensitive_flows
+}
+
+fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -> bool {
+    let Some(first) = candidates.first() else {
+        return false;
+    };
+    candidates
+        .iter()
+        .any(|candidate| candidate.key.underlay != first.key.underlay)
+}
+
+fn carrier_diverse_bulk_validation_order(
+    candidates: Vec<BulkPathCandidate>,
+) -> Vec<BulkPathCandidate> {
+    if !bulk_candidates_span_underlays(&candidates) {
+        return candidates;
+    }
+    let mut remaining = candidates;
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for underlay in [UnderlayProtocol::Udp, UnderlayProtocol::Tcp] {
+        if let Some(position) = remaining
+            .iter()
+            .position(|candidate| candidate.key.underlay == underlay)
+        {
+            ordered.push(remaining.remove(position));
+        }
+    }
+    ordered.extend(remaining);
+    ordered
 }
 
 pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
@@ -1846,6 +2382,9 @@ pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
 
 #[derive(Debug, Clone)]
 pub struct ServerPathContext {
+    pub(super) tag: Option<String>,
+    pub(super) route_target: Option<RouteTarget>,
+    pub(super) server_paths: Arc<Vec<PathSpec>>,
     pub(super) outbound: OutboundConfig,
     pub(super) outbound_dns: DnsConfig,
     pub(super) codec_limits: CodecLimits,

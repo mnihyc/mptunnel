@@ -6,6 +6,7 @@ use crate::ingress::{IngressConfig, ProxyAuthConfig};
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
 use crate::transport::PathSpec;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 pub const DEFAULT_PATH_PROBE_INTERVAL_MS: u64 = 10_000;
@@ -52,6 +53,7 @@ pub struct AppConfig {
     pub check_config: bool,
     pub service: ServiceConfig,
     pub resources: ResourceLimits,
+    pub management: ManagementConfig,
     pub security: SecurityConfig,
     pub command: CommandConfig,
 }
@@ -69,46 +71,43 @@ impl AppConfig {
         }
         self.service.validate()?;
         self.resources.validate()?;
+        self.management.validate()?;
         match &self.command {
-            CommandConfig::Client(client) => {
-                if client.paths.is_empty() {
-                    return Err(ConfigError::NoPaths);
+            CommandConfig::Client(client) => validate_client_config(client, self.resources)?,
+            CommandConfig::Server(server) => validate_server_config(server, self.resources)?,
+            CommandConfig::Node(node) => {
+                if node.clients.is_empty() && node.servers.is_empty() {
+                    return Err(ConfigError::NoRuntimeServices);
                 }
-                if client.ingresses.is_empty() {
-                    return Err(ConfigError::NoIngresses);
+                for client in &node.clients {
+                    validate_client_config(client, self.resources)?;
                 }
-                for ingress in &client.ingresses {
-                    validate_ingress(ingress)?;
-                    if let IngressConfig::TunL4(tun) = ingress {
-                        validate_tun_l4(tun)?;
-                    }
-                }
-                validate_proxy_auth(&client.proxy_auth)?;
-                if client.paths.len() > self.resources.max_paths {
-                    return Err(ConfigError::TooManyPaths {
-                        actual: client.paths.len(),
-                        limit: self.resources.max_paths,
-                    });
-                }
-                if client.path_probe_interval.is_zero() {
-                    return Err(ConfigError::PathProbeIntervalZero);
-                }
-                if client.path_probe_timeout.is_zero() {
-                    return Err(ConfigError::PathProbeTimeoutZero);
+                for server in &node.servers {
+                    validate_server_config(server, self.resources)?;
                 }
             }
-            CommandConfig::Server(server) => {
-                if server.bind_paths.is_empty() {
-                    return Err(ConfigError::NoPaths);
-                }
-                if server.bind_paths.len() > self.resources.max_paths {
-                    return Err(ConfigError::TooManyPaths {
-                        actual: server.bind_paths.len(),
-                        limit: self.resources.max_paths,
-                    });
-                }
-                server.outbound_dns.validate()?;
-            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagementConfig {
+    pub listen: Vec<SocketAddr>,
+    pub token: Option<String>,
+}
+
+impl ManagementConfig {
+    pub fn enabled(&self) -> bool {
+        !self.listen.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.listen.iter().any(|addr| addr.port() == 0) {
+            return Err(ConfigError::ManagementListenPortZero);
+        }
+        if self.token.as_ref().is_some_and(|token| token.is_empty()) {
+            return Err(ConfigError::ManagementTokenEmpty);
         }
         Ok(())
     }
@@ -316,22 +315,125 @@ impl SecurityConfig {
 pub enum CommandConfig {
     Client(ClientConfig),
     Server(ServerConfig),
+    Node(NodeConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeConfig {
+    pub clients: Vec<ClientConfig>,
+    pub servers: Vec<ServerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteTargetKind {
+    Outbound,
+    Balancer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTarget {
+    pub kind: RouteTargetKind,
+    pub tag: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
+    pub route_target: Option<RouteTarget>,
     pub ingresses: Vec<IngressConfig>,
     pub proxy_auth: ProxyAuthConfig,
-    pub paths: Vec<PathSpec>,
+    pub security: SecurityConfig,
+    pub paths: Vec<ClientPathConfig>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientPathConfig {
+    pub spec: PathSpec,
+    pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
+    pub tag: Option<String>,
+    pub route_target: Option<RouteTarget>,
     pub bind_paths: Vec<PathSpec>,
+    pub security: SecurityConfig,
     pub outbound: OutboundConfig,
     pub outbound_dns: DnsConfig,
+}
+
+fn validate_client_config(
+    client: &ClientConfig,
+    resources: ResourceLimits,
+) -> Result<(), ConfigError> {
+    if client.paths.is_empty() {
+        return Err(ConfigError::NoPaths);
+    }
+    if client.ingresses.is_empty() {
+        return Err(ConfigError::NoIngresses);
+    }
+    for ingress in &client.ingresses {
+        validate_ingress(ingress)?;
+        if let IngressConfig::TunL4(tun) = ingress {
+            validate_tun_l4(tun)?;
+        }
+    }
+    validate_proxy_auth(&client.proxy_auth)?;
+    validate_security_config(&client.security)?;
+    for ingress in &client.ingresses {
+        match ingress {
+            IngressConfig::Socks5 { proxy_auth, .. }
+            | IngressConfig::HttpConnect { proxy_auth, .. } => {
+                validate_proxy_auth(proxy_auth)?;
+            }
+            IngressConfig::TunL4(_) => {}
+        }
+    }
+    if client.paths.len() > resources.max_paths {
+        return Err(ConfigError::TooManyPaths {
+            actual: client.paths.len(),
+            limit: resources.max_paths,
+        });
+    }
+    if client.path_probe_interval.is_zero() {
+        return Err(ConfigError::PathProbeIntervalZero);
+    }
+    if client.path_probe_timeout.is_zero() {
+        return Err(ConfigError::PathProbeTimeoutZero);
+    }
+    Ok(())
+}
+
+fn validate_server_config(
+    server: &ServerConfig,
+    resources: ResourceLimits,
+) -> Result<(), ConfigError> {
+    if server.bind_paths.is_empty() {
+        return Err(ConfigError::NoPaths);
+    }
+    if server.bind_paths.len() > resources.max_paths {
+        return Err(ConfigError::TooManyPaths {
+            actual: server.bind_paths.len(),
+            limit: resources.max_paths,
+        });
+    }
+    validate_security_config(&server.security)?;
+    server.outbound_dns.validate()?;
+    Ok(())
+}
+
+fn validate_security_config(security: &SecurityConfig) -> Result<(), ConfigError> {
+    validate_transport_security(
+        security.mode,
+        security.transport,
+        security.integrity,
+        &security.secret,
+    )?;
+    if security.auth_freshness_window.is_zero() {
+        return Err(ConfigError::AuthFreshnessWindowZero);
+    }
+    Ok(())
 }
 
 impl DnsConfig {
@@ -348,7 +450,7 @@ impl DnsConfig {
 
 fn validate_ingress(ingress: &IngressConfig) -> Result<(), ConfigError> {
     match ingress {
-        IngressConfig::Socks5 { listen } | IngressConfig::HttpConnect { listen } => {
+        IngressConfig::Socks5 { listen, .. } | IngressConfig::HttpConnect { listen, .. } => {
             if listen.is_empty() {
                 return Err(ConfigError::NoListenAddresses);
             }
@@ -450,6 +552,9 @@ pub enum ConfigError {
     ProxyAuthPasswordEmpty,
     ProxyAuthUsernameTooLong,
     ProxyAuthPasswordTooLong,
+    ManagementListenPortZero,
+    ManagementTokenEmpty,
+    NoRuntimeServices,
 }
 
 impl From<SecurityPolicyError> for ConfigError {
@@ -567,6 +672,18 @@ impl std::fmt::Display for ConfigError {
             Self::ProxyAuthPasswordTooLong => {
                 write!(f, "proxy auth password must fit in 255 bytes")
             }
+            Self::ManagementListenPortZero => {
+                write!(f, "management API listen port must be nonzero")
+            }
+            Self::ManagementTokenEmpty => {
+                write!(f, "management API token must not be empty")
+            }
+            Self::NoRuntimeServices => {
+                write!(
+                    f,
+                    "config must define at least one inbound or path listener"
+                )
+            }
         }
     }
 }
@@ -607,6 +724,32 @@ mod tests {
         assert_eq!(
             compact_codec.max_udp_replay_window_packets,
             MIN_UDP_REPLAY_WINDOW_PACKETS
+        );
+    }
+
+    #[test]
+    fn udp_quic_and_custom_lab_engines_are_supported() {
+        let default_path = "udp://127.0.0.1:443"
+            .parse::<PathSpec>()
+            .expect("default udp path parses");
+        let quic_path = "udp://127.0.0.1:443?engine=quic"
+            .parse::<PathSpec>()
+            .expect("quic path parses");
+        let custom_lab_path = "udp://127.0.0.1:443?engine=custom-lab"
+            .parse::<PathSpec>()
+            .expect("custom lab path parses");
+
+        assert_eq!(
+            default_path.metadata.udp_engine,
+            crate::transport::UdpEngine::Quic
+        );
+        assert_eq!(
+            quic_path.metadata.udp_engine,
+            crate::transport::UdpEngine::Quic
+        );
+        assert_eq!(
+            custom_lab_path.metadata.udp_engine,
+            crate::transport::UdpEngine::CustomLab
         );
     }
 }

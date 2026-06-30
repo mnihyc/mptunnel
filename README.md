@@ -46,6 +46,61 @@ lab/run-heterogeneous-ablation.sh
 
 The lab emulates low-latency, balanced, cross-continent high-bandwidth, harsh poor-Internet, saturated-link, flapping-link, ideal 0%-loss, controlled 2^3 bandwidth/latency/loss matrix, UDP, and failover scenarios, then records direct, single-path, multipath, and mixed-workload comparison results under `lab/results/`. It mutates Docker network namespaces only.
 
+## Config File
+
+Starting `mptunnel` without arguments loads `./config.toml`. Use `--config PATH` or `-c PATH` to select another file, and use `--config PATH --check-config` to validate a file without starting listeners. The TOML file is role-free and V2Ray-style: `[[inbounds]]` accept traffic, `[[outbounds]]` forward it, every entry can have a `tag`, and `protocol = "mpp"` is the mptunnel protocol itself.
+
+Minimal local forwarding node:
+
+```toml
+[management]
+listen = ["127.0.0.1:7600"]
+token = "replace-with-management-token"
+
+[[inbounds]]
+tag = "local-socks"
+protocol = "socks5"
+listen = ["127.0.0.1:1080"]
+outbound = "edge-mpp"
+
+[[outbounds]]
+tag = "edge-mpp"
+protocol = "mpp"
+endpoints = ["tcp://203.0.113.10:443", "udp://203.0.113.10:443"]
+
+[outbounds.security]
+secret = "replace-with-shared-secret-at-least-32-bytes"
+```
+
+Minimal edge/relay node:
+
+```toml
+[management]
+listen = ["127.0.0.1:7601"]
+token = "replace-with-management-token"
+
+[[inbounds]]
+tag = "edge-mpp"
+protocol = "mpp"
+endpoints = ["tcp://0.0.0.0:443", "udp://0.0.0.0:443"]
+outbound = "direct-egress"
+
+[inbounds.security]
+secret = "replace-with-shared-secret-at-least-32-bytes"
+
+[[outbounds]]
+tag = "direct-egress"
+protocol = "direct"
+```
+
+To chain requests through another proxy, point an `inbound(protocol = "mpp")` at an outbound tagged with `protocol = "socks5"`, `http-connect`, or `http-connect-udp` and provide `proxy = "host:port"`.
+
+Routing policy is selected explicitly with `balancer = "tag"` on an inbound. MPP paths belong to `protocol = "mpp"` outbounds, and routing balancers reference outbound tags; balancers do not own endpoints or security directly. `strategy = "combined-mpp"` combines multiple MPP outbounds for a local SOCKS5/HTTP/TUN inbound while preserving each MPP outbound's own security. `strategy = "sequence"` and `strategy = "random"` apply to egress outbounds used by MPP inbounds.
+
+## Management API
+
+The release binary includes a lightweight JSON management API when `[management].listen` or `--management-listen` is configured. Endpoints include `GET /healthz`, `GET /status`, `GET /paths`, `GET /traffic`, `GET /diagnostics`, and client-side `POST /control/path`. If a token is set, use `Authorization: Bearer <token>` or `X-Mptunnel-Token: <token>`. Node status includes each MPP outbound or balancer route target, and path control accepts either `client_index` or `client_tag`.
+
 Client-side proxy ingress:
 
 ```bash

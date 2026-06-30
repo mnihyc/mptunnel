@@ -5,8 +5,14 @@ use std::net::SocketAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngressConfig {
-    Socks5 { listen: Vec<SocketAddr> },
-    HttpConnect { listen: Vec<SocketAddr> },
+    Socks5 {
+        listen: Vec<SocketAddr>,
+        proxy_auth: ProxyAuthConfig,
+    },
+    HttpConnect {
+        listen: Vec<SocketAddr>,
+        proxy_auth: ProxyAuthConfig,
+    },
     TunL4(TunL4Config),
 }
 

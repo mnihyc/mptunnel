@@ -10,7 +10,7 @@ const KIND_FRAME_FRAGMENT: u8 = 2;
 const KIND_CLOSE_STREAM: u8 = 3;
 const KIND_UNORDERED_FRAME_FRAGMENT: u8 = 4;
 const KIND_RELIABLE_UNORDERED_FRAME_FRAGMENT: u8 = 5;
-const ACK_PREFIX_LEN: usize = 3;
+const ACK_PREFIX_LEN: usize = 15;
 const ACK_RANGE_LEN: usize = 16;
 const FRAME_FRAGMENT_PREFIX_LEN: usize = 25;
 const CLOSE_STREAM_LEN: usize = 9;
@@ -27,6 +27,8 @@ pub(super) struct PacketHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PacketPayload {
     Ack {
+        largest_acked: u64,
+        ack_delay_us: u32,
         ranges: Vec<PacketAckRange>,
     },
     FrameFragment {
@@ -66,14 +68,14 @@ pub(super) fn encode_packet(
     header: PacketHeader,
     payload: &PacketPayload,
 ) -> Result<Vec<u8>, UdpCarrierFrameError> {
-    let mut plaintext = encode_payload(payload)?;
     let aad = encode_header(header);
+    let mut payload = encode_payload(payload)?;
     let tag = cipher
-        .encrypt(header.direction, header.packet_number, &aad, &mut plaintext)
+        .encrypt(header.direction, header.packet_number, &aad, &mut payload)
         .map_err(|_| UdpCarrierFrameError::Crypto)?;
-    let mut packet = Vec::with_capacity(aad.len() + plaintext.len() + tag.len());
+    let mut packet = Vec::with_capacity(HEADER_LEN + payload.len() + AEAD_TAG_LEN);
     packet.extend_from_slice(&aad);
-    packet.extend_from_slice(&plaintext);
+    packet.extend_from_slice(&payload);
     packet.extend_from_slice(&tag);
     Ok(packet)
 }
@@ -151,11 +153,45 @@ fn decode_header(header: &[u8; HEADER_LEN]) -> Result<PacketHeader, UdpCarrierFr
     })
 }
 
+pub(super) fn encoded_packet_len(payload: &PacketPayload) -> Result<usize, UdpCarrierFrameError> {
+    HEADER_LEN
+        .checked_add(encoded_payload_len(payload)?)
+        .and_then(|len| len.checked_add(AEAD_TAG_LEN))
+        .ok_or(UdpCarrierFrameError::InvalidPacket(
+            "packet payload too large",
+        ))
+}
+
+fn encoded_payload_len(payload: &PacketPayload) -> Result<usize, UdpCarrierFrameError> {
+    match payload {
+        PacketPayload::Ack { ranges, .. } => {
+            let count = u16::try_from(ranges.len())
+                .map_err(|_| UdpCarrierFrameError::InvalidPacket("too many ACK ranges"))?
+                as usize;
+            ACK_PREFIX_LEN
+                .checked_add(count.saturating_mul(ACK_RANGE_LEN))
+                .ok_or(UdpCarrierFrameError::InvalidPacket("ACK payload too large"))
+        }
+        PacketPayload::FrameFragment { payload, .. } => {
+            FRAME_FRAGMENT_PREFIX_LEN.checked_add(payload.len()).ok_or(
+                UdpCarrierFrameError::InvalidPacket("fragment payload too large"),
+            )
+        }
+        PacketPayload::CloseStream { .. } => Ok(CLOSE_STREAM_LEN),
+    }
+}
+
 fn encode_payload(payload: &PacketPayload) -> Result<Vec<u8>, UdpCarrierFrameError> {
     match payload {
-        PacketPayload::Ack { ranges } => {
+        PacketPayload::Ack {
+            largest_acked,
+            ack_delay_us,
+            ranges,
+        } => {
             let mut out = Vec::with_capacity(ACK_PREFIX_LEN + ranges.len() * ACK_RANGE_LEN);
             out.push(KIND_ACK);
+            out.extend_from_slice(&largest_acked.to_be_bytes());
+            out.extend_from_slice(&ack_delay_us.to_be_bytes());
             let count = u16::try_from(ranges.len())
                 .map_err(|_| UdpCarrierFrameError::InvalidPacket("too many ACK ranges"))?;
             out.extend_from_slice(&count.to_be_bytes());
@@ -207,8 +243,10 @@ fn decode_payload(payload: &[u8]) -> Result<PacketPayload, UdpCarrierFrameError>
             if payload.len() < ACK_PREFIX_LEN {
                 return Err(UdpCarrierFrameError::InvalidPacket("invalid ACK length"));
             }
+            let largest_acked = u64::from_be_bytes(payload[1..9].try_into().expect("slice length"));
+            let ack_delay_us = u32::from_be_bytes(payload[9..13].try_into().expect("slice length"));
             let count =
-                u16::from_be_bytes(payload[1..3].try_into().expect("slice length")) as usize;
+                u16::from_be_bytes(payload[13..15].try_into().expect("slice length")) as usize;
             if payload.len() != ACK_PREFIX_LEN + count * ACK_RANGE_LEN {
                 return Err(UdpCarrierFrameError::InvalidPacket(
                     "invalid ACK range length",
@@ -234,7 +272,19 @@ fn decode_payload(payload: &[u8]) -> Result<PacketPayload, UdpCarrierFrameError>
                 }
                 ranges.push(PacketAckRange { start, end });
             }
-            Ok(PacketPayload::Ack { ranges })
+            if !ranges
+                .iter()
+                .any(|range| range.start <= largest_acked && largest_acked < range.end)
+            {
+                return Err(UdpCarrierFrameError::InvalidPacket(
+                    "largest ACK is outside ACK ranges",
+                ));
+            }
+            Ok(PacketPayload::Ack {
+                largest_acked,
+                ack_delay_us,
+                ranges,
+            })
         }
         KIND_FRAME_FRAGMENT
         | KIND_UNORDERED_FRAME_FRAGMENT
@@ -319,5 +369,30 @@ mod tests {
                 payload: Bytes::from_static(b"hello"),
             }
         );
+    }
+
+    #[test]
+    fn ack_packet_carries_largest_acked_and_ack_delay() {
+        let secret = b"mptunnel integration test secret with enough entropy";
+        let cipher = PacketCipher::new(secret, CipherSuite::Aes256Gcm, 9).expect("cipher");
+        let header = PacketHeader {
+            direction: DIR_SERVER_TO_CLIENT,
+            connection_id: 9,
+            packet_number: 42,
+        };
+        let payload = PacketPayload::Ack {
+            largest_acked: 12,
+            ack_delay_us: 1_500,
+            ranges: vec![
+                PacketAckRange { start: 7, end: 9 },
+                PacketAckRange { start: 11, end: 13 },
+            ],
+        };
+        let encoded = encode_packet(&cipher, header, &payload).expect("encode");
+        let (decoded_header, decoded_payload) =
+            decode_packet(&cipher, &encoded, DIR_SERVER_TO_CLIENT).expect("decode");
+
+        assert_eq!(decoded_header, header);
+        assert_eq!(decoded_payload, payload);
     }
 }

@@ -16,8 +16,19 @@ pub(super) enum StreamCommand {
         stream_id: u64,
         frame_id: u64,
         encoded: Bytes,
+        next_offset: usize,
     },
-    Finish,
+    Finish {
+        stream_id: u64,
+    },
+}
+
+impl StreamCommand {
+    pub(super) fn stream_id(&self) -> u64 {
+        match self {
+            Self::SendFrame { stream_id, .. } | Self::Finish { stream_id } => *stream_id,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +80,7 @@ impl SendStream {
                 stream_id: self.stream_id,
                 frame_id,
                 encoded,
+                next_offset: 0,
             })
             .await
             .map_err(|_| UdpCarrierFrameError::QueueClosed)
@@ -168,8 +180,11 @@ fn carrier_frame_mode(frame: &Frame) -> CarrierFrameMode {
             ordered: false,
             reliable: true,
         },
-        Frame::StreamAck { .. }
-        | Frame::DatagramData { .. }
+        Frame::StreamAck { .. } => CarrierFrameMode {
+            ordered: false,
+            reliable: false,
+        },
+        Frame::DatagramData { .. }
         | Frame::DatagramFeedback { .. }
         | Frame::PathMetrics { .. }
         | Frame::RxRateHint { .. } => CarrierFrameMode {
@@ -184,6 +199,8 @@ fn carrier_frame_mode(frame: &Frame) -> CarrierFrameMode {
 }
 
 pub fn finish_stream(send: &mut SendStream) -> Result<(), UdpCarrierFrameError> {
-    let _ = send.commands.try_send(StreamCommand::Finish);
+    let _ = send.commands.try_send(StreamCommand::Finish {
+        stream_id: send.stream_id,
+    });
     Ok(())
 }

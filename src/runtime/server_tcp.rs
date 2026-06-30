@@ -120,17 +120,19 @@ pub(super) async fn handle_server_path(
                 Frame::OpenStream {
                     stream_id,
                     target,
+                    demand,
                     role,
                     ..
                 } if !draining => {
                     outbound::validate_target(&target)?;
                     context.outbound.ensure_supports(TargetProtocol::Tcp)?;
+                    let lane = flow_lane_from_stream_demand_hint(demand);
                     match context.tcp_streams.open_or_attach(
                         ServerTcpStreamOpenRequest {
                             session_id,
                             stream_id,
                             target: &target,
-                            lane: FlowLane::Latency,
+                            lane,
                             attachment: ServerTcpPathAttachment {
                                 path_id,
                                 underlay: UnderlayProtocol::Tcp,
@@ -344,13 +346,21 @@ pub(super) async fn handle_server_path(
                         )
                         .await?;
                 }
-                Frame::StreamAck { stream_id, ranges } => {
+                Frame::StreamAck {
+                    stream_id,
+                    complete,
+                    ranges,
+                } => {
                     context
                         .tcp_streams
                         .route_frame(
                             session_id,
                             stream_id,
-                            Frame::StreamAck { stream_id, ranges },
+                            Frame::StreamAck {
+                                stream_id,
+                                complete,
+                                ranges,
+                            },
                         )
                         .await?;
                 }
@@ -424,6 +434,14 @@ pub(super) async fn handle_server_path(
                     if !server_write_tcp_path_frame(&mut writer, &Frame::Pong { nonce }).await? {
                         return Ok(());
                     }
+                }
+                Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
+                    context.tcp_streams.record_path_metrics(
+                        session_id,
+                        UnderlayProtocol::Tcp,
+                        path_id,
+                        metrics,
+                    );
                 }
                 Frame::PathDrain {
                     path_id: drain_path_id,
@@ -570,7 +588,7 @@ pub(super) async fn run_server_tcp_stream(
                 max_offset: context.mux_limits.max_stream_window_bytes,
             })
             .await?;
-        relay_tcp_stream(outbound_stream, stream, context.mux_limits)
+        relay_tcp_stream(outbound_stream, stream, context.mux_limits, session_id)
             .await
             .map(|_| ())
     }

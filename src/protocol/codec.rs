@@ -1,7 +1,8 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
-    OutboundPolicy, PathCapabilities, PathId, PathMetrics, PathStatus, RateHint, ResetReason,
-    SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    OutboundPolicy, PathCapabilities, PathId, PathMetricDirection, PathMetrics, PathStatus,
+    RateHint, ResetReason, SessionId, StreamDemandHint, StreamFlags, StreamId, StreamOpenRole,
+    TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -228,12 +229,14 @@ fn encode_payload(
             target,
             ingress,
             outbound,
+            demand,
             role,
         } => {
             put_u64(out, stream_id.0);
             encode_target(out, target, limits)?;
             put_u8(out, ingress_to_u8(*ingress));
             encode_outbound(out, outbound, limits)?;
+            encode_stream_demand_hint(out, *demand);
             put_u8(out, stream_open_role_to_u8(*role));
             Ok(FrameKind::OpenStream)
         }
@@ -251,7 +254,11 @@ fn encode_payload(
             out.extend_from_slice(payload);
             Ok(FrameKind::StreamData)
         }
-        Frame::StreamAck { stream_id, ranges } => {
+        Frame::StreamAck {
+            stream_id,
+            complete,
+            ranges,
+        } => {
             if ranges.len() > limits.max_ack_ranges {
                 return Err(CodecError::TooManyAckRanges {
                     actual: ranges.len(),
@@ -262,6 +269,7 @@ fn encode_payload(
                 return Err(CodecError::LengthOverflow);
             }
             put_u64(out, stream_id.0);
+            put_u8(out, u8::from(*complete));
             put_u16(out, ranges.len() as u16);
             for range in ranges {
                 if range.is_empty() {
@@ -429,6 +437,7 @@ fn decode_payload(
             target: decode_target(reader, limits)?,
             ingress: ingress_from_u8(reader.get_u8()?)?,
             outbound: decode_outbound(reader, limits)?,
+            demand: decode_stream_demand_hint(reader)?,
             role: stream_open_role_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::StreamData => {
@@ -445,6 +454,11 @@ fn decode_payload(
         }
         FrameKind::StreamAck => {
             let stream_id = StreamId(reader.get_u64()?);
+            let complete = match reader.get_u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CodecError::InvalidEnum),
+            };
             let range_count = reader.get_u16()? as usize;
             if range_count > limits.max_ack_ranges {
                 return Err(CodecError::TooManyAckRanges {
@@ -461,7 +475,11 @@ fn decode_payload(
                 };
                 ranges.push(range);
             }
-            Ok(Frame::StreamAck { stream_id, ranges })
+            Ok(Frame::StreamAck {
+                stream_id,
+                complete,
+                ranges,
+            })
         }
         FrameKind::StreamMaxData => Ok(Frame::StreamMaxData {
             stream_id: StreamId(reader.get_u64()?),
@@ -733,29 +751,51 @@ fn decode_path_capabilities(reader: &mut Reader<'_>) -> Result<PathCapabilities,
 
 fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u16(out, metrics.path_id.0);
+    put_u8(out, underlay_to_u8(metrics.underlay));
+    put_u8(out, path_metric_direction_to_u8(metrics.direction));
+    put_u64(out, metrics.metric_epoch);
+    put_u32(out, metrics.metric_age_us);
     put_u32(out, metrics.min_rtt_us);
     put_u32(out, metrics.srtt_us);
     put_u32(out, metrics.rttvar_us);
     put_u32(out, metrics.jitter_us);
     put_u64(out, metrics.delivery_rate_bps);
+    put_u64(out, metrics.pacing_rate_bps);
     put_u32(out, metrics.loss_ppm);
     put_u32(out, metrics.ecn_ppm);
     put_u64(out, metrics.bytes_in_flight);
     put_u64(out, metrics.queue_bytes);
+    put_u64(out, metrics.inflight_limit_bytes);
+    put_u64(out, metrics.inflight_hi_bytes);
+    put_u32(out, metrics.confidence_ppm);
+    put_u8(out, u8::from(metrics.app_limited));
+    put_u8(out, u8::from(metrics.has_ack_derived_data_sample));
+    put_u32(out, metrics.data_sample_count);
 }
 
 fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecError> {
     Ok(PathMetrics {
         path_id: PathId(reader.get_u16()?),
+        underlay: underlay_from_u8(reader.get_u8()?)?,
+        direction: path_metric_direction_from_u8(reader.get_u8()?)?,
+        metric_epoch: reader.get_u64()?,
+        metric_age_us: reader.get_u32()?,
         min_rtt_us: reader.get_u32()?,
         srtt_us: reader.get_u32()?,
         rttvar_us: reader.get_u32()?,
         jitter_us: reader.get_u32()?,
         delivery_rate_bps: reader.get_u64()?,
+        pacing_rate_bps: reader.get_u64()?,
         loss_ppm: reader.get_u32()?,
         ecn_ppm: reader.get_u32()?,
         bytes_in_flight: reader.get_u64()?,
         queue_bytes: reader.get_u64()?,
+        inflight_limit_bytes: reader.get_u64()?,
+        inflight_hi_bytes: reader.get_u64()?,
+        confidence_ppm: reader.get_u32()?,
+        app_limited: decode_bool(reader.get_u8()?)?,
+        has_ack_derived_data_sample: decode_bool(reader.get_u8()?)?,
+        data_sample_count: reader.get_u32()?,
     })
 }
 
@@ -802,6 +842,24 @@ fn encode_offset_ranges(
         put_u64(out, range.end);
     }
     Ok(())
+}
+
+fn encode_stream_demand_hint(out: &mut Vec<u8>, demand: StreamDemandHint) {
+    put_u64(out, demand.observed_bytes);
+    put_u64(out, demand.repair_bytes);
+    put_u32(out, demand.latency_weight_ppm);
+    put_u32(out, demand.throughput_weight_ppm);
+    put_u32(out, demand.realtime_weight_ppm);
+}
+
+fn decode_stream_demand_hint(reader: &mut Reader<'_>) -> Result<StreamDemandHint, CodecError> {
+    Ok(StreamDemandHint {
+        observed_bytes: reader.get_u64()?,
+        repair_bytes: reader.get_u64()?,
+        latency_weight_ppm: reader.get_u32()?,
+        throughput_weight_ppm: reader.get_u32()?,
+        realtime_weight_ppm: reader.get_u32()?,
+    })
 }
 
 fn decode_offset_ranges(
@@ -1017,6 +1075,29 @@ fn underlay_from_u8(value: u8) -> Result<UnderlayProtocol, CodecError> {
     }
 }
 
+fn path_metric_direction_to_u8(value: PathMetricDirection) -> u8 {
+    match value {
+        PathMetricDirection::ClientToServer => 1,
+        PathMetricDirection::ServerToClient => 2,
+    }
+}
+
+fn path_metric_direction_from_u8(value: u8) -> Result<PathMetricDirection, CodecError> {
+    match value {
+        1 => Ok(PathMetricDirection::ClientToServer),
+        2 => Ok(PathMetricDirection::ServerToClient),
+        _ => Err(CodecError::InvalidEnum),
+    }
+}
+
+fn decode_bool(value: u8) -> Result<bool, CodecError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(CodecError::InvalidEnum),
+    }
+}
+
 fn path_status_to_u8(value: PathStatus) -> u8 {
     match value {
         PathStatus::Active => 1,
@@ -1059,6 +1140,7 @@ fn stream_open_role_to_u8(value: StreamOpenRole) -> u8 {
     match value {
         StreamOpenRole::Active => 1,
         StreamOpenRole::Repair => 2,
+        StreamOpenRole::Validation => 3,
     }
 }
 
@@ -1066,6 +1148,7 @@ fn stream_open_role_from_u8(value: u8) -> Result<StreamOpenRole, CodecError> {
     match value {
         1 => Ok(StreamOpenRole::Active),
         2 => Ok(StreamOpenRole::Repair),
+        3 => Ok(StreamOpenRole::Validation),
         _ => Err(CodecError::InvalidEnum),
     }
 }
@@ -1191,6 +1274,7 @@ mod tests {
             },
             ingress: IngressKind::Socks5,
             outbound: OutboundPolicy::Direct,
+            demand: StreamDemandHint::throughput(),
             role: StreamOpenRole::Active,
         });
         round_trip(Frame::StreamData {
@@ -1204,6 +1288,7 @@ mod tests {
         });
         round_trip(Frame::StreamAck {
             stream_id: StreamId(7),
+            complete: true,
             ranges: vec![
                 OffsetRange::new(0, 5).expect("range"),
                 OffsetRange::new(10, 12).expect("range"),
@@ -1305,15 +1390,26 @@ mod tests {
         round_trip(Frame::PathMetrics {
             metrics: PathMetrics {
                 path_id: PathId(3),
+                underlay: UnderlayProtocol::Udp,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: 1_735_689_600,
+                metric_age_us: 5_000,
                 min_rtt_us: 18_000,
                 srtt_us: 25_000,
                 rttvar_us: 3_000,
                 jitter_us: 1_200,
                 delivery_rate_bps: 125_000_000,
+                pacing_rate_bps: 150_000_000,
                 loss_ppm: 1_500,
                 ecn_ppm: 25,
                 bytes_in_flight: 64 * 1024,
                 queue_bytes: 16 * 1024,
+                inflight_limit_bytes: 512 * 1024,
+                inflight_hi_bytes: 768 * 1024,
+                confidence_ppm: 875_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 9,
             },
         });
         round_trip(Frame::RxRateHint {
@@ -1350,6 +1446,7 @@ mod tests {
 
         let too_many_ranges = Frame::StreamAck {
             stream_id: StreamId(1),
+            complete: true,
             ranges: vec![
                 OffsetRange::new(0, 1).expect("range"),
                 OffsetRange::new(2, 3).expect("range"),

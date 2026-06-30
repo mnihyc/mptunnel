@@ -58,6 +58,9 @@ pub struct PathSnapshot {
     pub loss_rate: f64,
     pub queue_bytes: u64,
     pub bytes_in_flight: u64,
+    pub product_bytes_in_flight: u64,
+    pub active_flows: u32,
+    pub active_latency_sensitive_flows: u32,
     pub pacing_rate_bps: f64,
     pub inflight_limit_bytes: u64,
     pub confidence: f64,
@@ -82,6 +85,9 @@ impl PathSnapshot {
             loss_rate: 0.0,
             queue_bytes: 0,
             bytes_in_flight: 0,
+            product_bytes_in_flight: 0,
+            active_flows: 0,
+            active_latency_sensitive_flows: 0,
             pacing_rate_bps: delivery_rate_bps,
             inflight_limit_bytes: 0,
             confidence: 1.0,
@@ -397,7 +403,7 @@ pub fn score_path(
         return None;
     }
 
-    let rate = path.pacing_rate_bps.max(path.delivery_rate_bps).max(1.0);
+    let rate = effective_path_rate_bps(path, lane);
     let effective_inflight = if path.inflight_limit_bytes > 0 {
         path.bytes_in_flight
             .min(path.inflight_limit_bytes.saturating_mul(2))
@@ -413,6 +419,7 @@ pub fn score_path(
     eta_ms += path.jitter_ms;
     eta_ms += path.loss_rate.clamp(0.0, 1.0) * policy.loss_penalty_scale_ms;
     eta_ms += (1.0 - path.confidence.clamp(0.0, 1.0)) * policy.low_confidence_penalty_ms;
+    eta_ms += active_flow_penalty_ms(path, lane);
 
     if path.state == PathState::Suspect {
         eta_ms += suspect_penalty_ms(lane, policy);
@@ -436,6 +443,31 @@ pub fn score_path(
     })
 }
 
+fn active_flow_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
+    match lane {
+        FlowLane::Throughput | FlowLane::Background => {
+            f64::from(path.active_latency_sensitive_flows) * path.srtt_ms.max(1.0)
+        }
+        FlowLane::Control | FlowLane::RealtimeDatagram | FlowLane::Latency => {
+            f64::from(path.active_flows) * path.srtt_ms.max(1.0) * 0.25
+        }
+    }
+}
+
+fn effective_path_rate_bps(path: PathSnapshot, lane: FlowLane) -> f64 {
+    let rate = path.pacing_rate_bps.max(path.delivery_rate_bps).max(1.0);
+    match lane {
+        FlowLane::Throughput | FlowLane::Background => {
+            let active_bulk_flows = path
+                .active_flows
+                .saturating_sub(path.active_latency_sensitive_flows)
+                .max(1) as f64;
+            rate / active_bulk_flows
+        }
+        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram => rate,
+    }
+}
+
 fn priority_order() -> [FlowLane; 5] {
     [
         FlowLane::Control,
@@ -451,7 +483,7 @@ fn lane_quantum_bytes(lane: FlowLane) -> u64 {
         FlowLane::Control => 128 * 1024,
         FlowLane::RealtimeDatagram => 96 * 1024,
         FlowLane::Latency => 96 * 1024,
-        FlowLane::Throughput => 512 * 1024,
+        FlowLane::Throughput => 64 * 1024,
         FlowLane::Background => 64 * 1024,
     }
 }
@@ -461,7 +493,7 @@ fn flow_quantum_bytes(lane: FlowLane) -> u64 {
         FlowLane::Control => 64 * 1024,
         FlowLane::RealtimeDatagram => 64 * 1024,
         FlowLane::Latency => 64 * 1024,
-        FlowLane::Throughput => 256 * 1024,
+        FlowLane::Throughput => 64 * 1024,
         FlowLane::Background => 32 * 1024,
     }
 }
@@ -600,6 +632,23 @@ mod tests {
 
         let choice = choose_path(
             &[low_latency, high_bandwidth, unstable],
+            FlowLane::Throughput,
+            4 * 1024 * 1024,
+            SchedulerPolicy::default(),
+        );
+
+        assert_eq!(choice.map(|score| score.path_id), Some(PathId(1)));
+    }
+
+    #[test]
+    fn throughput_scoring_accounts_for_active_bulk_flow_sharing() {
+        let mut busy_low_latency =
+            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, mbps(200.0));
+        busy_low_latency.active_flows = 3;
+        let independent = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 80.0, mbps(200.0));
+
+        let choice = choose_path(
+            &[busy_low_latency, independent],
             FlowLane::Throughput,
             4 * 1024 * 1024,
             SchedulerPolicy::default(),

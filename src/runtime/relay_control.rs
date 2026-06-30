@@ -1,150 +1,5 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayFlowSignals {
-    sent_offset: u64,
-    received_offset: u64,
-    repair_bytes: usize,
-}
-
-impl TcpRelayFlowSignals {
-    pub(super) fn new(sent_offset: u64, received_offset: u64, repair_bytes: usize) -> Self {
-        Self {
-            sent_offset,
-            received_offset,
-            repair_bytes,
-        }
-    }
-
-    pub(super) fn observed_bytes(self) -> u64 {
-        self.sent_offset
-            .max(self.received_offset)
-            .saturating_add(self.repair_bytes as u64)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayFlowDemandTracker {
-    current: FlowLane,
-    rebalance_attempted: bool,
-    started_at: Instant,
-    last_refresh_at: Instant,
-    last_observed_bytes: u64,
-    send_rate_bps: f64,
-}
-
-impl TcpRelayFlowDemandTracker {
-    pub(super) fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            current: FlowLane::Latency,
-            rebalance_attempted: false,
-            started_at: now,
-            last_refresh_at: now,
-            last_observed_bytes: 0,
-            send_rate_bps: 0.0,
-        }
-    }
-
-    pub(super) fn refresh(
-        &mut self,
-        signals: TcpRelayFlowSignals,
-        path: Option<PathSnapshot>,
-        mux_limits: MuxLimits,
-    ) -> TcpRelayFlowDecision {
-        let now = Instant::now();
-        let observed_bytes = signals.observed_bytes();
-        let delta_bytes = observed_bytes.saturating_sub(self.last_observed_bytes);
-        let elapsed = now.duration_since(self.last_refresh_at);
-        if delta_bytes > 0 || elapsed >= Duration::from_millis(1) {
-            let sample_rate = delta_bytes as f64 * 8.0 / elapsed.as_secs_f64().max(0.001);
-            self.send_rate_bps = if self.send_rate_bps <= 0.0 {
-                sample_rate
-            } else {
-                self.send_rate_bps * 0.75 + sample_rate * 0.25
-            };
-        }
-        self.last_refresh_at = now;
-        self.last_observed_bytes = observed_bytes;
-        let previous = self.current;
-        let threshold = tcp_auto_bulk_threshold_bytes(path, mux_limits);
-        let demand =
-            FlowDemand::reliable_stream(observed_bytes, signals.repair_bytes as u64, threshold);
-        let mut demand = demand;
-        let flow_age = now.duration_since(self.started_at);
-        let idle_gap = delta_bytes == 0 && elapsed >= tcp_auto_interactive_idle_gap(path);
-        let rate_threshold = tcp_auto_bulk_rate_threshold_bps(path, mux_limits);
-        let sustained_bulk = observed_bytes >= threshold
-            && (self.send_rate_bps >= rate_threshold
-                || flow_age >= tcp_auto_interactive_idle_gap(path) * 2);
-        if self.current == FlowLane::Throughput && !idle_gap {
-            demand.lane = FlowLane::Throughput;
-            demand.throughput_weight_ppm = demand
-                .throughput_weight_ppm
-                .max(FlowDemand::PPM_MAX / 2 + 1);
-            demand.latency_weight_ppm =
-                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
-        } else if !sustained_bulk {
-            demand.lane = FlowLane::Latency;
-            demand.throughput_weight_ppm =
-                demand.throughput_weight_ppm.min(FlowDemand::PPM_MAX / 2);
-            demand.latency_weight_ppm =
-                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
-            if idle_gap {
-                self.rebalance_attempted = false;
-            }
-        }
-        self.current = demand.lane;
-        TcpRelayFlowDecision {
-            demand,
-            previous_lane: previous,
-            promoted_to_throughput: previous != FlowLane::Throughput
-                && self.current == FlowLane::Throughput,
-        }
-    }
-
-    pub(super) fn should_rebalance(self, update: TcpRelayFlowDecision) -> bool {
-        update.promoted_to_throughput && !self.rebalance_attempted
-    }
-
-    pub(super) fn mark_rebalance_attempted(&mut self) {
-        self.rebalance_attempted = true;
-    }
-}
-
-fn tcp_auto_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxLimits) -> f64 {
-    path.map_or_else(
-        || tcp_relay_buffer_len(mux_limits) as f64 * 8.0 * 4.0,
-        |path| path.delivery_rate_bps.max(1.0) * 0.125,
-    )
-}
-
-fn tcp_auto_interactive_idle_gap(path: Option<PathSnapshot>) -> Duration {
-    let srtt_ms = path.map_or(100.0, |path| path.srtt_ms.max(1.0));
-    Duration::from_secs_f64((srtt_ms / 1000.0 * 4.0).clamp(0.05, 2.0))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayFlowDecision {
-    pub(super) demand: FlowDemand,
-    pub(super) previous_lane: FlowLane,
-    pub(super) promoted_to_throughput: bool,
-}
-
-pub(super) fn tcp_auto_bulk_threshold_bytes(
-    path: Option<PathSnapshot>,
-    mux_limits: MuxLimits,
-) -> u64 {
-    let relay_chunk = tcp_relay_buffer_len(mux_limits) as u64;
-    let window = mux_limits.max_stream_window_bytes.max(relay_chunk);
-    let bdp_bytes = path.map_or(relay_chunk, |path| {
-        ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)).ceil() as u64
-    });
-    let ramp_floor = relay_chunk.saturating_mul(2).min(window);
-    let ramp_bdp = bdp_bytes.saturating_div(8).max(relay_chunk).max(ramp_floor);
-    ramp_bdp.min(window)
-}
-
 pub(super) async fn relay_migrating_tcp_stream<S>(
     mut local: S,
     context: &ClientPathContext,
@@ -171,7 +26,8 @@ where
     let mut pending_remote_fin_offset = None;
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
-    let mut path_flights = RelayPathFlightLedger::default();
+    let mut path_next_live_sample_bytes = HashMap::<RelayPathKey, u64>::new();
+    let mut sender = RelaySenderService::new(stream_id);
     let mut flow_demand = TcpRelayFlowDemandTracker::new();
     let mut last_stream_progress_at = Instant::now();
     let mut last_delivery_progress_at = Instant::now();
@@ -182,9 +38,14 @@ where
     let mut path_last_delivery_at = HashMap::from([(initial_key, Instant::now())]);
     let mut interactive_response_pending = false;
     let mut recv_progress = ReliableRecvProgress::default();
+    let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
+    #[cfg(feature = "lab-diagnostics")]
+    let mut last_reported_read_block: Option<(usize, usize, usize)> = None;
+    #[cfg(feature = "lab-diagnostics")]
+    let mut last_reported_receive_hole: Option<(u64, usize, usize, u64)> = None;
 
     let result = loop {
         if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
@@ -231,6 +92,20 @@ where
             remotes.set_lane(relay_lane);
         }
         if flow_demand.should_rebalance(demand_update) {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "client_stream_rebalance_due",
+                format_args!(
+                    "stream_id={} lane={:?} promoted={} observed_bytes={} send_rate_mbps={:.3} interval_ms={:.3} attached_paths={}",
+                    stream_id.0,
+                    relay_lane,
+                    demand_update.promoted_to_throughput,
+                    demand_update.observed_bytes,
+                    demand_update.send_rate_bps / 1_000_000.0,
+                    demand_update.rebalance_interval.as_secs_f64() * 1000.0,
+                    remotes.path_keys().len(),
+                ),
+            );
             flow_demand.mark_rebalance_attempted();
             if let Err(err) = switch_tcp_relay_to_best_path(
                 context,
@@ -247,12 +122,30 @@ where
             } else {
                 last_stream_progress_at = Instant::now();
             }
+            if relay_lane_is_bulk(relay_lane)
+                && let Err(err) = attach_tcp_relay_validation_paths(
+                    context,
+                    &spec,
+                    relay_lane,
+                    &mut remotes,
+                    &send_stream,
+                    !local_open,
+                )
+                .await
+            {
+                eprintln!("warning: TCP auto validation attachment failed: {err}");
+            }
             send_stream.update_max_offset(remotes.max_offset());
         }
-        let adaptive_chunk =
-            adaptive_tcp_relay_chunk_bytes(path_snapshot, relay_lane, context.mux_limits)
-                .min(remotes.max_frame_payload_bytes(context.mux_limits))
-                .max(1);
+        let adaptive_chunk = adaptive_relay_chunk_bytes_for_underlay(
+            path_snapshot,
+            relay_lane,
+            context.mux_limits,
+            remotes
+                .active_carrier_underlay()
+                .unwrap_or(UnderlayProtocol::Tcp),
+            remotes.max_frame_payload_bytes(context.mux_limits),
+        );
         resize_tcp_relay_buffer(&mut buf, adaptive_chunk);
         let adaptive_inflight =
             adaptive_tcp_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
@@ -302,6 +195,69 @@ where
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot, relay_lane),
         );
+        let mut can_read_local =
+            local_open && tcp_relay_can_read_with_limit(&send_stream, adaptive_inflight);
+        let prospective_read_budget = if can_read_local {
+            tcp_relay_read_budget_with_limit(
+                &send_stream,
+                context.mux_limits,
+                adaptive_inflight,
+                adaptive_chunk.min(buf.len()),
+            )
+        } else {
+            0
+        };
+        if can_read_local
+            && relay_lane_is_bulk(relay_lane)
+            && !sender.can_send_stream_data_extent(
+                context,
+                &remotes,
+                relay_lane,
+                send_stream.next_offset(),
+                prospective_read_budget.max(1),
+            )
+        {
+            can_read_local = false;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "sender_admission_blocked",
+                format_args!(
+                    "stream_id={} lane={:?} reason=pre_read_bulk_no_safe_path offset={} payload_bytes={}",
+                    stream_id.0,
+                    relay_lane,
+                    send_stream.next_offset(),
+                    prospective_read_budget,
+                ),
+            );
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            if local_open && !can_read_local {
+                let blocked_state = (
+                    send_stream.repair_bytes(),
+                    send_stream.send_credit_bytes(),
+                    adaptive_inflight,
+                );
+                if last_reported_read_block != Some(blocked_state) {
+                    lab_diagnostic(
+                        "relay_local_read_blocked",
+                        format_args!(
+                            "stream_id={} lane={:?} repair_bytes={} send_credit_bytes={} inflight_limit={} sent_offset={} received_offset={}",
+                            stream_id.0,
+                            relay_lane,
+                            blocked_state.0,
+                            blocked_state.1,
+                            blocked_state.2,
+                            send_stream.next_offset(),
+                            recv_stream.next_offset(),
+                        ),
+                    );
+                    last_reported_read_block = Some(blocked_state);
+                }
+            } else {
+                last_reported_read_block = None;
+            }
+        }
 
         tokio::select! {
             _ = tokio::time::sleep_until(receive_hole_repair_deadline), if receive_hole_repair_active => {
@@ -410,6 +366,7 @@ where
                         response_stall_reannounce_attempts = 0;
                     }
                 }
+                let failed_key = remotes.active_path_instance().map(|instance| instance.key);
                 if let Some(instance) = remotes.active_path_instance() {
                     remotes.fail_path_instance(context, instance).await;
                 }
@@ -427,6 +384,21 @@ where
                                 &remotes.path_keys(),
                                 Instant::now(),
                             );
+                            if let Some(failed_key) = failed_key
+                                && let Err(err) = sender.send_failed_path_gap_repairs(
+                                    context,
+                                    &mut remotes,
+                                    &send_stream,
+                                    failed_key,
+                                    relay_lane,
+                                )
+                                .await
+                            {
+                                if remotes.is_empty() {
+                                    break Err(err);
+                                }
+                                eprintln!("warning: TCP stall path-failure repair failed: {err}");
+                            }
                             continue;
                         }
                         Err(err) => {
@@ -445,17 +417,32 @@ where
                 )
                 .await
                 {
-                        Ok(attached) if attached > 0 => {
-                            send_stream.update_max_offset(remotes.max_offset());
-                            last_stream_progress_at = Instant::now();
-                            last_response_stall_repair_at = Instant::now();
-                            tcp_relay_refresh_path_tracking(
-                                &mut path_last_delivery_at,
-                                &remotes.path_keys(),
-                                Instant::now(),
-                            );
-                            continue;
+                    Ok(attached) if attached > 0 => {
+                        send_stream.update_max_offset(remotes.max_offset());
+                        last_stream_progress_at = Instant::now();
+                        last_response_stall_repair_at = Instant::now();
+                        tcp_relay_refresh_path_tracking(
+                            &mut path_last_delivery_at,
+                            &remotes.path_keys(),
+                            Instant::now(),
+                        );
+                        if let Some(failed_key) = failed_key
+                            && let Err(err) = sender.send_failed_path_gap_repairs(
+                                context,
+                                &mut remotes,
+                                &send_stream,
+                                failed_key,
+                                relay_lane,
+                            )
+                            .await
+                        {
+                            if remotes.is_empty() {
+                                break Err(err);
+                            }
+                            eprintln!("warning: TCP attached path-failure repair failed: {err}");
                         }
+                        continue;
+                    }
                     Ok(_) => {
                         last_stream_progress_at = Instant::now();
                         last_response_stall_repair_at = Instant::now();
@@ -470,17 +457,19 @@ where
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.path_keys().len() > 1
                 && tcp_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
-                match send_tcp_recv_progress_remote_set(
+                match sender.send_recv_progress(
                     &mut remotes,
                     context,
                     &recv_stream,
                     &mut recv_progress,
-                    true,
+                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                 )
                 .await
                 {
-                    Ok(()) => {
-                        last_stream_progress_at = Instant::now();
+                    Ok(sent) => {
+                        if sent {
+                            last_stream_progress_at = Instant::now();
+                        }
                         last_recv_progress_sent_at = Instant::now();
                     }
                     Err(err) if tcp_relay_error_is_migratable(&err) => {
@@ -508,12 +497,7 @@ where
                 }
             }
             read = async {
-                let read_budget = tcp_relay_read_budget_with_limit(
-                    &send_stream,
-                    context.mux_limits,
-                    adaptive_inflight,
-                    adaptive_chunk.min(buf.len()),
-                );
+                let read_budget = prospective_read_budget;
                 #[cfg(feature = "lab-diagnostics")]
                 let read_started = Instant::now();
                 let result = local.read(&mut buf[..read_budget]).await;
@@ -522,7 +506,7 @@ where
                     lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
                 }
                 result
-            }, if local_open && tcp_relay_can_read_with_limit(&send_stream, adaptive_inflight) => {
+            }, if can_read_local => {
                 let read = match read {
                     Ok(read) => read,
                     Err(err) => break Err(RuntimeError::Io(err)),
@@ -532,13 +516,15 @@ where
                     if remotes.fin_requires_repair_drain() && send_stream.repair_bytes() > 0 {
                         pending_local_fin = true;
                     } else {
-                        match remotes
-                            .send_frame(
+                        match sender
+                            .send_control_frame(
                                 context,
+                                &mut remotes,
                                 Frame::StreamFin {
                                     stream_id,
                                     final_offset: send_stream.next_offset(),
                                 },
+                                RelaySendCause::StreamFin,
                             )
                             .await
                         {
@@ -582,15 +568,14 @@ where
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
                     let sent_frame = frame.clone();
-                    match remotes.send_frame(context, frame).await {
-                        Ok(path_key) => {
+                    match sender.send_stream_data(context, &mut remotes, frame).await {
+                        Ok(outcome) => {
                             last_stream_progress_at = Instant::now();
                             stats.record_payload_bytes(read);
                             path_stats
-                                .entry(path_key)
+                                .entry(outcome.path_key)
                                 .or_default()
                                 .record_payload_bytes(read);
-                            path_flights.record_frame(path_key, &sent_frame);
                         }
                         Err(err) if tcp_relay_error_is_migratable(&err) => {
                             match attach_tcp_relay_paths(
@@ -605,8 +590,23 @@ where
                             .await
                             {
                                 Ok(attached) if attached > 0 => {
-                                    last_stream_progress_at = Instant::now();
-                                    stats.record_payload_bytes(read);
+                                    match sender
+                                        .send_stream_data(context, &mut remotes, sent_frame.clone())
+                                        .await
+                                    {
+                                        Ok(outcome) => {
+                                            last_stream_progress_at = Instant::now();
+                                            stats.record_payload_bytes(read);
+                                            path_stats
+                                                .entry(outcome.path_key)
+                                                .or_default()
+                                                .record_payload_bytes(read);
+                                        }
+                                        Err(err) if tcp_relay_error_is_migratable(&err) => {
+                                            break Err(err);
+                                        }
+                                        Err(err) => break Err(err),
+                                    }
                                 }
                                 Ok(_) => break Err(err),
                                 Err(err) => break Err(err),
@@ -670,6 +670,17 @@ where
                                 &remotes.path_keys(),
                                 Instant::now(),
                             );
+                            if let Err(err) = sender.send_failed_path_gap_repairs(
+                                context,
+                                &mut remotes,
+                                &send_stream,
+                                path_key,
+                                relay_lane,
+                            )
+                            .await
+                            {
+                                break Err(err);
+                            }
                         }
                         if remotes.is_empty() {
                             match attach_tcp_relay_paths(
@@ -691,6 +702,17 @@ where
                                         &remotes.path_keys(),
                                         Instant::now(),
                                     );
+                                    if let Err(err) = sender.send_failed_path_gap_repairs(
+                                        context,
+                                        &mut remotes,
+                                        &send_stream,
+                                        path_key,
+                                        relay_lane,
+                                    )
+                                    .await
+                                    {
+                                        break Err(err);
+                                    }
                                     continue;
                                 }
                                 Ok(_) => break Err(err),
@@ -719,6 +741,37 @@ where
                             Err(err) => break Err(RuntimeError::Stream(err)),
                         };
                         #[cfg(feature = "lab-diagnostics")]
+                        {
+                            let reorder_bytes = recv_stream.reorder_bytes();
+                            if reorder_bytes > 0 {
+                                let ack_ranges = recv_stream.ack_ranges();
+                                let hole_state = (
+                                    recv_stream.next_offset(),
+                                    reorder_bytes,
+                                    ack_ranges.len(),
+                                    ack_ranges.last().map_or(0, |range| range.end),
+                                );
+                                if last_reported_receive_hole != Some(hole_state) {
+                                    lab_diagnostic(
+                                        "receive_hole",
+                                        format_args!(
+                                            "stream_id={} path_underlay={:?} path_index={} next_offset={} reorder_bytes={} ack_ranges={} largest_end={}",
+                                            stream_id.0,
+                                            path_key.underlay,
+                                            path_key.index,
+                                            hole_state.0,
+                                            hole_state.1,
+                                            hole_state.2,
+                                            hole_state.3,
+                                        ),
+                                    );
+                                    last_reported_receive_hole = Some(hole_state);
+                                }
+                            } else {
+                                last_reported_receive_hole = None;
+                            }
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
                         last_stream_progress_at = Instant::now();
                         let delivered_progress = recv_stream.next_offset() > previous_remote_offset;
@@ -727,28 +780,23 @@ where
                             receive_hole_repair_attempts = 0;
                             response_stall_reannounce_attempts = 0;
                             path_last_delivery_at.insert(path_key, Instant::now());
-                            if tcp_relay_delivery_path_should_become_active(
-                                context,
-                                remotes.active_path_key(),
-                                path_key,
-                                relay_lane,
-                                tcp_relay_attach_payload_bytes(
-                                    &send_stream,
-                                    relay_lane,
-                                    context.mux_limits,
-                                ),
-                            ) && remotes.promote_path_instance_to_active(instance)
-                            {
-                                last_stream_progress_at = Instant::now();
-                            }
                         }
                         let mut write_error = None;
+                        let mut delivered_payload_bytes = 0usize;
                         for chunk in outcome.delivered {
                             stats.record_payload_bytes(chunk.len());
-                            path_stats
+                            let path_stat = path_stats
                                 .entry(path_key)
-                                .or_default()
-                                .record_payload_bytes(chunk.len());
+                                .or_default();
+                            path_stat.record_payload_bytes(chunk.len());
+                            delivered_payload_bytes =
+                                delivered_payload_bytes.saturating_add(chunk.len());
+                            maybe_mark_live_relay_path_delivery(
+                                context,
+                                path_key,
+                                *path_stat,
+                                &mut path_next_live_sample_bytes,
+                            );
                             #[cfg(feature = "lab-diagnostics")]
                             let write_started = Instant::now();
                             if let Err(err) = local.write_all(&chunk).await {
@@ -770,18 +818,47 @@ where
                         lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
                         if delivered_progress {
                             interactive_response_pending = false;
+                            if delivered_payload_bytes > 0
+                                && tcp_relay_delivery_path_should_become_active(
+                                    context,
+                                    remotes.active_path_key(),
+                                    path_key,
+                                    relay_lane,
+                                    tcp_relay_attach_payload_bytes(
+                                        &send_stream,
+                                        relay_lane,
+                                        context.mux_limits,
+                                    ),
+                                ) && remotes.promote_path_instance_to_active(instance)
+                            {
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "client_relay_active_path_promoted",
+                                    format_args!(
+                                        "stream_id={} path_underlay={:?} path_index={} lane={:?} delivered_bytes={} cause=delivery_evidence",
+                                        stream_id.0,
+                                        path_key.underlay,
+                                        path_key.index,
+                                        relay_lane,
+                                        delivered_payload_bytes,
+                                    ),
+                                );
+                                last_stream_progress_at = Instant::now();
+                            }
                         }
-                        match send_tcp_recv_progress_remote_set(
+                        match sender.send_recv_progress(
                             &mut remotes,
                             context,
                             &recv_stream,
                             &mut recv_progress,
-                            false,
+                            RelayRecvProgressSend::new(path_snapshot, relay_lane, false),
                         )
                         .await
                         {
-                            Ok(()) => {
-                                last_recv_progress_sent_at = Instant::now();
+                            Ok(sent) => {
+                                if sent {
+                                    last_recv_progress_sent_at = Instant::now();
+                                }
                             }
                             Err(err) if tcp_relay_error_is_migratable(&err) => {
                                 match attach_tcp_relay_paths(
@@ -817,53 +894,81 @@ where
                     }
                     Frame::StreamAck {
                         stream_id: ack_stream_id,
+                        complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        let previous_repair_bytes = send_stream.repair_bytes();
                         #[cfg(feature = "lab-diagnostics")]
                         let mux_started = Instant::now();
                         let ack = send_stream.apply_ack(&ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        for release in path_flights.release_acked_ranges(&ranges) {
-                            context.release_relay_path_inflight(
-                                release.key.underlay,
-                                release.key.index,
-                                release.bytes,
-                            );
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "path_model",
-                                format_args!(
-                                    "stream_id={} path_underlay={:?} path_index={} released_bytes={} cause=stream_ack",
-                                    stream_id.0,
-                                    release.key.underlay,
-                                    release.key.index,
-                                    release.bytes,
-                                ),
-                            );
-                        }
-                        let repair_limit =
-                            adaptive_tcp_relay_inflight_bytes(None, relay_lane, context.mux_limits);
-                        let repair_frames =
-                            send_stream.retransmission_frames_for_ack_gaps(&ranges, repair_limit);
+                        sender.release_acked_ranges(context, &ranges);
+                        let repair_limit = adaptive_tcp_relay_repair_bytes(
+                            path_snapshot,
+                            relay_lane,
+                            context.mux_limits,
+                        );
+                        let has_multipath_repair_alternative = remotes.path_keys().len() > 1;
+                        let udp_gap_repair_ready = ack_gap_repair.repair_ready(
+                            complete,
+                            &ranges,
+                            remotes.active_carrier_underlay(),
+                            has_multipath_repair_alternative,
+                            path_snapshot,
+                            relay_lane,
+                        );
+                        let repair_frames = stream_ack_gap_repair_frames(
+                            &send_stream,
+                            &ranges,
+                            repair_limit,
+                            complete,
+                            remotes.active_carrier_underlay(),
+                            has_multipath_repair_alternative,
+                            udp_gap_repair_ready,
+                        );
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "stream_ack_received",
+                            format_args!(
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_before={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
+                                stream_id.0,
+                                complete,
+                                ranges.len(),
+                                ranges.iter().map(|range| range.end).max().unwrap_or(0),
+                                ack.released_bytes,
+                                previous_repair_bytes,
+                                ack.remaining_repair_bytes,
+                                repair_frames.len(),
+                                remotes.active_carrier_underlay(),
+                                has_multipath_repair_alternative,
+                                udp_gap_repair_ready,
+                            ),
+                        );
                         let mut repair_error = None;
                         for frame in repair_frames {
-                            let sent_frame = frame.clone();
-                            let avoid_keys = path_flights.sent_keys_for_frame(&sent_frame);
-                            match remotes
-                                .send_repair_frame(context, frame, &avoid_keys)
+                            let retry_frame = frame.clone();
+                            match sender
+                                .send_repair_frame(
+                                    context,
+                                    &mut remotes,
+                                    frame,
+                                    RelaySendCause::AckGapRepair,
+                                )
                                 .await
                             {
-                                Ok(path_key) => {
-                                    path_flights.record_frame(path_key, &sent_frame);
+                                Ok(outcome) => {
+                                    #[cfg(not(feature = "lab-diagnostics"))]
+                                    let _ = outcome;
                                     #[cfg(feature = "lab-diagnostics")]
                                     lab_diagnostic(
                                         "repair",
                                         format_args!(
                                             "stream_id={} path_underlay={:?} path_index={} cause=ack_gap",
                                             stream_id.0,
-                                            path_key.underlay,
-                                            path_key.index,
+                                            outcome.path_key.underlay,
+                                            outcome.path_key.index,
                                         ),
                                     );
                                 }
@@ -879,7 +984,23 @@ where
                                     )
                                     .await
                                     {
-                                        Ok(attached) if attached > 0 => {}
+                                        Ok(attached) if attached > 0 => {
+                                            match sender
+                                                .send_repair_frame(
+                                                    context,
+                                                    &mut remotes,
+                                                    retry_frame,
+                                                    RelaySendCause::AckGapRepair,
+                                                )
+                                                .await
+                                            {
+                                                Ok(_) => {}
+                                                Err(err) => {
+                                                    repair_error = Some(err);
+                                                    break;
+                                                }
+                                            }
+                                        }
                                         Ok(_) => {
                                             repair_error = Some(err);
                                             break;
@@ -903,13 +1024,15 @@ where
                         let _ = ack;
                         last_stream_progress_at = Instant::now();
                         if pending_local_fin && send_stream.repair_bytes() == 0 {
-                            match remotes
-                                .send_frame(
+                            match sender
+                                .send_control_frame(
                                     context,
+                                    &mut remotes,
                                     Frame::StreamFin {
                                         stream_id,
                                         final_offset: send_stream.next_offset(),
                                     },
+                                    RelaySendCause::StreamFin,
                                 )
                                 .await
                             {
@@ -976,20 +1099,10 @@ where
                         ..
                     } => {
                         match remotes
-                            .replay_repair_cache_to_instance(
+                            .send_attach_control_to_instance(
                                 instance,
                                 &send_stream,
                                 pending_local_fin,
-                                tcp_relay_attach_payload_bytes(
-                                    &send_stream,
-                                    relay_lane,
-                                    context.mux_limits,
-                                )
-                                .max(adaptive_tcp_relay_inflight_bytes(
-                                    None,
-                                    relay_lane,
-                                    context.mux_limits,
-                                )),
                             )
                             .await
                         {
@@ -1038,9 +1151,7 @@ where
     if result.is_ok() {
         remotes.close_all().await;
     }
-    for release in path_flights.drain_all() {
-        context.release_relay_path_inflight(release.key.underlay, release.key.index, release.bytes);
-    }
+    sender.release_all(context);
     for (key, lane) in remaining_paths {
         if relay_error_is_tcp_path_failure(&result) {
             context.mark_relay_path_failure(key.underlay, key.index);
@@ -1069,6 +1180,82 @@ pub(super) async fn switch_tcp_relay_to_best_path(
     Ok(true)
 }
 
+fn maybe_mark_live_relay_path_delivery(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    stats: PathDeliveryStats,
+    next_sample_bytes: &mut HashMap<RelayPathKey, u64>,
+) {
+    let sample_step = tcp_relay_live_delivery_sample_bytes(context.mux_limits);
+    let next = next_sample_bytes.entry(key).or_insert(sample_step);
+    if stats.payload_bytes < *next {
+        return;
+    }
+    let Some(sample) = stats.rate_sample() else {
+        return;
+    };
+    context.mark_relay_path_rate_sample(key.underlay, key.index, sample);
+    *next = stats.payload_bytes.saturating_add(sample_step);
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "path_model",
+        format_args!(
+            "path_underlay={:?} path_index={} delivered_bytes={} elapsed_ms={:.3} cause=live_delivery",
+            key.underlay,
+            key.index,
+            stats.payload_bytes,
+            stats
+                .last_payload_at
+                .unwrap_or_else(Instant::now)
+                .saturating_duration_since(stats.first_payload_at.unwrap_or_else(Instant::now))
+                .as_secs_f64()
+                * 1000.0,
+        ),
+    );
+}
+
+fn tcp_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
+    tcp_relay_buffer_len(mux_limits) as u64
+}
+
+async fn attach_tcp_relay_validation_paths(
+    context: &ClientPathContext,
+    spec: &TcpRelayOpenSpec,
+    lane: FlowLane,
+    remotes: &mut TcpRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+) -> Result<usize, RuntimeError> {
+    if !relay_lane_is_bulk(lane) {
+        return Ok(0);
+    }
+    let payload_bytes = tcp_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
+    let candidates = context
+        .ordered_reliable_bulk_validation_path_keys(payload_bytes)
+        .into_iter()
+        .filter(|key| !remotes.contains_path_key(*key))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    attach_relay_path_candidates(
+        context,
+        remotes,
+        RelayPathAttachRequest {
+            spec,
+            lane,
+            send_stream,
+            resend_fin,
+            candidates,
+            role: StreamOpenRole::Validation,
+            allow_mixed_carrier: true,
+            send_attach_control: true,
+            attach_all_candidates: true,
+        },
+    )
+    .await
+}
+
 pub(super) fn tcp_relay_frame_prefers_current_data_path(frame: &Frame, lane: FlowLane) -> bool {
     matches!(frame, Frame::StreamFin { .. })
         || (matches!(frame, Frame::StreamData { .. }) && !relay_lane_is_bulk(lane))
@@ -1080,9 +1267,9 @@ pub(super) struct RelayPathAttachRequest<'a> {
     send_stream: &'a ReliableSendStream,
     resend_fin: bool,
     candidates: Vec<RelayPathKey>,
-    race_repair: bool,
+    role: StreamOpenRole,
     allow_mixed_carrier: bool,
-    replay_repair_cache: bool,
+    send_attach_control: bool,
     attach_all_candidates: bool,
 }
 
@@ -1112,45 +1299,31 @@ pub(super) async fn attach_relay_path_candidates(
             request.spec.ingress,
             request.lane,
             key,
-            if request.race_repair {
-                StreamOpenRole::Repair
-            } else {
-                StreamOpenRole::Active
-            },
+            request.role,
         )
         .await
         {
             Ok(opened) => {
-                let replay_result = if request.replay_repair_cache {
-                    let repair_limit = tcp_relay_attach_payload_bytes(
-                        request.send_stream,
-                        request.lane,
-                        context.mux_limits,
-                    )
-                    .max(adaptive_tcp_relay_inflight_bytes(
-                        None,
-                        request.lane,
-                        context.mux_limits,
-                    ));
-                    replay_tcp_repair_flight(
+                let attach_control_result = if request.send_attach_control {
+                    send_relay_attach_control_frames(
                         &opened.stream,
                         request.send_stream,
                         request.resend_fin,
-                        repair_limit,
                     )
                     .await
                 } else {
                     Ok(())
                 };
-                match replay_result {
+                match attach_control_result {
                     Ok(()) => {
-                        if request.race_repair {
-                            remotes.attach_for_repair(opened);
-                        } else {
-                            remotes.attach(opened);
+                        match request.role {
+                            StreamOpenRole::Active => remotes.attach(opened),
+                            StreamOpenRole::Repair => remotes.attach_for_repair(opened),
+                            StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        if !request.race_repair && !request.attach_all_candidates {
+                        if request.role == StreamOpenRole::Active && !request.attach_all_candidates
+                        {
                             return Ok(attached);
                         }
                     }
@@ -1250,7 +1423,7 @@ pub(super) async fn attach_tcp_relay_paths(
     };
     if matches!(mode, TcpRelayAttachMode::BulkStriping) {
         let candidates = context.ordered_reliable_bulk_striping_path_keys(payload_bytes);
-        return attach_relay_path_candidates(
+        let result = attach_relay_path_candidates(
             context,
             remotes,
             RelayPathAttachRequest {
@@ -1259,13 +1432,22 @@ pub(super) async fn attach_tcp_relay_paths(
                 send_stream,
                 resend_fin,
                 candidates,
-                race_repair: false,
+                role: StreamOpenRole::Validation,
                 allow_mixed_carrier: true,
-                replay_repair_cache: false,
+                send_attach_control: false,
                 attach_all_candidates: true,
             },
         )
         .await;
+        match result {
+            Ok(attached) if attached > 0 || !remotes.is_empty() => return Ok(attached),
+            Ok(_) => {}
+            Err(err)
+                if remotes.is_empty()
+                    && (stream_open_error_is_path_retryable(&err)
+                        || udp_stream_open_error_is_path_retryable(&err)) => {}
+            Err(err) => return Err(err),
+        }
     }
     if context.tcp_paths.is_empty() {
         return attach_udp_relay_paths(context, spec, lane, remotes, send_stream, resend_fin, mode)
@@ -1280,7 +1462,13 @@ pub(super) async fn attach_tcp_relay_paths(
         lane,
         payload_bytes,
     );
-    let race_repair = tcp_relay_should_race_repair(lane, send_stream, resend_fin, mode);
+    let role = if matches!(mode, TcpRelayAttachMode::BulkStriping) {
+        StreamOpenRole::Validation
+    } else if tcp_relay_should_race_repair(lane, send_stream, resend_fin, mode) {
+        StreamOpenRole::Repair
+    } else {
+        StreamOpenRole::Active
+    };
     let attached = attach_relay_path_candidates(
         context,
         remotes,
@@ -1296,9 +1484,9 @@ pub(super) async fn attach_tcp_relay_paths(
                     index,
                 })
                 .collect(),
-            race_repair,
+            role,
             allow_mixed_carrier: false,
-            replay_repair_cache: true,
+            send_attach_control: true,
             attach_all_candidates: false,
         },
     )
@@ -1362,7 +1550,13 @@ pub(super) async fn attach_udp_relay_paths(
             })
         });
     }
-    let race_repair = tcp_relay_should_race_repair(lane, send_stream, resend_fin, mode);
+    let role = if matches!(mode, TcpRelayAttachMode::BulkStriping) {
+        StreamOpenRole::Validation
+    } else if tcp_relay_should_race_repair(lane, send_stream, resend_fin, mode) {
+        StreamOpenRole::Repair
+    } else {
+        StreamOpenRole::Active
+    };
     let mut last_retryable_error = None;
     let mut attached = 0usize;
 
@@ -1383,36 +1577,23 @@ pub(super) async fn attach_udp_relay_paths(
             path_index,
             UdpStreamOpenOptions {
                 wait_for_accept: false,
-                role: if race_repair {
-                    StreamOpenRole::Repair
-                } else {
-                    StreamOpenRole::Active
-                },
+                role,
             },
         )
         .await
         {
             Ok(opened) => {
-                let repair_limit =
-                    tcp_relay_attach_payload_bytes(send_stream, lane, context.mux_limits).max(
-                        adaptive_tcp_relay_inflight_bytes(None, lane, context.mux_limits),
-                    );
-                match replay_tcp_repair_flight(
-                    &opened.stream,
-                    send_stream,
-                    resend_fin,
-                    repair_limit,
-                )
-                .await
+                match send_relay_attach_control_frames(&opened.stream, send_stream, resend_fin)
+                    .await
                 {
                     Ok(()) => {
-                        if race_repair {
-                            remotes.attach_for_repair(opened);
-                        } else {
-                            remotes.attach(opened);
+                        match role {
+                            StreamOpenRole::Active => remotes.attach(opened),
+                            StreamOpenRole::Repair => remotes.attach_for_repair(opened),
+                            StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        if !race_repair {
+                        if role == StreamOpenRole::Active {
                             return Ok(attached);
                         }
                     }
@@ -1487,10 +1668,31 @@ pub(super) fn tcp_relay_bulk_striping_payload_bytes(
     send_stream: &ReliableSendStream,
     mux_limits: MuxLimits,
 ) -> usize {
-    let attach_payload =
-        tcp_relay_attach_payload_bytes(send_stream, FlowLane::Throughput, mux_limits);
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
-    attach_payload.max(mux_limits.max_tcp_path_inflight_bytes.min(stream_window))
+    let decision_quantum = adaptive_tcp_relay_chunk_bytes(None, FlowLane::Throughput, mux_limits)
+        .min(tcp_relay_buffer_len(mux_limits))
+        .min(stream_window)
+        .max(PATH_OPEN_SCORE_BYTES);
+    let repair_bytes = send_stream.repair_bytes();
+    if repair_bytes == 0 {
+        return decision_quantum;
+    }
+    repair_bytes
+        .min(decision_quantum)
+        .min(stream_window)
+        .max(PATH_OPEN_SCORE_BYTES)
+}
+
+pub(super) fn tcp_relay_bulk_validation_payload_bytes(
+    send_stream: &ReliableSendStream,
+    mux_limits: MuxLimits,
+) -> usize {
+    let proof_ceiling = tcp_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits);
+    let proof_payload = tcp_relay_bulk_striping_payload_bytes(send_stream, mux_limits)
+        .min(proof_ceiling)
+        .max(PATH_OPEN_SCORE_BYTES);
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    proof_payload.min(stream_window).max(PATH_OPEN_SCORE_BYTES)
 }
 
 pub(super) fn tcp_relay_stall_watch_active(
@@ -1562,11 +1764,11 @@ pub(super) fn tcp_relay_receive_hole_failure_attempts(_lane: FlowLane) -> u32 {
 }
 
 pub(super) fn tcp_relay_sole_survivor_reannounce_attempts(stall_timeout: Duration) -> u32 {
-    const FLUENT_REPAIR_BUDGET: Duration = Duration::from_millis(4500);
     let timeout = stall_timeout.max(TCP_STREAM_STALL_MIN_TIMEOUT);
-    (FLUENT_REPAIR_BUDGET.as_secs_f64() / timeout.as_secs_f64())
-        .floor()
-        .clamp(1.0, 16.0) as u32
+    let stall_scale = (TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64() / timeout.as_secs_f64())
+        .max(1.0)
+        .sqrt();
+    (2.0 + stall_scale * 4.0).round().clamp(2.0, 16.0) as u32
 }
 
 pub(super) fn tcp_relay_refresh_path_tracking(
@@ -1617,6 +1819,11 @@ pub(super) fn tcp_relay_delivery_path_should_become_active(
     payload_bytes: usize,
 ) -> bool {
     if current == Some(delivered) {
+        return false;
+    }
+    if relay_lane_is_bulk(lane)
+        && !context.relay_path_has_delivery_sample(delivered.underlay, delivered.index)
+    {
         return false;
     }
     let Some(delivered_eta) = tcp_relay_path_eta_ms(context, delivered, lane, payload_bytes) else {

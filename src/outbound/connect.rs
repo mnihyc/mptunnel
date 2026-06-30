@@ -20,6 +20,14 @@ pub enum OutboundConfig {
     Socks5 { proxy: Endpoint },
     HttpConnect { proxy: Endpoint },
     HttpConnectUdp { proxy: Endpoint },
+    Sequence { members: Vec<OutboundRouteMember> },
+    Random { members: Vec<OutboundRouteMember> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundRouteMember {
+    pub config: Box<OutboundConfig>,
+    pub dns: DnsConfig,
 }
 
 impl OutboundConfig {
@@ -30,7 +38,12 @@ impl OutboundConfig {
                 | Self::BindSourceIp(_)
                 | Self::Socks5 { .. }
                 | Self::HttpConnectUdp { .. }
-        )
+        ) || match self {
+            Self::Sequence { members } | Self::Random { members } => members
+                .iter()
+                .any(|member| member.config.supports_udp_targets()),
+            _ => false,
+        }
     }
 
     pub fn ensure_supports(&self, target_protocol: TargetProtocol) -> Result<(), OutboundError> {
@@ -51,6 +64,8 @@ pub enum TargetProtocol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundError {
     UdpNotSupported,
+    NoRouteMembers,
+    NestedRouteGroup,
     DomainTooLong,
     InvalidTargetPort,
 }
@@ -59,6 +74,8 @@ impl std::fmt::Display for OutboundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UdpNotSupported => write!(f, "outbound policy does not support UDP targets"),
+            Self::NoRouteMembers => write!(f, "outbound route group has no members"),
+            Self::NestedRouteGroup => write!(f, "outbound route groups cannot be nested"),
             Self::DomainTooLong => write!(f, "target domain is too long"),
             Self::InvalidTargetPort => write!(f, "target port must be greater than zero"),
         }
@@ -87,6 +104,22 @@ pub async fn connect_tcp(
 ) -> Result<TcpStream, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Tcp)?;
     validate_target(target)?;
+    if let OutboundConfig::Sequence { members } = config {
+        return connect_tcp_route_members(members, target, timeout, RouteMemberOrder::Sequence)
+            .await;
+    }
+    if let OutboundConfig::Random { members } = config {
+        return connect_tcp_route_members(members, target, timeout, RouteMemberOrder::Random).await;
+    }
+    connect_tcp_leaf(config, dns, target, timeout).await
+}
+
+async fn connect_tcp_leaf(
+    config: &OutboundConfig,
+    dns: &DnsConfig,
+    target: &TargetAddr,
+    timeout: Duration,
+) -> Result<TcpStream, OutboundConnectError> {
     match config {
         OutboundConfig::Direct => connect_direct_tcp(target, dns, None, timeout).await,
         OutboundConfig::BindSourceIp(ip) => {
@@ -95,6 +128,9 @@ pub async fn connect_tcp(
         OutboundConfig::Socks5 { proxy } => connect_socks5_tcp(proxy, target, timeout).await,
         OutboundConfig::HttpConnect { proxy } | OutboundConfig::HttpConnectUdp { proxy } => {
             connect_http_connect_tcp(proxy, target, timeout).await
+        }
+        OutboundConfig::Sequence { .. } | OutboundConfig::Random { .. } => {
+            Err(OutboundError::NestedRouteGroup.into())
         }
     }
 }
@@ -107,6 +143,22 @@ pub async fn connect_udp(
 ) -> Result<OutboundUdpSocket, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Udp)?;
     validate_target(target)?;
+    if let OutboundConfig::Sequence { members } = config {
+        return connect_udp_route_members(members, target, timeout, RouteMemberOrder::Sequence)
+            .await;
+    }
+    if let OutboundConfig::Random { members } = config {
+        return connect_udp_route_members(members, target, timeout, RouteMemberOrder::Random).await;
+    }
+    connect_udp_leaf(config, dns, target, timeout).await
+}
+
+async fn connect_udp_leaf(
+    config: &OutboundConfig,
+    dns: &DnsConfig,
+    target: &TargetAddr,
+    timeout: Duration,
+) -> Result<OutboundUdpSocket, OutboundConnectError> {
     match config {
         OutboundConfig::Direct => connect_direct_udp(target, dns, None, timeout)
             .await
@@ -123,7 +175,72 @@ pub async fn connect_udp(
                 .map(OutboundUdpSocket::HttpConnectUdp)
         }
         OutboundConfig::HttpConnect { .. } => Err(OutboundError::UdpNotSupported.into()),
+        OutboundConfig::Sequence { .. } | OutboundConfig::Random { .. } => {
+            Err(OutboundError::NestedRouteGroup.into())
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RouteMemberOrder {
+    Sequence,
+    Random,
+}
+
+async fn connect_tcp_route_members(
+    members: &[OutboundRouteMember],
+    target: &TargetAddr,
+    timeout: Duration,
+    order: RouteMemberOrder,
+) -> Result<TcpStream, OutboundConnectError> {
+    let mut last_error = None;
+    for index in route_member_indices(members.len(), order) {
+        let member = &members[index];
+        match connect_tcp_leaf(&member.config, &member.dns, target, timeout).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or(OutboundError::NoRouteMembers.into()))
+}
+
+async fn connect_udp_route_members(
+    members: &[OutboundRouteMember],
+    target: &TargetAddr,
+    timeout: Duration,
+    order: RouteMemberOrder,
+) -> Result<OutboundUdpSocket, OutboundConnectError> {
+    let mut last_error = None;
+    for index in route_member_indices(members.len(), order) {
+        let member = &members[index];
+        if !member.config.supports_udp_targets() {
+            continue;
+        }
+        match connect_udp_leaf(&member.config, &member.dns, target, timeout).await {
+            Ok(socket) => return Ok(socket),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or(OutboundError::NoRouteMembers.into()))
+}
+
+fn route_member_indices(len: usize, order: RouteMemberOrder) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let start = match order {
+        RouteMemberOrder::Sequence => 0,
+        RouteMemberOrder::Random => random_start_index(len),
+    };
+    (0..len).map(|offset| (start + offset) % len).collect()
+}
+
+fn random_start_index(len: usize) -> usize {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return 0;
+    }
+    (u64::from_le_bytes(bytes) as usize) % len
 }
 
 #[derive(Debug)]
@@ -717,6 +834,113 @@ mod tests {
 
         assert_eq!(&buf[..len], b"pong");
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn sequence_outbound_tries_members_until_connect_succeeds() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.expect("proxy accept");
+            let mut request = [0u8; 8];
+            let _ = stream.read(&mut request).await.expect("proxy read");
+        });
+
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let target_server = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.expect("target accept");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.expect("target read");
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.expect("target write");
+        });
+
+        let config = OutboundConfig::Sequence {
+            members: vec![
+                OutboundRouteMember {
+                    config: Box::new(OutboundConfig::HttpConnect {
+                        proxy: proxy_addr.to_string().parse().expect("proxy"),
+                    }),
+                    dns: DnsConfig::default(),
+                },
+                OutboundRouteMember {
+                    config: Box::new(OutboundConfig::Direct),
+                    dns: DnsConfig::default(),
+                },
+            ],
+        };
+
+        let mut stream = connect_tcp(
+            &config,
+            &DnsConfig::default(),
+            &TargetAddr::Ip(target_addr),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("connect");
+        stream.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.expect("read");
+
+        assert_eq!(&buf, b"pong");
+        proxy.await.expect("proxy");
+        target_server.await.expect("target server");
+    }
+
+    #[tokio::test]
+    async fn random_outbound_falls_back_across_members() {
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let target_server = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.expect("target accept");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.expect("target read");
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.expect("target write");
+        });
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.expect("proxy accept");
+            let mut request = [0u8; 8];
+            let _ = stream.read(&mut request).await.expect("proxy read");
+        });
+
+        let config = OutboundConfig::Random {
+            members: vec![
+                OutboundRouteMember {
+                    config: Box::new(OutboundConfig::HttpConnect {
+                        proxy: proxy_addr.to_string().parse().expect("proxy"),
+                    }),
+                    dns: DnsConfig::default(),
+                },
+                OutboundRouteMember {
+                    config: Box::new(OutboundConfig::Direct),
+                    dns: DnsConfig::default(),
+                },
+            ],
+        };
+
+        let mut stream = connect_tcp(
+            &config,
+            &DnsConfig::default(),
+            &TargetAddr::Ip(target_addr),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("connect");
+        stream.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.expect("read");
+
+        assert_eq!(&buf, b"pong");
+        target_server.await.expect("target server");
+        if !proxy.is_finished() {
+            proxy.abort();
+        }
+        let _ = proxy.await;
     }
 
     #[tokio::test]

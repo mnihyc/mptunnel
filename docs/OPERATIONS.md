@@ -90,6 +90,40 @@ Server path bindings use the same explicit model through repeated or comma-separ
 
 UDP targets are not limited to UDP underlay. mptunnel prefers UDP-target relay over UDP carrier paths when schedulable UDP paths exist, but it can carry UDP-target datagram flow frames over encrypted TCP underlay as best-effort relay. Use UDP underlay for the lowest latency and fastest packet-level recovery; keep TCP underlay available when reachability is more important than datagram-native behavior.
 
+## Config File And Management API
+
+Running `mptunnel` with no arguments reads `./config.toml`. Use `--config PATH` or `-c PATH` to select a different TOML file, and use `--config PATH --check-config` to validate it without opening listeners. The file is role-free and V2Ray-style: `[[inbounds]]` accept SOCKS5, HTTP, TUN, or MPP traffic; `[[outbounds]]` forward to MPP, direct, source-IP bound direct, SOCKS5, HTTP CONNECT, or HTTP CONNECT UDP. Each entry can have a tag. An inbound selects either one outbound with `outbound = "tag"` or one routing balancer with `balancer = "tag"`.
+
+MPP endpoints and security belong to `protocol = "mpp"` outbounds. Routing balancers reference outbound tags: `combined-mpp` combines MPP outbounds, while `sequence` and `random` select among egress outbounds. DNS resolver policy belongs to the egress outbound that resolves target names, usually as an inline `dns = { ... }` table on that outbound.
+
+The release management API is enabled only when `--management-listen` or `[management].listen` is configured. Keep it on loopback unless an operator network explicitly protects it. Set `--management-token` or `[management].token` for bearer-token authentication. Release endpoints expose JSON status and bounded traffic trends without lab-only component timing. When one process has both local inbounds using MPP outbounds and MPP inbounds using egress outbounds, the API reports a self-contained node snapshot with both service groups:
+
+```bash
+curl -H 'Authorization: Bearer replace-with-token' http://127.0.0.1:7600/status
+curl -H 'Authorization: Bearer replace-with-token' http://127.0.0.1:7600/paths
+```
+
+Client-side path control uses the scheduler-visible path health record:
+
+```bash
+curl -X POST \
+  -H 'Authorization: Bearer replace-with-token' \
+  -H 'Content-Type: application/json' \
+  --data '{"underlay":"udp","index":0,"state":"disabled"}' \
+  http://127.0.0.1:7600/control/path
+```
+
+For node configs with multiple MPP outbounds or balancers, use the configured
+target tag instead of an array index:
+
+```bash
+curl -X POST \
+  -H 'Authorization: Bearer replace-with-token' \
+  -H 'Content-Type: application/json' \
+  --data '{"client_tag":"edge-mpp","underlay":"udp","index":0,"state":"disabled"}' \
+  http://127.0.0.1:7600/control/path
+```
+
 ## Encryption
 
 Encrypted transport is the default and uses `aes-256-gcm` unless `--cipher chacha20-poly1305` or `MPTUNNEL_CIPHER=chacha20-poly1305` is set on both peers. Cipher suites are not negotiated; client and server must be configured consistently. `--secret` / `MPTUNNEL_SECRET` must be a random UUID or at least 32 bytes of high-entropy secret text. Runtime transport and HMAC keys are derived from that secret with mptunnel-specific context separation. Authenticated session/path control frames carry issue times and are rejected outside `--auth-freshness-window-seconds` / `MPTUNNEL_AUTH_FRESHNESS_WINDOW_SECONDS`, default `300`.

@@ -84,6 +84,7 @@ for load_duration in "${load_durations[@]}"; do
           FAILOVER_AFTER_SECONDS="$failover_after" \
           CURL_TIMEOUT_SECONDS="$curl_timeout" \
           CASE_FILTER="$case_filter" \
+          MPTUNNEL_LAB_FAIL_ON_BAD_STATUS="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-0}" \
           RESULT_FILE="$result_file" \
           "$script_dir/run-heterogeneous-ablation.sh"
         first_run=0

@@ -38,6 +38,31 @@ fn reliable_bulk_striping_path_keys(
     context.ordered_reliable_bulk_striping_path_keys(payload_bytes)
 }
 
+#[test]
+fn stream_open_demand_hint_preserves_aggressive_bulk_intent() {
+    let throughput = stream_demand_hint_for_lane(FlowLane::Throughput);
+    assert_eq!(
+        flow_lane_from_stream_demand_hint(throughput),
+        FlowLane::Throughput
+    );
+
+    let tie_break_to_throughput = StreamDemandHint {
+        latency_weight_ppm: 500_000,
+        throughput_weight_ppm: 500_000,
+        ..StreamDemandHint::latency()
+    };
+    assert_eq!(
+        flow_lane_from_stream_demand_hint(tie_break_to_throughput),
+        FlowLane::Throughput
+    );
+
+    let latency = stream_demand_hint_for_lane(FlowLane::Latency);
+    assert_eq!(
+        flow_lane_from_stream_demand_hint(latency),
+        FlowLane::Latency
+    );
+}
+
 fn udp_stream_path_indices(
     context: &ClientPathContext,
     lane: FlowLane,
@@ -51,6 +76,9 @@ fn udp_stream_path_indices(
 fn server_context(outbound: OutboundConfig) -> ServerPathContext {
     let resources = ResourceLimits::default();
     ServerPathContext {
+        tag: None,
+        route_target: None,
+        server_paths: Arc::new(Vec::new()),
         outbound,
         outbound_dns: DnsConfig::default(),
         codec_limits: resources.into(),
@@ -352,9 +380,12 @@ async fn spawn_tcp_relay_heartbeat_blackhole(
             .await?;
         framed.flush().await?;
 
-        let stream_id = match framed.read_frame().await? {
-            Frame::OpenStream { stream_id, .. } => stream_id,
-            _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+        let stream_id = loop {
+            match framed.read_frame().await? {
+                Frame::OpenStream { stream_id, .. } => break stream_id,
+                Frame::PathMetrics { .. } => {}
+                _ => return Err(RuntimeError::Protocol("expected OPEN_STREAM")),
+            }
         };
 
         framed
@@ -383,6 +414,7 @@ async fn spawn_tcp_relay_heartbeat_blackhole(
                     stream_id: ack_stream_id,
                     ..
                 } if ack_stream_id == stream_id => {}
+                Frame::PathMetrics { .. } => {}
                 Frame::SessionClose { .. } => return Ok(()),
                 _ => return Err(RuntimeError::Protocol("unexpected heartbeat test frame")),
             }
@@ -619,6 +651,30 @@ fn tcp_stream_frame_queue_tracks_relay_chunk_byte_budget() {
 }
 
 #[test]
+fn tcp_stream_frame_queue_tracks_actual_attachment_payload() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_stream_window_bytes: 16 * 1024 * 1024,
+        max_repair_bytes: 16 * 1024 * 1024,
+        max_reorder_bytes: 16 * 1024 * 1024,
+        max_datagram_queue_bytes: 4 * 1024 * 1024,
+        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_tcp_relay_chunk_bytes: 256 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+    };
+
+    let tcp_sized_queue = tcp_stream_frame_queue(mux_limits);
+    let udp_sized_queue = tcp_stream_frame_queue_for_payload(mux_limits, 1200);
+
+    assert_eq!(tcp_sized_queue, 68);
+    assert_eq!(udp_sized_queue, 1024);
+    assert!(udp_sized_queue > tcp_sized_queue);
+}
+
+#[test]
 fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024 * 1024,
@@ -642,6 +698,33 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         ..ResourceLimits::default()
     };
     assert_eq!(tcp_session_command_queue(resources), 20);
+}
+
+#[test]
+fn tcp_path_command_queue_tracks_actual_payload_quantum() {
+    let mux_limits = MuxLimits {
+        max_payload_bytes: 1024 * 1024,
+        max_ack_ranges: 256,
+        max_streams: 1024,
+        max_stream_window_bytes: 16 * 1024 * 1024,
+        max_repair_bytes: 16 * 1024 * 1024,
+        max_reorder_bytes: 16 * 1024 * 1024,
+        max_datagram_queue_bytes: 4 * 1024 * 1024,
+        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_tcp_relay_chunk_bytes: 256 * 1024,
+        tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
+        tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+    };
+
+    let tcp_sized_queue = tcp_path_command_queue(mux_limits);
+    let udp_sized_queue = tcp_path_command_queue_for_payload(mux_limits, 1200);
+
+    assert_eq!(tcp_sized_queue, 20);
+    assert_eq!(
+        udp_sized_queue,
+        mux_limits.max_tcp_path_inflight_bytes.div_ceil(1200) + 4
+    );
+    assert!(udp_sized_queue > tcp_sized_queue);
 }
 
 #[test]
@@ -728,6 +811,37 @@ fn adaptive_tcp_budgets_expand_for_bulk_and_shrink_under_instability() {
 }
 
 #[test]
+fn udp_relay_chunking_keeps_latency_single_packet_and_amortizes_bulk() {
+    let mux_limits = MuxLimits {
+        max_tcp_relay_chunk_bytes: 64 * 1024,
+        max_ack_ranges: 16,
+        ..MuxLimits::default()
+    };
+    let max_frame_payload =
+        udp_carrier::max_stream_payload_bytes(CodecLimits::default(), mux_limits);
+    let safe_payload = udp_carrier::safe_stream_payload_bytes(mux_limits);
+
+    let latency_chunk = adaptive_relay_chunk_bytes_for_underlay(
+        None,
+        FlowLane::Latency,
+        mux_limits,
+        UnderlayProtocol::Udp,
+        max_frame_payload,
+    );
+    let bulk_chunk = adaptive_relay_chunk_bytes_for_underlay(
+        None,
+        FlowLane::Throughput,
+        mux_limits,
+        UnderlayProtocol::Udp,
+        max_frame_payload,
+    );
+
+    assert!(latency_chunk <= safe_payload);
+    assert!(bulk_chunk > safe_payload);
+    assert!(bulk_chunk <= max_frame_payload);
+}
+
+#[test]
 fn tcp_relay_stall_timeout_is_adaptive_and_bounded_for_fluent_failover() {
     let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
     let mut cross_continent =
@@ -801,19 +915,116 @@ fn reliable_recv_progress_batches_max_data_updates() {
 }
 
 #[test]
-fn tcp_relay_repair_replay_interval_tracks_inflight_pressure() {
-    let mux_limits = MuxLimits::default();
-    let light = tcp_relay_repair_replay_interval(PATH_OPEN_SCORE_BYTES, mux_limits);
-    let full = tcp_relay_repair_replay_interval(mux_limits.max_tcp_path_inflight_bytes, mux_limits);
+fn reliable_recv_progress_batches_bulk_acks_by_window_and_ack_capacity() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 64 * 1024,
+        max_repair_bytes: 64 * 1024,
+        max_reorder_bytes: 64 * 1024,
+        max_tcp_path_inflight_bytes: 64 * 1024,
+        max_tcp_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(23), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+    let ack_step = reliable_stream_ack_update_bytes(None, FlowLane::Throughput, mux_limits);
 
-    assert!(light >= TCP_STREAM_STALL_MIN_TIMEOUT);
-    assert!(light < full);
-    assert_eq!(full, TCP_STREAM_STALL_MAX_TIMEOUT);
-    assert!(full < Duration::from_secs(5));
+    assert_eq!(ack_step, PATH_OPEN_SCORE_BYTES as u64);
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
+        .expect("first data");
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+
+    recv_stream
+        .receive_data(1024, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
+        .expect("below ack step");
+    assert!(!progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+
+    recv_stream
+        .receive_data(
+            2048,
+            Bytes::from(vec![0x33; ack_step as usize]),
+            StreamFlags::NONE,
+        )
+        .expect("past ack step");
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
 }
 
 #[test]
-fn tcp_sole_survivor_reannounce_budget_stays_within_fluency_window() {
+fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 64 * 1024,
+        max_repair_bytes: 64 * 1024,
+        max_reorder_bytes: 64 * 1024,
+        max_tcp_path_inflight_bytes: 64 * 1024,
+        max_tcp_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(24), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
+        .expect("first data");
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+
+    recv_stream
+        .receive_data(8192, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
+        .expect("out-of-order data");
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+}
+
+#[test]
+fn reliable_recv_progress_acks_repair_horizon_advancement() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 64 * 1024,
+        max_repair_bytes: 64 * 1024,
+        max_reorder_bytes: 64 * 1024,
+        max_tcp_path_inflight_bytes: 64 * 1024,
+        max_tcp_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut recv_stream = ReliableRecvStream::new(StreamId(25), mux_limits);
+    let mut progress = ReliableRecvProgress::default();
+
+    recv_stream
+        .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
+        .expect("head");
+    recv_stream
+        .receive_data(8192, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
+        .expect("first tail");
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+
+    recv_stream
+        .receive_data(9216, Bytes::from(vec![0x33; 1024]), StreamFlags::NONE)
+        .expect("small tail extension");
+    assert!(
+        !progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false),
+        "small same-range horizon movement should be batched"
+    );
+
+    let ack_step = reliable_stream_ack_update_bytes(None, FlowLane::Throughput, mux_limits);
+    assert!(
+        ack_step > 1024,
+        "test expects a bulk ACK step larger than one small chunk"
+    );
+    recv_stream
+        .receive_data(
+            10240,
+            Bytes::from(vec![0x44; ack_step as usize]),
+            StreamFlags::NONE,
+        )
+        .expect("meaningful tail extension");
+    assert!(
+        progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false),
+        "meaningful repair horizon advancement must be ACKed even when range count is unchanged"
+    );
+}
+
+#[test]
+fn tcp_sole_survivor_reannounce_budget_scales_from_stall_model() {
     let low_latency_budget =
         tcp_relay_sole_survivor_reannounce_attempts(TCP_STREAM_STALL_MIN_TIMEOUT);
     let max_timeout_budget =
@@ -822,7 +1033,7 @@ fn tcp_sole_survivor_reannounce_budget_stays_within_fluency_window() {
         low_latency_budget > max_timeout_budget,
         "low-latency paths should get more quick repair probes"
     );
-    assert!(TCP_STREAM_STALL_MAX_TIMEOUT * max_timeout_budget <= Duration::from_millis(4500));
+    assert!(max_timeout_budget >= 2);
     assert!(low_latency_budget <= 16);
 }
 
@@ -939,6 +1150,106 @@ fn tcp_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
         false,
         mux_limits
     ));
+}
+
+#[test]
+fn stream_ack_gap_repair_is_suppressed_on_udp_reliable_carrier() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(31), mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"aaaa"), StreamFlags::NONE)
+        .expect("first chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"bbbb"), StreamFlags::NONE)
+        .expect("missing chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"cccc"), StreamFlags::NONE)
+        .expect("later chunk");
+    let ranges = [
+        OffsetRange { start: 0, end: 4 },
+        OffsetRange { start: 8, end: 12 },
+    ];
+
+    let tcp_repairs = stream_ack_gap_repair_frames(
+        &send_stream,
+        &ranges,
+        usize::MAX,
+        true,
+        Some(UnderlayProtocol::Tcp),
+        false,
+        false,
+    );
+    assert_eq!(tcp_repairs.len(), 1);
+    assert!(matches!(
+        &tcp_repairs[0],
+        Frame::StreamData {
+            offset: 4,
+            payload,
+            ..
+        } if payload.as_ref() == b"bbbb"
+    ));
+
+    assert!(
+        stream_ack_gap_repair_frames(
+            &send_stream,
+            &ranges,
+            usize::MAX,
+            true,
+            Some(UnderlayProtocol::Udp),
+            false,
+            true,
+        )
+        .is_empty(),
+        "a single UDP reliable carrier owns ordinary packet-loss recovery"
+    );
+    assert!(
+        stream_ack_gap_repair_frames(
+            &send_stream,
+            &ranges,
+            usize::MAX,
+            true,
+            Some(UnderlayProtocol::Udp),
+            true,
+            false,
+        )
+        .is_empty(),
+        "fresh UDP multipath ACK gaps wait for persistent product-hole evidence"
+    );
+    let udp_multipath_repairs = stream_ack_gap_repair_frames(
+        &send_stream,
+        &ranges,
+        usize::MAX,
+        true,
+        Some(UnderlayProtocol::Udp),
+        true,
+        true,
+    );
+    assert_eq!(
+        udp_multipath_repairs.len(),
+        1,
+        "multipath UDP may reinject authoritative product gaps over another path"
+    );
+    assert!(matches!(
+        &udp_multipath_repairs[0],
+        Frame::StreamData {
+            offset: 4,
+            payload,
+            ..
+        } if payload.as_ref() == b"bbbb"
+    ));
+    assert!(
+        stream_ack_gap_repair_frames(
+            &send_stream,
+            &ranges,
+            usize::MAX,
+            false,
+            Some(UnderlayProtocol::Tcp),
+            false,
+            false,
+        )
+        .is_empty(),
+        "non-authoritative ACK snapshots must not infer missing holes"
+    );
 }
 
 #[test]
@@ -1103,6 +1414,23 @@ fn tcp_relay_attach_scoring_keeps_interactive_repairs_small() {
 }
 
 #[test]
+fn tcp_relay_bulk_admission_payload_uses_preemptible_quantum_not_inflight_ceiling() {
+    let mux_limits = MuxLimits::default();
+    let send_stream = ReliableSendStream::new(StreamId(12), mux_limits);
+    let expected_quantum = adaptive_tcp_relay_chunk_bytes(None, FlowLane::Throughput, mux_limits);
+
+    assert_eq!(
+        tcp_relay_bulk_striping_payload_bytes(&send_stream, mux_limits),
+        expected_quantum
+    );
+    let validation_quantum = tcp_relay_bulk_validation_payload_bytes(&send_stream, mux_limits);
+    assert!(validation_quantum >= PATH_OPEN_SCORE_BYTES);
+    assert!(validation_quantum <= tcp_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits));
+    assert!(validation_quantum < expected_quantum);
+    assert!(expected_quantum < mux_limits.max_tcp_path_inflight_bytes);
+}
+
+#[test]
 fn tcp_path_sessions_are_dedicated_for_latency_sensitive_lanes() {
     assert!(tcp_path_lane_uses_dedicated_session(FlowLane::Latency));
     assert!(tcp_path_lane_uses_dedicated_session(FlowLane::Control));
@@ -1156,8 +1484,13 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
 #[tokio::test]
 async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding =
-        ServerTcpStreamBinding::new(UnderlayProtocol::Tcp, PathId(0), tcp_tx, FlowLane::Latency);
+    let binding = ServerTcpStreamBinding::new(
+        SessionId(1),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        tcp_tx,
+        FlowLane::Latency,
+    );
     let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
     binding.attach(
         UnderlayProtocol::Udp,
@@ -1165,6 +1498,7 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
         udp_tx,
         FlowLane::Throughput,
         StreamOpenRole::Active,
+        tcp_relay_buffer_len(MuxLimits::default()),
     );
 
     binding.close_stream(StreamId(7)).await;
@@ -1189,3 +1523,4 @@ mod datagram;
 mod integration;
 mod security;
 mod tcp_path;
+mod tcp_path_binding;

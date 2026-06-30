@@ -32,9 +32,30 @@ failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
+case "$lab_diagnostics" in
+  1|true|TRUE|yes|YES)
+    export MPTUNNEL_LAB_DIAG="${MPTUNNEL_LAB_DIAG:-1}"
+    ;;
+esac
 lab_perf="${MPTUNNEL_LAB_PERF:-0}"
+lab_perf_samples="${MPTUNNEL_LAB_PERF_SAMPLES:-0}"
 lab_perf_interval_ms="${MPTUNNEL_LAB_PERF_INTERVAL_MS:-1000}"
+container_stats="${MPTUNNEL_LAB_CONTAINER_STATS:-1}"
+container_stats_interval="${MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS:-1}"
+fail_on_bad_status="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}"
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
+case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
+  auto)
+    if [[ "${MPTUNNEL_LAB_DIAG:-0}" == "1" || "$lab_perf" == "1" ]]; then
+      collect_logs="1"
+    else
+      collect_logs="0"
+    fi
+    ;;
+  *)
+    collect_logs="${MPTUNNEL_LAB_COLLECT_LOGS}"
+    ;;
+esac
 case "$lab_perf" in
   1|true|TRUE|yes|YES)
     log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-16000}"
@@ -155,6 +176,157 @@ mptunnel_resource_env_prefix() {
   done
 }
 
+case_artifact_name() {
+  local raw="$1"
+  printf '%s' "$raw" | tr -c 'A-Za-z0-9_.=-' '_'
+}
+
+telemetry_file_for_case() {
+  local case_name="$1"
+  printf '%s/container-stats-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
+}
+
+telemetry_stop_file_for_case() {
+  local case_name="$1"
+  printf '%s/container-stats-%s.stop' "$result_dir" "$(case_artifact_name "$case_name")"
+}
+
+telemetry_enabled() {
+  case "$container_stats" in
+    0|false|FALSE|no|NO) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+log_collection_enabled() {
+  case "$collect_logs" in
+    0|false|FALSE|no|NO) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+start_case_telemetry() {
+  local case_name="$1"
+  if ! telemetry_enabled; then
+    echo ""
+    return 0
+  fi
+  local telemetry_file stop_file
+  telemetry_file="$(telemetry_file_for_case "$case_name")"
+  stop_file="$(telemetry_stop_file_for_case "$case_name")"
+  rm -f "$telemetry_file" "$stop_file"
+  python3 "$script_dir/container_stats.py" sample \
+    --compose-file "$compose_file" \
+    --case "$case_name" \
+    --output "$telemetry_file" \
+    --stop-file "$stop_file" \
+    --interval "$container_stats_interval" \
+    >/dev/null 2>&1 &
+  echo "$!"
+}
+
+stop_case_telemetry() {
+  local case_name="$1"
+  local sampler_pid="${2:-}"
+  if ! telemetry_enabled; then
+    return 0
+  fi
+  touch "$(telemetry_stop_file_for_case "$case_name")" >/dev/null 2>&1 || true
+  if [[ -n "$sampler_pid" ]]; then
+    wait "$sampler_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+case_telemetry_summary() {
+  local case_name="$1"
+  if ! telemetry_enabled; then
+    printf '{}'
+    return 0
+  fi
+  local telemetry_file
+  telemetry_file="$(telemetry_file_for_case "$case_name")"
+  python3 "$script_dir/container_stats.py" summarize --input "$telemetry_file" 2>/dev/null || printf '{}'
+}
+
+case_log_artifacts_summary() {
+  local case_name="$1"
+  if ! log_collection_enabled; then
+    printf '{}'
+    return 0
+  fi
+
+  local case_artifact service output tmp
+  case_artifact="$(case_artifact_name "$case_name")"
+  for service in client server target; do
+    output="${result_dir}/logs-${case_artifact}-${service}.log"
+    tmp="${output}.tmp"
+    if exec_in "$service" "for file in /tmp/mptunnel*.log; do [ -f \"\$file\" ] || continue; echo \"== ${service}:\$(basename \"\$file\") ==\"; cat \"\$file\"; done" > "$tmp" 2>/dev/null; then
+      if [[ -s "$tmp" ]]; then
+        mv "$tmp" "$output"
+      else
+        rm -f "$tmp" "$output"
+      fi
+    else
+      rm -f "$tmp"
+    fi
+  done
+
+  CASE_ARTIFACT="$case_artifact" RESULT_DIR="$result_dir" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+result_dir = Path(os.environ["RESULT_DIR"])
+case_artifact = os.environ["CASE_ARTIFACT"]
+services = {}
+for service in ("client", "server", "target"):
+    path = result_dir / f"logs-{case_artifact}-{service}.log"
+    if path.exists() and path.stat().st_size > 0:
+        services[service] = {"file": str(path), "bytes": path.stat().st_size}
+print(json.dumps({"services": services}, separators=(",", ":"), sort_keys=True) if services else "{}")
+PY
+}
+
+append_row_with_telemetry() {
+  local case_name="$1"
+  local row_json="$2"
+  local protocol="${3:-}"
+  local telemetry_json log_artifacts_json
+  telemetry_json="$(case_telemetry_summary "$case_name")"
+  log_artifacts_json="$(case_log_artifacts_summary "$case_name")"
+  ROW="$row_json" PROTOCOL="$protocol" TELEMETRY="$telemetry_json" LOG_ARTIFACTS="$log_artifacts_json" python3 - "$case_name" <<'PY' >> "$result_file"
+import json
+import os
+import sys
+
+case = sys.argv[1]
+raw = os.environ.get("ROW", "")
+try:
+    row = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+    row = {"case": case, "raw_output": raw}
+if not row:
+    row = {"case": case}
+row.setdefault("case", case)
+protocol = os.environ.get("PROTOCOL", "")
+if protocol:
+    row["protocol"] = protocol
+try:
+    telemetry = json.loads(os.environ.get("TELEMETRY", "{}"))
+except json.JSONDecodeError:
+    telemetry = {}
+if telemetry:
+    row["container_telemetry"] = telemetry
+try:
+    log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
+except json.JSONDecodeError:
+    log_artifacts = {}
+if log_artifacts:
+    row["log_artifacts"] = log_artifacts
+print(json.dumps(row, sort_keys=True))
+PY
+}
+
 append_skipped_result() {
   local case_name="$1"
   local protocol="$2"
@@ -186,11 +358,13 @@ append_download_probe_result() {
   EXIT_CODE="$exit_code" \
   PROBE_STDERR="$probe_stderr" \
   CLIENT_LOG="$client_log" \
-  SERVER_LOG="$server_log" \
-  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
-  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
-  LOG_TAIL_BYTES="$log_tail_bytes" \
-  python3 - "$case_name" <<'PY' >> "$result_file"
+	  SERVER_LOG="$server_log" \
+	  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+	  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+	  LOG_TAIL_BYTES="$log_tail_bytes" \
+	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
+	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
 import sys
@@ -227,6 +401,18 @@ if row.get("status") != "ok" or lab_diag or lab_perf:
         value = os.environ.get(env_name, "")
         if value:
             row[field] = value[-log_tail_bytes:]
+try:
+    telemetry = json.loads(os.environ.get("TELEMETRY", "{}"))
+except json.JSONDecodeError:
+    telemetry = {}
+if telemetry:
+    row["container_telemetry"] = telemetry
+try:
+    log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
+except json.JSONDecodeError:
+    log_artifacts = {}
+if log_artifacts:
+    row["log_artifacts"] = log_artifacts
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -237,10 +423,13 @@ run_unproxied_download_probe_case() {
   local target="$3"
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --protocol '${protocol}' --target '${target}' --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
@@ -251,10 +440,13 @@ run_tcp_download_probe_case() {
   local case_name="$1"
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
@@ -275,11 +467,13 @@ append_upload_probe_result() {
   EXIT_CODE="$exit_code" \
   PROBE_STDERR="$probe_stderr" \
   CLIENT_LOG="$client_log" \
-  SERVER_LOG="$server_log" \
-  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
-  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
-  LOG_TAIL_BYTES="$log_tail_bytes" \
-  python3 - "$case_name" <<'PY' >> "$result_file"
+	  SERVER_LOG="$server_log" \
+	  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+	  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+	  LOG_TAIL_BYTES="$log_tail_bytes" \
+	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
+	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
 import sys
@@ -316,6 +510,18 @@ if row.get("status") != "ok" or lab_diag or lab_perf:
         value = os.environ.get(env_name, "")
         if value:
             row[field] = value[-log_tail_bytes:]
+try:
+    telemetry = json.loads(os.environ.get("TELEMETRY", "{}"))
+except json.JSONDecodeError:
+    telemetry = {}
+if telemetry:
+    row["container_telemetry"] = telemetry
+try:
+    log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
+except json.JSONDecodeError:
+    log_artifacts = {}
+if log_artifacts:
+    row["log_artifacts"] = log_artifacts
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -325,10 +531,13 @@ run_unproxied_upload_probe_case() {
   local target="$2"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
@@ -339,10 +548,13 @@ run_tcp_upload_probe_case() {
   local case_name="$1"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
@@ -559,9 +771,11 @@ start_server() {
   stop_server
   exec_in server "\
     $(mptunnel_resource_env_prefix) \
-    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
-    MPTUNNEL_LAB_PERF='${lab_perf}' \
-    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
+	    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
+	    MPTUNNEL_LAB_PERF='${lab_perf}' \
+	    MPTUNNEL_LAB_PERF_SAMPLES='${lab_perf_samples}' \
+	    MPTUNNEL_LAB_ROLE='server' \
+	    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       server \
@@ -607,9 +821,11 @@ start_client_with_netem() {
   fi
   exec_in client "\
     $(mptunnel_resource_env_prefix) \
-    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
-    MPTUNNEL_LAB_PERF='${lab_perf}' \
-    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
+	    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
+	    MPTUNNEL_LAB_PERF='${lab_perf}' \
+	    MPTUNNEL_LAB_PERF_SAMPLES='${lab_perf_samples}' \
+	    MPTUNNEL_LAB_ROLE='client' \
+	    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
@@ -652,9 +868,11 @@ start_tun_client() {
     stop_client
   fi
   exec_in client "\
-    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
-    MPTUNNEL_LAB_PERF='${lab_perf}' \
-    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
+	    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
+	    MPTUNNEL_LAB_PERF='${lab_perf}' \
+	    MPTUNNEL_LAB_PERF_SAMPLES='${lab_perf_samples}' \
+	    MPTUNNEL_LAB_ROLE='client' \
+	    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
     MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
       --secret '${secret}' \
       client \
@@ -689,15 +907,18 @@ run_udp_case() {
   local case_name="$1"
   shift
   start_client "$case_name" "$@"
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   local output
   output="$(exec_in client "python3 /workspace/lab/socks5_udp_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:9090 --load-duration '${load_duration_seconds}' --payload-bytes '${udp_payload_bytes}' --timeout-ms '${udp_timeout_ms}'" 2>/dev/null)"
   local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
   if [[ "$exit_code" == "0" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
+    append_row_with_telemetry "$case_name" "$output"
   else
-    printf '{"case":"%s","protocol":"udp","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
+    append_row_with_telemetry "$case_name" "{\"case\":\"$case_name\",\"protocol\":\"udp\",\"status\":\"fail\",\"exit_code\":$exit_code}"
   fi
 }
 
@@ -723,21 +944,17 @@ run_baseline_download_probe_case() {
   local out_file="/tmp/mptunnel-baseline-${case_name}.out"
   local err_file="/tmp/mptunnel-baseline-${case_name}.err"
   local output probe_stderr exit_code
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
   if [[ -n "$output" ]]; then
-    ROW="$output" PROTOCOL="$protocol" python3 - <<'PY' >> "$result_file"
-import json
-import os
-
-row = json.loads(os.environ["ROW"])
-row["protocol"] = os.environ["PROTOCOL"]
-print(json.dumps(row, sort_keys=True))
-PY
+    append_row_with_telemetry "$case_name" "$output" "$protocol"
   else
     append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr"
   fi
@@ -750,9 +967,12 @@ run_baseline_upload_probe_case() {
   local out_file="/tmp/mptunnel-baseline-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-baseline-upload-${case_name}.err"
   local output probe_stderr exit_code
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
@@ -899,28 +1119,31 @@ run_mptcp_baseline_case() {
     stop_baselines
     return 0
   fi
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   set +e
   local output exit_code
   output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/mptcp_http.py download --label '${case_name}' --target 172.31.10.30:${baseline_mptcp_port} --path '${large_http_path}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}'" 2>/dev/null)"
   exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
   if [[ -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
+    append_row_with_telemetry "$case_name" "$output" "mptcp"
   else
-    printf '{"case":"%s","protocol":"mptcp","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
+    append_row_with_telemetry "$case_name" "{\"case\":\"$case_name\",\"protocol\":\"mptcp\",\"status\":\"fail\",\"exit_code\":$exit_code}"
   fi
   stop_baselines
 }
 
-record_mixed_probe_case() {
+append_mixed_probe_result() {
   local case_name="$1"
-  set +e
-  local output client_log server_log
-  output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
-  local exit_code="$?"
+  local exit_code="$2"
+  local output="$3"
+  local client_log server_log
+
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
   server_log="$(exec_in server "tail -n '${log_tail_lines}' /tmp/mptunnel-server.log 2>/dev/null | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
-  set -e
+
   ROW="$output" \
   EXIT_CODE="$exit_code" \
   CLIENT_LOG="$client_log" \
@@ -928,6 +1151,8 @@ record_mixed_probe_case() {
   LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
   LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
   LOG_TAIL_BYTES="$log_tail_bytes" \
+  TELEMETRY="$(case_telemetry_summary "$case_name")" \
+  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
@@ -964,8 +1189,33 @@ if row.get("status") != "ok" or lab_diag or lab_perf:
         value = os.environ.get(env_name, "")
         if value:
             row[field] = value[-log_tail_bytes:]
+try:
+    telemetry = json.loads(os.environ.get("TELEMETRY", "{}"))
+except json.JSONDecodeError:
+    telemetry = {}
+if telemetry:
+    row["container_telemetry"] = telemetry
+try:
+    log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
+except json.JSONDecodeError:
+    log_artifacts = {}
+if log_artifacts:
+    row["log_artifacts"] = log_artifacts
 print(json.dumps(row, sort_keys=True))
 PY
+}
+
+record_mixed_probe_case() {
+  local case_name="$1"
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
+  set +e
+  local output
+  output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
+  local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  set -e
+  append_mixed_probe_result "$case_name" "$exit_code" "$output"
 }
 
 run_mixed_case() {
@@ -1071,60 +1321,61 @@ run_matrix_upload_case() {
 run_mixed_failover_case() {
   local case_name="mptunnel_mixed_multipath_failover_blackhole_fat"
   local output exit_code
+  local telemetry_pid
   local started_file="/tmp/mptunnel-mixed.started"
   start_client "$case_name" "$tcp_all $udp_all"
   exec_in client "rm -f /tmp/mptunnel-mixed.out /tmp/mptunnel-mixed.status /tmp/mptunnel-mixed.pid '${started_file}'"
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed.out 2>/tmp/mptunnel-mixed.err; echo \$? >/tmp/mptunnel-mixed.status) & echo \$! >/tmp/mptunnel-mixed.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-mixed.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-mixed.status ]; then echo 124 >/tmp/mptunnel-mixed.status; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-mixed.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-mixed.status 2>/dev/null || echo 124")"
-  if [[ -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
-  else
-    printf '{"case":"%s","protocol":"mixed","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
-  fi
+  append_mixed_probe_result "$case_name" "$exit_code" "$output"
   apply_netem apply
 }
 
 run_mixed_latency_spike_case() {
   local case_name="mptunnel_mixed_multipath_latency_spike_fat"
   local output exit_code
+  local telemetry_pid
   local started_file="/tmp/mptunnel-mixed-spike.started"
   start_client "$case_name" "$tcp_all $udp_all"
   exec_in client "rm -f /tmp/mptunnel-mixed-spike.out /tmp/mptunnel-mixed-spike.status /tmp/mptunnel-mixed-spike.pid '${started_file}'"
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed-spike.out 2>/tmp/mptunnel-mixed-spike.err; echo \$? >/tmp/mptunnel-mixed-spike.status) & echo \$! >/tmp/mptunnel-mixed-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-mixed-spike.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-mixed-spike.status ]; then echo 124 >/tmp/mptunnel-mixed-spike.status; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-mixed-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-mixed-spike.status 2>/dev/null || echo 124")"
-  if [[ -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
-  else
-    printf '{"case":"%s","protocol":"mixed","status":"fail","exit_code":%s}\n' "$case_name" "$exit_code" >> "$result_file"
-  fi
+  append_mixed_probe_result "$case_name" "$exit_code" "$output"
   apply_netem apply
 }
 
 run_failover_case() {
   local case_name="mptunnel_tcp_multipath_failover_blackhole_fat"
   local output exit_code
+  local telemetry_pid
   local started_file="/tmp/mptunnel-failover.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-failover.out /tmp/mptunnel-failover.status /tmp/mptunnel-failover.pid '${started_file}'"
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-failover.status ]; then echo 124 >/tmp/mptunnel-failover.status; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-failover.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-failover.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
+    append_row_with_telemetry "$case_name" "$output"
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-failover.err 2>/dev/null | tail -c 4000 || true")"
@@ -1136,18 +1387,21 @@ run_failover_case() {
 run_upload_failover_case() {
   local case_name="mptunnel_tcp_multipath_failover_blackhole_fat_upload"
   local output exit_code
+  local telemetry_pid
   local started_file="/tmp/mptunnel-upload-failover.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-upload-failover.out /tmp/mptunnel-upload-failover.status /tmp/mptunnel-upload-failover.pid '${started_file}'"
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-upload-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-failover.status ]; then echo 124 >/tmp/mptunnel-upload-failover.status; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-upload-failover.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-upload-failover.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
+    append_row_with_telemetry "$case_name" "$output"
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-failover.err 2>/dev/null | tail -c 4000 || true")"
@@ -1159,18 +1413,21 @@ run_upload_failover_case() {
 run_latency_spike_case() {
   local case_name="mptunnel_tcp_multipath_latency_spike_fat"
   local output exit_code
+  local telemetry_pid
   local started_file="/tmp/mptunnel-spike.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-spike.out /tmp/mptunnel-spike.status /tmp/mptunnel-spike.pid '${started_file}'"
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-spike.out 2>/tmp/mptunnel-spike.err; echo \$? >/tmp/mptunnel-spike.status) & echo \$! >/tmp/mptunnel-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-spike.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-spike.status ]; then echo 124 >/tmp/mptunnel-spike.status; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-spike.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
+    append_row_with_telemetry "$case_name" "$output"
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-spike.err 2>/dev/null | tail -c 4000 || true")"
@@ -1182,18 +1439,21 @@ run_latency_spike_case() {
 run_upload_latency_spike_case() {
   local case_name="mptunnel_tcp_multipath_latency_spike_fat_upload"
   local output exit_code
+  local telemetry_pid
   local started_file="/tmp/mptunnel-upload-spike.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-upload-spike.out /tmp/mptunnel-upload-spike.status /tmp/mptunnel-upload-spike.pid '${started_file}'"
+  telemetry_pid="$(start_case_telemetry "$case_name")"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-upload-spike.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-spike.status ]; then echo 124 >/tmp/mptunnel-upload-spike.status; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-upload-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-upload-spike.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    printf '%s\n' "$output" >> "$result_file"
+    append_row_with_telemetry "$case_name" "$output"
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-spike.err 2>/dev/null | tail -c 4000 || true")"
@@ -1578,10 +1838,16 @@ if should_run_case "mptunnel_tcp_multipath_latency_spike_fat_upload"; then
 fi
 
 echo "$result_file"
-python3 - "$result_file" <<'PY'
+FAIL_ON_BAD_STATUS="$fail_on_bad_status" python3 - "$result_file" <<'PY'
 import json
+import os
 import sys
 
+fail_on_bad_status = os.environ.get("FAIL_ON_BAD_STATUS", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 failed = []
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     for line_number, line in enumerate(handle, 1):
@@ -1597,5 +1863,6 @@ if failed:
             f"failed experiment row {line_number}: {case} status={status}",
             file=sys.stderr,
         )
+if failed and fail_on_bad_status:
     sys.exit(1)
 PY

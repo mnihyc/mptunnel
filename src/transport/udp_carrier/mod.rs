@@ -1,34 +1,49 @@
+mod ack;
+mod assembly;
+mod controller;
 mod crypto;
 mod endpoint;
 mod error;
 mod packet;
+mod send;
 mod stream;
+mod window;
 
 use crate::mux::MuxLimits;
-use crate::protocol::codec::CodecLimits;
+use crate::protocol::codec::{CodecLimits, FRAME_HEADER_LEN};
 
-pub use endpoint::{Connection, Endpoint};
+pub use endpoint::{Connection, Endpoint, UdpCarrierPathMetrics};
 pub use error::{UdpCarrierConnectionError, UdpCarrierFrameError, UdpCarrierTransportError};
 pub use stream::{RecvStream, SendStream, finish_stream, read_frame, write_frame};
 
-const MIN_STREAM_FRAME_PACKET_BATCH: usize = 32;
-const MAX_STREAM_FRAME_PACKET_BATCH: usize = 512;
-const STREAM_FRAME_CODEC_OVERHEAD_ALLOWANCE: usize = 256;
+const STREAM_DATA_PAYLOAD_PREFIX_LEN: usize = 8 + 8 + 1 + 4;
+
+fn stream_frame_overhead() -> usize {
+    FRAME_HEADER_LEN.saturating_add(STREAM_DATA_PAYLOAD_PREFIX_LEN)
+}
+
+fn stream_payload_for_fragment(fragment_payload: usize) -> usize {
+    fragment_payload
+        .saturating_sub(stream_frame_overhead())
+        .max(1)
+}
+
+pub fn safe_stream_payload_bytes(mux_limits: MuxLimits) -> usize {
+    let fragment_payload = packet::max_frame_fragment_payload();
+    stream_payload_for_fragment(fragment_payload)
+        .min(mux_limits.max_tcp_relay_chunk_bytes)
+        .max(1)
+}
 
 pub fn max_stream_payload_bytes(codec_limits: CodecLimits, mux_limits: MuxLimits) -> usize {
-    let fragment_payload = packet::max_frame_fragment_payload();
-    let target_payload = mux_limits
+    let safe_payload = safe_stream_payload_bytes(mux_limits);
+    let ack_horizon_fragments = mux_limits.max_ack_ranges.max(1);
+    let bulk_payload = safe_payload.saturating_mul(ack_horizon_fragments);
+    mux_limits
         .max_tcp_relay_chunk_bytes
         .min(codec_limits.max_payload_bytes)
-        .max(1);
-    let packet_batch = target_payload
-        .div_ceil(fragment_payload)
-        .clamp(MIN_STREAM_FRAME_PACKET_BATCH, MAX_STREAM_FRAME_PACKET_BATCH);
-    fragment_payload
-        .saturating_mul(packet_batch)
-        .saturating_sub(128)
-        .saturating_sub(STREAM_FRAME_CODEC_OVERHEAD_ALLOWANCE)
-        .clamp(1, codec_limits.max_payload_bytes.max(1))
+        .min(bulk_payload)
+        .max(1)
 }
 
 #[cfg(test)]
@@ -36,7 +51,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_payload_ceiling_tracks_mux_chunk_budget() {
+    fn safe_stream_payload_ceiling_fits_one_udp_packet() {
         let codec_limits = CodecLimits::default();
         let compact = MuxLimits {
             max_tcp_relay_chunk_bytes: 64 * 1024,
@@ -47,11 +62,31 @@ mod tests {
             ..MuxLimits::default()
         };
 
-        let compact_payload = max_stream_payload_bytes(codec_limits, compact);
-        let high_bdp_payload = max_stream_payload_bytes(codec_limits, high_bdp);
+        let compact_payload = safe_stream_payload_bytes(compact);
+        let high_bdp_payload = safe_stream_payload_bytes(high_bdp);
+        let fragment_payload = packet::max_frame_fragment_payload();
+        let packet_fit_payload = fragment_payload.saturating_sub(stream_frame_overhead());
 
-        assert!(compact_payload >= packet::max_frame_fragment_payload() * 32 - 384);
-        assert!(high_bdp_payload > compact_payload.saturating_mul(4));
+        assert_eq!(compact_payload, high_bdp_payload);
+        assert_eq!(high_bdp_payload, packet_fit_payload);
         assert!(high_bdp_payload <= codec_limits.max_payload_bytes);
+    }
+
+    #[test]
+    fn udp_bulk_stream_payload_ceiling_amortizes_across_ack_horizon() {
+        let codec_limits = CodecLimits::default();
+        let limits = MuxLimits {
+            max_tcp_relay_chunk_bytes: 64 * 1024,
+            max_ack_ranges: 16,
+            ..MuxLimits::default()
+        };
+        let safe_payload = safe_stream_payload_bytes(limits);
+        let bulk_payload = max_stream_payload_bytes(codec_limits, limits);
+
+        assert!(bulk_payload > safe_payload);
+        assert_eq!(
+            bulk_payload,
+            (safe_payload * limits.max_ack_ranges).min(limits.max_tcp_relay_chunk_bytes)
+        );
     }
 }

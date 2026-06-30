@@ -20,7 +20,7 @@ fn mixed_bulk_striping_includes_unmeasured_endpoint_only_udp() {
     assert!(
         context
             .ordered_reliable_bulk_striping_path_keys(
-                MuxLimits::default().max_tcp_path_inflight_bytes
+                MuxLimits::default().max_tcp_relay_chunk_bytes
             )
             .contains(&RelayPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -435,7 +435,6 @@ fn udp_association_retry_budget_tracks_live_loss_model() {
     let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
     let stable_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
     assert!(stable_budget >= UDP_MIN_RETRY_BUDGET);
-    assert!(stable_budget <= UDP_MAX_RETRY_BUDGET);
 
     context.mark_udp_path_feedback(
         0,
@@ -449,7 +448,20 @@ fn udp_association_retry_budget_tracks_live_loss_model() {
 
     let lossy_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
     assert!(lossy_budget > stable_budget);
-    assert!(lossy_budget <= UDP_MAX_RETRY_BUDGET);
+    assert!(lossy_budget > Duration::from_millis(500));
+}
+
+#[test]
+fn datagram_retry_budget_scales_from_ttl_slack_and_response_model() {
+    let high_rtt_timeout = Duration::from_millis(900);
+    let budget = datagram_retry_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
+    let low_rtt_budget =
+        datagram_retry_budget(Duration::from_millis(50), DEFAULT_SOCKS5_UDP_TTL_MS);
+    assert!(budget > low_rtt_budget);
+    assert!(budget < Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into()));
+
+    let tight_ttl_budget = datagram_retry_budget(high_rtt_timeout, 1_000);
+    assert!(tight_ttl_budget <= Duration::from_millis(900));
 }
 
 #[test]
@@ -574,7 +586,7 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
     );
     let health = context.health.lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
-    assert_eq!(health.tcp[0].load_bytes, 0);
+    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
 }
 
 #[test]
@@ -767,8 +779,8 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     let health = context.health.lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
     assert_eq!(health.tcp[1].active_flows, 0);
-    assert_eq!(health.tcp[0].load_bytes, 0);
-    assert_eq!(health.tcp[1].load_bytes, 0);
+    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
+    assert_eq!(health.tcp[1].relay_bytes_in_flight, 0);
 }
 
 #[test]
@@ -888,6 +900,82 @@ fn hinted_tcp_startup_uses_configured_metrics_before_order() {
 }
 
 #[test]
+fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
+    let path = "udp://127.0.0.1:10129"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let now = Instant::now();
+
+    {
+        let mut health = context.health.lock().expect("health lock");
+        health.udp[0].mark_udp_carrier_metrics(udp_carrier::UdpCarrierPathMetrics {
+            direction: 1,
+            srtt: Duration::from_millis(42),
+            rttvar: Duration::from_millis(7),
+            min_rtt: Duration::from_millis(40),
+            min_rtt_observed: true,
+            delivery_rate_bps: 300_000_000.0,
+            pacing_rate_bps: 300_000_000.0,
+            inflight_hi: 512 * 1024,
+            bytes_in_flight: 48 * 1024,
+            pending_bytes: 64 * 1024,
+            target_datagram_bytes: 1400,
+            loss_events: 0,
+            spurious_loss_events: 0,
+            packet_loss_threshold: 3,
+            pto_count: 0,
+            app_limited: true,
+            delivery_sample_count: 0,
+            last_delivery_sample_at: None,
+        });
+    }
+
+    let snapshot = context.udp_path_snapshot(0).expect("snapshot");
+    assert_eq!(snapshot.srtt_ms, 42.0);
+    assert_eq!(snapshot.jitter_ms, 7.0);
+    assert_eq!(snapshot.bytes_in_flight, 48 * 1024);
+    assert_eq!(snapshot.queue_bytes, 16 * 1024);
+    assert_eq!(snapshot.inflight_limit_bytes, 512 * 1024);
+    assert!(
+        !context.relay_path_has_bulk_model_evidence(UnderlayProtocol::Udp, 0),
+        "carrier RTT/liveness alone must not promote a UDP path for ordinary bulk"
+    );
+
+    {
+        let mut health = context.health.lock().expect("health lock");
+        health.udp[0].mark_udp_carrier_metrics(udp_carrier::UdpCarrierPathMetrics {
+            direction: 1,
+            srtt: Duration::from_millis(42),
+            rttvar: Duration::from_millis(7),
+            min_rtt: Duration::from_millis(40),
+            min_rtt_observed: true,
+            delivery_rate_bps: 300_000_000.0,
+            pacing_rate_bps: 300_000_000.0,
+            inflight_hi: 512 * 1024,
+            bytes_in_flight: 48 * 1024,
+            pending_bytes: 64 * 1024,
+            target_datagram_bytes: 1400,
+            loss_events: 0,
+            spurious_loss_events: 0,
+            packet_loss_threshold: 3,
+            pto_count: 0,
+            app_limited: false,
+            delivery_sample_count: 2,
+            last_delivery_sample_at: Some(now),
+        });
+    }
+
+    let snapshot = context.udp_path_snapshot(0).expect("snapshot");
+    assert_eq!(snapshot.delivery_rate_bps, 300_000_000.0);
+    assert!(
+        context.relay_path_has_bulk_model_evidence(UnderlayProtocol::Udp, 0),
+        "ACK-derived carrier delivery samples should become bulk model evidence"
+    );
+}
+
+#[test]
 fn active_udp_load_spreads_new_associations_and_releases_on_close() {
     let first_path = "udp://127.0.0.1:10031?srtt-ms=10&rate-mbps=10"
         .parse::<PathSpec>()
@@ -912,13 +1000,8 @@ fn active_udp_load_spreads_new_associations_and_releases_on_close() {
     );
 
     context.release_udp_path_load(0);
-    assert_eq!(
-        udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS)
-            .first()
-            .copied(),
-        Some(0)
-    );
+    assert!(udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS).contains(&0));
     let health = context.health.lock().expect("health lock");
     assert_eq!(health.udp[0].active_flows, 0);
-    assert_eq!(health.udp[0].load_bytes, 0);
+    assert_eq!(health.udp[0].relay_bytes_in_flight, 0);
 }

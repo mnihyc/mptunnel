@@ -978,7 +978,30 @@ where
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
-                    path_stream.send_frame(frame).await?;
+                    #[cfg(feature = "lab-diagnostics")]
+                    let send_lane = tcp_path_effective_frame_lane(&frame, relay_lane);
+                    #[cfg(feature = "lab-diagnostics")]
+                    let pacing_bytes = frame_pacing_bytes(&frame);
+                    let selected_path = path_stream.send_frame_tracked(frame).await?;
+                    #[cfg(not(feature = "lab-diagnostics"))]
+                    let _ = selected_path;
+                    #[cfg(feature = "lab-diagnostics")]
+                    if selected_path.is_none() {
+                        lab_sender_service_decision(
+                            "server",
+                            Some(session_id.0),
+                            stream_id.0,
+                            "primary",
+                            "stream_data",
+                            read,
+                            format_args!(
+                                "path_underlay={:?} path_id=none lane={:?} pacing_bytes={} degenerate_single_path=true",
+                                path_stream.underlay,
+                                send_lane,
+                                pacing_bytes,
+                            ),
+                        );
+                    }
                     stats.record_payload_bytes(read);
                 }
             }

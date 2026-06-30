@@ -2672,4 +2672,70 @@ mod tests {
             FlowLane::Throughput
         ));
     }
+
+    #[test]
+    fn control_and_ack_frames_never_use_throughput_lane() {
+        let priority_frames = [
+            (
+                Frame::StreamAck {
+                    stream_id: StreamId(1),
+                    complete: false,
+                    ranges: vec![],
+                },
+                FlowLane::Control,
+            ),
+            (
+                Frame::StreamMaxData {
+                    stream_id: StreamId(1),
+                    max_offset: 1024,
+                },
+                FlowLane::Control,
+            ),
+            (
+                Frame::StreamFin {
+                    stream_id: StreamId(1),
+                    final_offset: 64,
+                },
+                FlowLane::Control,
+            ),
+            (
+                Frame::StreamReset {
+                    stream_id: StreamId(1),
+                    reason: ResetReason::RemoteClosed,
+                },
+                FlowLane::Control,
+            ),
+            (
+                Frame::StreamDetach {
+                    stream_id: StreamId(1),
+                },
+                FlowLane::Control,
+            ),
+            (
+                Frame::DatagramFeedback {
+                    flow_id: DatagramFlowId(1),
+                    received: vec![],
+                },
+                FlowLane::RealtimeDatagram,
+            ),
+            (
+                Frame::DatagramClose {
+                    flow_id: DatagramFlowId(1),
+                },
+                FlowLane::Control,
+            ),
+        ];
+
+        for (frame, expected_lane) in priority_frames {
+            let effective_lane = tcp_path_effective_frame_lane(&frame, FlowLane::Throughput);
+            assert_eq!(effective_lane, expected_lane);
+            assert!(tcp_path_frame_uses_priority_queue(effective_lane));
+            if !matches!(frame, Frame::StreamFin { .. }) {
+                assert!(!tcp_relay_frame_prefers_current_data_path(
+                    &frame,
+                    FlowLane::Throughput
+                ));
+            }
+        }
+    }
 }

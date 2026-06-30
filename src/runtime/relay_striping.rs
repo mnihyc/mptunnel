@@ -1,3 +1,5 @@
+#[cfg(feature = "lab-diagnostics")]
+use super::bulk_admission::bulk_completion_horizon_ms_with_ordering_debt;
 use super::bulk_admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
     bulk_candidate_admission_suppression_with_ordering_debt,
@@ -195,6 +197,7 @@ pub(super) enum BulkRelayPathChoice {
 }
 
 pub(super) struct BulkRelayPathRequest<'a> {
+    pub(super) stream_id: StreamId,
     pub(super) context: &'a ClientPathContext,
     pub(super) paths: &'a [TcpRelayRemotePath],
     pub(super) lane: FlowLane,
@@ -205,19 +208,161 @@ pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
 }
 
-pub(super) fn choose_bulk_relay_path_avoiding(
-    context: &ClientPathContext,
-    paths: &[TcpRelayRemotePath],
+pub(super) struct BulkRelayFrameRequest<'a> {
+    pub(super) stream_id: StreamId,
+    pub(super) context: &'a ClientPathContext,
+    pub(super) paths: &'a [TcpRelayRemotePath],
+    pub(super) lane: FlowLane,
+    pub(super) frame: &'a Frame,
+    pub(super) cursor: usize,
+    pub(super) avoid_keys: &'a [RelayPathKey],
+    pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+#[derive(Debug, Clone, Copy)]
+struct BulkRelayCandidateDiagnostics {
+    stream_id: StreamId,
     lane: FlowLane,
-    frame: &Frame,
-    cursor: usize,
-    avoid_keys: &[RelayPathKey],
-    path_flights: Option<&RelayPathFlightLedger>,
+    key: RelayPathKey,
+    lead_key: Option<RelayPathKey>,
+    role: Option<BulkAdmissionRole>,
+    eta_ms: Option<f64>,
+    best_eta_ms: Option<f64>,
+    completion_horizon_ms: Option<f64>,
+    stream_ordering_debt_bytes: u64,
+    payload_bytes: usize,
+    snapshot: Option<PathSnapshot>,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+impl BulkRelayCandidateDiagnostics {
+    fn skipped(
+        stream_id: StreamId,
+        lane: FlowLane,
+        key: RelayPathKey,
+        lead_key: Option<RelayPathKey>,
+        payload_bytes: usize,
+    ) -> Self {
+        Self {
+            stream_id,
+            lane,
+            key,
+            lead_key,
+            role: None,
+            eta_ms: None,
+            best_eta_ms: None,
+            completion_horizon_ms: None,
+            stream_ordering_debt_bytes: 0,
+            payload_bytes,
+            snapshot: None,
+        }
+    }
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn log_bulk_relay_candidate_decision(
+    diagnostics: BulkRelayCandidateDiagnostics,
+    selected: bool,
+    reason: &'static str,
+) {
+    let lead_underlay = diagnostics
+        .lead_key
+        .map(|key| format!("{:?}", key.underlay))
+        .unwrap_or_else(|| "none".to_string());
+    let lead_index = diagnostics
+        .lead_key
+        .map(|key| key.index.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let role = diagnostics
+        .role
+        .map(|role| format!("{role:?}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let eta_ms = diagnostics
+        .eta_ms
+        .map(|eta_ms| format!("{eta_ms:.3}"))
+        .unwrap_or_else(|| "none".to_string());
+    let best_eta_ms = diagnostics
+        .best_eta_ms
+        .map(|eta_ms| format!("{eta_ms:.3}"))
+        .unwrap_or_else(|| "none".to_string());
+    let completion_horizon_ms = diagnostics
+        .completion_horizon_ms
+        .map(|horizon| format!("{horizon:.3}"))
+        .unwrap_or_else(|| "none".to_string());
+    let (
+        product_queue_debt,
+        carrier_queue_debt,
+        bytes_in_flight,
+        inflight_limit,
+        confidence,
+        app_limited,
+        delivery_rate_bps,
+        pacing_rate_bps,
+    ) = diagnostics
+        .snapshot
+        .map(|snapshot| {
+            (
+                snapshot.product_bytes_in_flight,
+                snapshot.queue_bytes,
+                snapshot.bytes_in_flight,
+                snapshot.inflight_limit_bytes,
+                snapshot.confidence,
+                snapshot.app_limited,
+                snapshot.delivery_rate_bps,
+                snapshot.pacing_rate_bps,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0.0, false, 0.0, 0.0));
+
+    lab_diagnostic(
+        "scheduler_decision",
+        format_args!(
+            "stream_id={} lane={:?} candidate_underlay={:?} candidate_index={} lead_underlay={} lead_index={} role={} selected={} reason={} eta_ms={} best_eta_ms={} completion_horizon_ms={} stream_ordering_debt_bytes={} payload_bytes={} product_queue_debt={} carrier_queue_debt={} bytes_in_flight={} inflight_limit={} confidence={:.3} app_limited={} delivery_rate_bps={:.0} pacing_rate_bps={:.0} delivery_sample_source=sender_model",
+            diagnostics.stream_id.0,
+            diagnostics.lane,
+            diagnostics.key.underlay,
+            diagnostics.key.index,
+            lead_underlay,
+            lead_index,
+            role,
+            selected,
+            reason,
+            eta_ms,
+            best_eta_ms,
+            completion_horizon_ms,
+            diagnostics.stream_ordering_debt_bytes,
+            diagnostics.payload_bytes,
+            product_queue_debt,
+            carrier_queue_debt,
+            bytes_in_flight,
+            inflight_limit,
+            confidence,
+            app_limited,
+            delivery_rate_bps,
+            pacing_rate_bps,
+        ),
+    );
+}
+
+pub(super) fn choose_bulk_relay_path_avoiding(
+    request: BulkRelayFrameRequest<'_>,
 ) -> BulkRelayPathChoice {
+    let BulkRelayFrameRequest {
+        stream_id,
+        context,
+        paths,
+        lane,
+        frame,
+        cursor,
+        avoid_keys,
+        path_flights,
+    } = request;
     let Some((offset, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return BulkRelayPathChoice::NotApplicable;
     };
     choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
+        stream_id,
         context,
         paths,
         lane,
@@ -233,6 +378,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     request: BulkRelayPathRequest<'_>,
 ) -> BulkRelayPathChoice {
     let BulkRelayPathRequest {
+        stream_id,
         context,
         paths,
         lane,
@@ -242,6 +388,8 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         avoid_keys,
         path_flights,
     } = request;
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = stream_id;
     if paths.len() <= 1 || !relay_lane_is_bulk(lane) || payload_bytes == 0 {
         return BulkRelayPathChoice::NotApplicable;
     }
@@ -273,22 +421,72 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             .iter()
             .any(|path| admitted_bulk_keys.contains(&path.key()));
     let mut best: Option<(usize, f64, usize)> = None;
+    #[cfg(feature = "lab-diagnostics")]
+    let mut best_diagnostics: Option<BulkRelayCandidateDiagnostics> = None;
     for (position, path) in paths.iter().enumerate() {
         let key = path.key();
         if normal_bulk_send && path.placement == RelayPathPlacement::Repair {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics::skipped(
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    payload_bytes,
+                ),
+                false,
+                "repair_path_not_for_ordinary_bulk",
+            );
             continue;
         }
         if avoid_keys.contains(&path.key())
             && paths.iter().any(|path| !avoid_keys.contains(&path.key()))
         {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics::skipped(
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    payload_bytes,
+                ),
+                false,
+                "avoid_previous_path",
+            );
             continue;
         }
         if normal_bulk_send {
             if restrict_to_admitted {
                 if !admitted_bulk_keys.contains(&key) {
+                    #[cfg(feature = "lab-diagnostics")]
+                    log_bulk_relay_candidate_decision(
+                        BulkRelayCandidateDiagnostics::skipped(
+                            stream_id,
+                            lane,
+                            key,
+                            lead_key,
+                            payload_bytes,
+                        ),
+                        false,
+                        "not_in_admitted_cohort",
+                    );
                     continue;
                 }
             } else if Some(key) != active_key {
+                #[cfg(feature = "lab-diagnostics")]
+                log_bulk_relay_candidate_decision(
+                    BulkRelayCandidateDiagnostics::skipped(
+                        stream_id,
+                        lane,
+                        key,
+                        lead_key,
+                        payload_bytes,
+                    ),
+                    false,
+                    "no_safe_cohort_non_active_path",
+                );
                 continue;
             }
         }
@@ -296,14 +494,58 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             && Some(key) != active_key
             && !context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
         {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics::skipped(
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    payload_bytes,
+                ),
+                false,
+                "no_sender_evidence",
+            );
             continue;
         }
         let Some(snapshot) = relay_path_snapshot_for_bulk_choice(context, key, active_key) else {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics::skipped(
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    payload_bytes,
+                ),
+                false,
+                "no_path_snapshot",
+            );
             continue;
         };
         let Some(score) = scheduler::score_path(snapshot, lane, payload_bytes, policy) else {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics {
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    role: None,
+                    eta_ms: None,
+                    best_eta_ms: None,
+                    completion_horizon_ms: None,
+                    stream_ordering_debt_bytes: 0,
+                    payload_bytes,
+                    snapshot: Some(snapshot),
+                },
+                false,
+                "no_path_score",
+            );
             continue;
         };
+        #[cfg(feature = "lab-diagnostics")]
+        let mut candidate_diagnostics = None;
         if normal_bulk_send {
             let role = if Some(key) == lead_key {
                 BulkAdmissionRole::ActiveDataPath
@@ -316,6 +558,30 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             let ordering_debt = path_flights
                 .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
                 .unwrap_or(0);
+            #[cfg(feature = "lab-diagnostics")]
+            {
+                let completion_horizon_ms = bulk_completion_horizon_ms_with_ordering_debt(
+                    best_snapshot,
+                    best_eta_ms,
+                    snapshot,
+                    payload_bytes,
+                    context.mux_limits,
+                    ordering_debt,
+                );
+                candidate_diagnostics = Some(BulkRelayCandidateDiagnostics {
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    role: Some(role),
+                    eta_ms: Some(score.eta_ms),
+                    best_eta_ms: Some(best_eta_ms),
+                    completion_horizon_ms: Some(completion_horizon_ms),
+                    stream_ordering_debt_bytes: ordering_debt,
+                    payload_bytes,
+                    snapshot: Some(snapshot),
+                });
+            }
             let ordering_suppression =
                 bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
                     best_snapshot,
@@ -328,38 +594,68 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     stream_ordering_debt_bytes: ordering_debt,
                 });
             if let Some(reason) = ordering_suppression {
+                #[cfg(feature = "lab-diagnostics")]
+                if let Some(diagnostics) = candidate_diagnostics {
+                    log_bulk_relay_candidate_decision(diagnostics, false, reason);
+                }
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = reason;
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "bulk_striping_candidate_suppressed",
-                    format_args!(
-                        "path_underlay={:?} path_index={} role={:?} eta_ms={:.3} best_eta_ms={:.3} stream_ordering_debt={} reason={}",
-                        key.underlay,
-                        key.index,
-                        role,
-                        score.eta_ms,
-                        best_eta_ms,
-                        ordering_debt,
-                        reason,
-                    ),
-                );
                 continue;
             }
         }
         let cursor_distance = path_cursor_distance(position, cursor, paths.len());
         match best {
-            None => best = Some((position, score.eta_ms, cursor_distance)),
+            None => {
+                best = Some((position, score.eta_ms, cursor_distance));
+                #[cfg(feature = "lab-diagnostics")]
+                {
+                    best_diagnostics =
+                        candidate_diagnostics.or(Some(BulkRelayCandidateDiagnostics {
+                            stream_id,
+                            lane,
+                            key,
+                            lead_key,
+                            role: None,
+                            eta_ms: Some(score.eta_ms),
+                            best_eta_ms: Some(score.eta_ms),
+                            completion_horizon_ms: None,
+                            stream_ordering_debt_bytes: 0,
+                            payload_bytes,
+                            snapshot: Some(snapshot),
+                        }));
+                }
+            }
             Some((_, best_eta, best_distance)) => {
                 if score.eta_ms < best_eta
                     || (score.eta_ms == best_eta && cursor_distance < best_distance)
                 {
                     best = Some((position, score.eta_ms, cursor_distance));
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
+                        best_diagnostics =
+                            candidate_diagnostics.or(Some(BulkRelayCandidateDiagnostics {
+                                stream_id,
+                                lane,
+                                key,
+                                lead_key,
+                                role: None,
+                                eta_ms: Some(score.eta_ms),
+                                best_eta_ms: Some(score.eta_ms),
+                                completion_horizon_ms: None,
+                                stream_ordering_debt_bytes: 0,
+                                payload_bytes,
+                                snapshot: Some(snapshot),
+                            }));
+                    }
                 }
             }
         }
     }
     if let Some((position, _, _)) = best {
+        #[cfg(feature = "lab-diagnostics")]
+        if let Some(diagnostics) = best_diagnostics {
+            log_bulk_relay_candidate_decision(diagnostics, true, "selected");
+        }
         return BulkRelayPathChoice::Selected(position);
     }
     if !normal_bulk_send {
@@ -373,6 +669,12 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 && !avoid_keys.contains(&owner)
         })
     {
+        #[cfg(feature = "lab-diagnostics")]
+        log_bulk_relay_candidate_decision(
+            BulkRelayCandidateDiagnostics::skipped(stream_id, lane, owner, lead_key, payload_bytes),
+            true,
+            "lower_flight_owner_frontier",
+        );
         return BulkRelayPathChoice::Selected(position);
     }
     BulkRelayPathChoice::Blocked
@@ -391,25 +693,8 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     Some((snapshot, score.eta_ms))
 }
 
-pub(super) fn bulk_relay_send_ready_for_extent(
-    context: &ClientPathContext,
-    paths: &[TcpRelayRemotePath],
-    lane: FlowLane,
-    offset: u64,
-    payload_bytes: usize,
-    cursor: usize,
-    path_flights: &RelayPathFlightLedger,
-) -> bool {
-    match choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-        context,
-        paths,
-        lane,
-        offset,
-        payload_bytes,
-        cursor,
-        avoid_keys: &[],
-        path_flights: Some(path_flights),
-    }) {
+pub(super) fn bulk_relay_send_ready_for_extent(request: BulkRelayPathRequest<'_>) -> bool {
+    match choose_bulk_relay_path_for_extent_avoiding(request) {
         BulkRelayPathChoice::Selected(_) | BulkRelayPathChoice::NotApplicable => true,
         BulkRelayPathChoice::Blocked => false,
     }
@@ -531,17 +816,20 @@ mod tests {
         let mut ledger = RelayPathFlightLedger::default();
         ledger.record_frame(missing_owner, &data_frame(0, 64 * 1024));
 
-        assert!(!bulk_relay_send_ready_for_extent(
-            &context,
-            &paths,
-            FlowLane::Throughput,
-            64 * 1024,
-            64 * 1024,
-            0,
-            &ledger,
-        ));
+        assert!(!bulk_relay_send_ready_for_extent(BulkRelayPathRequest {
+            stream_id: StreamId(7),
+            context: &context,
+            paths: &paths,
+            lane: FlowLane::Throughput,
+            offset: 64 * 1024,
+            payload_bytes: 64 * 1024,
+            cursor: 0,
+            avoid_keys: &[],
+            path_flights: Some(&ledger),
+        }));
         assert_eq!(
             choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
+                stream_id: StreamId(7),
                 context: &context,
                 paths: &paths,
                 lane: FlowLane::Throughput,
@@ -574,6 +862,7 @@ mod tests {
 
         assert_eq!(
             choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
+                stream_id: StreamId(7),
                 context: &context,
                 paths: &paths,
                 lane: FlowLane::Throughput,

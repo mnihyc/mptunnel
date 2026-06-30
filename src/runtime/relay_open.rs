@@ -267,15 +267,17 @@ impl TcpRelayRemoteSet {
         payload_bytes: usize,
         path_flights: &RelayPathFlightLedger,
     ) -> bool {
-        bulk_relay_send_ready_for_extent(
+        bulk_relay_send_ready_for_extent(BulkRelayPathRequest {
+            stream_id: self.stream_id,
             context,
-            &self.paths,
+            paths: &self.paths,
             lane,
             offset,
             payload_bytes,
-            self.next_send_index,
-            path_flights,
-        )
+            cursor: self.next_send_index,
+            avoid_keys: &[],
+            path_flights: Some(path_flights),
+        })
     }
 
     async fn send_frame_with_avoid(
@@ -294,46 +296,48 @@ impl TcpRelayRemoteSet {
         let prefer_current_data_path =
             tcp_relay_frame_prefers_current_data_path(&frame, stream_lane);
         while !self.paths.is_empty() {
-            let selected_by_bulk_admission = match choose_bulk_relay_path_avoiding(
-                context,
-                &self.paths,
-                stream_lane,
-                &frame,
-                self.next_send_index,
-                avoid_keys,
-                path_flights,
-            ) {
-                BulkRelayPathChoice::Selected(position) => {
-                    self.next_send_index = position;
-                    true
-                }
-                BulkRelayPathChoice::Blocked => {
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "sender_admission_blocked",
-                        format_args!(
-                            "stream_id={} lane={:?} reason=bulk_no_safe_path",
-                            self.stream_id.0, stream_lane,
-                        ),
-                    );
-                    tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
-                    continue;
-                }
-                BulkRelayPathChoice::NotApplicable
-                    if prefer_current_data_path
-                        || relay_frame_is_bulk_stream_data(&frame, stream_lane)
-                        || self.paths.last().is_some_and(|path| {
-                            tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
-                                &frame,
-                                path.stream.lane,
-                            ))
-                        }) =>
-                {
-                    self.next_send_index = self.paths.len() - 1;
-                    false
-                }
-                BulkRelayPathChoice::NotApplicable => false,
-            };
+            let selected_by_bulk_admission =
+                match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+                    stream_id: self.stream_id,
+                    context,
+                    paths: &self.paths,
+                    lane: stream_lane,
+                    frame: &frame,
+                    cursor: self.next_send_index,
+                    avoid_keys,
+                    path_flights,
+                }) {
+                    BulkRelayPathChoice::Selected(position) => {
+                        self.next_send_index = position;
+                        true
+                    }
+                    BulkRelayPathChoice::Blocked => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "sender_admission_blocked",
+                            format_args!(
+                                "stream_id={} lane={:?} reason=bulk_no_safe_path",
+                                self.stream_id.0, stream_lane,
+                            ),
+                        );
+                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                        continue;
+                    }
+                    BulkRelayPathChoice::NotApplicable
+                        if prefer_current_data_path
+                            || relay_frame_is_bulk_stream_data(&frame, stream_lane)
+                            || self.paths.last().is_some_and(|path| {
+                                tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
+                                    &frame,
+                                    path.stream.lane,
+                                ))
+                            }) =>
+                    {
+                        self.next_send_index = self.paths.len() - 1;
+                        false
+                    }
+                    BulkRelayPathChoice::NotApplicable => false,
+                };
             #[cfg(not(feature = "lab-diagnostics"))]
             let _ = selected_by_bulk_admission;
             self.next_send_index %= self.paths.len();

@@ -832,6 +832,26 @@ mod tests {
     }
 
     #[test]
+    fn active_path_with_ordering_debt_must_still_beat_lead_completion_horizon() {
+        let best = candidate(0, 10.0, 10.0, 1000.0);
+        let active_with_debt = candidate(1, 100.0, 10.0, 1000.0);
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: active_with_debt.snapshot,
+                candidate_eta_ms: active_with_debt.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::ActiveDataPath,
+                stream_ordering_debt_bytes: 128 * 1024,
+            }),
+            Some("completion_horizon")
+        );
+    }
+
+    #[test]
     fn bulk_admission_rejects_saturated_best_candidate() {
         let mut saturated_best = candidate(0, 100.0, 50.0, 500.0);
         saturated_best.snapshot.inflight_limit_bytes = 64 * 1024;

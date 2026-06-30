@@ -254,6 +254,20 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         Vec::new()
     };
     let lead_key = admitted_bulk_keys.first().copied().or(active_key);
+    let lead_baseline = if normal_bulk_send {
+        lead_key.and_then(|key| {
+            scored_relay_path_snapshot_for_bulk_choice(
+                context,
+                key,
+                active_key,
+                lane,
+                payload_bytes,
+                policy,
+            )
+        })
+    } else {
+        None
+    };
     let restrict_to_admitted = normal_bulk_send
         && paths
             .iter()
@@ -298,13 +312,14 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             } else {
                 BulkAdmissionRole::ActiveDataPath
             };
+            let (best_snapshot, best_eta_ms) = lead_baseline.unwrap_or((snapshot, score.eta_ms));
             let ordering_debt = path_flights
                 .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
                 .unwrap_or(0);
             let ordering_suppression =
                 bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-                    best_snapshot: snapshot,
-                    best_eta_ms: score.eta_ms,
+                    best_snapshot,
+                    best_eta_ms,
                     candidate_snapshot: snapshot,
                     candidate_eta_ms: score.eta_ms,
                     payload_bytes,
@@ -324,7 +339,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                         key.index,
                         role,
                         score.eta_ms,
-                        score.eta_ms,
+                        best_eta_ms,
                         ordering_debt,
                         reason,
                     ),
@@ -361,6 +376,19 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         return BulkRelayPathChoice::Selected(position);
     }
     BulkRelayPathChoice::Blocked
+}
+
+fn scored_relay_path_snapshot_for_bulk_choice(
+    context: &ClientPathContext,
+    key: RelayPathKey,
+    active_key: Option<RelayPathKey>,
+    lane: FlowLane,
+    payload_bytes: usize,
+    policy: SchedulerPolicy,
+) -> Option<(PathSnapshot, f64)> {
+    let snapshot = relay_path_snapshot_for_bulk_choice(context, key, active_key)?;
+    let score = scheduler::score_path(snapshot, lane, payload_bytes, policy)?;
+    Some((snapshot, score.eta_ms))
 }
 
 pub(super) fn bulk_relay_send_ready_for_extent(

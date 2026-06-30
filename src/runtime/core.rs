@@ -129,19 +129,20 @@ fn new_client_path_context(
     ClientPathContext::new_with_path_configs_and_target(
         client.paths.clone(),
         resources,
-        client.proxy_auth.clone(),
+        ProxyAuthConfig::disabled(),
         client.route_target.clone(),
+        client.ingresses.clone(),
     )
 }
 
 fn spawn_client_ingresses(
-    ingresses: Vec<IngressConfig>,
+    ingresses: Vec<LocalIngressConfig>,
     context: ClientPathContext,
     tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
     for ingress in ingresses {
         let context = context.clone();
-        match ingress {
+        match ingress.config {
             IngressConfig::Socks5 { listen, proxy_auth } => {
                 tasks.spawn(
                     async move { run_socks5_client_ingress(listen, context, proxy_auth).await },
@@ -263,6 +264,7 @@ pub(super) async fn probe_client_paths(context: &ClientPathContext, timeout: Dur
 #[derive(Debug, Clone)]
 pub struct ClientPathContext {
     pub(super) route_target: Option<RouteTarget>,
+    pub(super) ingresses: Arc<Vec<LocalIngressConfig>>,
     pub(super) tcp_paths: Arc<Vec<PathSpec>>,
     pub(super) udp_paths: Arc<Vec<PathSpec>>,
     pub(super) tcp_security: Arc<Vec<SecurityConfig>>,
@@ -757,7 +759,7 @@ impl ClientPathContext {
                 security: security.clone(),
             })
             .collect();
-        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None)
+        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None, Vec::new())
     }
 
     pub fn new_with_path_configs_and_target(
@@ -765,6 +767,7 @@ impl ClientPathContext {
         resources: ResourceLimits,
         proxy_auth: ProxyAuthConfig,
         route_target: Option<RouteTarget>,
+        ingresses: Vec<LocalIngressConfig>,
     ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
@@ -841,6 +844,7 @@ impl ClientPathContext {
         let _ = proxy_auth;
         Ok(Self {
             route_target,
+            ingresses: Arc::new(ingresses),
             tcp_paths: Arc::new(tcp_paths),
             udp_paths: Arc::new(udp_paths),
             tcp_security: Arc::new(tcp_security),

@@ -96,7 +96,7 @@ Running `mptunnel` with no arguments reads `./config.toml`. Use `--config PATH` 
 
 MPP endpoints and security belong to `protocol = "mpp"` outbounds. Routing balancers reference outbound tags: `combined-mpp` combines MPP outbounds, while `sequence` and `random` select among egress outbounds. DNS resolver policy belongs to the egress outbound that resolves target names, usually as an inline `dns = { ... }` table on that outbound.
 
-The release management API is enabled only when `--management-listen` or `[management].listen` is configured. Keep it on loopback unless an operator network explicitly protects it. Set `--management-token` or `[management].token` for bearer-token authentication. Release endpoints expose JSON status and bounded traffic trends without lab-only component timing. When one process has both local inbounds using MPP outbounds and MPP inbounds using egress outbounds, the API reports a self-contained node snapshot with both service groups:
+The release management API is enabled only when `--management-listen` or `[management].listen` is configured. Keep it on loopback unless an operator network explicitly protects it. Set `--management-token` or `[management].token` for bearer-token authentication. Release endpoints expose JSON status and bounded traffic trends without lab-only component timing. Status includes local inbound tags, listener addresses, route targets, path health, and traffic summaries; local proxy credentials are not exposed. When one process has both local inbounds using MPP outbounds and MPP inbounds using egress outbounds, the API reports a self-contained node snapshot with both service groups:
 
 ```bash
 curl -H 'Authorization: Bearer replace-with-token' http://127.0.0.1:7600/status

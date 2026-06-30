@@ -1,6 +1,6 @@
 pub(super) use crate::config::{
-    AppConfig, ClientConfig, ClientPathConfig, CommandConfig, ManagementConfig, NodeConfig,
-    ResourceLimits, RouteTarget, RouteTargetKind, SecurityConfig,
+    AppConfig, ClientConfig, ClientPathConfig, CommandConfig, LocalIngressConfig, ManagementConfig,
+    NodeConfig, ResourceLimits, RouteTarget, RouteTargetKind, SecurityConfig,
 };
 pub(super) use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 pub(super) use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};

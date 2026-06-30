@@ -2,8 +2,8 @@ use super::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig, ConfigError,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_PATH_PROBE_INTERVAL_MS,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    ManagementConfig, NodeConfig, ResourceLimits, RouteTarget, RouteTargetKind, SecurityConfig,
-    SecurityPolicyError, ServerConfig, ServiceConfig, SharedSecret,
+    LocalIngressConfig, ManagementConfig, NodeConfig, ResourceLimits, RouteTarget, RouteTargetKind,
+    SecurityConfig, SecurityPolicyError, ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU, TunL4Config,
@@ -12,7 +12,7 @@ use crate::ingress::{IngressConfig, ProxyAuthConfig};
 use crate::outbound::{DnsConfig, DnsIpStrategy, OutboundConfig, OutboundRouteMember};
 use crate::transport::{EndpointParseError, PathSpec, PathSpecParseError};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
@@ -725,8 +725,9 @@ fn build_node_services(
     inbounds: Vec<InboundFileConfig>,
     outbounds: ParsedOutbounds,
 ) -> Result<(Vec<ClientConfig>, Vec<ServerConfig>), ConfigFileError> {
-    let mut client_groups: HashMap<String, Vec<IngressConfig>> = HashMap::new();
+    let mut client_groups: HashMap<String, Vec<LocalIngressConfig>> = HashMap::new();
     let mut client_targets: HashMap<String, ResolvedMppTarget> = HashMap::new();
+    let mut inbound_tags = HashSet::new();
     let mut client_order = Vec::new();
     let mut servers = Vec::new();
 
@@ -740,15 +741,19 @@ fn build_node_services(
                 auth,
             } => {
                 validate_optional_tag(tag.as_deref())?;
+                validate_unique_inbound_tag(tag.as_deref(), &mut inbound_tags)?;
                 let target = resolve_mpp_target(outbound, balancer, &outbounds)?;
                 push_client_ingress(
                     &mut client_groups,
                     &mut client_targets,
                     &mut client_order,
                     target,
-                    IngressConfig::Socks5 {
-                        listen: listen_or_default(listen, 1080),
-                        proxy_auth: proxy_auth_or_disabled(auth)?,
+                    LocalIngressConfig {
+                        tag,
+                        config: IngressConfig::Socks5 {
+                            listen: listen_or_default(listen, 1080),
+                            proxy_auth: proxy_auth_or_disabled(auth)?,
+                        },
                     },
                 );
             }
@@ -760,15 +765,19 @@ fn build_node_services(
                 auth,
             } => {
                 validate_optional_tag(tag.as_deref())?;
+                validate_unique_inbound_tag(tag.as_deref(), &mut inbound_tags)?;
                 let target = resolve_mpp_target(outbound, balancer, &outbounds)?;
                 push_client_ingress(
                     &mut client_groups,
                     &mut client_targets,
                     &mut client_order,
                     target,
-                    IngressConfig::HttpConnect {
-                        listen: listen_or_default(listen, 8080),
-                        proxy_auth: proxy_auth_or_disabled(auth)?,
+                    LocalIngressConfig {
+                        tag,
+                        config: IngressConfig::HttpConnect {
+                            listen: listen_or_default(listen, 8080),
+                            proxy_auth: proxy_auth_or_disabled(auth)?,
+                        },
                     },
                 );
             }
@@ -789,28 +798,32 @@ fn build_node_services(
                 dns_ttl_ms,
             } => {
                 validate_optional_tag(tag.as_deref())?;
+                validate_unique_inbound_tag(tag.as_deref(), &mut inbound_tags)?;
                 let target = resolve_mpp_target(outbound, balancer, &outbounds)?;
                 push_client_ingress(
                     &mut client_groups,
                     &mut client_targets,
                     &mut client_order,
                     target,
-                    IngressConfig::TunL4(
-                        TunFileConfig {
-                            name,
-                            ipv4,
-                            disable_ipv4,
-                            ipv4_prefix,
-                            ipv4_gateway,
-                            ipv6,
-                            ipv6_prefix,
-                            mtu,
-                            disable_icmp,
-                            dns_resolvers,
-                            dns_ttl_ms,
-                        }
-                        .into_config()?,
-                    ),
+                    LocalIngressConfig {
+                        tag,
+                        config: IngressConfig::TunL4(
+                            TunFileConfig {
+                                name,
+                                ipv4,
+                                disable_ipv4,
+                                ipv4_prefix,
+                                ipv4_gateway,
+                                ipv6,
+                                ipv6_prefix,
+                                mtu,
+                                disable_icmp,
+                                dns_resolvers,
+                                dns_ttl_ms,
+                            }
+                            .into_config()?,
+                        ),
+                    },
                 );
             }
             InboundFileConfig::Mpp {
@@ -821,6 +834,7 @@ fn build_node_services(
                 balancer,
             } => {
                 validate_optional_tag(tag.as_deref())?;
+                validate_unique_inbound_tag(tag.as_deref(), &mut inbound_tags)?;
                 let egress = resolve_egress_target(outbound, balancer, &outbounds)?;
                 let paths = parse_path_specs(endpoints)?;
                 if paths.is_empty() {
@@ -846,7 +860,6 @@ fn build_node_services(
         clients.push(ClientConfig {
             route_target: Some(mpp.target),
             ingresses: client_groups.remove(&key).unwrap_or_default(),
-            proxy_auth: ProxyAuthConfig::disabled(),
             security: mpp.config.security.clone(),
             paths: mpp.config.paths.clone(),
             path_probe_interval: mpp.config.path_probe_interval,
@@ -1062,6 +1075,19 @@ fn validate_optional_tag(tag: Option<&str>) -> Result<(), ConfigFileError> {
     Ok(())
 }
 
+fn validate_unique_inbound_tag(
+    tag: Option<&str>,
+    seen: &mut HashSet<String>,
+) -> Result<(), ConfigFileError> {
+    let Some(tag) = tag else {
+        return Ok(());
+    };
+    if !seen.insert(tag.to_string()) {
+        return Err(ConfigFileError::DuplicateInboundTag(tag.to_string()));
+    }
+    Ok(())
+}
+
 fn proxy_auth_or_disabled(
     auth: Option<ProxyAuthFileConfig>,
 ) -> Result<ProxyAuthConfig, ConfigFileError> {
@@ -1072,11 +1098,11 @@ fn proxy_auth_or_disabled(
 }
 
 fn push_client_ingress(
-    groups: &mut HashMap<String, Vec<IngressConfig>>,
+    groups: &mut HashMap<String, Vec<LocalIngressConfig>>,
     targets: &mut HashMap<String, ResolvedMppTarget>,
     order: &mut Vec<String>,
     target: ResolvedMppTarget,
-    ingress: IngressConfig,
+    ingress: LocalIngressConfig,
 ) {
     let key = target.key.clone();
     if !groups.contains_key(&key) {
@@ -1153,6 +1179,7 @@ pub enum ConfigFileError {
     NoRuntimeServices,
     EmptyTag,
     DuplicateTag(String),
+    DuplicateInboundTag(String),
     MissingOutboundTag(String),
     MissingBalancerTag(String),
     OutboundTagWrongProtocol {
@@ -1179,7 +1206,6 @@ pub enum ConfigFileError {
         expected: &'static str,
     },
     CombinedMppProbePolicyMismatch(String),
-    MissingOutboundBindIp,
     MissingOutboundProxy,
     TunIpv4DisabledWithIpv4Options,
     ProxyUsernameRequired,
@@ -1218,6 +1244,7 @@ impl std::fmt::Display for ConfigFileError {
             }
             Self::EmptyTag => write!(f, "inbound and outbound tags must not be empty"),
             Self::DuplicateTag(tag) => write!(f, "duplicate outbound or balancer tag {tag:?}"),
+            Self::DuplicateInboundTag(tag) => write!(f, "duplicate inbound tag {tag:?}"),
             Self::MissingOutboundTag(tag) => write!(f, "outbound tag {tag:?} does not exist"),
             Self::MissingBalancerTag(tag) => {
                 write!(f, "routing balancer tag {tag:?} does not exist")
@@ -1284,12 +1311,6 @@ impl std::fmt::Display for ConfigFileError {
                 f,
                 "combined MPP balancer {tag:?} requires member MPP outbounds to use the same path probe timing"
             ),
-            Self::MissingOutboundBindIp => {
-                write!(
-                    f,
-                    "direct outbound bind_ip must be a valid source IP when set"
-                )
-            }
             Self::MissingOutboundProxy => write!(f, "proxied outbound requires proxy"),
             Self::TunIpv4DisabledWithIpv4Options => {
                 write!(
@@ -1316,6 +1337,7 @@ impl std::error::Error for ConfigFileError {
             | Self::NoRuntimeServices
             | Self::EmptyTag
             | Self::DuplicateTag(_)
+            | Self::DuplicateInboundTag(_)
             | Self::MissingOutboundTag(_)
             | Self::MissingBalancerTag(_)
             | Self::OutboundTagWrongProtocol { .. }
@@ -1332,7 +1354,6 @@ impl std::error::Error for ConfigFileError {
             | Self::RoutingBalancerRequiresMembers(_)
             | Self::RoutingBalancerMemberWrongProtocol { .. }
             | Self::CombinedMppProbePolicyMismatch(_)
-            | Self::MissingOutboundBindIp
             | Self::MissingOutboundProxy
             | Self::TunIpv4DisabledWithIpv4Options
             | Self::ProxyUsernameRequired
@@ -1345,6 +1366,13 @@ impl std::error::Error for ConfigFileError {
 mod tests {
     use super::*;
     use crate::config::{CommandConfig, TransportSecurity};
+
+    fn ingress_configs(ingresses: &[LocalIngressConfig]) -> Vec<IngressConfig> {
+        ingresses
+            .iter()
+            .map(|ingress| ingress.config.clone())
+            .collect()
+    }
 
     #[test]
     fn node_config_toml_uses_inbound_to_mpp_outbound_defaults_and_management() {
@@ -1383,8 +1411,9 @@ secret = "0123456789abcdef0123456789abcdef"
                     Some((&RouteTargetKind::Outbound, "mpp-main"))
                 );
                 assert_eq!(client.paths.len(), 2);
+                assert_eq!(client.ingresses[0].tag, None);
                 assert_eq!(
-                    client.ingresses,
+                    ingress_configs(&client.ingresses),
                     vec![IngressConfig::Socks5 {
                         listen: vec!["127.0.0.1:1080".parse().expect("listen")],
                         proxy_auth: ProxyAuthConfig::disabled(),
@@ -1393,6 +1422,77 @@ secret = "0123456789abcdef0123456789abcdef"
             }
             CommandConfig::Client(_) | CommandConfig::Server(_) => panic!("expected node"),
         }
+    }
+
+    #[test]
+    fn node_config_toml_preserves_local_inbound_tags() {
+        let config = load_config_toml_str(
+            r#"
+[[inbounds]]
+tag = "local-socks"
+protocol = "socks5"
+listen = ["127.0.0.1:1080"]
+outbound = "mpp-main"
+
+[[inbounds]]
+tag = "local-http"
+protocol = "http"
+listen = ["127.0.0.1:8080"]
+outbound = "mpp-main"
+
+[[outbounds]]
+tag = "mpp-main"
+protocol = "mpp"
+endpoints = ["tcp://127.0.0.1:443"]
+
+[outbounds.security]
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+        )
+        .expect("config");
+
+        let CommandConfig::Node(node) = config.command else {
+            panic!("expected node");
+        };
+        assert_eq!(node.clients.len(), 1);
+        let ingresses = &node.clients[0].ingresses;
+        assert_eq!(ingresses.len(), 2);
+        assert_eq!(ingresses[0].tag.as_deref(), Some("local-socks"));
+        assert_eq!(ingresses[1].tag.as_deref(), Some("local-http"));
+        assert!(matches!(&ingresses[0].config, IngressConfig::Socks5 { .. }));
+        assert!(matches!(
+            &ingresses[1].config,
+            IngressConfig::HttpConnect { .. }
+        ));
+    }
+
+    #[test]
+    fn inbound_tags_must_be_unique() {
+        let err = load_config_toml_str(
+            r#"
+[[inbounds]]
+tag = "duplicate"
+protocol = "socks5"
+
+[[inbounds]]
+tag = "duplicate"
+protocol = "http"
+
+[[outbounds]]
+tag = "mpp-main"
+protocol = "mpp"
+endpoints = ["tcp://127.0.0.1:443"]
+
+[outbounds.security]
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+        )
+        .expect_err("duplicate inbound tag should fail");
+
+        assert!(matches!(
+            err,
+            ConfigFileError::DuplicateInboundTag(tag) if tag == "duplicate"
+        ));
     }
 
     #[test]

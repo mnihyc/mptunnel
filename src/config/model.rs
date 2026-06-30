@@ -339,12 +339,17 @@ pub struct RouteTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     pub route_target: Option<RouteTarget>,
-    pub ingresses: Vec<IngressConfig>,
-    pub proxy_auth: ProxyAuthConfig,
+    pub ingresses: Vec<LocalIngressConfig>,
     pub security: SecurityConfig,
     pub paths: Vec<ClientPathConfig>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalIngressConfig {
+    pub tag: Option<String>,
+    pub config: IngressConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,15 +379,14 @@ fn validate_client_config(
         return Err(ConfigError::NoIngresses);
     }
     for ingress in &client.ingresses {
-        validate_ingress(ingress)?;
-        if let IngressConfig::TunL4(tun) = ingress {
+        validate_ingress(&ingress.config)?;
+        if let IngressConfig::TunL4(tun) = &ingress.config {
             validate_tun_l4(tun)?;
         }
     }
-    validate_proxy_auth(&client.proxy_auth)?;
     validate_security_config(&client.security)?;
     for ingress in &client.ingresses {
-        match ingress {
+        match &ingress.config {
             IngressConfig::Socks5 { proxy_auth, .. }
             | IngressConfig::HttpConnect { proxy_auth, .. } => {
                 validate_proxy_auth(proxy_auth)?;

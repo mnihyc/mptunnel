@@ -306,6 +306,7 @@ impl ManagementTarget {
                     "schema": "mptunnel.management.v1",
                     "role": state.role,
                     "route_target": route_target_json(context.route_target.as_ref()),
+                    "inbounds": client_inbounds_json(context),
                     "uptime_ms": state.uptime_ms(),
                     "started_unix_ms": state.started_unix_ms,
                     "summary": summary,
@@ -429,6 +430,7 @@ impl ManagementTarget {
                 json!({
                     "role": state.role,
                     "route_target": route_target_json(context.route_target.as_ref()),
+                    "inbounds": client_inbounds_json(context),
                     "summary": summary,
                     "paths": paths,
                     "traffic_trends": state.trends(),
@@ -684,9 +686,49 @@ fn client_snapshot_json(context: &ClientPathContext) -> Value {
     let (paths, summary) = client_path_statuses(context);
     json!({
         "route_target": route_target_json(context.route_target.as_ref()),
+        "inbounds": client_inbounds_json(context),
         "summary": summary,
         "paths": paths,
     })
+}
+
+fn client_inbounds_json(context: &ClientPathContext) -> Vec<Value> {
+    context
+        .ingresses
+        .iter()
+        .map(|ingress| match &ingress.config {
+            IngressConfig::Socks5 { listen, proxy_auth } => json!({
+                "tag": ingress.tag.as_deref(),
+                "protocol": "socks5",
+                "listen": listen.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "auth_required": proxy_auth.is_required(),
+            }),
+            IngressConfig::HttpConnect { listen, proxy_auth } => json!({
+                "tag": ingress.tag.as_deref(),
+                "protocol": "http",
+                "listen": listen.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "auth_required": proxy_auth.is_required(),
+            }),
+            IngressConfig::TunL4(tun) => json!({
+                "tag": ingress.tag.as_deref(),
+                "protocol": "tun",
+                "name": tun.name.as_deref(),
+                "ipv4": tun.ipv4.map(|addr| addr.to_string()),
+                "ipv4_prefix": tun.ipv4_prefix,
+                "ipv4_gateway": tun.ipv4_gateway.map(|addr| addr.to_string()),
+                "ipv6": tun.ipv6.map(|addr| addr.to_string()),
+                "ipv6_prefix": tun.ipv6_prefix,
+                "mtu": tun.mtu,
+                "icmp_enabled": tun.enable_icmp,
+                "dns_resolvers": tun
+                    .dns_resolvers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "dns_ttl_ms": tun.dns_ttl_ms,
+            }),
+        })
+        .collect()
 }
 
 fn server_snapshot_json(context: &ServerPathContext) -> Value {
@@ -1141,6 +1183,7 @@ mod tests {
                 kind: RouteTargetKind::Outbound,
                 tag: "edge-mpp".to_string(),
             }),
+            Vec::new(),
         )
         .expect("context");
         let target = ManagementTarget::Node {
@@ -1158,5 +1201,48 @@ mod tests {
         let health = context.health.lock().expect("health");
         assert!(health.tcp[0].manual_disabled);
         assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
+    }
+
+    #[test]
+    fn client_status_exposes_inbound_tags_without_credentials() {
+        let security = SecurityConfig::encrypted(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+        );
+        let context = ClientPathContext::new_with_path_configs_and_target(
+            vec![ClientPathConfig {
+                spec: "tcp://127.0.0.1:443".parse().expect("path"),
+                security,
+            }],
+            ResourceLimits::default(),
+            ProxyAuthConfig::disabled(),
+            Some(RouteTarget {
+                kind: RouteTargetKind::Outbound,
+                tag: "edge-mpp".to_string(),
+            }),
+            vec![LocalIngressConfig {
+                tag: Some("local-socks".to_string()),
+                config: IngressConfig::Socks5 {
+                    listen: vec!["127.0.0.1:1080".parse().expect("listen")],
+                    proxy_auth: ProxyAuthConfig::required(
+                        "operator".to_string(),
+                        "secret".to_string(),
+                    ),
+                },
+            }],
+        )
+        .expect("context");
+        let target = ManagementTarget::Client {
+            context,
+            state: ManagementState::new("client"),
+        };
+
+        let status = target.status_json();
+        let inbounds = status["inbounds"].as_array().expect("inbounds");
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["tag"], "local-socks");
+        assert_eq!(inbounds[0]["protocol"], "socks5");
+        assert_eq!(inbounds[0]["auth_required"], true);
+        assert!(inbounds[0].get("username").is_none());
+        assert!(inbounds[0].get("password").is_none());
     }
 }

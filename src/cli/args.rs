@@ -5,8 +5,8 @@ use crate::config::{
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
     DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
     DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
-    DEFAULT_TCP_PATH_INFLIGHT_BYTES, ManagementConfig, ResourceLimits, SecurityConfig,
-    ServerConfig, ServiceConfig, SharedSecret,
+    DEFAULT_TCP_PATH_INFLIGHT_BYTES, LocalIngressConfig, ManagementConfig, ResourceLimits,
+    SecurityConfig, ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
@@ -470,15 +470,21 @@ impl ClientArgs {
 
         let mut ingresses = Vec::with_capacity(3);
         if socks5_enabled {
-            ingresses.push(IngressConfig::Socks5 {
-                listen: listen_or_default(socks5_listen, 1080),
-                proxy_auth: proxy_auth.clone(),
+            ingresses.push(LocalIngressConfig {
+                tag: None,
+                config: IngressConfig::Socks5 {
+                    listen: listen_or_default(socks5_listen, 1080),
+                    proxy_auth: proxy_auth.clone(),
+                },
             });
         }
         if http_connect_enabled {
-            ingresses.push(IngressConfig::HttpConnect {
-                listen: self.http_listen.clone(),
-                proxy_auth: proxy_auth.clone(),
+            ingresses.push(LocalIngressConfig {
+                tag: None,
+                config: IngressConfig::HttpConnect {
+                    listen: self.http_listen.clone(),
+                    proxy_auth: proxy_auth.clone(),
+                },
             });
         }
         if tun_enabled {
@@ -493,23 +499,25 @@ impl ClientArgs {
                         .unwrap_or(crate::ingress::tun::DEFAULT_TUN_IPV4),
                 )
             };
-            ingresses.push(IngressConfig::TunL4(TunL4Config {
-                name: self.tun_name.clone(),
-                ipv4: tun_ipv4,
-                ipv4_prefix: self.tun_ipv4_prefix,
-                ipv4_gateway: self.tun_ipv4_gateway,
-                ipv6: self.tun_ipv6,
-                ipv6_prefix: self.tun_ipv6_prefix,
-                mtu: self.tun_mtu,
-                enable_icmp: !self.tun_disable_icmp,
-                dns_resolvers: self.tun_dns_resolvers.clone(),
-                dns_ttl_ms: self.tun_dns_ttl_ms,
-            }));
+            ingresses.push(LocalIngressConfig {
+                tag: None,
+                config: IngressConfig::TunL4(TunL4Config {
+                    name: self.tun_name.clone(),
+                    ipv4: tun_ipv4,
+                    ipv4_prefix: self.tun_ipv4_prefix,
+                    ipv4_gateway: self.tun_ipv4_gateway,
+                    ipv6: self.tun_ipv6,
+                    ipv6_prefix: self.tun_ipv6_prefix,
+                    mtu: self.tun_mtu,
+                    enable_icmp: !self.tun_disable_icmp,
+                    dns_resolvers: self.tun_dns_resolvers.clone(),
+                    dns_ttl_ms: self.tun_dns_ttl_ms,
+                }),
+            });
         }
         Ok(ClientConfig {
             route_target: None,
             ingresses,
-            proxy_auth: ProxyAuthConfig::disabled(),
             paths: self
                 .paths
                 .into_iter()
@@ -756,6 +764,13 @@ mod tests {
     use crate::config::{CipherSuite, CommandConfig, TransportSecurity};
     use clap::Parser;
 
+    fn ingress_configs(ingresses: &[LocalIngressConfig]) -> Vec<IngressConfig> {
+        ingresses
+            .iter()
+            .map(|ingress| ingress.config.clone())
+            .collect()
+    }
+
     #[test]
     fn client_cli_builds_default_socks_config() {
         let cli = Cli::try_parse_from([
@@ -781,7 +796,7 @@ mod tests {
             CommandConfig::Client(client) => {
                 assert_eq!(client.paths.len(), 2);
                 assert_eq!(
-                    client.ingresses,
+                    ingress_configs(&client.ingresses),
                     vec![IngressConfig::Socks5 {
                         listen: vec!["127.0.0.1:1080".parse().expect("listen")],
                         proxy_auth: ProxyAuthConfig::disabled(),
@@ -821,7 +836,7 @@ mod tests {
             panic!("expected client config");
         };
         assert_eq!(
-            client.ingresses,
+            ingress_configs(&client.ingresses),
             vec![IngressConfig::HttpConnect {
                 listen: vec![
                     "127.0.0.1:8080".parse().expect("ipv4 listen"),
@@ -853,7 +868,7 @@ mod tests {
             panic!("expected client config");
         };
         assert_eq!(
-            client.ingresses,
+            ingress_configs(&client.ingresses),
             vec![
                 IngressConfig::Socks5 {
                     listen: vec!["127.0.0.1:1080".parse().expect("socks listen")],
@@ -887,7 +902,13 @@ mod tests {
         let CommandConfig::Client(client) = config.command else {
             panic!("expected client config");
         };
-        let [IngressConfig::Socks5 { proxy_auth, .. }] = client.ingresses.as_slice() else {
+        let [
+            LocalIngressConfig {
+                config: IngressConfig::Socks5 { proxy_auth, .. },
+                ..
+            },
+        ] = client.ingresses.as_slice()
+        else {
             panic!("expected default SOCKS5 ingress");
         };
         assert!(proxy_auth.is_required());
@@ -932,7 +953,7 @@ mod tests {
             panic!("expected client config");
         };
         assert_eq!(
-            client.ingresses,
+            ingress_configs(&client.ingresses),
             vec![
                 IngressConfig::Socks5 {
                     listen: vec!["127.0.0.1:1080".parse().expect("socks listen")],
@@ -1196,7 +1217,13 @@ mod tests {
         let CommandConfig::Client(client) = config.command else {
             panic!("expected client config");
         };
-        let [IngressConfig::TunL4(tun)] = client.ingresses.as_slice() else {
+        let [
+            LocalIngressConfig {
+                config: IngressConfig::TunL4(tun),
+                ..
+            },
+        ] = client.ingresses.as_slice()
+        else {
             panic!("expected TUN L4 ingress");
         };
         assert_eq!(tun.name.as_deref(), Some("mptun0"));
@@ -1246,7 +1273,13 @@ mod tests {
         let CommandConfig::Client(client) = config.command else {
             panic!("expected client config");
         };
-        let [IngressConfig::TunL4(tun)] = client.ingresses.as_slice() else {
+        let [
+            LocalIngressConfig {
+                config: IngressConfig::TunL4(tun),
+                ..
+            },
+        ] = client.ingresses.as_slice()
+        else {
             panic!("expected TUN L4 ingress");
         };
         assert_eq!(tun.ipv4, None);

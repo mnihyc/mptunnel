@@ -99,7 +99,7 @@ Routing policy is selected explicitly with `balancer = "tag"` on an inbound. MPP
 
 ## Management API
 
-The release binary includes a lightweight JSON management API when `[management].listen` or `--management-listen` is configured. Endpoints include `GET /healthz`, `GET /status`, `GET /paths`, `GET /traffic`, `GET /diagnostics`, and client-side `POST /control/path`. If a token is set, use `Authorization: Bearer <token>` or `X-Mptunnel-Token: <token>`. Node status includes each MPP outbound or balancer route target, and path control accepts either `client_index` or `client_tag`.
+The release binary includes a lightweight JSON management API when `[management].listen` or `--management-listen` is configured. Endpoints include `GET /healthz`, `GET /status`, `GET /paths`, `GET /traffic`, `GET /diagnostics`, and client-side `POST /control/path`. If a token is set, use `Authorization: Bearer <token>` or `X-Mptunnel-Token: <token>`. Node status includes local inbound tags, each MPP outbound or balancer route target, path summaries, and traffic trends. Proxy credentials are never returned; the API reports only whether local proxy auth is required. Path control accepts either `client_index` or `client_tag`.
 
 Client-side proxy ingress:
 

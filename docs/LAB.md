@@ -12,7 +12,7 @@ Run the heterogeneous ablation lab from the repository root:
 lab/run-heterogeneous-ablation.sh
 ```
 
-The script builds the product binary on the host, then runs all network mutation inside Docker containers. It does not change host routes, host DNS, host TUN devices, or host `tc` state. Product client launches are intentionally user-like by default: they pass the secret, SOCKS5 listen endpoint, and TCP/UDP path endpoints only. They do not inject path metadata hints, probe timing, resource limits, or other tuning flags unless an explicit lab override is set.
+The script builds the product binary on the host, then runs all network mutation inside Docker containers. It does not change host routes, host DNS, host TUN devices, or host `tc` state. Product launches are intentionally user-like by default: the harness generates the same role-free TOML graph that operators use, validates it inside the container with `mptunnel --config ... --check-config`, then starts the process with `--config`. The generated lab graph is `inbound(socks5|tun) -> outbound(mpp)` for client-side cases and `inbound(mpp) -> outbound(direct)` for the server. It does not inject path metadata hints, probe timing, resource limits, or other tuning fields unless an explicit lab override is set.
 
 For repeated manual experiments, use the matrix runner:
 

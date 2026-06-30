@@ -156,24 +156,228 @@ build_mptunnel_binary() {
   fi
 }
 
-mptunnel_resource_env_prefix() {
-  local env_name
-  local -a env_names=(
-    MPTUNNEL_MAX_FRAME_BYTES
-    MPTUNNEL_MAX_PAYLOAD_BYTES
-    MPTUNNEL_MAX_ACK_RANGES
-    MPTUNNEL_MAX_STREAM_WINDOW_BYTES
-    MPTUNNEL_MAX_REPAIR_BYTES
-    MPTUNNEL_MAX_REORDER_BYTES
-    MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES
-    MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES
-    MPTUNNEL_MAX_TCP_RELAY_CHUNK_BYTES
+toml_string() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+print(json.dumps(sys.argv[1]))
+PY
+}
+
+toml_array_from_args() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+print(json.dumps(sys.argv[1:]))
+PY
+}
+
+path_args_to_endpoint_array() {
+  local path_args="$1"
+  python3 - "$path_args" <<'PY'
+import json
+import shlex
+import sys
+
+tokens = shlex.split(sys.argv[1])
+endpoints = []
+index = 0
+while index < len(tokens):
+    token = tokens[index]
+    if token != "--path":
+        raise SystemExit(f"unsupported mptunnel lab path argument: {token}")
+    if index + 1 >= len(tokens):
+        raise SystemExit("--path requires an endpoint")
+    endpoints.append(tokens[index + 1])
+    index += 2
+
+if not endpoints:
+    raise SystemExit("lab mptunnel client config requires at least one endpoint")
+
+print(json.dumps(endpoints))
+PY
+}
+
+resource_config_toml() {
+  local env_name key value lines=""
+  local -a mappings=(
+    MPTUNNEL_MAX_FRAME_BYTES:max_frame_bytes
+    MPTUNNEL_MAX_PAYLOAD_BYTES:max_payload_bytes
+    MPTUNNEL_MAX_ACK_RANGES:max_ack_ranges
+    MPTUNNEL_MAX_PATHS:max_paths
+    MPTUNNEL_MAX_STREAMS:max_streams
+    MPTUNNEL_MAX_STREAM_WINDOW_BYTES:max_stream_window_bytes
+    MPTUNNEL_MAX_REPAIR_BYTES:max_repair_bytes
+    MPTUNNEL_MAX_REORDER_BYTES:max_reorder_bytes
+    MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES:max_datagram_queue_bytes
+    MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES:max_tcp_path_inflight_bytes
+    MPTUNNEL_MAX_TCP_RELAY_CHUNK_BYTES:max_tcp_relay_chunk_bytes
+    MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS:tcp_path_heartbeat_interval_ms
+    MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS:tcp_path_heartbeat_timeout_ms
   )
-  for env_name in "${env_names[@]}"; do
-    if [[ -n "${!env_name:-}" ]]; then
-      printf '%s=%q ' "$env_name" "${!env_name}"
+  for mapping in "${mappings[@]}"; do
+    env_name="${mapping%%:*}"
+    key="${mapping#*:}"
+    value="${!env_name:-}"
+    if [[ -n "$value" ]]; then
+      if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "$env_name must be an unsigned integer when passed into lab config" >&2
+        return 2
+      fi
+      lines+="${key} = ${value}"$'\n'
     fi
   done
+  if [[ -n "$lines" ]]; then
+    printf '[resources]\n%s\n' "$lines"
+  fi
+}
+
+probe_config_toml() {
+  if [[ -n "${PATH_PROBE_INTERVAL_MS:-}" ]]; then
+    if [[ ! "${PATH_PROBE_INTERVAL_MS}" =~ ^[0-9]+$ ]]; then
+      echo "PATH_PROBE_INTERVAL_MS must be an unsigned integer" >&2
+      return 2
+    fi
+    printf 'path_probe_interval_ms = %s\n' "$PATH_PROBE_INTERVAL_MS"
+  fi
+  if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
+    if [[ ! "${PATH_PROBE_TIMEOUT_MS}" =~ ^[0-9]+$ ]]; then
+      echo "PATH_PROBE_TIMEOUT_MS must be an unsigned integer" >&2
+      return 2
+    fi
+    printf 'path_probe_timeout_ms = %s\n' "$PATH_PROBE_TIMEOUT_MS"
+  fi
+}
+
+mptunnel_lab_env_prefix() {
+  local role="$1"
+  printf 'MPTUNNEL_LAB_DIAG=%q MPTUNNEL_LAB_PERF=%q MPTUNNEL_LAB_PERF_SAMPLES=%q MPTUNNEL_LAB_ROLE=%q MPTUNNEL_LAB_PERF_INTERVAL_MS=%q ' \
+    "${MPTUNNEL_LAB_DIAG:-0}" \
+    "$lab_perf" \
+    "$lab_perf_samples" \
+    "$role" \
+    "$lab_perf_interval_ms"
+}
+
+write_in() {
+  local service="$1"
+  local path="$2"
+  local content="$3"
+  local quoted_path
+  printf -v quoted_path '%q' "$path"
+  printf '%s' "$content" | compose exec -T "$service" bash -lc "cat > $quoted_path"
+}
+
+validate_mptunnel_config_in() {
+  local service="$1"
+  local path="$2"
+  exec_in "$service" "/workspace/target/release/mptunnel --config '$path' --check-config"
+}
+
+server_config_toml() {
+  local log_level_json secret_json endpoints resources
+  log_level_json="$(toml_string "$lab_log_level")"
+  secret_json="$(toml_string "$secret")"
+  endpoints="$(toml_array_from_args \
+    "tcp://172.31.10.20:${server_port}" \
+    "tcp://172.31.15.20:${server_port}" \
+    "tcp://172.31.20.20:${server_port}" \
+    "tcp://172.31.30.20:${server_port}" \
+    "udp://172.31.10.20:${server_port}" \
+    "udp://172.31.15.20:${server_port}" \
+    "udp://172.31.20.20:${server_port}" \
+    "udp://172.31.30.20:${server_port}")"
+  resources="$(resource_config_toml)"
+  if [[ -n "$resources" ]]; then
+    resources="${resources}"$'\n\n'
+  fi
+  cat <<EOF
+log_level = ${log_level_json}
+
+${resources}[[inbounds]]
+tag = "lab-mpp-in"
+protocol = "mpp"
+endpoints = ${endpoints}
+outbound = "lab-direct"
+
+[inbounds.security]
+secret = ${secret_json}
+
+[[outbounds]]
+tag = "lab-direct"
+protocol = "direct"
+EOF
+}
+
+socks_client_config_toml() {
+  local path_args="$1"
+  local log_level_json secret_json listen endpoints resources probe
+  log_level_json="$(toml_string "$lab_log_level")"
+  secret_json="$(toml_string "$secret")"
+  listen="$(toml_array_from_args "127.0.0.1:${proxy_port}")"
+  endpoints="$(path_args_to_endpoint_array "$path_args")"
+  resources="$(resource_config_toml)"
+  probe="$(probe_config_toml)"
+  if [[ -n "$resources" ]]; then
+    resources="${resources}"$'\n\n'
+  fi
+  if [[ -n "$probe" ]]; then
+    probe="${probe}"$'\n'
+  fi
+  cat <<EOF
+log_level = ${log_level_json}
+
+${resources}[[inbounds]]
+tag = "lab-socks"
+protocol = "socks5"
+listen = ${listen}
+outbound = "lab-mpp-out"
+
+[[outbounds]]
+tag = "lab-mpp-out"
+protocol = "mpp"
+endpoints = ${endpoints}
+${probe}
+[outbounds.security]
+secret = ${secret_json}
+EOF
+}
+
+tun_client_config_toml() {
+  local path_args="$1"
+  local log_level_json secret_json endpoints resources probe
+  log_level_json="$(toml_string "$lab_log_level")"
+  secret_json="$(toml_string "$secret")"
+  endpoints="$(path_args_to_endpoint_array "$path_args")"
+  resources="$(resource_config_toml)"
+  probe="$(probe_config_toml)"
+  if [[ -n "$resources" ]]; then
+    resources="${resources}"$'\n\n'
+  fi
+  if [[ -n "$probe" ]]; then
+    probe="${probe}"$'\n'
+  fi
+  cat <<EOF
+log_level = ${log_level_json}
+
+${resources}[[inbounds]]
+tag = "lab-tun"
+protocol = "tun"
+outbound = "lab-mpp-out"
+name = "mptun0"
+ipv4 = "10.88.0.1"
+ipv4_prefix = 24
+
+[[outbounds]]
+tag = "lab-mpp-out"
+protocol = "mpp"
+endpoints = ${endpoints}
+${probe}
+[outbounds.security]
+secret = ${secret_json}
+EOF
 }
 
 case_artifact_name() {
@@ -769,25 +973,12 @@ start_target_services() {
 
 start_server() {
   stop_server
+  local config_path="/tmp/mptunnel-server.toml"
+  write_in server "$config_path" "$(server_config_toml)"
+  validate_mptunnel_config_in server "$config_path"
   exec_in server "\
-    $(mptunnel_resource_env_prefix) \
-	    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
-	    MPTUNNEL_LAB_PERF='${lab_perf}' \
-	    MPTUNNEL_LAB_PERF_SAMPLES='${lab_perf_samples}' \
-	    MPTUNNEL_LAB_ROLE='server' \
-	    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
-    MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
-      --secret '${secret}' \
-      server \
-      --bind-path tcp://172.31.10.20:${server_port} \
-      --bind-path tcp://172.31.15.20:${server_port} \
-      --bind-path tcp://172.31.20.20:${server_port} \
-      --bind-path tcp://172.31.30.20:${server_port} \
-      --bind-path udp://172.31.10.20:${server_port} \
-      --bind-path udp://172.31.15.20:${server_port} \
-      --bind-path udp://172.31.20.20:${server_port} \
-      --bind-path udp://172.31.30.20:${server_port} \
-      --outbound direct \
+    $(mptunnel_lab_env_prefix server) \
+    /workspace/target/release/mptunnel --config '${config_path}' \
       >/tmp/mptunnel-server.log 2>&1 & echo \$! >/tmp/mptunnel-server.pid"
   sleep 1
   exec_in server "kill -0 \$(cat /tmp/mptunnel-server.pid)"
@@ -798,13 +989,6 @@ start_client_with_netem() {
   local netem_mode="$2"
   shift 2
   local path_args="$*"
-  local probe_args=""
-  if [[ -n "${PATH_PROBE_INTERVAL_MS:-}" ]]; then
-    probe_args="${probe_args} --path-probe-interval-ms '${PATH_PROBE_INTERVAL_MS}'"
-  fi
-  if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
-    probe_args="${probe_args} --path-probe-timeout-ms '${PATH_PROBE_TIMEOUT_MS}'"
-  fi
   if [[ "$isolate_cases" == "1" ]]; then
     stop_client
     if [[ "$isolate_containers" == "1" ]]; then
@@ -819,19 +1003,12 @@ start_client_with_netem() {
     stop_client
     apply_netem "$netem_mode"
   fi
+  local config_path="/tmp/mptunnel-client-${profile}.toml"
+  write_in client "$config_path" "$(socks_client_config_toml "$path_args")"
+  validate_mptunnel_config_in client "$config_path"
   exec_in client "\
-    $(mptunnel_resource_env_prefix) \
-	    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
-	    MPTUNNEL_LAB_PERF='${lab_perf}' \
-	    MPTUNNEL_LAB_PERF_SAMPLES='${lab_perf_samples}' \
-	    MPTUNNEL_LAB_ROLE='client' \
-	    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
-    MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
-      --secret '${secret}' \
-      client \
-      --listen 127.0.0.1:${proxy_port} \
-      ${probe_args} \
-      ${path_args} \
+    $(mptunnel_lab_env_prefix client) \
+    /workspace/target/release/mptunnel --config '${config_path}' \
       >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
   sleep 1
   exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"
@@ -847,13 +1024,6 @@ start_tun_client() {
   local profile="$1"
   shift
   local path_args="$*"
-  local probe_args=""
-  if [[ -n "${PATH_PROBE_INTERVAL_MS:-}" ]]; then
-    probe_args="${probe_args} --path-probe-interval-ms '${PATH_PROBE_INTERVAL_MS}'"
-  fi
-  if [[ -n "${PATH_PROBE_TIMEOUT_MS:-}" ]]; then
-    probe_args="${probe_args} --path-probe-timeout-ms '${PATH_PROBE_TIMEOUT_MS}'"
-  fi
   if [[ "$isolate_cases" == "1" ]]; then
     stop_client
     if [[ "$isolate_containers" == "1" ]]; then
@@ -867,21 +1037,12 @@ start_tun_client() {
   else
     stop_client
   fi
+  local config_path="/tmp/mptunnel-client-${profile}.toml"
+  write_in client "$config_path" "$(tun_client_config_toml "$path_args")"
+  validate_mptunnel_config_in client "$config_path"
   exec_in client "\
-	    MPTUNNEL_LAB_DIAG='${MPTUNNEL_LAB_DIAG:-0}' \
-	    MPTUNNEL_LAB_PERF='${lab_perf}' \
-	    MPTUNNEL_LAB_PERF_SAMPLES='${lab_perf_samples}' \
-	    MPTUNNEL_LAB_ROLE='client' \
-	    MPTUNNEL_LAB_PERF_INTERVAL_MS='${lab_perf_interval_ms}' \
-    MPTUNNEL_LOG='${lab_log_level}' /workspace/target/release/mptunnel \
-      --secret '${secret}' \
-      client \
-      --tun \
-      --tun-name mptun0 \
-      --tun-ipv4 10.88.0.1 \
-      --tun-ipv4-prefix 24 \
-      ${probe_args} \
-      ${path_args} \
+    $(mptunnel_lab_env_prefix client) \
+    /workspace/target/release/mptunnel --config '${config_path}' \
       >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
   sleep 1
   exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"

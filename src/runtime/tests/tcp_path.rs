@@ -194,6 +194,46 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
 }
 
 #[tokio::test]
+async fn tcp_path_data_queue_round_robins_bulk_streams() {
+    let (tx, mut rx) = tcp_path_session_command_channels(8);
+    for (stream_id, offset, payload) in [
+        (StreamId(1), 0, b"a1".as_slice()),
+        (StreamId(1), 2, b"a2".as_slice()),
+        (StreamId(2), 0, b"b1".as_slice()),
+    ] {
+        tx.send_frame(
+            Frame::StreamData {
+                stream_id,
+                offset,
+                flags: StreamFlags::NONE,
+                payload: Bytes::copy_from_slice(payload),
+            },
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("queue bulk frame");
+    }
+
+    let mut dispatched = Vec::new();
+    for _ in 0..3 {
+        match recv_tcp_path_command(&mut rx)
+            .await
+            .expect("queued command")
+        {
+            TcpPathSessionCommand::SendFrame(Frame::StreamData {
+                stream_id, offset, ..
+            }) => dispatched.push((stream_id, offset)),
+            _ => panic!("expected stream data"),
+        }
+    }
+
+    assert_eq!(
+        dispatched,
+        vec![(StreamId(1), 0), (StreamId(2), 0), (StreamId(1), 2)]
+    );
+}
+
+#[tokio::test]
 async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
     let (tx, mut commands_rx) = tcp_path_session_command_channels(1);
     tx.send_frame(

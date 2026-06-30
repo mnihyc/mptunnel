@@ -15,6 +15,7 @@ mod sender_service;
 mod server_runtime;
 mod server_tcp;
 mod tcp_path;
+mod tcp_path_commands;
 mod tun_l4;
 mod udp_path;
 
@@ -40,6 +41,7 @@ use sender_service::*;
 use server_runtime::run_server;
 use server_tcp::*;
 use tcp_path::*;
+use tcp_path_commands::*;
 use tun_l4::*;
 use udp_path::*;
 

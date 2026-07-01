@@ -387,19 +387,16 @@ where
                                 Instant::now(),
                             );
                             if let Some(failed_key) = failed_key
-                                && let Err(err) = sender.send_failed_path_gap_repairs(
+                                && sender.enqueue_failed_path_gap_repairs(
+                                    &mut sender_queue,
                                     context,
-                                    &mut remotes,
+                                    &remotes,
                                     &send_stream,
                                     failed_key,
                                     relay_lane,
                                 )
-                                .await
                             {
-                                if remotes.is_empty() {
-                                    break Err(err);
-                                }
-                                eprintln!("warning: TCP stall path-failure repair failed: {err}");
+                                sender_retry_at = None;
                             }
                             continue;
                         }
@@ -430,19 +427,16 @@ where
                             Instant::now(),
                         );
                         if let Some(failed_key) = failed_key
-                            && let Err(err) = sender.send_failed_path_gap_repairs(
+                            && sender.enqueue_failed_path_gap_repairs(
+                                &mut sender_queue,
                                 context,
-                                &mut remotes,
+                                &remotes,
                                 &send_stream,
                                 failed_key,
                                 relay_lane,
                             )
-                            .await
                         {
-                            if remotes.is_empty() {
-                                break Err(err);
-                            }
-                            eprintln!("warning: TCP attached path-failure repair failed: {err}");
+                            sender_retry_at = None;
                         }
                         continue;
                     }
@@ -542,94 +536,186 @@ where
                 }
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let (_, queued) = sender_queue
+                let queued_kind = sender_queue
                     .front()
+                    .map(|(_, queued)| queued.kind.clone())
                     .expect("queued_send_ready requires queued data");
-                let payload = match &queued.kind {
-                    ReliableRelayQueuedWorkKind::Data(payload) => payload.clone(),
-                    ReliableRelayQueuedWorkKind::Repair(_) => {
-                        break Err(RuntimeError::Protocol("client sender queue repair item"))
-                    }
-                };
-                let frame = match send_stream.send_data(payload, StreamFlags::NONE) {
-                    Ok(frame) => frame,
-                    Err(err) => break Err(RuntimeError::Stream(err)),
-                };
-                let retry_frame = frame.clone();
-                match sender.send_stream_data(context, &mut remotes, frame.clone()).await {
-                    Ok(outcome) => {
-                        let (_, committed) = sender_queue
-                            .commit_front()
-                            .expect("sent queued data must still be at queue front");
-                        last_stream_progress_at = Instant::now();
-                        stats.record_payload_bytes(committed.payload_bytes);
-                        path_stats
-                            .entry(outcome.path_key)
-                            .or_default()
-                            .record_payload_bytes(committed.payload_bytes);
-                    }
-                    Err(RuntimeError::SenderServiceBlocked) => {
-                        let _ = send_stream.rollback_committed_data(&frame);
-                        sender_retry_at =
-                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                        continue;
-                    }
-                    Err(err) if reliable_relay_error_is_migratable(&err) => {
-                        let _ = send_stream.rollback_committed_data(&frame);
-                        match attach_reliable_relay_paths(
-                            context,
-                            &spec,
-                            relay_lane,
-                            &mut remotes,
-                            &send_stream,
-                            !local_open,
-                            ReliableRelayAttachMode::Any,
-                        )
-                        .await
-                        {
-                            Ok(attached) if attached > 0 => {
-                                sender_retry_at = None;
-                                if let Err(err) = send_stream.commit_prepared_data(&frame) {
-                                    break Err(RuntimeError::Stream(err));
-                                }
-                                match sender
-                                    .send_stream_data(context, &mut remotes, retry_frame)
-                                    .await
+                match queued_kind {
+                    ReliableRelayQueuedWorkKind::Data(payload) => {
+                        let frame = match send_stream.send_data(payload, StreamFlags::NONE) {
+                            Ok(frame) => frame,
+                            Err(err) => break Err(RuntimeError::Stream(err)),
+                        };
+                        let retry_frame = frame.clone();
+                        match sender.send_stream_data(context, &mut remotes, frame.clone()).await {
+                            Ok(outcome) => {
+                                let (_, committed) = sender_queue
+                                    .commit_front()
+                                    .expect("sent queued data must still be at queue front");
+                                last_stream_progress_at = Instant::now();
+                                stats.record_payload_bytes(committed.payload_bytes);
+                                path_stats
+                                    .entry(outcome.path_key)
+                                    .or_default()
+                                    .record_payload_bytes(committed.payload_bytes);
+                            }
+                            Err(RuntimeError::SenderServiceBlocked) => {
+                                let _ = send_stream.rollback_committed_data(&frame);
+                                sender_retry_at =
+                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                                continue;
+                            }
+                            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                let _ = send_stream.rollback_committed_data(&frame);
+                                match attach_reliable_relay_paths(
+                                    context,
+                                    &spec,
+                                    relay_lane,
+                                    &mut remotes,
+                                    &send_stream,
+                                    !local_open,
+                                    ReliableRelayAttachMode::Any,
+                                )
+                                .await
                                 {
-                                    Ok(outcome) => {
-                                        let (_, committed) = sender_queue
-                                            .commit_front()
-                                            .expect("sent queued data must still be at queue front");
-                                        last_stream_progress_at = Instant::now();
-                                        stats.record_payload_bytes(committed.payload_bytes);
-                                        path_stats
-                                            .entry(outcome.path_key)
-                                            .or_default()
-                                            .record_payload_bytes(committed.payload_bytes);
+                                    Ok(attached) if attached > 0 => {
+                                        sender_retry_at = None;
+                                        if let Err(err) = send_stream.commit_prepared_data(&frame) {
+                                            break Err(RuntimeError::Stream(err));
+                                        }
+                                        match sender
+                                            .send_stream_data(context, &mut remotes, retry_frame)
+                                            .await
+                                        {
+                                            Ok(outcome) => {
+                                                let (_, committed) = sender_queue
+                                                    .commit_front()
+                                                    .expect("sent queued data must still be at queue front");
+                                                last_stream_progress_at = Instant::now();
+                                                stats.record_payload_bytes(committed.payload_bytes);
+                                                path_stats
+                                                    .entry(outcome.path_key)
+                                                    .or_default()
+                                                    .record_payload_bytes(committed.payload_bytes);
+                                            }
+                                            Err(RuntimeError::SenderServiceBlocked) => {
+                                                let _ = send_stream.rollback_committed_data(&frame);
+                                                sender_retry_at =
+                                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                                                continue;
+                                            }
+                                            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                                let _ = send_stream.rollback_committed_data(&frame);
+                                                break Err(err);
+                                            }
+                                            Err(err) => {
+                                                let _ = send_stream.rollback_committed_data(&frame);
+                                                break Err(err);
+                                            }
+                                        }
                                     }
-                                    Err(RuntimeError::SenderServiceBlocked) => {
-                                        let _ = send_stream.rollback_committed_data(&frame);
-                                        sender_retry_at =
-                                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                                        continue;
-                                    }
-                                    Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                        let _ = send_stream.rollback_committed_data(&frame);
-                                        break Err(err);
-                                    }
-                                    Err(err) => {
-                                        let _ = send_stream.rollback_committed_data(&frame);
-                                        break Err(err);
-                                    }
+                                    Ok(_) => break Err(err),
+                                    Err(err) => break Err(err),
                                 }
                             }
-                            Ok(_) => break Err(err),
-                            Err(err) => break Err(err),
+                            Err(err) => {
+                                let _ = send_stream.rollback_committed_data(&frame);
+                                break Err(err);
+                            }
                         }
                     }
-                    Err(err) => {
-                        let _ = send_stream.rollback_committed_data(&frame);
-                        break Err(err);
+                    ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
+                        let retry_frame = frame.clone();
+                        match sender
+                            .send_repair_frame(context, &mut remotes, frame, cause)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                let (_, committed) = sender_queue
+                                    .commit_front()
+                                    .expect("sent queued repair must still be at queue front");
+                                #[cfg(not(feature = "lab-diagnostics"))]
+                                let _ = committed;
+                                #[cfg(not(feature = "lab-diagnostics"))]
+                                let _ = outcome;
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "repair",
+                                    format_args!(
+                                        "stream_id={} path_underlay={:?} path_index={} cause={} queued_dispatch=true payload_bytes={}",
+                                        stream_id.0,
+                                        outcome.path_key.underlay,
+                                        outcome.path_key.index,
+                                        cause.as_str(),
+                                        committed.payload_bytes,
+                                    ),
+                                );
+                                last_stream_progress_at = Instant::now();
+                            }
+                            Err(RuntimeError::SenderServiceBlocked) => {
+                                sender_retry_at =
+                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                                continue;
+                            }
+                            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                match attach_reliable_relay_paths(
+                                    context,
+                                    &spec,
+                                    relay_lane,
+                                    &mut remotes,
+                                    &send_stream,
+                                    !local_open,
+                                    ReliableRelayAttachMode::Any,
+                                )
+                                .await
+                                {
+                                    Ok(attached) if attached > 0 => {
+                                        sender_retry_at = None;
+                                        match sender
+                                            .send_repair_frame(
+                                                context,
+                                                &mut remotes,
+                                                retry_frame,
+                                                cause,
+                                            )
+                                            .await
+                                        {
+                                            Ok(outcome) => {
+                                                let (_, committed) = sender_queue
+                                                    .commit_front()
+                                                    .expect("sent queued repair must still be at queue front");
+                                                #[cfg(not(feature = "lab-diagnostics"))]
+                                                let _ = committed;
+                                                #[cfg(not(feature = "lab-diagnostics"))]
+                                                let _ = outcome;
+                                                #[cfg(feature = "lab-diagnostics")]
+                                                lab_diagnostic(
+                                                    "repair",
+                                                    format_args!(
+                                                        "stream_id={} path_underlay={:?} path_index={} cause={} queued_dispatch=true after_attach=true payload_bytes={}",
+                                                        stream_id.0,
+                                                        outcome.path_key.underlay,
+                                                        outcome.path_key.index,
+                                                        cause.as_str(),
+                                                        committed.payload_bytes,
+                                                    ),
+                                                );
+                                                last_stream_progress_at = Instant::now();
+                                            }
+                                            Err(RuntimeError::SenderServiceBlocked) => {
+                                                sender_retry_at =
+                                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                                                continue;
+                                            }
+                                            Err(err) => break Err(err),
+                                        }
+                                    }
+                                    Ok(_) => break Err(err),
+                                    Err(err) => break Err(err),
+                                }
+                            }
+                            Err(err) => break Err(err),
+                        }
                     }
                 }
             }
@@ -769,16 +855,15 @@ where
                                 &remotes.path_keys(),
                                 Instant::now(),
                             );
-                            if let Err(err) = sender.send_failed_path_gap_repairs(
+                            if sender.enqueue_failed_path_gap_repairs(
+                                &mut sender_queue,
                                 context,
-                                &mut remotes,
+                                &remotes,
                                 &send_stream,
                                 path_key,
                                 relay_lane,
-                            )
-                            .await
-                            {
-                                break Err(err);
+                            ) {
+                                sender_retry_at = None;
                             }
                         }
                         if remotes.is_empty() {
@@ -802,16 +887,15 @@ where
                                         &remotes.path_keys(),
                                         Instant::now(),
                                     );
-                                    if let Err(err) = sender.send_failed_path_gap_repairs(
+                                    if sender.enqueue_failed_path_gap_repairs(
+                                        &mut sender_queue,
                                         context,
-                                        &mut remotes,
+                                        &remotes,
                                         &send_stream,
                                         path_key,
                                         relay_lane,
-                                    )
-                                    .await
-                                    {
-                                        break Err(err);
+                                    ) {
+                                        sender_retry_at = None;
                                     }
                                     continue;
                                 }
@@ -1072,80 +1156,18 @@ where
                                 udp_gap_repair_ready,
                             ),
                         );
-                        let mut repair_error = None;
                         for frame in repair_frames {
-                            let retry_frame = frame.clone();
-                            match sender
-                                .send_repair_frame(
-                                    context,
-                                    &mut remotes,
-                                    frame,
-                                    RelaySendCause::AckGapRepair,
-                                )
-                                .await
-                            {
-                                Ok(outcome) => {
-                                    #[cfg(not(feature = "lab-diagnostics"))]
-                                    let _ = outcome;
-                                    #[cfg(feature = "lab-diagnostics")]
-                                    lab_diagnostic(
-                                        "repair",
-                                        format_args!(
-                                            "stream_id={} path_underlay={:?} path_index={} cause=ack_gap",
-                                            stream_id.0,
-                                            outcome.path_key.underlay,
-                                            outcome.path_key.index,
-                                        ),
-                                    );
-                                }
-                                Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                    match attach_reliable_relay_paths(
-                                        context,
-                                        &spec,
-                                        relay_lane,
-                                        &mut remotes,
-                                        &send_stream,
-                                        !local_open,
-                                        ReliableRelayAttachMode::Any,
-                                    )
-                                    .await
-                                    {
-                                        Ok(attached) if attached > 0 => {
-                                            sender_retry_at = None;
-                                            match sender
-                                                .send_repair_frame(
-                                                    context,
-                                                    &mut remotes,
-                                                    retry_frame,
-                                                    RelaySendCause::AckGapRepair,
-                                                )
-                                                .await
-                                            {
-                                                Ok(_) => {}
-                                                Err(err) => {
-                                                    repair_error = Some(err);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Ok(_) => {
-                                            repair_error = Some(err);
-                                            break;
-                                        }
-                                        Err(err) => {
-                                            repair_error = Some(err);
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    repair_error = Some(err);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(err) = repair_error {
-                            break Err(err);
+                            sender_queue
+                                .push_repair_with_cause(frame, RelaySendCause::AckGapRepair);
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "repair",
+                                format_args!(
+                                    "stream_id={} cause=ack_gap queued=true",
+                                    stream_id.0,
+                                ),
+                            );
+                            sender_retry_at = None;
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;

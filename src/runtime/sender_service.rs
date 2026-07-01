@@ -21,7 +21,7 @@ pub(super) enum RelaySendCause {
 
 impl RelaySendCause {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::StreamData => "stream_data",
             Self::StreamFin => "stream_fin",
@@ -69,7 +69,7 @@ impl RelayRecvProgressSend {
 #[derive(Debug, Clone)]
 pub(super) enum ReliableRelayQueuedWorkKind {
     Data(Bytes),
-    Repair(Frame),
+    Repair { frame: Frame, cause: RelaySendCause },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,10 +132,15 @@ impl ReliableRelaySenderQueue {
     }
 
     pub(super) fn push_repair(&mut self, frame: Frame) -> u64 {
+        self.push_repair_with_cause(frame, RelaySendCause::AckGapRepair)
+    }
+
+    pub(super) fn push_repair_with_cause(&mut self, frame: Frame, cause: RelaySendCause) -> u64 {
+        debug_assert!(cause.is_repair());
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         self.push_work(
             ReliableRelayQueuedWorkLane::Repair,
-            ReliableRelayQueuedWorkKind::Repair(frame),
+            ReliableRelayQueuedWorkKind::Repair { frame, cause },
             payload_bytes,
         )
     }
@@ -709,7 +714,7 @@ impl ServerResponseSenderService {
                 lab_perf_record("mux.send_data", mux_started.elapsed(), queued.payload_bytes);
                 (frame, "data")
             }
-            ReliableRelayQueuedWorkKind::Repair(frame) => (frame.clone(), "repair"),
+            ReliableRelayQueuedWorkKind::Repair { frame, .. } => (frame.clone(), "repair"),
         };
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = if queued_lane == ReliableRelayQueuedWorkLane::Repair {
@@ -1183,17 +1188,18 @@ impl RelaySenderService {
         Ok(sent_any)
     }
 
-    pub(super) async fn send_failed_path_gap_repairs(
-        &mut self,
+    pub(super) fn enqueue_failed_path_gap_repairs(
+        &self,
+        sender_queue: &mut ReliableRelaySenderQueue,
         context: &ClientPathContext,
-        remotes: &mut ReliableRelayRemoteSet,
+        remotes: &ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
         failed_key: RelayPathKey,
         lane: FlowLane,
-    ) -> Result<bool, RuntimeError> {
+    ) -> bool {
         let ranges = self.flights.latest_unacked_ranges_for_path(failed_key);
         if ranges.is_empty() {
-            return Ok(false);
+            return false;
         }
         let repair_path = remotes
             .primary_path_key()
@@ -1202,30 +1208,22 @@ impl RelaySenderService {
             adaptive_reliable_relay_repair_bytes(repair_path, lane, context.mux_limits);
         let repair_frames = send_stream.retransmission_frames_for_ranges(&ranges, repair_limit);
         if repair_frames.is_empty() {
-            return Ok(false);
+            return false;
         }
-        let mut sent = false;
+        let mut queued = false;
         for frame in repair_frames {
-            let outcome = self
-                .send_repair_frame(context, remotes, frame, RelaySendCause::PathFailureRepair)
-                .await?;
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = outcome;
-            sent = true;
+            sender_queue.push_repair_with_cause(frame, RelaySendCause::PathFailureRepair);
+            queued = true;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "repair",
                 format_args!(
-                    "stream_id={} path_underlay={:?} path_index={} failed_underlay={:?} failed_index={} cause=path_failure",
-                    self.stream_id.0,
-                    outcome.path_key.underlay,
-                    outcome.path_key.index,
-                    failed_key.underlay,
-                    failed_key.index,
+                    "stream_id={} failed_underlay={:?} failed_index={} cause=path_failure queued=true",
+                    self.stream_id.0, failed_key.underlay, failed_key.index,
                 ),
             );
         }
-        Ok(sent)
+        queued
     }
 
     fn record_decision(

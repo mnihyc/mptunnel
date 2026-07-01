@@ -1654,6 +1654,73 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
 }
 
 #[tokio::test]
+async fn path_failure_repairs_enqueue_repair_lane_without_carrier_send() {
+    let path = "tcp://127.0.0.1:10271?srtt-ms=20&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let stream_id = StreamId(78);
+    let mux_limits = MuxLimits::default();
+    let (opened, mut command_rx, _frames_tx) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    let mut sender = RelaySenderService::new(stream_id);
+    let failed_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+
+    let frame = send_stream
+        .send_data(Bytes::from_static(b"repair-me"), StreamFlags::NONE)
+        .expect("stream data frame");
+    sender
+        .send_stream_data(&context, &mut remotes, frame)
+        .await
+        .expect("initial data send");
+    assert!(matches!(
+        recv_tcp_path_command(&mut command_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"repair-me")
+    ));
+
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert!(sender.enqueue_failed_path_gap_repairs(
+        &mut sender_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        failed_key,
+        FlowLane::Throughput,
+    ));
+
+    let (lane, work) = sender_queue.pop_front().expect("queued repair");
+    assert_eq!(lane, ReliableRelayQueuedWorkLane::Repair);
+    assert!(matches!(
+        work.kind,
+        ReliableRelayQueuedWorkKind::Repair {
+            frame: Frame::StreamData {
+                payload,
+                ..
+            },
+            cause: RelaySendCause::PathFailureRepair,
+        } if payload == Bytes::from_static(b"repair-me")
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut command_rx)
+        )
+        .await
+        .is_err(),
+        "path-failure repair generation must not send directly to the carrier"
+    );
+}
+
+#[tokio::test]
 async fn datagram_response_queue_full_is_realtime_backpressure() {
     let flow_id = DatagramFlowId(12);
     let (commands, mut command_rx) = tcp_path_session_command_channels(1);

@@ -679,7 +679,10 @@ fn reliable_relay_sender_queue_prioritizes_repair_lane() {
     assert_eq!(lane, ReliableRelayQueuedWorkLane::Repair);
     assert!(matches!(
         work.kind,
-        ReliableRelayQueuedWorkKind::Repair(Frame::StreamData { .. })
+        ReliableRelayQueuedWorkKind::Repair {
+            frame: Frame::StreamData { .. },
+            cause: RelaySendCause::AckGapRepair,
+        }
     ));
     assert_eq!(queue.data_bytes(), b"ordinary".len());
 }

@@ -2104,9 +2104,13 @@ unbounded set of cached chunks. It emits at most the adaptive repair quantum,
 normally an MSS-to-latency-quantum-sized byte range, and later progress or stall
 events may emit subsequent ranges. ACK handlers, receive-hole detectors, and
 stall timers create repair work items; they do not send repair frames through
-the ordinary stream-data branch. The sender service dispatches those repair
-items through the repair lane and records their path-flight ownership
-separately from ordinary throughput data.
+the ordinary stream-data branch and they do not call carrier/path send APIs
+directly. Path-failure handlers follow the same rule: a failed path may identify
+unacknowledged ranges that require reinjection, but those ranges become queued
+repair work, not immediate writes. This applies symmetrically to request and
+response directions. The sender service dispatches those repair items through
+the repair lane and records their path-flight ownership separately from ordinary
+throughput data.
 
 The sender service separates send quantum from send rate. This distinction is
 essential for user-space encrypted proxying: very small bulk frames can consume

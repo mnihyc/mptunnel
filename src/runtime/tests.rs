@@ -781,7 +781,7 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
     let stream_id = StreamId(48);
     let (commands, mut receivers) = tcp_path_session_command_channels(1);
     commands
-        .send_frame(
+        .try_enqueue_admitted_frame(
             Frame::StreamAck {
                 stream_id,
                 complete: false,
@@ -789,7 +789,6 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
             },
             FlowLane::Control,
         )
-        .await
         .expect("prefill priority queue");
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -859,7 +858,7 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
     let stream_id = StreamId(46);
     let (commands, mut receivers) = tcp_path_session_command_channels(1);
     commands
-        .send_frame(
+        .try_enqueue_admitted_frame(
             Frame::StreamData {
                 stream_id,
                 offset: 0,
@@ -868,7 +867,6 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
             },
             FlowLane::Throughput,
         )
-        .await
         .expect("prefill carrier data queue");
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {

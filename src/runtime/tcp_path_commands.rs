@@ -79,67 +79,6 @@ impl TcpPathSessionCommandSender {
         result
     }
 
-    pub(super) async fn send_frame(
-        &self,
-        frame: Frame,
-        lane: FlowLane,
-    ) -> Result<(), RuntimeError> {
-        let bytes = frame_pacing_bytes(&frame);
-        let effective_lane = tcp_path_effective_frame_lane(&frame, lane);
-        #[cfg(feature = "lab-diagnostics")]
-        let frame_kind = tcp_path_frame_kind(&frame);
-        #[cfg(feature = "lab-diagnostics")]
-        let stream_id = tcp_path_frame_stream_id(&frame);
-        let queue = if tcp_path_frame_uses_priority_queue(effective_lane) {
-            &self.priority
-        } else {
-            &self.data
-        };
-        #[cfg(feature = "lab-diagnostics")]
-        let started = Instant::now();
-        let result = match queue.reserve().await {
-            Ok(permit) => {
-                self.metrics.add_pending_bytes(bytes);
-                permit.send(TcpPathSessionCommand::SendFrame(frame));
-                Ok(())
-            }
-            Err(_) => Err(RuntimeError::TcpPathSessionClosed),
-        };
-        #[cfg(feature = "lab-diagnostics")]
-        {
-            let elapsed = started.elapsed();
-            let queue_name = if tcp_path_frame_uses_priority_queue(effective_lane) {
-                "priority"
-            } else {
-                "data"
-            };
-            lab_perf_record(
-                if tcp_path_frame_uses_priority_queue(effective_lane) {
-                    "runtime.path_queue.priority_send"
-                } else {
-                    "runtime.path_queue.data_send"
-                },
-                elapsed,
-                bytes,
-            );
-            lab_diagnostic(
-                "path_command_queue_send",
-                format_args!(
-                    "queue={} frame_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms={} result={}",
-                    queue_name,
-                    frame_kind,
-                    stream_id.0,
-                    lane,
-                    effective_lane,
-                    bytes,
-                    elapsed.as_millis(),
-                    if result.is_ok() { "queued" } else { "closed" },
-                ),
-            );
-        }
-        result
-    }
-
     pub(super) fn try_enqueue_admitted_frame(
         &self,
         frame: Frame,

@@ -144,8 +144,7 @@ impl ReliablePathStreamOutput {
     pub(super) async fn send_stream_detach(&self, stream_id: StreamId) {
         if let Self::Fixed(commands) = self {
             let _ = commands
-                .send_frame(Frame::StreamDetach { stream_id }, FlowLane::Control)
-                .await;
+                .try_enqueue_admitted_frame(Frame::StreamDetach { stream_id }, FlowLane::Control);
         }
     }
 

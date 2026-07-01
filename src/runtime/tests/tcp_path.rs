@@ -151,7 +151,7 @@ fn reliable_initial_open_allows_no_bulk_path_for_latency_lane() {
 #[tokio::test]
 async fn tcp_path_control_command_bypasses_saturated_data_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);
-    tx.send_frame(
+    tx.try_enqueue_admitted_frame(
         Frame::StreamData {
             stream_id: StreamId(3),
             offset: 0,
@@ -160,7 +160,6 @@ async fn tcp_path_control_command_bypasses_saturated_data_queue() {
         },
         FlowLane::Throughput,
     )
-    .await
     .expect("fill data queue");
 
     tokio::time::timeout(
@@ -249,7 +248,7 @@ async fn fixed_reliable_path_detach_is_explicit_product_control() {
 #[tokio::test]
 async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);
-    tx.send_frame(
+    tx.try_enqueue_admitted_frame(
         Frame::StreamData {
             stream_id: StreamId(10),
             offset: 0,
@@ -258,23 +257,17 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
         },
         FlowLane::Throughput,
     )
-    .await
     .expect("fill bulk data queue");
 
-    tokio::time::timeout(
-        Duration::from_millis(50),
-        tx.send_frame(
-            Frame::StreamData {
-                stream_id: StreamId(11),
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"i"),
-            },
-            FlowLane::Latency,
-        ),
+    tx.try_enqueue_admitted_frame(
+        Frame::StreamData {
+            stream_id: StreamId(11),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"i"),
+        },
+        FlowLane::Latency,
     )
-    .await
-    .expect("interactive send should not wait for bulk queue")
     .expect("interactive send");
 
     match recv_tcp_path_command(&mut rx).await.expect("first command") {
@@ -291,7 +284,7 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
 #[tokio::test]
 async fn tcp_path_stream_fin_bypasses_saturated_bulk_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);
-    tx.send_frame(
+    tx.try_enqueue_admitted_frame(
         Frame::StreamData {
             stream_id: StreamId(30),
             offset: 0,
@@ -300,21 +293,15 @@ async fn tcp_path_stream_fin_bypasses_saturated_bulk_queue() {
         },
         FlowLane::Throughput,
     )
-    .await
     .expect("fill bulk data queue");
 
-    tokio::time::timeout(
-        Duration::from_millis(50),
-        tx.send_frame(
-            Frame::StreamFin {
-                stream_id: StreamId(30),
-                final_offset: 4,
-            },
-            FlowLane::Throughput,
-        ),
+    tx.try_enqueue_admitted_frame(
+        Frame::StreamFin {
+            stream_id: StreamId(30),
+            final_offset: 4,
+        },
+        FlowLane::Throughput,
     )
-    .await
-    .expect("FIN should not wait behind bulk data")
     .expect("queue FIN");
 
     match recv_tcp_path_command(&mut rx).await.expect("first command") {
@@ -340,8 +327,7 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
     };
     let expected = frame_pacing_bytes(&frame) as u64;
 
-    tx.send_frame(frame, FlowLane::Throughput)
-        .await
+    tx.try_enqueue_admitted_frame(frame, FlowLane::Throughput)
         .expect("queue frame");
     assert_eq!(tx.pending_bytes(), expected);
 
@@ -364,7 +350,7 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
 #[tokio::test]
 async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
     let (tx, mut commands_rx) = tcp_path_session_command_channels(1);
-    tx.send_frame(
+    tx.try_enqueue_admitted_frame(
         Frame::StreamData {
             stream_id: StreamId(10),
             offset: 0,
@@ -373,7 +359,6 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
         },
         FlowLane::Throughput,
     )
-    .await
     .expect("fill bulk output command queue");
     let (frame_tx, mut path_frames) = mpsc::channel(1);
     frame_tx
@@ -1589,7 +1574,7 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
     let mux_limits = MuxLimits::default();
     let (commands, mut command_rx) = tcp_path_session_command_channels(1);
     commands
-        .send_frame(
+        .try_enqueue_admitted_frame(
             Frame::StreamData {
                 stream_id,
                 offset: 0,
@@ -1598,7 +1583,6 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
             },
             FlowLane::Throughput,
         )
-        .await
         .expect("prefill relay carrier queue");
     let (_frames_tx, frames_rx) = mpsc::channel(4);
     let opened = OpenedRemoteStream {
@@ -1725,7 +1709,7 @@ async fn datagram_response_queue_full_is_realtime_backpressure() {
     let flow_id = DatagramFlowId(12);
     let (commands, mut command_rx) = tcp_path_session_command_channels(1);
     commands
-        .send_frame(
+        .try_enqueue_admitted_frame(
             Frame::DatagramData {
                 flow_id,
                 datagram_id: DatagramId(1),
@@ -1734,7 +1718,6 @@ async fn datagram_response_queue_full_is_realtime_backpressure() {
             },
             FlowLane::RealtimeDatagram,
         )
-        .await
         .expect("prefill realtime queue");
 
     let err = try_send_server_datagram_realtime_frame(
@@ -1773,7 +1756,7 @@ async fn datagram_close_queue_full_is_realtime_backpressure() {
     let flow_id = DatagramFlowId(13);
     let (commands, mut command_rx) = tcp_path_session_command_channels(1);
     commands
-        .send_frame(
+        .try_enqueue_admitted_frame(
             Frame::DatagramData {
                 flow_id,
                 datagram_id: DatagramId(1),
@@ -1782,7 +1765,6 @@ async fn datagram_close_queue_full_is_realtime_backpressure() {
             },
             FlowLane::RealtimeDatagram,
         )
-        .await
         .expect("prefill realtime queue");
 
     let err = try_send_server_datagram_realtime_frame(&commands, Frame::DatagramClose { flow_id })

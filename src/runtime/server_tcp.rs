@@ -593,9 +593,15 @@ pub(super) async fn run_server_tcp_stream(
                 max_offset: context.mux_limits.max_stream_window_bytes,
             })
             .await?;
-        relay_reliable_stream(outbound_stream, stream, context.mux_limits, session_id)
-            .await
-            .map(|_| ())
+        relay_reliable_stream(
+            outbound_stream,
+            stream,
+            context.mux_limits,
+            context.performance,
+            session_id,
+        )
+        .await
+        .map(|_| ())
     }
     .await;
     context.reliable_streams.close(session_id, stream_id);

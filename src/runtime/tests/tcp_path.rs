@@ -498,6 +498,7 @@ async fn server_reliable_relay_does_not_replay_whole_repair_cache_on_path_reatta
             frames: frames_rx,
         },
         mux_limits,
+        MppPerformanceConfig::default(),
         SessionId(1),
     ));
 

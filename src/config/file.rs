@@ -2,8 +2,9 @@ use super::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig, ConfigError,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_PATH_PROBE_INTERVAL_MS,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    LocalIngressConfig, ManagementConfig, NodeConfig, ResourceLimits, RouteTarget, RouteTargetKind,
-    SecurityConfig, SecurityPolicyError, ServerConfig, ServiceConfig, SharedSecret,
+    LocalIngressConfig, ManagementConfig, MppPerformanceConfig, NodeConfig, ResourceLimits,
+    RouteTarget, RouteTargetKind, SecurityConfig, SecurityPolicyError, ServerConfig, ServiceConfig,
+    SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU, TunL4Config,
@@ -249,6 +250,26 @@ impl From<CipherFileValue> for CipherSuite {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MppPerformanceFileConfig {
+    extra_traffic_hint_percent: Option<u16>,
+}
+
+impl MppPerformanceFileConfig {
+    fn into_config(self) -> MppPerformanceConfig {
+        MppPerformanceConfig {
+            extra_traffic_hint_percent: self
+                .extra_traffic_hint_percent
+                .unwrap_or(MppPerformanceConfig::default().extra_traffic_hint_percent),
+        }
+    }
+
+    fn is_explicit(self) -> bool {
+        self.extra_traffic_hint_percent.is_some()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "protocol", rename_all = "kebab-case", deny_unknown_fields)]
 enum InboundFileConfig {
@@ -291,6 +312,8 @@ enum InboundFileConfig {
     Mpp {
         tag: Option<String>,
         security: SecurityFileConfig,
+        #[serde(default)]
+        performance: MppPerformanceFileConfig,
         #[serde(default)]
         endpoints: Vec<String>,
         outbound: Option<String>,
@@ -382,6 +405,8 @@ enum OutboundFileConfig {
         tag: Option<String>,
         security: SecurityFileConfig,
         #[serde(default)]
+        performance: MppPerformanceFileConfig,
+        #[serde(default)]
         endpoints: Vec<String>,
         path_probe_interval_ms: Option<u64>,
         path_probe_timeout_ms: Option<u64>,
@@ -426,6 +451,8 @@ struct RoutingBalancerFileConfig {
     strategy: RoutingStrategyFileValue,
     #[serde(default)]
     outbounds: Vec<String>,
+    #[serde(default)]
+    performance: MppPerformanceFileConfig,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -454,6 +481,7 @@ struct ParsedMppOutbound {
     paths: Vec<ClientPathConfig>,
     path_probe_interval: Duration,
     path_probe_timeout: Duration,
+    performance: MppPerformanceConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +506,7 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
             OutboundFileConfig::Mpp {
                 tag,
                 security,
+                performance,
                 endpoints,
                 path_probe_interval_ms,
                 path_probe_timeout_ms,
@@ -508,6 +537,7 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
                         path_probe_timeout: Duration::from_millis(
                             path_probe_timeout_ms.unwrap_or(DEFAULT_PATH_PROBE_TIMEOUT_MS),
                         ),
+                        performance: performance.into_config(),
                     },
                 );
             }
@@ -610,6 +640,11 @@ fn apply_routing(
                 paths.extend(first.paths.clone());
                 let path_probe_interval = first.path_probe_interval;
                 let path_probe_timeout = first.path_probe_timeout;
+                let performance = if balancer.performance.is_explicit() {
+                    balancer.performance.into_config()
+                } else {
+                    first.performance
+                };
                 for tag in balancer.outbounds.iter().skip(1) {
                     let member = parsed.mpp.get(tag).ok_or_else(|| {
                         routing_member_wrong_protocol(parsed, &balancer.tag, tag, "mpp")
@@ -618,6 +653,11 @@ fn apply_routing(
                         || member.path_probe_timeout != path_probe_timeout
                     {
                         return Err(ConfigFileError::CombinedMppProbePolicyMismatch(
+                            balancer.tag,
+                        ));
+                    }
+                    if !balancer.performance.is_explicit() && member.performance != performance {
+                        return Err(ConfigFileError::CombinedMppPerformancePolicyMismatch(
                             balancer.tag,
                         ));
                     }
@@ -631,6 +671,7 @@ fn apply_routing(
                         paths,
                         path_probe_interval,
                         path_probe_timeout,
+                        performance,
                     },
                 );
             }
@@ -829,6 +870,7 @@ fn build_node_services(
             InboundFileConfig::Mpp {
                 tag,
                 security,
+                performance,
                 endpoints,
                 outbound,
                 balancer,
@@ -847,6 +889,7 @@ fn build_node_services(
                     security: security.into_config()?,
                     outbound: egress.config.outbound.clone(),
                     outbound_dns: egress.config.dns.clone(),
+                    performance: performance.into_config(),
                 });
             }
         }
@@ -864,6 +907,7 @@ fn build_node_services(
             paths: mpp.config.paths.clone(),
             path_probe_interval: mpp.config.path_probe_interval,
             path_probe_timeout: mpp.config.path_probe_timeout,
+            performance: mpp.config.performance,
         });
     }
 
@@ -1206,6 +1250,7 @@ pub enum ConfigFileError {
         expected: &'static str,
     },
     CombinedMppProbePolicyMismatch(String),
+    CombinedMppPerformancePolicyMismatch(String),
     MissingOutboundProxy,
     TunIpv4DisabledWithIpv4Options,
     ProxyUsernameRequired,
@@ -1311,6 +1356,10 @@ impl std::fmt::Display for ConfigFileError {
                 f,
                 "combined MPP balancer {tag:?} requires member MPP outbounds to use the same path probe timing"
             ),
+            Self::CombinedMppPerformancePolicyMismatch(tag) => write!(
+                f,
+                "combined MPP balancer {tag:?} requires member MPP outbounds to use the same performance policy unless the balancer defines performance"
+            ),
             Self::MissingOutboundProxy => write!(f, "proxied outbound requires proxy"),
             Self::TunIpv4DisabledWithIpv4Options => {
                 write!(
@@ -1354,6 +1403,7 @@ impl std::error::Error for ConfigFileError {
             | Self::RoutingBalancerRequiresMembers(_)
             | Self::RoutingBalancerMemberWrongProtocol { .. }
             | Self::CombinedMppProbePolicyMismatch(_)
+            | Self::CombinedMppPerformancePolicyMismatch(_)
             | Self::MissingOutboundProxy
             | Self::TunIpv4DisabledWithIpv4Options
             | Self::ProxyUsernameRequired
@@ -1390,6 +1440,9 @@ tag = "mpp-main"
 protocol = "mpp"
 endpoints = ["tcp://127.0.0.1:443", "udp://127.0.0.1:443"]
 
+[outbounds.performance]
+extra_traffic_hint_percent = 25
+
 [outbounds.security]
 secret = "0123456789abcdef0123456789abcdef"
 "#,
@@ -1411,6 +1464,7 @@ secret = "0123456789abcdef0123456789abcdef"
                     Some((&RouteTargetKind::Outbound, "mpp-main"))
                 );
                 assert_eq!(client.paths.len(), 2);
+                assert_eq!(client.performance.extra_traffic_hint_percent, 25);
                 assert_eq!(client.ingresses[0].tag, None);
                 assert_eq!(
                     ingress_configs(&client.ingresses),
@@ -1514,6 +1568,9 @@ outbound = "proxy-egress"
 [inbounds.security]
 secret = "0123456789abcdef0123456789abcdef"
 
+[inbounds.performance]
+extra_traffic_hint_percent = 200
+
 [[outbounds]]
 tag = "mpp-main"
 protocol = "mpp"
@@ -1537,6 +1594,7 @@ dns = { resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"], strategy = "ipv
                 assert_eq!(node.servers.len(), 1);
                 let server = &node.servers[0];
                 assert_eq!(server.tag.as_deref(), Some("edge-mpp"));
+                assert_eq!(server.performance.extra_traffic_hint_percent, 200);
                 assert_eq!(
                     server
                         .route_target

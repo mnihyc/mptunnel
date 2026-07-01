@@ -55,6 +55,7 @@ pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
                 server.outbound,
                 server.outbound_dns,
                 server.security,
+                server.performance,
                 config.resources,
                 config.management,
             )
@@ -92,6 +93,7 @@ pub(super) async fn run_node(
             server.outbound,
             server.outbound_dns,
             server.security,
+            server.performance,
             resources,
         );
         let bound = bind_server_paths(server.bind_paths, &context).await?;
@@ -1815,6 +1817,7 @@ pub struct ServerPathContext {
     pub(super) server_paths: Arc<Vec<PathSpec>>,
     pub(super) outbound: OutboundConfig,
     pub(super) outbound_dns: DnsConfig,
+    pub(super) performance: MppPerformanceConfig,
     pub(super) codec_limits: CodecLimits,
     pub(super) mux_limits: MuxLimits,
     pub(super) security: SecurityConfig,

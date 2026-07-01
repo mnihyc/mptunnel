@@ -666,10 +666,78 @@ pub(super) fn tcp_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -
     }
 }
 
+fn repair_limit_with_extra_traffic_hint(
+    base_limit: usize,
+    performance: MppPerformanceConfig,
+) -> usize {
+    let hint = performance.extra_traffic_hint_percent as usize;
+    base_limit.saturating_add(base_limit.saturating_mul(hint) / 100)
+}
+
+async fn send_reliable_tail_repair(
+    path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
+    last_send_ack_ranges: &[OffsetRange],
+    last_send_ack_complete: bool,
+    send_path_snapshot: Option<PathSnapshot>,
+    relay_lane: FlowLane,
+    mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
+    last_send_ack_frontier: u64,
+    last_tail_repair_path: &mut Option<CarrierPathKey>,
+) -> Result<(), RuntimeError> {
+    let base_repair_limit = adaptive_relay_chunk_bytes_for_underlay(
+        send_path_snapshot,
+        FlowLane::Throughput,
+        mux_limits,
+        path_stream.underlay,
+        path_stream.max_frame_payload_bytes,
+    )
+    .max(adaptive_reliable_relay_repair_bytes(
+        send_path_snapshot,
+        relay_lane,
+        mux_limits,
+    ));
+    let repair_limit = repair_limit_with_extra_traffic_hint(base_repair_limit, performance);
+    let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
+        send_stream,
+        last_send_ack_ranges,
+        repair_limit,
+        last_send_ack_complete,
+    );
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = repair_kind;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "tail_stall_repair",
+        format_args!(
+            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind={}",
+            path_stream.stream_id.0,
+            relay_lane,
+            last_send_ack_frontier,
+            send_stream.next_offset(),
+            send_stream.repair_bytes(),
+            repair_frames.len(),
+            base_repair_limit,
+            repair_limit,
+            performance.extra_traffic_hint_percent,
+            repair_kind,
+        ),
+    );
+    for frame in repair_frames {
+        if let Some(path_key) = path_stream.send_repair_frame(frame).await? {
+            *last_tail_repair_path = Some(path_key);
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn relay_reliable_stream<S>(
     mut local: S,
     mut path_stream: ReliablePathStream,
     mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
     session_id: SessionId,
 ) -> Result<PathDeliveryStats, RuntimeError>
 where
@@ -822,46 +890,18 @@ where
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
-                let repair_limit = adaptive_relay_chunk_bytes_for_underlay(
-                    send_path_snapshot,
-                    FlowLane::Throughput,
-                    mux_limits,
-                    path_stream.underlay,
-                    path_stream.max_frame_payload_bytes,
-                )
-                .max(adaptive_reliable_relay_repair_bytes(
+                send_reliable_tail_repair(
+                    &path_stream,
+                    &send_stream,
+                    &last_send_ack_ranges,
+                    last_send_ack_complete,
                     send_path_snapshot,
                     relay_lane,
                     mux_limits,
-                ));
-                let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
-                    &send_stream,
-                    &last_send_ack_ranges,
-                    repair_limit,
-                    last_send_ack_complete,
-                );
-                #[cfg(not(feature = "lab-diagnostics"))]
-                let _ = repair_kind;
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "tail_stall_repair",
-                    format_args!(
-                        "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} repair_limit={} repair_kind={}",
-                        stream_id.0,
-                        relay_lane,
-                        last_send_ack_frontier,
-                        send_stream.next_offset(),
-                        send_stream.repair_bytes(),
-                        repair_frames.len(),
-                        repair_limit,
-                        repair_kind,
-                    ),
-                );
-                for frame in repair_frames {
-                    if let Some(path_key) = path_stream.send_repair_frame(frame).await? {
-                        last_tail_repair_path = Some(path_key);
-                    }
-                }
+                    performance,
+                    last_send_ack_frontier,
+                    &mut last_tail_repair_path,
+                ).await?;
                 last_tail_repair_at = Instant::now();
                 continue;
             }
@@ -1382,5 +1422,27 @@ mod tests {
             interval,
             now + interval + interval,
         ));
+    }
+
+    #[test]
+    fn tail_repair_hint_scales_repair_budget_by_percent() {
+        let base = TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES;
+        let low_hint = MppPerformanceConfig {
+            extra_traffic_hint_percent: 1,
+        };
+        let high_hint = MppPerformanceConfig {
+            extra_traffic_hint_percent: 100,
+        };
+        let severe_hint = MppPerformanceConfig {
+            extra_traffic_hint_percent: 200,
+        };
+
+        let low_limit = repair_limit_with_extra_traffic_hint(base, low_hint);
+        let high_limit = repair_limit_with_extra_traffic_hint(base, high_hint);
+        let severe_limit = repair_limit_with_extra_traffic_hint(base, severe_hint);
+
+        assert_eq!(low_limit, base + base / 100);
+        assert_eq!(high_limit, base * 2);
+        assert_eq!(severe_limit, base * 3);
     }
 }

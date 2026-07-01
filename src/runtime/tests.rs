@@ -91,6 +91,7 @@ fn server_context(outbound: OutboundConfig) -> ServerPathContext {
         server_paths: Arc::new(Vec::new()),
         outbound,
         outbound_dns: DnsConfig::default(),
+        performance: MppPerformanceConfig::default(),
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security: security(),

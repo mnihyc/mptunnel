@@ -88,6 +88,12 @@ protocol = "mpp"
 endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
 # path_probe_interval_ms = 10000
 # path_probe_timeout_ms = 2000
+# MPP sender hint for evidence-backed duplicate/repair/probe overhead. This is
+# not a hard limit or a named mode. `1` means roughly 1% extra traffic is
+# acceptable when it reduces stalls; `100` permits full duplication in severe
+# moments; `200` may be useful on very unstable paths.
+# [outbounds.performance]
+# extra_traffic_hint_percent = 1
 
 [outbounds.security]
 # MPP security is scoped to this MPP outbound, so one node can talk to multiple
@@ -106,6 +112,8 @@ secret = "01234567-89ab-cdef-0123-456789abcdef"
 # protocol = "mpp"
 # endpoints = ["tcp://0.0.0.0:7443", "udp://0.0.0.0:7443"]
 # outbound = "direct-egress"
+# [inbounds.performance]
+# extra_traffic_hint_percent = 1
 # [inbounds.security]
 # secret = "01234567-89ab-cdef-0123-456789abcdef"
 

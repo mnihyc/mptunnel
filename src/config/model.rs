@@ -120,6 +120,28 @@ impl ManagementConfig {
     }
 }
 
+pub const DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MppPerformanceConfig {
+    /// Operator hint for adaptive duplicate/probe/repair overhead, in percent.
+    ///
+    /// 1 means the sender treats roughly 1% extra transport traffic as
+    /// acceptable when runtime evidence shows that additional repair/probing can
+    /// reduce stalls. 100 permits full duplication in pathological cases, and
+    /// values above 100 bias toward redundant repair under severe instability.
+    /// This is a hint, not a production hard limit.
+    pub extra_traffic_hint_percent: u16,
+}
+
+impl Default for MppPerformanceConfig {
+    fn default() -> Self {
+        Self {
+            extra_traffic_hint_percent: DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceConfig {
     pub service_mode: bool,
@@ -356,6 +378,8 @@ pub struct ClientConfig {
     pub paths: Vec<ClientPathConfig>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
+    /// MPP sender behavior for this outbound path group.
+    pub performance: MppPerformanceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +410,8 @@ pub struct ServerConfig {
     pub outbound: OutboundConfig,
     /// DNS policy owned by the selected egress behavior.
     pub outbound_dns: DnsConfig,
+    /// MPP sender behavior for streams accepted by this inbound path group.
+    pub performance: MppPerformanceConfig,
 }
 
 fn validate_client_config(

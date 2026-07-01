@@ -5,6 +5,7 @@ pub(super) async fn run_server(
     outbound: OutboundConfig,
     outbound_dns: DnsConfig,
     security: SecurityConfig,
+    performance: MppPerformanceConfig,
     resources: ResourceLimits,
     management: ManagementConfig,
 ) -> Result<(), RuntimeError> {
@@ -13,6 +14,7 @@ pub(super) async fn run_server(
         outbound,
         outbound_dns,
         security,
+        performance,
         resources,
     );
     let bound = bind_server_paths(bind_paths, &context).await?;
@@ -30,6 +32,7 @@ pub(super) fn new_server_path_context(
     outbound: OutboundConfig,
     outbound_dns: DnsConfig,
     security: SecurityConfig,
+    performance: MppPerformanceConfig,
     resources: ResourceLimits,
 ) -> ServerPathContext {
     new_server_path_context_with_identity(
@@ -39,6 +42,7 @@ pub(super) fn new_server_path_context(
         outbound,
         outbound_dns,
         security,
+        performance,
         resources,
     )
 }
@@ -50,6 +54,7 @@ pub(super) fn new_server_path_context_with_identity(
     outbound: OutboundConfig,
     outbound_dns: DnsConfig,
     security: SecurityConfig,
+    performance: MppPerformanceConfig,
     resources: ResourceLimits,
 ) -> ServerPathContext {
     ServerPathContext {
@@ -58,6 +63,7 @@ pub(super) fn new_server_path_context_with_identity(
         server_paths: Arc::new(server_paths),
         outbound,
         outbound_dns,
+        performance,
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,

@@ -441,6 +441,18 @@ relationship, ingress target metadata, outbound target policy, flow-control
 limits, and management API settings. Unknown or contradictory operator fields
 SHOULD be rejected before runtime.
 
+MPP inbounds and MPP outbounds MAY carry performance hints scoped to that path
+group. A version 1 implementation defines `extra_traffic_hint_percent` as an
+operator hint for how acceptable duplicate, repair, or probe overhead is when
+the sender has evidence that additional traffic can reduce latency, failover
+time, or ordering stalls. The value is numeric rather than a named mode because
+performance policy is continuous: `1` means roughly one percent extra traffic is
+acceptable under evidence-backed pressure, `100` permits full duplication in
+pathological moments, and values above `100` bias the sender toward redundant
+repair under severe instability. It is not a hard limit, not a fixed rate, and
+not a condition that can terminate production traffic. Auto scheduling remains
+the default and MUST adapt from measurements even when the hint is left unset.
+
 ### 5.3 Resource Parameters
 
 Default resource parameters are:
@@ -1358,8 +1370,12 @@ The controller follows the same principles as QUIC loss recovery and BBR-style
 control: pace by a path model, update the model from delivery samples, bound
 inflight data, and distinguish confirmed loss from probe timeout. The goal is
 aggressive fluency, not passive safety. When links are unstable, the controller
-MAY spend a small amount of extra probe or duplicate traffic if the expected
-latency/failover benefit justifies it.
+MAY spend extra probe, repair, or duplicate traffic if the expected
+latency/failover benefit justifies it. The sender interprets
+`extra_traffic_hint_percent` as a bias for that decision, but MUST keep the
+decision evidence-driven: ACK progress, ordered-frontier debt, carrier loss/PTO,
+path failure, and queue pressure are inputs; the hint alone is not sufficient
+evidence.
 
 Startup is part of the controller, not a lab constant. A UDP sender MUST NOT
 use the full pending-byte, stream-window, repair-cache, or production memory
@@ -2392,11 +2408,19 @@ receive hole.
 Lead-path admission and lead-path repair are intentionally separate
 decisions. The lead path may keep a larger product queue than additional
 paths so that a UDP controller or TCP writer is not starved by slow product
-ACKs. Version 1 does not perform proactive active ordering-debt repair merely
-because lower-offset bytes are outstanding on another path. That condition is
-handled first by admission: the sender must avoid creating or expanding an
-ordered receive hole when the modeled completion cost is worse than waiting for
-the path that owns the lower bytes.
+ACKs. A sender MUST NOT treat ordinary queued response bytes blocked by
+unresolved lower-frontier debt as loss evidence by itself. In that condition it
+continues servicing carrier ACKs, product ACKs, control frames, flow-control
+updates, explicit gap repair, duplicate validation, and path events while the
+ordinary byte range waits for ACK progress or a serviceable lower-frontier
+owner. If the blocked frontier later produces data-plane PTO/stall evidence,
+the sender may perform the normal tail/gap repair action described below.
+`extra_traffic_hint_percent` scales the byte budget of that evidence-backed
+repair action: `1` permits roughly one percent more repair/probe traffic, `100`
+roughly doubles that repair budget, and `200` roughly triples it. The value is a
+continuous hint for how aggressively the sender may trade duplicate traffic for
+recovery speed; it is not a fixed rate, not a hard cap, and not permission to
+send speculative unique bytes that deepen ordered receive debt.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
 a gap, a path failure or detach event, or data-plane PTO/stall evidence. The
@@ -2407,15 +2431,11 @@ of the repaired range. This is the MPTCP reinjection rule applied only after
 loss, failure, or stall evidence exists, with the QUIC-style recovery
 constraint that a repair action is small, ACK-clocked, and never a replay of
 unrelated cached bytes. A sender MUST NOT duplicate every lower outstanding byte
-merely because a faster active path is available. Lab evidence showed that
-immediate or stale-gated speculative response-side reinjection can reduce
-download goodput by occupying send queues before the receiver has proven a gap.
-
-A future protocol revision may add proactive lead ordering-debt repair only
-if it is implemented inside the unified nonblocking sender service and
-diagnostics prove that it cannot delay ordinary response transmission, carrier
-ACK feedback, or explicit gap repair. Until then, active ordering debt is an
-admission input and explicit repair signal, not a standalone repair trigger.
+merely because a faster active path is available. Speculative reinjection outside
+the sender-service queue is prohibited because it can occupy path queues before
+the receiver has proven useful repair. A queued sender may spend additional
+repair traffic only after explicit ACK-gap, path failure/detach, or PTO/stall
+evidence, and the numeric traffic hint only scales that repair/probe budget.
 
 Repair `STREAM_DATA` is still stream data for correctness and flow accounting,
 but its service lane is repair/latency, not ordinary bulk. It therefore uses
@@ -3079,12 +3099,13 @@ on_stream_ack(stream_id, complete, ranges):
         do_not_infer_holes_from_omitted_ranges()
 
 on_tail_stall_repair(stream_id, last_complete_ack_ranges):
+    repair_budget = base_repair_budget * (1 + extra_traffic_hint_percent / 100)
     holes = unacked_chunks_below_largest_acked_not_covered_by(last_complete_ack_ranges)
     if holes is not empty:
-        schedule_repair(holes)
+        schedule_repair(holes, repair_budget)
     else:
         tail = unacked_chunks_after_largest_acked(last_complete_ack_ranges)
-        schedule_repair(tail)
+        schedule_repair(tail, repair_budget)
     never_replay_whole_repair_cache()
 
 on_path_failure(path):

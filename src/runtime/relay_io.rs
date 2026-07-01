@@ -706,7 +706,7 @@ where
     let mut last_send_ack_complete = false;
     let mut flow_demand = TcpRelayFlowDemandTracker::new();
     let mut output_updates = path_stream.subscribe_output_updates();
-    let mut sender_queue = TcpRelaySenderQueue::default();
+    let mut response_sender = ServerResponseSenderService::new(session_id, stream_id);
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
 
@@ -714,7 +714,7 @@ where
         if !local_open
             && !remote_open
             && send_stream.repair_bytes() == 0
-            && sender_queue.is_empty()
+            && response_sender.is_empty()
             && (!pending_local_fin || close_sent)
         {
             break Ok(stats);
@@ -751,7 +751,7 @@ where
                 ),
             );
         }
-        path_stream.set_sender_queue_bytes(sender_queue.bytes());
+        response_sender.publish_queue_bytes(&path_stream);
         let send_path_snapshot = path_stream.send_path_snapshot(
             relay_lane,
             tcp_lane_startup_chunk_bytes(relay_lane, mux_limits)
@@ -799,40 +799,23 @@ where
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
-        let queued_send_ready =
-            sender_queue
-                .front_stream_extent()
-                .is_some_and(|(offset, payload_bytes)| {
-                    !relay_lane_is_bulk(relay_lane)
-                        || path_stream.can_send_stream_data_extent(
-                            relay_lane,
-                            offset,
-                            payload_bytes,
-                        )
-                });
-        let queued_send_blocked = !sender_queue.is_empty() && !queued_send_ready;
-        let can_read_by_flow = tcp_relay_can_read_product_source(
+        let queued_send_ready = response_sender.queued_send_ready(&path_stream, relay_lane);
+        let queued_send_blocked = response_sender.queued_send_blocked(queued_send_ready);
+        let can_read_by_flow = response_sender.can_read_product_source(
             local_open,
             queued_send_blocked,
             &send_stream,
-            &sender_queue,
             mux_limits,
             sender_queue_limit,
         );
         let read_budget = if can_read_by_flow {
-            tcp_relay_sender_queue_read_budget(
-                &send_stream,
-                &sender_queue,
-                mux_limits,
-                sender_queue_limit,
-                buf.len(),
-            )
+            response_sender.read_budget(&send_stream, mux_limits, sender_queue_limit, buf.len())
         } else {
             0
         };
         let can_read_local = can_read_by_flow && read_budget > 0;
         let can_send_pending_fin = pending_local_fin
-            && sender_queue.is_empty()
+            && response_sender.is_empty()
             && !close_sent
             && (path_stream.underlay != UnderlayProtocol::Udp || send_stream.repair_bytes() == 0);
 
@@ -1022,7 +1005,7 @@ where
                                 largest_ack_end,
                                 ack.released_bytes,
                                 send_stream.next_offset(),
-                                sender_queue.bytes(),
+                                response_sender.bytes(),
                                 ack.remaining_repair_bytes,
                                 repair_frames.len(),
                                 Some(path_stream.underlay),
@@ -1103,73 +1086,8 @@ where
                 pending_local_fin = false;
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let queued = sender_queue
-                    .pop_front()
-                    .expect("queued_send_ready requires a queued frame");
-                #[cfg(feature = "lab-diagnostics")]
-                let enqueue_id = queued.enqueue_id;
-                #[cfg(feature = "lab-diagnostics")]
-                let queue_delay_ms = queued.queued_at.elapsed().as_millis();
-                #[cfg(feature = "lab-diagnostics")]
-                let send_lane = tcp_path_effective_frame_lane(&queued.frame, relay_lane);
-                #[cfg(feature = "lab-diagnostics")]
-                let pacing_bytes = frame_pacing_bytes(&queued.frame);
-                #[cfg(feature = "lab-diagnostics")]
-                let stream_extent = match &queued.frame {
-                    Frame::StreamData {
-                        offset, payload, ..
-                    } => Some((*offset, payload.len())),
-                    _ => None,
-                };
-                let selected_path = path_stream.send_frame_tracked(queued.frame).await?;
-                #[cfg(not(feature = "lab-diagnostics"))]
-                let _ = selected_path;
-                #[cfg(feature = "lab-diagnostics")]
-                if let Some((offset, payload_bytes)) = stream_extent {
-                    lab_server_response_stream_data(
-                        session_id.0,
-                        stream_id.0,
-                        offset,
-                        payload_bytes,
-                    );
-                    if selected_path.is_none() {
-                        lab_sender_service_decision(
-                            "server",
-                            Some(session_id.0),
-                            stream_id.0,
-                            "primary",
-                            "stream_data",
-                            payload_bytes,
-                            format_args!(
-                                "path_underlay={:?} path_id=none lane={:?} pacing_bytes={} degenerate_single_path=true",
-                                path_stream.underlay,
-                                send_lane,
-                                pacing_bytes,
-                            ),
-                        );
-                    }
-                    let (selected_underlay, selected_path_id) = selected_path
-                        .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
-                        .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
-                    lab_diagnostic(
-                        "server_sender_dispatch",
-                        format_args!(
-                            "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
-                            session_id.0,
-                            stream_id.0,
-                            enqueue_id,
-                            offset,
-                            payload_bytes,
-                            send_lane,
-                            queue_delay_ms,
-                            sender_queue.bytes(),
-                            selected_underlay,
-                            selected_path_id,
-                            pacing_bytes,
-                        ),
-                    );
-                }
-                stats.record_payload_bytes(queued.payload_bytes);
+                let dispatch = response_sender.dispatch_next(&path_stream, relay_lane).await?;
+                stats.record_payload_bytes(dispatch.payload_bytes);
             }
             read = async {
                 #[cfg(feature = "lab-diagnostics")]
@@ -1202,9 +1120,9 @@ where
                         _ => None,
                     };
                     #[cfg(feature = "lab-diagnostics")]
-                    let enqueue_id = sender_queue.push(frame);
+                    let enqueue_id = response_sender.enqueue_frame(frame);
                     #[cfg(not(feature = "lab-diagnostics"))]
-                    sender_queue.push(frame);
+                    response_sender.enqueue_frame(frame);
                     #[cfg(feature = "lab-diagnostics")]
                     if let Some((offset, payload_bytes)) = stream_extent {
                         lab_diagnostic(
@@ -1217,7 +1135,7 @@ where
                                 relay_lane,
                                 offset,
                                 payload_bytes,
-                                sender_queue.bytes(),
+                                response_sender.bytes(),
                                 sender_queue_limit,
                                 send_stream.send_credit_bytes(),
                                 send_stream.repair_bytes(),

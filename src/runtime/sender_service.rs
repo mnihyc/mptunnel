@@ -172,6 +172,175 @@ pub(super) fn tcp_relay_sender_queue_read_budget(
         .min(buffer_len)
 }
 
+#[derive(Debug)]
+pub(super) struct ServerResponseSenderService {
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    session_id: SessionId,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    stream_id: StreamId,
+    queue: TcpRelaySenderQueue,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ServerResponseDispatch {
+    pub(super) payload_bytes: usize,
+}
+
+impl ServerResponseSenderService {
+    pub(super) fn new(session_id: SessionId, stream_id: StreamId) -> Self {
+        Self {
+            session_id,
+            stream_id,
+            queue: TcpRelaySenderQueue::default(),
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) fn bytes(&self) -> usize {
+        self.queue.bytes()
+    }
+
+    pub(super) fn publish_queue_bytes(&self, path_stream: &TcpPathStream) {
+        path_stream.set_sender_queue_bytes(self.queue.bytes());
+    }
+
+    pub(super) fn queued_send_ready(
+        &self,
+        path_stream: &TcpPathStream,
+        relay_lane: FlowLane,
+    ) -> bool {
+        self.queue
+            .front_stream_extent()
+            .is_some_and(|(offset, payload_bytes)| {
+                !relay_lane_is_bulk(relay_lane)
+                    || path_stream.can_send_stream_data_extent(relay_lane, offset, payload_bytes)
+            })
+    }
+
+    pub(super) fn queued_send_blocked(&self, queued_send_ready: bool) -> bool {
+        !self.queue.is_empty() && !queued_send_ready
+    }
+
+    pub(super) fn can_read_product_source(
+        &self,
+        local_open: bool,
+        queued_send_blocked: bool,
+        send_stream: &ReliableSendStream,
+        mux_limits: MuxLimits,
+        queue_limit: usize,
+    ) -> bool {
+        tcp_relay_can_read_product_source(
+            local_open,
+            queued_send_blocked,
+            send_stream,
+            &self.queue,
+            mux_limits,
+            queue_limit,
+        )
+    }
+
+    pub(super) fn read_budget(
+        &self,
+        send_stream: &ReliableSendStream,
+        mux_limits: MuxLimits,
+        queue_limit: usize,
+        buffer_len: usize,
+    ) -> usize {
+        tcp_relay_sender_queue_read_budget(
+            send_stream,
+            &self.queue,
+            mux_limits,
+            queue_limit,
+            buffer_len,
+        )
+    }
+
+    pub(super) fn enqueue_frame(&mut self, frame: Frame) -> u64 {
+        self.queue.push(frame)
+    }
+
+    pub(super) async fn dispatch_next(
+        &mut self,
+        path_stream: &TcpPathStream,
+        relay_lane: FlowLane,
+    ) -> Result<ServerResponseDispatch, RuntimeError> {
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = relay_lane;
+        let queued = self
+            .queue
+            .pop_front()
+            .expect("queued_send_ready requires a queued frame");
+        #[cfg(feature = "lab-diagnostics")]
+        let enqueue_id = queued.enqueue_id;
+        #[cfg(feature = "lab-diagnostics")]
+        let queue_delay_ms = queued.queued_at.elapsed().as_millis();
+        #[cfg(feature = "lab-diagnostics")]
+        let send_lane = tcp_path_effective_frame_lane(&queued.frame, relay_lane);
+        #[cfg(feature = "lab-diagnostics")]
+        let pacing_bytes = frame_pacing_bytes(&queued.frame);
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_extent = match &queued.frame {
+            Frame::StreamData {
+                offset, payload, ..
+            } => Some((*offset, payload.len())),
+            _ => None,
+        };
+        let selected_path = path_stream.send_frame_tracked(queued.frame).await?;
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = selected_path;
+        #[cfg(feature = "lab-diagnostics")]
+        if let Some((offset, payload_bytes)) = stream_extent {
+            lab_server_response_stream_data(
+                self.session_id.0,
+                self.stream_id.0,
+                offset,
+                payload_bytes,
+            );
+            if selected_path.is_none() {
+                lab_sender_service_decision(
+                    "server",
+                    Some(self.session_id.0),
+                    self.stream_id.0,
+                    "primary",
+                    "stream_data",
+                    payload_bytes,
+                    format_args!(
+                        "path_underlay={:?} path_id=none lane={:?} pacing_bytes={} degenerate_single_path=true",
+                        path_stream.underlay, send_lane, pacing_bytes,
+                    ),
+                );
+            }
+            let (selected_underlay, selected_path_id) = selected_path
+                .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
+                .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
+            lab_diagnostic(
+                "server_sender_dispatch",
+                format_args!(
+                    "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
+                    self.session_id.0,
+                    self.stream_id.0,
+                    enqueue_id,
+                    offset,
+                    payload_bytes,
+                    send_lane,
+                    queue_delay_ms,
+                    self.queue.bytes(),
+                    selected_underlay,
+                    selected_path_id,
+                    pacing_bytes,
+                ),
+            );
+        }
+        Ok(ServerResponseDispatch {
+            payload_bytes: queued.payload_bytes,
+        })
+    }
+}
+
 impl RelaySenderService {
     pub(super) fn new(stream_id: StreamId) -> Self {
         Self {

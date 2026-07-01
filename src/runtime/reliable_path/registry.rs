@@ -48,6 +48,7 @@ pub(in crate::runtime) struct ServerReliableStreamOpenRequest<'a> {
 pub(in crate::runtime) enum ServerReliableStreamOpen {
     New(ReliablePathStream),
     Existing,
+    Rejected,
 }
 
 pub(in crate::runtime) struct ServerReliableRegistryManagementSnapshot {
@@ -156,6 +157,35 @@ impl ServerReliableStreamRegistry {
                 ),
             );
             return Ok(ServerReliableStreamOpen::Existing);
+        }
+
+        if self
+            .closed_streams
+            .lock()
+            .expect("server reliable stream closed cache lock")
+            .contains(&(session_id, stream_id))
+        {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "server_stream_open",
+                format_args!(
+                    "session_id={} stream_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=rejected_closed_stream",
+                    session_id.0, stream_id.0, underlay, path_id.0, role, lane,
+                ),
+            );
+            return Ok(ServerReliableStreamOpen::Rejected);
+        }
+
+        if role != StreamOpenRole::Active {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "server_stream_open",
+                format_args!(
+                    "session_id={} stream_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=rejected_attach_only_unknown",
+                    session_id.0, stream_id.0, underlay, path_id.0, role, lane,
+                ),
+            );
+            return Ok(ServerReliableStreamOpen::Rejected);
         }
 
         if streams.len() >= max_streams {
@@ -327,17 +357,21 @@ impl ServerReliableStreamRegistry {
         };
         let Some(stream) = stream else {
             let closed_key = (session_id, stream_id);
-            if self
-                .closed_streams
+            self.closed_streams
                 .lock()
                 .expect("server reliable stream closed cache lock")
-                .contains(&closed_key)
-            {
-                return Ok(());
-            }
-            return Err(RuntimeError::Protocol(
-                "frame for unknown server reliable stream",
-            ));
+                .insert(closed_key);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "server_stream_unknown_frame_drop",
+                format_args!(
+                    "session_id={} stream_id={} frame_kind={}",
+                    session_id.0,
+                    stream_id.0,
+                    frame_kind_name(&frame),
+                ),
+            );
+            return Ok(());
         };
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();

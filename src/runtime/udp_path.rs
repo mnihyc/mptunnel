@@ -1141,6 +1141,18 @@ async fn handle_server_udp_reliable_stream(
             )
             .await?;
         }
+        ServerReliableStreamOpen::Rejected => {
+            udp_path_write_frame(
+                &mut send,
+                &Frame::StreamReset {
+                    stream_id,
+                    reason: ResetReason::Refused,
+                },
+                context.codec_limits,
+            )
+            .await?;
+            return Ok(());
+        }
     }
     run_server_udp_reliable_stream_loop(
         send,
@@ -1292,6 +1304,17 @@ async fn run_server_udp_reliable_stream_loop(
                                 return Err(RuntimeError::Protocol(
                                     "UDP carrier reannouncement opened duplicate stream",
                                 ));
+                            }
+                            ServerReliableStreamOpen::Rejected => {
+                                udp_path_write_frame(
+                                    &mut send,
+                                    &Frame::StreamReset {
+                                        stream_id,
+                                        reason: ResetReason::Refused,
+                                    },
+                                    context.codec_limits,
+                                )
+                                .await?;
                             }
                         }
                         continue;

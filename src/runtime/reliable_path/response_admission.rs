@@ -1,3 +1,4 @@
+use super::super::bulk_admission::bulk_service_horizon_payload_bytes;
 use super::*;
 
 /// One carrier output attached to a response stream.
@@ -5,19 +6,28 @@ use super::*;
 /// It owns carrier command access and sender-evidence fields for this stream on
 /// this path. Product repair and ordering identity stay in `ResponseStreamBinding`.
 #[derive(Clone)]
-pub(super) struct ResponseStreamOutputEntry {
+pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
     pub(super) commands: TcpPathSessionCommandSender,
     pub(super) bytes_in_flight: u64,
     pub(super) product_queue_bytes: u64,
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
-    pub(super) validation_credit_bytes: u64,
     pub(super) path_metrics: Option<ServerPathMetricsEntry>,
 }
 
-pub(super) struct ResponseStreamOutputs {
+pub(in crate::runtime) struct ResponseStreamOutputs {
     pub(super) entries: Vec<ResponseStreamOutputEntry>,
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct ResponseSenderPathTarget {
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) commands: TcpPathSessionCommandSender,
+    pub(in crate::runtime) snapshot: PathSnapshot,
+    pub(in crate::runtime) eta_ms: f64,
+    pub(in crate::runtime) is_active: bool,
+    pub(in crate::runtime) has_sender_evidence: bool,
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -25,7 +35,7 @@ pub(super) struct ResponseStreamOutputs {
 /// STREAM_ACK releases this ledger entry from product flight; carrier ACKs only
 /// update carrier/path evidence and must not release product repair state.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CarrierPathFlight {
+pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) key: CarrierPathKey,
     pub(super) end: u64,
     pub(super) bytes: usize,
@@ -33,13 +43,13 @@ pub(super) struct CarrierPathFlight {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CarrierPathFlightDebt {
-    pub(super) key: CarrierPathKey,
-    pub(super) bytes: u64,
+pub(in crate::runtime) struct CarrierPathFlightDebt {
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CarrierPathAckedHole {
+pub(in crate::runtime) struct CarrierPathAckedHole {
     pub(super) key: CarrierPathKey,
     pub(super) end: u64,
     pub(super) bytes: u64,
@@ -47,12 +57,12 @@ pub(super) struct CarrierPathAckedHole {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ResponseAckOrderingState {
+pub(in crate::runtime) struct ResponseAckOrderingState {
     pub(super) contiguous_frontier: u64,
     pub(super) acked_holes: BTreeMap<u64, Vec<CarrierPathAckedHole>>,
 }
 
-pub(super) struct ResponseAckOrderingUpdate {
+pub(in crate::runtime) struct ResponseAckOrderingUpdate {
     pub(super) changed: bool,
     pub(super) contiguous_frontier: u64,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
@@ -148,13 +158,13 @@ impl ResponseAckOrderingState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ServerPathMetricsSource {
+pub(in crate::runtime) enum ServerPathMetricsSource {
     PeerHint,
     LocalSender,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ServerPathMetricsEntry {
+pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(super) metrics: PathMetrics,
     pub(super) source: ServerPathMetricsSource,
 }
@@ -371,7 +381,9 @@ fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
     }
 }
 
-pub(super) fn server_output_has_sender_evidence(entry: &ResponseStreamOutputEntry) -> bool {
+pub(in crate::runtime) fn server_output_has_sender_evidence(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
     entry.delivery_samples > 0
         || matches!(
             entry.path_metrics,
@@ -386,7 +398,7 @@ pub(super) fn server_output_has_sender_evidence(entry: &ResponseStreamOutputEntr
         )
 }
 
-pub(super) fn record_server_sender_decision(
+pub(in crate::runtime) fn record_server_sender_decision(
     session_id: SessionId,
     stream_id: StreamId,
     key: CarrierPathKey,

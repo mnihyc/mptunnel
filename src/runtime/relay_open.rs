@@ -50,7 +50,6 @@ pub(super) struct ReliableRelayRemoteSet {
     pub(super) paths: Vec<ReliableRelayRemotePath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
-    next_send_index: usize,
     next_instance_id: u64,
 }
 
@@ -63,7 +62,6 @@ impl ReliableRelayRemoteSet {
             paths: Vec::new(),
             frames_tx,
             frames_rx,
-            next_send_index: 0,
             next_instance_id: 0,
         };
         set.attach(opened);
@@ -218,13 +216,7 @@ impl ReliableRelayRemoteSet {
             }
             RelayPathPlacement::Repair | RelayPathPlacement::Validation => self.paths.len() - 1,
         };
-        if insert_at < self.paths.len() && self.next_send_index >= insert_at {
-            self.next_send_index = self.next_send_index.saturating_add(1);
-        }
         self.paths.insert(insert_at, path);
-        if !self.paths.is_empty() {
-            self.next_send_index %= self.paths.len();
-        }
     }
 
     pub(super) async fn recv_frame(&mut self) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
@@ -234,192 +226,11 @@ impl ReliableRelayRemoteSet {
             .ok_or(RuntimeError::TcpPathSessionClosed)
     }
 
-    pub(super) async fn send_frame(
-        &mut self,
-        context: &ClientPathContext,
-        frame: Frame,
-    ) -> Result<RelayPathKey, RuntimeError> {
-        self.send_frame_with_avoid(context, frame, &[], None).await
-    }
-
-    pub(super) async fn send_frame_with_flight_ledger(
-        &mut self,
-        context: &ClientPathContext,
-        frame: Frame,
-        path_flights: &RelayPathFlightLedger,
-    ) -> Result<RelayPathKey, RuntimeError> {
-        self.send_frame_with_avoid(context, frame, &[], Some(path_flights))
-            .await
-    }
-
-    pub(super) async fn send_repair_frame(
-        &mut self,
-        context: &ClientPathContext,
-        frame: Frame,
-        avoid_keys: &[RelayPathKey],
-    ) -> Result<RelayPathKey, RuntimeError> {
-        self.send_frame_with_avoid(context, frame, avoid_keys, None)
-            .await
-    }
-
-    async fn send_frame_with_avoid(
-        &mut self,
-        context: &ClientPathContext,
-        frame: Frame,
-        avoid_keys: &[RelayPathKey],
-        path_flights: Option<&RelayPathFlightLedger>,
-    ) -> Result<RelayPathKey, RuntimeError> {
-        let mut last_error = None;
-        let stream_lane = self
-            .paths
-            .last()
-            .map(|path| path.stream.lane)
-            .unwrap_or(FlowLane::Latency);
-        let prefer_current_data_path =
-            reliable_relay_frame_prefers_current_data_path(&frame, stream_lane);
-        while !self.paths.is_empty() {
-            let selected_by_bulk_admission =
-                match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
-                    stream_id: self.stream_id,
-                    context,
-                    paths: &self.paths,
-                    lane: stream_lane,
-                    frame: &frame,
-                    cursor: self.next_send_index,
-                    avoid_keys,
-                    path_flights,
-                }) {
-                    BulkRelayPathChoice::Selected(position) => {
-                        self.next_send_index = position;
-                        true
-                    }
-                    BulkRelayPathChoice::Blocked => {
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "sender_admission_blocked",
-                            format_args!(
-                                "stream_id={} lane={:?} reason=bulk_no_safe_path",
-                                self.stream_id.0, stream_lane,
-                            ),
-                        );
-                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
-                        continue;
-                    }
-                    BulkRelayPathChoice::NotApplicable
-                        if prefer_current_data_path
-                            || relay_frame_is_bulk_stream_data(&frame, stream_lane)
-                            || self.paths.last().is_some_and(|path| {
-                                tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
-                                    &frame,
-                                    path.stream.lane,
-                                ))
-                            }) =>
-                    {
-                        self.next_send_index = self.paths.len() - 1;
-                        false
-                    }
-                    BulkRelayPathChoice::NotApplicable => false,
-                };
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = selected_by_bulk_admission;
-            self.next_send_index %= self.paths.len();
-            if avoid_keys.contains(&self.paths[self.next_send_index].key())
-                && let Some(position) = self
-                    .paths
-                    .iter()
-                    .position(|path| !avoid_keys.contains(&path.key()))
-            {
-                self.next_send_index = position;
-            }
-            let instance = self.paths[self.next_send_index].instance();
-            match self.paths[self.next_send_index]
-                .stream
-                .send_frame(frame.clone())
-                .await
-            {
-                Ok(()) => {
-                    let sent_bytes = reliable_stream_frame_payload_bytes(&frame);
-                    if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
-                        context.record_relay_path_send(
-                            instance.key.underlay,
-                            instance.key.index,
-                            sent_bytes,
-                        );
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "scheduler_decision",
-                            format_args!(
-                                "stream_id={} lane={:?} path_underlay={:?} path_index={} payload_bytes={} reason={}",
-                                self.stream_id.0,
-                                stream_lane,
-                                instance.key.underlay,
-                                instance.key.index,
-                                sent_bytes,
-                                if selected_by_bulk_admission {
-                                    "bulk_admission"
-                                } else {
-                                    "active_or_round_robin"
-                                },
-                            ),
-                        );
-                    }
-                    if !prefer_current_data_path
-                        && !tcp_path_frame_uses_priority_queue(tcp_path_effective_frame_lane(
-                            &frame,
-                            self.paths[self.next_send_index].stream.lane,
-                        ))
-                    {
-                        self.next_send_index = (self.next_send_index + 1) % self.paths.len();
-                    }
-                    return Ok(instance.key);
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    self.fail_path_instance(context, instance).await;
-                }
-            }
-        }
-        Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed))
-    }
-
-    pub(super) async fn reannounce_active_path(
-        &mut self,
-        context: &ClientPathContext,
-        spec: &ReliableRelayOpenSpec,
-        lane: FlowLane,
-    ) -> Result<(), RuntimeError> {
-        let Some(position) = self.paths.len().checked_sub(1) else {
-            return Err(RuntimeError::TcpPathSessionClosed);
-        };
-        let instance = self.paths[position].instance();
-        let output = self.paths[position].stream.output.clone();
-        self.paths[position].stream.lane = lane;
-        let frame = Frame::OpenStream {
-            stream_id: self.stream_id,
-            target: spec.target.clone(),
-            ingress: spec.ingress,
-            outbound: OutboundPolicy::Direct,
-            demand: stream_demand_hint_for_lane(lane),
-            role: StreamOpenRole::Active,
-        };
-        match output
-            .send_frame(self.stream_id, FlowLane::Control, frame)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                self.fail_path_instance(context, instance).await;
-                Err(err)
-            }
-        }
-    }
-
     pub(super) async fn close_all(&mut self) {
         let paths = std::mem::take(&mut self.paths);
         for path in paths {
             path.stream.close().await;
         }
-        self.next_send_index = 0;
     }
 
     pub(super) async fn fail_path_instance(
@@ -468,11 +279,6 @@ impl ReliableRelayRemoteSet {
 
     pub(super) fn remove_path_at(&mut self, position: usize) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
-        if self.paths.is_empty() {
-            self.next_send_index = 0;
-        } else {
-            self.next_send_index %= self.paths.len();
-        }
         Some(path)
     }
 
@@ -490,7 +296,6 @@ impl ReliableRelayRemoteSet {
         let mut path = self.paths.remove(position);
         path.placement = RelayPathPlacement::Active;
         self.paths.push(path);
-        self.next_send_index = 0;
         true
     }
 
@@ -499,34 +304,6 @@ impl ReliableRelayRemoteSet {
             .iter()
             .rposition(|path| path.placement == RelayPathPlacement::Active)
             .or_else(|| self.paths.len().checked_sub(1))
-    }
-
-    pub(super) async fn send_attach_control_to_instance(
-        &mut self,
-        instance: RelayPathInstance,
-        send_stream: &ReliableSendStream,
-        resend_fin: bool,
-    ) -> Result<bool, RuntimeError> {
-        let Some(position) = self
-            .paths
-            .iter()
-            .position(|path| path.instance() == instance)
-        else {
-            return Ok(false);
-        };
-        let mut sent = false;
-        if resend_fin {
-            self.paths[position]
-                .stream
-                .send_frame(Frame::StreamFin {
-                    stream_id: self.stream_id,
-                    final_offset: send_stream.next_offset(),
-                })
-                .await?;
-            sent = true;
-        }
-        let _ = send_stream;
-        Ok(sent)
     }
 }
 
@@ -832,9 +609,9 @@ async fn send_open_path_metrics(
     let Some(metrics) = context.relay_path_metrics(underlay, path_index) else {
         return Ok(());
     };
-    stream
-        .send_frame_with_lane(Frame::PathMetrics { metrics }, FlowLane::Control)
+    send_reliable_path_control_frame(stream, Frame::PathMetrics { metrics })
         .await
+        .map(|_| ())
 }
 
 pub(super) fn authenticated_path_join_frames(

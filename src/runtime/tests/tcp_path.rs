@@ -293,46 +293,6 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
 }
 
 #[tokio::test]
-async fn tcp_path_data_queue_round_robins_bulk_streams() {
-    let (tx, mut rx) = tcp_path_session_command_channels(8);
-    for (stream_id, offset, payload) in [
-        (StreamId(1), 0, b"a1".as_slice()),
-        (StreamId(1), 2, b"a2".as_slice()),
-        (StreamId(2), 0, b"b1".as_slice()),
-    ] {
-        tx.send_frame(
-            Frame::StreamData {
-                stream_id,
-                offset,
-                flags: StreamFlags::NONE,
-                payload: Bytes::copy_from_slice(payload),
-            },
-            FlowLane::Throughput,
-        )
-        .await
-        .expect("queue bulk frame");
-    }
-
-    let mut dispatched = Vec::new();
-    for _ in 0..3 {
-        match recv_tcp_path_command(&mut rx)
-            .await
-            .expect("queued command")
-        {
-            TcpPathSessionCommand::SendFrame(Frame::StreamData {
-                stream_id, offset, ..
-            }) => dispatched.push((stream_id, offset)),
-            _ => panic!("expected stream data"),
-        }
-    }
-
-    assert_eq!(
-        dispatched,
-        vec![(StreamId(1), 0), (StreamId(2), 0), (StreamId(1), 2)]
-    );
-}
-
-#[tokio::test]
 async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
     let (tx, mut commands_rx) = tcp_path_session_command_channels(1);
     tx.send_frame(
@@ -405,7 +365,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     .expect("late frame for closed stream should be ignored");
 
     let unknown = StreamId(99);
-    let err = route_client_tcp_stream_frame(
+    route_client_tcp_stream_frame(
         &mut streams,
         &mut closed_streams,
         unknown,
@@ -415,8 +375,8 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
         },
     )
     .await
-    .expect_err("unknown stream should remain a protocol error");
-    assert!(matches!(err, RuntimeError::Protocol(_)));
+    .expect("unknown product stream frame should be dropped at product layer");
+    assert!(closed_streams.contains(&unknown));
 }
 
 #[tokio::test]
@@ -465,7 +425,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
         .expect("late server stream frame should be ignored");
 
     let unknown = StreamId(99);
-    let err = registry
+    registry
         .route_frame(
             session_id,
             unknown,
@@ -475,8 +435,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
             },
         )
         .await
-        .expect_err("unknown server stream should remain a protocol error");
-    assert!(matches!(err, RuntimeError::Protocol(_)));
+        .expect("unknown server product stream frame should be dropped");
 }
 
 #[tokio::test]
@@ -1541,6 +1500,15 @@ fn opened_relay_stream_for_test(
     )
 }
 
+async fn send_relay_stream_frame_for_test(
+    sender: &mut RelaySenderService,
+    context: &ClientPathContext,
+    remotes: &mut ReliableRelayRemoteSet,
+    frame: Frame,
+) -> Result<RelaySendOutcome, RuntimeError> {
+    sender.send_stream_data(context, remotes, frame).await
+}
+
 #[tokio::test]
 async fn mixed_relay_current_carrier_tracks_latest_data_path() {
     let (tcp_stream, _tcp_commands, _tcp_frames) =
@@ -1604,18 +1572,20 @@ async fn repair_race_attach_preserves_active_data_path() {
         ResourceLimits::default(),
     )
     .expect("context");
-    remotes
-        .send_frame(
-            &context,
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"data"),
-            },
-        )
-        .await
-        .expect("send data");
+    let mut sender = RelaySenderService::new(stream_id);
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"data"),
+        },
+    )
+    .await
+    .expect("send data");
 
     match recv_tcp_path_command(&mut active_commands)
         .await
@@ -1660,19 +1630,21 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
     )
     .expect("context");
 
+    let mut sender = RelaySenderService::new(stream_id);
     let first_payload = Bytes::from(vec![1u8; 64 * 1024]);
-    remotes
-        .send_frame(
-            &context,
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: first_payload,
-            },
-        )
-        .await
-        .expect("first send");
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: first_payload,
+        },
+    )
+    .await
+    .expect("first send");
     match recv_tcp_path_command(&mut active_commands)
         .await
         .expect("active path first command")
@@ -1684,18 +1656,19 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
     }
 
     let second_payload = Bytes::from(vec![2u8; 64 * 1024]);
-    remotes
-        .send_frame(
-            &context,
-            Frame::StreamData {
-                stream_id,
-                offset: 64 * 1024,
-                flags: StreamFlags::NONE,
-                payload: second_payload,
-            },
-        )
-        .await
-        .expect("second send");
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 64 * 1024,
+            flags: StreamFlags::NONE,
+            payload: second_payload,
+        },
+    )
+    .await
+    .expect("second send");
     match recv_tcp_path_command(&mut active_commands)
         .await
         .expect("active path second command")
@@ -1741,18 +1714,20 @@ async fn bulk_relay_validation_path_can_receive_admitted_probe_data() {
     context.mark_tcp_path_open_success(0, Duration::from_millis(180), FlowLane::Throughput);
     context.mark_tcp_path_open_success(1, Duration::from_millis(20), FlowLane::Throughput);
 
-    remotes
-        .send_frame(
-            &context,
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from(vec![8u8; 64 * 1024]),
-            },
-        )
-        .await
-        .expect("send admitted validation bulk");
+    let mut sender = RelaySenderService::new(stream_id);
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![8u8; 64 * 1024]),
+        },
+    )
+    .await
+    .expect("send admitted validation bulk");
 
     match tokio::time::timeout(
         Duration::from_millis(100),
@@ -1803,18 +1778,20 @@ async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Throughput);
     context.mark_tcp_path_open_success(1, Duration::from_millis(180), FlowLane::Throughput);
 
-    remotes
-        .send_frame(
-            &context,
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from(vec![4u8; 64 * 1024]),
-            },
-        )
-        .await
-        .expect("send bulk through ECF-gated peer path");
+    let mut sender = RelaySenderService::new(stream_id);
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![4u8; 64 * 1024]),
+        },
+    )
+    .await
+    .expect("send bulk through ECF-gated peer path");
 
     match tokio::time::timeout(
         Duration::from_millis(100),
@@ -1897,18 +1874,20 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         Some(0)
     );
 
-    remotes
-        .send_frame(
-            &context,
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from_static(b"bulk"),
-            },
-        )
-        .await
-        .expect("send data");
+    let mut sender = RelaySenderService::new(stream_id);
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"bulk"),
+        },
+    )
+    .await
+    .expect("send data");
     match recv_tcp_path_command(&mut fast_commands)
         .await
         .expect("fast command")
@@ -1966,10 +1945,11 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
     send_stream
         .send_data(Bytes::from_static(b"repair"), StreamFlags::NONE)
         .expect("repair data");
+    let mut sender = RelaySenderService::new(stream_id);
 
     assert!(
-        !remotes
-            .send_attach_control_to_instance(instance, &send_stream, false)
+        !sender
+            .send_attach_control_to_instance(&mut remotes, instance, &send_stream, false)
             .await
             .expect("repair replay decision"),
         "reattach without an explicit ACK gap must not emit whole-cache repair data"
@@ -1983,91 +1963,4 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
         .is_err(),
         "repair emission must be gap-targeted instead of whole-cache"
     );
-}
-
-#[tokio::test]
-async fn server_bulk_output_waits_when_active_path_exceeds_admission_budget() {
-    let mux_limits = MuxLimits {
-        max_tcp_path_inflight_bytes: 16 * 1024,
-        max_reorder_bytes: 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let (commands, mut command_rx) = tcp_path_session_command_channels(8);
-    let binding = ResponseStreamBinding::new_with_limits(
-        SessionId(1),
-        UnderlayProtocol::Udp,
-        PathId(0),
-        commands,
-        FlowLane::Throughput,
-        mux_limits,
-    );
-    let stream_id = StreamId(80);
-    let first_payload = Bytes::from(vec![1u8; mux_limits.max_tcp_path_inflight_bytes]);
-    binding
-        .send_frame(
-            stream_id,
-            FlowLane::Throughput,
-            Frame::StreamData {
-                stream_id,
-                offset: 0,
-                flags: StreamFlags::NONE,
-                payload: first_payload,
-            },
-        )
-        .await
-        .expect("first bulk send")
-        .expect("selected path");
-    let first_command = recv_tcp_path_command(&mut command_rx)
-        .await
-        .expect("first queued command");
-    let first_pending_bytes = tcp_path_command_pending_bytes(&first_command);
-    match first_command {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => assert_eq!(offset, 0),
-        _ => panic!("expected first stream data frame"),
-    }
-
-    let pending_binding = binding.clone();
-    let pending = tokio::spawn(async move {
-        pending_binding
-            .send_frame(
-                stream_id,
-                FlowLane::Throughput,
-                Frame::StreamData {
-                    stream_id,
-                    offset: mux_limits.max_tcp_path_inflight_bytes as u64,
-                    flags: StreamFlags::NONE,
-                    payload: Bytes::from_static(b"x"),
-                },
-            )
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(
-        !pending.is_finished(),
-        "bulk send should wait while the active path is over admission budget"
-    );
-
-    binding.release_acked_ranges(&[OffsetRange {
-        start: 0,
-        end: mux_limits.max_tcp_path_inflight_bytes as u64,
-    }]);
-    command_rx.release_pending_command_bytes(first_pending_bytes);
-    tokio::time::timeout(Duration::from_millis(200), pending)
-        .await
-        .expect("send should wake after ACK release")
-        .expect("join pending send")
-        .expect("second bulk send")
-        .expect("selected path");
-    match recv_tcp_path_command(&mut command_rx)
-        .await
-        .expect("second queued command")
-    {
-        TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            offset, payload, ..
-        }) => {
-            assert_eq!(offset, mux_limits.max_tcp_path_inflight_bytes as u64);
-            assert_eq!(payload, Bytes::from_static(b"x"));
-        }
-        _ => panic!("expected second stream data frame"),
-    }
 }

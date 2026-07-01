@@ -703,7 +703,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
     let mut sender = ServerResponseSenderService::new(SessionId(7), stream_id);
     sender.enqueue_data(Bytes::from_static(b"response"));
 
-    assert!(sender.queued_send_ready(&path_stream, &send_stream, FlowLane::Throughput));
+    assert!(sender.queued_send_ready());
     let dispatch = sender
         .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
         .await
@@ -1752,6 +1752,7 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
     {
         ServerReliableStreamOpen::New(stream) => stream,
         ServerReliableStreamOpen::Existing => panic!("expected new stream"),
+        ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
     };
     assert_eq!(stream.current_lane(), FlowLane::Latency);
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
@@ -1763,6 +1764,87 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
 
     assert_eq!(stream.current_lane(), FlowLane::Throughput);
     assert_eq!(binding.lane(), FlowLane::Throughput);
+}
+
+#[test]
+fn server_reliable_registry_rejects_attach_only_unknown_stream() {
+    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let opened = registry
+        .open_or_attach(
+            ServerReliableStreamOpenRequest {
+                session_id: SessionId(1),
+                stream_id: StreamId(99),
+                target: &target,
+                lane: FlowLane::Throughput,
+                attachment: ServerReliablePathAttachment {
+                    path_id: PathId(1),
+                    underlay: UnderlayProtocol::Tcp,
+                    commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Validation,
+                },
+            },
+            MuxLimits::default(),
+            ResourceLimits::default().max_streams,
+        )
+        .expect("attach-only open should be handled");
+    assert!(matches!(opened, ServerReliableStreamOpen::Rejected));
+    assert_eq!(registry.management_snapshot().active_streams, 0);
+}
+
+#[test]
+fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
+    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let session_id = SessionId(1);
+    let stream_id = StreamId(100);
+    let opened = registry
+        .open_or_attach(
+            ServerReliableStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: &target,
+                lane: FlowLane::Throughput,
+                attachment: ServerReliablePathAttachment {
+                    path_id: PathId(0),
+                    underlay: UnderlayProtocol::Tcp,
+                    commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Active,
+                },
+            },
+            MuxLimits::default(),
+            ResourceLimits::default().max_streams,
+        )
+        .expect("active open should be handled");
+    assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
+    registry.close(session_id, stream_id);
+
+    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let reopened = registry
+        .open_or_attach(
+            ServerReliableStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: &target,
+                lane: FlowLane::Throughput,
+                attachment: ServerReliablePathAttachment {
+                    path_id: PathId(1),
+                    underlay: UnderlayProtocol::Tcp,
+                    commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Active,
+                },
+            },
+            MuxLimits::default(),
+            ResourceLimits::default().max_streams,
+        )
+        .expect("closed-stream reopen should be handled");
+    assert!(matches!(reopened, ServerReliableStreamOpen::Rejected));
+    assert_eq!(registry.management_snapshot().active_streams, 0);
 }
 
 #[tokio::test]

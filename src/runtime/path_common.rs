@@ -130,7 +130,7 @@ fn server_udp_next_response_ttl(
         .map(|(_, ttl_ms, datagram_id)| (ttl_ms, datagram_id))
 }
 
-fn frame_kind_name(frame: &Frame) -> &'static str {
+pub(super) fn frame_kind_name(frame: &Frame) -> &'static str {
     match frame {
         Frame::SessionHello { .. } => "SESSION_HELLO",
         Frame::SessionAuth { .. } => "SESSION_AUTH",

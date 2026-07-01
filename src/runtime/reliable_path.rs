@@ -5,7 +5,7 @@ mod registry;
 mod response_admission;
 
 pub(in crate::runtime) use registry::*;
-use response_admission::*;
+pub(super) use response_admission::*;
 
 // Ownership boundary:
 // This module owns carrier-neutral reliable stream bindings on the response
@@ -212,7 +212,6 @@ pub(super) struct ResponseStreamBinding {
     outputs: Mutex<ResponseStreamOutputs>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
-    lead_path: Mutex<Option<CarrierPathKey>>,
     version: watch::Sender<u64>,
 }
 
@@ -280,13 +279,11 @@ impl ResponseStreamBinding {
                     product_queue_bytes: 0,
                     delivery_samples: 0,
                     last_delivery_at: None,
-                    validation_credit_bytes: 0,
                     path_metrics: None,
                 }],
             }),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
-            lead_path: Mutex::new(Some(key)),
             version,
         })
     }
@@ -298,7 +295,7 @@ impl ResponseStreamBinding {
         commands: TcpPathSessionCommandSender,
         lane: FlowLane,
         role: StreamOpenRole,
-        max_frame_payload_bytes: usize,
+        _max_frame_payload_bytes: usize,
     ) {
         let previous_lane = {
             let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
@@ -313,7 +310,7 @@ impl ResponseStreamBinding {
         let key = CarrierPathKey { underlay, path_id };
         let mut was_active = false;
         let mut already_attached = false;
-        let mut entry =
+        let entry =
             if let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) {
                 was_active = position + 1 == outputs.entries.len();
                 already_attached = true;
@@ -328,20 +325,9 @@ impl ResponseStreamBinding {
                     product_queue_bytes: 0,
                     delivery_samples: 0,
                     last_delivery_at: None,
-                    validation_credit_bytes: if role == StreamOpenRole::Validation {
-                        max_frame_payload_bytes.saturating_mul(2) as u64
-                    } else {
-                        0
-                    },
                     path_metrics: None,
                 }
             };
-        if role == StreamOpenRole::Validation {
-            let validation_limit = max_frame_payload_bytes.saturating_mul(2) as u64;
-            entry.validation_credit_bytes = entry.validation_credit_bytes.max(validation_limit);
-        } else {
-            entry.validation_credit_bytes = 0;
-        }
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
             || was_active
             || outputs.entries.is_empty();
@@ -363,12 +349,6 @@ impl ResponseStreamBinding {
         }
         if !already_attached {
             self.lane_tracker.attach(self.session_id, key, lane);
-        }
-        if server_stream_open_role_promotes_data_path(role) {
-            *self
-                .lead_path
-                .lock()
-                .expect("server reliable stream lead path lock") = Some(key);
         }
         self.notify_update();
     }
@@ -451,7 +431,7 @@ impl ResponseStreamBinding {
             > 1
     }
 
-    fn detach(&self, key: CarrierPathKey, commands: &TcpPathSessionCommandSender) {
+    pub(super) fn detach(&self, key: CarrierPathKey, commands: &TcpPathSessionCommandSender) {
         let lane = self.lane();
         let mut outputs = self
             .outputs
@@ -462,17 +442,7 @@ impl ResponseStreamBinding {
             .entries
             .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
         if outputs.entries.len() != before {
-            let still_attached = outputs
-                .entries
-                .iter()
-                .any(|entry| Some(entry.key) == *self.lead_path.lock().expect("lead path lock"));
             drop(outputs);
-            if !still_attached {
-                *self
-                    .lead_path
-                    .lock()
-                    .expect("server reliable stream lead path lock") = None;
-            }
             self.lane_tracker.detach(self.session_id, key, lane);
             self.notify_update();
         }
@@ -491,7 +461,6 @@ impl ResponseStreamBinding {
         outputs.entries[position].delivery_samples =
             outputs.entries[position].delivery_samples.saturating_add(1);
         outputs.entries[position].last_delivery_at = Some(now);
-        outputs.entries[position].validation_credit_bytes = 0;
         if !was_active {
             let entry = outputs.entries.remove(position);
             outputs.entries.push(entry);
@@ -600,7 +569,12 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn record_flight(&self, key: CarrierPathKey, frame: &Frame, stream_ack_proves_path: bool) {
+    pub(super) fn record_flight(
+        &self,
+        key: CarrierPathKey,
+        frame: &Frame,
+        stream_ack_proves_path: bool,
+    ) {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
@@ -611,8 +585,6 @@ impl ResponseStreamBinding {
                 .expect("server reliable stream binding lock");
             if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
-                entry.validation_credit_bytes =
-                    entry.validation_credit_bytes.saturating_sub(bytes as u64);
             }
         }
         self.flights
@@ -628,14 +600,14 @@ impl ResponseStreamBinding {
             });
     }
 
-    fn lower_flights_before_frame(&self, frame: &Frame) -> Vec<CarrierPathFlightDebt> {
+    pub(super) fn lower_flights_before_frame(&self, frame: &Frame) -> Vec<CarrierPathFlightDebt> {
         let Some((offset, _, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
         self.lower_flights_before_offset(offset)
     }
 
-    fn flight_keys_overlapping_frame(&self, frame: &Frame) -> Vec<CarrierPathKey> {
+    pub(super) fn flight_keys_overlapping_frame(&self, frame: &Frame) -> Vec<CarrierPathKey> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
@@ -694,6 +666,56 @@ impl ResponseStreamBinding {
         debts.into_values().collect()
     }
 
+    pub(super) fn sender_path_targets(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Vec<ResponseSenderPathTarget> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let active_key = outputs.entries.last().map(|entry| entry.key);
+        let now = Instant::now();
+        outputs
+            .entries
+            .iter()
+            .map(|entry| {
+                let snapshot = server_bulk_output_snapshot(
+                    entry,
+                    self.session_id,
+                    lane,
+                    &self.lane_tracker,
+                    self.mux_limits,
+                    now,
+                );
+                ResponseSenderPathTarget {
+                    key: entry.key,
+                    commands: entry.commands.clone(),
+                    snapshot,
+                    eta_ms: server_bulk_output_eta_ms(
+                        entry.key,
+                        snapshot,
+                        active_key,
+                        lane,
+                        payload_bytes,
+                        self.mux_limits,
+                    ),
+                    is_active: Some(entry.key) == active_key,
+                    has_sender_evidence: server_output_has_sender_evidence(entry),
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn mux_limits(&self) -> MuxLimits {
+        self.mux_limits
+    }
+
+    pub(super) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
         let lane = self.lane();
         let outputs = self
@@ -738,157 +760,6 @@ impl ResponseStreamBinding {
             self.notify_update();
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn update_path_metrics_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        metrics: PathMetrics,
-    ) {
-        self.update_path_metrics(
-            CarrierPathKey { underlay, path_id },
-            metrics,
-            ServerPathMetricsSource::LocalSender,
-        );
-    }
-
-    #[cfg(test)]
-    pub(super) fn update_peer_path_metrics_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        metrics: PathMetrics,
-    ) {
-        self.update_path_metrics(
-            CarrierPathKey { underlay, path_id },
-            metrics,
-            ServerPathMetricsSource::PeerHint,
-        );
-    }
-
-    #[cfg(test)]
-    pub(super) fn output_snapshot_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-    ) -> Option<PathSnapshot> {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        outputs
-            .entries
-            .iter()
-            .find(|entry| entry.key == CarrierPathKey { underlay, path_id })
-            .map(|entry| {
-                server_bulk_output_snapshot(
-                    entry,
-                    self.session_id,
-                    FlowLane::Throughput,
-                    &self.lane_tracker,
-                    self.mux_limits,
-                    Instant::now(),
-                )
-            })
-    }
-
-    #[cfg(test)]
-    pub(super) fn output_has_sender_evidence_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-    ) -> bool {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        outputs
-            .entries
-            .iter()
-            .find(|entry| entry.key == CarrierPathKey { underlay, path_id })
-            .is_some_and(server_output_has_sender_evidence)
-    }
-
-    #[cfg(test)]
-    pub(super) fn output_eta_ms_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        payload_bytes: usize,
-    ) -> Option<f64> {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let active_key = outputs.entries.last().map(|entry| entry.key);
-        outputs
-            .entries
-            .iter()
-            .find(|entry| entry.key == CarrierPathKey { underlay, path_id })
-            .map(|entry| {
-                server_bulk_output_eta_ms(
-                    entry.key,
-                    server_bulk_output_snapshot(
-                        entry,
-                        self.session_id,
-                        FlowLane::Throughput,
-                        &self.lane_tracker,
-                        self.mux_limits,
-                        Instant::now(),
-                    ),
-                    active_key,
-                    FlowLane::Throughput,
-                    payload_bytes,
-                    self.mux_limits,
-                )
-            })
-    }
-
-    #[cfg(test)]
-    pub(super) fn record_flight_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        offset: u64,
-        payload_bytes: usize,
-        stream_ack_proves_path: bool,
-    ) {
-        self.record_flight(
-            CarrierPathKey { underlay, path_id },
-            &Frame::StreamData {
-                stream_id: StreamId(7),
-                offset,
-                flags: StreamFlags::NONE,
-                payload: Bytes::from(vec![0u8; payload_bytes]),
-            },
-            stream_ack_proves_path,
-        );
-    }
-
-    #[cfg(test)]
-    pub(super) fn lower_flight_debt_keys_for_test(
-        &self,
-        offset: u64,
-    ) -> Vec<(UnderlayProtocol, PathId, u64)> {
-        self.lower_flights_before_offset(offset)
-            .into_iter()
-            .map(|debt| (debt.key.underlay, debt.key.path_id, debt.bytes))
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(super) fn ack_ordering_state_for_test(&self) -> (u64, u64) {
-        let ordering = self
-            .ack_ordering
-            .lock()
-            .expect("server response ACK ordering lock");
-        (ordering.contiguous_frontier, ordering.acked_hole_bytes())
-    }
-}
-
-pub(super) fn server_frame_prefers_current_data_path(frame: &Frame, lane: FlowLane) -> bool {
-    matches!(frame, Frame::StreamData { .. }) && !relay_lane_is_bulk(lane)
 }
 
 fn server_stream_open_role_promotes_data_path(role: StreamOpenRole) -> bool {

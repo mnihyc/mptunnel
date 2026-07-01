@@ -1,3 +1,7 @@
+use super::bulk_admission::{
+    BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
+    bulk_candidate_admission_suppression_with_ordering_debt,
+};
 use super::*;
 
 // Ownership boundary:
@@ -42,6 +46,7 @@ pub(super) struct RelaySenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     stream_id: StreamId,
     flights: RelayPathFlightLedger,
+    next_send_index: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,10 +204,6 @@ impl ReliableRelaySenderQueue {
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
         self.commit_front()
     }
-
-    pub(super) fn front_data_payload_bytes(&self) -> Option<usize> {
-        self.data.front().map(|work| work.payload_bytes)
-    }
 }
 
 pub(super) fn reliable_relay_sender_queue_limit(
@@ -291,6 +292,248 @@ pub(super) struct ServerResponseDispatch {
     pub(super) payload_bytes: usize,
     pub(super) lane: ReliableRelayQueuedWorkLane,
     pub(super) selected_path: Option<CarrierPathKey>,
+}
+
+fn carrier_path_key_order(left: CarrierPathKey, right: CarrierPathKey) -> std::cmp::Ordering {
+    relay_underlay_order(left.underlay)
+        .cmp(&relay_underlay_order(right.underlay))
+        .then_with(|| left.path_id.0.cmp(&right.path_id.0))
+}
+
+fn response_total_lower_flight_debt_bytes(lower_flights: &[CarrierPathFlightDebt]) -> u64 {
+    lower_flights.iter().map(|flight| flight.bytes).sum()
+}
+
+fn response_ordering_debt_bytes(
+    lower_flights: &[CarrierPathFlightDebt],
+    candidate: CarrierPathKey,
+) -> u64 {
+    lower_flights
+        .iter()
+        .filter_map(|flight| (flight.key != candidate).then_some(flight.bytes))
+        .sum()
+}
+
+fn response_oldest_lower_flight_owner(
+    lower_flights: &[CarrierPathFlightDebt],
+) -> Option<CarrierPathKey> {
+    lower_flights.first().map(|flight| flight.key)
+}
+
+fn response_bulk_admission_role(
+    lead_key: CarrierPathKey,
+    candidate: CarrierPathKey,
+    lower_owner: Option<CarrierPathKey>,
+    ordering_debt: u64,
+) -> BulkAdmissionRole {
+    if lower_owner == Some(candidate) || (candidate == lead_key && ordering_debt == 0) {
+        BulkAdmissionRole::ActiveDataPath
+    } else if let Some(owner) = lower_owner {
+        bulk_additional_admission_role(owner.underlay, candidate.underlay)
+    } else {
+        bulk_additional_admission_role(lead_key.underlay, candidate.underlay)
+    }
+}
+
+fn choose_lowest_eta_response_target(
+    targets: &[ResponseSenderPathTarget],
+    avoid_keys: &[CarrierPathKey],
+    prefer_avoiding: bool,
+) -> Option<ResponseSenderPathTarget> {
+    targets
+        .iter()
+        .filter(|target| !prefer_avoiding || !avoid_keys.contains(&target.key))
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .cloned()
+}
+
+fn choose_response_sender_target(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    frame: &Frame,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    avoid_keys: &[CarrierPathKey],
+    repair: bool,
+) -> Option<ResponseSenderPathTarget> {
+    if targets.is_empty() {
+        return None;
+    }
+    if repair || !relay_frame_is_bulk_stream_data(frame, lane) {
+        return choose_lowest_eta_response_target(targets, avoid_keys, true)
+            .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false));
+    }
+    let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+    let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    let proven_targets = targets
+        .iter()
+        .filter(|target| target.is_active || target.has_sender_evidence)
+        .collect::<Vec<_>>();
+    let candidate_targets = if proven_targets.is_empty() {
+        targets.iter().collect::<Vec<_>>()
+    } else {
+        proven_targets
+    };
+    let lead = targets
+        .iter()
+        .filter(|target| {
+            candidate_targets
+                .iter()
+                .any(|candidate| candidate.key == target.key)
+        })
+        .filter(|target| {
+            lower_owner.is_none_or(|owner| owner == target.key)
+                || target.is_active
+                || target.has_sender_evidence
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .or_else(|| {
+            candidate_targets.iter().copied().min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+        })?;
+    let selected = candidate_targets
+        .iter()
+        .copied()
+        .filter(|target| {
+            let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
+            let role =
+                response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
+            let admission_debt = if role == BulkAdmissionRole::ActiveDataPath {
+                response_total_lower_flight_debt_bytes(lower_flights)
+            } else {
+                ordering_debt
+            };
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: target.snapshot,
+                candidate_eta_ms: target.eta_ms,
+                payload_bytes,
+                mux_limits,
+                role,
+                stream_ordering_debt_bytes: admission_debt,
+            })
+            .is_none()
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .cloned();
+    selected.or_else(|| {
+        candidate_targets
+            .iter()
+            .copied()
+            .min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+            .cloned()
+    })
+}
+
+async fn emit_response_frame_from_sender_service(
+    stream: &ReliablePathStream,
+    frame: Frame,
+    lane: FlowLane,
+    reason: &'static str,
+    repair: bool,
+) -> Result<Option<CarrierPathKey>, RuntimeError> {
+    match &stream.output {
+        ReliablePathStreamOutput::Fixed(commands) => {
+            commands.send_frame(frame, lane).await?;
+            Ok(None)
+        }
+        ReliablePathStreamOutput::Switchable(binding) => {
+            let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+            let lower_flights = if relay_frame_is_bulk_stream_data(&frame, lane) && !repair {
+                binding.lower_flights_before_frame(&frame)
+            } else {
+                Vec::new()
+            };
+            let avoid_keys = if repair {
+                binding.flight_keys_overlapping_frame(&frame)
+            } else {
+                Vec::new()
+            };
+            let mut last_error = None;
+            loop {
+                let targets = binding.sender_path_targets(lane, payload_bytes);
+                let Some(target) = choose_response_sender_target(
+                    &targets,
+                    lane,
+                    &frame,
+                    binding.mux_limits(),
+                    &lower_flights,
+                    &avoid_keys,
+                    repair,
+                ) else {
+                    return Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed));
+                };
+                match target.commands.send_frame(frame.clone(), lane).await {
+                    Ok(()) => {
+                        if matches!(frame, Frame::StreamData { .. }) {
+                            binding.record_flight(target.key, &frame, !repair);
+                        }
+                        record_server_sender_decision(
+                            binding.session_id(),
+                            stream.stream_id,
+                            target.key,
+                            &frame,
+                            lane,
+                            reason,
+                        );
+                        return Ok(Some(target.key));
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                        binding.detach(target.key, &target.commands);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(super) async fn send_reliable_path_control_frame(
+    stream: &ReliablePathStream,
+    frame: Frame,
+) -> Result<Option<CarrierPathKey>, RuntimeError> {
+    emit_response_frame_from_sender_service(stream, frame, FlowLane::Control, "control", false)
+        .await
+}
+
+async fn emit_relay_path_frame(
+    stream: &ReliablePathStreamHandle,
+    frame: Frame,
+    lane: FlowLane,
+) -> Result<(), RuntimeError> {
+    match &stream.output {
+        ReliablePathStreamOutput::Fixed(commands) => commands.send_frame(frame, lane).await,
+        ReliablePathStreamOutput::Switchable(_) => {
+            Err(RuntimeError::Protocol("request relay path is not fixed"))
+        }
+    }
+}
+
+fn relay_cursor_distance(position: usize, cursor: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    position.wrapping_add(len).wrapping_sub(cursor % len) % len
 }
 
 impl ServerResponseSenderService {
@@ -410,17 +653,30 @@ impl ServerResponseSenderService {
             _ => None,
         };
         let selected_path = match queued_lane {
-            ReliableRelayQueuedWorkLane::Data => {
-                match path_stream.send_frame_tracked(frame.clone()).await {
-                    Ok(selected_path) => selected_path,
-                    Err(err) => {
-                        let _ = send_stream.rollback_committed_data(&frame);
-                        return Err(err);
-                    }
+            ReliableRelayQueuedWorkLane::Data => match emit_response_frame_from_sender_service(
+                path_stream,
+                frame.clone(),
+                tcp_path_effective_frame_lane(&frame, relay_lane),
+                "data",
+                false,
+            )
+            .await
+            {
+                Ok(selected_path) => selected_path,
+                Err(err) => {
+                    let _ = send_stream.rollback_committed_data(&frame);
+                    return Err(err);
                 }
-            }
+            },
             ReliableRelayQueuedWorkLane::Repair => {
-                path_stream.send_repair_frame(frame.clone()).await?
+                emit_response_frame_from_sender_service(
+                    path_stream,
+                    frame.clone(),
+                    FlowLane::Latency,
+                    "tail_repair",
+                    true,
+                )
+                .await?
             }
         };
         let (_, committed) = self
@@ -488,6 +744,7 @@ impl RelaySenderService {
         Self {
             stream_id,
             flights: RelayPathFlightLedger::default(),
+            next_send_index: 0,
         }
     }
 
@@ -531,21 +788,183 @@ impl RelaySenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
-        let path_key = if cause.is_repair() {
-            let avoid_keys = self.flights.sent_keys_for_frame(&sent_frame);
-            remotes
-                .send_repair_frame(context, frame, &avoid_keys)
-                .await?
-        } else if matches!(sent_frame, Frame::StreamData { .. }) {
-            remotes
-                .send_frame_with_flight_ledger(context, frame, &self.flights)
-                .await?
+        let avoid_keys = if cause.is_repair() {
+            self.flights.sent_keys_for_frame(&sent_frame)
         } else {
-            remotes.send_frame(context, frame).await?
+            Vec::new()
         };
+        let path_key = self
+            .emit_relay_frame(context, remotes, frame, cause, &avoid_keys)
+            .await?;
         let payload_bytes = self.flights.record_frame(path_key, &sent_frame);
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
         Ok(RelaySendOutcome { path_key })
+    }
+
+    async fn emit_relay_frame(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        frame: Frame,
+        cause: RelaySendCause,
+        avoid_keys: &[RelayPathKey],
+    ) -> Result<RelayPathKey, RuntimeError> {
+        let mut last_error = None;
+        while !remotes.paths.is_empty() {
+            let stream_lane = remotes
+                .paths
+                .last()
+                .map(|path| path.stream.lane)
+                .unwrap_or(FlowLane::Latency);
+            let Some(position) = self.choose_relay_path_position(
+                context,
+                remotes,
+                &frame,
+                stream_lane,
+                cause,
+                avoid_keys,
+            ) else {
+                return Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed));
+            };
+            let instance = remotes.paths[position].instance();
+            let lane = tcp_path_effective_frame_lane(&frame, remotes.paths[position].stream.lane);
+            match emit_relay_path_frame(&remotes.paths[position].stream, frame.clone(), lane).await
+            {
+                Ok(()) => {
+                    if matches!(frame, Frame::StreamData { .. }) {
+                        let sent_bytes = reliable_stream_frame_payload_bytes(&frame);
+                        context.record_relay_path_send(
+                            instance.key.underlay,
+                            instance.key.index,
+                            sent_bytes,
+                        );
+                    }
+                    self.next_send_index = if remotes.paths.is_empty() {
+                        0
+                    } else {
+                        (position + 1) % remotes.paths.len()
+                    };
+                    return Ok(instance.key);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    remotes.fail_path_instance(context, instance).await;
+                    if !remotes.paths.is_empty() {
+                        self.next_send_index %= remotes.paths.len();
+                    } else {
+                        self.next_send_index = 0;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed))
+    }
+
+    fn choose_relay_path_position(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: FlowLane,
+        cause: RelaySendCause,
+        avoid_keys: &[RelayPathKey],
+    ) -> Option<usize> {
+        if remotes.paths.is_empty() {
+            return None;
+        }
+        self.next_send_index %= remotes.paths.len();
+        if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
+            match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+                stream_id: remotes.stream_id(),
+                context,
+                paths: &remotes.paths,
+                lane,
+                frame,
+                cursor: self.next_send_index,
+                avoid_keys,
+                path_flights: Some(&self.flights),
+            }) {
+                BulkRelayPathChoice::Selected(position) => return Some(position),
+                BulkRelayPathChoice::Blocked | BulkRelayPathChoice::NotApplicable => {}
+            }
+        }
+        self.choose_lowest_eta_relay_path(
+            context,
+            remotes,
+            frame,
+            lane,
+            avoid_keys,
+            matches!(frame, Frame::StreamData { .. }) && !cause.is_repair(),
+        )
+    }
+
+    fn choose_lowest_eta_relay_path(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: FlowLane,
+        avoid_keys: &[RelayPathKey],
+        ordinary_stream_data: bool,
+    ) -> Option<usize> {
+        let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+        let has_active_path = remotes
+            .paths
+            .iter()
+            .any(|path| path.placement == RelayPathPlacement::Active);
+        let choose = |prefer_avoiding: bool| {
+            remotes
+                .paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| !prefer_avoiding || !avoid_keys.contains(&path.key()))
+                .filter(|(_, path)| {
+                    !ordinary_stream_data
+                        || !has_active_path
+                        || path.placement == RelayPathPlacement::Active
+                })
+                .filter_map(|(position, path)| {
+                    let key = path.key();
+                    let snapshot = relay_path_snapshot(context, key)?;
+                    let score = scheduler::score_path(
+                        snapshot,
+                        lane,
+                        payload_bytes,
+                        SchedulerPolicy::default(),
+                    )?;
+                    Some((
+                        position,
+                        score.eta_ms,
+                        relay_cursor_distance(position, self.next_send_index, remotes.paths.len()),
+                    ))
+                })
+                .min_by(|left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| left.2.cmp(&right.2))
+                })
+                .map(|(position, _, _)| position)
+        };
+        choose(true).or_else(|| choose(false)).or_else(|| {
+            remotes
+                .paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| {
+                    !ordinary_stream_data
+                        || !has_active_path
+                        || path.placement == RelayPathPlacement::Active
+                })
+                .map(|(position, _)| position)
+                .find(|position| !avoid_keys.contains(&remotes.paths[*position].key()))
+                .or_else(|| {
+                    remotes
+                        .paths
+                        .iter()
+                        .position(|path| !avoid_keys.contains(&path.key()))
+                })
+                .or_else(|| remotes.paths.first().map(|_| 0))
+        })
     }
 
     pub(super) fn release_acked_ranges(
@@ -582,6 +1001,65 @@ impl RelaySenderService {
                 release.bytes,
             );
         }
+    }
+
+    pub(super) async fn reannounce_active_path(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        spec: &ReliableRelayOpenSpec,
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        let Some(position) = remotes.paths.len().checked_sub(1) else {
+            return Err(RuntimeError::TcpPathSessionClosed);
+        };
+        let instance = remotes.paths[position].instance();
+        remotes.paths[position].stream.lane = lane;
+        let frame = Frame::OpenStream {
+            stream_id: remotes.stream_id(),
+            target: spec.target.clone(),
+            ingress: spec.ingress,
+            outbound: OutboundPolicy::Direct,
+            demand: stream_demand_hint_for_lane(lane),
+            role: StreamOpenRole::Active,
+        };
+        match emit_relay_path_frame(&remotes.paths[position].stream, frame, FlowLane::Control).await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                remotes.fail_path_instance(context, instance).await;
+                Err(err)
+            }
+        }
+    }
+
+    pub(super) async fn send_attach_control_to_instance(
+        &mut self,
+        remotes: &mut ReliableRelayRemoteSet,
+        instance: RelayPathInstance,
+        send_stream: &ReliableSendStream,
+        resend_fin: bool,
+    ) -> Result<bool, RuntimeError> {
+        let Some(position) = remotes
+            .paths
+            .iter()
+            .position(|path| path.instance() == instance)
+        else {
+            return Ok(false);
+        };
+        if !resend_fin {
+            return Ok(false);
+        }
+        emit_relay_path_frame(
+            &remotes.paths[position].stream,
+            Frame::StreamFin {
+                stream_id: remotes.stream_id(),
+                final_offset: send_stream.next_offset(),
+            },
+            FlowLane::Control,
+        )
+        .await?;
+        Ok(true)
     }
 
     pub(super) async fn send_recv_progress(

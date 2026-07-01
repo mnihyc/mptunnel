@@ -12,12 +12,14 @@ pub(super) async fn send_relay_attach_control_frames(
     resend_fin: bool,
 ) -> Result<(), RuntimeError> {
     if resend_fin {
-        path_stream
-            .send_frame(Frame::StreamFin {
+        send_reliable_path_control_frame(
+            path_stream,
+            Frame::StreamFin {
                 stream_id: path_stream.stream_id,
                 final_offset: send_stream.next_offset(),
-            })
-            .await?;
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -329,11 +331,11 @@ pub(super) async fn send_tcp_recv_progress(
         let ack_frame = recv_stream.ack_frame();
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record("mux.ack_frames", ack_started.elapsed(), 1);
-        path_stream.send_frame(ack_frame).await?;
+        send_reliable_path_control_frame(path_stream, ack_frame).await?;
         sent_any = true;
     }
     if progress.should_send_max_data(recv_stream, mux_limits, force_max_data) {
-        path_stream.send_frame(recv_stream.max_data_frame()).await?;
+        send_reliable_path_control_frame(path_stream, recv_stream.max_data_frame()).await?;
         sent_any = true;
     }
     Ok(sent_any)
@@ -1061,7 +1063,7 @@ where
                                 stream_id,
                                 final_offset: send_stream.next_offset(),
                             };
-                            path_stream.send_frame(frame).await?;
+                            send_reliable_path_control_frame(&path_stream, frame).await?;
                             close_sent = true;
                             pending_local_fin = false;
                         }
@@ -1131,7 +1133,7 @@ where
                     stream_id,
                     final_offset: send_stream.next_offset(),
                 };
-                path_stream.send_frame(frame).await?;
+                send_reliable_path_control_frame(&path_stream, frame).await?;
                 close_sent = true;
                 pending_local_fin = false;
             }
@@ -1189,6 +1191,21 @@ where
         }
     };
 
+    let mut result = result;
+    if result.is_ok() && pending_local_fin && !close_sent {
+        let frame = Frame::StreamFin {
+            stream_id,
+            final_offset: send_stream.next_offset(),
+        };
+        match send_reliable_path_control_frame(&path_stream, frame).await {
+            Ok(_) => {
+                close_sent = true;
+            }
+            Err(err) => {
+                result = Err(err);
+            }
+        }
+    }
     if !close_sent {
         path_stream.close().await;
     }

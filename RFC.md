@@ -1125,6 +1125,16 @@ MUST NOT be represented as carrier packet loss. This preserves the product
 invariant that target metadata and stream role are known before data is routed
 without corrupting the carrier RTT, delivery-rate, PTO, or congestion model.
 
+The same layering applies to TCP and QUIC stream carriers. A valid encrypted
+carrier frame whose product stream is unknown, already closed, or not yet
+opened by ordered control MUST NOT tear down the carrier path merely because the
+product layer cannot route it. The receiver either associates it with a bounded
+orphan/reorder context, drops it as stale product work, or returns a product
+reset when the carrier writer is available. This rule prevents late
+`STREAM_MAX_DATA`, `STREAM_ACK`, `STREAM_FIN`, `STREAM_RESET`, or `STREAM_DATA`
+frames from converting normal stream-close races into path failure. It does not
+permit unknown frames to create target sockets or ordinary data ownership.
+
 ### 11.3 Packet Numbers and ACKs
 
 Each direction has a monotonically increasing packet number. Receivers collect
@@ -1509,6 +1519,16 @@ hints, successful opens, control
 probes, RTT-only liveness, and single duplicated stream ranges do not satisfy
 this requirement.
 
+Repair and Validation opens are attach-only. If their stream ID is unknown to
+the receiver, or if the receiver has recently closed that product stream, the
+open MUST be rejected or ignored as stale product control. It MUST NOT create a
+new outbound target connection. Active opens create a product stream only when
+the stream ID is not in the receiver's recent closed-stream cache; an Active
+open for a recently closed stream is also stale reattachment control and is
+rejected or ignored without opening the target again. This rule keeps path
+validation and reannouncement from replaying user connections during races
+around stream teardown.
+
 The server maps a repeated stream ID to the same outbound TCP connection when
 reattaching after path migration or repair.
 
@@ -1595,6 +1615,16 @@ FIN, RESET, and DETACH represent different failure domains. FIN completes the
 byte stream, RESET aborts the logical stream, and DETACH removes only one
 carrier attachment. Separating them prevents a path failure from unnecessarily
 killing the application connection.
+
+If the sender has observed EOF from its local product source, it MUST attempt to
+emit `STREAM_FIN(final_offset)` before detaching the carrier path. A
+`STREAM_DETACH` is not a substitute for FIN and MUST NOT be used to signal
+logical stream completion. If a carrier path is lost after the local side is
+closed, no product bytes are queued, no repair bytes remain, no receive-hole
+debt exists, and the receiver has already delivered contiguous response bytes,
+the stream MAY complete without waiting for a late remote FIN that can no
+longer be recovered. This is a product-level close race rule: it releases stale
+teardown bookkeeping, not unread data or repair debt.
 
 ### 13.6 Repair Cache
 

@@ -709,10 +709,17 @@ pub(super) async fn route_client_tcp_stream_frame(
     frame: Frame,
 ) -> Result<(), RuntimeError> {
     let Some(state) = streams.get_mut(&stream_id) else {
-        if closed_streams.contains(&stream_id) {
-            return Ok(());
-        }
-        return Err(RuntimeError::Protocol("frame for unknown TCP stream"));
+        closed_streams.insert(stream_id);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "client_tcp_unknown_stream_frame_drop",
+            format_args!(
+                "stream_id={} frame_kind={}",
+                stream_id.0,
+                frame_kind_name(&frame),
+            ),
+        );
+        return Ok(());
     };
     #[cfg(feature = "lab-diagnostics")]
     let bytes = frame_pacing_bytes(&frame);
@@ -899,19 +906,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_stream_fin_is_control_not_current_data_path() {
-        let frame = Frame::StreamFin {
-            stream_id: StreamId(1),
-            final_offset: 64,
-        };
-
-        assert!(!server_frame_prefers_current_data_path(
-            &frame,
-            FlowLane::Throughput
-        ));
-    }
-
-    #[test]
     fn control_and_ack_frames_never_use_throughput_lane() {
         let priority_frames = [
             (
@@ -968,12 +962,6 @@ mod tests {
             let effective_lane = tcp_path_effective_frame_lane(&frame, FlowLane::Throughput);
             assert_eq!(effective_lane, expected_lane);
             assert!(tcp_path_frame_uses_priority_queue(effective_lane));
-            if !matches!(frame, Frame::StreamFin { .. }) {
-                assert!(!reliable_relay_frame_prefers_current_data_path(
-                    &frame,
-                    FlowLane::Throughput
-                ));
-            }
         }
     }
 }

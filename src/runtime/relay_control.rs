@@ -51,12 +51,7 @@ where
     let mut last_reported_receive_hole: Option<(u64, usize, usize, u64)> = None;
 
     let result = loop {
-        if !local_open
-            && !remote_open
-            && send_stream.repair_bytes() == 0
-            && sender_queue.is_empty()
-            && !pending_local_fin
-        {
+        if !local_open && !remote_open && sender_queue.is_empty() {
             break Ok(stats);
         }
         let path_snapshot = remotes
@@ -300,8 +295,7 @@ where
                             {
                                 path_last_delivery_at.remove(&path_key);
                                 if !remotes.is_empty()
-                                    && let Err(err) = remotes
-                                        .reannounce_active_path(context, &spec, relay_lane)
+                                    && let Err(err) = sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                                         .await
                                 {
                                     eprintln!(
@@ -315,8 +309,7 @@ where
                                 continue;
                             }
                             if !remotes.is_empty()
-                                && let Err(err) = remotes
-                                    .reannounce_active_path(context, &spec, relay_lane)
+                                && let Err(err) = sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                                     .await
                             {
                                 eprintln!(
@@ -343,8 +336,7 @@ where
                     {
                         response_stall_reannounce_attempts =
                             response_stall_reannounce_attempts.saturating_add(1);
-                        match remotes
-                            .reannounce_active_path(context, &spec, relay_lane)
+                        match sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                             .await
                         {
                             Ok(()) => {
@@ -373,8 +365,7 @@ where
                     remotes.fail_path_instance(context, instance).await;
                 }
                 if !remotes.is_empty() {
-                    match remotes
-                        .reannounce_active_path(context, &spec, relay_lane)
+                    match sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                         .await
                     {
                         Ok(()) => {
@@ -690,11 +681,47 @@ where
                                 last_stream_progress_at = Instant::now();
                                 continue;
                             }
-                            Ok(_) => break Err(err),
-                            Err(_) => break Err(err),
+                            Ok(_) => {
+                                if reliable_relay_can_finish_after_path_loss(
+                                    local_open,
+                                    remote_open,
+                                    &send_stream,
+                                    &recv_stream,
+                                    &sender_queue,
+                                    stats,
+                                ) {
+                                    break Ok(stats);
+                                }
+                                break Err(err);
+                            }
+                            Err(_attach_err) => {
+                                if reliable_relay_can_finish_after_path_loss(
+                                    local_open,
+                                    remote_open,
+                                    &send_stream,
+                                    &recv_stream,
+                                    &sender_queue,
+                                    stats,
+                                ) {
+                                    break Ok(stats);
+                                }
+                                break Err(err);
+                            }
                         }
                     }
-                    Err(err) => break Err(err),
+                    Err(err) => {
+                        if reliable_relay_can_finish_after_path_loss(
+                            local_open,
+                            remote_open,
+                            &send_stream,
+                            &recv_stream,
+                            &sender_queue,
+                            stats,
+                        ) {
+                            break Ok(stats);
+                        }
+                        break Err(err);
+                    }
                 };
                 let path_key = instance.key;
                 let frame = match frame {
@@ -702,8 +729,7 @@ where
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         remotes.fail_path_instance(context, instance).await;
                         if !remotes.is_empty()
-                            && let Err(err) = remotes
-                                .reannounce_active_path(context, &spec, relay_lane)
+                            && let Err(err) = sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                                 .await
                         {
                             eprintln!("warning: TCP path-error survivor reannounce failed: {err}");
@@ -761,8 +787,32 @@ where
                                     }
                                     continue;
                                 }
-                                Ok(_) => break Err(err),
-                                Err(_) => break Err(err),
+                                Ok(_) => {
+                                    if reliable_relay_can_finish_after_path_loss(
+                                        local_open,
+                                        remote_open,
+                                        &send_stream,
+                                        &recv_stream,
+                                        &sender_queue,
+                                        stats,
+                                    ) {
+                                        break Ok(stats);
+                                    }
+                                    break Err(err);
+                                }
+                                Err(_attach_err) => {
+                                    if reliable_relay_can_finish_after_path_loss(
+                                        local_open,
+                                        remote_open,
+                                        &send_stream,
+                                        &recv_stream,
+                                        &sender_queue,
+                                        stats,
+                                    ) {
+                                        break Ok(stats);
+                                    }
+                                    break Err(err);
+                                }
                             }
                         }
                         path_last_delivery_at.remove(&path_key);
@@ -1147,12 +1197,7 @@ where
                         status: crate::protocol::PathStatus::Active,
                         ..
                     } => {
-                        match remotes
-                            .send_attach_control_to_instance(
-                                instance,
-                                &send_stream,
-                                pending_local_fin,
-                            )
+                        match sender.send_attach_control_to_instance(&mut remotes, instance, &send_stream, pending_local_fin)
                             .await
                         {
                             Ok(true) => {
@@ -1264,6 +1309,22 @@ fn maybe_mark_live_relay_path_delivery(
     );
 }
 
+fn reliable_relay_can_finish_after_path_loss(
+    local_open: bool,
+    remote_open: bool,
+    send_stream: &ReliableSendStream,
+    recv_stream: &ReliableRecvStream,
+    sender_queue: &ReliableRelaySenderQueue,
+    stats: PathDeliveryStats,
+) -> bool {
+    !local_open
+        && remote_open
+        && sender_queue.is_empty()
+        && send_stream.repair_bytes() == 0
+        && recv_stream.reorder_bytes() == 0
+        && stats.payload_bytes > 0
+}
+
 fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
     reliable_relay_buffer_len(mux_limits) as u64
 }
@@ -1305,14 +1366,6 @@ async fn attach_reliable_relay_validation_paths(
         },
     )
     .await
-}
-
-pub(super) fn reliable_relay_frame_prefers_current_data_path(
-    frame: &Frame,
-    lane: FlowLane,
-) -> bool {
-    matches!(frame, Frame::StreamFin { .. })
-        || (matches!(frame, Frame::StreamData { .. }) && !relay_lane_is_bulk(lane))
 }
 
 pub(super) struct RelayPathAttachRequest<'a> {

@@ -191,6 +191,19 @@ pub(super) async fn handle_server_path(
                                 return Ok(());
                             }
                         }
+                        ServerReliableStreamOpen::Rejected => {
+                            if !server_write_tcp_path_frame(
+                                &mut writer,
+                                &Frame::StreamReset {
+                                    stream_id,
+                                    reason: ResetReason::Refused,
+                                },
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 Frame::OpenStream { stream_id, .. } => {
@@ -577,22 +590,26 @@ pub(super) async fn run_server_tcp_stream(
         {
             Ok(stream) => stream,
             Err(err) => {
-                stream
-                    .send_frame(Frame::StreamReset {
+                send_reliable_path_control_frame(
+                    &stream,
+                    Frame::StreamReset {
                         stream_id,
                         reason: ResetReason::Refused,
-                    })
-                    .await?;
+                    },
+                )
+                .await?;
                 stream.close().await;
                 return Err(RuntimeError::OutboundConnect(err));
             }
         };
-        stream
-            .send_frame(Frame::StreamMaxData {
+        send_reliable_path_control_frame(
+            &stream,
+            Frame::StreamMaxData {
                 stream_id,
                 max_offset: context.mux_limits.max_stream_window_bytes,
-            })
-            .await?;
+            },
+        )
+        .await?;
         relay_reliable_stream(
             outbound_stream,
             stream,

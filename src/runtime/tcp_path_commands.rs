@@ -140,29 +140,6 @@ impl TcpPathSessionCommandSender {
         result
     }
 
-    pub(super) fn try_send_frame(
-        &self,
-        frame: Frame,
-        lane: FlowLane,
-    ) -> Result<bool, RuntimeError> {
-        let bytes = frame_pacing_bytes(&frame);
-        let effective_lane = tcp_path_effective_frame_lane(&frame, lane);
-        let queue = if tcp_path_frame_uses_priority_queue(effective_lane) {
-            &self.priority
-        } else {
-            &self.data
-        };
-        match queue.try_reserve() {
-            Ok(permit) => {
-                self.metrics.add_pending_bytes(bytes);
-                permit.send(TcpPathSessionCommand::SendFrame(frame));
-                Ok(true)
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::TcpPathSessionClosed),
-        }
-    }
-
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
     pub(super) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()
@@ -290,6 +267,7 @@ pub(super) fn tcp_path_command_pending_bytes(command: &TcpPathSessionCommand) ->
     }
 }
 
+#[cfg(feature = "lab-diagnostics")]
 fn tcp_path_command_stream_id(command: &TcpPathSessionCommand) -> StreamId {
     match command {
         TcpPathSessionCommand::SendFrame(frame) => tcp_path_frame_stream_id(frame),
@@ -298,6 +276,7 @@ fn tcp_path_command_stream_id(command: &TcpPathSessionCommand) -> StreamId {
     }
 }
 
+#[cfg(feature = "lab-diagnostics")]
 fn tcp_path_frame_stream_id(frame: &Frame) -> StreamId {
     match frame {
         Frame::OpenStream { stream_id, .. }

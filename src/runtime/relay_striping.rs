@@ -718,13 +718,6 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     Some((snapshot, score.eta_ms))
 }
 
-pub(super) fn bulk_relay_send_ready_for_extent(request: BulkRelayPathRequest<'_>) -> bool {
-    match choose_bulk_relay_path_for_extent_avoiding(request) {
-        BulkRelayPathChoice::Selected(_) | BulkRelayPathChoice::NotApplicable => true,
-        BulkRelayPathChoice::Blocked => false,
-    }
-}
-
 fn relay_path_snapshot_for_bulk_choice(
     context: &ClientPathContext,
     key: RelayPathKey,
@@ -842,17 +835,6 @@ mod tests {
         let mut ledger = RelayPathFlightLedger::default();
         ledger.record_frame(missing_owner, &data_frame(0, 64 * 1024));
 
-        assert!(!bulk_relay_send_ready_for_extent(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
-            lane: FlowLane::Throughput,
-            offset: 64 * 1024,
-            payload_bytes: 64 * 1024,
-            cursor: 0,
-            avoid_keys: &[],
-            path_flights: Some(&ledger),
-        }));
         assert_eq!(
             choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
                 stream_id: StreamId(7),

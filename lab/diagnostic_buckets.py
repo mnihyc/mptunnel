@@ -190,6 +190,14 @@ def collect_metrics(
         for value in values
     ]
     result_bytes = int(row.get("bytes") or row.get("bulk_bytes") or 0)
+    receive_hole_significant = (
+        max_receive_hole_bytes > max(1024 * 1024, result_bytes // 100)
+        if result_bytes > 0
+        else max_receive_hole_bytes > 1024 * 1024
+    )
+    repair_debt_has_hole_evidence = (
+        events.get("receive_hole", 0) > 0 and max_receive_hole_bytes > 256 * 1024
+    )
     return {
         "event_counts": dict(events.most_common(32)),
         "server_sender_enqueue_count": enqueue_count,
@@ -215,9 +223,11 @@ def collect_metrics(
         "receive_hole_events": events.get("receive_hole", 0),
         "receive_hole_max_bytes": max_receive_hole_bytes,
         "receive_hole_max_ratio": ratio(max_receive_hole_bytes, result_bytes),
+        "receive_hole_significant": receive_hole_significant,
         "stream_ordering_debt_max_bytes": max_stream_ordering_debt,
         "command_pending_max_bytes": max_command_pending_bytes,
         "repair_bytes_after_max": max_or_none(repair_bytes_after),
+        "repair_debt_has_hole_evidence": repair_debt_has_hole_evidence,
         "stream_ack_released_bytes_total": sum(stream_ack_released_bytes),
         "candidate_reasons": dict(candidate_reasons.most_common(16)),
         "selected_underlays": dict(selected_underlays),
@@ -275,7 +285,9 @@ def score_buckets(
             f"server response STREAM_DATA/decision delta {metrics['server_sender_conformance_delta']}",
         )
 
-    if metrics["receive_hole_events"]:
+    if metrics["receive_hole_events"] and (
+        metrics["receive_hole_significant"] or metrics["receive_hole_events"] > 100
+    ):
         add(
             "product_repair_ordering_debt",
             min(5, 1 + int(math.log10(metrics["receive_hole_events"] + 1))),
@@ -293,19 +305,29 @@ def score_buckets(
             3,
             f"receive-hole max {metrics['receive_hole_max_bytes']} bytes",
         )
-    if metrics["stream_ordering_debt_max_bytes"] > 0:
+    if metrics["stream_ordering_debt_max_bytes"] > 0 and (
+        metrics["receive_hole_significant"] or metrics["receive_hole_events"] > 100
+    ):
         add(
             "harmful_admission",
             2,
             f"stream ordering debt reached {metrics['stream_ordering_debt_max_bytes']} bytes",
         )
-    if len(metrics["selected_underlays"]) > 1 and metrics["receive_hole_events"]:
+    if (
+        len(metrics["selected_underlays"]) > 1
+        and metrics["receive_hole_events"]
+        and (metrics["receive_hole_significant"] or metrics["receive_hole_events"] > 100)
+    ):
         add(
             "harmful_admission",
             2,
             f"mixed underlay selection with receive holes: {metrics['selected_underlays']}",
         )
-    if metrics["repair_bytes_after_max"] and metrics["repair_bytes_after_max"] > 0:
+    if (
+        metrics["repair_bytes_after_max"]
+        and metrics["repair_bytes_after_max"] > 0
+        and metrics["repair_debt_has_hole_evidence"]
+    ):
         add(
             "product_repair_ordering_debt",
             3,

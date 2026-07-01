@@ -724,6 +724,39 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
 }
 
 #[tokio::test]
+async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
+    let stream_id = StreamId(44);
+    let (commands, receivers) = tcp_path_session_command_channels(1);
+    drop(receivers);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(9), stream_id);
+    sender.enqueue_data(Bytes::from_static(b"response"));
+
+    assert_eq!(sender.bytes(), b"response".len());
+    assert!(
+        sender
+            .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+            .await
+            .is_err()
+    );
+    assert_eq!(sender.bytes(), b"response".len());
+    assert_eq!(sender.data_bytes(), b"response".len());
+    assert_eq!(send_stream.next_offset(), 0);
+    assert_eq!(send_stream.repair_bytes(), 0);
+}
+
+#[tokio::test]
 async fn server_response_sender_dispatches_repair_before_data() {
     let stream_id = StreamId(43);
     let (commands, mut receivers) = tcp_path_session_command_channels(4);

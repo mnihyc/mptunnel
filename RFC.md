@@ -1977,6 +1977,19 @@ implementations MUST emit a sender decision event for every server response
 `STREAM_DATA` write so lab runs can assert that response bytes did not bypass
 the measured scheduling path.
 
+Creating a candidate `STREAM_DATA` frame for an admitted dispatch is a staged
+operation. The sender may calculate the next offset and build the carrier frame
+after all gates pass, but it MUST NOT advance the stream offset, place the range
+in the repair cache, remove the raw bytes from the sender queue, or record the
+range as product flight before lane priority and path admission have selected a
+carrier. Once a carrier command is about to become visible to a writer pipe, the
+sender MUST atomically move the byte range from prepared candidate state into
+repair-cache/product-flight ownership before the peer can ACK it. If carrier
+queue acceptance then fails before the frame is visible, the sender rolls back
+that tail commit and keeps the raw byte range queued. This prepare/commit split
+prevents the same byte from being treated as free while also preventing a fast
+ACK from arriving before the repair cache owns the acknowledged range.
+
 When ordinary queued data is blocked by flow control, ordering debt, or path
 admission, inbound path frames remain part of the active sender-service loop.
 An implementation MUST poll and process product ACKs, flow-control frames,
@@ -2099,6 +2112,12 @@ state, and ACK-derived delivery samples. TCP path state owns encrypted frame
 write pressure and path-level inflight accounting. An implementation MUST NOT
 count the same byte as free in more than one owner, and MUST release ownership
 only from the corresponding ACK, loss, failure, expiry, or local-delivery event.
+For reliable streams, ownership moves in this order: raw source byte in the
+sender queue, prepared dispatch candidate, repair-cache and product-flight entry
+immediately before carrier visibility, carrier-command acceptance, stream-ACK
+release, and finally contiguous-delivery evidence. A prepared candidate is not
+durable ownership; a tail commit may be rolled back only when the selected
+carrier rejects the command before the frame becomes visible to the peer.
 
 Before a product data frame is emitted, all applicable gates must pass:
 

@@ -552,10 +552,10 @@ where
             }
             _ = std::future::ready(()), if queued_send_ready => {
                 let (_, queued) = sender_queue
-                    .pop_front()
+                    .front()
                     .expect("queued_send_ready requires queued data");
-                let payload = match queued.kind {
-                    ReliableRelayQueuedWorkKind::Data(payload) => payload,
+                let payload = match &queued.kind {
+                    ReliableRelayQueuedWorkKind::Data(payload) => payload.clone(),
                     ReliableRelayQueuedWorkKind::Repair(_) => {
                         break Err(RuntimeError::Protocol("client sender queue repair item"))
                     }
@@ -565,16 +565,20 @@ where
                     Err(err) => break Err(RuntimeError::Stream(err)),
                 };
                 let retry_frame = frame.clone();
-                match sender.send_stream_data(context, &mut remotes, frame).await {
+                match sender.send_stream_data(context, &mut remotes, frame.clone()).await {
                     Ok(outcome) => {
+                        let (_, committed) = sender_queue
+                            .commit_front()
+                            .expect("sent queued data must still be at queue front");
                         last_stream_progress_at = Instant::now();
-                        stats.record_payload_bytes(queued.payload_bytes);
+                        stats.record_payload_bytes(committed.payload_bytes);
                         path_stats
                             .entry(outcome.path_key)
                             .or_default()
-                            .record_payload_bytes(queued.payload_bytes);
+                            .record_payload_bytes(committed.payload_bytes);
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
+                        let _ = send_stream.rollback_committed_data(&frame);
                         match attach_reliable_relay_paths(
                             context,
                             &spec,
@@ -587,29 +591,42 @@ where
                         .await
                         {
                             Ok(attached) if attached > 0 => {
+                                if let Err(err) = send_stream.commit_prepared_data(&frame) {
+                                    break Err(RuntimeError::Stream(err));
+                                }
                                 match sender
                                     .send_stream_data(context, &mut remotes, retry_frame)
                                     .await
                                 {
                                     Ok(outcome) => {
+                                        let (_, committed) = sender_queue
+                                            .commit_front()
+                                            .expect("sent queued data must still be at queue front");
                                         last_stream_progress_at = Instant::now();
-                                        stats.record_payload_bytes(queued.payload_bytes);
+                                        stats.record_payload_bytes(committed.payload_bytes);
                                         path_stats
                                             .entry(outcome.path_key)
                                             .or_default()
-                                            .record_payload_bytes(queued.payload_bytes);
+                                            .record_payload_bytes(committed.payload_bytes);
                                     }
                                     Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                        let _ = send_stream.rollback_committed_data(&frame);
                                         break Err(err);
                                     }
-                                    Err(err) => break Err(err),
+                                    Err(err) => {
+                                        let _ = send_stream.rollback_committed_data(&frame);
+                                        break Err(err);
+                                    }
                                 }
                             }
                             Ok(_) => break Err(err),
                             Err(err) => break Err(err),
                         }
                     }
-                    Err(err) => break Err(err),
+                    Err(err) => {
+                        let _ = send_stream.rollback_committed_data(&frame);
+                        break Err(err);
+                    }
                 }
             }
             _ = tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT), if queued_send_blocked => {

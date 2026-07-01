@@ -61,7 +61,7 @@ impl RelayRecvProgressSend {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum ReliableRelayQueuedWorkKind {
     Data(Bytes),
     Repair(Frame),
@@ -168,7 +168,17 @@ impl ReliableRelaySenderQueue {
         enqueue_id
     }
 
-    pub(super) fn pop_front(
+    pub(super) fn front(&self) -> Option<(ReliableRelayQueuedWorkLane, &ReliableRelayQueuedWork)> {
+        if let Some(work) = self.repair.front() {
+            Some((ReliableRelayQueuedWorkLane::Repair, work))
+        } else {
+            self.data
+                .front()
+                .map(|work| (ReliableRelayQueuedWorkLane::Data, work))
+        }
+    }
+
+    pub(super) fn commit_front(
         &mut self,
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
         let (lane, work) = if let Some(work) = self.repair.pop_front() {
@@ -183,14 +193,11 @@ impl ReliableRelaySenderQueue {
         Some((lane, work))
     }
 
-    pub(super) fn front_lane(&self) -> Option<ReliableRelayQueuedWorkLane> {
-        if !self.repair.is_empty() {
-            Some(ReliableRelayQueuedWorkLane::Repair)
-        } else if !self.data.is_empty() {
-            Some(ReliableRelayQueuedWorkLane::Data)
-        } else {
-            None
-        }
+    #[cfg(test)]
+    pub(super) fn pop_front(
+        &mut self,
+    ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
+        self.commit_front()
     }
 
     pub(super) fn front_data_payload_bytes(&self) -> Option<usize> {
@@ -318,9 +325,9 @@ impl ServerResponseSenderService {
         send_stream: &ReliableSendStream,
         relay_lane: FlowLane,
     ) -> bool {
-        match self.queue.front_lane() {
-            Some(ReliableRelayQueuedWorkLane::Repair) => true,
-            Some(ReliableRelayQueuedWorkLane::Data) => {
+        match self.queue.front() {
+            Some((ReliableRelayQueuedWorkLane::Repair, _)) => true,
+            Some((ReliableRelayQueuedWorkLane::Data, _)) => {
                 let Some(payload_bytes) = self.queue.front_data_payload_bytes() else {
                     return false;
                 };
@@ -389,22 +396,22 @@ impl ServerResponseSenderService {
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
-            .pop_front()
+            .front()
             .expect("queued_send_ready requires a queued frame");
         #[cfg(feature = "lab-diagnostics")]
         let enqueue_id = queued.enqueue_id;
         #[cfg(feature = "lab-diagnostics")]
         let queue_delay_ms = queued.queued_at.elapsed().as_millis();
-        let (frame, dispatch_lane_name) = match queued.kind {
+        let (frame, dispatch_lane_name) = match &queued.kind {
             ReliableRelayQueuedWorkKind::Data(payload) => {
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
-                let frame = send_stream.send_data(payload, StreamFlags::NONE)?;
+                let frame = send_stream.send_data(payload.clone(), StreamFlags::NONE)?;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_perf_record("mux.send_data", mux_started.elapsed(), queued.payload_bytes);
                 (frame, "data")
             }
-            ReliableRelayQueuedWorkKind::Repair(frame) => (frame, "repair"),
+            ReliableRelayQueuedWorkKind::Repair(frame) => (frame.clone(), "repair"),
         };
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = if queued_lane == ReliableRelayQueuedWorkLane::Repair {
@@ -422,9 +429,23 @@ impl ServerResponseSenderService {
             _ => None,
         };
         let selected_path = match queued_lane {
-            ReliableRelayQueuedWorkLane::Data => path_stream.send_frame_tracked(frame).await?,
-            ReliableRelayQueuedWorkLane::Repair => path_stream.send_repair_frame(frame).await?,
+            ReliableRelayQueuedWorkLane::Data => {
+                match path_stream.send_frame_tracked(frame.clone()).await {
+                    Ok(selected_path) => selected_path,
+                    Err(err) => {
+                        let _ = send_stream.rollback_committed_data(&frame);
+                        return Err(err);
+                    }
+                }
+            }
+            ReliableRelayQueuedWorkLane::Repair => {
+                path_stream.send_repair_frame(frame.clone()).await?
+            }
         };
+        let (_, committed) = self
+            .queue
+            .commit_front()
+            .expect("dispatched queued work must still be at queue front");
         #[cfg(not(feature = "lab-diagnostics"))]
         let _ = (relay_lane, dispatch_lane_name);
         #[cfg(feature = "lab-diagnostics")]
@@ -474,7 +495,7 @@ impl ServerResponseSenderService {
             );
         }
         Ok(ServerResponseDispatch {
-            payload_bytes: queued.payload_bytes,
+            payload_bytes: committed.payload_bytes,
             lane: queued_lane,
             selected_path,
         })

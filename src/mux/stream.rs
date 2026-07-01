@@ -46,6 +46,12 @@ impl ReliableSendStream {
     }
 
     pub fn send_data(&mut self, payload: Bytes, flags: StreamFlags) -> Result<Frame, StreamError> {
+        let frame = self.prepare_data(payload, flags)?;
+        self.commit_prepared_data(&frame)?;
+        Ok(frame)
+    }
+
+    pub fn prepare_data(&self, payload: Bytes, flags: StreamFlags) -> Result<Frame, StreamError> {
         if payload.is_empty() {
             return Err(StreamError::EmptyPayload);
         }
@@ -80,23 +86,88 @@ impl ReliableSendStream {
         }
 
         let offset = self.next_offset;
-        self.next_offset = end;
-        self.repair_bytes = new_repair_bytes;
-        self.repair_cache.insert(
-            offset,
-            SentChunk {
-                offset,
-                payload: payload.clone(),
-                flags,
-            },
-        );
-
         Ok(Frame::StreamData {
             stream_id: self.stream_id,
             offset,
             flags,
             payload,
         })
+    }
+
+    pub fn commit_prepared_data(&mut self, frame: &Frame) -> Result<(), StreamError> {
+        let Frame::StreamData {
+            stream_id,
+            offset,
+            flags,
+            payload,
+        } = frame
+        else {
+            return Err(StreamError::InvalidPreparedFrame);
+        };
+        if *stream_id != self.stream_id || *offset != self.next_offset {
+            return Err(StreamError::InvalidPreparedFrame);
+        }
+        let end = self
+            .next_offset
+            .checked_add(payload.len() as u64)
+            .ok_or(StreamError::OffsetOverflow)?;
+        if end > self.max_offset {
+            return Err(StreamError::FlowControlBlocked {
+                end,
+                max: self.max_offset,
+            });
+        }
+        let new_repair_bytes =
+            self.repair_bytes
+                .checked_add(payload.len())
+                .ok_or(StreamError::RepairCacheFull {
+                    actual: usize::MAX,
+                    limit: self.limits.max_repair_bytes,
+                })?;
+        if new_repair_bytes > self.limits.max_repair_bytes {
+            return Err(StreamError::RepairCacheFull {
+                actual: new_repair_bytes,
+                limit: self.limits.max_repair_bytes,
+            });
+        }
+        self.next_offset = end;
+        self.repair_bytes = new_repair_bytes;
+        self.repair_cache.insert(
+            *offset,
+            SentChunk {
+                offset: *offset,
+                payload: payload.clone(),
+                flags: *flags,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn rollback_committed_data(&mut self, frame: &Frame) -> Result<(), StreamError> {
+        let Frame::StreamData {
+            stream_id,
+            offset,
+            payload,
+            ..
+        } = frame
+        else {
+            return Err(StreamError::InvalidPreparedFrame);
+        };
+        let end = offset
+            .checked_add(payload.len() as u64)
+            .ok_or(StreamError::OffsetOverflow)?;
+        if *stream_id != self.stream_id || end != self.next_offset {
+            return Err(StreamError::InvalidPreparedFrame);
+        }
+        let Some(chunk) = self.repair_cache.remove(offset) else {
+            return Err(StreamError::InvalidPreparedFrame);
+        };
+        if chunk.payload.len() != payload.len() || chunk.offset != *offset {
+            return Err(StreamError::InvalidPreparedFrame);
+        }
+        self.next_offset = *offset;
+        self.repair_bytes = self.repair_bytes.saturating_sub(payload.len());
+        Ok(())
     }
 
     pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
@@ -668,6 +739,7 @@ pub enum StreamError {
     TooManyAckRanges { actual: usize, limit: usize },
     OverlappingData,
     OffsetOverflow,
+    InvalidPreparedFrame,
 }
 
 impl std::fmt::Display for StreamError {
@@ -697,6 +769,9 @@ impl std::fmt::Display for StreamError {
             }
             Self::OverlappingData => write!(f, "stream data overlaps an existing range"),
             Self::OffsetOverflow => write!(f, "stream offset overflow"),
+            Self::InvalidPreparedFrame => {
+                write!(f, "prepared stream frame does not match send stream state")
+            }
         }
     }
 }
@@ -866,6 +941,39 @@ mod tests {
         assert!(matches!(
             &frames[1],
             Frame::StreamData { offset: 8, payload, .. } if payload.as_ref() == b"cc"
+        ));
+    }
+
+    #[test]
+    fn send_stream_prepares_data_without_taking_ownership_until_commit() {
+        let mut stream = ReliableSendStream::new(StreamId(1), limits());
+        let frame = stream
+            .prepare_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
+            .expect("prepare");
+
+        assert_eq!(stream.next_offset(), 0);
+        assert_eq!(stream.repair_bytes(), 0);
+        assert!(matches!(
+            &frame,
+            Frame::StreamData { offset: 0, payload, .. } if payload.as_ref() == b"hello"
+        ));
+
+        stream
+            .commit_prepared_data(&frame)
+            .expect("commit prepared frame");
+        assert_eq!(stream.next_offset(), 5);
+        assert_eq!(stream.repair_bytes(), 5);
+        stream
+            .rollback_committed_data(&frame)
+            .expect("rollback tail frame");
+        assert_eq!(stream.next_offset(), 0);
+        assert_eq!(stream.repair_bytes(), 0);
+        stream
+            .commit_prepared_data(&frame)
+            .expect("commit prepared frame again");
+        assert!(matches!(
+            stream.commit_prepared_data(&frame),
+            Err(StreamError::InvalidPreparedFrame)
         ));
     }
 

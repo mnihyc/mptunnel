@@ -260,6 +260,144 @@ packet recovery, and BBR-style controllers separate delivery-rate models from
 application semantics. mptunnel applies the same separation while preserving
 proxy and TUN compatibility.
 
+### 4.1 Ownership Model
+
+A conforming implementation MUST keep ownership boundaries explicit. The rule is
+simple: configuration owns operator intent, sessions own live protocol identity,
+the sender service owns product bytes, path models own evidence, schedulers own
+decisions, and carrier engines own packet or connection mechanics. No layer may
+silently substitute its state for another layer's state.
+
+The runtime hierarchy is:
+
+```
+inbound
+  -> routing rule
+    -> outbound tag or balancer tag
+      -> outbound instance
+        -> MPP session when the selected outbound is mpp
+          -> live carrier paths
+            -> product reliable streams and datagram flows
+              -> selected remote outbound target
+```
+
+An inbound owns only local ingress exposure: listen addresses, TUN device
+binding, local proxy authentication, accepted ingress protocol, and inbound tag.
+It does not own remote MPP paths, target dialing, stream offsets, datagram IDs,
+or congestion decisions. After it produces target metadata and local user
+intent, the routing layer decides which outbound or balancer receives the flow.
+
+Routing owns tag selection only. It may select one outbound tag directly or one
+balancer tag. It does not buffer product bytes and does not choose carrier paths
+inside an MPP session. A route decision ends when the selected outbound accepts
+the flow.
+
+An outbound owns how traffic leaves the current process. A direct outbound owns
+target dialing and optional source-address binding; binding is a property of
+direct dialing, not a separate outbound kind. SOCKS5, HTTP CONNECT, and HTTP
+CONNECT-UDP outbounds own upstream proxy negotiation. An MPP outbound owns the
+remote MPP endpoint relationship: peer address, security material, path
+specifications, and session creation policy. An outbound does not own bytes after
+they have entered an active MPP sender service.
+
+A balancer owns selection among outbound tags. Sequence and random balancers
+choose one member for a flow. A combined MPP balancer may assemble one logical
+MPP outbound from multiple MPP members when policy explicitly asks for combined
+transport capacity, including members with distinct secrets. A balancer owns
+selection policy and member health; it does not own stream offsets, carrier
+packet numbers, or repair state.
+
+An MPP session owns the authenticated peer relationship and the versioned
+protocol identity within that relationship: session ID, key schedule, negotiated
+resource envelope, stream ID space, datagram flow ID space, live path registry,
+path-join replay cache, and management snapshot identity. A session does not own
+target sockets and does not directly schedule product bytes; it provides the
+identity and registries used by the sender service and carrier engines.
+
+A path owns one concrete underlay association inside a session. For TCP this is
+one encrypted framed stream session. For UDP this is one QUIC production engine
+association or one custom-lab UDP carrier association. A path owns path ID,
+underlay family, bind/peer address, liveness, carrier-local RTT/loss/rate/queue
+samples, carrier credit, and path-specific authentication. A path MUST NOT own
+product stream offsets or decide that a reliable stream should stripe onto it
+merely because it has capacity.
+
+A path group or carrier cohort is not a long-lived owner. It is a scheduler
+decision for one flow at one dispatch epoch: the lead path and any admitted extra
+paths for the next product quantum. The cohort is derived from session paths,
+path-model evidence, queue state, and ECF/BLEST admission. It expires after the
+dispatch decision and MUST be recomputed from fresh evidence.
+
+A product reliable stream owns only stream semantics: stream ID, target metadata,
+ingress metadata, outbound policy metadata, send offset space, receive offset
+space, STREAM_ACK ranges, STREAM_MAX_DATA, STREAM_FIN final offset, repair-cache
+byte ranges, and receive reorder ranges. It supplies byte facts to the sender
+service. It MUST NOT own congestion, pacing, path scoring, or carrier packet
+state.
+
+A datagram flow owns flow ID, target metadata, datagram IDs, TTL, feedback
+ranges, and datagram queue bytes. It owns unreliable message identity and expiry.
+It does not own reliable-stream repair or carrier congestion state.
+
+The sender service owns product work that is ready to leave the process but has
+not yet been admitted to a carrier. It owns lane queues, per-flow fairness,
+product queue age, repair priority, validation work, flow-control gating,
+preemptible quanta, and the dispatch ledger that binds a product byte range to a
+selected carrier path. Server response bytes and client upload bytes MUST enter
+a sender-service queue before they can become STREAM_DATA carrier commands.
+Control, ACK, FIN, RESET, DETACH, repair, realtime, latency, throughput, and
+background lanes are sender-service concerns, not path-queue concerns.
+
+The scheduler and algorithms own policy decisions only. They consume sender
+queue snapshots, path-model snapshots, stream-ordering debt, flow demand,
+validation state, and carrier credit, then return an admitted path or cohort plus
+an explanation. They MUST NOT mutate repair caches, write to carriers, own
+application buffers, or treat hints as delivery proof.
+
+The path model owns evidence and provenance. Local sender-side evidence from
+carrier ACKs, QUIC delivery samples, unpolluted ordered stream delivery, and
+datagram feedback is authoritative for scheduling. Peer PATH_METRICS are bounded
+validation hints unless their provenance, freshness, confidence, and direction
+make them safe for the specific decision. STREAM_ACK releases product repair
+state and ordering debt; it is not by itself carrier bandwidth proof.
+
+Carrier engines own underlay mechanics. TCP owns encrypted framed records,
+writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
+QUIC packets, QUIC TLS, connection IDs, packet recovery, congestion control,
+pacing, ACKs, and roaming. The custom-lab UDP engine owns its experimental packet
+numbers, ACK ranges, loss detection, and PTO state. Carrier engines report
+credit and metrics upward; they do not decide product flow fairness or rewrite
+stream ordering rules.
+
+Buffers are owned by the layer whose invariant they protect:
+
+* inbound buffers protect local proxy/TUN reads before routing;
+* sender-service queues protect product lane fairness before carrier admission;
+* repair caches protect reliable stream byte-range recovery;
+* receive reorder buffers protect contiguous stream delivery;
+* datagram queues protect TTL-bounded datagram flow delivery;
+* carrier command queues are dumb emission pipes for already-admitted work;
+* carrier flight state protects packet or framed-record accounting;
+* orphan/reorder carrier buffers protect valid packets whose product control
+  context has not arrived yet;
+* outbound target buffers protect the selected egress socket or upstream proxy.
+
+Management and diagnostics own observation and explicit control-plane requests.
+They may expose snapshots, trends, path state, queue state, scheduler decisions,
+ledger reconciliation, and manual administrative actions. They MUST NOT become a
+hidden data-plane owner, and enabling diagnostics MUST NOT select a different
+carrier, scheduler, protocol, crypto, or queue implementation.
+
+These ownership rules are normative because most bad multipath behavior comes
+from misplaced ownership: path queues trying to be fair schedulers, carrier ACKs
+being treated as product delivery, stream ACKs being treated as carrier-rate
+proof, validation bytes owning the only copy of ordered data, or TCP-named relay
+buffers governing UDP-backed product streams. The model deliberately follows the
+same separation that makes mature transports understandable: MPTCP maps data
+sequence numbers onto subflows without letting subflows own the application byte
+identity, QUIC keeps stream offsets separate from packet numbers, and BBR builds
+a path model from delivery evidence instead of from application labels.
+
 ## 5. Configuration Model
 
 ### 5.1 Global Security Parameters
@@ -319,7 +457,7 @@ Default resource parameters are:
 | max reorder bytes | 67,108,864 |
 | max datagram queue bytes | 16,777,216 |
 | max TCP path inflight bytes | 33,554,432 |
-| max TCP relay chunk bytes | 524,288 |
+| max reliable relay chunk bytes | 524,288 |
 | TCP path heartbeat interval | 10,000 ms |
 | TCP path heartbeat timeout | 30,000 ms |
 
@@ -354,7 +492,7 @@ hard-coding lab pass/fail behavior:
   while still allowing short bursts and NAT-rebinding recovery.
 * The 32 MiB TCP path inflight budget is intentionally below repair capacity so
   TCP path queues cannot consume all retransmission memory.
-* The 512 KiB TCP relay chunk is a read-buffer ceiling. It MUST NOT become an
+* The 512 KiB reliable relay chunk is a read-buffer ceiling. It MUST NOT become an
   indivisible scheduler item, AEAD record, or shared-path write quantum. The
   scheduler uses smaller preemptible quanta so control, ACK, repair, latency,
   and later bulk flows can interleave with existing bulk transfer.

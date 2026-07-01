@@ -1,14 +1,14 @@
-use super::relay_io::{tcp_relay_buffer_len, tcp_relay_scheduler_quantum_cap};
+use super::relay_io::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayFlowSignals {
+pub(super) struct ReliableRelayFlowSignals {
     sent_offset: u64,
     received_offset: u64,
     repair_bytes: usize,
 }
 
-impl TcpRelayFlowSignals {
+impl ReliableRelayFlowSignals {
     pub(super) fn new(sent_offset: u64, received_offset: u64, repair_bytes: usize) -> Self {
         Self {
             sent_offset,
@@ -25,7 +25,7 @@ impl TcpRelayFlowSignals {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayFlowDemandTracker {
+pub(super) struct ReliableRelayFlowDemandTracker {
     current: FlowLane,
     started_at: Instant,
     last_refresh_at: Instant,
@@ -35,7 +35,7 @@ pub(super) struct TcpRelayFlowDemandTracker {
     send_rate_bps: f64,
 }
 
-impl TcpRelayFlowDemandTracker {
+impl ReliableRelayFlowDemandTracker {
     pub(super) fn new() -> Self {
         let now = Instant::now();
         Self {
@@ -51,10 +51,10 @@ impl TcpRelayFlowDemandTracker {
 
     pub(super) fn refresh(
         &mut self,
-        signals: TcpRelayFlowSignals,
+        signals: ReliableRelayFlowSignals,
         path: Option<PathSnapshot>,
         mux_limits: MuxLimits,
-    ) -> TcpRelayFlowDecision {
+    ) -> ReliableRelayFlowDecision {
         let now = Instant::now();
         let observed_bytes = signals.observed_bytes();
         let delta_bytes = observed_bytes.saturating_sub(self.last_observed_bytes);
@@ -114,7 +114,7 @@ impl TcpRelayFlowDemandTracker {
             previous != FlowLane::Throughput && self.current == FlowLane::Throughput;
         let rebalance_due = self.current == FlowLane::Throughput
             && (promoted_to_throughput || now >= self.next_rebalance_at);
-        TcpRelayFlowDecision {
+        ReliableRelayFlowDecision {
             demand,
             previous_lane: previous,
             promoted_to_throughput,
@@ -128,7 +128,7 @@ impl TcpRelayFlowDemandTracker {
         }
     }
 
-    pub(super) fn should_rebalance(self, update: TcpRelayFlowDecision) -> bool {
+    pub(super) fn should_rebalance(self, update: ReliableRelayFlowDecision) -> bool {
         update.rebalance_due
     }
 
@@ -139,7 +139,7 @@ impl TcpRelayFlowDemandTracker {
 
 fn tcp_auto_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxLimits) -> f64 {
     path.map_or_else(
-        || tcp_relay_buffer_len(mux_limits) as f64 * 8.0 * 4.0,
+        || reliable_relay_buffer_len(mux_limits) as f64 * 8.0 * 4.0,
         |path| path.delivery_rate_bps.max(1.0) * 0.125,
     )
 }
@@ -150,8 +150,8 @@ fn tcp_auto_rate_bulk_evidence_bytes(
     full_threshold: u64,
 ) -> u64 {
     let service_quantum =
-        tcp_relay_scheduler_quantum_cap(path, FlowLane::Throughput, mux_limits) as u64;
-    let relay_chunk = tcp_relay_buffer_len(mux_limits) as u64;
+        reliable_relay_scheduler_quantum_cap(path, FlowLane::Throughput, mux_limits) as u64;
+    let relay_chunk = reliable_relay_buffer_len(mux_limits) as u64;
     let floor = service_quantum
         .saturating_mul(2)
         .max(relay_chunk.saturating_div(8))
@@ -170,7 +170,7 @@ fn tcp_auto_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TcpRelayFlowDecision {
+pub(super) struct ReliableRelayFlowDecision {
     pub(super) demand: FlowDemand,
     pub(super) previous_lane: FlowLane,
     pub(super) promoted_to_throughput: bool,
@@ -187,7 +187,7 @@ pub(super) fn tcp_auto_bulk_threshold_bytes(
     path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
 ) -> u64 {
-    let relay_chunk = tcp_relay_buffer_len(mux_limits) as u64;
+    let relay_chunk = reliable_relay_buffer_len(mux_limits) as u64;
     let window = mux_limits.max_stream_window_bytes.max(relay_chunk);
     let bdp_bytes = path.map_or(relay_chunk, |path| {
         ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)).ceil() as u64
@@ -203,10 +203,10 @@ mod tests {
 
     #[test]
     fn flow_demand_rebalances_repeatedly_during_sustained_bulk() {
-        let mut tracker = TcpRelayFlowDemandTracker::new();
+        let mut tracker = ReliableRelayFlowDemandTracker::new();
         let limits = MuxLimits::default();
         let first = tracker.refresh(
-            TcpRelayFlowSignals::new(tcp_relay_buffer_len(limits) as u64 * 4, 0, 0),
+            ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 4, 0, 0),
             None,
             limits,
         );
@@ -216,7 +216,7 @@ mod tests {
         tracker.mark_rebalance_attempted();
 
         let immediate = tracker.refresh(
-            TcpRelayFlowSignals::new(tcp_relay_buffer_len(limits) as u64 * 5, 0, 0),
+            ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 5, 0, 0),
             None,
             limits,
         );
@@ -225,7 +225,7 @@ mod tests {
 
         tracker.next_rebalance_at = Instant::now() - Duration::from_millis(1);
         let recurring = tracker.refresh(
-            TcpRelayFlowSignals::new(tcp_relay_buffer_len(limits) as u64 * 6, 0, 0),
+            ReliableRelayFlowSignals::new(reliable_relay_buffer_len(limits) as u64 * 6, 0, 0),
             None,
             limits,
         );
@@ -235,12 +235,16 @@ mod tests {
 
     #[test]
     fn rate_evidence_does_not_promote_before_service_quantum_floor() {
-        let mut tracker = TcpRelayFlowDemandTracker::new();
+        let mut tracker = ReliableRelayFlowDemandTracker::new();
         let limits = MuxLimits::default();
         let floor = tcp_auto_rate_bulk_evidence_bytes(None, limits, u64::MAX);
         let below_floor = floor.saturating_sub(1).max(1);
 
-        let decision = tracker.refresh(TcpRelayFlowSignals::new(below_floor, 0, 0), None, limits);
+        let decision = tracker.refresh(
+            ReliableRelayFlowSignals::new(below_floor, 0, 0),
+            None,
+            limits,
+        );
 
         assert_eq!(decision.demand.lane, FlowLane::Latency);
         assert!(!decision.promoted_to_throughput);
@@ -248,11 +252,11 @@ mod tests {
 
     #[test]
     fn rate_evidence_promotes_after_service_quantum_floor() {
-        let mut tracker = TcpRelayFlowDemandTracker::new();
+        let mut tracker = ReliableRelayFlowDemandTracker::new();
         let limits = MuxLimits::default();
         let floor = tcp_auto_rate_bulk_evidence_bytes(None, limits, u64::MAX);
 
-        let decision = tracker.refresh(TcpRelayFlowSignals::new(floor, 0, 0), None, limits);
+        let decision = tracker.refresh(ReliableRelayFlowSignals::new(floor, 0, 0), None, limits);
 
         assert_eq!(decision.demand.lane, FlowLane::Throughput);
         assert!(decision.promoted_to_throughput);

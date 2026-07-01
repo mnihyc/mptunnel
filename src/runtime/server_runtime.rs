@@ -61,11 +61,11 @@ pub(super) fn new_server_path_context_with_identity(
         codec_limits: resources.into(),
         mux_limits: resources.into(),
         security,
-        tcp_streams: Arc::new(ServerTcpStreamRegistry::new(resources.max_streams)),
+        reliable_streams: Arc::new(ServerReliableStreamRegistry::new(resources.max_streams)),
         path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),
-        max_tcp_streams: resources.max_streams,
+        max_reliable_streams: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
     }
 }

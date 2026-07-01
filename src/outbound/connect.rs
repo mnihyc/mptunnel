@@ -15,18 +15,27 @@ const MAX_SOCKS5_UDP_PACKET_BYTES: usize = 65_535;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundConfig {
+    /// Direct target dialing with the OS-selected source address.
     Direct,
+    /// Direct target dialing with an operator-selected source IP.
     BindSourceIp(IpAddr),
+    /// Upstream SOCKS5 proxy egress.
     Socks5 { proxy: Endpoint },
+    /// Upstream HTTP CONNECT egress for TCP targets.
     HttpConnect { proxy: Endpoint },
+    /// Upstream HTTP CONNECT-UDP egress for UDP targets.
     HttpConnectUdp { proxy: Endpoint },
+    /// Egress balancer that tries members in configured order.
     Sequence { members: Vec<OutboundRouteMember> },
+    /// Egress balancer that rotates the starting member per flow.
     Random { members: Vec<OutboundRouteMember> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundRouteMember {
+    /// Leaf egress config. Nested route groups are rejected by the connector.
     pub config: Box<OutboundConfig>,
+    /// DNS policy scoped to this exact egress member.
     pub dns: DnsConfig,
 }
 

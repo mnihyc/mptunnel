@@ -160,7 +160,7 @@ where
                 relay_migrating_tcp_stream(
                     stream,
                     &context,
-                    TcpRelayOpenSpec {
+                    ReliableRelayOpenSpec {
                         target,
                         ingress: IngressKind::Socks5,
                     },
@@ -238,7 +238,7 @@ where
         relay_migrating_tcp_stream(
             stream,
             &context,
-            TcpRelayOpenSpec {
+            ReliableRelayOpenSpec {
                 target,
                 ingress: IngressKind::HttpConnect,
             },

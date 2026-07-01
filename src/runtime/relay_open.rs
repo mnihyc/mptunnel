@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct OpenedRemoteStream {
-    pub(super) stream: TcpPathStream,
+    pub(super) stream: ReliablePathStream,
     pub(super) path_index: usize,
 }
 
@@ -17,14 +17,14 @@ pub(super) struct RelayPathInstance {
     pub(super) id: u64,
 }
 
-pub(super) struct TcpRelayRemotePath {
+pub(super) struct ReliableRelayRemotePath {
     pub(super) path_index: usize,
     pub(super) instance_id: u64,
     pub(super) placement: RelayPathPlacement,
-    pub(super) stream: TcpPathStreamHandle,
+    pub(super) stream: ReliablePathStreamHandle,
 }
 
-impl TcpRelayRemotePath {
+impl ReliableRelayRemotePath {
     pub(super) fn key(&self) -> RelayPathKey {
         RelayPathKey {
             underlay: self.stream.underlay,
@@ -40,21 +40,21 @@ impl TcpRelayRemotePath {
     }
 }
 
-pub(super) struct TcpRelayRemoteFrame {
+pub(super) struct ReliableRelayRemoteFrame {
     pub(super) instance: RelayPathInstance,
     pub(super) frame: Result<Frame, RuntimeError>,
 }
 
-pub(super) struct TcpRelayRemoteSet {
+pub(super) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
-    pub(super) paths: Vec<TcpRelayRemotePath>,
-    frames_tx: mpsc::Sender<TcpRelayRemoteFrame>,
-    frames_rx: mpsc::Receiver<TcpRelayRemoteFrame>,
+    pub(super) paths: Vec<ReliableRelayRemotePath>,
+    frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
+    frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
     next_send_index: usize,
     next_instance_id: u64,
 }
 
-impl TcpRelayRemoteSet {
+impl ReliableRelayRemoteSet {
     pub(super) fn new(opened: OpenedRemoteStream, frame_queue: usize) -> Self {
         let stream_id = opened.stream.stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
@@ -81,7 +81,7 @@ impl TcpRelayRemoteSet {
     pub(super) fn active_path_instance(&self) -> Option<RelayPathInstance> {
         self.active_path_position()
             .and_then(|position| self.paths.get(position))
-            .map(TcpRelayRemotePath::instance)
+            .map(ReliableRelayRemotePath::instance)
     }
 
     pub(super) fn active_path_key(&self) -> Option<RelayPathKey> {
@@ -115,7 +115,10 @@ impl TcpRelayRemoteSet {
     }
 
     pub(super) fn path_keys(&self) -> Vec<RelayPathKey> {
-        self.paths.iter().map(TcpRelayRemotePath::key).collect()
+        self.paths
+            .iter()
+            .map(ReliableRelayRemotePath::key)
+            .collect()
     }
 
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
@@ -141,7 +144,7 @@ impl TcpRelayRemoteSet {
             .iter()
             .map(|path| path.stream.max_frame_payload_bytes)
             .min()
-            .unwrap_or_else(|| tcp_relay_buffer_len(mux_limits))
+            .unwrap_or_else(|| reliable_relay_buffer_len(mux_limits))
             .max(1)
     }
 
@@ -185,7 +188,7 @@ impl TcpRelayRemoteSet {
             while let Some(frame) = frames.recv().await {
                 let done = frame.is_err();
                 if frames_tx
-                    .send(TcpRelayRemoteFrame { instance, frame })
+                    .send(ReliableRelayRemoteFrame { instance, frame })
                     .await
                     .is_err()
                     || done
@@ -194,13 +197,13 @@ impl TcpRelayRemoteSet {
                 }
             }
             let _ = frames_tx
-                .send(TcpRelayRemoteFrame {
+                .send(ReliableRelayRemoteFrame {
                     instance,
                     frame: Err(RuntimeError::TcpPathSessionClosed),
                 })
                 .await;
         });
-        let path = TcpRelayRemotePath {
+        let path = ReliableRelayRemotePath {
             path_index,
             instance_id,
             placement,
@@ -224,7 +227,7 @@ impl TcpRelayRemoteSet {
         }
     }
 
-    pub(super) async fn recv_frame(&mut self) -> Result<TcpRelayRemoteFrame, RuntimeError> {
+    pub(super) async fn recv_frame(&mut self) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
         self.frames_rx
             .recv()
             .await
@@ -294,7 +297,7 @@ impl TcpRelayRemoteSet {
             .map(|path| path.stream.lane)
             .unwrap_or(FlowLane::Latency);
         let prefer_current_data_path =
-            tcp_relay_frame_prefers_current_data_path(&frame, stream_lane);
+            reliable_relay_frame_prefers_current_data_path(&frame, stream_lane);
         while !self.paths.is_empty() {
             let selected_by_bulk_admission =
                 match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
@@ -403,7 +406,7 @@ impl TcpRelayRemoteSet {
     pub(super) async fn reannounce_active_path(
         &mut self,
         context: &ClientPathContext,
-        spec: &TcpRelayOpenSpec,
+        spec: &ReliableRelayOpenSpec,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
         let Some(position) = self.paths.len().checked_sub(1) else {
@@ -471,7 +474,7 @@ impl TcpRelayRemoteSet {
     pub(super) fn remove_path_instance(
         &mut self,
         instance: RelayPathInstance,
-    ) -> Option<TcpRelayRemotePath> {
+    ) -> Option<ReliableRelayRemotePath> {
         let position = self
             .paths
             .iter()
@@ -479,12 +482,12 @@ impl TcpRelayRemoteSet {
         self.remove_path_at(position)
     }
 
-    pub(super) fn remove_path_key(&mut self, key: RelayPathKey) -> Option<TcpRelayRemotePath> {
+    pub(super) fn remove_path_key(&mut self, key: RelayPathKey) -> Option<ReliableRelayRemotePath> {
         let position = self.paths.iter().position(|path| path.key() == key)?;
         self.remove_path_at(position)
     }
 
-    pub(super) fn remove_path_at(&mut self, position: usize) -> Option<TcpRelayRemotePath> {
+    pub(super) fn remove_path_at(&mut self, position: usize) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
         if self.paths.is_empty() {
             self.next_send_index = 0;
@@ -556,13 +559,13 @@ pub(super) enum RelayPathPlacement {
 }
 
 #[derive(Clone)]
-pub(super) struct TcpRelayOpenSpec {
+pub(super) struct ReliableRelayOpenSpec {
     pub(super) target: TargetAddr,
     pub(super) ingress: IngressKind,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum TcpRelayAttachMode {
+pub(super) enum ReliableRelayAttachMode {
     Any,
     BulkStriping,
 }
@@ -662,7 +665,7 @@ pub(super) async fn open_remote_stream_on_path(
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     context.reserve_tcp_path_load(path_index, lane);
-    let open_timeout = tcp_relay_attach_open_timeout(
+    let open_timeout = reliable_relay_attach_open_timeout(
         context,
         RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -706,12 +709,12 @@ pub(super) async fn open_remote_stream_on_path(
     }
 }
 
-pub(super) fn tcp_relay_attach_open_timeout(
+pub(super) fn reliable_relay_attach_open_timeout(
     context: &ClientPathContext,
     key: RelayPathKey,
     lane: FlowLane,
 ) -> Duration {
-    tcp_relay_stall_timeout(relay_path_snapshot(context, key), lane)
+    reliable_relay_stall_timeout(relay_path_snapshot(context, key), lane)
 }
 
 pub(super) async fn open_remote_stream_on_reserved_path(
@@ -843,7 +846,7 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
 
 async fn send_open_path_metrics(
     context: &ClientPathContext,
-    stream: &TcpPathStream,
+    stream: &ReliablePathStream,
     underlay: UnderlayProtocol,
     path_index: usize,
 ) -> Result<(), RuntimeError> {

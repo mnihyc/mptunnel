@@ -20,7 +20,7 @@ fn mixed_bulk_striping_includes_unmeasured_endpoint_only_udp() {
     assert!(
         context
             .ordered_reliable_bulk_striping_path_keys(
-                MuxLimits::default().max_tcp_relay_chunk_bytes
+                MuxLimits::default().max_reliable_relay_chunk_bytes
             )
             .contains(&RelayPathKey {
                 underlay: UnderlayProtocol::Udp,

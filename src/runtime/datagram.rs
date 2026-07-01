@@ -61,7 +61,7 @@ async fn client_udp_datagram_round_trip_with_limits(
 pub(super) enum DatagramClientAssociation {
     Udp {
         primary: Box<UdpDatagramClientAssociation>,
-        tcp_relay: Option<Box<TcpDatagramClientAssociation>>,
+        tcp_underlay_relay: Option<Box<TcpDatagramClientAssociation>>,
     },
     Tcp(Box<TcpDatagramClientAssociation>),
 }
@@ -71,7 +71,7 @@ impl DatagramClientAssociation {
         if !context.udp_paths.is_empty() {
             return Ok(Self::Udp {
                 primary: Box::new(UdpDatagramClientAssociation::new(context)?),
-                tcp_relay: None,
+                tcp_underlay_relay: None,
             });
         }
         if context.tcp_paths.is_empty() {
@@ -89,21 +89,26 @@ impl DatagramClientAssociation {
         ttl_ms: u32,
     ) -> Result<Bytes, RuntimeError> {
         match self {
-            Self::Udp { primary, tcp_relay } => {
+            Self::Udp {
+                primary,
+                tcp_underlay_relay,
+            } => {
                 match primary
                     .send_to_with_adaptive_retries(target.clone(), payload.clone(), ttl_ms)
                     .await
                 {
                     Ok(response) => Ok(response),
                     Err(err) if udp_datagram_should_try_tcp_underlay(&err, &primary.context) => {
-                        if tcp_relay.is_none() {
+                        if tcp_underlay_relay.is_none() {
                             match TcpDatagramClientAssociation::open_best(
                                 primary.context.clone(),
                                 payload.len(),
                             )
                             .await
                             {
-                                Ok(association) => *tcp_relay = Some(Box::new(association)),
+                                Ok(association) => {
+                                    *tcp_underlay_relay = Some(Box::new(association))
+                                }
                                 Err(tcp_err)
                                     if matches!(
                                         err,
@@ -116,7 +121,7 @@ impl DatagramClientAssociation {
                                 Err(_) => return Err(err),
                             }
                         }
-                        let relay = tcp_relay
+                        let relay = tcp_underlay_relay
                             .as_mut()
                             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
                         relay
@@ -136,14 +141,17 @@ impl DatagramClientAssociation {
 
     pub(super) async fn close(&mut self) -> Result<(), RuntimeError> {
         match self {
-            Self::Udp { primary, tcp_relay } => {
+            Self::Udp {
+                primary,
+                tcp_underlay_relay,
+            } => {
                 let primary_result = primary.close().await;
-                let tcp_relay_result = if let Some(relay) = tcp_relay {
+                let reliable_relay_result = if let Some(relay) = tcp_underlay_relay {
                     relay.close().await
                 } else {
                     Ok(())
                 };
-                primary_result.and(tcp_relay_result)
+                primary_result.and(reliable_relay_result)
             }
             Self::Tcp(association) => association.close().await,
         }
@@ -1413,7 +1421,7 @@ impl UdpDatagramClientSession {
             security,
             codec_limits,
             mux_limits,
-            stream_frame_queue: tcp_stream_frame_queue(mux_limits),
+            stream_frame_queue: reliable_stream_frame_queue(mux_limits),
             health,
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, handshake_timeout).await

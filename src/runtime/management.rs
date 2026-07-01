@@ -322,7 +322,7 @@ impl ManagementTarget {
             }
             Self::Server { context, state } => {
                 let paths = server_paths(context);
-                let registry = context.tcp_streams.management_snapshot();
+                let registry = context.reliable_streams.management_snapshot();
                 let summary = server_summary(&registry);
                 json!({
                     "schema": "mptunnel.management.v1",
@@ -401,7 +401,7 @@ impl ManagementTarget {
                 json!({"summary":summary,"traffic_trends":state.trends()})
             }
             Self::Server { context, state } => {
-                let registry = context.tcp_streams.management_snapshot();
+                let registry = context.reliable_streams.management_snapshot();
                 json!({"summary":server_summary(&registry),"traffic_trends":state.trends()})
             }
             Self::Node {
@@ -415,7 +415,7 @@ impl ManagementTarget {
                     summary
                 }).collect::<Vec<_>>(),
                 "servers": servers.iter().map(|context| {
-                    let registry = context.tcp_streams.management_snapshot();
+                    let registry = context.reliable_streams.management_snapshot();
                     server_summary(&registry)
                 }).collect::<Vec<_>>(),
                 "traffic_trends": state.trends()
@@ -441,7 +441,7 @@ impl ManagementTarget {
                 })
             }
             Self::Server { context, state } => {
-                let registry = context.tcp_streams.management_snapshot();
+                let registry = context.reliable_streams.management_snapshot();
                 json!({
                     "role": state.role,
                     "tag": context.tag,
@@ -661,7 +661,7 @@ fn start_server_sampler(context: ServerPathContext, state: ManagementState) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let registry = context.tcp_streams.management_snapshot();
+            let registry = context.reliable_streams.management_snapshot();
             state.push_sample(server_summary(&registry));
         }
     });
@@ -732,7 +732,7 @@ fn client_inbounds_json(context: &ClientPathContext) -> Vec<Value> {
 }
 
 fn server_snapshot_json(context: &ServerPathContext) -> Value {
-    let registry = context.tcp_streams.management_snapshot();
+    let registry = context.reliable_streams.management_snapshot();
     json!({
         "tag": context.tag,
         "route_target": route_target_json(context.route_target.as_ref()),
@@ -762,7 +762,7 @@ fn node_summary(clients: &[ClientPathContext], servers: &[ServerPathContext]) ->
         merge_summary(&mut summary, client_summary);
     }
     for context in servers {
-        let registry = context.tcp_streams.management_snapshot();
+        let registry = context.reliable_streams.management_snapshot();
         merge_summary(&mut summary, server_summary(&registry));
     }
     summary
@@ -1049,7 +1049,9 @@ struct ServerMetricStatus {
     data_sample_count: u32,
 }
 
-fn server_path_metrics(registry: &ServerTcpRegistryManagementSnapshot) -> Vec<ServerMetricStatus> {
+fn server_path_metrics(
+    registry: &ServerReliableRegistryManagementSnapshot,
+) -> Vec<ServerMetricStatus> {
     registry
         .path_metrics
         .iter()
@@ -1080,7 +1082,7 @@ fn server_path_metrics(registry: &ServerTcpRegistryManagementSnapshot) -> Vec<Se
         .collect()
 }
 
-fn server_summary(registry: &ServerTcpRegistryManagementSnapshot) -> ManagementSummary {
+fn server_summary(registry: &ServerReliableRegistryManagementSnapshot) -> ManagementSummary {
     let mut summary = ManagementSummary {
         active_flows: registry.active_streams as u64,
         path_count: registry.path_metrics.len(),

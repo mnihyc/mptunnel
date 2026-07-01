@@ -41,7 +41,7 @@
 # max_reorder_bytes = 67108864
 # max_datagram_queue_bytes = 16777216
 # max_tcp_path_inflight_bytes = 33554432
-# max_tcp_relay_chunk_bytes = 524288
+# max_reliable_relay_chunk_bytes = 524288
 # tcp_path_heartbeat_interval_ms = 10000
 # tcp_path_heartbeat_timeout_ms = 30000
 

@@ -607,8 +607,9 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 }
 
 #[tokio::test]
-async fn tcp_relay_active_stream_heartbeat_timeout_does_not_abort_stream() {
-    let (path, server_path) = spawn_tcp_relay_heartbeat_blackhole(Duration::from_millis(500)).await;
+async fn reliable_relay_active_stream_heartbeat_timeout_does_not_abort_stream() {
+    let (path, server_path) =
+        spawn_reliable_relay_heartbeat_blackhole(Duration::from_millis(500)).await;
     let resources = ResourceLimits {
         tcp_path_heartbeat_interval: Duration::from_millis(10),
         tcp_path_heartbeat_timeout: Duration::from_millis(30),
@@ -1337,11 +1338,11 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
                     SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec())
                         .expect("secret"),
                 ),
-                tcp_streams: Arc::new(ServerTcpStreamRegistry::default()),
+                reliable_streams: Arc::new(ServerReliableStreamRegistry::default()),
                 path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
                     path_join_replay_cache_capacity(ResourceLimits::default().max_streams),
                 ))),
-                max_tcp_streams: ResourceLimits::default().max_streams,
+                max_reliable_streams: ResourceLimits::default().max_streams,
                 max_udp_flows_per_session: ResourceLimits::default().max_streams,
             },
         )

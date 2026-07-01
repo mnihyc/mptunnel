@@ -31,8 +31,8 @@ fn test_path_metrics(
     }
 }
 
-fn switchable_binding(stream: &TcpPathStream) -> Arc<ServerTcpStreamBinding> {
-    let TcpPathStreamOutput::Switchable(binding) = &stream.output else {
+fn switchable_binding(stream: &ReliablePathStream) -> Arc<ResponseStreamBinding> {
+    let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable binding");
     };
     binding.clone()
@@ -41,7 +41,7 @@ fn switchable_binding(stream: &TcpPathStream) -> Arc<ServerTcpStreamBinding> {
 #[tokio::test]
 async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
     let (old_tx, mut old_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -55,11 +55,11 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
         new_tx,
         FlowLane::Throughput,
         StreamOpenRole::Active,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
     assert_eq!(binding.lane(), FlowLane::Throughput);
 
-    let large_payload = Bytes::from(vec![7u8; tcp_relay_buffer_len(MuxLimits::default())]);
+    let large_payload = Bytes::from(vec![7u8; reliable_relay_buffer_len(MuxLimits::default())]);
     let large_len = large_payload.len() as u64;
     binding
         .send_frame(
@@ -118,7 +118,7 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
 #[tokio::test]
 async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
     let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -132,7 +132,7 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
         path1_tx,
         FlowLane::Latency,
         StreamOpenRole::Active,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
     binding.attach(
@@ -141,7 +141,7 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
         path0_repair_tx,
         FlowLane::Latency,
         StreamOpenRole::Active,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     binding
@@ -179,10 +179,10 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
 
 #[tokio::test]
 async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_data() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let validation_credit_bytes = max_frame_payload_bytes.saturating_mul(2);
     let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -274,10 +274,10 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
 
 #[tokio::test]
 async fn server_udp_binding_bulk_validation_credit_can_lead_bounded_probe_data() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let validation_credit_bytes = max_frame_payload_bytes.saturating_mul(2);
     let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(0),
@@ -347,9 +347,9 @@ async fn server_udp_binding_bulk_validation_credit_can_lead_bounded_probe_data()
 
 #[tokio::test]
 async fn server_udp_binding_peer_hint_validation_does_not_promote_without_carrier_evidence() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (active_tx, mut active_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(1),
@@ -432,9 +432,9 @@ async fn server_udp_binding_peer_hint_validation_does_not_promote_without_carrie
 
 #[tokio::test]
 async fn server_udp_binding_local_carrier_metrics_promote_validation_path() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (active_tx, mut active_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(1),
@@ -524,7 +524,7 @@ async fn server_udp_binding_local_carrier_metrics_promote_validation_path() {
 #[tokio::test]
 async fn server_udp_binding_ignores_product_ack_rate_without_local_carrier_metrics() {
     let (active_tx, mut active_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(0),
@@ -583,7 +583,7 @@ async fn server_udp_binding_ignores_product_ack_rate_without_local_carrier_metri
 #[tokio::test]
 async fn server_udp_binding_uses_quic_pacing_when_local_rate_sample_is_app_limited() {
     let (active_tx, _active_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(0),
@@ -611,7 +611,7 @@ async fn server_udp_binding_uses_quic_pacing_when_local_rate_sample_is_app_limit
 #[tokio::test]
 async fn server_tcp_binding_ignores_product_ack_rate_without_path_metrics() {
     let (active_tx, mut active_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -686,9 +686,9 @@ async fn server_tcp_binding_ignores_product_ack_rate_without_path_metrics() {
 
 #[tokio::test]
 async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -717,7 +717,7 @@ async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
 
     assert_eq!(
         binding.bulk_choice_key_for_test(64 * 1024),
-        Some(ServerTcpPathKey {
+        Some(CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(0),
         }),
@@ -758,9 +758,9 @@ async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
 
 #[tokio::test]
 async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead_jump() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -847,9 +847,9 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
 
 #[tokio::test]
 async fn server_mixed_binding_proven_path_waits_for_lower_frontier_owner() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -936,9 +936,9 @@ async fn server_mixed_binding_proven_path_waits_for_lower_frontier_owner() {
 
 #[tokio::test]
 async fn server_mixed_binding_blocks_unserviceable_lower_frontier_owner() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -1031,10 +1031,10 @@ async fn server_mixed_binding_blocks_unserviceable_lower_frontier_owner() {
 
 #[tokio::test]
 async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exists() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let probe_payload_bytes = (max_frame_payload_bytes / 4).max(1024);
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -1118,10 +1118,10 @@ async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exi
 
 #[tokio::test]
 async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_continue() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let validation_credit_bytes = max_frame_payload_bytes.saturating_mul(2);
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -1195,9 +1195,9 @@ async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_conti
 
 #[tokio::test]
 async fn server_mixed_binding_read_backpressure_uses_best_safe_lead_snapshot() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, _tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -1234,9 +1234,9 @@ async fn server_mixed_binding_read_backpressure_uses_best_safe_lead_snapshot() {
 
 #[tokio::test]
 async fn server_mixed_binding_unproven_tcp_validation_cannot_jump_udp_frontier() {
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(1),
@@ -1324,7 +1324,7 @@ async fn server_mixed_binding_unproven_tcp_validation_cannot_jump_udp_frontier()
 #[tokio::test]
 async fn server_ack_ordering_keeps_out_of_order_acked_ranges_as_debt() {
     let (tcp_tx, _tcp_rx) = tcp_path_session_command_channels(4);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -1338,7 +1338,7 @@ async fn server_ack_ordering_keeps_out_of_order_acked_ranges_as_debt() {
         udp_tx,
         FlowLane::Throughput,
         StreamOpenRole::Active,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     let chunk = 64 * 1024;
@@ -1392,23 +1392,23 @@ async fn server_ack_ordering_keeps_out_of_order_acked_ranges_as_debt() {
 
 #[tokio::test]
 async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
-    let registry = ServerTcpStreamRegistry::default();
+    let registry = ServerReliableStreamRegistry::default();
     let session_id = SessionId(71);
     let stream_id = StreamId(7);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (active_tx, mut active_rx) = tcp_path_session_command_channels(4);
     let stream = match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id,
                 target: &target,
                 lane: FlowLane::Throughput,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: active_tx,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
                 },
             },
@@ -1417,8 +1417,8 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
         )
         .expect("open active stream")
     {
-        ServerTcpStreamOpen::New(stream) => stream,
-        ServerTcpStreamOpen::Existing => panic!("expected new stream"),
+        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::Existing => panic!("expected new stream"),
     };
     registry.record_path_metrics(
         session_id,
@@ -1436,16 +1436,16 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
     assert!(matches!(
         registry
             .open_or_attach(
-                ServerTcpStreamOpenRequest {
+                ServerReliableStreamOpenRequest {
                     session_id,
                     stream_id,
                     target: &target,
                     lane: FlowLane::Throughput,
-                    attachment: ServerTcpPathAttachment {
+                    attachment: ServerReliablePathAttachment {
                         path_id: PathId(1),
                         underlay: UnderlayProtocol::Tcp,
                         commands: validation_tx,
-                        max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                         role: StreamOpenRole::Validation,
                     },
                 },
@@ -1453,7 +1453,7 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
                 ResourceLimits::default().max_streams,
             )
             .expect("attach validation path"),
-        ServerTcpStreamOpen::Existing
+        ServerReliableStreamOpen::Existing
     ));
 
     stream
@@ -1487,7 +1487,7 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
 #[tokio::test]
 async fn server_tcp_binding_counts_command_queue_debt_for_bulk_admission() {
     let (active_tx, _active_rx) = tcp_path_session_command_channels(128);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -1501,7 +1501,7 @@ async fn server_tcp_binding_counts_command_queue_debt_for_bulk_admission() {
         validation_tx,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
     binding.update_path_metrics_for_test(
         UnderlayProtocol::Tcp,
@@ -1563,7 +1563,7 @@ async fn server_tcp_binding_counts_command_queue_debt_for_bulk_admission() {
     );
     assert_eq!(
         binding.bulk_choice_key_for_test(64 * 1024),
-        Some(ServerTcpPathKey {
+        Some(CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(1),
         }),
@@ -1603,7 +1603,7 @@ async fn server_tcp_binding_counts_command_queue_debt_for_bulk_admission() {
 #[tokio::test]
 async fn server_bulk_binding_uses_service_horizon_for_fat_path() {
     let (lowlat_tx, _lowlat_rx) = tcp_path_session_command_channels(128);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -1617,7 +1617,7 @@ async fn server_bulk_binding_uses_service_horizon_for_fat_path() {
         fat_tx,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
     binding.update_path_metrics_for_test(
         UnderlayProtocol::Tcp,
@@ -1632,7 +1632,7 @@ async fn server_bulk_binding_uses_service_horizon_for_fat_path() {
 
     assert_eq!(
         binding.bulk_choice_key_for_test(64 * 1024),
-        Some(ServerTcpPathKey {
+        Some(CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(2),
         }),
@@ -1664,22 +1664,22 @@ async fn server_bulk_binding_uses_service_horizon_for_fat_path() {
 
 #[tokio::test]
 async fn server_registry_bulk_snapshot_includes_cross_stream_latency_load() {
-    let registry = ServerTcpStreamRegistry::default();
+    let registry = ServerReliableStreamRegistry::default();
     let session_id = SessionId(81);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (latency_tx, _latency_rx) = tcp_path_session_command_channels(4);
     let latency_stream = match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id: StreamId(1),
                 target: &target,
                 lane: FlowLane::Latency,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: latency_tx,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
                 },
             },
@@ -1688,23 +1688,23 @@ async fn server_registry_bulk_snapshot_includes_cross_stream_latency_load() {
         )
         .expect("open latency stream")
     {
-        ServerTcpStreamOpen::New(stream) => stream,
-        ServerTcpStreamOpen::Existing => panic!("expected latency stream to be new"),
+        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::Existing => panic!("expected latency stream to be new"),
     };
 
     let (bulk_tx, _bulk_rx) = tcp_path_session_command_channels(4);
     let bulk_stream = match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id: StreamId(2),
                 target: &target,
                 lane: FlowLane::Throughput,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: bulk_tx,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
                 },
             },
@@ -1713,8 +1713,8 @@ async fn server_registry_bulk_snapshot_includes_cross_stream_latency_load() {
         )
         .expect("open bulk stream")
     {
-        ServerTcpStreamOpen::New(stream) => stream,
-        ServerTcpStreamOpen::Existing => panic!("expected bulk stream to be new"),
+        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::Existing => panic!("expected bulk stream to be new"),
     };
     registry.record_local_path_metrics(
         session_id,
@@ -1747,22 +1747,22 @@ async fn server_registry_bulk_snapshot_includes_cross_stream_latency_load() {
 
 #[tokio::test]
 async fn server_registry_all_startup_latency_flows_do_not_protect_against_each_other() {
-    let registry = ServerTcpStreamRegistry::default();
+    let registry = ServerReliableStreamRegistry::default();
     let session_id = SessionId(83);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (first_tx, _first_rx) = tcp_path_session_command_channels(4);
     let first_stream = match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id: StreamId(1),
                 target: &target,
                 lane: FlowLane::Latency,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: first_tx,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
                 },
             },
@@ -1771,22 +1771,22 @@ async fn server_registry_all_startup_latency_flows_do_not_protect_against_each_o
         )
         .expect("open first startup stream")
     {
-        ServerTcpStreamOpen::New(stream) => stream,
-        ServerTcpStreamOpen::Existing => panic!("expected first stream to be new"),
+        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::Existing => panic!("expected first stream to be new"),
     };
     let (second_tx, _second_rx) = tcp_path_session_command_channels(4);
     let second_stream = match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id: StreamId(2),
                 target: &target,
                 lane: FlowLane::Latency,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: second_tx,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
                 },
             },
@@ -1795,8 +1795,8 @@ async fn server_registry_all_startup_latency_flows_do_not_protect_against_each_o
         )
         .expect("open second startup stream")
     {
-        ServerTcpStreamOpen::New(stream) => stream,
-        ServerTcpStreamOpen::Existing => panic!("expected second stream to be new"),
+        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::Existing => panic!("expected second stream to be new"),
     };
     registry.record_local_path_metrics(
         session_id,
@@ -1830,19 +1830,19 @@ async fn server_registry_all_startup_latency_flows_do_not_protect_against_each_o
 
 #[tokio::test]
 async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
-    let registry = ServerTcpStreamRegistry::default();
+    let registry = ServerReliableStreamRegistry::default();
     let session_id = SessionId(82);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (latency_tx, _latency_rx) = tcp_path_session_command_channels(4);
     match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id: StreamId(1),
                 target: &target,
                 lane: FlowLane::Latency,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: latency_tx,
@@ -1855,19 +1855,19 @@ async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
         )
         .expect("open latency stream")
     {
-        ServerTcpStreamOpen::New(_) => {}
-        ServerTcpStreamOpen::Existing => panic!("expected latency stream to be new"),
+        ServerReliableStreamOpen::New(_) => {}
+        ServerReliableStreamOpen::Existing => panic!("expected latency stream to be new"),
     }
 
     let (bulk_path0_tx, mut bulk_path0_rx) = tcp_path_session_command_channels(4);
     let bulk_stream = match registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id: StreamId(2),
                 target: &target,
                 lane: FlowLane::Throughput,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands: bulk_path0_tx,
@@ -1880,8 +1880,8 @@ async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
         )
         .expect("open bulk stream")
     {
-        ServerTcpStreamOpen::New(stream) => stream,
-        ServerTcpStreamOpen::Existing => panic!("expected bulk stream to be new"),
+        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::Existing => panic!("expected bulk stream to be new"),
     };
     let binding = switchable_binding(&bulk_stream);
     let (bulk_path1_tx, mut bulk_path1_rx) = tcp_path_session_command_channels(4);
@@ -1908,7 +1908,7 @@ async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
 
     assert_eq!(
         binding.bulk_choice_key_for_test(64 * 1024),
-        Some(ServerTcpPathKey {
+        Some(CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(1),
         }),
@@ -1949,7 +1949,7 @@ async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
 #[tokio::test]
 async fn server_tcp_binding_interactive_repair_reattach_preserves_active_path() {
     let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -1963,7 +1963,7 @@ async fn server_tcp_binding_interactive_repair_reattach_preserves_active_path() 
         path1_tx,
         FlowLane::Latency,
         StreamOpenRole::Active,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
     binding.attach(
@@ -1972,7 +1972,7 @@ async fn server_tcp_binding_interactive_repair_reattach_preserves_active_path() 
         path0_repair_tx,
         FlowLane::Latency,
         StreamOpenRole::Repair,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     binding
@@ -2011,7 +2011,7 @@ async fn server_tcp_binding_interactive_repair_reattach_preserves_active_path() 
 #[tokio::test]
 async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
     let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
-    let binding = ServerTcpStreamBinding::new(
+    let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -2025,7 +2025,7 @@ async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
         path1_tx,
         FlowLane::RealtimeDatagram,
         StreamOpenRole::Active,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
     let (path0_repair_tx, mut path0_repair_rx) = tcp_path_session_command_channels(1);
     binding.attach(
@@ -2034,7 +2034,7 @@ async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
         path0_repair_tx,
         FlowLane::RealtimeDatagram,
         StreamOpenRole::Repair,
-        tcp_relay_buffer_len(MuxLimits::default()),
+        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     binding

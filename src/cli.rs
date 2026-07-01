@@ -1,7 +1,7 @@
 use crate::config::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
-    DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
+    DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
     DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
     DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
     DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
@@ -266,10 +266,10 @@ pub struct ResourceArgs {
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_MAX_TCP_RELAY_CHUNK_BYTES",
-        default_value_t = DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES
+        env = "MPTUNNEL_MAX_RELIABLE_RELAY_CHUNK_BYTES",
+        default_value_t = DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES
     )]
-    pub max_tcp_relay_chunk_bytes: usize,
+    pub max_reliable_relay_chunk_bytes: usize,
 
     #[arg(
         long,
@@ -301,7 +301,7 @@ impl ResourceArgs {
             max_reorder_bytes: self.max_reorder_bytes,
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
             max_tcp_path_inflight_bytes: self.max_tcp_path_inflight_bytes,
-            max_tcp_relay_chunk_bytes: self.max_tcp_relay_chunk_bytes,
+            max_reliable_relay_chunk_bytes: self.max_reliable_relay_chunk_bytes,
             tcp_path_heartbeat_interval: Duration::from_millis(self.tcp_path_heartbeat_interval_ms),
             tcp_path_heartbeat_timeout: Duration::from_millis(self.tcp_path_heartbeat_timeout_ms),
         }
@@ -1411,7 +1411,7 @@ mod tests {
             "1024",
             "--max-repair-bytes",
             "4096",
-            "--max-tcp-relay-chunk-bytes",
+            "--max-reliable-relay-chunk-bytes",
             "1024",
             "--max-tcp-path-inflight-bytes",
             "512",
@@ -1436,7 +1436,7 @@ mod tests {
             "1024",
             "--max-repair-bytes",
             "4096",
-            "--max-tcp-relay-chunk-bytes",
+            "--max-reliable-relay-chunk-bytes",
             "1024",
             "--max-tcp-path-inflight-bytes",
             "8192",
@@ -1457,7 +1457,7 @@ mod tests {
             "mptunnel",
             "--secret",
             "0123456789abcdef0123456789abcdef",
-            "--max-tcp-relay-chunk-bytes",
+            "--max-reliable-relay-chunk-bytes",
             "0",
             "client",
             "--path",
@@ -1468,7 +1468,7 @@ mod tests {
         assert!(matches!(
             cli.into_config(),
             Err(CliConfigError::Config(
-                crate::config::ConfigError::MaxTcpRelayChunkBytesZero
+                crate::config::ConfigError::MaxReliableRelayChunkBytesZero
             ))
         ));
 
@@ -1478,7 +1478,7 @@ mod tests {
             "0123456789abcdef0123456789abcdef",
             "--max-payload-bytes",
             "1024",
-            "--max-tcp-relay-chunk-bytes",
+            "--max-reliable-relay-chunk-bytes",
             "2048",
             "client",
             "--path",
@@ -1489,7 +1489,7 @@ mod tests {
         assert!(matches!(
             cli.into_config(),
             Err(CliConfigError::Config(
-                crate::config::ConfigError::MaxTcpRelayChunkExceedsPayloadLimit
+                crate::config::ConfigError::MaxReliableRelayChunkExceedsPayloadLimit
             ))
         ));
     }

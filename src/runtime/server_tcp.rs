@@ -130,24 +130,26 @@ pub(super) async fn handle_server_path(
                     outbound::validate_target(&target)?;
                     context.outbound.ensure_supports(TargetProtocol::Tcp)?;
                     let lane = flow_lane_from_stream_demand_hint(demand);
-                    match context.tcp_streams.open_or_attach(
-                        ServerTcpStreamOpenRequest {
+                    match context.reliable_streams.open_or_attach(
+                        ServerReliableStreamOpenRequest {
                             session_id,
                             stream_id,
                             target: &target,
                             lane,
-                            attachment: ServerTcpPathAttachment {
+                            attachment: ServerReliablePathAttachment {
                                 path_id,
                                 underlay: UnderlayProtocol::Tcp,
                                 commands: commands_tx.clone(),
-                                max_frame_payload_bytes: tcp_relay_buffer_len(context.mux_limits),
+                                max_frame_payload_bytes: reliable_relay_buffer_len(
+                                    context.mux_limits,
+                                ),
                                 role,
                             },
                         },
                         context.mux_limits,
-                        context.max_tcp_streams,
+                        context.max_reliable_streams,
                     )? {
-                        ServerTcpStreamOpen::New(stream) => {
+                        ServerReliableStreamOpen::New(stream) => {
                             attached_streams.insert(stream_id);
                             let stream_context = context.clone();
                             tokio::spawn(async move {
@@ -159,14 +161,14 @@ pub(super) async fn handle_server_path(
                                 )
                                 .await
                                 {
-                                    eprintln!("warning: server TCP stream failed: {err}");
+                                    eprintln!("warning: server reliable stream failed: {err}");
                                 }
                             });
                         }
-                        ServerTcpStreamOpen::Existing => {
+                        ServerReliableStreamOpen::Existing => {
                             attached_streams.insert(stream_id);
                             context
-                                .tcp_streams
+                                .reliable_streams
                                 .route_frame(
                                     session_id,
                                     stream_id,
@@ -336,7 +338,7 @@ pub(super) async fn handle_server_path(
                     payload,
                 } => {
                     context
-                        .tcp_streams
+                        .reliable_streams
                         .route_frame(
                             session_id,
                             stream_id,
@@ -355,7 +357,7 @@ pub(super) async fn handle_server_path(
                     ranges,
                 } => {
                     context
-                        .tcp_streams
+                        .reliable_streams
                         .route_frame(
                             session_id,
                             stream_id,
@@ -372,7 +374,7 @@ pub(super) async fn handle_server_path(
                     max_offset,
                 } => {
                     context
-                        .tcp_streams
+                        .reliable_streams
                         .route_frame(
                             session_id,
                             stream_id,
@@ -388,7 +390,7 @@ pub(super) async fn handle_server_path(
                     final_offset,
                 } => {
                     context
-                        .tcp_streams
+                        .reliable_streams
                         .route_frame(
                             session_id,
                             stream_id,
@@ -401,7 +403,7 @@ pub(super) async fn handle_server_path(
                 }
                 Frame::StreamDetach { stream_id } => {
                     attached_streams.remove(&stream_id);
-                    context.tcp_streams.detach_path(
+                    context.reliable_streams.detach_path(
                         session_id,
                         stream_id,
                         UnderlayProtocol::Tcp,
@@ -425,7 +427,7 @@ pub(super) async fn handle_server_path(
                 }
                 Frame::StreamReset { stream_id, reason } => {
                     context
-                        .tcp_streams
+                        .reliable_streams
                         .route_frame(
                             session_id,
                             stream_id,
@@ -439,7 +441,7 @@ pub(super) async fn handle_server_path(
                     }
                 }
                 Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
-                    context.tcp_streams.record_path_metrics(
+                    context.reliable_streams.record_path_metrics(
                         session_id,
                         UnderlayProtocol::Tcp,
                         path_id,
@@ -498,7 +500,7 @@ pub(super) async fn handle_server_tcp_path_command(
         }
         TcpPathSessionCommand::CloseStream(stream_id) => {
             attached_streams.remove(&stream_id);
-            context.tcp_streams.detach_path(
+            context.reliable_streams.detach_path(
                 command_context.session_id,
                 stream_id,
                 UnderlayProtocol::Tcp,
@@ -560,7 +562,7 @@ pub(super) fn encrypted_framed_peer_closed(err: &EncryptedFramedTransportError) 
 pub(super) async fn run_server_tcp_stream(
     context: ServerPathContext,
     session_id: SessionId,
-    stream: TcpPathStream,
+    stream: ReliablePathStream,
     target: TargetAddr,
 ) -> Result<(), RuntimeError> {
     let stream_id = stream.stream_id;
@@ -591,12 +593,12 @@ pub(super) async fn run_server_tcp_stream(
                 max_offset: context.mux_limits.max_stream_window_bytes,
             })
             .await?;
-        relay_tcp_stream(outbound_stream, stream, context.mux_limits, session_id)
+        relay_reliable_stream(outbound_stream, stream, context.mux_limits, session_id)
             .await
             .map(|_| ())
     }
     .await;
-    context.tcp_streams.close(session_id, stream_id);
+    context.reliable_streams.close(session_id, stream_id);
     result
 }
 

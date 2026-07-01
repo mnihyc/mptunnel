@@ -1,4 +1,4 @@
-use super::tcp_path::TcpPathStream;
+use super::reliable_path::ReliablePathStream;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -395,7 +395,7 @@ pub(super) enum TcpPathSessionCommand {
         lane: FlowLane,
         role: StreamOpenRole,
         session_commands: TcpPathSessionCommandSender,
-        response: oneshot::Sender<Result<TcpPathStream, RuntimeError>>,
+        response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
     },
     SendFrame(Frame),
     CloseStream(StreamId),

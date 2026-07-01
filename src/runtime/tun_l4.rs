@@ -96,7 +96,7 @@ where
     relay_migrating_tcp_stream(
         stream,
         &context,
-        TcpRelayOpenSpec {
+        ReliableRelayOpenSpec {
             target,
             ingress: IngressKind::TunTcp,
         },

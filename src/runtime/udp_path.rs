@@ -35,7 +35,7 @@ impl ClientUdpPathSessionHandle {
         ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
-    ) -> Result<TcpPathStream, RuntimeError> {
+    ) -> Result<ReliablePathStream, RuntimeError> {
         let connection = self.ensure_connection().await?;
         match open_client_udp_stream_on_connection(
             connection,
@@ -475,7 +475,7 @@ fn udp_path_max_stream_payload_bytes(
     match engine {
         UdpEngine::CustomLab => udp_carrier::max_stream_payload_bytes(codec_limits, mux_limits),
         UdpEngine::Quic => quic_carrier::max_stream_payload_bytes(codec_limits)
-            .min(mux_limits.max_tcp_relay_chunk_bytes)
+            .min(mux_limits.max_reliable_relay_chunk_bytes)
             .max(1),
     }
 }
@@ -618,7 +618,7 @@ async fn open_client_udp_stream_on_connection(
     lane: FlowLane,
     role: StreamOpenRole,
     runtime: ClientUdpPathSessionRuntime,
-) -> Result<TcpPathStream, RuntimeError> {
+) -> Result<ReliablePathStream, RuntimeError> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let open = Frame::OpenStream {
         stream_id,
@@ -662,7 +662,7 @@ async fn open_client_udp_stream_on_connection(
         receivers,
         frames_tx,
     ));
-    Ok(TcpPathStream {
+    Ok(ReliablePathStream {
         stream_id,
         max_offset,
         lane,
@@ -672,7 +672,7 @@ async fn open_client_udp_stream_on_connection(
             runtime.codec_limits,
             runtime.mux_limits,
         ),
-        output: TcpPathStreamOutput::Fixed(commands),
+        output: ReliablePathStreamOutput::Fixed(commands),
         frames: frames_rx,
     })
 }
@@ -863,7 +863,7 @@ fn spawn_server_udp_carrier_metrics(
                 continue;
             };
             if metrics.delivery_sample_count > 0 {
-                context.tcp_streams.record_local_path_metrics(
+                context.reliable_streams.record_local_path_metrics(
                     session_id,
                     UnderlayProtocol::Udp,
                     path_id,
@@ -1086,13 +1086,13 @@ async fn handle_server_udp_reliable_stream(
         context.mux_limits,
         context.codec_limits,
     ));
-    match context.tcp_streams.open_or_attach(
-        ServerTcpStreamOpenRequest {
+    match context.reliable_streams.open_or_attach(
+        ServerReliableStreamOpenRequest {
             session_id,
             stream_id,
             target: &target,
             lane,
-            attachment: ServerTcpPathAttachment {
+            attachment: ServerReliablePathAttachment {
                 path_id,
                 underlay: UnderlayProtocol::Udp,
                 commands: commands_tx.clone(),
@@ -1105,22 +1105,22 @@ async fn handle_server_udp_reliable_stream(
             },
         },
         context.mux_limits,
-        context.max_tcp_streams,
+        context.max_reliable_streams,
     )? {
-        ServerTcpStreamOpen::New(stream) => {
+        ServerReliableStreamOpen::New(stream) => {
             let stream_context = context.clone();
             let target = target.clone();
             tokio::spawn(async move {
                 if let Err(err) =
                     run_server_tcp_stream(stream_context, session_id, stream, target).await
                 {
-                    eprintln!("warning: server TCP stream failed: {err}");
+                    eprintln!("warning: server reliable stream failed: {err}");
                 }
             });
         }
-        ServerTcpStreamOpen::Existing => {
+        ServerReliableStreamOpen::Existing => {
             context
-                .tcp_streams
+                .reliable_streams
                 .route_frame(
                     session_id,
                     stream_id,
@@ -1197,7 +1197,7 @@ async fn run_server_udp_reliable_stream_loop(
     let mut carrier_frames = spawn_udp_carrier_reader(
         recv,
         context.codec_limits,
-        tcp_stream_frame_queue(context.mux_limits),
+        reliable_stream_frame_queue(context.mux_limits),
     );
 
     loop {
@@ -1212,12 +1212,12 @@ async fn run_server_udp_reliable_stream_loop(
                         | Frame::StreamReset { stream_id: received_stream_id, .. })))
                         if received_stream_id == stream_id =>
                     {
-                        context.tcp_streams.route_frame(session_id, stream_id, frame).await?;
+                        context.reliable_streams.route_frame(session_id, stream_id, frame).await?;
                     }
                     Some(Ok(Frame::StreamDetach { stream_id: detach_stream_id }))
                         if detach_stream_id == stream_id =>
                     {
-                        context.tcp_streams.detach_path(
+                        context.reliable_streams.detach_path(
                             session_id,
                             stream_id,
                             UnderlayProtocol::Udp,
@@ -1228,7 +1228,7 @@ async fn run_server_udp_reliable_stream_loop(
                         return Ok(());
                     }
                     Some(Ok(Frame::PathMetrics { metrics })) if metrics.path_id == path_id => {
-                        context.tcp_streams.record_path_metrics(
+                        context.reliable_streams.record_path_metrics(
                             session_id,
                             UnderlayProtocol::Udp,
                             path_id,
@@ -1244,13 +1244,13 @@ async fn run_server_udp_reliable_stream_loop(
                     })) if open_stream_id == stream_id && open_target == target =>
                     {
                         let updated_lane = flow_lane_from_stream_demand_hint(open_demand);
-                        match context.tcp_streams.open_or_attach(
-                            ServerTcpStreamOpenRequest {
+                        match context.reliable_streams.open_or_attach(
+                            ServerReliableStreamOpenRequest {
                                 session_id,
                                 stream_id,
                                 target: &target,
                                 lane: updated_lane,
-                                attachment: ServerTcpPathAttachment {
+                                attachment: ServerReliablePathAttachment {
                                     path_id,
                                     underlay: UnderlayProtocol::Udp,
                                     commands: commands_tx.clone(),
@@ -1263,11 +1263,11 @@ async fn run_server_udp_reliable_stream_loop(
                                 },
                             },
                             context.mux_limits,
-                            context.max_tcp_streams,
+                            context.max_reliable_streams,
                         )? {
-                            ServerTcpStreamOpen::Existing => {
+                            ServerReliableStreamOpen::Existing => {
                                 context
-                                    .tcp_streams
+                                    .reliable_streams
                                     .route_frame(
                                         session_id,
                                         stream_id,
@@ -1288,7 +1288,7 @@ async fn run_server_udp_reliable_stream_loop(
                                 )
                                 .await?;
                             }
-                            ServerTcpStreamOpen::New(_) => {
+                            ServerReliableStreamOpen::New(_) => {
                                 return Err(RuntimeError::Protocol(
                                     "UDP carrier reannouncement opened duplicate stream",
                                 ));
@@ -1309,7 +1309,7 @@ async fn run_server_udp_reliable_stream_loop(
                         return Err(RuntimeError::Protocol("unexpected server UDP carrier reliable stream frame"));
                     }
                     Some(Err(RuntimeError::TcpPathSessionClosed)) | None => {
-                        context.tcp_streams.detach_path(
+                        context.reliable_streams.detach_path(
                             session_id,
                             stream_id,
                             UnderlayProtocol::Udp,
@@ -1333,7 +1333,7 @@ async fn run_server_udp_reliable_stream_loop(
                                 }
                                 TcpPathSessionCommand::CloseStream(close_stream_id) => {
                                     if close_stream_id == stream_id {
-                                        context.tcp_streams.detach_path(
+                                        context.reliable_streams.detach_path(
                                             session_id,
                                             stream_id,
                                             UnderlayProtocol::Udp,

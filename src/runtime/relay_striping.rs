@@ -206,7 +206,7 @@ pub(super) enum BulkRelayPathChoice {
 pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) stream_id: StreamId,
     pub(super) context: &'a ClientPathContext,
-    pub(super) paths: &'a [TcpRelayRemotePath],
+    pub(super) paths: &'a [ReliableRelayRemotePath],
     pub(super) lane: FlowLane,
     pub(super) offset: u64,
     pub(super) payload_bytes: usize,
@@ -218,7 +218,7 @@ pub(super) struct BulkRelayPathRequest<'a> {
 pub(super) struct BulkRelayFrameRequest<'a> {
     pub(super) stream_id: StreamId,
     pub(super) context: &'a ClientPathContext,
-    pub(super) paths: &'a [TcpRelayRemotePath],
+    pub(super) paths: &'a [ReliableRelayRemotePath],
     pub(super) lane: FlowLane,
     pub(super) frame: &'a Frame,
     pub(super) cursor: usize,
@@ -780,19 +780,19 @@ mod tests {
         underlay: UnderlayProtocol,
         index: usize,
         placement: RelayPathPlacement,
-    ) -> TcpRelayRemotePath {
+    ) -> ReliableRelayRemotePath {
         let (commands, _receivers) = tcp_path_session_command_channels(8);
-        TcpRelayRemotePath {
+        ReliableRelayRemotePath {
             path_index: index,
             instance_id: index as u64 + 1,
             placement,
-            stream: TcpPathStreamHandle {
+            stream: ReliablePathStreamHandle {
                 stream_id: StreamId(7),
                 max_offset: u64::MAX,
                 lane: FlowLane::Throughput,
                 underlay,
                 max_frame_payload_bytes: 64 * 1024,
-                output: TcpPathStreamOutput::Fixed(commands),
+                output: ReliablePathStreamOutput::Fixed(commands),
             },
         }
     }

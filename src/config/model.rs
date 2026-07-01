@@ -20,7 +20,7 @@ pub const DEFAULT_REPAIR_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_REORDER_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_DATAGRAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
-pub const DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES: usize = 512 * 1024;
+pub const DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES: usize = 512 * 1024;
 pub const MIN_UDP_REPLAY_WINDOW_PACKETS: u64 = 1_024;
 pub const MAX_UDP_REPLAY_WINDOW_PACKETS: u64 = 65_536;
 pub const UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES: usize = 512;
@@ -49,12 +49,19 @@ pub fn udp_replay_window_packets_for_inflight(inflight_bytes: usize) -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
+    /// Process-level logging/check behavior. It does not own protocol state.
     pub log_level: String,
     pub check_config: bool,
+    /// Process supervision behavior, separate from data-plane ownership.
     pub service: ServiceConfig,
+    /// Runtime envelopes shared by product streams, datagram flows, and carriers.
     pub resources: ResourceLimits,
+    /// Observation/control plane. It must not become a hidden data-plane owner.
     pub management: ManagementConfig,
+    /// Representative process security for CLI/default checks. MPP peer secrets
+    /// are scoped to each MPP inbound/outbound/path where configured.
     pub security: SecurityConfig,
+    /// Role-free runtime graph: client, server, or a node containing both.
     pub command: CommandConfig,
 }
 
@@ -164,7 +171,7 @@ pub struct ResourceLimits {
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
     pub max_tcp_path_inflight_bytes: usize,
-    pub max_tcp_relay_chunk_bytes: usize,
+    pub max_reliable_relay_chunk_bytes: usize,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
 }
@@ -182,7 +189,7 @@ impl Default for ResourceLimits {
             max_reorder_bytes: DEFAULT_REORDER_BYTES,
             max_datagram_queue_bytes: DEFAULT_DATAGRAM_QUEUE_BYTES,
             max_tcp_path_inflight_bytes: DEFAULT_TCP_PATH_INFLIGHT_BYTES,
-            max_tcp_relay_chunk_bytes: DEFAULT_MAX_TCP_RELAY_CHUNK_BYTES,
+            max_reliable_relay_chunk_bytes: DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
         }
@@ -221,13 +228,13 @@ impl ResourceLimits {
         if self.max_datagram_queue_bytes < self.max_payload_bytes {
             return Err(ConfigError::DatagramQueueLimitTooSmall);
         }
-        if self.max_tcp_relay_chunk_bytes == 0 {
-            return Err(ConfigError::MaxTcpRelayChunkBytesZero);
+        if self.max_reliable_relay_chunk_bytes == 0 {
+            return Err(ConfigError::MaxReliableRelayChunkBytesZero);
         }
-        if self.max_tcp_relay_chunk_bytes > self.max_payload_bytes {
-            return Err(ConfigError::MaxTcpRelayChunkExceedsPayloadLimit);
+        if self.max_reliable_relay_chunk_bytes > self.max_payload_bytes {
+            return Err(ConfigError::MaxReliableRelayChunkExceedsPayloadLimit);
         }
-        if self.max_tcp_path_inflight_bytes < self.max_tcp_relay_chunk_bytes {
+        if self.max_tcp_path_inflight_bytes < self.max_reliable_relay_chunk_bytes {
             return Err(ConfigError::TcpPathInflightLimitTooSmall);
         }
         if self.max_tcp_path_inflight_bytes > self.max_repair_bytes {
@@ -338,9 +345,14 @@ pub struct RouteTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
+    /// Route selected by local inbounds: one MPP outbound tag or MPP balancer tag.
     pub route_target: Option<RouteTarget>,
+    /// Local SOCKS5/HTTP/TUN ingress surfaces owned by this client service.
     pub ingresses: Vec<LocalIngressConfig>,
+    /// Representative security for process-level validation; live path security
+    /// is stored per `ClientPathConfig`.
     pub security: SecurityConfig,
+    /// Candidate MPP carrier paths. Each path owns its own peer security.
     pub paths: Vec<ClientPathConfig>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
@@ -354,17 +366,25 @@ pub struct LocalIngressConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPathConfig {
+    /// One configured carrier path for an MPP outbound.
     pub spec: PathSpec,
+    /// Security scoped to this path's MPP peer relationship.
     pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
+    /// Display/routing tag for this MPP inbound.
     pub tag: Option<String>,
+    /// Egress outbound or egress balancer selected for accepted MPP flows.
     pub route_target: Option<RouteTarget>,
+    /// Carrier listen/bind paths owned by this MPP inbound.
     pub bind_paths: Vec<PathSpec>,
+    /// Security scoped to peers that join this MPP inbound.
     pub security: SecurityConfig,
+    /// Resolved egress behavior for accepted target TCP/UDP flows.
     pub outbound: OutboundConfig,
+    /// DNS policy owned by the selected egress behavior.
     pub outbound_dns: DnsConfig,
 }
 
@@ -527,8 +547,8 @@ pub enum ConfigError {
     RepairLimitTooSmall,
     ReorderLimitTooSmall,
     DatagramQueueLimitTooSmall,
-    MaxTcpRelayChunkBytesZero,
-    MaxTcpRelayChunkExceedsPayloadLimit,
+    MaxReliableRelayChunkBytesZero,
+    MaxReliableRelayChunkExceedsPayloadLimit,
     TcpPathInflightLimitTooSmall,
     TcpPathInflightLimitExceedsRepairLimit,
     TcpPathHeartbeatIntervalZero,
@@ -598,13 +618,16 @@ impl std::fmt::Display for ConfigError {
                     "max datagram queue bytes must be at least max payload bytes"
                 )
             }
-            Self::MaxTcpRelayChunkBytesZero => {
-                write!(f, "max TCP relay chunk bytes must be greater than zero")
-            }
-            Self::MaxTcpRelayChunkExceedsPayloadLimit => {
+            Self::MaxReliableRelayChunkBytesZero => {
                 write!(
                     f,
-                    "max TCP relay chunk bytes must be no greater than max payload bytes"
+                    "max reliable relay chunk bytes must be greater than zero"
+                )
+            }
+            Self::MaxReliableRelayChunkExceedsPayloadLimit => {
+                write!(
+                    f,
+                    "max reliable relay chunk bytes must be no greater than max payload bytes"
                 )
             }
             Self::TcpPathInflightLimitTooSmall => {
@@ -721,7 +744,7 @@ mod tests {
 
         let compact_codec: CodecLimits = ResourceLimits {
             max_tcp_path_inflight_bytes: 256 * 1024,
-            max_tcp_relay_chunk_bytes: 64 * 1024,
+            max_reliable_relay_chunk_bytes: 64 * 1024,
             ..ResourceLimits::default()
         }
         .into();

@@ -141,7 +141,7 @@ struct ResourceFileConfig {
     max_reorder_bytes: Option<usize>,
     max_datagram_queue_bytes: Option<usize>,
     max_tcp_path_inflight_bytes: Option<usize>,
-    max_tcp_relay_chunk_bytes: Option<usize>,
+    max_reliable_relay_chunk_bytes: Option<usize>,
     tcp_path_heartbeat_interval_ms: Option<u64>,
     tcp_path_heartbeat_timeout_ms: Option<u64>,
 }
@@ -166,9 +166,9 @@ impl ResourceFileConfig {
             max_tcp_path_inflight_bytes: self
                 .max_tcp_path_inflight_bytes
                 .unwrap_or(defaults.max_tcp_path_inflight_bytes),
-            max_tcp_relay_chunk_bytes: self
-                .max_tcp_relay_chunk_bytes
-                .unwrap_or(defaults.max_tcp_relay_chunk_bytes),
+            max_reliable_relay_chunk_bytes: self
+                .max_reliable_relay_chunk_bytes
+                .unwrap_or(defaults.max_reliable_relay_chunk_bytes),
             tcp_path_heartbeat_interval: Duration::from_millis(
                 self.tcp_path_heartbeat_interval_ms
                     .unwrap_or(defaults.tcp_path_heartbeat_interval.as_millis() as u64),
@@ -968,7 +968,7 @@ fn resolve_default_mpp_target(
     match candidates.as_slice() {
         [target] => Ok(target.clone()),
         [] => Err(ConfigFileError::LocalInboundRequiresMppOutbound),
-        _ => Err(ConfigFileError::AmbiguousMppOutbound),
+        _ => Err(ConfigFileError::MultipleDefaultMppTargets),
     }
 }
 
@@ -1038,7 +1038,7 @@ fn resolve_default_egress_target(
     match candidates.as_slice() {
         [target] => Ok(target.clone()),
         [] => Err(ConfigFileError::MppInboundRequiresEgressOutbound),
-        _ => Err(ConfigFileError::AmbiguousEgressOutbound),
+        _ => Err(ConfigFileError::MultipleDefaultEgressTargets),
     }
 }
 
@@ -1195,8 +1195,8 @@ pub enum ConfigFileError {
     BalancerFieldReferencesOutbound(String),
     LocalInboundRequiresMppOutbound,
     MppInboundRequiresEgressOutbound,
-    AmbiguousMppOutbound,
-    AmbiguousEgressOutbound,
+    MultipleDefaultMppTargets,
+    MultipleDefaultEgressTargets,
     MppInboundRequiresEndpoint,
     MppOutboundRequiresEndpoint(String),
     RoutingBalancerRequiresMembers(String),
@@ -1279,11 +1279,11 @@ impl std::fmt::Display for ConfigFileError {
                 f,
                 "MPP inbounds require an egress outbound or egress balancer with protocol direct, socks5, http-connect, or http-connect-udp"
             ),
-            Self::AmbiguousMppOutbound => write!(
+            Self::MultipleDefaultMppTargets => write!(
                 f,
                 "local inbound outbound or balancer tag is required when multiple MPP targets exist"
             ),
-            Self::AmbiguousEgressOutbound => write!(
+            Self::MultipleDefaultEgressTargets => write!(
                 f,
                 "MPP inbound outbound or balancer tag is required when multiple egress targets exist"
             ),
@@ -1347,8 +1347,8 @@ impl std::error::Error for ConfigFileError {
             | Self::BalancerFieldReferencesOutbound(_)
             | Self::LocalInboundRequiresMppOutbound
             | Self::MppInboundRequiresEgressOutbound
-            | Self::AmbiguousMppOutbound
-            | Self::AmbiguousEgressOutbound
+            | Self::MultipleDefaultMppTargets
+            | Self::MultipleDefaultEgressTargets
             | Self::MppInboundRequiresEndpoint
             | Self::MppOutboundRequiresEndpoint(_)
             | Self::RoutingBalancerRequiresMembers(_)

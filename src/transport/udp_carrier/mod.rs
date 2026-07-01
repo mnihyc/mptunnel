@@ -31,7 +31,7 @@ fn stream_payload_for_fragment(fragment_payload: usize) -> usize {
 pub fn safe_stream_payload_bytes(mux_limits: MuxLimits) -> usize {
     let fragment_payload = packet::max_frame_fragment_payload();
     stream_payload_for_fragment(fragment_payload)
-        .min(mux_limits.max_tcp_relay_chunk_bytes)
+        .min(mux_limits.max_reliable_relay_chunk_bytes)
         .max(1)
 }
 
@@ -40,7 +40,7 @@ pub fn max_stream_payload_bytes(codec_limits: CodecLimits, mux_limits: MuxLimits
     let ack_horizon_fragments = mux_limits.max_ack_ranges.max(1);
     let bulk_payload = safe_payload.saturating_mul(ack_horizon_fragments);
     mux_limits
-        .max_tcp_relay_chunk_bytes
+        .max_reliable_relay_chunk_bytes
         .min(codec_limits.max_payload_bytes)
         .min(bulk_payload)
         .max(1)
@@ -54,11 +54,11 @@ mod tests {
     fn safe_stream_payload_ceiling_fits_one_udp_packet() {
         let codec_limits = CodecLimits::default();
         let compact = MuxLimits {
-            max_tcp_relay_chunk_bytes: 64 * 1024,
+            max_reliable_relay_chunk_bytes: 64 * 1024,
             ..MuxLimits::default()
         };
         let high_bdp = MuxLimits {
-            max_tcp_relay_chunk_bytes: 512 * 1024,
+            max_reliable_relay_chunk_bytes: 512 * 1024,
             ..MuxLimits::default()
         };
 
@@ -76,7 +76,7 @@ mod tests {
     fn udp_bulk_stream_payload_ceiling_amortizes_across_ack_horizon() {
         let codec_limits = CodecLimits::default();
         let limits = MuxLimits {
-            max_tcp_relay_chunk_bytes: 64 * 1024,
+            max_reliable_relay_chunk_bytes: 64 * 1024,
             max_ack_ranges: 16,
             ..MuxLimits::default()
         };
@@ -86,7 +86,7 @@ mod tests {
         assert!(bulk_payload > safe_payload);
         assert_eq!(
             bulk_payload,
-            (safe_payload * limits.max_ack_ranges).min(limits.max_tcp_relay_chunk_bytes)
+            (safe_payload * limits.max_ack_ranges).min(limits.max_reliable_relay_chunk_bytes)
         );
     }
 }

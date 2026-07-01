@@ -400,7 +400,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
 
 #[tokio::test]
 async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
-    let registry = ServerTcpStreamRegistry::new(8);
+    let registry = ServerReliableStreamRegistry::new(8);
     let session_id = SessionId(11);
     let stream_id = StreamId(5);
     let (commands, _receivers) = tcp_path_session_command_channels(4);
@@ -411,16 +411,16 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
 
     let opened = registry
         .open_or_attach(
-            ServerTcpStreamOpenRequest {
+            ServerReliableStreamOpenRequest {
                 session_id,
                 stream_id,
                 target: &target,
                 lane: FlowLane::Latency,
-                attachment: ServerTcpPathAttachment {
+                attachment: ServerReliablePathAttachment {
                     path_id: PathId(0),
                     underlay: UnderlayProtocol::Tcp,
                     commands,
-                    max_frame_payload_bytes: tcp_relay_buffer_len(MuxLimits::default()),
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
                 },
             },
@@ -428,7 +428,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
             8,
         )
         .expect("server stream open");
-    assert!(matches!(opened, ServerTcpStreamOpen::New(_)));
+    assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
 
     registry.close(session_id, stream_id);
     registry
@@ -459,21 +459,21 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
 }
 
 #[tokio::test]
-async fn server_tcp_relay_does_not_replay_whole_repair_cache_on_path_reattach() {
+async fn server_reliable_relay_does_not_replay_whole_repair_cache_on_path_reattach() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(42);
     let (mut target_peer, target_side) = duplex(4096);
     let (commands_tx, mut commands_rx) = tcp_path_session_command_channels(8);
     let (frames_tx, frames_rx) = mpsc::channel(8);
-    let relay = tokio::spawn(relay_tcp_stream(
+    let relay = tokio::spawn(relay_reliable_stream(
         target_side,
-        TcpPathStream {
+        ReliablePathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
             lane: FlowLane::Latency,
             underlay: UnderlayProtocol::Tcp,
-            max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
-            output: TcpPathStreamOutput::Fixed(commands_tx),
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::Fixed(commands_tx),
             frames: frames_rx,
         },
         mux_limits,
@@ -675,9 +675,12 @@ fn bulk_striping_orders_paths_by_bulk_eta() {
     .expect("context");
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
-            .first()
-            .copied(),
+        tcp_bulk_striping_indices(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        )
+        .first()
+        .copied(),
         Some(1)
     );
 }
@@ -722,7 +725,10 @@ fn bulk_striping_skips_expensive_path() {
     .expect("context");
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        tcp_bulk_striping_indices(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![0]
     );
 }
@@ -846,7 +852,7 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
     .expect("context");
 
     assert_eq!(
-        tcp_relay_attach_open_timeout(
+        reliable_relay_attach_open_timeout(
             &context,
             RelayPathKey {
                 underlay: UnderlayProtocol::Tcp,
@@ -857,7 +863,7 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
         TCP_STREAM_STALL_MIN_TIMEOUT
     );
     assert!(
-        tcp_relay_attach_open_timeout(
+        reliable_relay_attach_open_timeout(
             &context,
             RelayPathKey {
                 underlay: UnderlayProtocol::Tcp,
@@ -872,7 +878,7 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
 fn path_open_timeout_is_a_migratable_retryable_path_failure() {
     let err = RuntimeError::PathOpenTimedOut;
     assert!(stream_open_error_is_path_retryable(&err));
-    assert!(tcp_relay_error_is_migratable(&err));
+    assert!(reliable_relay_error_is_migratable(&err));
     assert!(relay_error_is_tcp_path_failure::<()>(&Err(err)));
 }
 
@@ -895,7 +901,10 @@ fn endpoint_only_tcp_bulk_striping_admits_only_best_unmeasured_path() {
     .expect("context");
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        tcp_bulk_striping_indices(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![0]
     );
 }
@@ -927,12 +936,17 @@ fn endpoint_only_tcp_bulk_striping_validates_unmeasured_paths_after_bulk_promoti
     );
 
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        tcp_bulk_striping_indices(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![0]
     );
     assert_eq!(
         context
-            .ordered_reliable_bulk_validation_path_keys(tcp_relay_buffer_len(MuxLimits::default()))
+            .ordered_reliable_bulk_validation_path_keys(reliable_relay_buffer_len(
+                MuxLimits::default()
+            ))
             .into_iter()
             .map(|key| key.index)
             .collect::<Vec<_>>(),
@@ -966,8 +980,9 @@ fn mixed_bulk_validation_prioritizes_udp_path_scoped_proof() {
         FlowLane::Throughput,
     );
 
-    let candidates = context
-        .ordered_reliable_bulk_validation_path_keys(tcp_relay_buffer_len(MuxLimits::default()));
+    let candidates = context.ordered_reliable_bulk_validation_path_keys(reliable_relay_buffer_len(
+        MuxLimits::default(),
+    ));
 
     assert_eq!(
         candidates
@@ -1029,7 +1044,10 @@ fn endpoint_only_tcp_bulk_striping_keeps_unknown_paths_out_of_measured_bulk_coho
 
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     assert_eq!(
-        tcp_bulk_striping_indices(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        tcp_bulk_striping_indices(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![0]
     );
 }
@@ -1083,10 +1101,13 @@ fn endpoint_only_udp_stream_bulk_striping_admits_only_best_unmeasured_path() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
-            .into_iter()
-            .filter_map(|key| (key.underlay == UnderlayProtocol::Udp).then_some(key.index))
-            .collect::<Vec<_>>(),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        )
+        .into_iter()
+        .filter_map(|key| (key.underlay == UnderlayProtocol::Udp).then_some(key.index))
+        .collect::<Vec<_>>(),
         vec![0]
     );
 }
@@ -1151,7 +1172,10 @@ fn mixed_endpoint_only_bulk_striping_admits_only_best_unmeasured_path() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -1176,9 +1200,12 @@ fn mixed_endpoint_only_bulk_striping_keeps_udp_eligible_under_tcp_pressure() {
     context.reserve_tcp_path_load(0, FlowLane::Latency);
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
-            .first()
-            .copied(),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        )
+        .first()
+        .copied(),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -1204,7 +1231,10 @@ fn mixed_endpoint_only_bulk_striping_keeps_measured_udp_without_unmeasured_tcp()
     context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -1236,7 +1266,7 @@ fn mixed_udp_repair_keeps_healthy_udp_eligible_on_active_tcp_stream() {
             .ordered_udp_stream_repair_path_indices(
                 None,
                 FlowLane::Throughput,
-                MuxLimits::default().max_tcp_relay_chunk_bytes,
+                MuxLimits::default().max_reliable_relay_chunk_bytes,
                 true,
             )
             .is_empty()
@@ -1256,7 +1286,7 @@ fn mixed_udp_repair_keeps_healthy_udp_eligible_on_active_tcp_stream() {
         context.ordered_udp_stream_repair_path_indices(
             None,
             FlowLane::Throughput,
-            MuxLimits::default().max_tcp_relay_chunk_bytes,
+            MuxLimits::default().max_reliable_relay_chunk_bytes,
             true,
         ),
         vec![1]
@@ -1284,7 +1314,7 @@ fn udp_repair_keeps_healthy_endpoint_only_path_eligible() {
             .ordered_udp_stream_repair_path_indices(
                 Some(0),
                 FlowLane::Throughput,
-                MuxLimits::default().max_tcp_relay_chunk_bytes,
+                MuxLimits::default().max_reliable_relay_chunk_bytes,
                 true,
             )
             .is_empty()
@@ -1304,7 +1334,7 @@ fn udp_repair_keeps_healthy_endpoint_only_path_eligible() {
         context.ordered_udp_stream_repair_path_indices(
             Some(0),
             FlowLane::Throughput,
-            MuxLimits::default().max_tcp_relay_chunk_bytes,
+            MuxLimits::default().max_reliable_relay_chunk_bytes,
             true,
         ),
         vec![1]
@@ -1327,9 +1357,12 @@ fn mixed_bulk_striping_orders_better_udp_before_tcp() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
-            .first()
-            .copied(),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        )
+        .first()
+        .copied(),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -1353,7 +1386,10 @@ fn mixed_bulk_striping_suppresses_catastrophically_worse_udp_candidate() {
     .expect("context");
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        ),
         vec![RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -1386,9 +1422,12 @@ fn mixed_bulk_striping_penalizes_lossy_high_rtt_udp_carrier() {
     );
 
     assert_eq!(
-        reliable_bulk_striping_path_keys(&context, MuxLimits::default().max_tcp_relay_chunk_bytes)
-            .first()
-            .copied(),
+        reliable_bulk_striping_path_keys(
+            &context,
+            MuxLimits::default().max_reliable_relay_chunk_bytes
+        )
+        .first()
+        .copied(),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -1414,7 +1453,7 @@ fn mixed_bulk_striping_can_choose_best_carrier_without_active_cohort() {
     assert_eq!(
         context
             .ordered_reliable_bulk_striping_path_keys(
-                MuxLimits::default().max_tcp_relay_chunk_bytes
+                MuxLimits::default().max_reliable_relay_chunk_bytes
             )
             .first()
             .copied(),
@@ -1465,13 +1504,13 @@ fn opened_relay_stream_for_test(
     (
         OpenedRemoteStream {
             path_index,
-            stream: TcpPathStream {
+            stream: ReliablePathStream {
                 stream_id,
                 max_offset: mux_limits.max_stream_window_bytes,
                 lane: FlowLane::Throughput,
                 underlay,
-                max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
-                output: TcpPathStreamOutput::Fixed(commands),
+                max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+                output: ReliablePathStreamOutput::Fixed(commands),
                 frames: frames_rx,
             },
         },
@@ -1484,7 +1523,7 @@ fn opened_relay_stream_for_test(
 async fn mixed_relay_current_carrier_tracks_latest_data_path() {
     let (tcp_stream, _tcp_commands, _tcp_frames) =
         opened_relay_stream_for_test(StreamId(44), UnderlayProtocol::Tcp, 0);
-    let mut remotes = TcpRelayRemoteSet::new(tcp_stream, 4);
+    let mut remotes = ReliableRelayRemoteSet::new(tcp_stream, 4);
     assert_eq!(
         remotes.active_carrier_underlay(),
         Some(UnderlayProtocol::Tcp)
@@ -1524,7 +1563,7 @@ async fn repair_race_attach_preserves_active_data_path() {
     let stream_id = StreamId(46);
     let (active_stream, mut active_commands, _active_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
-    let mut remotes = TcpRelayRemoteSet::new(active_stream, 4);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 4);
     let (repair_stream, mut repair_commands, _repair_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 1);
 
@@ -1581,7 +1620,7 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
     let stream_id = StreamId(146);
     let (active_stream, mut active_commands, _active_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = TcpRelayRemoteSet::new(active_stream, 8);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
     let (repair_stream, mut repair_commands, _repair_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
     remotes.attach_for_repair(repair_stream);
@@ -1660,7 +1699,7 @@ async fn bulk_relay_validation_path_can_receive_admitted_probe_data() {
     let stream_id = StreamId(149);
     let (active_stream, mut active_commands, _active_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = TcpRelayRemoteSet::new(active_stream, 8);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
     let (validation_stream, mut validation_commands, _validation_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
     remotes.attach_for_validation(validation_stream);
@@ -1722,7 +1761,7 @@ async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
     let stream_id = StreamId(148);
     let (best_stream, mut best_commands, _best_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = TcpRelayRemoteSet::new(best_stream, 8);
+    let mut remotes = ReliableRelayRemoteSet::new(best_stream, 8);
     let (slow_active_stream, mut slow_active_commands, _slow_active_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
     remotes.attach(slow_active_stream);
@@ -1797,7 +1836,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
     .expect("context");
     let (slow_active, mut slow_commands, _slow_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 1);
-    let mut remotes = TcpRelayRemoteSet::new(slow_active, 4);
+    let mut remotes = ReliableRelayRemoteSet::new(slow_active, 4);
     let (fast_repair, mut fast_commands, _fast_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
     remotes.attach_for_repair(fast_repair);
@@ -1809,7 +1848,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         .instance();
 
     assert!(
-        !tcp_relay_delivery_path_should_become_active(
+        !reliable_relay_delivery_path_should_become_active(
             &context,
             remotes.active_path_key(),
             fast_instance.key,
@@ -1823,7 +1862,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         0,
         PathRateSample::new(512 * 1024, Duration::from_millis(50)).expect("rate sample"),
     );
-    assert!(tcp_relay_delivery_path_should_become_active(
+    assert!(reliable_relay_delivery_path_should_become_active(
         &context,
         remotes.active_path_key(),
         fast_instance.key,
@@ -1871,7 +1910,7 @@ async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
         underlay: UnderlayProtocol::Udp,
         index: 1,
     };
-    assert!(!tcp_relay_delivery_path_should_become_active(
+    assert!(!reliable_relay_delivery_path_should_become_active(
         &context,
         remotes.active_path_key(),
         worse_path,
@@ -1888,17 +1927,17 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
     let (_frames_tx, frames_rx) = mpsc::channel(4);
     let opened = OpenedRemoteStream {
         path_index: 1,
-        stream: TcpPathStream {
+        stream: ReliablePathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
             lane: FlowLane::Throughput,
             underlay: UnderlayProtocol::Udp,
-            max_frame_payload_bytes: tcp_relay_buffer_len(mux_limits),
-            output: TcpPathStreamOutput::Fixed(commands),
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::Fixed(commands),
             frames: frames_rx,
         },
     };
-    let mut remotes = TcpRelayRemoteSet::new(opened, 4);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
     let instance = remotes.active_path_instance().expect("active path");
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
@@ -1932,7 +1971,7 @@ async fn server_bulk_output_waits_when_active_path_exceeds_admission_budget() {
         ..MuxLimits::default()
     };
     let (commands, mut command_rx) = tcp_path_session_command_channels(8);
-    let binding = ServerTcpStreamBinding::new_with_limits(
+    let binding = ResponseStreamBinding::new_with_limits(
         SessionId(1),
         UnderlayProtocol::Udp,
         PathId(0),

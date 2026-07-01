@@ -1,5 +1,11 @@
 use super::*;
 
+// Ownership boundary:
+// Sender services own product work before it reaches carrier command queues.
+// Client relay sending and server response dispatch both use this module for
+// queueing, product flight ledgers, stream-ACK release, and diagnostics. Final
+// TCP/UDP emission still happens through carrier command senders.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RelaySendCause {
     StreamData,
@@ -56,7 +62,11 @@ impl RelayRecvProgressSend {
 }
 
 #[derive(Debug)]
-pub(super) struct TcpRelayQueuedFrame {
+/// Byte-bounded queue for product reliable frames awaiting sender admission.
+///
+/// This is above carrier paths: it is sized by product flow-control and repair
+/// envelopes, not by TCP socket buffers or QUIC packet queues.
+pub(super) struct ReliableRelayQueuedFrame {
     pub(super) frame: Frame,
     pub(super) payload_bytes: usize,
     #[cfg(feature = "lab-diagnostics")]
@@ -66,14 +76,18 @@ pub(super) struct TcpRelayQueuedFrame {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct TcpRelaySenderQueue {
-    frames: VecDeque<TcpRelayQueuedFrame>,
+/// FIFO staging queue used by the current response sender service.
+///
+/// It owns queued product frames and queue age before dispatch. Path command
+/// queues must receive only already-admitted frames.
+pub(super) struct ReliableRelaySenderQueue {
+    frames: VecDeque<ReliableRelayQueuedFrame>,
     bytes: usize,
     #[cfg(feature = "lab-diagnostics")]
     next_enqueue_id: u64,
 }
 
-impl TcpRelaySenderQueue {
+impl ReliableRelaySenderQueue {
     pub(super) fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
@@ -93,7 +107,7 @@ impl TcpRelaySenderQueue {
         #[cfg(not(feature = "lab-diagnostics"))]
         let enqueue_id = 0;
         self.bytes = self.bytes.saturating_add(payload_bytes);
-        self.frames.push_back(TcpRelayQueuedFrame {
+        self.frames.push_back(ReliableRelayQueuedFrame {
             frame,
             payload_bytes,
             #[cfg(feature = "lab-diagnostics")]
@@ -104,7 +118,7 @@ impl TcpRelaySenderQueue {
         enqueue_id
     }
 
-    pub(super) fn pop_front(&mut self) -> Option<TcpRelayQueuedFrame> {
+    pub(super) fn pop_front(&mut self) -> Option<ReliableRelayQueuedFrame> {
         let frame = self.frames.pop_front()?;
         self.bytes = self.bytes.saturating_sub(frame.payload_bytes);
         Some(frame)
@@ -121,7 +135,10 @@ impl TcpRelaySenderQueue {
     }
 }
 
-pub(super) fn tcp_relay_sender_queue_limit(mux_limits: MuxLimits, inflight_limit: usize) -> usize {
+pub(super) fn reliable_relay_sender_queue_limit(
+    mux_limits: MuxLimits,
+    inflight_limit: usize,
+) -> usize {
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
     inflight_limit
         .max(mux_limits.max_tcp_path_inflight_bytes)
@@ -130,9 +147,9 @@ pub(super) fn tcp_relay_sender_queue_limit(mux_limits: MuxLimits, inflight_limit
         .max(1)
 }
 
-pub(super) fn tcp_relay_can_read_into_sender_queue(
+pub(super) fn reliable_relay_can_read_into_sender_queue(
     send_stream: &ReliableSendStream,
-    sender_queue: &TcpRelaySenderQueue,
+    sender_queue: &ReliableRelaySenderQueue,
     mux_limits: MuxLimits,
     queue_limit: usize,
 ) -> bool {
@@ -141,22 +158,27 @@ pub(super) fn tcp_relay_can_read_into_sender_queue(
         && send_stream.repair_bytes() < mux_limits.max_repair_bytes
 }
 
-pub(super) fn tcp_relay_can_read_product_source(
+pub(super) fn reliable_relay_can_read_product_source(
     local_open: bool,
     queued_send_blocked: bool,
     send_stream: &ReliableSendStream,
-    sender_queue: &TcpRelaySenderQueue,
+    sender_queue: &ReliableRelaySenderQueue,
     mux_limits: MuxLimits,
     queue_limit: usize,
 ) -> bool {
     local_open
         && !queued_send_blocked
-        && tcp_relay_can_read_into_sender_queue(send_stream, sender_queue, mux_limits, queue_limit)
+        && reliable_relay_can_read_into_sender_queue(
+            send_stream,
+            sender_queue,
+            mux_limits,
+            queue_limit,
+        )
 }
 
-pub(super) fn tcp_relay_sender_queue_read_budget(
+pub(super) fn reliable_relay_sender_queue_read_budget(
     send_stream: &ReliableSendStream,
-    sender_queue: &TcpRelaySenderQueue,
+    sender_queue: &ReliableRelaySenderQueue,
     mux_limits: MuxLimits,
     queue_limit: usize,
     buffer_len: usize,
@@ -173,12 +195,17 @@ pub(super) fn tcp_relay_sender_queue_read_budget(
 }
 
 #[derive(Debug)]
+/// Current server response sender-service boundary.
+///
+/// Target reads enqueue STREAM_DATA here before any carrier path write. The
+/// service owns queue accounting and dispatch diagnostics, while the
+/// `ReliablePathStream` binding owns the current carrier-neutral path choice.
 pub(super) struct ServerResponseSenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     session_id: SessionId,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     stream_id: StreamId,
-    queue: TcpRelaySenderQueue,
+    queue: ReliableRelaySenderQueue,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -191,7 +218,7 @@ impl ServerResponseSenderService {
         Self {
             session_id,
             stream_id,
-            queue: TcpRelaySenderQueue::default(),
+            queue: ReliableRelaySenderQueue::default(),
         }
     }
 
@@ -204,13 +231,13 @@ impl ServerResponseSenderService {
         self.queue.bytes()
     }
 
-    pub(super) fn publish_queue_bytes(&self, path_stream: &TcpPathStream) {
+    pub(super) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
         path_stream.set_sender_queue_bytes(self.queue.bytes());
     }
 
     pub(super) fn queued_send_ready(
         &self,
-        path_stream: &TcpPathStream,
+        path_stream: &ReliablePathStream,
         relay_lane: FlowLane,
     ) -> bool {
         self.queue
@@ -233,7 +260,7 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
         queue_limit: usize,
     ) -> bool {
-        tcp_relay_can_read_product_source(
+        reliable_relay_can_read_product_source(
             local_open,
             queued_send_blocked,
             send_stream,
@@ -250,7 +277,7 @@ impl ServerResponseSenderService {
         queue_limit: usize,
         buffer_len: usize,
     ) -> usize {
-        tcp_relay_sender_queue_read_budget(
+        reliable_relay_sender_queue_read_budget(
             send_stream,
             &self.queue,
             mux_limits,
@@ -265,7 +292,7 @@ impl ServerResponseSenderService {
 
     pub(super) async fn dispatch_next(
         &mut self,
-        path_stream: &TcpPathStream,
+        path_stream: &ReliablePathStream,
         relay_lane: FlowLane,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         #[cfg(not(feature = "lab-diagnostics"))]
@@ -352,7 +379,7 @@ impl RelaySenderService {
     pub(super) async fn send_stream_data(
         &mut self,
         context: &ClientPathContext,
-        remotes: &mut TcpRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         self.send_frame(context, remotes, frame, RelaySendCause::StreamData)
@@ -362,7 +389,7 @@ impl RelaySenderService {
     pub(super) async fn send_control_frame(
         &mut self,
         context: &ClientPathContext,
-        remotes: &mut TcpRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
@@ -373,7 +400,7 @@ impl RelaySenderService {
     pub(super) async fn send_repair_frame(
         &mut self,
         context: &ClientPathContext,
-        remotes: &mut TcpRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
@@ -384,7 +411,7 @@ impl RelaySenderService {
     async fn send_frame(
         &mut self,
         context: &ClientPathContext,
-        remotes: &mut TcpRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
@@ -445,7 +472,7 @@ impl RelaySenderService {
     pub(super) fn can_send_stream_data_extent(
         &self,
         context: &ClientPathContext,
-        remotes: &TcpRelayRemoteSet,
+        remotes: &ReliableRelayRemoteSet,
         lane: FlowLane,
         offset: u64,
         payload_bytes: usize,
@@ -455,7 +482,7 @@ impl RelaySenderService {
 
     pub(super) async fn send_recv_progress(
         &mut self,
-        remotes: &mut TcpRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         context: &ClientPathContext,
         recv_stream: &ReliableRecvStream,
         progress: &mut ReliableRecvProgress,
@@ -494,7 +521,7 @@ impl RelaySenderService {
     pub(super) async fn send_failed_path_gap_repairs(
         &mut self,
         context: &ClientPathContext,
-        remotes: &mut TcpRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
         failed_key: RelayPathKey,
         lane: FlowLane,
@@ -506,7 +533,8 @@ impl RelaySenderService {
         let repair_path = remotes
             .primary_path_key()
             .and_then(|key| relay_path_snapshot(context, key));
-        let repair_limit = adaptive_tcp_relay_repair_bytes(repair_path, lane, context.mux_limits);
+        let repair_limit =
+            adaptive_reliable_relay_repair_bytes(repair_path, lane, context.mux_limits);
         let repair_frames = send_stream.retransmission_frames_for_ranges(&ranges, repair_limit);
         if repair_frames.is_empty() {
             return Ok(false);

@@ -600,6 +600,15 @@ if not row:
     }
 lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
 lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
+instrumented_run = lab_diag or lab_perf
+row["lab_diagnostics_enabled"] = lab_diag
+row["lab_perf_enabled"] = lab_perf
+row["performance_comparable"] = not instrumented_run
+if instrumented_run:
+    row["performance_comparable_reason"] = (
+        "diagnostic/perf instrumentation is for causal analysis only; "
+        "use non-instrumented release rows for throughput comparisons"
+    )
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:
@@ -717,6 +726,15 @@ if not row:
     }
 lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
 lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
+instrumented_run = lab_diag or lab_perf
+row["lab_diagnostics_enabled"] = lab_diag
+row["lab_perf_enabled"] = lab_perf
+row["performance_comparable"] = not instrumented_run
+if instrumented_run:
+    row["performance_comparable_reason"] = (
+        "diagnostic/perf instrumentation is for causal analysis only; "
+        "use non-instrumented release rows for throughput comparisons"
+    )
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:
@@ -1362,6 +1380,15 @@ if not row:
     }
 lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
 lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
+instrumented_run = lab_diag or lab_perf
+row["lab_diagnostics_enabled"] = lab_diag
+row["lab_perf_enabled"] = lab_perf
+row["performance_comparable"] = not instrumented_run
+if instrumented_run:
+    row["performance_comparable_reason"] = (
+        "diagnostic/perf instrumentation is for causal analysis only; "
+        "use non-instrumented release rows for throughput comparisons"
+    )
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:

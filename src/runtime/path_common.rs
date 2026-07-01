@@ -78,12 +78,22 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                         ttl_ms,
                         payload: Bytes::copy_from_slice(&response_buffer[..len]),
                     };
-                    if commands
-                        .send_frame(frame, FlowLane::RealtimeDatagram)
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    match try_send_server_datagram_response_frame(&commands, frame) {
+                        Ok(()) => {}
+                        Err(RuntimeError::SenderServiceBlocked) => {
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "server_datagram_response_dropped",
+                                format_args!(
+                                    "flow_id={} datagram_id={} payload_bytes={} reason=carrier_credit",
+                                    flow_id.0,
+                                    datagram_id.0,
+                                    len,
+                                ),
+                            );
+                            continue;
+                        }
+                        Err(_) => break,
                     }
                 }
                 request = requests_rx.recv() => {
@@ -110,6 +120,17 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
         }
     });
     requests_tx
+}
+
+pub(super) fn try_send_server_datagram_response_frame(
+    commands: &TcpPathSessionCommandSender,
+    frame: Frame,
+) -> Result<(), RuntimeError> {
+    debug_assert!(matches!(
+        frame,
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. }
+    ));
+    commands.try_enqueue_admitted_frame(frame, FlowLane::RealtimeDatagram)
 }
 
 fn prune_server_udp_pending_ttls(pending_ttls: &mut VecDeque<(Instant, u32, DatagramId)>) {

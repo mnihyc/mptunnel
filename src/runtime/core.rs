@@ -2277,6 +2277,7 @@ pub(super) fn path_snapshot(
         product_bytes_in_flight: observation.relay_bytes_in_flight,
         active_flows: observation.active_flows,
         active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
+        session_active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
         pacing_rate_bps,
         inflight_limit_bytes,
         confidence,

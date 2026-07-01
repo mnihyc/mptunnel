@@ -14,6 +14,7 @@ pub(super) struct BulkPathCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BulkAdmissionRole {
     ActiveDataPath,
+    ActiveSingleCarrier,
     AdditionalSameUnderlay,
     AdditionalCrossUnderlay,
 }
@@ -252,7 +253,9 @@ fn bulk_candidate_within_inflight_limit(
     mux_limits: MuxLimits,
     role: BulkAdmissionRole,
 ) -> bool {
-    let (inflight_limit, committed) = if candidate.underlay == UnderlayProtocol::Udp {
+    let use_carrier_gate = candidate.underlay == UnderlayProtocol::Udp
+        && !bulk_uses_product_only_active_gate(candidate, role);
+    let (inflight_limit, committed) = if use_carrier_gate {
         (
             bulk_carrier_inflight_limit_bytes(candidate, payload_bytes, mux_limits, role),
             bulk_scheduler_inflight_debt_bytes(candidate, role),
@@ -273,7 +276,7 @@ fn bulk_product_inflight_limit_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    _role: BulkAdmissionRole,
+    role: BulkAdmissionRole,
 ) -> u64 {
     let configured_ceiling = mux_limits.max_tcp_path_inflight_bytes as u64;
     let payload_floor = payload_bytes as u64;
@@ -287,7 +290,12 @@ fn bulk_product_inflight_limit_bytes(
     } else {
         bdp_limit
     };
-    modeled_limit.min(configured_ceiling.max(payload_floor))
+    let modeled_limit = modeled_limit.min(configured_ceiling.max(payload_floor));
+    if bulk_active_role_has_latency_pressure(candidate, role) {
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
+        return modeled_limit.min(service_horizon.max(payload_floor));
+    }
+    modeled_limit
 }
 
 fn bulk_carrier_inflight_limit_bytes(
@@ -349,7 +357,12 @@ fn bulk_reorder_absorption_ms(
 }
 
 fn bulk_scheduler_inflight_debt_bytes(candidate: PathSnapshot, role: BulkAdmissionRole) -> u64 {
-    if matches!(role, BulkAdmissionRole::ActiveDataPath) {
+    if bulk_uses_product_only_active_gate(candidate, role) {
+        return candidate
+            .product_bytes_in_flight
+            .saturating_add(candidate.queue_bytes);
+    }
+    if role == BulkAdmissionRole::ActiveDataPath {
         return bulk_product_reorder_debt_bytes(candidate).saturating_add(candidate.queue_bytes);
     }
     if candidate.underlay == UnderlayProtocol::Udp
@@ -360,6 +373,23 @@ fn bulk_scheduler_inflight_debt_bytes(candidate: PathSnapshot, role: BulkAdmissi
             .saturating_add(candidate.bytes_in_flight);
     }
     bulk_product_reorder_debt_bytes(candidate)
+}
+
+fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
+    role == BulkAdmissionRole::ActiveSingleCarrier && bulk_latency_pressure_flows(candidate) > 0
+}
+
+fn bulk_active_role_has_latency_pressure(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
+    matches!(
+        role,
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
+    ) && bulk_latency_pressure_flows(candidate) > 0
+}
+
+fn bulk_latency_pressure_flows(candidate: PathSnapshot) -> u32 {
+    candidate
+        .active_latency_sensitive_flows
+        .max(candidate.session_active_latency_sensitive_flows)
 }
 
 fn bulk_product_reorder_debt_bytes(candidate: PathSnapshot) -> u64 {
@@ -376,7 +406,9 @@ fn bulk_total_reorder_debt_bytes(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     let path_debt = match role {
-        BulkAdmissionRole::ActiveDataPath => candidate.queue_bytes,
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
+            candidate.queue_bytes
+        }
         BulkAdmissionRole::AdditionalSameUnderlay | BulkAdmissionRole::AdditionalCrossUnderlay => {
             bulk_product_reorder_debt_bytes(candidate)
         }
@@ -419,7 +451,9 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     match role {
-        BulkAdmissionRole::ActiveDataPath if stream_ordering_debt_bytes == 0 => {
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
+            if stream_ordering_debt_bytes == 0 =>
+        {
             bulk_product_inflight_limit_bytes(
                 candidate,
                 payload_bytes,
@@ -427,7 +461,7 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
                 BulkAdmissionRole::ActiveDataPath,
             )
         }
-        BulkAdmissionRole::ActiveDataPath => {
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
             bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
         }
         BulkAdmissionRole::AdditionalSameUnderlay => {
@@ -536,6 +570,51 @@ mod tests {
 
         assert!(limit < mux_limits.max_tcp_path_inflight_bytes as u64);
         assert_eq!(limit, 625_000);
+    }
+
+    #[test]
+    fn active_tcp_with_session_latency_pressure_uses_preemptible_service_horizon() {
+        let mux_limits = MuxLimits {
+            max_tcp_path_inflight_bytes: 32 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
+        candidate.session_active_latency_sensitive_flows = 1;
+        let payload = 64 * 1024;
+        let limit = bulk_product_inflight_limit_bytes(
+            candidate,
+            payload,
+            mux_limits,
+            BulkAdmissionRole::ActiveDataPath,
+        );
+
+        assert_eq!(
+            limit,
+            bulk_service_horizon_payload_bytes(payload, mux_limits) as u64
+        );
+        assert!(limit < bulk_path_bdp_bytes(candidate));
+    }
+
+    #[test]
+    fn active_tcp_with_session_latency_pressure_rejects_hidden_command_backlog() {
+        let best = candidate(0, 100.0, 50.0, 500.0);
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
+        active.queue_bytes = 8 * 1024 * 1024;
+        active.product_bytes_in_flight = 8 * 1024 * 1024;
+        active.session_active_latency_sensitive_flows = 1;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                best.snapshot,
+                best.eta_ms,
+                active,
+                100.0,
+                64 * 1024,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit")
+        );
     }
 
     #[test]
@@ -743,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_active_path_obeys_carrier_queue_gate() {
+    fn udp_multipath_active_path_obeys_carrier_queue_gate() {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut active = candidate(0, 100.0, 50.0, 500.0);
         active.snapshot.confidence = 1.0;
@@ -759,6 +838,54 @@ mod tests {
                 64 * 1024,
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit")
+        );
+    }
+
+    #[test]
+    fn udp_single_carrier_lead_uses_product_budget_not_duplicate_carrier_cwnd() {
+        let best = candidate(0, 100.0, 50.0, 500.0);
+        let mut active = candidate(0, 100.0, 50.0, 500.0);
+        active.snapshot.confidence = 1.0;
+        active.snapshot.active_flows = 2;
+        active.snapshot.active_latency_sensitive_flows = 1;
+        active.snapshot.inflight_limit_bytes = 512 * 1024;
+        active.snapshot.bytes_in_flight = 512 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                best.snapshot,
+                best.eta_ms,
+                active.snapshot,
+                active.eta_ms,
+                64 * 1024,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveSingleCarrier,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn udp_single_flow_lead_keeps_carrier_queue_gate() {
+        let best = candidate(0, 100.0, 50.0, 500.0);
+        let mut active = candidate(0, 100.0, 50.0, 500.0);
+        active.snapshot.confidence = 1.0;
+        active.snapshot.active_flows = 1;
+        active.snapshot.active_latency_sensitive_flows = 0;
+        active.snapshot.inflight_limit_bytes = 512 * 1024;
+        active.snapshot.bytes_in_flight = 512 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                best.snapshot,
+                best.eta_ms,
+                active.snapshot,
+                active.eta_ms,
+                64 * 1024,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveSingleCarrier,
             ),
             Some("inflight_limit")
         );
@@ -791,6 +918,8 @@ mod tests {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut startup = candidate(0, 100.1, 50.0, 10.0);
         startup.snapshot.confidence = 0.1;
+        startup.snapshot.active_flows = 2;
+        startup.snapshot.active_latency_sensitive_flows = 1;
         startup.snapshot.bytes_in_flight = 1024 * 1024;
 
         assert_eq!(
@@ -801,9 +930,9 @@ mod tests {
                 startup.eta_ms,
                 64 * 1024,
                 MuxLimits::default(),
-                BulkAdmissionRole::ActiveDataPath,
+                BulkAdmissionRole::ActiveSingleCarrier,
             ),
-            Some("inflight_limit")
+            None
         );
         assert_eq!(
             bulk_candidate_admission_suppression(
@@ -938,7 +1067,7 @@ mod tests {
     fn bulk_admission_rejects_saturated_best_candidate() {
         let mut saturated_best = candidate(0, 100.0, 50.0, 500.0);
         saturated_best.snapshot.inflight_limit_bytes = 64 * 1024;
-        saturated_best.snapshot.bytes_in_flight =
+        saturated_best.snapshot.product_bytes_in_flight =
             MuxLimits::default().max_tcp_path_inflight_bytes as u64;
         let backup = candidate(1, 130.0, 50.0, 500.0);
 

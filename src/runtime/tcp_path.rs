@@ -1215,6 +1215,21 @@ impl ServerPathLaneTracker {
             .copied()
             .unwrap_or_default()
     }
+
+    fn session_snapshot(&self, session_id: SessionId) -> ServerPathLaneLoad {
+        self.loads
+            .lock()
+            .expect("server path lane tracker lock")
+            .iter()
+            .filter(|(key, _)| key.session_id == session_id)
+            .fold(ServerPathLaneLoad::default(), |mut total, (_, load)| {
+                total.active_flows = total.active_flows.saturating_add(load.active_flows);
+                total.active_latency_sensitive_flows = total
+                    .active_latency_sensitive_flows
+                    .saturating_add(load.active_latency_sensitive_flows);
+                total
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -1404,6 +1419,17 @@ fn server_bulk_admission_role(
     }
 }
 
+fn server_bulk_role_for_output_count(
+    role: BulkAdmissionRole,
+    output_count: usize,
+) -> BulkAdmissionRole {
+    if role == BulkAdmissionRole::ActiveDataPath && output_count <= 1 {
+        BulkAdmissionRole::ActiveSingleCarrier
+    } else {
+        role
+    }
+}
+
 fn server_bulk_lead_candidate_suppression(
     key: ServerTcpPathKey,
     snapshot: PathSnapshot,
@@ -1411,6 +1437,7 @@ fn server_bulk_lead_candidate_suppression(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     lower_flights: &[ServerTcpPathFlightDebt],
+    output_count: usize,
 ) -> Option<&'static str> {
     let lower_flight_owner = server_oldest_lower_flight_owner(lower_flights);
     let role = if lower_flight_owner.is_none() || lower_flight_owner == Some(key) {
@@ -1418,6 +1445,7 @@ fn server_bulk_lead_candidate_suppression(
     } else {
         bulk_additional_admission_role(lower_flight_owner.expect("checked").underlay, key.underlay)
     };
+    let role = server_bulk_role_for_output_count(role, output_count);
     let ordering_debt = if role == BulkAdmissionRole::ActiveDataPath {
         server_total_lower_flight_debt_bytes(lower_flights)
     } else {
@@ -1759,6 +1787,7 @@ impl ServerTcpStreamOutputs {
                     payload_bytes,
                     mux_limits,
                     lower_flights,
+                    self.entries.len(),
                 )
                 .is_none()
             })
@@ -1778,14 +1807,19 @@ impl ServerTcpStreamOutputs {
                         lower_flight_owner,
                         cross_path_ordering_debt,
                     );
+                    let role = server_bulk_role_for_output_count(role, self.entries.len());
                     let admission_ordering_debt =
                         server_admission_ordering_debt_bytes(lower_flights, key, role);
-                    let (baseline_snapshot, baseline_eta_ms) =
-                        if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
-                            (*snapshot, *eta_ms)
-                        } else {
-                            (best_snapshot, best_eta_ms)
-                        };
+                    let (baseline_snapshot, baseline_eta_ms) = if owns_lower_frontier
+                        && matches!(
+                            role,
+                            BulkAdmissionRole::ActiveDataPath
+                                | BulkAdmissionRole::ActiveSingleCarrier
+                        ) {
+                        (*snapshot, *eta_ms)
+                    } else {
+                        (best_snapshot, best_eta_ms)
+                    };
                     bulk_candidate_admission_suppression(
                         baseline_snapshot,
                         baseline_eta_ms,
@@ -1952,10 +1986,17 @@ impl ServerTcpStreamOutputs {
                     lower_flight_owner,
                     cross_path_ordering_debt,
                 );
+                let role = server_bulk_role_for_output_count(role, self.entries.len());
                 let admission_ordering_debt =
                     server_admission_ordering_debt_bytes(lower_flights, *validation_key, role);
                 let (baseline_snapshot, baseline_eta_ms) =
-                    if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
+                    if owns_lower_frontier
+                        && matches!(
+                            role,
+                            BulkAdmissionRole::ActiveDataPath
+                                | BulkAdmissionRole::ActiveSingleCarrier
+                        )
+                    {
                         (*validation_snapshot, *validation_eta_ms)
                     } else {
                         (primary_snapshot, primary_eta_ms)
@@ -2079,6 +2120,7 @@ impl ServerTcpStreamOutputs {
                     payload_bytes,
                     mux_limits,
                     lower_flights,
+                    self.entries.len(),
                 )
                 .is_none()
             })
@@ -2143,16 +2185,20 @@ impl ServerTcpStreamOutputs {
                     server_oldest_lower_flight_owner(lower_flights),
                     cross_path_ordering_debt,
                 );
+                let role = server_bulk_role_for_output_count(role, self.entries.len());
                 let admission_ordering_debt =
                     server_admission_ordering_debt_bytes(lower_flights, entry.key, role);
                 let owns_lower_frontier =
                     server_oldest_lower_flight_owner(lower_flights) == Some(entry.key);
-                let (baseline_snapshot, baseline_eta_ms) =
-                    if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
-                        (snapshot, eta_ms)
-                    } else {
-                        (best_snapshot, best_eta_ms)
-                    };
+                let (baseline_snapshot, baseline_eta_ms) = if owns_lower_frontier
+                    && matches!(
+                        role,
+                        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
+                    ) {
+                    (snapshot, eta_ms)
+                } else {
+                    (best_snapshot, best_eta_ms)
+                };
                 if let Some(suppression) =
                     bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
                         best_snapshot: baseline_snapshot,
@@ -2200,13 +2246,16 @@ impl ServerTcpStreamOutputs {
                     server_admission_ordering_debt_bytes(
                         lower_flights,
                         entry.key,
-                        server_bulk_admission_role(
-                            lead_candidate
-                                .map(|candidate| candidate.0)
-                                .unwrap_or(entry.key),
-                            entry.key,
-                            server_oldest_lower_flight_owner(lower_flights),
-                            server_stream_ordering_debt_bytes(lower_flights, entry.key),
+                        server_bulk_role_for_output_count(
+                            server_bulk_admission_role(
+                                lead_candidate
+                                    .map(|candidate| candidate.0)
+                                    .unwrap_or(entry.key),
+                                entry.key,
+                                server_oldest_lower_flight_owner(lower_flights),
+                                server_stream_ordering_debt_bytes(lower_flights, entry.key),
+                            ),
+                            self.entries.len(),
                         )
                     ),
                     snapshot.queue_bytes,
@@ -2280,8 +2329,11 @@ fn server_bulk_output_snapshot(
         model_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes);
     snapshot.confidence = server_output_confidence(entry, now);
     let lane_load = lane_tracker.snapshot(session_id, entry.key);
+    let session_lane_load = lane_tracker.session_snapshot(session_id);
     snapshot.active_flows = lane_load.active_flows;
     snapshot.active_latency_sensitive_flows = lane_load.active_latency_sensitive_flows;
+    snapshot.session_active_latency_sensitive_flows =
+        session_lane_load.active_latency_sensitive_flows;
     let known_bulk_flows = lane_load
         .active_flows
         .saturating_sub(lane_load.active_latency_sensitive_flows);

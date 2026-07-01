@@ -2140,14 +2140,36 @@ has not yet been released by `STREAM_ACK`. These are deliberately different
 ledgers. QUIC and BBR gate packet emission and pacing on carrier debt, while
 MPTCP-style sequence repair and receive-window protection reason about product
 byte ownership. `product_queue_debt` is the lead path's bounded,
-preemptible product work already admitted to the transport. An implementation
-MUST NOT use slow product-ACK release timing as the UDP carrier congestion
-window, MUST NOT use carrier ACK progress as proof that a stream byte is no
-longer needed for repair, and MUST NOT treat the configured product envelope as
-a floor above UDP carrier credit. The UDP controller limits packet emission and
-provides an upper gate for active UDP product admission; the lead product
-scheduler keeps only enough bounded, preemptible work queued for that controller
-to stay ACK-clocked.
+preemptible product work already admitted to the transport.
+
+When the UDP production engine is QUIC, the stream currently has only one
+attached response carrier, and that carrier is shared with latency-sensitive or
+realtime product flows, the active lead path MUST NOT be gated by a second
+product-layer copy of the QUIC congestion window. QUIC already owns packet
+pacing, congestion response, stream flow control, and sender backpressure for
+that single shared lead. The product scheduler gates this case with the product
+queue and stream-ordering envelope so the QUIC stream remains fed without
+creating unbounded response backlog. A throughput-only stream, a stream with no
+latency-sensitive sharing on that path, and any stream with multiple attached
+carriers keep carrier debt as an admission gate. Additional UDP paths,
+validation paths, and cross-underlay candidates also use carrier debt as an
+admission gate because they can create new reordering debt or probe traffic
+outside the single shared lead. An implementation MUST NOT use slow product-ACK
+release timing as the UDP carrier congestion window, MUST NOT use carrier ACK
+progress as proof that a stream byte is no longer needed for repair, and MUST
+NOT treat the configured product envelope as a floor above UDP carrier credit.
+
+The sender-service admission model also applies session-level lane pressure.
+When a session has active latency-sensitive or realtime flows, an active bulk
+lead MUST NOT use the large throughput BDP envelope to accumulate hidden command
+backlog behind path queues. Its product admission envelope is reduced to the
+preemptible service horizon for the next quantum, while carrier pacing and
+stream flow control continue to govern final emission. This rule is independent
+of whether the latency-sensitive flow is attached to the same underlay path as
+the bulk flow; otherwise dedicated latency paths can hide user-visible pressure
+from the bulk scheduler and the path command queue becomes an unintended product
+queue. When the session has only throughput/background flows, the model-based
+BDP envelope remains available so file-download aggregation is not penalized.
 
 Bulk admission also includes lane-protection debt. When another flow on the
 same session path is currently using a control, latency, or realtime lane and

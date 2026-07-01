@@ -1491,11 +1491,8 @@ run_mixed_flapping_case() {
   stop_random_flapping
 }
 
-run_mixed_ideal_case() {
-  local case_name="$1"
-  local ideal_path="$2"
-  shift 2
-  start_client "$case_name" "$@"
+apply_ideal_netem_profile() {
+  local ideal_path="$1"
   case "$ideal_path" in
     lowlat)
       exec_netem client ideal-lowlat
@@ -1518,6 +1515,34 @@ run_mixed_ideal_case() {
       return 2
       ;;
   esac
+}
+
+run_reliable_ideal_download_case() {
+  local case_name="$1"
+  local ideal_path="$2"
+  shift 2
+  start_client "$case_name" "$@"
+  apply_ideal_netem_profile "$ideal_path"
+  run_tcp_download_probe_case "$case_name"
+  apply_netem apply
+}
+
+run_reliable_ideal_upload_case() {
+  local case_name="$1"
+  local ideal_path="$2"
+  shift 2
+  start_client "$case_name" "$@"
+  apply_ideal_netem_profile "$ideal_path"
+  run_tcp_upload_probe_case "$case_name"
+  apply_netem apply
+}
+
+run_mixed_ideal_case() {
+  local case_name="$1"
+  local ideal_path="$2"
+  shift 2
+  start_client "$case_name" "$@"
+  apply_ideal_netem_profile "$ideal_path"
   record_mixed_probe_case "$case_name"
   apply_netem apply
 }
@@ -1727,6 +1752,15 @@ start_target_services
 apply_netem apply
 start_server
 
+tcp_endpoint_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
+tcp_endpoint_balanced="--path 'tcp://172.31.15.20:${server_port}'"
+tcp_endpoint_fat="--path 'tcp://172.31.20.20:${server_port}'"
+tcp_endpoint_poor="--path 'tcp://172.31.30.20:${server_port}'"
+udp_endpoint_lowlat="--path 'udp://172.31.10.20:${server_port}'"
+udp_endpoint_balanced="--path 'udp://172.31.15.20:${server_port}'"
+udp_endpoint_fat="--path 'udp://172.31.20.20:${server_port}'"
+udp_endpoint_poor="--path 'udp://172.31.30.20:${server_port}'"
+
 if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
   tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80&low-latency=true'"
   tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
@@ -1748,6 +1782,9 @@ else
 fi
 tcp_all="${tcp_lowlat} ${tcp_balanced} ${tcp_fat} ${tcp_poor}"
 udp_all="${udp_lowlat} ${udp_balanced} ${udp_fat} ${udp_poor}"
+tcp_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_fat} ${tcp_endpoint_poor}"
+udp_equal_all="${udp_endpoint_lowlat} ${udp_endpoint_balanced} ${udp_endpoint_fat} ${udp_endpoint_poor}"
+mixed_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${udp_endpoint_fat} ${udp_endpoint_poor}"
 
 if should_run_case "direct_low_latency"; then
   run_unproxied_download_probe_case "direct_low_latency" "tcp" "172.31.10.30:8080"
@@ -1883,6 +1920,18 @@ if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
   run_tcp_download_probe_case "mptunnel_reliable_mixed_multipath_all"
 fi
 
+for equal_profile in lowlat balanced fat; do
+  if should_run_case "mptunnel_tcp_multipath_equal_${equal_profile}"; then
+    run_reliable_ideal_download_case "mptunnel_tcp_multipath_equal_${equal_profile}" "$equal_profile" "$tcp_equal_all"
+  fi
+  if should_run_case "mptunnel_udp_stream_multipath_equal_${equal_profile}"; then
+    run_reliable_ideal_download_case "mptunnel_udp_stream_multipath_equal_${equal_profile}" "$equal_profile" "$udp_equal_all"
+  fi
+  if should_run_case "mptunnel_reliable_mixed_multipath_equal_${equal_profile}"; then
+    run_reliable_ideal_download_case "mptunnel_reliable_mixed_multipath_equal_${equal_profile}" "$equal_profile" "$mixed_equal_all"
+  fi
+done
+
 if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"; then
   start_client "reliable_mixed_tcp_lowlat_udp_fat" "$tcp_lowlat $udp_fat"
   run_tcp_download_probe_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"
@@ -1952,6 +2001,18 @@ if should_run_case "mptunnel_reliable_mixed_multipath_all_upload"; then
   start_client "reliable_mixed_multipath_all_upload" "$tcp_all $udp_all"
   run_tcp_upload_probe_case "mptunnel_reliable_mixed_multipath_all_upload"
 fi
+
+for equal_profile in lowlat balanced fat; do
+  if should_run_case "mptunnel_tcp_multipath_equal_${equal_profile}_upload"; then
+    run_reliable_ideal_upload_case "mptunnel_tcp_multipath_equal_${equal_profile}_upload" "$equal_profile" "$tcp_equal_all"
+  fi
+  if should_run_case "mptunnel_udp_stream_multipath_equal_${equal_profile}_upload"; then
+    run_reliable_ideal_upload_case "mptunnel_udp_stream_multipath_equal_${equal_profile}_upload" "$equal_profile" "$udp_equal_all"
+  fi
+  if should_run_case "mptunnel_reliable_mixed_multipath_equal_${equal_profile}_upload"; then
+    run_reliable_ideal_upload_case "mptunnel_reliable_mixed_multipath_equal_${equal_profile}_upload" "$equal_profile" "$mixed_equal_all"
+  fi
+done
 
 if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_upload"; then
   start_client "reliable_mixed_tcp_lowlat_udp_fat_upload" "$tcp_lowlat $udp_fat"
@@ -2052,6 +2113,17 @@ fi
 if should_run_case "mptunnel_mixed_multipath_ideal_fat"; then
   run_mixed_ideal_case "mptunnel_mixed_multipath_ideal_fat" "fat" "$tcp_all $udp_all"
 fi
+for equal_profile in lowlat balanced fat; do
+  if should_run_case "mptunnel_mixed_tcp_multipath_equal_${equal_profile}"; then
+    run_mixed_ideal_case "mptunnel_mixed_tcp_multipath_equal_${equal_profile}" "$equal_profile" "$tcp_equal_all"
+  fi
+  if should_run_case "mptunnel_mixed_udp_multipath_equal_${equal_profile}"; then
+    run_mixed_ideal_case "mptunnel_mixed_udp_multipath_equal_${equal_profile}" "$equal_profile" "$udp_equal_all"
+  fi
+  if should_run_case "mptunnel_mixed_multipath_equal_${equal_profile}"; then
+    run_mixed_ideal_case "mptunnel_mixed_multipath_equal_${equal_profile}" "$equal_profile" "$mixed_equal_all"
+  fi
+done
 if should_run_case "mptunnel_mixed_multipath_saturate_lowlat"; then
   run_mixed_saturated_case "mptunnel_mixed_multipath_saturate_lowlat" "lowlat" "$tcp_all $udp_all"
 fi

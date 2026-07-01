@@ -237,6 +237,73 @@ def best_goodput(records, prefix):
     return max(candidates, key=lambda record: record["goodput_mbps"])
 
 
+def equal_cohort_comparisons(records):
+    profiles = ("lowlat", "balanced", "fat")
+    workloads = {
+        "download": {
+            "metric": "goodput_mbps",
+            "cases": {
+                "tcp": "mptunnel_tcp_multipath_equal_{profile}",
+                "udp": "mptunnel_udp_stream_multipath_equal_{profile}",
+                "mixed": "mptunnel_reliable_mixed_multipath_equal_{profile}",
+            },
+        },
+        "upload": {
+            "metric": "upload_goodput_mbps",
+            "cases": {
+                "tcp": "mptunnel_tcp_multipath_equal_{profile}_upload",
+                "udp": "mptunnel_udp_stream_multipath_equal_{profile}_upload",
+                "mixed": "mptunnel_reliable_mixed_multipath_equal_{profile}_upload",
+            },
+        },
+        "mixed-workload": {
+            "metric": "bulk_goodput_mbps",
+            "cases": {
+                "tcp": "mptunnel_mixed_tcp_multipath_equal_{profile}",
+                "udp": "mptunnel_mixed_udp_multipath_equal_{profile}",
+                "mixed": "mptunnel_mixed_multipath_equal_{profile}",
+            },
+        },
+    }
+    rows = []
+    for source, source_records in by_source(records).items():
+        by_case = {record.get("case"): record for record in source_records}
+        for profile in profiles:
+            for workload, spec in workloads.items():
+                values = {}
+                statuses = {}
+                for cohort, pattern in spec["cases"].items():
+                    record = by_case.get(pattern.format(profile=profile))
+                    statuses[cohort] = record.get("status") if record else None
+                    value = record.get(spec["metric"]) if record else None
+                    if isinstance(value, (int, float)):
+                        values[cohort] = value
+                    else:
+                        values[cohort] = None
+                if all(value is None for value in values.values()) and all(
+                    status is None for status in statuses.values()
+                ):
+                    continue
+                numeric = [value for value in values.values() if isinstance(value, (int, float))]
+                rows.append(
+                    {
+                        "source": Path(source).name,
+                        "profile": profile,
+                        "workload": workload,
+                        "tcp": values["tcp"],
+                        "udp": values["udp"],
+                        "mixed": values["mixed"],
+                        "tcp_status": statuses["tcp"],
+                        "udp_status": statuses["udp"],
+                        "mixed_status": statuses["mixed"],
+                        "min_vs_best": min(numeric) / max(numeric)
+                        if len(numeric) == 3 and max(numeric) > 0
+                        else None,
+                    }
+                )
+    return rows
+
+
 def by_source(records):
     buckets = defaultdict(list)
     for record in records:
@@ -456,6 +523,32 @@ def render_markdown(records):
             )
         )
     lines.append("")
+    lines.extend(
+        [
+            "## Equal Underlay Cohorts",
+            "",
+            "| source | profile | workload | TCP Mbps | UDP Mbps | mixed Mbps | TCP status | UDP status | mixed status | min/best |",
+            "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: |",
+        ]
+    )
+    for row in equal_cohort_comparisons(records):
+        if row["tcp"] is None and row["udp"] is None and row["mixed"] is None:
+            continue
+        lines.append(
+            "| {source} | {profile} | {workload} | {tcp} | {udp} | {mixed} | {tcp_status} | {udp_status} | {mixed_status} | {min_vs_best} |".format(
+                source=row["source"],
+                profile=row["profile"],
+                workload=row["workload"],
+                tcp=fmt_float(row["tcp"]),
+                udp=fmt_float(row["udp"]),
+                mixed=fmt_float(row["mixed"]),
+                tcp_status=row["tcp_status"] or "-",
+                udp_status=row["udp_status"] or "-",
+                mixed_status=row["mixed_status"] or "-",
+                min_vs_best=fmt_float(row["min_vs_best"], 2),
+            )
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -469,6 +562,7 @@ def render_json(records):
         "upload": upload_rows(by_case),
         "mixed": mixed_rows(by_case),
         "comparisons": source_comparisons(records),
+        "equal_cohort_comparisons": equal_cohort_comparisons(records),
     }
     return json.dumps(payload, indent=2, sort_keys=True)
 

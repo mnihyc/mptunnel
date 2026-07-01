@@ -1712,13 +1712,14 @@ Datagram workers MUST treat target responses, `DGRAM_FEEDBACK`, and
 `DGRAM_CLOSE` as realtime feedback. If target responses and additional outbound
 requests are both ready, the response/feedback side is processed first so that
 fresh datagrams and close signals do not wait behind more request sends.
-`DGRAM_DATA` response emission uses the realtime carrier-credit gate. If the
-carrier command queue cannot accept a realtime datagram response immediately,
-the worker MUST NOT block behind bulk or ordinary request sending. It may drop
-the response as expired/backpressured work and continue processing later target
-responses, feedback, close signals, and requests. This preserves datagram
-freshness and prevents a full path queue from becoming a hidden realtime
-head-of-line blocker.
+`DGRAM_DATA` response and `DGRAM_CLOSE` emission use the realtime
+carrier-credit gate. If the carrier command queue cannot accept a realtime
+datagram response or close signal immediately, the worker MUST NOT block behind
+bulk or ordinary request sending. It may drop the response as
+expired/backpressured work, and close emission is best-effort when the target
+side has already failed. The worker then continues or exits according to the
+flow state. This preserves datagram freshness and prevents a full path queue
+from becoming a hidden realtime head-of-line blocker.
 
 `DGRAM_CLOSE` closes a flow. A closed flow MUST release scheduler load and
 delivery statistics.

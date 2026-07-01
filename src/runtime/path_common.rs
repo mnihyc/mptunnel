@@ -61,9 +61,10 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                         Ok(len) => len,
                         Err(err) => {
                             eprintln!("warning: UDP outbound receive failed: {err}");
-                            let _ = commands
-                                .send_frame(Frame::DatagramClose { flow_id }, FlowLane::RealtimeDatagram)
-                                .await;
+                            let _ = try_send_server_datagram_realtime_frame(
+                                &commands,
+                                Frame::DatagramClose { flow_id },
+                            );
                             break;
                         }
                     };
@@ -78,7 +79,7 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                         ttl_ms,
                         payload: Bytes::copy_from_slice(&response_buffer[..len]),
                     };
-                    match try_send_server_datagram_response_frame(&commands, frame) {
+                    match try_send_server_datagram_realtime_frame(&commands, frame) {
                         Ok(()) => {}
                         Err(RuntimeError::SenderServiceBlocked) => {
                             #[cfg(feature = "lab-diagnostics")]
@@ -122,13 +123,13 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
     requests_tx
 }
 
-pub(super) fn try_send_server_datagram_response_frame(
+pub(super) fn try_send_server_datagram_realtime_frame(
     commands: &TcpPathSessionCommandSender,
     frame: Frame,
 ) -> Result<(), RuntimeError> {
     debug_assert!(matches!(
         frame,
-        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. }
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::DatagramClose { .. }
     ));
     commands.try_enqueue_admitted_frame(frame, FlowLane::RealtimeDatagram)
 }

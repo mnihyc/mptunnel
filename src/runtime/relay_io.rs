@@ -670,12 +670,18 @@ pub(super) fn tcp_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -
 pub(super) struct TcpRelayQueuedFrame {
     pub(super) frame: Frame,
     pub(super) payload_bytes: usize,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) enqueue_id: u64,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) queued_at: Instant,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct TcpRelaySenderQueue {
     frames: VecDeque<TcpRelayQueuedFrame>,
     bytes: usize,
+    #[cfg(feature = "lab-diagnostics")]
+    next_enqueue_id: u64,
 }
 
 impl TcpRelaySenderQueue {
@@ -687,13 +693,26 @@ impl TcpRelaySenderQueue {
         self.bytes
     }
 
-    pub(super) fn push(&mut self, frame: Frame) {
+    pub(super) fn push(&mut self, frame: Frame) -> u64 {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        #[cfg(feature = "lab-diagnostics")]
+        let enqueue_id = {
+            let enqueue_id = self.next_enqueue_id;
+            self.next_enqueue_id = self.next_enqueue_id.saturating_add(1);
+            enqueue_id
+        };
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let enqueue_id = 0;
         self.bytes = self.bytes.saturating_add(payload_bytes);
         self.frames.push_back(TcpRelayQueuedFrame {
             frame,
             payload_bytes,
+            #[cfg(feature = "lab-diagnostics")]
+            enqueue_id,
+            #[cfg(feature = "lab-diagnostics")]
+            queued_at: Instant::now(),
         });
+        enqueue_id
     }
 
     pub(super) fn pop_front(&mut self) -> Option<TcpRelayQueuedFrame> {
@@ -1113,12 +1132,14 @@ where
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
                                 largest_ack_end,
                                 ack.released_bytes,
+                                send_stream.next_offset(),
+                                sender_queue.bytes(),
                                 ack.remaining_repair_bytes,
                                 repair_frames.len(),
                                 Some(path_stream.underlay),
@@ -1203,6 +1224,10 @@ where
                     .pop_front()
                     .expect("queued_send_ready requires a queued frame");
                 #[cfg(feature = "lab-diagnostics")]
+                let enqueue_id = queued.enqueue_id;
+                #[cfg(feature = "lab-diagnostics")]
+                let queue_delay_ms = queued.queued_at.elapsed().as_millis();
+                #[cfg(feature = "lab-diagnostics")]
                 let send_lane = tcp_path_effective_frame_lane(&queued.frame, relay_lane);
                 #[cfg(feature = "lab-diagnostics")]
                 let pacing_bytes = frame_pacing_bytes(&queued.frame);
@@ -1240,6 +1265,26 @@ where
                             ),
                         );
                     }
+                    let (selected_underlay, selected_path_id) = selected_path
+                        .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
+                        .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
+                    lab_diagnostic(
+                        "server_sender_dispatch",
+                        format_args!(
+                            "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
+                            session_id.0,
+                            stream_id.0,
+                            enqueue_id,
+                            offset,
+                            payload_bytes,
+                            send_lane,
+                            queue_delay_ms,
+                            sender_queue.bytes(),
+                            selected_underlay,
+                            selected_path_id,
+                            pacing_bytes,
+                        ),
+                    );
                 }
                 stats.record_payload_bytes(queued.payload_bytes);
             }
@@ -1269,18 +1314,33 @@ where
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
                     #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "server_sender_enqueue",
-                        format_args!(
-                            "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={}",
-                            stream_id.0,
-                            relay_lane,
-                            read,
-                            sender_queue.bytes().saturating_add(read),
-                            sender_queue_limit,
-                        ),
-                    );
+                    let stream_extent = match &frame {
+                        Frame::StreamData { offset, payload, .. } => Some((*offset, payload.len())),
+                        _ => None,
+                    };
+                    #[cfg(feature = "lab-diagnostics")]
+                    let enqueue_id = sender_queue.push(frame);
+                    #[cfg(not(feature = "lab-diagnostics"))]
                     sender_queue.push(frame);
+                    #[cfg(feature = "lab-diagnostics")]
+                    if let Some((offset, payload_bytes)) = stream_extent {
+                        lab_diagnostic(
+                            "server_sender_enqueue",
+                            format_args!(
+                                "session_id={} stream_id={} enqueue_id={} lane={:?} offset={} payload_bytes={} queue_bytes={} queue_limit={} send_credit_bytes={} repair_bytes={}",
+                                session_id.0,
+                                stream_id.0,
+                                enqueue_id,
+                                relay_lane,
+                                offset,
+                                payload_bytes,
+                                sender_queue.bytes(),
+                                sender_queue_limit,
+                                send_stream.send_credit_bytes(),
+                                send_stream.repair_bytes(),
+                            ),
+                        );
+                    }
                 }
             }
             else => break Ok(stats),

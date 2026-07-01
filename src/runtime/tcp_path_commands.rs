@@ -99,10 +99,27 @@ impl TcpPathSessionCommandSender {
         command: TcpPathSessionCommand,
     ) -> Result<(), mpsc::error::SendError<TcpPathSessionCommand>> {
         #[cfg(feature = "lab-diagnostics")]
+        let command_kind = tcp_path_command_kind(&command);
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_id = tcp_path_command_stream_id(&command);
+        #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
         let result = self.control.send(command).await;
         #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record("runtime.path_queue.control_send", started.elapsed(), 0);
+        {
+            let elapsed = started.elapsed();
+            lab_perf_record("runtime.path_queue.control_send", elapsed, 0);
+            lab_diagnostic(
+                "path_command_queue_send",
+                format_args!(
+                    "queue=control command_kind={} stream_id={} pacing_bytes=0 wait_ms={} result={}",
+                    command_kind,
+                    stream_id.0,
+                    elapsed.as_millis(),
+                    if result.is_ok() { "queued" } else { "closed" },
+                ),
+            );
+        }
         result
     }
 
@@ -113,6 +130,10 @@ impl TcpPathSessionCommandSender {
     ) -> Result<(), RuntimeError> {
         let bytes = frame_pacing_bytes(&frame);
         let effective_lane = tcp_path_effective_frame_lane(&frame, lane);
+        #[cfg(feature = "lab-diagnostics")]
+        let frame_kind = tcp_path_frame_kind(&frame);
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_id = tcp_path_frame_stream_id(&frame);
         let queue = if tcp_path_frame_uses_priority_queue(effective_lane) {
             &self.priority
         } else {
@@ -129,15 +150,37 @@ impl TcpPathSessionCommandSender {
             Err(_) => Err(RuntimeError::TcpPathSessionClosed),
         };
         #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record(
-            if tcp_path_frame_uses_priority_queue(effective_lane) {
-                "runtime.path_queue.priority_send"
+        {
+            let elapsed = started.elapsed();
+            let queue_name = if tcp_path_frame_uses_priority_queue(effective_lane) {
+                "priority"
             } else {
-                "runtime.path_queue.data_send"
-            },
-            started.elapsed(),
-            bytes,
-        );
+                "data"
+            };
+            lab_perf_record(
+                if tcp_path_frame_uses_priority_queue(effective_lane) {
+                    "runtime.path_queue.priority_send"
+                } else {
+                    "runtime.path_queue.data_send"
+                },
+                elapsed,
+                bytes,
+            );
+            lab_diagnostic(
+                "path_command_queue_send",
+                format_args!(
+                    "queue={} frame_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms={} result={}",
+                    queue_name,
+                    frame_kind,
+                    stream_id.0,
+                    lane,
+                    effective_lane,
+                    bytes,
+                    elapsed.as_millis(),
+                    if result.is_ok() { "queued" } else { "closed" },
+                ),
+            );
+        }
         result
     }
 
@@ -376,4 +419,48 @@ pub(super) enum TcpPathSessionCommand {
     },
     SendFrame(Frame),
     CloseStream(StreamId),
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn tcp_path_command_kind(command: &TcpPathSessionCommand) -> &'static str {
+    match command {
+        TcpPathSessionCommand::OpenStream { .. } => "open_stream",
+        TcpPathSessionCommand::SendFrame(frame) => tcp_path_frame_kind(frame),
+        TcpPathSessionCommand::CloseStream(_) => "close_stream",
+    }
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn tcp_path_frame_kind(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::SessionHello { .. } => "session_hello",
+        Frame::SessionAuth { .. } => "session_auth",
+        Frame::SessionReady => "session_ready",
+        Frame::SessionClose { .. } => "session_close",
+        Frame::PathJoin { .. } => "path_join",
+        Frame::PathJoinOk { .. } => "path_join_ok",
+        Frame::PathChallenge { .. } => "path_challenge",
+        Frame::PathResponse { .. } => "path_response",
+        Frame::PathStatus { .. } => "path_status",
+        Frame::PathDrain { .. } => "path_drain",
+        Frame::PathClose { .. } => "path_close",
+        Frame::PathMtuProbe { .. } => "path_mtu_probe",
+        Frame::PathMtuAck { .. } => "path_mtu_ack",
+        Frame::OpenStream { .. } => "open_stream",
+        Frame::StreamData { .. } => "stream_data",
+        Frame::StreamAck { .. } => "stream_ack",
+        Frame::StreamMaxData { .. } => "stream_max_data",
+        Frame::StreamFin { .. } => "stream_fin",
+        Frame::StreamDetach { .. } => "stream_detach",
+        Frame::StreamReset { .. } => "stream_reset",
+        Frame::OpenDatagramFlow { .. } => "open_dgram_flow",
+        Frame::DatagramData { .. } => "datagram_data",
+        Frame::DatagramClose { .. } => "datagram_close",
+        Frame::DatagramFeedback { .. } => "datagram_feedback",
+        Frame::PathMetrics { .. } => "path_metrics",
+        Frame::RxRateHint { .. } => "rx_rate_hint",
+        Frame::MaxConnectionData { .. } => "max_connection_data",
+        Frame::Ping { .. } => "ping",
+        Frame::Pong { .. } => "pong",
+    }
 }

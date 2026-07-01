@@ -498,7 +498,7 @@ append_row_with_telemetry() {
   local telemetry_json log_artifacts_json
   telemetry_json="$(case_telemetry_summary "$case_name")"
   log_artifacts_json="$(case_log_artifacts_summary "$case_name")"
-  ROW="$row_json" PROTOCOL="$protocol" TELEMETRY="$telemetry_json" LOG_ARTIFACTS="$log_artifacts_json" python3 - "$case_name" <<'PY' >> "$result_file"
+  ROW="$row_json" PROTOCOL="$protocol" TELEMETRY="$telemetry_json" LOG_ARTIFACTS="$log_artifacts_json" LAB_SCRIPT_DIR="$script_dir" python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
 import sys
@@ -527,6 +527,13 @@ except json.JSONDecodeError:
     log_artifacts = {}
 if log_artifacts:
     row["log_artifacts"] = log_artifacts
+if log_artifacts or row.get("status") not in ("ok", "loss"):
+    try:
+        sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+        from diagnostic_buckets import analyze_row
+        row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
+    except Exception as exc:
+        row["diagnostic_failure_buckets_error"] = str(exc)
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -568,6 +575,7 @@ append_download_probe_result() {
 	  LOG_TAIL_BYTES="$log_tail_bytes" \
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+	  LAB_SCRIPT_DIR="$script_dir" \
 	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
@@ -617,6 +625,13 @@ except json.JSONDecodeError:
     log_artifacts = {}
 if log_artifacts:
     row["log_artifacts"] = log_artifacts
+if log_artifacts or row.get("status") not in ("ok", "loss"):
+    try:
+        sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+        from diagnostic_buckets import analyze_row
+        row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
+    except Exception as exc:
+        row["diagnostic_failure_buckets_error"] = str(exc)
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -677,6 +692,7 @@ append_upload_probe_result() {
 	  LOG_TAIL_BYTES="$log_tail_bytes" \
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+	  LAB_SCRIPT_DIR="$script_dir" \
 	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
@@ -726,6 +742,13 @@ except json.JSONDecodeError:
     log_artifacts = {}
 if log_artifacts:
     row["log_artifacts"] = log_artifacts
+if log_artifacts or row.get("status") not in ("ok", "loss"):
+    try:
+        sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+        from diagnostic_buckets import analyze_row
+        row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
+    except Exception as exc:
+        row["diagnostic_failure_buckets_error"] = str(exc)
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -1314,6 +1337,7 @@ append_mixed_probe_result() {
   LOG_TAIL_BYTES="$log_tail_bytes" \
   TELEMETRY="$(case_telemetry_summary "$case_name")" \
   LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+  LAB_SCRIPT_DIR="$script_dir" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
@@ -1362,6 +1386,13 @@ except json.JSONDecodeError:
     log_artifacts = {}
 if log_artifacts:
     row["log_artifacts"] = log_artifacts
+if log_artifacts or row.get("status") not in ("ok", "loss"):
+    try:
+        sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+        from diagnostic_buckets import analyze_row
+        row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
+    except Exception as exc:
+        row["diagnostic_failure_buckets_error"] = str(exc)
 print(json.dumps(row, sort_keys=True))
 PY
 }

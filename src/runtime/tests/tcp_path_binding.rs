@@ -83,6 +83,19 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
         }))
     ));
 
+    assert!(
+        !binding.can_send_stream_data_extent(FlowLane::Throughput, large_len, b"bulk".len(),),
+        "active reattach must not keep admitting ordinary bulk beyond the service horizon before ACK progress"
+    );
+
+    binding.release_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: large_len,
+    }]);
+    assert!(
+        binding.can_send_stream_data_extent(FlowLane::Throughput, large_len, b"bulk".len(),),
+        "ACK progress must release the service horizon for ordinary bulk"
+    );
     binding
         .send_frame(
             StreamId(7),
@@ -95,7 +108,7 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
             },
         )
         .await
-        .expect("binding send active bulk");
+        .expect("binding send active bulk after ACK progress");
 
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut new_rx).await,
@@ -240,6 +253,20 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
         .is_err()
     );
 
+    assert!(
+        !binding
+            .can_send_stream_data_extent(FlowLane::Throughput, large_len, b"bulk-repair".len(),),
+        "active path must wait for ACK progress instead of expanding an unresolved service horizon"
+    );
+
+    binding.release_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: large_len,
+    }]);
+    assert!(
+        binding.can_send_stream_data_extent(FlowLane::Throughput, large_len, b"bulk-repair".len(),),
+        "ACK progress must release the active path for ordinary bulk after repair attach"
+    );
     binding
         .send_frame(
             StreamId(7),
@@ -252,7 +279,7 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
             },
         )
         .await
-        .expect("send active bulk frame");
+        .expect("send active bulk frame after ACK progress");
 
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut path1_rx).await,

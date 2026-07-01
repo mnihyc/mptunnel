@@ -1976,6 +1976,14 @@ implementations MUST emit a sender decision event for every server response
 `STREAM_DATA` write so lab runs can assert that response bytes did not bypass
 the measured scheduling path.
 
+When ordinary queued data is blocked by flow control, ordering debt, or path
+admission, inbound path frames remain part of the active sender-service loop.
+An implementation MUST poll and process product ACKs, flow-control frames,
+stream resets, detach/close frames, and received stream data before treating a
+local path-output update as sufficient progress. Output-update wakeups are
+scheduler housekeeping; they MUST NOT outrank feedback that can release
+product ownership, repair state, or flow-control credit.
+
 The service maintains separate logical lanes in this priority order:
 
 1. carrier ACK-only feedback;
@@ -2405,6 +2413,16 @@ rule closes the MPTCP-style failure mode where a slow or failed subflow owns
 early data and all later high-rate data either blocks behind it or deepens the
 receive hole.
 
+The lower-frontier owner is also bounded by the preemptible bulk service
+horizon while `stream_ordering_debt` is nonzero. Owning the oldest unresolved
+byte does not grant the full path reorder envelope for additional unique data.
+The sender may keep the owner fed enough for ACK-clocked progress, but once the
+owner's unresolved ordering debt exceeds the service horizon it pauses ordinary
+unique bytes until ACK progress, repair, detach/failover, or updated path
+evidence changes the frontier. This prevents a TCP or QUIC UDP writer from
+turning one lost or delayed lower byte into tens of MiB of undeliverable later
+offsets while still avoiding carrier starvation.
+
 Lead-path admission and lead-path repair are intentionally separate
 decisions. The lead path may keep a larger product queue than additional
 paths so that a UDP controller or TCP writer is not starved by slow product
@@ -2424,18 +2442,21 @@ send speculative unique bytes that deepen ordered receive debt.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
 a gap, a path failure or detach event, or data-plane PTO/stall evidence. The
-repair extent is the missing or suspect unacknowledged byte range indicated by
-that event, not every cached chunk below the frontier. When another eligible
-path exists, repair prefers a path that did not carry the last outstanding copy
-of the repaired range. This is the MPTCP reinjection rule applied only after
-loss, failure, or stall evidence exists, with the QUIC-style recovery
-constraint that a repair action is small, ACK-clocked, and never a replay of
-unrelated cached bytes. A sender MUST NOT duplicate every lower outstanding byte
-merely because a faster active path is available. Speculative reinjection outside
-the sender-service queue is prohibited because it can occupy path queues before
-the receiver has proven useful repair. A queued sender may spend additional
-repair traffic only after explicit ACK-gap, path failure/detach, or PTO/stall
-evidence, and the numeric traffic hint only scales that repair/probe budget.
+same `extra_traffic_hint_percent` budget applies to immediate ACK-gap repair
+and later tail/PTO repair, because both cases have concrete gap, failure, or
+stall evidence. The repair extent is the missing or suspect unacknowledged byte
+range indicated by that event, not every cached chunk below the frontier. When
+another eligible path exists, repair prefers a path that did not carry the last
+outstanding copy of the repaired range. This is the MPTCP reinjection rule
+applied only after loss, failure, or stall evidence exists, with the QUIC-style
+recovery constraint that a repair action is small, ACK-clocked, and never a
+replay of unrelated cached bytes. A sender MUST NOT duplicate every lower
+outstanding byte merely because a faster active path is available. Speculative
+reinjection outside the sender-service queue is prohibited because it can occupy
+path queues before the receiver has proven useful repair. A queued sender may
+spend additional repair traffic only after explicit ACK-gap, path
+failure/detach, or PTO/stall evidence, and the numeric traffic hint only scales
+that repair/probe budget.
 
 Repair `STREAM_DATA` is still stream data for correctness and flow accounting,
 but its service lane is repair/latency, not ordinary bulk. It therefore uses
@@ -3093,8 +3114,9 @@ on_stream_ack(stream_id, complete, ranges):
             else:
                 remember_possible_receive_hole(hole.start)
     else if complete:
+        repair_budget = base_repair_budget * (1 + extra_traffic_hint_percent / 100)
         holes = unacked_chunks_below_largest_acked_not_covered_by(ranges)
-        schedule_repair(holes)
+        schedule_repair(holes, repair_budget)
     else:
         do_not_infer_holes_from_omitted_ranges()
 

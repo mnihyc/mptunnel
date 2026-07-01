@@ -905,18 +905,6 @@ where
                 last_tail_repair_at = Instant::now();
                 continue;
             }
-            changed = async {
-                match output_updates.as_mut() {
-                    Some(updates) => updates
-                        .changed()
-                        .await
-                        .map_err(|_| RuntimeError::TcpPathSessionClosed),
-                    None => std::future::pending::<Result<(), RuntimeError>>().await,
-                }
-            }, if queued_send_blocked => {
-                changed?;
-                continue;
-            }
             frame = async {
                 #[cfg(feature = "lab-diagnostics")]
                 let recv_started = Instant::now();
@@ -1013,8 +1001,10 @@ where
                         last_send_ack_frontier = last_send_ack_frontier.max(largest_ack_end);
                         last_send_ack_ranges = ranges.clone();
                         last_send_ack_complete = complete;
-                        let repair_limit =
+                        let base_repair_limit =
                             adaptive_reliable_relay_repair_bytes(None, relay_lane, mux_limits);
+                        let repair_limit =
+                            repair_limit_with_extra_traffic_hint(base_repair_limit, performance);
                         let has_multipath_repair_alternative =
                             path_stream.has_multipath_repair_alternative();
                         let udp_gap_repair_ready = ack_gap_repair.repair_ready(
@@ -1038,7 +1028,7 @@ where
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
@@ -1051,6 +1041,9 @@ where
                                 Some(path_stream.underlay),
                                 has_multipath_repair_alternative,
                                 udp_gap_repair_ready,
+                                base_repair_limit,
+                                repair_limit,
+                                performance.extra_traffic_hint_percent,
                             ),
                         );
                         for frame in repair_frames {
@@ -1101,6 +1094,18 @@ where
                         return Err(RuntimeError::Protocol("unexpected stream relay frame"));
                     }
                 }
+            }
+            changed = async {
+                match output_updates.as_mut() {
+                    Some(updates) => updates
+                        .changed()
+                        .await
+                        .map_err(|_| RuntimeError::TcpPathSessionClosed),
+                    None => std::future::pending::<Result<(), RuntimeError>>().await,
+                }
+            }, if queued_send_blocked => {
+                changed?;
+                continue;
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
                 && reliable_relay_recv_progress_resend_active(&recv_stream, remote_open) => {

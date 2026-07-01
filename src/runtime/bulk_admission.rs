@@ -464,7 +464,13 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
             )
         }
         BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
-            bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
+            let reorder_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
+            if stream_ordering_debt_bytes > 0 {
+                let service_horizon =
+                    bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
+                return reorder_budget.min(service_horizon.max(payload_bytes as u64));
+            }
+            reorder_budget
         }
         BulkAdmissionRole::AdditionalSameUnderlay => {
             bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
@@ -766,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn best_active_path_can_continue_across_existing_hole() {
+    fn best_active_path_can_continue_across_small_existing_hole() {
         let active = candidate(0, 100.0, 170.0, 180.0);
 
         assert_eq!(
@@ -778,9 +784,31 @@ mod tests {
                 payload_bytes: 16 * 1024,
                 mux_limits: MuxLimits::default(),
                 role: BulkAdmissionRole::ActiveDataPath,
-                stream_ordering_debt_bytes: 4 * 1024 * 1024,
+                stream_ordering_debt_bytes: 64 * 1024,
             },),
             None
+        );
+    }
+
+    #[test]
+    fn active_lower_frontier_owner_uses_service_horizon_when_debt_exists() {
+        let active = candidate(0, 100.0, 170.0, 500.0);
+        let payload = 64 * 1024;
+        let mux_limits = MuxLimits::default();
+        let service_horizon = bulk_service_horizon_payload_bytes(payload, mux_limits) as u64;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: active.snapshot,
+                best_eta_ms: active.eta_ms,
+                candidate_snapshot: active.snapshot,
+                candidate_eta_ms: active.eta_ms,
+                payload_bytes: payload,
+                mux_limits,
+                role: BulkAdmissionRole::ActiveDataPath,
+                stream_ordering_debt_bytes: service_horizon.saturating_add(payload as u64),
+            },),
+            Some("reorder_budget")
         );
     }
 

@@ -1495,20 +1495,20 @@ apply_ideal_netem_profile() {
   local ideal_path="$1"
   case "$ideal_path" in
     lowlat)
-      exec_netem client ideal-lowlat
-      exec_netem server ideal-lowlat
+      exec_netem client ideal-all-lowlat
+      exec_netem server ideal-all-lowlat
       ;;
     balanced)
-      exec_netem client ideal-balanced
-      exec_netem server ideal-balanced
+      exec_netem client ideal-all-balanced
+      exec_netem server ideal-all-balanced
       ;;
     fat)
-      exec_netem client ideal-fat
-      exec_netem server ideal-fat
+      exec_netem client ideal-all-fat
+      exec_netem server ideal-all-fat
       ;;
     poor)
-      exec_netem client ideal-poor
-      exec_netem server ideal-poor
+      exec_netem client ideal-all-poor
+      exec_netem server ideal-all-poor
       ;;
     *)
       echo "unknown ideal path: $ideal_path" >&2
@@ -1521,8 +1521,8 @@ run_reliable_ideal_download_case() {
   local case_name="$1"
   local ideal_path="$2"
   shift 2
-  start_client "$case_name" "$@"
   apply_ideal_netem_profile "$ideal_path"
+  start_client "$case_name" "$@"
   run_tcp_download_probe_case "$case_name"
   apply_netem apply
 }
@@ -1531,8 +1531,8 @@ run_reliable_ideal_upload_case() {
   local case_name="$1"
   local ideal_path="$2"
   shift 2
-  start_client "$case_name" "$@"
   apply_ideal_netem_profile "$ideal_path"
+  start_client "$case_name" "$@"
   run_tcp_upload_probe_case "$case_name"
   apply_netem apply
 }
@@ -1541,8 +1541,8 @@ run_mixed_ideal_case() {
   local case_name="$1"
   local ideal_path="$2"
   shift 2
-  start_client "$case_name" "$@"
   apply_ideal_netem_profile "$ideal_path"
+  start_client "$case_name" "$@"
   record_mixed_probe_case "$case_name"
   apply_netem apply
 }

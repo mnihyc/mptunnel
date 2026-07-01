@@ -264,6 +264,12 @@ pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {
         && path.metadata.capabilities == crate::protocol::PathCapabilities::default()
 }
 
+pub(super) fn path_has_configured_performance_hint(path: &PathSpec) -> bool {
+    path.metadata.initial_srtt_ms.is_some()
+        || path.metadata.initial_jitter_ms.is_some()
+        || path.metadata.initial_rate != RateHint::Unknown
+}
+
 pub(super) fn configured_order_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
@@ -364,7 +370,7 @@ pub(super) fn reliable_stream_path_candidates(
     let udp_scores =
         reliable_stream_mixed_startup_path_scores(udp_paths, udp_observations, lane, payload_bytes);
 
-    tcp_scores
+    let mut candidates = tcp_scores
         .into_iter()
         .filter_map(|(index, eta_ms)| {
             let path = tcp_paths.get(index)?;
@@ -379,6 +385,10 @@ pub(super) fn reliable_stream_path_candidates(
                     eta_ms: eta_ms
                         + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
                     has_evidence: bulk_candidate_has_evidence(path, observation),
+                    has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+                        observation,
+                    ),
+                    has_configured_performance_hint: path_has_configured_performance_hint(path),
                     snapshot,
                 },
             )
@@ -402,11 +412,17 @@ pub(super) fn reliable_stream_path_candidates(
                     },
                     eta_ms,
                     has_evidence: bulk_candidate_has_evidence(path, observation),
+                    has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+                        observation,
+                    ),
+                    has_configured_performance_hint: path_has_configured_performance_hint(path),
                     snapshot,
                 },
             )
         }))
-        .collect()
+        .collect::<Vec<_>>();
+    retain_safe_mixed_latency_startup_candidates(&mut candidates, lane);
+    candidates
 }
 
 pub(super) fn reliable_stream_initial_underlay_order(
@@ -673,6 +689,16 @@ pub(super) fn bulk_candidate_has_delivery_evidence(
         || path.metadata.initial_rate != RateHint::Unknown
 }
 
+pub(super) fn bulk_candidate_has_sender_delivery_evidence(
+    observation: ClientPathObservation,
+) -> bool {
+    observation.delivery_samples > 0
+        || observation.carrier_delivery_samples > 0
+        || observation.last_delivery_at.is_some()
+        || observation.carrier_last_delivery_at.is_some()
+        || observation.carrier_delivery_rate_bps.is_some()
+}
+
 pub(super) fn bulk_candidate_has_active_bulk_work(candidate: &BulkPathCandidate) -> bool {
     candidate.snapshot.active_flows > candidate.snapshot.active_latency_sensitive_flows
 }
@@ -684,6 +710,32 @@ pub(super) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -
     candidates
         .iter()
         .any(|candidate| candidate.key.underlay != first.key.underlay)
+}
+
+fn retain_safe_mixed_latency_startup_candidates(
+    candidates: &mut Vec<BulkPathCandidate>,
+    lane: FlowLane,
+) {
+    if matches!(lane, FlowLane::Throughput | FlowLane::Background)
+        || !bulk_candidates_span_underlays(candidates)
+    {
+        return;
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.has_sender_delivery_evidence)
+        || candidates
+            .iter()
+            .any(|candidate| candidate.has_configured_performance_hint)
+    {
+        return;
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.key.underlay == UnderlayProtocol::Tcp)
+    {
+        candidates.retain(|candidate| candidate.key.underlay == UnderlayProtocol::Tcp);
+    }
 }
 
 pub(super) fn carrier_diverse_bulk_validation_order(

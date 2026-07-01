@@ -75,6 +75,18 @@ apply_profile() {
     loss "$loss"
 }
 
+apply_profile_all() {
+  local rate="$1"
+  local delay="$2"
+  local jitter="$3"
+  local loss="$4"
+
+  apply_profile "172.31.10" "$rate" "$delay" "$jitter" "$loss"
+  apply_profile "172.31.15" "$rate" "$delay" "$jitter" "$loss"
+  apply_profile "172.31.20" "$rate" "$delay" "$jitter" "$loss"
+  apply_profile "172.31.30" "$rate" "$delay" "$jitter" "$loss"
+}
+
 blackhole_profile() {
   local subnet_prefix="$1"
   local iface
@@ -145,6 +157,18 @@ case "$mode" in
   ideal-poor)
     apply_profile "172.31.30" "$poor_rate" "$poor_delay" "$poor_jitter" "$ideal_loss"
     ;;
+  ideal-all-lowlat)
+    apply_profile_all "$lowlat_rate" "$lowlat_delay" "$lowlat_jitter" "$ideal_loss"
+    ;;
+  ideal-all-balanced)
+    apply_profile_all "$balanced_rate" "$balanced_delay" "$balanced_jitter" "$ideal_loss"
+    ;;
+  ideal-all-fat)
+    apply_profile_all "$fat_rate" "$fat_delay" "$fat_jitter" "$ideal_loss"
+    ;;
+  ideal-all-poor)
+    apply_profile_all "$poor_rate" "$poor_delay" "$poor_jitter" "$ideal_loss"
+    ;;
   matrix-b*)
     bits="${mode#matrix-}"
     if [[ "$bits" != b[01][01][01] ]]; then
@@ -207,7 +231,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-fat|ideal-poor|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

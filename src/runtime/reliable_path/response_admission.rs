@@ -939,6 +939,11 @@ impl ResponseStreamOutputs {
                 "waiting_for_lower_frontier_owner"
             } else if Some(entry.key) != active_key
                 && !server_output_has_sender_evidence(entry)
+                && active_key.is_some_and(|active| active.underlay != entry.key.underlay)
+            {
+                "cross_underlay_validation_needs_sender_evidence"
+            } else if Some(entry.key) != active_key
+                && !server_output_has_sender_evidence(entry)
                 && !server_output_has_primary_validation_credit(entry, payload_bytes)
             {
                 "validation_credit_exhausted"
@@ -1251,6 +1256,11 @@ fn server_output_can_carry_primary_bulk(
     }
     if Some(entry.key) == active_key || server_output_has_sender_evidence(entry) {
         return true;
+    }
+    if let Some(active) = active_key
+        && active.underlay != entry.key.underlay
+    {
+        return false;
     }
     if has_sender_evidence_candidate {
         return false;

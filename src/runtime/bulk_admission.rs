@@ -8,6 +8,8 @@ pub(super) struct BulkPathCandidate {
     pub(super) key: RelayPathKey,
     pub(super) eta_ms: f64,
     pub(super) has_evidence: bool,
+    pub(super) has_sender_delivery_evidence: bool,
+    pub(super) has_configured_performance_hint: bool,
     pub(super) snapshot: PathSnapshot,
 }
 
@@ -515,6 +517,8 @@ mod tests {
             },
             eta_ms,
             has_evidence: true,
+            has_sender_delivery_evidence: true,
+            has_configured_performance_hint: false,
             snapshot: PathSnapshot::new(
                 PathId(index as u16),
                 UnderlayProtocol::Udp,

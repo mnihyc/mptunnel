@@ -83,6 +83,27 @@ fn mixed_reliable_initial_open_uses_best_carrier_not_tcp_first() {
 }
 
 #[test]
+fn mixed_reliable_latency_startup_ignores_udp_probe_only_sample() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11086".parse().expect("tcp path"),
+            "udp://127.0.0.1:11087".parse().expect("udp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_udp_path_probe_success(0, Duration::from_millis(1));
+
+    let selected = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("selected path");
+
+    assert_eq!(selected.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(selected.index, 0);
+}
+
+#[test]
 fn reliable_initial_open_allows_no_bulk_path_for_latency_lane() {
     let context = ClientPathContext::new(
         vec![

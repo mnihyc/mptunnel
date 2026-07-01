@@ -1477,17 +1477,21 @@ carry bulk without weakening the invariant that repair traffic is gap-targeted.
 Validation traffic remains subject to ECF/BLEST-style admission, flow control,
 and a finite validation budget. For ordered reliable streams, Validation credit
 is not throughput evidence. A validation path without sender-side delivery
-evidence MAY carry a bounded unique next `STREAM_DATA` proof only while no other
-candidate has sender-side evidence and the proof would not jump over lower
-offsets already owned by another path. Once any path has sender-side evidence,
-an unproven validation path MUST NOT carry new later stream offsets; it is used
-only for duplicate stream data, repair data for an already-missing range, or
-carrier/control probe traffic. Liveness from the open itself is not delivery
-evidence. A receiver MUST NOT promote a Validation or Repair attachment to the
-Active data slot merely because one frame arrived in order. For bulk streams,
-receiver-side Active promotion is allowed only after delivered application bytes
-have been accounted into the path model and the path has local delivery samples
-or ACK-derived carrier data samples. Configured hints, successful opens, control
+evidence MAY carry a bounded unique next `STREAM_DATA` proof only when it is in
+the same underlay family as the current ordinary lead path, no candidate has
+sender-side evidence, and the proof would not jump over lower offsets already
+owned by another path. An unproven cross-underlay validation path MUST NOT own
+the only copy of new ordered bytes while an ordinary lead from another underlay
+exists. It validates by duplicate stream data, repair data for an
+already-missing range, or carrier/control probe traffic until sender-side
+delivery evidence exists. Once any path has sender-side evidence, an unproven
+validation path MUST NOT carry new later stream offsets. Liveness from the open
+itself is not delivery evidence. A receiver MUST NOT promote a Validation or
+Repair attachment to the Active data slot merely because one frame arrived in
+order. For bulk streams, receiver-side Active promotion is allowed only after
+delivered application bytes have been accounted into the path model and the path
+has local delivery samples or ACK-derived carrier data samples. Configured
+hints, successful opens, control
 probes, RTT-only liveness, and single duplicated stream ranges do not satisfy
 this requirement.
 
@@ -2170,21 +2174,18 @@ path responsible for a large unique ordered-stream range.
 Validation for ordered reliable streams is non-blocking and path-scoped. A
 validation byte range that is sent only on an unproven path can itself create
 the ordered-stream hole being measured, so the sender MUST NOT treat validation
-credit as ordinary bulk capacity. However, when no sender-evidence candidate
-exists and a UDP validation path wins the same ECF/BLEST lead admission check
-for the next preemptible quantum without jumping over lower offsets owned
-elsewhere, the UDP validation path MAY carry the unique next `STREAM_DATA`
-quantum as a bounded primary probe. This exception is deliberately limited to
-the validation credit envelope and to UDP underlays, where the carrier can
-provide packet/path-scoped ACK-derived proof. It prevents a stale startup path
-from owning the lower frontier before a better carrier has a chance to prove
-itself. If the validation path does not win lead admission, the sender either
-duplicates the same `STREAM_DATA` on an admitted ordinary path and the
-validation path, sends repair for an already-missing range, or sends
-carrier/control probes that do not create a new application-data dependency.
-This follows QUIC path validation and MPTCP reinjection practice while adapting
-it to a product-layer stream that must avoid creating irreversible receive-hole
-debt.
+credit as ordinary bulk capacity. When no sender-evidence candidate exists and
+a same-underlay validation path wins the ECF/BLEST lead admission check for the
+next preemptible quantum without jumping over lower offsets owned elsewhere,
+that same-underlay validation path MAY carry the unique next `STREAM_DATA`
+quantum as a bounded primary probe. Cross-underlay validation is stricter: if
+an ordinary lead exists in another underlay family, the validation path MUST NOT
+own the only copy of a new ordered byte range. Instead, the sender duplicates
+the same `STREAM_DATA` on an admitted ordinary path and the validation path,
+sends repair for an already-missing range, or sends carrier/control probes that
+do not create a new application-data dependency. This follows QUIC path
+validation and MPTCP/MPQUIC reinjection practice while adapting it to a
+product-layer stream that must avoid creating irreversible receive-hole debt.
 
 A stream ACK for duplicated data proves end-to-end byte delivery but does not
 identify which underlay path delivered the bytes. It therefore releases product

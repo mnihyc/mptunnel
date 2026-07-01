@@ -1155,6 +1155,10 @@ impl ClientPathContext {
                 },
                 eta_ms,
                 has_evidence: bulk_candidate_has_evidence(path, observation),
+                has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+                    observation,
+                ),
+                has_configured_performance_hint: path_has_configured_performance_hint(path),
                 snapshot,
             })
         })
@@ -1178,6 +1182,10 @@ impl ClientPathContext {
                     eta_ms: eta_ms
                         + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
                     has_evidence: bulk_candidate_has_evidence(path, observation),
+                    has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+                        observation,
+                    ),
+                    has_configured_performance_hint: path_has_configured_performance_hint(path),
                     snapshot,
                 })
             }),

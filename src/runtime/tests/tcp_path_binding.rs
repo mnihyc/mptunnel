@@ -685,7 +685,7 @@ async fn server_tcp_binding_ignores_product_ack_rate_without_path_metrics() {
 }
 
 #[tokio::test]
-async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
+async fn server_mixed_binding_cross_underlay_validation_is_duplicate_before_evidence() {
     let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
     let binding = ResponseStreamBinding::new(
@@ -718,10 +718,10 @@ async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
     assert_eq!(
         binding.bulk_choice_key_for_test(64 * 1024),
         Some(CarrierPathKey {
-            underlay: UnderlayProtocol::Udp,
-            path_id: PathId(0),
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
         }),
-        "bounded UDP validation credit must compete for the lead before active TCP owns the lower frontier"
+        "unproven cross-underlay validation must not own the only copy of the next ordered bytes"
     );
 
     binding
@@ -739,25 +739,23 @@ async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
         .expect("send first mixed bulk frame");
 
     assert!(matches!(
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ..
+        }))
+    ));
+    assert!(matches!(
         recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
         }))
     ));
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut tcp_rx)
-        )
-        .await
-        .is_err(),
-        "active TCP must not receive the first bulk frame when a bounded UDP validation lead is faster"
-    );
 }
 
 #[tokio::test]
-async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead_jump() {
+async fn server_mixed_binding_cross_underlay_validation_does_not_steal_frontier() {
     let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
     let binding = ResponseStreamBinding::new(
@@ -801,20 +799,19 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ..
+        }))
+    ));
+    assert!(matches!(
         recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
         }))
     ));
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut tcp_rx)
-        )
-        .await
-        .is_err()
-    );
 
     binding.update_path_metrics_for_test(
         UnderlayProtocol::Tcp,
@@ -823,26 +820,37 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
     );
 
     assert!(
-        !binding.can_send_stream_data_extent(FlowLane::Throughput, 64 * 1024, 64 * 1024),
-        "unproven validation that owns lower bytes must wait instead of growing a cross-underlay hole"
+        binding.can_send_stream_data_extent(FlowLane::Throughput, 64 * 1024, 64 * 1024),
+        "active TCP should continue ordinary bytes because cross-underlay validation was only a duplicate proof"
     );
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut udp_rx)
+    let selected = binding
+        .send_frame(
+            StreamId(7),
+            FlowLane::Throughput,
+            Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 64 * 1024,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![4u8; 64 * 1024]),
+            },
         )
         .await
-        .is_err()
+        .expect("send second mixed bulk frame");
+    assert_eq!(
+        selected,
+        Some(CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        }),
+        "cross-underlay validation must not become primary without sender evidence"
     );
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut tcp_rx)
-        )
-        .await
-        .is_err(),
-        "a cross-underlay path must not become the response lead while lower offsets are still outstanding elsewhere"
-    );
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset,
+            ..
+        })) if offset == 64 * 1024
+    ));
 }
 
 #[tokio::test]
@@ -1030,7 +1038,7 @@ async fn server_mixed_binding_blocks_unserviceable_lower_frontier_owner() {
 }
 
 #[tokio::test]
-async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exists() {
+async fn server_mixed_binding_cross_underlay_validation_keeps_active_primary() {
     let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let probe_payload_bytes = (max_frame_payload_bytes / 4).max(1024);
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
@@ -1075,6 +1083,13 @@ async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exi
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset,
+            ..
+        })) if offset == 0
+    ));
+    assert!(matches!(
         recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset,
@@ -1089,37 +1104,40 @@ async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exi
     );
 
     assert!(
-        !binding.can_send_stream_data_extent(
+        binding.can_send_stream_data_extent(
             FlowLane::Throughput,
             probe_payload_bytes as u64,
             probe_payload_bytes,
         ),
-        "unproven validation must not grow a lower-frontier hole once a proven path exists"
+        "active TCP should continue because unproven cross-underlay validation carried only duplicate proof"
     );
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut udp_rx)
+    let selected = binding
+        .send_frame(
+            StreamId(7),
+            FlowLane::Throughput,
+            Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: probe_payload_bytes as u64,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![4u8; probe_payload_bytes]),
+            },
         )
         .await
-        .is_err(),
-        "unproven lower-frontier validation must wait for ACK or local sender evidence"
-    );
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut tcp_rx)
-        )
-        .await
-        .is_err(),
-        "the lower-frontier UDP owner may continue only while it still has bounded validation credit"
+        .expect("send next mixed bulk frame");
+    assert_eq!(
+        selected,
+        Some(CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        }),
+        "sender evidence on the active TCP path must not make unproven UDP validation primary"
     );
 }
 
 #[tokio::test]
-async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_continue() {
+async fn server_mixed_binding_pre_read_gate_allows_active_primary_after_duplicate_validation() {
     let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
-    let validation_credit_bytes = max_frame_payload_bytes.saturating_mul(2);
+    let payload_bytes = 64 * 1024;
     let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
     let binding = ResponseStreamBinding::new(
         SessionId(1),
@@ -1148,7 +1166,7 @@ async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_conti
         test_path_metrics(PathId(0), UnderlayProtocol::Udp, 170_000, 100_000_000),
     );
 
-    assert!(binding.can_send_stream_data_extent(FlowLane::Throughput, 0, validation_credit_bytes));
+    assert!(binding.can_send_stream_data_extent(FlowLane::Throughput, 0, payload_bytes));
     binding
         .send_frame(
             StreamId(7),
@@ -1157,11 +1175,18 @@ async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_conti
                 stream_id: StreamId(7),
                 offset: 0,
                 flags: StreamFlags::NONE,
-                payload: Bytes::from(vec![3u8; validation_credit_bytes]),
+                payload: Bytes::from(vec![3u8; payload_bytes]),
             },
         )
         .await
         .expect("send full validation-credit frame");
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ..
+        }))
+    ));
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
@@ -1176,12 +1201,8 @@ async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_conti
         test_path_metrics(PathId(1), UnderlayProtocol::Tcp, 30_000, 500_000_000),
     );
     assert!(
-        !binding.can_send_stream_data_extent(
-            FlowLane::Throughput,
-            validation_credit_bytes as u64,
-            64 * 1024,
-        ),
-        "the server must pause reads instead of creating later offsets on TCP while lower bytes are outstanding on an unproven UDP validation path"
+        binding.can_send_stream_data_extent(FlowLane::Throughput, payload_bytes as u64, 64 * 1024,),
+        "the server may keep reading onto active TCP because cross-underlay validation did not own unique lower bytes"
     );
     assert!(
         tokio::time::timeout(

@@ -55,26 +55,7 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
         loop {
             prune_server_udp_pending_ttls(&mut pending_ttls);
             tokio::select! {
-                request = requests_rx.recv() => {
-                    let Some(request) = request else {
-                        break;
-                    };
-                    if request.ttl_ms == 0 {
-                        continue;
-                    }
-                    match outbound_socket.send(&request.payload).await {
-                        Ok(_) => {
-                            pending_ttls.push_back((
-                                Instant::now() + Duration::from_millis(u64::from(request.ttl_ms)),
-                                request.ttl_ms,
-                                request.datagram_id,
-                            ));
-                        }
-                        Err(err) => {
-                            eprintln!("warning: UDP outbound send failed: {err}");
-                        }
-                    }
-                }
+                biased;
                 received = outbound_socket.recv(&mut response_buffer) => {
                     let len = match received {
                         Ok(len) => len,
@@ -103,6 +84,26 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                         .is_err()
                     {
                         break;
+                    }
+                }
+                request = requests_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    if request.ttl_ms == 0 {
+                        continue;
+                    }
+                    match outbound_socket.send(&request.payload).await {
+                        Ok(_) => {
+                            pending_ttls.push_back((
+                                Instant::now() + Duration::from_millis(u64::from(request.ttl_ms)),
+                                request.ttl_ms,
+                                request.datagram_id,
+                            ));
+                        }
+                        Err(err) => {
+                            eprintln!("warning: UDP outbound send failed: {err}");
+                        }
                     }
                 }
             }

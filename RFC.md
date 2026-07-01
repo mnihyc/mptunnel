@@ -1708,6 +1708,11 @@ whose ETA cannot fit the TTL SHOULD be avoided. `DGRAM_FEEDBACK` acknowledges
 received datagram ID ranges and feeds RTT/loss/delivery-rate observations into
 path models.
 
+Datagram workers MUST treat target responses, `DGRAM_FEEDBACK`, and
+`DGRAM_CLOSE` as realtime feedback. If target responses and additional outbound
+requests are both ready, the response/feedback side is processed first so that
+fresh datagrams and close signals do not wait behind more request sends.
+
 `DGRAM_CLOSE` closes a flow. A closed flow MUST release scheduler load and
 delivery statistics.
 

@@ -2375,6 +2375,14 @@ carry control, ACK, realtime, latency, duplicate validation, and explicit
 gap-targeted repair; they become ordinary data paths only through the same
 flow-level lead admission rule.
 
+Path-scoped `STREAM_DETACH` is explicit product-control work. An implementation
+MUST NOT hide `STREAM_DETACH` creation inside a generic local carrier close
+helper. Normal ordered stream teardown MAY emit `STREAM_DETACH` on each
+attached carrier path before closing that local carrier handle. Failure removal
+of a carrier path SHOULD close the local handle and release local ownership
+without trying to send new product-control frames over a path already marked
+failed.
+
 `carrier_debt` is the sender-visible network backlog: carrier bytes in flight,
 carrier queue bytes, and locally queued carrier commands that are ahead of the
 candidate chunk. `product_reorder_debt` is the stream-level byte ownership that

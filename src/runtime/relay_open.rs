@@ -233,6 +233,7 @@ impl ReliableRelayRemoteSet {
     pub(super) async fn close_all(&mut self) {
         let paths = std::mem::take(&mut self.paths);
         for path in paths {
+            path.stream.send_detach().await;
             path.stream.close().await;
         }
     }

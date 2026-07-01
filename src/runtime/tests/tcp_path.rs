@@ -178,6 +178,75 @@ async fn tcp_path_control_command_bypasses_saturated_data_queue() {
 }
 
 #[tokio::test]
+async fn fixed_reliable_path_close_is_carrier_local_without_hidden_detach() {
+    let (commands, mut commands_rx) = tcp_path_session_command_channels(4);
+    let stream = ReliablePathStreamHandle {
+        stream_id: StreamId(44),
+        max_offset: u64::MAX,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: 64 * 1024,
+        output: ReliablePathStreamOutput::Fixed(commands),
+    };
+
+    stream.close().await;
+
+    match recv_tcp_path_command(&mut commands_rx)
+        .await
+        .expect("close command")
+    {
+        TcpPathSessionCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(44)),
+        _ => panic!("expected close stream command"),
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut commands_rx)
+        )
+        .await
+        .is_err(),
+        "close() must not hide a STREAM_DETACH product frame"
+    );
+}
+
+#[tokio::test]
+async fn fixed_reliable_path_detach_is_explicit_product_control() {
+    let (commands, mut commands_rx) = tcp_path_session_command_channels(4);
+    let stream = ReliablePathStreamHandle {
+        stream_id: StreamId(45),
+        max_offset: u64::MAX,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: 64 * 1024,
+        output: ReliablePathStreamOutput::Fixed(commands),
+    };
+
+    stream.send_detach().await;
+    stream.close().await;
+
+    let mut saw_detach = false;
+    let mut saw_close = false;
+    for _ in 0..2 {
+        match recv_tcp_path_command(&mut commands_rx)
+            .await
+            .expect("detach/close command")
+        {
+            TcpPathSessionCommand::SendFrame(Frame::StreamDetach { stream_id }) => {
+                assert_eq!(stream_id, StreamId(45));
+                saw_detach = true;
+            }
+            TcpPathSessionCommand::CloseStream(stream_id) => {
+                assert_eq!(stream_id, StreamId(45));
+                saw_close = true;
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+    assert!(saw_detach);
+    assert!(saw_close);
+}
+
+#[tokio::test]
 async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);
     tx.send_frame(

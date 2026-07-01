@@ -110,6 +110,10 @@ pub(super) struct ReliablePathStreamHandle {
 }
 
 impl ReliablePathStreamHandle {
+    pub(super) async fn send_detach(&self) {
+        self.output.send_stream_detach(self.stream_id).await;
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -126,12 +130,17 @@ pub(super) enum ReliablePathStreamOutput {
 }
 
 impl ReliablePathStreamOutput {
+    pub(super) async fn send_stream_detach(&self, stream_id: StreamId) {
+        if let Self::Fixed(commands) = self {
+            let _ = commands
+                .send_frame(Frame::StreamDetach { stream_id }, FlowLane::Control)
+                .await;
+        }
+    }
+
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
         match self {
             Self::Fixed(commands) => {
-                let _ = commands
-                    .send_frame(Frame::StreamDetach { stream_id }, FlowLane::Control)
-                    .await;
                 let _ = commands
                     .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                     .await;

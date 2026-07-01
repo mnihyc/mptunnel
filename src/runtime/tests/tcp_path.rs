@@ -255,10 +255,19 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
         .expect("queue frame");
     assert_eq!(tx.pending_bytes(), expected);
 
+    let command = recv_tcp_path_command(&mut rx)
+        .await
+        .expect("queued command");
     assert!(matches!(
-        recv_tcp_path_command(&mut rx).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData { .. }))
+        command,
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { .. })
     ));
+    assert_eq!(
+        tx.pending_bytes(),
+        expected,
+        "dequeue alone must not hide writer backlog from admission"
+    );
+    rx.release_pending_command_bytes(tcp_path_command_pending_bytes(&command));
     assert_eq!(tx.pending_bytes(), 0);
 }
 
@@ -1947,10 +1956,11 @@ async fn server_bulk_output_waits_when_active_path_exceeds_admission_budget() {
         .await
         .expect("first bulk send")
         .expect("selected path");
-    match recv_tcp_path_command(&mut command_rx)
+    let first_command = recv_tcp_path_command(&mut command_rx)
         .await
-        .expect("first queued command")
-    {
+        .expect("first queued command");
+    let first_pending_bytes = tcp_path_command_pending_bytes(&first_command);
+    match first_command {
         TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => assert_eq!(offset, 0),
         _ => panic!("expected first stream data frame"),
     }
@@ -1980,6 +1990,7 @@ async fn server_bulk_output_waits_when_active_path_exceeds_admission_budget() {
         start: 0,
         end: mux_limits.max_tcp_path_inflight_bytes as u64,
     }]);
+    command_rx.release_pending_command_bytes(first_pending_bytes);
     tokio::time::timeout(Duration::from_millis(200), pending)
         .await
         .expect("send should wake after ACK release")

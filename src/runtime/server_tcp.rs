@@ -94,11 +94,12 @@ pub(super) async fn handle_server_path(
         };
         match event {
             ServerTcpPathEvent::Command(command) => {
+                let pending_bytes = tcp_path_command_pending_bytes(&command);
                 if let TcpPathSessionCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command
                 {
                     datagram_flows.retain(|flow| flow.flow_id != *flow_id);
                 }
-                if !handle_server_tcp_path_command(
+                let result = handle_server_tcp_path_command(
                     command,
                     &mut writer,
                     &context,
@@ -111,8 +112,10 @@ pub(super) async fn handle_server_path(
                         active_datagram_flows: datagram_flows.len(),
                     },
                 )
-                .await?
-                {
+                .await;
+                commands_rx.release_pending_command_bytes(pending_bytes);
+                let keep_running = result?;
+                if !keep_running {
                     return Ok(());
                 }
             }

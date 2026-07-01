@@ -778,23 +778,36 @@ async fn run_client_udp_stream(
             }
             command = recv_tcp_path_command(&mut commands), if command_may_recv => {
                 match command {
-                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
-                        if let Err(err) = udp_path_write_frame(&mut send, &frame, codec_limits).await {
-                            let _ = frames.send(Err(err)).await;
-                            return;
+                    Some(command) => {
+                        let pending_bytes = tcp_path_command_pending_bytes(&command);
+                        let result = async {
+                            match command {
+                                TcpPathSessionCommand::SendFrame(frame) => {
+                                    udp_path_write_frame(&mut send, &frame, codec_limits).await?;
+                                    Ok(false)
+                                }
+                                TcpPathSessionCommand::CloseStream(close_stream_id) => {
+                                    if close_stream_id == stream_id {
+                                        let _ = udp_path_finish_stream(&mut send);
+                                        return Ok(true);
+                                    }
+                                    Ok(false)
+                                }
+                                TcpPathSessionCommand::OpenStream { .. } => {
+                                    Err(RuntimeError::Protocol("client UDP carrier stream received open command"))
+                                }
+                            }
                         }
-                    }
-                    Some(TcpPathSessionCommand::CloseStream(close_stream_id)) => {
-                        if close_stream_id == stream_id {
-                            let _ = udp_path_finish_stream(&mut send);
-                            return;
+                        .await;
+                        commands.release_pending_command_bytes(pending_bytes);
+                        match result {
+                            Ok(false) => {}
+                            Ok(true) => return,
+                            Err(err) => {
+                                let _ = frames.send(Err(err)).await;
+                                return;
+                            }
                         }
-                    }
-                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
-                        let _ = frames
-                            .send(Err(RuntimeError::Protocol("client UDP carrier stream received open command")))
-                            .await;
-                        return;
                     }
                     None => {}
                 }
@@ -1310,24 +1323,38 @@ async fn run_server_udp_reliable_stream_loop(
             }
             command = recv_tcp_path_command(&mut commands_rx), if command_may_recv => {
                 match command {
-                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
-                        udp_path_write_frame(&mut send, &frame, context.codec_limits).await?;
-                    }
-                    Some(TcpPathSessionCommand::CloseStream(close_stream_id)) => {
-                        if close_stream_id == stream_id {
-                            context.tcp_streams.detach_path(
-                                session_id,
-                                stream_id,
-                                UnderlayProtocol::Udp,
-                                path_id,
-                                &commands_tx,
-                            );
-                            let _ = udp_path_finish_stream(&mut send);
+                    Some(command) => {
+                        let pending_bytes = tcp_path_command_pending_bytes(&command);
+                        let result = async {
+                            match command {
+                                TcpPathSessionCommand::SendFrame(frame) => {
+                                    udp_path_write_frame(&mut send, &frame, context.codec_limits).await?;
+                                    Ok(false)
+                                }
+                                TcpPathSessionCommand::CloseStream(close_stream_id) => {
+                                    if close_stream_id == stream_id {
+                                        context.tcp_streams.detach_path(
+                                            session_id,
+                                            stream_id,
+                                            UnderlayProtocol::Udp,
+                                            path_id,
+                                            &commands_tx,
+                                        );
+                                        let _ = udp_path_finish_stream(&mut send);
+                                        return Ok(true);
+                                    }
+                                    Ok(false)
+                                }
+                                TcpPathSessionCommand::OpenStream { .. } => {
+                                    Err(RuntimeError::Protocol("server UDP carrier stream received client open command"))
+                                }
+                            }
+                        }
+                        .await;
+                        commands_rx.release_pending_command_bytes(pending_bytes);
+                        if result? {
                             return Ok(());
                         }
-                    }
-                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
-                        return Err(RuntimeError::Protocol("server UDP carrier stream received client open command"));
                     }
                     None => {}
                 }
@@ -1437,20 +1464,38 @@ async fn handle_server_udp_datagram_stream(
             }
             command = recv_tcp_path_command(&mut commands_rx), if command_may_recv => {
                 match command {
-                    Some(TcpPathSessionCommand::SendFrame(frame)) => {
-                        if let Frame::DatagramClose { flow_id } = frame {
-                            flows.retain(|flow| flow.flow_id != flow_id);
-                            udp_path_write_frame(&mut send, &Frame::DatagramClose { flow_id }, context.codec_limits).await?;
-                        } else {
-                            udp_path_write_frame(&mut send, &frame, context.codec_limits).await?;
+                    Some(command) => {
+                        let pending_bytes = tcp_path_command_pending_bytes(&command);
+                        let result = async {
+                            match command {
+                                TcpPathSessionCommand::SendFrame(frame) => {
+                                    if let Frame::DatagramClose { flow_id } = frame {
+                                        flows.retain(|flow| flow.flow_id != flow_id);
+                                        udp_path_write_frame(
+                                            &mut send,
+                                            &Frame::DatagramClose { flow_id },
+                                            context.codec_limits,
+                                        )
+                                        .await?;
+                                    } else {
+                                        udp_path_write_frame(&mut send, &frame, context.codec_limits).await?;
+                                    }
+                                    Ok(false)
+                                }
+                                TcpPathSessionCommand::CloseStream(_) => {
+                                    let _ = udp_path_finish_stream(&mut send);
+                                    Ok(true)
+                                }
+                                TcpPathSessionCommand::OpenStream { .. } => {
+                                    Err(RuntimeError::Protocol("server UDP carrier datagram stream received open command"))
+                                }
+                            }
                         }
-                    }
-                    Some(TcpPathSessionCommand::CloseStream(_)) => {
-                        let _ = udp_path_finish_stream(&mut send);
-                        return Ok(());
-                    }
-                    Some(TcpPathSessionCommand::OpenStream { .. }) => {
-                        return Err(RuntimeError::Protocol("server UDP carrier datagram stream received open command"));
+                        .await;
+                        commands_rx.release_pending_command_bytes(pending_bytes);
+                        if result? {
+                            return Ok(());
+                        }
                     }
                     None => {}
                 }

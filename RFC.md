@@ -2636,6 +2636,17 @@ backpressure and stalled path writers, but they MUST NOT be treated as a peer
 congestion signal and MUST NOT replace stream ACK ranges, carrier ACK ranges, or
 the carrier controller's own bytes-in-flight model.
 
+A path command queue owns frame bytes until the writer has either emitted the
+frame to its transport endpoint or explicitly dropped it because the path or
+stream closed. Dequeueing a command inside a writer task is not a release event:
+the frame can still be waiting on encryption, transport write readiness, QUIC
+stream credit, TCP write pressure, or local error handling. Sender-service
+admission and diagnostics therefore MUST release path command pending bytes only
+after transport emission or local discard, never merely because a writer loop
+received the command from an in-process channel. This keeps local writer backlog
+visible to the scheduler and prevents an endpoint from admitting more ordered
+bulk bytes on a path whose hidden writer queue has not actually drained.
+
 Configured limits are operating envelopes, not assumptions that all traffic
 reserves memory. The implementation should allocate according to demand and
 measured BDP. This lets browsing and SSH remain lightweight while file downloads

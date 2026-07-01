@@ -38,6 +38,16 @@ fn reliable_bulk_striping_path_keys(
     context.ordered_reliable_bulk_striping_path_keys(payload_bytes)
 }
 
+async fn recv_emitted_tcp_path_command(
+    receivers: &mut TcpPathSessionCommandReceivers,
+) -> Option<TcpPathSessionCommand> {
+    let command = recv_tcp_path_command(receivers).await;
+    if let Some(command) = &command {
+        receivers.release_pending_command_bytes(tcp_path_command_pending_bytes(command));
+    }
+    command
+}
+
 #[test]
 fn stream_open_demand_hint_preserves_aggressive_bulk_intent() {
     let throughput = stream_demand_hint_for_lane(FlowLane::Throughput);

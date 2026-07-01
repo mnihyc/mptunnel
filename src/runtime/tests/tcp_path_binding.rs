@@ -76,7 +76,7 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
         .expect("binding send active bulk");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut new_rx).await,
+        recv_emitted_tcp_path_command(&mut new_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -98,7 +98,7 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
         .expect("binding send active bulk");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut new_rx).await,
+        recv_emitted_tcp_path_command(&mut new_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset,
             ..
@@ -107,7 +107,7 @@ async fn server_tcp_binding_active_reattach_carries_ordinary_bulk_data() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut old_rx)
+            recv_emitted_tcp_path_command(&mut old_rx)
         )
         .await
         .is_err(),
@@ -158,7 +158,7 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
         .await
         .expect("send on promoted repair path");
 
-    match recv_tcp_path_command(&mut path0_repair_rx)
+    match recv_emitted_tcp_path_command(&mut path0_repair_rx)
         .await
         .expect("path0 repair command")
     {
@@ -170,7 +170,7 @@ async fn server_tcp_binding_active_reattach_promotes_existing_path_for_data() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut path1_rx)
+            recv_emitted_tcp_path_command(&mut path1_rx)
         )
         .await
         .is_err()
@@ -225,7 +225,7 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
         .expect("send active bulk frame");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut path1_rx).await,
+        recv_emitted_tcp_path_command(&mut path1_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -234,7 +234,7 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut path0_repair_rx)
+            recv_emitted_tcp_path_command(&mut path0_repair_rx)
         )
         .await
         .is_err()
@@ -255,7 +255,7 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
         .expect("send active bulk frame");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut path1_rx).await,
+        recv_emitted_tcp_path_command(&mut path1_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset,
             ..
@@ -264,7 +264,7 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut path0_repair_rx)
+            recv_emitted_tcp_path_command(&mut path0_repair_rx)
         )
         .await
         .is_err(),
@@ -328,7 +328,7 @@ async fn server_udp_binding_bulk_validation_credit_can_lead_bounded_probe_data()
         .expect("send UDP validation bulk frame");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut path0_validation_rx).await,
+        recv_emitted_tcp_path_command(&mut path0_validation_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -337,7 +337,7 @@ async fn server_udp_binding_bulk_validation_credit_can_lead_bounded_probe_data()
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut path1_rx)
+            recv_emitted_tcp_path_command(&mut path1_rx)
         )
         .await
         .is_err(),
@@ -390,7 +390,7 @@ async fn server_udp_binding_peer_hint_validation_does_not_promote_without_carrie
         .await
         .expect("send duplicate validation frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut active_rx).await,
+        recv_emitted_tcp_path_command(&mut active_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -399,7 +399,7 @@ async fn server_udp_binding_peer_hint_validation_does_not_promote_without_carrie
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut validation_rx)
+            recv_emitted_tcp_path_command(&mut validation_rx)
         )
         .await
         .is_err(),
@@ -422,7 +422,7 @@ async fn server_udp_binding_peer_hint_validation_does_not_promote_without_carrie
         .expect("send after duplicate ack");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut active_rx).await,
+        recv_emitted_tcp_path_command(&mut active_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 5,
             ..
@@ -471,7 +471,7 @@ async fn server_udp_binding_local_carrier_metrics_promote_validation_path() {
         .await
         .expect("send duplicate validation frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut active_rx).await,
+        recv_emitted_tcp_path_command(&mut active_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -480,7 +480,7 @@ async fn server_udp_binding_local_carrier_metrics_promote_validation_path() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut validation_rx)
+            recv_emitted_tcp_path_command(&mut validation_rx)
         )
         .await
         .is_err(),
@@ -504,7 +504,7 @@ async fn server_udp_binding_local_carrier_metrics_promote_validation_path() {
         .expect("send after local carrier evidence");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut validation_rx).await,
+        recv_emitted_tcp_path_command(&mut validation_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 5,
             ..
@@ -513,7 +513,7 @@ async fn server_udp_binding_local_carrier_metrics_promote_validation_path() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut active_rx)
+            recv_emitted_tcp_path_command(&mut active_rx)
         )
         .await
         .is_err(),
@@ -546,7 +546,7 @@ async fn server_udp_binding_ignores_product_ack_rate_without_local_carrier_metri
         .await
         .expect("send active UDP frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut active_rx).await,
+        recv_emitted_tcp_path_command(&mut active_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -633,7 +633,7 @@ async fn server_tcp_binding_ignores_product_ack_rate_without_path_metrics() {
         .await
         .expect("send active TCP frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut active_rx).await,
+        recv_emitted_tcp_path_command(&mut active_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -739,7 +739,7 @@ async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
         .expect("send first mixed bulk frame");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut udp_rx).await,
+        recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -748,7 +748,7 @@ async fn server_mixed_binding_udp_validation_can_be_primary_before_tcp_debt() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut tcp_rx)
+            recv_emitted_tcp_path_command(&mut tcp_rx)
         )
         .await
         .is_err(),
@@ -801,7 +801,7 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut udp_rx).await,
+        recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -810,7 +810,7 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut tcp_rx)
+            recv_emitted_tcp_path_command(&mut tcp_rx)
         )
         .await
         .is_err()
@@ -829,7 +829,7 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut udp_rx)
+            recv_emitted_tcp_path_command(&mut udp_rx)
         )
         .await
         .is_err()
@@ -837,7 +837,7 @@ async fn server_mixed_binding_unproven_frontier_owner_blocks_cross_underlay_lead
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut tcp_rx)
+            recv_emitted_tcp_path_command(&mut tcp_rx)
         )
         .await
         .is_err(),
@@ -890,7 +890,7 @@ async fn server_mixed_binding_proven_path_waits_for_lower_frontier_owner() {
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut tcp_rx).await,
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -917,7 +917,7 @@ async fn server_mixed_binding_proven_path_waits_for_lower_frontier_owner() {
         .expect("send second mixed bulk frame");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut tcp_rx).await,
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset,
             ..
@@ -926,7 +926,7 @@ async fn server_mixed_binding_proven_path_waits_for_lower_frontier_owner() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut udp_rx)
+            recv_emitted_tcp_path_command(&mut udp_rx)
         )
         .await
         .is_err(),
@@ -979,7 +979,7 @@ async fn server_mixed_binding_blocks_unserviceable_lower_frontier_owner() {
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut tcp_rx).await,
+        recv_emitted_tcp_path_command(&mut tcp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1021,7 +1021,7 @@ async fn server_mixed_binding_blocks_unserviceable_lower_frontier_owner() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut udp_rx)
+            recv_emitted_tcp_path_command(&mut udp_rx)
         )
         .await
         .is_err(),
@@ -1075,7 +1075,7 @@ async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exi
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut udp_rx).await,
+        recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset,
             ..
@@ -1099,7 +1099,7 @@ async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exi
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut udp_rx)
+            recv_emitted_tcp_path_command(&mut udp_rx)
         )
         .await
         .is_err(),
@@ -1108,7 +1108,7 @@ async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exi
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut tcp_rx)
+            recv_emitted_tcp_path_command(&mut tcp_rx)
         )
         .await
         .is_err(),
@@ -1163,7 +1163,7 @@ async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_conti
         .await
         .expect("send full validation-credit frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut udp_rx).await,
+        recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1186,7 +1186,7 @@ async fn server_mixed_binding_pre_read_gate_blocks_when_lower_owner_cannot_conti
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut tcp_rx)
+            recv_emitted_tcp_path_command(&mut tcp_rx)
         )
         .await
         .is_err()
@@ -1277,7 +1277,7 @@ async fn server_mixed_binding_unproven_tcp_validation_cannot_jump_udp_frontier()
         .await
         .expect("send first mixed bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut udp_rx).await,
+        recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1304,7 +1304,7 @@ async fn server_mixed_binding_unproven_tcp_validation_cannot_jump_udp_frontier()
         .await
         .expect("send second mixed bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut udp_rx).await,
+        recv_emitted_tcp_path_command(&mut udp_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset,
             ..
@@ -1313,7 +1313,7 @@ async fn server_mixed_binding_unproven_tcp_validation_cannot_jump_udp_frontier()
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut tcp_validation_rx)
+            recv_emitted_tcp_path_command(&mut tcp_validation_rx)
         )
         .await
         .is_err(),
@@ -1467,7 +1467,7 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
         .expect("send response bulk");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut validation_rx).await,
+        recv_emitted_tcp_path_command(&mut validation_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1476,7 +1476,7 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut active_rx)
+            recv_emitted_tcp_path_command(&mut active_rx)
         )
         .await
         .is_err(),
@@ -1586,7 +1586,7 @@ async fn server_tcp_binding_counts_command_queue_debt_for_bulk_admission() {
 
     let validation_frame = tokio::time::timeout(
         Duration::from_millis(20),
-        recv_tcp_path_command(&mut validation_rx),
+        recv_emitted_tcp_path_command(&mut validation_rx),
     )
     .await
     .ok()
@@ -1654,7 +1654,7 @@ async fn server_bulk_binding_uses_service_horizon_for_fat_path() {
         .expect("send response bulk on service-horizon lead");
 
     assert!(matches!(
-        recv_tcp_path_command(&mut fat_rx).await,
+        recv_emitted_tcp_path_command(&mut fat_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1929,7 +1929,7 @@ async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
         .await
         .expect("send bulk frame");
     assert!(matches!(
-        recv_tcp_path_command(&mut bulk_path1_rx).await,
+        recv_emitted_tcp_path_command(&mut bulk_path1_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1938,7 +1938,7 @@ async fn server_registry_bulk_admission_yields_to_path_without_latency_load() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut bulk_path0_rx)
+            recv_emitted_tcp_path_command(&mut bulk_path0_rx)
         )
         .await
         .is_err(),
@@ -1989,7 +1989,7 @@ async fn server_tcp_binding_interactive_repair_reattach_preserves_active_path() 
         .await
         .expect("send on active interactive path");
 
-    match recv_tcp_path_command(&mut path1_rx)
+    match recv_emitted_tcp_path_command(&mut path1_rx)
         .await
         .expect("interactive active command")
     {
@@ -2001,7 +2001,7 @@ async fn server_tcp_binding_interactive_repair_reattach_preserves_active_path() 
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut path0_repair_rx)
+            recv_emitted_tcp_path_command(&mut path0_repair_rx)
         )
         .await
         .is_err()
@@ -2051,7 +2051,7 @@ async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
         .await
         .expect("send on active path");
 
-    match recv_tcp_path_command(&mut path1_rx)
+    match recv_emitted_tcp_path_command(&mut path1_rx)
         .await
         .expect("active path command")
     {
@@ -2063,7 +2063,7 @@ async fn server_tcp_binding_repair_reattach_preserves_realtime_data_path() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_tcp_path_command(&mut path0_repair_rx)
+            recv_emitted_tcp_path_command(&mut path0_repair_rx)
         )
         .await
         .is_err()

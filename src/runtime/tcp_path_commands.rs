@@ -93,6 +93,12 @@ impl TcpPathSessionCommandQueueMetrics {
     }
 }
 
+impl TcpPathSessionCommandReceivers {
+    pub(super) fn release_pending_command_bytes(&self, bytes: usize) {
+        self.metrics.release_pending_bytes(bytes);
+    }
+}
+
 impl TcpPathSessionCommandSender {
     pub(super) async fn send_control(
         &self,
@@ -278,12 +284,10 @@ pub(super) async fn recv_tcp_path_command(
     receivers: &mut TcpPathSessionCommandReceivers,
 ) -> Option<TcpPathSessionCommand> {
     if let Some(command) = recv_ready_priority_command(receivers) {
-        release_tcp_path_command_pending_bytes(receivers, &command);
         return Some(command);
     }
     drain_ready_data_commands(receivers);
     if let Some(command) = receivers.fair_data.pop_round_robin() {
-        release_tcp_path_command_pending_bytes(receivers, &command);
         return Some(command);
     }
     let control_may_recv = tcp_receiver_may_recv(&receivers.control);
@@ -325,28 +329,13 @@ pub(super) async fn recv_tcp_path_command(
         (false, false, false) => TcpPathReceivedCommand::Priority(None),
     };
     match command {
-        TcpPathReceivedCommand::Priority(command) => {
-            if let Some(command) = &command {
-                release_tcp_path_command_pending_bytes(receivers, command);
-            }
-            command
-        }
+        TcpPathReceivedCommand::Priority(command) => command,
         TcpPathReceivedCommand::Data(Some(command)) => {
             receivers.fair_data.push(command);
             drain_ready_data_commands(receivers);
-            let command = receivers.fair_data.pop_round_robin();
-            if let Some(command) = &command {
-                release_tcp_path_command_pending_bytes(receivers, command);
-            }
-            command
+            receivers.fair_data.pop_round_robin()
         }
-        TcpPathReceivedCommand::Data(None) => {
-            let command = receivers.fair_data.pop_round_robin();
-            if let Some(command) = &command {
-                release_tcp_path_command_pending_bytes(receivers, command);
-            }
-            command
-        }
+        TcpPathReceivedCommand::Data(None) => receivers.fair_data.pop_round_robin(),
     }
 }
 
@@ -370,16 +359,7 @@ fn drain_ready_data_commands(receivers: &mut TcpPathSessionCommandReceivers) {
     }
 }
 
-fn release_tcp_path_command_pending_bytes(
-    receivers: &TcpPathSessionCommandReceivers,
-    command: &TcpPathSessionCommand,
-) {
-    receivers
-        .metrics
-        .release_pending_bytes(tcp_path_command_pacing_bytes(command));
-}
-
-fn tcp_path_command_pacing_bytes(command: &TcpPathSessionCommand) -> usize {
+pub(super) fn tcp_path_command_pending_bytes(command: &TcpPathSessionCommand) -> usize {
     match command {
         TcpPathSessionCommand::SendFrame(frame) => frame_pacing_bytes(frame),
         TcpPathSessionCommand::OpenStream { .. } | TcpPathSessionCommand::CloseStream(_) => 0,

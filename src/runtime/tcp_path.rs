@@ -3024,7 +3024,9 @@ async fn run_client_tcp_path_session(
         if state.connection.is_none() {
             match recv_tcp_path_command(&mut commands).await {
                 Some(command) => {
+                    let pending_bytes = tcp_path_command_pending_bytes(&command);
                     handle_disconnected_client_tcp_command(command, &runtime, &mut state).await;
+                    commands.release_pending_command_bytes(pending_bytes);
                 }
                 None => return,
             }
@@ -3064,7 +3066,8 @@ async fn run_client_tcp_path_session(
             command = recv_tcp_path_command(&mut commands), if command_may_recv => {
                 match command {
                     Some(command) => {
-                        if let Err(err) = handle_connected_client_tcp_command(
+                        let pending_bytes = tcp_path_command_pending_bytes(&command);
+                        let result = handle_connected_client_tcp_command(
                             command,
                             state.connection.as_mut().expect("checked connected TCP path session"),
                             &mut state.streams,
@@ -3072,8 +3075,9 @@ async fn run_client_tcp_path_session(
                             runtime.stream_frame_queue,
                             runtime.mux_limits,
                         )
-                        .await
-                        {
+                        .await;
+                        commands.release_pending_command_bytes(pending_bytes);
+                        if let Err(err) = result {
                             fail_client_tcp_streams(&mut state.streams, &err);
                             eprintln!("warning: TCP path session command failed: {err}");
                             drop_connection = true;

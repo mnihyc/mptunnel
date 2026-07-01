@@ -1227,6 +1227,75 @@ async fn server_mixed_binding_unproven_tcp_validation_cannot_jump_udp_frontier()
 }
 
 #[tokio::test]
+async fn server_ack_ordering_keeps_out_of_order_acked_ranges_as_debt() {
+    let (tcp_tx, _tcp_rx) = tcp_path_session_command_channels(4);
+    let binding = ServerTcpStreamBinding::new(
+        SessionId(1),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        tcp_tx,
+        FlowLane::Throughput,
+    );
+    let (udp_tx, _udp_rx) = tcp_path_session_command_channels(4);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        udp_tx,
+        FlowLane::Throughput,
+        StreamOpenRole::Active,
+        tcp_relay_buffer_len(MuxLimits::default()),
+    );
+
+    let chunk = 64 * 1024;
+    binding.record_flight_for_test(UnderlayProtocol::Tcp, PathId(0), 0, chunk, true);
+    binding.record_flight_for_test(UnderlayProtocol::Udp, PathId(1), chunk as u64, chunk, true);
+
+    binding.release_acked_ranges(&[OffsetRange {
+        start: chunk as u64,
+        end: (chunk * 2) as u64,
+    }]);
+
+    assert_eq!(
+        binding.ack_ordering_state_for_test(),
+        (0, chunk as u64),
+        "a later ACKed range is repair-released but still blocks ordered progress"
+    );
+    assert_eq!(
+        binding.lower_flight_debt_keys_for_test((chunk * 2) as u64),
+        vec![
+            (UnderlayProtocol::Tcp, PathId(0), chunk as u64),
+            (UnderlayProtocol::Udp, PathId(1), chunk as u64),
+        ],
+        "admission must still see both the missing lower range and the out-of-order ACKed later range"
+    );
+    assert!(
+        !binding.output_has_sender_evidence_for_test(UnderlayProtocol::Udp, PathId(1)),
+        "out-of-order ACK release alone must not prove ordered UDP response progress"
+    );
+
+    binding.release_acked_ranges(&[OffsetRange {
+        start: 0,
+        end: chunk as u64,
+    }]);
+
+    assert_eq!(
+        binding.ack_ordering_state_for_test(),
+        ((chunk * 2) as u64, 0),
+        "the previous later ACK hole becomes contiguous once the lower range arrives"
+    );
+    assert!(
+        binding
+            .lower_flight_debt_keys_for_test((chunk * 2) as u64)
+            .is_empty(),
+        "contiguous ACK progress clears ordering debt"
+    );
+    assert!(
+        binding.output_has_sender_evidence_for_test(UnderlayProtocol::Udp, PathId(1)),
+        "the later path gains sender evidence only when its ACKed bytes become contiguous"
+    );
+}
+
+#[tokio::test]
 async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
     let registry = ServerTcpStreamRegistry::default();
     let session_id = SessionId(71);

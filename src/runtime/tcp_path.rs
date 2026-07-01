@@ -286,6 +286,7 @@ pub(super) struct ServerTcpStreamBinding {
     lane_tracker: Arc<ServerPathLaneTracker>,
     outputs: Mutex<ServerTcpStreamOutputs>,
     flights: Mutex<BTreeMap<u64, Vec<ServerTcpPathFlight>>>,
+    ack_ordering: Mutex<ServerTcpAckOrderingState>,
     version: watch::Sender<u64>,
 }
 
@@ -359,6 +360,7 @@ impl ServerTcpStreamBinding {
                 }],
             }),
             flights: Mutex::new(BTreeMap::new()),
+            ack_ordering: Mutex::new(ServerTcpAckOrderingState::default()),
             version,
         })
     }
@@ -755,35 +757,76 @@ impl ServerTcpStreamBinding {
             })
             .collect::<Vec<_>>();
         if acked_offsets.is_empty() {
+            let ordering_update = self
+                .ack_ordering
+                .lock()
+                .expect("server TCP ACK ordering lock")
+                .apply_ack(ranges, &[]);
+            if ordering_update.changed {
+                self.notify_update();
+            }
             return;
         }
         let mut released = Vec::new();
         for offset in acked_offsets {
             if let Some(path_flights) = flights.remove(&offset) {
-                released.extend(path_flights);
+                released.extend(path_flights.into_iter().map(|flight| (offset, flight)));
             }
         }
         drop(flights);
 
+        let ordering_update = {
+            let mut ordering = self
+                .ack_ordering
+                .lock()
+                .expect("server TCP ACK ordering lock");
+            ordering.apply_ack(ranges, &released)
+        };
+        #[cfg(feature = "lab-diagnostics")]
+        if ordering_update.acked_hole_bytes > 0 {
+            lab_diagnostic(
+                "server_ack_ordering_state",
+                format_args!(
+                    "session_id={} contiguous_frontier={} acked_hole_bytes={} released_flights={}",
+                    self.session_id.0,
+                    ordering_update.contiguous_frontier,
+                    ordering_update.acked_hole_bytes,
+                    released.len(),
+                ),
+            );
+        }
+
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let now = Instant::now();
         let mut changed = false;
-        for flight in released {
+        for (_, flight) in released {
             if let Some(entry) = outputs
                 .entries
                 .iter_mut()
                 .find(|entry| entry.key == flight.key)
             {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
-                if flight.stream_ack_proves_path {
-                    entry.delivery_samples = entry.delivery_samples.saturating_add(1);
-                    entry.last_delivery_at = Some(now);
-                }
                 changed = true;
             }
         }
+        for hole in ordering_update.newly_contiguous {
+            if !hole.stream_ack_proves_path {
+                continue;
+            }
+            if let Some(entry) = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == hole.key)
+            {
+                if hole.end <= ordering_update.contiguous_frontier {
+                    entry.delivery_samples = entry.delivery_samples.saturating_add(1);
+                    entry.last_delivery_at = Some(now);
+                    changed = true;
+                }
+            }
+        }
         drop(outputs);
-        if changed {
+        if changed || ordering_update.changed {
             self.notify_update();
         }
     }
@@ -838,17 +881,39 @@ impl ServerTcpStreamBinding {
     }
 
     fn lower_flights_before_offset(&self, offset: u64) -> Vec<ServerTcpPathFlightDebt> {
-        let flights = self.flights.lock().expect("server TCP stream flight lock");
-        flights
-            .range(..offset)
-            .filter_map(|(_, path_flights)| {
-                let latest = path_flights.last()?;
-                Some(ServerTcpPathFlightDebt {
-                    key: latest.key,
-                    bytes: latest.bytes as u64,
-                })
-            })
-            .collect()
+        let mut debts = BTreeMap::<u64, ServerTcpPathFlightDebt>::new();
+        {
+            let flights = self.flights.lock().expect("server TCP stream flight lock");
+            for (flight_offset, path_flights) in flights.range(..offset) {
+                if let Some(latest) = path_flights.last() {
+                    debts.insert(
+                        *flight_offset,
+                        ServerTcpPathFlightDebt {
+                            key: latest.key,
+                            bytes: latest.bytes as u64,
+                        },
+                    );
+                }
+            }
+        }
+        {
+            let ack_ordering = self
+                .ack_ordering
+                .lock()
+                .expect("server TCP ACK ordering lock");
+            for (hole_offset, holes) in ack_ordering.acked_holes.range(..offset) {
+                if let Some(latest) = holes.last() {
+                    debts.insert(
+                        *hole_offset,
+                        ServerTcpPathFlightDebt {
+                            key: latest.key,
+                            bytes: latest.bytes,
+                        },
+                    );
+                }
+            }
+        }
+        debts.into_values().collect()
     }
 
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
@@ -1007,6 +1072,47 @@ impl ServerTcpStreamBinding {
                 )
             })
     }
+
+    #[cfg(test)]
+    pub(super) fn record_flight_for_test(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        offset: u64,
+        payload_bytes: usize,
+        stream_ack_proves_path: bool,
+    ) {
+        self.record_flight(
+            ServerTcpPathKey { underlay, path_id },
+            &Frame::StreamData {
+                stream_id: StreamId(7),
+                offset,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![0u8; payload_bytes]),
+            },
+            stream_ack_proves_path,
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn lower_flight_debt_keys_for_test(
+        &self,
+        offset: u64,
+    ) -> Vec<(UnderlayProtocol, PathId, u64)> {
+        self.lower_flights_before_offset(offset)
+            .into_iter()
+            .map(|debt| (debt.key.underlay, debt.key.path_id, debt.bytes))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn ack_ordering_state_for_test(&self) -> (u64, u64) {
+        let ordering = self
+            .ack_ordering
+            .lock()
+            .expect("server TCP ACK ordering lock");
+        (ordering.contiguous_frontier, ordering.acked_hole_bytes())
+    }
 }
 
 fn server_frame_prefers_current_data_path(frame: &Frame, lane: FlowLane) -> bool {
@@ -1140,6 +1246,115 @@ struct ServerTcpPathFlight {
 struct ServerTcpPathFlightDebt {
     key: ServerTcpPathKey,
     bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerTcpPathAckedHole {
+    key: ServerTcpPathKey,
+    end: u64,
+    bytes: u64,
+    stream_ack_proves_path: bool,
+}
+
+#[derive(Debug, Default)]
+struct ServerTcpAckOrderingState {
+    contiguous_frontier: u64,
+    acked_holes: BTreeMap<u64, Vec<ServerTcpPathAckedHole>>,
+}
+
+struct ServerTcpAckOrderingUpdate {
+    changed: bool,
+    contiguous_frontier: u64,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    acked_hole_bytes: u64,
+    newly_contiguous: Vec<ServerTcpPathAckedHole>,
+}
+
+impl ServerTcpAckOrderingState {
+    fn apply_ack(
+        &mut self,
+        ranges: &[OffsetRange],
+        released: &[(u64, ServerTcpPathFlight)],
+    ) -> ServerTcpAckOrderingUpdate {
+        let previous_frontier = self.contiguous_frontier;
+        let previous_hole_bytes = self.acked_hole_bytes();
+        let mut newly_contiguous = Vec::new();
+
+        for (offset, flight) in released {
+            let hole = ServerTcpPathAckedHole {
+                key: flight.key,
+                end: flight.end,
+                bytes: flight.bytes as u64,
+                stream_ack_proves_path: flight.stream_ack_proves_path,
+            };
+            if hole.end <= self.contiguous_frontier {
+                newly_contiguous.push(hole);
+            } else {
+                self.acked_holes.entry(*offset).or_default().push(hole);
+            }
+        }
+
+        self.advance_contiguous_frontier(ranges);
+        let frontier = self.contiguous_frontier;
+        self.acked_holes.retain(|_, holes| {
+            holes.retain(|hole| {
+                if hole.end <= frontier {
+                    newly_contiguous.push(*hole);
+                    false
+                } else {
+                    true
+                }
+            });
+            !holes.is_empty()
+        });
+        let acked_hole_bytes = self.acked_hole_bytes();
+
+        ServerTcpAckOrderingUpdate {
+            changed: previous_frontier != self.contiguous_frontier
+                || previous_hole_bytes != acked_hole_bytes
+                || !newly_contiguous.is_empty(),
+            contiguous_frontier: self.contiguous_frontier,
+            acked_hole_bytes,
+            newly_contiguous,
+        }
+    }
+
+    fn advance_contiguous_frontier(&mut self, ranges: &[OffsetRange]) {
+        let ranges = normalized_offset_ranges(ranges);
+        loop {
+            let mut next_frontier = self.contiguous_frontier;
+            for range in &ranges {
+                if range.start > next_frontier {
+                    break;
+                }
+                if range.end > next_frontier {
+                    next_frontier = range.end;
+                }
+            }
+            for (offset, holes) in self.acked_holes.range(..=next_frontier) {
+                if *offset > next_frontier {
+                    break;
+                }
+                for hole in holes {
+                    if hole.end > next_frontier {
+                        next_frontier = hole.end;
+                    }
+                }
+            }
+            if next_frontier == self.contiguous_frontier {
+                break;
+            }
+            self.contiguous_frontier = next_frontier;
+        }
+    }
+
+    fn acked_hole_bytes(&self) -> u64 {
+        self.acked_holes
+            .values()
+            .flat_map(|holes| holes.iter())
+            .map(|hole| hole.bytes)
+            .sum()
+    }
 }
 
 fn server_stream_ordering_debt_bytes(

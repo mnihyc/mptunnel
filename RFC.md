@@ -1462,7 +1462,10 @@ payload exactly describe that subrange.
 
 On `STREAM_ACK`, a sender MUST release all explicitly ACKed byte ranges from
 repair state, including ACKed subranges inside a previously cached
-`STREAM_DATA` frame. If the ACK is not repair-authoritative
+`STREAM_DATA` frame. This release is not the same as contiguous application
+progress: ACKed bytes above a lower missing range remain part of the sender's
+ordering-debt ledger until the contiguous ACK frontier reaches them. If the ACK
+is not repair-authoritative
 (`complete == false`), omitted ranges MUST NOT be interpreted as holes. If the
 ACK is repair-authoritative (`complete == true`),
 the sender may compute holes below the largest end offset carried in that frame
@@ -2181,6 +2184,17 @@ bytes owned by the other carrier family, the sender either continues on the
 path that owns the lower bytes, performs bounded gap-targeted reinjection, or
 waits for ACK/path-state progress; it MUST NOT keep feeding later offsets to a
 path that will expand the ordered receive hole.
+
+`STREAM_ACK` processing maintains two product-side ledgers. Explicitly ACKed
+ranges release repair-cache and product-flight state even when they arrive
+above a lower missing range. They do not, however, prove ordered application
+progress until the sender's contiguous ACK frontier reaches those bytes. ACKed
+ranges above that frontier remain visible to `stream_ordering_debt` as
+receive-hole debt, and a path that carried those bytes gains ordinary response
+delivery evidence only when the contiguous frontier advances through the
+range. This mirrors QUIC's separation between packet ACK state and stream
+delivery state, and MPTCP's distinction between subflow progress and
+connection-level data-sequence progress.
 
 Version 1 applies this as a contiguous-frontier ownership rule for ordinary
 same-stream bulk: while any lower byte range is still outstanding on an

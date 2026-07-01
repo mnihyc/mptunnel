@@ -1410,6 +1410,35 @@ record_mixed_probe_case() {
   append_mixed_probe_result "$case_name" "$exit_code" "$output"
 }
 
+run_direct_mixed_case() {
+  local case_name="$1"
+  local target_ip="$2"
+  if [[ "$isolate_cases" == "1" ]]; then
+    stop_client
+    if [[ "$isolate_containers" == "1" ]]; then
+      stop_server
+      compose down --remove-orphans >/dev/null 2>&1 || true
+      compose up -d --remove-orphans >/dev/null
+    fi
+    apply_netem apply
+    start_target_services
+    sleep 1
+  else
+    stop_client
+    apply_netem apply
+  fi
+
+  local telemetry_pid
+  telemetry_pid="$(start_case_telemetry "$case_name")"
+  set +e
+  local output
+  output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --mode direct --http-target '${target_ip}:8080' --udp-target '${target_ip}:9090' --tcp-echo-target '${target_ip}:10022' --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
+  local exit_code="$?"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  set -e
+  append_mixed_probe_result "$case_name" "$exit_code" "$output"
+}
+
 run_mixed_case() {
   local case_name="$1"
   shift
@@ -1716,6 +1745,19 @@ if should_run_case "direct_upload_cross_continent_high_bandwidth"; then
 fi
 if should_run_case "direct_upload_poor_internet"; then
   run_unproxied_upload_probe_case "direct_upload_poor_internet" "172.31.30.30:${tcp_upload_target_port}"
+fi
+
+if should_run_case "direct_mixed_low_latency"; then
+  run_direct_mixed_case "direct_mixed_low_latency" "172.31.10.30"
+fi
+if should_run_case "direct_mixed_balanced"; then
+  run_direct_mixed_case "direct_mixed_balanced" "172.31.15.30"
+fi
+if should_run_case "direct_mixed_cross_continent_high_bandwidth"; then
+  run_direct_mixed_case "direct_mixed_cross_continent_high_bandwidth" "172.31.20.30"
+fi
+if should_run_case "direct_mixed_poor_internet"; then
+  run_direct_mixed_case "direct_mixed_poor_internet" "172.31.30.30"
 fi
 
 if should_run_case "baseline_vmess_tcp_single_balanced"; then

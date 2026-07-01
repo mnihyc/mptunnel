@@ -151,9 +151,18 @@ def parse_http_headers(buffer):
     return int(parts[1]), content_length, body
 
 
-def http_get_via_socks(proxy, target, path, timeout, chunk_bytes):
+def connect_target(args, target, timeout):
+    if args.mode == "direct":
+        target_host, target_port = parse_host_port(target)
+        sock = socket.create_connection((target_host, target_port), timeout=timeout)
+        sock.settimeout(timeout)
+        return sock, target_host, target_port
+    return connect_socks5(args.proxy, target, timeout)
+
+
+def http_get(args, target, path, timeout, chunk_bytes):
     started = time.monotonic()
-    sock, target_host, target_port = connect_socks5(proxy, target, timeout)
+    sock, target_host, target_port = connect_target(args, target, timeout)
     with sock:
         request = (
             f"GET {path} HTTP/1.1\r\n"
@@ -251,8 +260,8 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
             if time.monotonic() >= deadline:
                 break
             requests += 1
-            sock, target_host, target_port = connect_socks5(
-                args.proxy, args.http_target, args.timeout
+            sock, target_host, target_port = connect_target(
+                args, args.http_target, args.timeout
             )
             sock.settimeout(min(args.timeout, 1.0))
             with sock:
@@ -353,8 +362,8 @@ def small_http_worker(args, started_at, bulk_ready, result):
         started = time.monotonic()
         remaining = max(0.1, min(args.timeout, deadline - started))
         try:
-            status, _, _ = http_get_via_socks(
-                args.proxy,
+            status, _, _ = http_get(
+                args,
                 args.http_target,
                 args.small_path,
                 remaining,
@@ -416,9 +425,7 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
                     connect_timeout = max(
                         0.1, min(args.timeout, timeout, deadline - time.monotonic())
                     )
-                    sock, _, _ = connect_socks5(
-                        args.proxy, args.tcp_echo_target, connect_timeout
-                    )
+                    sock, _, _ = connect_target(args, args.tcp_echo_target, connect_timeout)
                     sock.settimeout(timeout)
                     connected = True
                 except Exception as exc:
@@ -527,6 +534,96 @@ def udp_worker(args, started_at, bulk_ready, result):
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
     worker_started = time.monotonic()
     try:
+        if args.mode == "direct":
+            target_host, target_port = parse_host_port(args.udp_target)
+            timeout = args.udp_timeout_ms / 1000.0
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            with udp:
+                udp.settimeout(timeout)
+                body_len = max(4, args.udp_payload_bytes)
+                index = 0
+                while time.monotonic() < workload_deadline_at:
+                    if time.monotonic() >= safety_deadline:
+                        deadline_hit = True
+                        break
+                    payload = struct.pack("!I", index) + bytes([index % 251]) * (
+                        body_len - 4
+                    )
+                    attempted += 1
+                    started = time.monotonic()
+                    started_s = started - started_at
+                    udp.sendto(payload, (target_host, target_port))
+                    deadline = min(started + timeout, safety_deadline, workload_deadline_at)
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            if time.monotonic() >= safety_deadline:
+                                deadline_hit = True
+                            break
+                        udp.settimeout(remaining)
+                        try:
+                            response, _ = udp.recvfrom(65535)
+                        except socket.timeout:
+                            break
+                        if response == payload:
+                            finished_s = time.monotonic() - started_at
+                            latency_ms = (time.monotonic() - started) * 1000.0
+                            received += 1
+                            latencies.append(latency_ms)
+                            if max_latency_ms is None or latency_ms > max_latency_ms:
+                                max_latency_ms = latency_ms
+                                max_index = index
+                                max_start_s = started_s
+                                max_end_s = finished_s
+                            if (
+                                args.failover_after >= 0
+                                and (
+                                    finished_s >= args.failover_after
+                                    or started_s >= args.failover_after
+                                )
+                                and (
+                                    max_after_failover_ms is None
+                                    or latency_ms > max_after_failover_ms
+                                )
+                            ):
+                                max_after_failover_ms = latency_ms
+                                max_after_failover_index = index
+                                max_after_failover_start_s = started_s
+                                max_after_failover_end_s = finished_s
+                            break
+                    if args.udp_interval_ms > 0:
+                        time.sleep(args.udp_interval_ms / 1000.0)
+                    if deadline_hit:
+                        break
+                    index += 1
+            result.update(
+                {
+                    "udp_error": (
+                        f"UDP probe deadline exceeded after {args.timeout:.3f}s"
+                        if deadline_hit
+                        else None
+                    ),
+                    "udp_start_s": worker_started - started_at,
+                    "udp_time_s": time.monotonic() - worker_started,
+                    "udp_count": attempted,
+                    "udp_received": received,
+                    "udp_loss_rate": (attempted - received) / attempted
+                    if attempted
+                    else 0.0,
+                    "udp_p50_ms": percentile(latencies, 0.50),
+                    "udp_p95_ms": percentile(latencies, 0.95),
+                    "udp_max_ms": max_latency_ms,
+                    "udp_max_index": max_index,
+                    "udp_max_start_s": max_start_s,
+                    "udp_max_end_s": max_end_s,
+                    "udp_max_after_failover_ms": max_after_failover_ms,
+                    "udp_max_after_failover_index": max_after_failover_index,
+                    "udp_max_after_failover_start_s": max_after_failover_start_s,
+                    "udp_max_after_failover_end_s": max_after_failover_end_s,
+                }
+            )
+            return
+
         proxy_host, proxy_port = parse_host_port(args.proxy)
         target_host, target_port = parse_host_port(args.udp_target)
         timeout = args.udp_timeout_ms / 1000.0
@@ -667,12 +764,13 @@ def build_record(args, bulk, small, interactive, udp):
         "case": args.label,
         "protocol": "mixed",
         "status": status,
-            "target": args.http_target,
-            "udp_target": args.udp_target,
-            "tcp_echo_target": args.tcp_echo_target,
-            "failover_after_s": args.failover_after,
-            "test_duration_s": args.load_duration if args.load_duration > 0 else args.timeout,
-        }
+        "mode": args.mode,
+        "target": args.http_target,
+        "udp_target": args.udp_target,
+        "tcp_echo_target": args.tcp_echo_target,
+        "failover_after_s": args.failover_after,
+        "test_duration_s": args.load_duration if args.load_duration > 0 else args.timeout,
+    }
     record.update(bulk)
     record.update(small)
     record.update(interactive)
@@ -683,6 +781,7 @@ def build_record(args, bulk, small, interactive, udp):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
+    parser.add_argument("--mode", choices=("socks5", "direct"), default="socks5")
     parser.add_argument("--proxy", default="127.0.0.1:1080")
     parser.add_argument("--http-target", required=True)
     parser.add_argument("--udp-target", required=True)

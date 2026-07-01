@@ -935,6 +935,101 @@ async fn server_mixed_binding_proven_path_waits_for_lower_frontier_owner() {
 }
 
 #[tokio::test]
+async fn server_mixed_binding_blocks_unserviceable_lower_frontier_owner() {
+    let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
+    let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
+    let binding = ServerTcpStreamBinding::new(
+        SessionId(1),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        tcp_tx,
+        FlowLane::Throughput,
+    );
+    let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        udp_tx,
+        FlowLane::Throughput,
+        StreamOpenRole::Active,
+        max_frame_payload_bytes,
+    );
+    binding.update_path_metrics_for_test(
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        test_path_metrics(PathId(0), UnderlayProtocol::Tcp, 40_000, 400_000_000),
+    );
+    binding.update_path_metrics_for_test(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        test_path_metrics(PathId(1), UnderlayProtocol::Udp, 220_000, 40_000_000),
+    );
+
+    binding
+        .send_frame(
+            StreamId(7),
+            FlowLane::Throughput,
+            Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![3u8; 64 * 1024]),
+            },
+        )
+        .await
+        .expect("send first mixed bulk frame");
+    assert!(matches!(
+        recv_tcp_path_command(&mut tcp_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ..
+        }))
+    ));
+
+    binding.update_path_metrics_for_test(
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        test_path_metrics(PathId(0), UnderlayProtocol::Tcp, 900_000, 1_000_000),
+    );
+    binding.update_path_metrics_for_test(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        test_path_metrics(PathId(1), UnderlayProtocol::Udp, 30_000, 500_000_000),
+    );
+
+    assert!(
+        !binding.can_send_stream_data_extent(FlowLane::Throughput, 64 * 1024, 64 * 1024),
+        "a stale lower-frontier owner must not keep receiving later ordinary bytes once a proven alternate is clearly better"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            binding.send_frame(
+                StreamId(7),
+                FlowLane::Throughput,
+                Frame::StreamData {
+                    stream_id: StreamId(7),
+                    offset: 64 * 1024,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from(vec![4u8; 64 * 1024]),
+                },
+            ),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut udp_rx)
+        )
+        .await
+        .is_err(),
+        "the proven alternate must wait for repair or ACK-frontier migration instead of receiving later unique bytes"
+    );
+}
+
+#[tokio::test]
 async fn server_mixed_binding_unproven_lower_frontier_waits_when_proven_path_exists() {
     let max_frame_payload_bytes = tcp_relay_buffer_len(MuxLimits::default());
     let probe_payload_bytes = (max_frame_payload_bytes / 4).max(1024);

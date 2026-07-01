@@ -1696,6 +1696,22 @@ impl ServerTcpStreamOutputs {
         let lower_flight_owner = server_oldest_lower_flight_owner(lower_flights);
         let attached_lower_flight_owner =
             lower_flight_owner.filter(|owner| self.entries.iter().any(|entry| entry.key == *owner));
+        if let Some(owner) = attached_lower_flight_owner
+            && self
+                .lower_frontier_owner_service_suppression(
+                    session_id,
+                    lane_tracker,
+                    lane,
+                    owner,
+                    payload_bytes,
+                    mux_limits,
+                    lower_flights,
+                    now,
+                )
+                .is_some()
+        {
+            return None;
+        }
         let has_sender_evidence_candidate =
             self.entries.iter().any(server_output_has_sender_evidence);
         let normal_candidates = self
@@ -1797,6 +1813,85 @@ impl ServerTcpStreamOutputs {
                 })
             })
             .min_by(|left, right| left.1.total_cmp(&right.1))
+    }
+
+    fn lower_frontier_owner_service_suppression(
+        &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        owner: ServerTcpPathKey,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+        lower_flights: &[ServerTcpPathFlightDebt],
+        now: Instant,
+    ) -> Option<&'static str> {
+        let active_key = self.entries.last().map(|entry| entry.key);
+        let owner_entry = self.entries.iter().find(|entry| entry.key == owner)?;
+        let owner_snapshot = server_bulk_output_snapshot(
+            owner_entry,
+            session_id,
+            lane,
+            lane_tracker,
+            mux_limits,
+            now,
+        );
+        let owner_eta_ms = server_bulk_output_eta_ms(
+            owner,
+            owner_snapshot,
+            active_key,
+            lane,
+            payload_bytes,
+            mux_limits,
+        );
+        let alternate = self
+            .entries
+            .iter()
+            .filter(|entry| entry.key != owner && server_output_has_sender_evidence(entry))
+            .map(|entry| {
+                let snapshot = server_bulk_output_snapshot(
+                    entry,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                    now,
+                );
+                let eta_ms = server_bulk_output_eta_ms(
+                    entry.key,
+                    snapshot,
+                    active_key,
+                    lane,
+                    payload_bytes,
+                    mux_limits,
+                );
+                (entry.key, eta_ms, snapshot)
+            })
+            .filter(|(_, eta_ms, snapshot)| {
+                bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                    best_snapshot: *snapshot,
+                    best_eta_ms: *eta_ms,
+                    candidate_snapshot: *snapshot,
+                    candidate_eta_ms: *eta_ms,
+                    payload_bytes,
+                    mux_limits,
+                    role: BulkAdmissionRole::ActiveDataPath,
+                    stream_ordering_debt_bytes: 0,
+                })
+                .is_none()
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1));
+        let (_, alternate_eta_ms, alternate_snapshot) = alternate?;
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: alternate_snapshot,
+            best_eta_ms: alternate_eta_ms,
+            candidate_snapshot: owner_snapshot,
+            candidate_eta_ms: owner_eta_ms,
+            payload_bytes,
+            mux_limits,
+            role: BulkAdmissionRole::ActiveDataPath,
+            stream_ordering_debt_bytes: server_total_lower_flight_debt_bytes(lower_flights),
+        })
     }
 
     fn validation_duplicate_for_bulk_choice(

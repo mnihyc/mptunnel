@@ -2212,6 +2212,22 @@ safe frontier switches, and repair/failover; broader same-stream striping
 requires stronger path-scoped proof that it will not increase completion time
 or ordered receive debt.
 
+Lower-frontier ownership is a correctness guard, not an unconditional
+throughput entitlement. If the path that owns the oldest lower outstanding
+range is still attached but no longer passes active-data serviceability against
+a proven alternate path in the same sender direction, the sender MUST NOT keep
+admitting later ordinary unique bytes to that stale owner merely because it
+owns the lower offset. It also MUST NOT move those later unique bytes to the
+alternate path while the lower frontier is still unresolved. Instead, it pauses
+ordinary source reads for that stream and continues servicing carrier ACKs,
+product ACKs, control frames, flow-control updates, explicit gap repair,
+duplicate validation, and path events. Ordinary data resumes when ACK progress,
+repair delivery, detach/failover, or updated path evidence produces a
+serviceable lower-frontier owner or advances the contiguous frontier. This
+rule closes the MPTCP-style failure mode where a slow or failed subflow owns
+early data and all later high-rate data either blocks behind it or deepens the
+receive hole.
+
 Lead-path admission and lead-path repair are intentionally separate
 decisions. The lead path may keep a larger product queue than additional
 paths so that a UDP controller or TCP writer is not starved by slow product

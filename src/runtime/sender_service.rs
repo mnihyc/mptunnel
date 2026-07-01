@@ -559,10 +559,6 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
-    pub(super) fn queued_send_blocked(&self, queued_send_ready: bool) -> bool {
-        !self.queue.is_empty() && !queued_send_ready
-    }
-
     pub(super) fn can_read_product_source(
         &self,
         local_open: bool,

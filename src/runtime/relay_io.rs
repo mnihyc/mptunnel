@@ -778,6 +778,7 @@ where
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut output_updates = path_stream.subscribe_output_updates();
     let mut response_sender = ServerResponseSenderService::new(session_id, stream_id);
+    let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
 
@@ -872,8 +873,14 @@ where
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
-        let queued_send_ready = response_sender.queued_send_ready();
-        let queued_send_blocked = response_sender.queued_send_blocked(queued_send_ready);
+        if response_sender_retry_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            response_sender_retry_at = None;
+        }
+        let queued_send_blocked = !response_sender.is_empty() && response_sender_retry_at.is_some();
+        let queued_send_ready = response_sender.queued_send_ready() && !queued_send_blocked;
+        let queued_send_retry_deadline =
+            response_sender_retry_at.unwrap_or_else(tokio::time::Instant::now);
         let can_read_by_flow = response_sender.can_read_product_source(
             local_open,
             queued_send_blocked,
@@ -922,7 +929,9 @@ where
                 }
                 result
             }, if remote_open || send_stream.repair_bytes() > 0 => {
-                match frame? {
+                let frame = frame?;
+                response_sender_retry_at = None;
+                match frame {
                     Frame::StreamData {
                         stream_id: received_stream_id,
                         offset,
@@ -1112,6 +1121,11 @@ where
                 }
             }, if queued_send_blocked => {
                 changed?;
+                response_sender_retry_at = None;
+                continue;
+            }
+            _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
+                response_sender_retry_at = None;
                 continue;
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
@@ -1141,7 +1155,8 @@ where
                 let dispatch = match response_sender.dispatch_next(&path_stream, &mut send_stream, relay_lane).await {
                     Ok(dispatch) => dispatch,
                     Err(RuntimeError::SenderServiceBlocked) => {
-                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                        response_sender_retry_at =
+                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
                         continue;
                     }
                     Err(err) => break Err(err),

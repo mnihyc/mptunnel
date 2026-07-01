@@ -2629,6 +2629,12 @@ turn: the implementation MUST NOT fall through to the current active path or a
 round-robin path after declaring that no safe candidate exists. The next attempt
 is made only after a normal wake event such as stream ACK release, path metric
 refresh, attachment change, repair progress, or a short scheduler retry.
+That retry is a scheduler timer, not an awaited sleep inside the ordinary-data
+send branch. While the timer is pending, the relay remains active for inbound
+carrier frames, product ACKs, stream credit, resets, detach/close, repair
+evidence, and path updates. Blocking the whole relay task behind a rejected
+ordinary-data quantum is prohibited because it delays exactly the feedback that
+can make the queued byte range admissible again.
 This remains true when only one carrier path is currently attached. If the
 oldest lower outstanding range is owned by a detached, failed, or otherwise
 non-serviceable path, the remaining carrier path is not automatically safe for

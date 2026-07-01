@@ -43,6 +43,7 @@ where
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
     let mut sender_queue = ReliableRelaySenderQueue::default();
+    let mut sender_retry_at: Option<tokio::time::Instant> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -202,8 +203,12 @@ where
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot, relay_lane),
         );
-        let queued_send_ready = !sender_queue.is_empty();
-        let queued_send_blocked = !sender_queue.is_empty() && !queued_send_ready;
+        if sender_retry_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            sender_retry_at = None;
+        }
+        let queued_send_blocked = !sender_queue.is_empty() && sender_retry_at.is_some();
+        let queued_send_ready = !sender_queue.is_empty() && !queued_send_blocked;
+        let queued_send_retry_deadline = sender_retry_at.unwrap_or_else(tokio::time::Instant::now);
         let can_read_by_flow = reliable_relay_can_read_product_source(
             local_open,
             queued_send_blocked,
@@ -558,7 +563,8 @@ where
                     }
                     Err(RuntimeError::SenderServiceBlocked) => {
                         let _ = send_stream.rollback_committed_data(&frame);
-                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                        sender_retry_at =
+                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
                         continue;
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
@@ -595,7 +601,8 @@ where
                                     }
                                     Err(RuntimeError::SenderServiceBlocked) => {
                                         let _ = send_stream.rollback_committed_data(&frame);
-                                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                                        sender_retry_at =
+                                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
                                         continue;
                                     }
                                     Err(err) if reliable_relay_error_is_migratable(&err) => {
@@ -618,7 +625,8 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT), if queued_send_blocked => {
+            _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
+                sender_retry_at = None;
                 continue;
             }
             read = async {
@@ -830,6 +838,7 @@ where
                     }
                     Err(err) => break Err(err),
                 };
+                sender_retry_at = None;
                 match frame {
                     Frame::StreamData {
                         stream_id: received_stream_id,

@@ -606,7 +606,9 @@ async fn send_sender_service_frame_to_carrier(
     frame: Frame,
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
-    let _ = lane;
+    // Sender-service dispatch must not await a path queue permit; queue-full is
+    // explicit backpressure so the owner can keep work queued and continue
+    // polling ACK/control/path feedback.
     commands.try_enqueue_admitted_frame(frame, lane)
 }
 

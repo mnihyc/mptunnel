@@ -1,9 +1,10 @@
 use super::bulk_admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
     bulk_candidate_admission_suppression, bulk_candidate_admission_suppression_with_ordering_debt,
+    bulk_service_horizon_payload_bytes,
 };
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub(super) struct TcpPathStream {
     pub(super) stream_id: StreamId,
@@ -50,6 +51,17 @@ impl TcpPathStream {
             .map(|_| ())
     }
 
+    pub(super) async fn send_repair_frame(
+        &self,
+        frame: Frame,
+    ) -> Result<Option<ServerTcpPathKey>, RuntimeError> {
+        self.output.send_repair_frame(self.stream_id, frame).await
+    }
+
+    pub(super) fn mark_repair_path_delivery_and_promote(&self, key: ServerTcpPathKey) -> bool {
+        self.output.mark_repair_path_delivery_and_promote(key)
+    }
+
     pub(super) async fn send_frame_tracked(
         &self,
         frame: Frame,
@@ -73,6 +85,32 @@ impl TcpPathStream {
 
     pub(super) fn current_lane(&self) -> FlowLane {
         self.output.current_lane(self.lane)
+    }
+
+    pub(super) fn send_path_snapshot(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Option<PathSnapshot> {
+        self.output.send_path_snapshot(lane, payload_bytes)
+    }
+
+    pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
+        self.output.set_sender_queue_bytes(bytes);
+    }
+
+    pub(super) fn can_send_stream_data_extent(
+        &self,
+        lane: FlowLane,
+        offset: u64,
+        payload_bytes: usize,
+    ) -> bool {
+        self.output
+            .can_send_stream_data_extent(lane, offset, payload_bytes)
+    }
+
+    pub(super) fn subscribe_output_updates(&self) -> Option<watch::Receiver<u64>> {
+        self.output.subscribe_updates()
     }
 
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
@@ -141,6 +179,20 @@ impl TcpPathStreamOutput {
         }
     }
 
+    pub(super) async fn send_repair_frame(
+        &self,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<Option<ServerTcpPathKey>, RuntimeError> {
+        match self {
+            Self::Fixed(commands) => {
+                commands.send_frame(frame, FlowLane::Latency).await?;
+                Ok(None)
+            }
+            Self::Switchable(binding) => binding.send_repair_frame(stream_id, frame).await,
+        }
+    }
+
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
         match self {
             Self::Fixed(commands) => {
@@ -155,10 +207,55 @@ impl TcpPathStreamOutput {
         }
     }
 
+    pub(super) fn mark_repair_path_delivery_and_promote(&self, key: ServerTcpPathKey) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.mark_repair_path_delivery_and_promote(key),
+        }
+    }
+
     pub(super) fn current_lane(&self, fallback: FlowLane) -> FlowLane {
         match self {
             Self::Fixed(_) => fallback,
             Self::Switchable(binding) => binding.lane(),
+        }
+    }
+
+    pub(super) fn send_path_snapshot(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Option<PathSnapshot> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Switchable(binding) => binding.send_path_snapshot(lane, payload_bytes),
+        }
+    }
+
+    pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
+        if let Self::Switchable(binding) = self {
+            binding.set_sender_queue_bytes(bytes);
+        }
+    }
+
+    pub(super) fn can_send_stream_data_extent(
+        &self,
+        lane: FlowLane,
+        offset: u64,
+        payload_bytes: usize,
+    ) -> bool {
+        match self {
+            Self::Fixed(_) => true,
+            Self::Switchable(binding) => {
+                binding.can_send_stream_data_extent(lane, offset, payload_bytes)
+            }
+        }
+    }
+
+    pub(super) fn subscribe_updates(&self) -> Option<watch::Receiver<u64>> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Switchable(binding) => Some(binding.subscribe_updates()),
         }
     }
 
@@ -186,6 +283,7 @@ pub(super) struct ServerTcpStreamBinding {
     session_id: SessionId,
     lane: Mutex<FlowLane>,
     mux_limits: MuxLimits,
+    lane_tracker: Arc<ServerPathLaneTracker>,
     outputs: Mutex<ServerTcpStreamOutputs>,
     flights: Mutex<BTreeMap<u64, Vec<ServerTcpPathFlight>>>,
     version: watch::Sender<u64>,
@@ -210,6 +308,7 @@ impl ServerTcpStreamBinding {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new_with_limits(
         session_id: SessionId,
         underlay: UnderlayProtocol,
@@ -218,18 +317,41 @@ impl ServerTcpStreamBinding {
         lane: FlowLane,
         mux_limits: MuxLimits,
     ) -> Arc<Self> {
+        Self::new_with_limits_and_tracker(
+            session_id,
+            underlay,
+            path_id,
+            commands,
+            lane,
+            mux_limits,
+            Arc::new(ServerPathLaneTracker::default()),
+        )
+    }
+
+    fn new_with_limits_and_tracker(
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        commands: TcpPathSessionCommandSender,
+        lane: FlowLane,
+        mux_limits: MuxLimits,
+        lane_tracker: Arc<ServerPathLaneTracker>,
+    ) -> Arc<Self> {
         let (version, _) = watch::channel(0);
+        let key = ServerTcpPathKey { underlay, path_id };
+        lane_tracker.attach(session_id, key, lane);
         Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
+            lane_tracker,
             outputs: Mutex::new(ServerTcpStreamOutputs {
                 next_index: 0,
                 entries: vec![ServerTcpStreamOutputEntry {
-                    key: ServerTcpPathKey { underlay, path_id },
+                    key,
                     commands,
                     bytes_in_flight: 0,
-                    delivery_rate_bps: None,
+                    product_queue_bytes: 0,
                     delivery_samples: 0,
                     last_delivery_at: None,
                     validation_credit_bytes: 0,
@@ -250,13 +372,20 @@ impl ServerTcpStreamBinding {
         role: StreamOpenRole,
         max_frame_payload_bytes: usize,
     ) {
-        *self.lane.lock().expect("server TCP stream lane lock") = lane;
+        let previous_lane = {
+            let mut current_lane = self.lane.lock().expect("server TCP stream lane lock");
+            let previous = *current_lane;
+            *current_lane = lane;
+            previous
+        };
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let key = ServerTcpPathKey { underlay, path_id };
         let mut was_active = false;
+        let mut already_attached = false;
         let mut entry =
             if let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) {
                 was_active = position + 1 == outputs.entries.len();
+                already_attached = true;
                 let mut entry = outputs.entries.remove(position);
                 entry.commands = commands;
                 entry
@@ -265,7 +394,7 @@ impl ServerTcpStreamBinding {
                     key,
                     commands,
                     bytes_in_flight: 0,
-                    delivery_rate_bps: None,
+                    product_queue_bytes: 0,
                     delivery_samples: 0,
                     last_delivery_at: None,
                     validation_credit_bytes: if role == StreamOpenRole::Validation {
@@ -291,8 +420,20 @@ impl ServerTcpStreamBinding {
             let insert_at = outputs.entries.len().saturating_sub(1);
             outputs.entries.insert(insert_at, entry);
         }
+        let attached_keys = outputs
+            .entries
+            .iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
         outputs.next_index %= outputs.entries.len().max(1);
         drop(outputs);
+        if previous_lane != lane {
+            self.lane_tracker
+                .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
+        }
+        if !already_attached {
+            self.lane_tracker.attach(self.session_id, key, lane);
+        }
         self.notify_update();
     }
 
@@ -300,8 +441,80 @@ impl ServerTcpStreamBinding {
         *self.lane.lock().expect("server TCP stream lane lock")
     }
 
+    pub(super) fn subscribe_updates(&self) -> watch::Receiver<u64> {
+        self.version.subscribe()
+    }
+
+    pub(super) fn send_path_snapshot(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Option<PathSnapshot> {
+        let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        outputs.read_backpressure_snapshot(
+            self.session_id,
+            &self.lane_tracker,
+            lane,
+            payload_bytes,
+            self.mux_limits,
+        )
+    }
+
+    fn set_sender_queue_bytes(&self, bytes: usize) {
+        let bytes = bytes as u64;
+        let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        let mut changed = false;
+        for entry in &mut outputs.entries {
+            if entry.product_queue_bytes != bytes {
+                entry.product_queue_bytes = bytes;
+                changed = true;
+            }
+        }
+        drop(outputs);
+        if changed {
+            self.notify_update();
+        }
+    }
+
+    pub(super) fn can_send_stream_data_extent(
+        &self,
+        lane: FlowLane,
+        offset: u64,
+        payload_bytes: usize,
+    ) -> bool {
+        if !relay_lane_is_bulk(lane) || payload_bytes == 0 {
+            return true;
+        }
+        let lower_flights = self.lower_flights_before_offset(offset);
+        let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        outputs.bulk_send_ready(
+            self.session_id,
+            &self.lane_tracker,
+            lane,
+            payload_bytes,
+            self.mux_limits,
+            &lower_flights,
+        )
+    }
+
     pub(super) fn set_lane(&self, lane: FlowLane) {
-        *self.lane.lock().expect("server TCP stream lane lock") = lane;
+        let previous_lane = {
+            let mut current_lane = self.lane.lock().expect("server TCP stream lane lock");
+            let previous = *current_lane;
+            *current_lane = lane;
+            previous
+        };
+        if previous_lane != lane {
+            let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+            let attached_keys = outputs
+                .entries
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>();
+            drop(outputs);
+            self.lane_tracker
+                .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
+        }
         self.notify_update();
     }
 
@@ -315,6 +528,7 @@ impl ServerTcpStreamBinding {
     }
 
     fn detach(&self, key: ServerTcpPathKey, commands: &TcpPathSessionCommandSender) {
+        let lane = self.lane();
         let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
         let before = outputs.entries.len();
         outputs
@@ -323,8 +537,30 @@ impl ServerTcpStreamBinding {
         if outputs.entries.len() != before {
             outputs.next_index %= outputs.entries.len().max(1);
             drop(outputs);
+            self.lane_tracker.detach(self.session_id, key, lane);
             self.notify_update();
         }
+    }
+
+    fn mark_repair_path_delivery_and_promote(&self, key: ServerTcpPathKey) -> bool {
+        let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) else {
+            return false;
+        };
+        let was_active = position + 1 == outputs.entries.len();
+        let now = Instant::now();
+        outputs.entries[position].delivery_samples =
+            outputs.entries[position].delivery_samples.saturating_add(1);
+        outputs.entries[position].last_delivery_at = Some(now);
+        outputs.entries[position].validation_credit_bytes = 0;
+        if !was_active {
+            let entry = outputs.entries.remove(position);
+            outputs.entries.push(entry);
+            outputs.next_index %= outputs.entries.len().max(1);
+        }
+        drop(outputs);
+        self.notify_update();
+        !was_active
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -349,6 +585,9 @@ impl ServerTcpStreamBinding {
                 } else if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
                     outputs
                         .bulk_commands(
+                            self.session_id,
+                            &self.lane_tracker,
+                            stream_lane,
                             reliable_stream_frame_payload_bytes(&frame),
                             self.mux_limits,
                             &lower_flights,
@@ -436,6 +675,67 @@ impl ServerTcpStreamBinding {
         }
     }
 
+    pub(super) async fn send_repair_frame(
+        &self,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<Option<ServerTcpPathKey>, RuntimeError> {
+        let mut updates = self.version.subscribe();
+        loop {
+            let avoid_keys = self.flight_keys_overlapping_frame(&frame);
+            let selected = {
+                let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+                outputs.repair_commands(
+                    self.session_id,
+                    &self.lane_tracker,
+                    &avoid_keys,
+                    reliable_stream_frame_payload_bytes(&frame),
+                    self.mux_limits,
+                )
+            };
+            if let Some(target) = selected {
+                tokio::select! {
+                    result = target.commands.send_frame(frame.clone(), FlowLane::Latency) => {
+                        match result {
+                            Ok(()) => {
+                                self.record_flight(target.key, &frame, false);
+                                record_server_sender_decision(
+                                    self.session_id,
+                                    stream_id,
+                                    target.key,
+                                    &frame,
+                                    FlowLane::Latency,
+                                    "tail_repair",
+                                );
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "repair",
+                                    format_args!(
+                                        "stream_id={} path_underlay={:?} path_id={} cause=tail_stall avoided_paths={}",
+                                        stream_id.0,
+                                        target.key.underlay,
+                                        target.key.path_id.0,
+                                        avoid_keys.len(),
+                                    ),
+                                );
+                                return Ok(Some(target.key));
+                            }
+                            Err(_) => self.detach(target.key, &target.commands),
+                        }
+                    }
+                    changed = updates.changed() => {
+                        changed.map_err(|_| RuntimeError::TcpPathSessionClosed)?;
+                    }
+                }
+            } else {
+                updates
+                    .changed()
+                    .await
+                    .map_err(|_| RuntimeError::TcpPathSessionClosed)?;
+            }
+        }
+    }
+
     pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
         if ranges.is_empty() {
             return;
@@ -478,14 +778,6 @@ impl ServerTcpStreamBinding {
                 if flight.stream_ack_proves_path {
                     entry.delivery_samples = entry.delivery_samples.saturating_add(1);
                     entry.last_delivery_at = Some(now);
-                    let elapsed = now.saturating_duration_since(flight.sent_at).as_secs_f64();
-                    if elapsed > f64::EPSILON {
-                        let sample = flight.bytes as f64 * 8.0 / elapsed;
-                        entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
-                            Some(previous) => previous.mul_add(0.75, sample * 0.25),
-                            None => sample,
-                        });
-                    }
                 }
                 changed = true;
             }
@@ -517,7 +809,6 @@ impl ServerTcpStreamBinding {
                 key,
                 end,
                 bytes,
-                sent_at: Instant::now(),
                 stream_ack_proves_path,
             });
     }
@@ -526,6 +817,27 @@ impl ServerTcpStreamBinding {
         let Some((offset, _, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
+        self.lower_flights_before_offset(offset)
+    }
+
+    fn flight_keys_overlapping_frame(&self, frame: &Frame) -> Vec<ServerTcpPathKey> {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return Vec::new();
+        };
+        let flights = self.flights.lock().expect("server TCP stream flight lock");
+        let mut keys = Vec::new();
+        for (_, path_flights) in flights.range(..end) {
+            for flight in path_flights {
+                if flight.end <= start || keys.contains(&flight.key) {
+                    continue;
+                }
+                keys.push(flight.key);
+            }
+        }
+        keys
+    }
+
+    fn lower_flights_before_offset(&self, offset: u64) -> Vec<ServerTcpPathFlightDebt> {
         let flights = self.flights.lock().expect("server TCP stream flight lock");
         flights
             .range(..offset)
@@ -540,6 +852,7 @@ impl ServerTcpStreamBinding {
     }
 
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
+        let lane = self.lane();
         let outputs = self
             .outputs
             .lock()
@@ -551,6 +864,7 @@ impl ServerTcpStreamBinding {
                 .commands
                 .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                 .await;
+            self.lane_tracker.detach(self.session_id, entry.key, lane);
         }
     }
 
@@ -606,6 +920,93 @@ impl ServerTcpStreamBinding {
             ServerPathMetricsSource::PeerHint,
         );
     }
+
+    #[cfg(test)]
+    pub(super) fn output_snapshot_for_test(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> Option<PathSnapshot> {
+        let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == ServerTcpPathKey { underlay, path_id })
+            .map(|entry| {
+                server_bulk_output_snapshot(
+                    entry,
+                    self.session_id,
+                    FlowLane::Throughput,
+                    &self.lane_tracker,
+                    self.mux_limits,
+                    Instant::now(),
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn bulk_choice_key_for_test(
+        &self,
+        payload_bytes: usize,
+    ) -> Option<ServerTcpPathKey> {
+        let mut outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        outputs
+            .bulk_commands(
+                self.session_id,
+                &self.lane_tracker,
+                FlowLane::Throughput,
+                payload_bytes,
+                self.mux_limits,
+                &[],
+            )
+            .map(|choice| choice.primary.key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn output_has_sender_evidence_for_test(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> bool {
+        let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == ServerTcpPathKey { underlay, path_id })
+            .is_some_and(server_output_has_sender_evidence)
+    }
+
+    #[cfg(test)]
+    pub(super) fn output_eta_ms_for_test(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        payload_bytes: usize,
+    ) -> Option<f64> {
+        let outputs = self.outputs.lock().expect("server TCP stream binding lock");
+        let active_key = outputs.entries.last().map(|entry| entry.key);
+        outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == ServerTcpPathKey { underlay, path_id })
+            .map(|entry| {
+                server_bulk_output_eta_ms(
+                    entry.key,
+                    server_bulk_output_snapshot(
+                        entry,
+                        self.session_id,
+                        FlowLane::Throughput,
+                        &self.lane_tracker,
+                        self.mux_limits,
+                        Instant::now(),
+                    ),
+                    active_key,
+                    FlowLane::Throughput,
+                    payload_bytes,
+                    self.mux_limits,
+                )
+            })
+    }
 }
 
 fn server_frame_prefers_current_data_path(frame: &Frame, lane: FlowLane) -> bool {
@@ -622,12 +1023,100 @@ pub(super) struct ServerTcpPathKey {
     pub(super) path_id: PathId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ServerPathLoadKey {
+    session_id: SessionId,
+    path: ServerTcpPathKey,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ServerPathLaneLoad {
+    active_flows: u32,
+    active_latency_sensitive_flows: u32,
+}
+
+impl ServerPathLaneLoad {
+    fn add(&mut self, lane: FlowLane) {
+        self.active_flows = self.active_flows.saturating_add(1);
+        if tcp_relay_expects_interactive_response(lane) {
+            self.active_latency_sensitive_flows =
+                self.active_latency_sensitive_flows.saturating_add(1);
+        }
+    }
+
+    fn remove(&mut self, lane: FlowLane) {
+        self.active_flows = self.active_flows.saturating_sub(1);
+        if tcp_relay_expects_interactive_response(lane) {
+            self.active_latency_sensitive_flows =
+                self.active_latency_sensitive_flows.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ServerPathLaneTracker {
+    loads: Mutex<HashMap<ServerPathLoadKey, ServerPathLaneLoad>>,
+}
+
+impl ServerPathLaneTracker {
+    fn attach(&self, session_id: SessionId, path: ServerTcpPathKey, lane: FlowLane) {
+        self.loads
+            .lock()
+            .expect("server path lane tracker lock")
+            .entry(ServerPathLoadKey { session_id, path })
+            .or_default()
+            .add(lane);
+    }
+
+    fn detach(&self, session_id: SessionId, path: ServerTcpPathKey, lane: FlowLane) {
+        let mut loads = self.loads.lock().expect("server path lane tracker lock");
+        let key = ServerPathLoadKey { session_id, path };
+        if let Some(load) = loads.get_mut(&key) {
+            load.remove(lane);
+            if load.active_flows == 0 {
+                loads.remove(&key);
+            }
+        }
+    }
+
+    fn change_lanes(
+        &self,
+        session_id: SessionId,
+        paths: &[ServerTcpPathKey],
+        from: FlowLane,
+        to: FlowLane,
+    ) {
+        if from == to {
+            return;
+        }
+        let mut loads = self.loads.lock().expect("server path lane tracker lock");
+        for path in paths {
+            if let Some(load) = loads.get_mut(&ServerPathLoadKey {
+                session_id,
+                path: *path,
+            }) {
+                load.remove(from);
+                load.add(to);
+            }
+        }
+    }
+
+    fn snapshot(&self, session_id: SessionId, path: ServerTcpPathKey) -> ServerPathLaneLoad {
+        self.loads
+            .lock()
+            .expect("server path lane tracker lock")
+            .get(&ServerPathLoadKey { session_id, path })
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone)]
 struct ServerTcpStreamOutputEntry {
     key: ServerTcpPathKey,
     commands: TcpPathSessionCommandSender,
     bytes_in_flight: u64,
-    delivery_rate_bps: Option<f64>,
+    product_queue_bytes: u64,
     delivery_samples: u32,
     last_delivery_at: Option<Instant>,
     validation_credit_bytes: u64,
@@ -644,7 +1133,6 @@ struct ServerTcpPathFlight {
     key: ServerTcpPathKey,
     end: u64,
     bytes: usize,
-    sent_at: Instant,
     stream_ack_proves_path: bool,
 }
 
@@ -662,6 +1150,74 @@ fn server_stream_ordering_debt_bytes(
         .iter()
         .filter_map(|flight| (flight.key != candidate).then_some(flight.bytes))
         .sum()
+}
+
+fn server_total_lower_flight_debt_bytes(lower_flights: &[ServerTcpPathFlightDebt]) -> u64 {
+    lower_flights.iter().map(|flight| flight.bytes).sum()
+}
+
+fn server_admission_ordering_debt_bytes(
+    lower_flights: &[ServerTcpPathFlightDebt],
+    candidate: ServerTcpPathKey,
+    role: BulkAdmissionRole,
+) -> u64 {
+    if role == BulkAdmissionRole::ActiveDataPath {
+        server_total_lower_flight_debt_bytes(lower_flights)
+    } else {
+        server_stream_ordering_debt_bytes(lower_flights, candidate)
+    }
+}
+
+fn server_oldest_lower_flight_owner(
+    lower_flights: &[ServerTcpPathFlightDebt],
+) -> Option<ServerTcpPathKey> {
+    lower_flights.first().map(|flight| flight.key)
+}
+
+fn server_bulk_admission_role(
+    lead_key: ServerTcpPathKey,
+    candidate: ServerTcpPathKey,
+    lower_flight_owner: Option<ServerTcpPathKey>,
+    ordering_debt: u64,
+) -> BulkAdmissionRole {
+    if lower_flight_owner == Some(candidate) || (candidate == lead_key && ordering_debt == 0) {
+        BulkAdmissionRole::ActiveDataPath
+    } else if let Some(owner) = lower_flight_owner {
+        bulk_additional_admission_role(owner.underlay, candidate.underlay)
+    } else {
+        bulk_additional_admission_role(lead_key.underlay, candidate.underlay)
+    }
+}
+
+fn server_bulk_lead_candidate_suppression(
+    key: ServerTcpPathKey,
+    snapshot: PathSnapshot,
+    eta_ms: f64,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[ServerTcpPathFlightDebt],
+) -> Option<&'static str> {
+    let lower_flight_owner = server_oldest_lower_flight_owner(lower_flights);
+    let role = if lower_flight_owner.is_none() || lower_flight_owner == Some(key) {
+        BulkAdmissionRole::ActiveDataPath
+    } else {
+        bulk_additional_admission_role(lower_flight_owner.expect("checked").underlay, key.underlay)
+    };
+    let ordering_debt = if role == BulkAdmissionRole::ActiveDataPath {
+        server_total_lower_flight_debt_bytes(lower_flights)
+    } else {
+        server_stream_ordering_debt_bytes(lower_flights, key)
+    };
+    bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+        best_snapshot: snapshot,
+        best_eta_ms: eta_ms,
+        candidate_snapshot: snapshot,
+        candidate_eta_ms: eta_ms,
+        payload_bytes,
+        mux_limits,
+        role,
+        stream_ordering_debt_bytes: ordering_debt,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,6 +1249,49 @@ enum ServerTcpPathSendChoice {
 }
 
 impl ServerTcpStreamOutputs {
+    fn read_backpressure_snapshot(
+        &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> Option<PathSnapshot> {
+        let now = Instant::now();
+        if !relay_lane_is_bulk(lane) {
+            return self.entries.last().map(|entry| {
+                server_bulk_output_snapshot(entry, session_id, lane, lane_tracker, mux_limits, now)
+            });
+        }
+        let active_key = self.entries.last().map(|entry| entry.key);
+        self.entries
+            .iter()
+            .filter(|entry| {
+                Some(entry.key) == active_key || server_output_has_sender_evidence(entry)
+            })
+            .map(|entry| {
+                let snapshot = server_bulk_output_snapshot(
+                    entry,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                    now,
+                );
+                let eta_ms = server_bulk_output_eta_ms(
+                    entry.key,
+                    snapshot,
+                    active_key,
+                    lane,
+                    payload_bytes,
+                    mux_limits,
+                );
+                (eta_ms, snapshot)
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, snapshot)| snapshot)
+    }
+
     fn next_commands(&mut self) -> Option<ServerTcpPathSendTarget> {
         if self.entries.is_empty() {
             return None;
@@ -716,54 +1315,249 @@ impl ServerTcpStreamOutputs {
             })
     }
 
+    fn repair_commands(
+        &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        avoid_keys: &[ServerTcpPathKey],
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> Option<ServerTcpPathSendTarget> {
+        let now = Instant::now();
+        let active_key = self.entries.last().map(|entry| entry.key);
+        let choose = |prefer_avoiding: bool| {
+            self.entries
+                .iter()
+                .filter(|entry| !prefer_avoiding || !avoid_keys.contains(&entry.key))
+                .map(|entry| {
+                    let snapshot = server_bulk_output_snapshot(
+                        entry,
+                        session_id,
+                        FlowLane::Latency,
+                        lane_tracker,
+                        mux_limits,
+                        now,
+                    );
+                    let eta_ms = server_bulk_output_eta_ms(
+                        entry.key,
+                        snapshot,
+                        active_key,
+                        FlowLane::Latency,
+                        payload_bytes,
+                        mux_limits,
+                    );
+                    (eta_ms, entry)
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0))
+                .map(|(_, entry)| ServerTcpPathSendTarget {
+                    key: entry.key,
+                    commands: entry.commands.clone(),
+                })
+        };
+        choose(true).or_else(|| choose(false))
+    }
+
+    fn bulk_send_ready(
+        &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+        lower_flights: &[ServerTcpPathFlightDebt],
+    ) -> bool {
+        self.select_bulk_output(
+            session_id,
+            lane_tracker,
+            lane,
+            payload_bytes,
+            mux_limits,
+            lower_flights,
+            Instant::now(),
+        )
+        .is_some()
+    }
+
     fn bulk_commands(
         &mut self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
         payload_bytes: usize,
         mux_limits: MuxLimits,
         lower_flights: &[ServerTcpPathFlightDebt],
     ) -> Option<ServerTcpPathBulkChoice> {
-        let active_key = self.entries.last().map(|entry| entry.key);
         let now = Instant::now();
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            let active_key = self.entries.last().map(|entry| entry.key);
+            let lead_candidate = self.bulk_lead_candidate(
+                session_id,
+                lane_tracker,
+                lane,
+                payload_bytes,
+                mux_limits,
+                now,
+                active_key,
+                lower_flights,
+            );
+            self.log_bulk_candidates(
+                session_id,
+                lane_tracker,
+                lane,
+                active_key,
+                lead_candidate,
+                payload_bytes,
+                mux_limits,
+                now,
+                lower_flights,
+            );
+        }
+        let (position, primary_eta_ms, primary_snapshot) = self.select_bulk_output(
+            session_id,
+            lane_tracker,
+            lane,
+            payload_bytes,
+            mux_limits,
+            lower_flights,
+            now,
+        )?;
+        let entry = self.entries[position].clone();
+        #[cfg(feature = "lab-diagnostics")]
+        let snapshot =
+            server_bulk_output_snapshot(&entry, session_id, lane, lane_tracker, mux_limits, now);
+        self.next_index = (position + 1) % self.entries.len().max(1);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "server_bulk_output_selected",
+            format_args!(
+                "path_underlay={:?} path_id={} reason=admitted payload_bytes={} scoring_payload_bytes={} delivery_samples={} validation_credit_bytes={} product_bytes_in_flight={} carrier_bytes_in_flight={} queue_bytes={} inflight_limit={} active_flows={} active_latency_sensitive_flows={}",
+                entry.key.underlay,
+                entry.key.path_id.0,
+                payload_bytes,
+                bulk_service_horizon_payload_bytes(payload_bytes, mux_limits),
+                entry.delivery_samples,
+                entry.validation_credit_bytes,
+                entry.bytes_in_flight,
+                snapshot.bytes_in_flight,
+                snapshot.queue_bytes,
+                snapshot.inflight_limit_bytes,
+                snapshot.active_flows,
+                snapshot.active_latency_sensitive_flows,
+            ),
+        );
+        let validation_duplicate = self.validation_duplicate_for_bulk_choice(
+            &entry,
+            session_id,
+            lane_tracker,
+            lane,
+            primary_eta_ms,
+            primary_snapshot,
+            payload_bytes,
+            mux_limits,
+            lower_flights,
+            now,
+        );
+        Some(ServerTcpPathBulkChoice {
+            primary: ServerTcpPathSendTarget {
+                key: entry.key,
+                commands: entry.commands,
+            },
+            validation_duplicate,
+        })
+    }
+
+    fn select_bulk_output(
+        &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+        lower_flights: &[ServerTcpPathFlightDebt],
+        now: Instant,
+    ) -> Option<(usize, f64, PathSnapshot)> {
+        let active_key = self.entries.last().map(|entry| entry.key);
+        let lower_flight_owner = server_oldest_lower_flight_owner(lower_flights);
+        let attached_lower_flight_owner =
+            lower_flight_owner.filter(|owner| self.entries.iter().any(|entry| entry.key == *owner));
+        let has_sender_evidence_candidate =
+            self.entries.iter().any(server_output_has_sender_evidence);
         let normal_candidates = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                Some(entry.key) == active_key || server_output_has_sender_evidence(entry)
+                server_output_can_carry_primary_bulk(
+                    entry,
+                    active_key,
+                    payload_bytes,
+                    lower_flights,
+                    attached_lower_flight_owner,
+                    has_sender_evidence_candidate,
+                )
             })
             .map(|(position, entry)| {
-                let snapshot = server_bulk_output_snapshot(entry, mux_limits, now);
-                let eta_ms =
-                    server_bulk_output_eta_ms(entry.key, snapshot, active_key, payload_bytes);
+                let snapshot = server_bulk_output_snapshot(
+                    entry,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                    now,
+                );
+                let eta_ms = server_bulk_output_eta_ms(
+                    entry.key,
+                    snapshot,
+                    active_key,
+                    lane,
+                    payload_bytes,
+                    mux_limits,
+                );
                 (position, eta_ms, snapshot)
             })
             .collect::<Vec<_>>();
         let lead_candidate = normal_candidates
             .iter()
+            .filter(|(position, eta_ms, snapshot)| {
+                let key = self.entries[*position].key;
+                server_bulk_lead_candidate_suppression(
+                    key,
+                    *snapshot,
+                    *eta_ms,
+                    payload_bytes,
+                    mux_limits,
+                    lower_flights,
+                )
+                .is_none()
+            })
             .min_by(|left, right| left.1.total_cmp(&right.1))
             .map(|(position, eta_ms, snapshot)| (self.entries[*position].key, *eta_ms, *snapshot));
-        #[cfg(feature = "lab-diagnostics")]
-        self.log_bulk_candidates(
-            active_key,
-            lead_candidate,
-            payload_bytes,
-            mux_limits,
-            now,
-            lower_flights,
-        );
-        let (position, primary_eta_ms, primary_snapshot) = normal_candidates
+        normal_candidates
             .into_iter()
             .filter(|(position, eta_ms, snapshot)| {
                 lead_candidate.is_some_and(|(lead_key, best_eta_ms, best_snapshot)| {
                     let key = self.entries[*position].key;
-                    let role = if key == lead_key {
-                        BulkAdmissionRole::ActiveDataPath
-                    } else {
-                        bulk_additional_admission_role(lead_key.underlay, key.underlay)
-                    };
+                    let cross_path_ordering_debt =
+                        server_stream_ordering_debt_bytes(lower_flights, key);
+                    let owns_lower_frontier = lower_flight_owner == Some(key);
+                    let role = server_bulk_admission_role(
+                        lead_key,
+                        key,
+                        lower_flight_owner,
+                        cross_path_ordering_debt,
+                    );
+                    let admission_ordering_debt =
+                        server_admission_ordering_debt_bytes(lower_flights, key, role);
+                    let (baseline_snapshot, baseline_eta_ms) =
+                        if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
+                            (*snapshot, *eta_ms)
+                        } else {
+                            (best_snapshot, best_eta_ms)
+                        };
                     bulk_candidate_admission_suppression(
-                        best_snapshot,
-                        best_eta_ms,
+                        baseline_snapshot,
+                        baseline_eta_ms,
                         *snapshot,
                         *eta_ms,
                         payload_bytes,
@@ -771,48 +1565,41 @@ impl ServerTcpStreamOutputs {
                         role,
                     )
                     .or_else(|| {
-                        let ordering_debt = server_stream_ordering_debt_bytes(
-                            lower_flights,
-                            self.entries[*position].key,
-                        );
                         bulk_candidate_admission_suppression_with_ordering_debt(
                             BulkAdmissionCheck {
-                                best_snapshot,
-                                best_eta_ms,
+                                best_snapshot: baseline_snapshot,
+                                best_eta_ms: baseline_eta_ms,
                                 candidate_snapshot: *snapshot,
                                 candidate_eta_ms: *eta_ms,
                                 payload_bytes,
                                 mux_limits,
                                 role,
-                                stream_ordering_debt_bytes: ordering_debt,
+                                stream_ordering_debt_bytes: admission_ordering_debt,
                             },
                         )
                     })
                     .is_none()
                 })
             })
-            .min_by(|left, right| left.1.total_cmp(&right.1))?;
-        let entry = self.entries[position].clone();
-        #[cfg(feature = "lab-diagnostics")]
-        let snapshot = server_bulk_output_snapshot(&entry, mux_limits, now);
-        self.next_index = (position + 1) % self.entries.len().max(1);
-        #[cfg(feature = "lab-diagnostics")]
-        lab_diagnostic(
-            "server_bulk_output_selected",
-            format_args!(
-                "path_underlay={:?} path_id={} reason=admitted payload_bytes={} delivery_samples={} validation_credit_bytes={} product_bytes_in_flight={} carrier_bytes_in_flight={} queue_bytes={} inflight_limit={}",
-                entry.key.underlay,
-                entry.key.path_id.0,
-                payload_bytes,
-                entry.delivery_samples,
-                entry.validation_credit_bytes,
-                entry.bytes_in_flight,
-                snapshot.bytes_in_flight,
-                snapshot.queue_bytes,
-                snapshot.inflight_limit_bytes,
-            ),
-        );
-        let validation_duplicate = self
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+    }
+
+    fn validation_duplicate_for_bulk_choice(
+        &self,
+        entry: &ServerTcpStreamOutputEntry,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        primary_eta_ms: f64,
+        primary_snapshot: PathSnapshot,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+        lower_flights: &[ServerTcpPathFlightDebt],
+        now: Instant,
+    ) -> Option<ServerTcpPathSendTarget> {
+        let active_key = self.entries.last().map(|entry| entry.key);
+        let lower_flight_owner = server_oldest_lower_flight_owner(lower_flights);
+        self
             .entries
             .iter()
             .enumerate()
@@ -823,8 +1610,14 @@ impl ServerTcpStreamOutputs {
                     && validation.validation_credit_bytes >= payload_bytes as u64
             })
             .map(|(validation_position, validation)| {
-                let validation_snapshot =
-                    server_bulk_output_snapshot(validation, mux_limits, now);
+                let validation_snapshot = server_bulk_output_snapshot(
+                    validation,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                    now,
+                );
                 (
                     validation_position,
                     validation.key,
@@ -832,37 +1625,51 @@ impl ServerTcpStreamOutputs {
                         validation.key,
                         validation_snapshot,
                         active_key,
+                        lane,
                         payload_bytes,
+                        mux_limits,
                     ),
                     validation_snapshot,
                 )
             })
             .filter(|(_, validation_key, validation_eta_ms, validation_snapshot)| {
+                let cross_path_ordering_debt =
+                    server_stream_ordering_debt_bytes(lower_flights, *validation_key);
+                let owns_lower_frontier = lower_flight_owner == Some(*validation_key);
+                let role = server_bulk_admission_role(
+                    entry.key,
+                    *validation_key,
+                    lower_flight_owner,
+                    cross_path_ordering_debt,
+                );
+                let admission_ordering_debt =
+                    server_admission_ordering_debt_bytes(lower_flights, *validation_key, role);
+                let (baseline_snapshot, baseline_eta_ms) =
+                    if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
+                        (*validation_snapshot, *validation_eta_ms)
+                    } else {
+                        (primary_snapshot, primary_eta_ms)
+                    };
                 bulk_candidate_admission_suppression(
-                    primary_snapshot,
-                    primary_eta_ms,
+                    baseline_snapshot,
+                    baseline_eta_ms,
                     *validation_snapshot,
                     *validation_eta_ms,
                     payload_bytes,
                     mux_limits,
-                    bulk_additional_admission_role(entry.key.underlay, validation_key.underlay),
+                    role,
                 )
                 .or_else(|| {
-                    let ordering_debt =
-                        server_stream_ordering_debt_bytes(lower_flights, *validation_key);
                     bulk_candidate_admission_suppression_with_ordering_debt(
                         BulkAdmissionCheck {
-                            best_snapshot: primary_snapshot,
-                            best_eta_ms: primary_eta_ms,
+                            best_snapshot: baseline_snapshot,
+                            best_eta_ms: baseline_eta_ms,
                             candidate_snapshot: *validation_snapshot,
                             candidate_eta_ms: *validation_eta_ms,
                             payload_bytes,
                             mux_limits,
-                            role: bulk_additional_admission_role(
-                                entry.key.underlay,
-                                validation_key.underlay,
-                            ),
-                            stream_ordering_debt_bytes: ordering_debt,
+                            role,
+                            stream_ordering_debt_bytes: admission_ordering_debt,
                         },
                     )
                 })
@@ -873,21 +1680,30 @@ impl ServerTcpStreamOutputs {
                 let validation = self.entries[validation_position].clone();
                 #[cfg(feature = "lab-diagnostics")]
                 {
-                    let validation_snapshot =
-                        server_bulk_output_snapshot(&validation, mux_limits, now);
+                    let validation_snapshot = server_bulk_output_snapshot(
+                        &validation,
+                        session_id,
+                        lane,
+                        lane_tracker,
+                        mux_limits,
+                        now,
+                    );
                     lab_diagnostic(
                         "server_bulk_output_selected",
                         format_args!(
-                            "path_underlay={:?} path_id={} reason=validation_duplicate payload_bytes={} delivery_samples={} validation_credit_bytes={} product_bytes_in_flight={} carrier_bytes_in_flight={} queue_bytes={} inflight_limit={}",
+                            "path_underlay={:?} path_id={} reason=validation_duplicate payload_bytes={} scoring_payload_bytes={} delivery_samples={} validation_credit_bytes={} product_bytes_in_flight={} carrier_bytes_in_flight={} queue_bytes={} inflight_limit={} active_flows={} active_latency_sensitive_flows={}",
                             validation.key.underlay,
                             validation.key.path_id.0,
                             payload_bytes,
+                            bulk_service_horizon_payload_bytes(payload_bytes, mux_limits),
                             validation.delivery_samples,
                             validation.validation_credit_bytes,
                             validation.bytes_in_flight,
                             validation_snapshot.bytes_in_flight,
                             validation_snapshot.queue_bytes,
                             validation_snapshot.inflight_limit_bytes,
+                            validation_snapshot.active_flows,
+                            validation_snapshot.active_latency_sensitive_flows,
                         ),
                     );
                 }
@@ -895,19 +1711,76 @@ impl ServerTcpStreamOutputs {
                     key: validation.key,
                     commands: validation.commands,
                 }
-            });
-        Some(ServerTcpPathBulkChoice {
-            primary: ServerTcpPathSendTarget {
-                key: entry.key,
-                commands: entry.commands,
-            },
-            validation_duplicate,
-        })
+            })
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    fn bulk_lead_candidate(
+        &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+        now: Instant,
+        active_key: Option<ServerTcpPathKey>,
+        lower_flights: &[ServerTcpPathFlightDebt],
+    ) -> Option<(ServerTcpPathKey, f64, PathSnapshot)> {
+        let has_sender_evidence_candidate =
+            self.entries.iter().any(server_output_has_sender_evidence);
+        let attached_lower_flight_owner = server_oldest_lower_flight_owner(lower_flights)
+            .filter(|owner| self.entries.iter().any(|entry| entry.key == *owner));
+        self.entries
+            .iter()
+            .filter(|entry| {
+                server_output_can_carry_primary_bulk(
+                    entry,
+                    active_key,
+                    payload_bytes,
+                    lower_flights,
+                    attached_lower_flight_owner,
+                    has_sender_evidence_candidate,
+                )
+            })
+            .map(|entry| {
+                let snapshot = server_bulk_output_snapshot(
+                    entry,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                    now,
+                );
+                let eta_ms = server_bulk_output_eta_ms(
+                    entry.key,
+                    snapshot,
+                    active_key,
+                    lane,
+                    payload_bytes,
+                    mux_limits,
+                );
+                (entry.key, eta_ms, snapshot)
+            })
+            .filter(|(key, eta_ms, snapshot)| {
+                server_bulk_lead_candidate_suppression(
+                    *key,
+                    *snapshot,
+                    *eta_ms,
+                    payload_bytes,
+                    mux_limits,
+                    lower_flights,
+                )
+                .is_none()
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
     }
 
     #[cfg(feature = "lab-diagnostics")]
     fn log_bulk_candidates(
         &self,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
         active_key: Option<ServerTcpPathKey>,
         lead_candidate: Option<(ServerTcpPathKey, f64, PathSnapshot)>,
         payload_bytes: usize,
@@ -915,34 +1788,79 @@ impl ServerTcpStreamOutputs {
         now: Instant,
         lower_flights: &[ServerTcpPathFlightDebt],
     ) {
+        let attached_lower_flight_owner = server_oldest_lower_flight_owner(lower_flights)
+            .filter(|owner| self.entries.iter().any(|entry| entry.key == *owner));
         for entry in &self.entries {
-            let snapshot = server_bulk_output_snapshot(entry, mux_limits, now);
-            let eta_ms = server_bulk_output_eta_ms(entry.key, snapshot, active_key, payload_bytes);
-            let reason = if entry.validation_credit_bytes < payload_bytes as u64
-                && Some(entry.key) != active_key
+            let snapshot =
+                server_bulk_output_snapshot(entry, session_id, lane, lane_tracker, mux_limits, now);
+            let eta_ms = server_bulk_output_eta_ms(
+                entry.key,
+                snapshot,
+                active_key,
+                lane,
+                payload_bytes,
+                mux_limits,
+            );
+            let validation_ordering_debt =
+                server_stream_ordering_debt_bytes(lower_flights, entry.key);
+            let has_sender_evidence_candidate =
+                self.entries.iter().any(server_output_has_sender_evidence);
+            let reason = if Some(entry.key) != active_key
+                && attached_lower_flight_owner.is_some_and(|owner| owner != entry.key)
+            {
+                "waiting_for_lower_frontier_owner"
+            } else if Some(entry.key) != active_key
                 && !server_output_has_sender_evidence(entry)
+                && !server_output_has_primary_validation_credit(entry, payload_bytes)
             {
                 "validation_credit_exhausted"
+            } else if Some(entry.key) != active_key
+                && !server_output_has_sender_evidence(entry)
+                && has_sender_evidence_candidate
+            {
+                "validation_without_sender_evidence"
+            } else if Some(entry.key) != active_key
+                && !server_output_has_sender_evidence(entry)
+                && validation_ordering_debt > 0
+            {
+                "validation_would_expand_ordering_debt"
             } else if let Some((lead_key, best_eta_ms, best_snapshot)) = lead_candidate {
-                let role = if entry.key == lead_key {
-                    BulkAdmissionRole::ActiveDataPath
-                } else {
-                    bulk_additional_admission_role(lead_key.underlay, entry.key.underlay)
-                };
-                let ordering_debt = server_stream_ordering_debt_bytes(lower_flights, entry.key);
+                let cross_path_ordering_debt =
+                    server_stream_ordering_debt_bytes(lower_flights, entry.key);
+                let role = server_bulk_admission_role(
+                    lead_key,
+                    entry.key,
+                    server_oldest_lower_flight_owner(lower_flights),
+                    cross_path_ordering_debt,
+                );
+                let admission_ordering_debt =
+                    server_admission_ordering_debt_bytes(lower_flights, entry.key, role);
+                let owns_lower_frontier =
+                    server_oldest_lower_flight_owner(lower_flights) == Some(entry.key);
+                let (baseline_snapshot, baseline_eta_ms) =
+                    if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
+                        (snapshot, eta_ms)
+                    } else {
+                        (best_snapshot, best_eta_ms)
+                    };
                 if let Some(suppression) =
                     bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-                        best_snapshot,
-                        best_eta_ms,
+                        best_snapshot: baseline_snapshot,
+                        best_eta_ms: baseline_eta_ms,
                         candidate_snapshot: snapshot,
                         candidate_eta_ms: eta_ms,
                         payload_bytes,
                         mux_limits,
                         role,
-                        stream_ordering_debt_bytes: ordering_debt,
+                        stream_ordering_debt_bytes: admission_ordering_debt,
                     })
                 {
                     suppression
+                } else if entry.key == lead_key
+                    && server_output_has_primary_validation_credit(entry, payload_bytes)
+                    && !server_output_has_sender_evidence(entry)
+                {
+                    "validation_lead_admitted"
                 } else if entry.key == lead_key {
                     "lead_admitted"
                 } else if server_output_has_sender_evidence(entry) {
@@ -956,22 +1874,36 @@ impl ServerTcpStreamOutputs {
             lab_diagnostic(
                 "server_bulk_output_candidate",
                 format_args!(
-                    "path_underlay={:?} path_id={} active={} reason={} payload_bytes={} eta_ms={:.3} confidence={:.3} delivery_samples={} validation_credit_bytes={} product_bytes_in_flight={} carrier_bytes_in_flight={} stream_ordering_debt={} queue_bytes={} command_pending_bytes={} inflight_limit={} srtt_ms={:.3} delivery_rate_mbps={:.3}",
+                    "path_underlay={:?} path_id={} active={} reason={} payload_bytes={} scoring_payload_bytes={} eta_ms={:.3} confidence={:.3} delivery_samples={} validation_credit_bytes={} product_bytes_in_flight={} carrier_bytes_in_flight={} stream_ordering_debt={} queue_bytes={} command_pending_bytes={} inflight_limit={} active_flows={} active_latency_sensitive_flows={} srtt_ms={:.3} delivery_rate_mbps={:.3}",
                     entry.key.underlay,
                     entry.key.path_id.0,
                     Some(entry.key) == active_key,
                     reason,
                     payload_bytes,
+                    bulk_service_horizon_payload_bytes(payload_bytes, mux_limits),
                     eta_ms,
                     snapshot.confidence,
                     entry.delivery_samples,
                     entry.validation_credit_bytes,
                     entry.bytes_in_flight,
                     snapshot.bytes_in_flight,
-                    server_stream_ordering_debt_bytes(lower_flights, entry.key),
+                    server_admission_ordering_debt_bytes(
+                        lower_flights,
+                        entry.key,
+                        server_bulk_admission_role(
+                            lead_candidate
+                                .map(|candidate| candidate.0)
+                                .unwrap_or(entry.key),
+                            entry.key,
+                            server_oldest_lower_flight_owner(lower_flights),
+                            server_stream_ordering_debt_bytes(lower_flights, entry.key),
+                        )
+                    ),
                     snapshot.queue_bytes,
                     entry.commands.pending_bytes(),
                     snapshot.inflight_limit_bytes,
+                    snapshot.active_flows,
+                    snapshot.active_latency_sensitive_flows,
                     snapshot.srtt_ms,
                     snapshot.delivery_rate_bps / 1_000_000.0,
                 ),
@@ -982,56 +1914,77 @@ impl ServerTcpStreamOutputs {
 
 fn server_bulk_output_snapshot(
     entry: &ServerTcpStreamOutputEntry,
-    _mux_limits: MuxLimits,
+    session_id: SessionId,
+    lane: FlowLane,
+    lane_tracker: &ServerPathLaneTracker,
+    mux_limits: MuxLimits,
     now: Instant,
 ) -> PathSnapshot {
-    let srtt_ms = entry.path_metrics.map_or_else(
+    let local_sender_metrics = entry.path_metrics.and_then(|path_metrics| {
+        (path_metrics.source == ServerPathMetricsSource::LocalSender).then_some(path_metrics)
+    });
+    let validation_hint_metrics = entry
+        .path_metrics
+        .and_then(|path_metrics| (entry.delivery_samples == 0).then_some(path_metrics));
+    let model_metrics = local_sender_metrics.or(validation_hint_metrics);
+    let srtt_ms = model_metrics.map_or_else(
         || default_path_srtt_ms(entry.key.underlay),
         |path_metrics| f64::from(path_metrics.metrics.srtt_us.max(1)) / 1000.0,
     );
-    let jitter_ms = entry.path_metrics.map_or(0.0, |path_metrics| {
+    let jitter_ms = model_metrics.map_or(0.0, |path_metrics| {
         f64::from(path_metrics.metrics.jitter_us) / 1000.0
     });
-    let loss_rate = entry
-        .path_metrics
+    let loss_rate = model_metrics
         .map_or(0.0, |path_metrics| {
             f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
         })
         .clamp(0.0, 1.0);
-    let metric_rate_bps = entry
-        .path_metrics
-        .map(|path_metrics| path_metrics.metrics.delivery_rate_bps as f64);
+    let model_rate_bps = model_metrics.map(server_path_metrics_rate_bps);
+    let local_sender_rate_bps = local_sender_metrics.map(server_path_metrics_rate_bps);
     let rate_bps = match entry.key.underlay {
-        UnderlayProtocol::Udp => metric_rate_bps.or(entry.delivery_rate_bps),
-        UnderlayProtocol::Tcp => entry.delivery_rate_bps.or(metric_rate_bps),
+        UnderlayProtocol::Udp => local_sender_rate_bps,
+        UnderlayProtocol::Tcp => model_rate_bps,
     }
     .unwrap_or_else(|| default_path_rate_bps(entry.key.underlay))
     .max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
-    let local_sender_metrics = entry.path_metrics.and_then(|path_metrics| {
-        (path_metrics.source == ServerPathMetricsSource::LocalSender).then_some(path_metrics)
-    });
-    snapshot.queue_bytes = if entry.key.underlay == UnderlayProtocol::Udp {
-        local_sender_metrics
-            .map_or(0, |path_metrics| path_metrics.metrics.queue_bytes)
-            .saturating_add(entry.commands.pending_bytes())
-    } else {
-        entry
-            .path_metrics
-            .map_or(0, |path_metrics| path_metrics.metrics.queue_bytes)
-    };
-    snapshot.bytes_in_flight = if entry.key.underlay == UnderlayProtocol::Udp {
-        local_sender_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
-    } else {
-        entry.bytes_in_flight
+    if let Some(path_metrics) = model_metrics {
+        snapshot.pacing_rate_bps =
+            (path_metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
+        snapshot.app_limited = path_metrics.metrics.app_limited;
+    }
+    let metric_queue_bytes =
+        model_metrics.map_or(0, |path_metrics| path_metrics.metrics.queue_bytes);
+    snapshot.queue_bytes = metric_queue_bytes.saturating_add(entry.commands.pending_bytes());
+    snapshot.product_queue_bytes = entry.product_queue_bytes;
+    snapshot.bytes_in_flight = match entry.key.underlay {
+        UnderlayProtocol::Udp => {
+            local_sender_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
+        }
+        UnderlayProtocol::Tcp => entry.bytes_in_flight,
     };
     snapshot.product_bytes_in_flight = entry.bytes_in_flight;
-    snapshot.inflight_limit_bytes = entry
-        .path_metrics
-        .map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes);
+    snapshot.inflight_limit_bytes =
+        model_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes);
     snapshot.confidence = server_output_confidence(entry, now);
+    let lane_load = lane_tracker.snapshot(session_id, entry.key);
+    snapshot.active_flows = lane_load.active_flows;
+    snapshot.active_latency_sensitive_flows = lane_load.active_latency_sensitive_flows;
+    let known_bulk_flows = lane_load
+        .active_flows
+        .saturating_sub(lane_load.active_latency_sensitive_flows);
+    if relay_lane_is_bulk(lane)
+        && lane_load.active_latency_sensitive_flows > 0
+        && known_bulk_flows > 0
+    {
+        let latency_headroom =
+            adaptive_tcp_relay_inflight_bytes(Some(snapshot), FlowLane::Latency, mux_limits) as u64;
+        let protected_queue =
+            latency_headroom.saturating_mul(u64::from(lane_load.active_latency_sensitive_flows));
+        snapshot.queue_bytes = snapshot.queue_bytes.saturating_add(protected_queue);
+    }
     snapshot
 }
 
@@ -1039,17 +1992,36 @@ fn server_bulk_output_eta_ms(
     key: ServerTcpPathKey,
     snapshot: PathSnapshot,
     active_key: Option<ServerTcpPathKey>,
+    lane: FlowLane,
     payload_bytes: usize,
+    mux_limits: MuxLimits,
 ) -> f64 {
     let queued_bits = snapshot
         .queue_bytes
+        .saturating_add(snapshot.product_queue_bytes)
         .saturating_add(snapshot.bytes_in_flight)
         .saturating_mul(8) as f64;
-    let payload_bits = payload_bytes as f64 * 8.0;
+    let scoring_payload_bytes = if relay_lane_is_bulk(lane) {
+        bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+    } else {
+        payload_bytes
+    };
+    let payload_bits = scoring_payload_bytes as f64 * 8.0;
     let mut eta_ms = snapshot.srtt_ms / 2.0;
-    eta_ms += (queued_bits + payload_bits) / snapshot.delivery_rate_bps.max(1.0) * 1000.0;
+    let effective_rate_bps = if relay_lane_is_bulk(lane) {
+        snapshot
+            .delivery_rate_bps
+            .max(snapshot.pacing_rate_bps)
+            .max(1.0)
+    } else {
+        snapshot.delivery_rate_bps.max(1.0)
+    };
+    eta_ms += (queued_bits + payload_bits) / effective_rate_bps * 1000.0;
     eta_ms += snapshot.jitter_ms;
     eta_ms += snapshot.loss_rate.clamp(0.0, 1.0) * 500.0;
+    if key.underlay == UnderlayProtocol::Udp && relay_lane_is_bulk(lane) {
+        eta_ms += udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes);
+    }
     eta_ms += (1.0 - snapshot.confidence.clamp(0.0, 1.0)) * snapshot.srtt_ms;
     if Some(key) != active_key && snapshot.confidence < 0.5 {
         eta_ms += snapshot.srtt_ms;
@@ -1067,7 +2039,10 @@ fn server_output_confidence(entry: &ServerTcpStreamOutputEntry, now: Instant) ->
             source: ServerPathMetricsSource::LocalSender,
             metrics,
         }) if metrics.has_ack_derived_data_sample => {
-            f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0 * 0.35
+            let source_confidence =
+                f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
+            let sample_confidence = (f64::from(metrics.data_sample_count) / 8.0).clamp(0.0, 1.0);
+            source_confidence * sample_confidence
         }
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::PeerHint,
@@ -1082,7 +2057,22 @@ fn server_output_confidence(entry: &ServerTcpStreamOutputEntry, now: Instant) ->
             (1.0 - age / 30.0).clamp(0.0, 1.0) * 0.25
         })
         .unwrap_or(0.0);
-    (delivery_confidence + metric_confidence + freshness_confidence).clamp(0.1, 1.0)
+    delivery_confidence
+        .max(metric_confidence)
+        .max(freshness_confidence)
+        .clamp(0.1, 1.0)
+}
+
+fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
+    let delivery_rate_bps = path_metrics.metrics.delivery_rate_bps.max(1) as f64;
+    let pacing_rate_bps = path_metrics.metrics.pacing_rate_bps.max(1) as f64;
+    if path_metrics.source == ServerPathMetricsSource::LocalSender
+        && path_metrics.metrics.app_limited
+    {
+        delivery_rate_bps.max(pacing_rate_bps)
+    } else {
+        delivery_rate_bps
+    }
 }
 
 fn server_output_has_sender_evidence(entry: &ServerTcpStreamOutputEntry) -> bool {
@@ -1098,6 +2088,36 @@ fn server_output_has_sender_evidence(entry: &ServerTcpStreamOutputEntry) -> bool
                 },
             })
         )
+}
+
+fn server_output_has_primary_validation_credit(
+    entry: &ServerTcpStreamOutputEntry,
+    payload_bytes: usize,
+) -> bool {
+    entry.validation_credit_bytes >= payload_bytes as u64
+}
+
+fn server_output_can_carry_primary_bulk(
+    entry: &ServerTcpStreamOutputEntry,
+    active_key: Option<ServerTcpPathKey>,
+    payload_bytes: usize,
+    lower_flights: &[ServerTcpPathFlightDebt],
+    attached_lower_flight_owner: Option<ServerTcpPathKey>,
+    has_sender_evidence_candidate: bool,
+) -> bool {
+    if let Some(owner) = attached_lower_flight_owner
+        && entry.key != owner
+    {
+        return false;
+    }
+    if Some(entry.key) == active_key || server_output_has_sender_evidence(entry) {
+        return true;
+    }
+    if has_sender_evidence_candidate {
+        return false;
+    }
+    server_output_has_primary_validation_credit(entry, payload_bytes)
+        && server_stream_ordering_debt_bytes(lower_flights, entry.key) == 0
 }
 
 fn record_server_sender_decision(
@@ -1148,6 +2168,7 @@ pub(super) struct ServerTcpStreamRegistry {
     streams: Mutex<HashMap<(SessionId, StreamId), ServerTcpStreamEntry>>,
     path_metrics: Mutex<HashMap<(SessionId, UnderlayProtocol, PathId), ServerPathMetricsEntry>>,
     closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
+    lane_tracker: Arc<ServerPathLaneTracker>,
 }
 
 impl std::fmt::Debug for ServerTcpStreamRegistry {
@@ -1206,6 +2227,7 @@ impl ServerTcpStreamRegistry {
             closed_streams: Mutex::new(RecentIdCache::new(tcp_closed_stream_cache_capacity(
                 max_streams,
             ))),
+            lane_tracker: Arc::new(ServerPathLaneTracker::default()),
         }
     }
 
@@ -1298,13 +2320,14 @@ impl ServerTcpStreamRegistry {
             mux_limits,
             max_frame_payload_bytes,
         ));
-        let binding = ServerTcpStreamBinding::new_with_limits(
+        let binding = ServerTcpStreamBinding::new_with_limits_and_tracker(
             session_id,
             underlay,
             path_id,
             attachment.commands,
             lane,
             mux_limits,
+            self.lane_tracker.clone(),
         );
         if let Some(metrics) = initial_metrics {
             binding.update_path_metrics(

@@ -808,6 +808,36 @@ or malicious peer reports. A response sender MUST NOT promote ordinary bulk
 service from peer metrics alone; promotion requires local sender evidence or
 stream delivery samples that are not polluted by ordering holes.
 
+When `has_ack_derived_data_sample` is set by the local sender for the current
+direction, `confidence_ppm` and `data_sample_count` are sender-side evidence and
+SHOULD materially raise the path model confidence. A mature sample set with high
+confidence is not merely a liveness hint. Peer-provided metrics, successful
+opens, and control-only traffic remain low-confidence validation hints unless
+local delivery or carrier ACK-derived data samples confirm them. The sender path
+model MUST also add locally queued carrier command bytes to `queue_bytes` for
+all underlays, including TCP, so hidden path queues cannot be ignored by
+ECF/BLEST admission.
+
+Each endpoint also keeps local lane occupancy for every session path. This
+state is not trusted from the peer because it reflects local product work
+already admitted to that endpoint's sender service. A path snapshot used for
+bulk admission MUST include `active_flows` and
+`active_latency_sensitive_flows` from this local ledger. When a bulk or
+background stream evaluates a path with active control, latency, or realtime
+datagram work while bulk/background work is also present on that path, the
+sender MUST reserve adaptive latency headroom as additional queue debt before
+reading more source bytes or choosing the next bulk quantum.
+The headroom is derived from the same path model used for latency inflight
+(`srtt`, delivery or pacing rate, loss, jitter, and queue pressure); it is not
+an operator traffic mode and not a fixed product cap. This makes lane
+protection part of admission rather than a late path-writer preference.
+An all-startup state where every stream is still classified as latency MUST NOT
+reserve those startup streams against each other as protected latency work; once
+one flow is classified as throughput/background, separately active latency or
+realtime flows become protected. This prevents bulk discovery from deadlocking
+while still protecting browsing, SSH-like, ACK/control, repair, and datagram
+traffic from already-proven bulk.
+
 ## 10. TCP Underlay Transport
 
 TCP underlay carries product frames in an encrypted `MPTE` envelope:
@@ -1307,17 +1337,21 @@ attaches an additional path for bounded proof traffic. Validation is distinct
 from Repair because the scheduler needs to learn whether an unknown path can
 carry bulk without weakening the invariant that repair traffic is gap-targeted.
 Validation traffic remains subject to ECF/BLEST-style admission, flow control,
-and a finite validation budget. For ordered reliable streams, Validation MUST
-NOT make an unproven path the only carrier of new stream bytes when an admitted
-ordinary path exists. Such proof is sent as duplicate stream data, repair data
-for an already-missing range, or carrier/control probe traffic. Liveness from
-the open itself is not delivery evidence. A receiver MUST NOT promote a
-Validation or Repair attachment to the Active data slot merely because one frame
-arrived in order. For bulk streams, receiver-side Active promotion is allowed
-only after delivered application bytes have been accounted into the path model
-and the path has local delivery samples or ACK-derived carrier data samples.
-Configured hints, successful opens, control probes, RTT-only liveness, and
-single duplicated stream ranges do not satisfy this requirement.
+and a finite validation budget. For ordered reliable streams, Validation credit
+is not throughput evidence. A validation path without sender-side delivery
+evidence MAY carry a bounded unique next `STREAM_DATA` proof only while no other
+candidate has sender-side evidence and the proof would not jump over lower
+offsets already owned by another path. Once any path has sender-side evidence,
+an unproven validation path MUST NOT carry new later stream offsets; it is used
+only for duplicate stream data, repair data for an already-missing range, or
+carrier/control probe traffic. Liveness from the open itself is not delivery
+evidence. A receiver MUST NOT promote a Validation or Repair attachment to the
+Active data slot merely because one frame arrived in order. For bulk streams,
+receiver-side Active promotion is allowed only after delivered application bytes
+have been accounted into the path model and the path has local delivery samples
+or ACK-derived carrier data samples. Configured hints, successful opens, control
+probes, RTT-only liveness, and single duplicated stream ranges do not satisfy
+this requirement.
 
 The server maps a repeated stream ID to the same outbound TCP connection when
 reattaching after path migration or repair.
@@ -1339,12 +1373,18 @@ payload:u32 bytes
 
 Offsets are absolute within the stream. Receivers MUST buffer out-of-order data
 up to the configured reorder limit and deliver contiguous bytes in order.
-Overlapping or invalid ranges MUST be rejected.
+Invalid ranges MUST be rejected. Duplicate or partially overlapping valid ranges
+MUST NOT be fatal: the receiver trims the incoming payload to byte subranges not
+already received, buffers only those novel bytes, and treats fully duplicate data
+as an idempotent no-op while still allowing ACK feedback to describe the received
+range set.
 
 Absolute offsets give mptunnel the same essential tool that MPTCP data sequence
 mapping provides: data correctness is independent of the underlay that carried a
-chunk. This enables striping, retransmission, and path-aware reinjection without
-changing the application byte stream.
+chunk. This enables striping, retransmission, validation probes, and path-aware
+reinjection without changing the application byte stream. Because reinjection
+can race the original path, overlap acceptance is a correctness requirement, not
+a compatibility fallback.
 
 ### 13.3 Stream ACKs
 
@@ -1450,6 +1490,15 @@ other survivor paths are usable. On path failure, the sender repairs only
 unacknowledged bytes last sent on the failed or suspect path. A sender MUST NOT
 retransmit acknowledged ranges and MUST NOT replay the entire repair cache after
 reattach.
+
+When a tail-stall repair timer fires, a sender MUST first inspect the most
+recent repair-authoritative `STREAM_ACK`. If that ACK proves an unacknowledged
+gap below its largest end offset, the repair extent is that gap, not bytes after
+the ACK frontier. Bytes after the largest ACKed end are eligible for tail repair
+only when no authoritative lower gap is known. This keeps receive-hole repair
+ahead of continuation replay and matches the same ordering principle used by
+QUIC ACK ranges and MPTCP reinjection: recover the earliest missing logical
+offset before spending repair budget on later stream bytes.
 
 ## 14. Datagram Flow Layer
 
@@ -1621,8 +1670,9 @@ prevents early wrong decisions before the model has enough samples.
 Successful stream opens and association opens are liveness evidence. They MAY
 clear failure state and update active-flow counts, but they MUST NOT by
 themselves create RTT, delivery-rate, or freshness confidence samples. Stream
-ACKs release inflight ownership and repair-cache entries, but delayed or tiny
-ACK-release timing MUST NOT lower the bulk delivery-rate estimate. Probe
+ACKs release inflight ownership and repair-cache entries, but delayed, compressed,
+or tiny ACK-release timing MUST NOT raise or lower the bulk delivery-rate
+estimate. Probe
 responses, ACK-derived carrier data samples, datagram feedback, and other
 data-plane observations are the inputs that raise path-model confidence.
 
@@ -1658,20 +1708,39 @@ observed actual delivery.
 
 Scheduler scoring estimates completion time from RTT, queue bytes, bytes in
 flight, pacing/delivery rate, loss, jitter, confidence, and capability
-penalties. For throughput and background lanes, delivery rate is first adjusted
-by the number of active bulk flows sharing the path; when a stream considers
-moving or adding work to a non-active path, that stream is counted as joining
-the path for scoring. Backup, expensive, suspect, high-loss, high-jitter, and
-low-confidence paths receive penalties. Realtime datagrams are latency
+penalties. Latency, realtime, control, and repair lanes score the next
+preemptible quantum. Throughput and background lanes score a service horizon
+derived from both the next quantum and the configured product resource
+envelope. The envelope is the minimum of the stream window, path inflight
+envelope, and receiver reorder envelope. The service horizon is the geometric
+mean of the next quantum and that envelope, bounded below by the actual next
+quantum and above by the envelope. This makes scoring more forward-looking than
+latency-probe scheduling without letting a fresh bulk stream behave as though
+an entire product envelope were already safe to put in flight. This horizon is
+used only for path scoring; it MUST NOT become an indivisible frame, AEAD
+record, or path write. The sender still emits bounded quanta so control, ACK,
+repair, realtime, and latency work can interleave.
+
+For throughput and background lanes, delivery rate is first adjusted by the
+number of active bulk flows sharing the path; when a stream considers moving or
+adding work to a non-active path, that stream is counted as joining the path
+for scoring. Backup, expensive, suspect, high-loss, high-jitter, and
+low-confidence paths receive penalties. For reliable streams over UDP, the
+bulk score also includes the estimated repair cost of the next emitted quantum
+from loss, MTU fragmentation, RTT, and jitter; this keeps poor-loss UDP from
+being treated as free capacity while still allowing normal low-loss UDP to win
+when its measured delivery rate is better. Realtime datagrams are latency
 sensitive. Bulk reliable streams may use multiple paths only after ECF/BLEST-
 style admission proves that the additional path should not increase completion
-time versus the best available path.
+time versus the best safe available path.
 
 Earliest-completion scoring approximates the practical goal of MPTCP ECF-style
-scheduling without exposing subflow details to applications. It lets a
-high-RTT/high-bandwidth path join a bulk cohort only when its bandwidth and
-queue state offset its latency, and keeps short flows sticky to the path that
-completes soonest.
+scheduling without exposing subflow details to applications. The service
+horizon prevents a sustained file transfer from being mis-modeled as an
+infinite sequence of tiny latency probes, so a high-RTT/high-bandwidth path can
+lead or join a bulk cohort when its bandwidth and queue state offset its
+latency. Short flows remain sticky to the path that completes the immediate
+quantum soonest.
 
 ### 17.4 Fairness
 
@@ -1762,6 +1831,27 @@ sender service. A saturated throughput lane MUST NOT prevent control, ACK,
 latency, or repair lanes from making progress. Throughput lanes use
 deficit-round-robin style service across flows so a later bulk transfer
 gradually shares capacity with an earlier transfer.
+
+Initial reliable-stream carrier selection is part of the same sender-service
+contract. When both TCP and UDP underlay paths are configured, a new stream
+MUST NOT be opened on TCP merely because TCP paths are stored or attempted
+first. The sender chooses the initial lead carrier from the path model using
+the stream lane, health state, configured path capabilities, RTT, delivery
+rate, queue/inflight debt, and lane-protection pressure. The selected path is
+then opened through the corresponding TCP or UDP carrier engine. UDP-only and
+TCP-only deployments are degenerate candidate sets of this rule.
+
+Endpoint-only startup uses cautious evidence handling before cross-carrier
+sorting. Probe-only RTT or rate samples MUST NOT by themselves make a path
+steal the first reliable stream when no product delivery evidence exists, and
+a UDP path already serving realtime or latency-sensitive work receives an
+additional lane-protection cost before it is chosen for a reliable latency
+stream. This is not a manual mode or fixed traffic class: it is a path-model
+penalty that can be overcome by a materially better UDP path. The intent is to
+preserve QUIC/BBR-style lane isolation while still allowing a low-RTT/high-rate
+QUIC UDP carrier to become the initial lead when it is genuinely the best
+completion candidate.
+
 The DRR service quantum for throughput data is capped at the preemptible bulk
 quantum ceiling, currently 64 KiB, and is independent from the 512 KiB TCP
 read-buffer ceiling. Larger local reads may be split into multiple service
@@ -1936,40 +2026,55 @@ decision quantum. This keeps validation visible to the scheduler and lets ACKs
 arrive quickly enough to prove or reject the path without making an unproven
 path responsible for a large unique ordered-stream range.
 
-Validation for ordered reliable streams is non-blocking. A validation byte
-range that is sent only on an unproven path can itself create the
-ordered-stream hole being measured. Therefore a validation path MUST NOT be the
-sole carrier of new unique `STREAM_DATA` while an admitted ordinary path is
-available. The sender either duplicates the same `STREAM_DATA` on an admitted
-ordinary path and the validation path, sends repair for an already-missing
-range, or sends carrier/control probes that do not create a new application-data
-dependency. This follows QUIC path validation and MPTCP reinjection practice:
-prove a path without letting unproven subflows hold the only copy of the next
-ordered bytes.
+Validation for ordered reliable streams is non-blocking and path-scoped. A
+validation byte range that is sent only on an unproven path can itself create
+the ordered-stream hole being measured, so the sender MUST NOT treat validation
+credit as ordinary bulk capacity. However, when no sender-evidence candidate
+exists and a UDP validation path wins the same ECF/BLEST lead admission check
+for the next preemptible quantum without jumping over lower offsets owned
+elsewhere, the UDP validation path MAY carry the unique next `STREAM_DATA`
+quantum as a bounded primary probe. This exception is deliberately limited to
+the validation credit envelope and to UDP underlays, where the carrier can
+provide packet/path-scoped ACK-derived proof. It prevents a stale startup path
+from owning the lower frontier before a better carrier has a chance to prove
+itself. If the validation path does not win lead admission, the sender either
+duplicates the same `STREAM_DATA` on an admitted ordinary path and the
+validation path, sends repair for an already-missing range, or sends
+carrier/control probes that do not create a new application-data dependency.
+This follows QUIC path validation and MPTCP reinjection practice while adapting
+it to a product-layer stream that must avoid creating irreversible receive-hole
+debt.
 
 A stream ACK for duplicated data proves end-to-end byte delivery but does not
 identify which underlay path delivered the bytes. It therefore releases product
 flight for every duplicate copy of that range, but it MUST NOT by itself promote
-the validation path into ordinary same-stream bulk service. In protocol version
-1, ordered-stream duplicate validation is used only for UDP underlays, because
-the sender's local UDP carrier ACK metrics can provide the path-scoped proof
-needed for promotion. TCP validation uses attach/control liveness and peer
-hints only; it MUST NOT spend duplicate ordered-stream payload for promotion
-unless a future path-scoped TCP proof signal is specified.
+the validation path into ordinary same-stream bulk service. By contrast, a
+stream ACK for non-duplicated data that was sent as an admitted UDP validation
+lead is path-scoped for that quantum and MAY become sender-side stream delivery
+evidence if the receiver had no lower receive hole that could have polluted the
+sample. In protocol version 1, ordered-stream validation payload is used only
+for UDP underlays before path-scoped sender evidence exists, because the
+sender's local UDP carrier ACK metrics can provide the stronger proof needed
+for sustained promotion. TCP validation uses attach/control liveness and peer
+hints only; it MUST NOT spend ordered-stream payload for promotion unless a
+future path-scoped TCP proof signal is specified.
 
 Response-side validation uses the same principle. The server MUST NOT schedule
-download bytes only onto a validation path using generic TCP or UDP defaults
-when an admitted ordinary path exists. Client-supplied `PATH_METRICS` are hints,
-not final proof of response-direction throughput. They are useful to distinguish
-a plausible high-bandwidth path from a poor or high-loss path before bounded
-duplicate proof is sent, but sender-side evidence decides ordinary promotion.
-The receiver applies the same rule when it observes incoming stream data:
-ordered progress on a validation or repair path may refresh liveness and may
-feed delivery sampling, but the path becomes an ordinary lead candidate only
-after that sampling has created real delivery evidence and ETA scoring says it
-should displace the current lead path. This prevents a high-RTT, high-loss, or
-reordered path from winning ordinary bulk service because it delivered a small
-duplicate before its long-term behavior was known.
+download bytes onto a validation path merely from generic TCP or UDP defaults,
+but it MAY let a UDP validation path lead a bounded proof quantum only before
+any sender-evidence candidate exists and when ECF/BLEST admission says that
+waiting on or continuing the current ordinary path would be worse.
+Client-supplied `PATH_METRICS` are hints, not final proof of response-direction
+throughput. They are useful to distinguish a plausible
+high-bandwidth path from a poor or high-loss path before bounded proof is sent,
+but sender-side evidence decides sustained ordinary promotion. The receiver
+applies the same rule when it observes incoming stream data: ordered progress on
+a validation or repair path may refresh liveness and may feed delivery sampling,
+but the path becomes an ordinary lead candidate only after that sampling has
+created real delivery evidence and ETA scoring says it should displace the
+current lead path. This prevents a high-RTT, high-loss, or reordered path from
+winning ordinary bulk service because it delivered a small probe before its
+long-term behavior was known.
 
 For UDP underlays, the response sender also maintains local carrier TX metrics
 from its own UDP packet controller. Once the server has ACK-derived carrier
@@ -1982,6 +2087,14 @@ that signal. This mirrors QUIC and BBR practice: congestion and pacing decisions
 are sender-side and packet/path scoped, while stream ordering is a separate
 correctness layer.
 
+When the UDP production engine is QUIC, the response sender MUST preserve both
+ACK-derived delivery rate and QUIC pacing/cwnd-derived pacing rate in its path
+snapshot. Application-limited ACK samples MUST NOT initialize or reduce the
+bulk delivery-rate model to a tiny value. Until a non-application-limited data
+sample exists, the scheduler MAY use the QUIC pacing/cwnd rate or the normal
+UDP startup model for bounded admission, but it MUST keep the app-limited
+provenance visible to diagnostics and admission.
+
 For any same-stream bulk striping, the scheduler chooses eligible paths from
 live ETA. Eligibility requires active or sufficiently confident suspect state,
 no probe-only/backup restriction unless necessary, acceptable inflight/queue
@@ -1991,7 +2104,7 @@ join a bulk striping cohort merely because it has available capacity.
 A path is admitted for the next bulk chunk only if the implementation estimates:
 
 ```
-lead_path = min_eta_candidate_that_is_eligible_for_ordinary_bulk()
+lead_path = min_eta_candidate_that_is_eligible_and_admissible_for_ordinary_bulk()
 if path is the lead path and stream_ordering_debt(path, chunk) == 0:
     product_queue_debt(path) + stream_ordering_debt(path, chunk) + chunk
         <= lead_product_queue_envelope(path, chunk)
@@ -2009,6 +2122,14 @@ if path is an additional data path:
     eta_p(chunk) <= completion_horizon(lead_path, path, chunk)
 ```
 
+The lead path is a safe baseline, not merely the lowest raw ETA. A candidate
+whose carrier or product debt already violates the active data-path admission
+gate MUST NOT be used as the baseline that rejects other paths. Otherwise a
+saturated path can prevent a proven alternate from carrying traffic while also
+being unable to accept the next quantum itself. This rule is the sender-service
+equivalent of ECF/BLEST comparing against the best usable subflow rather than
+against an unavailable one.
+
 `carrier_debt` is the sender-visible network backlog: carrier bytes in flight,
 carrier queue bytes, and locally queued carrier commands that are ahead of the
 candidate chunk. `product_reorder_debt` is the stream-level byte ownership that
@@ -2019,10 +2140,29 @@ byte ownership. `product_queue_debt` is the lead path's bounded,
 preemptible product work already admitted to the transport. An implementation
 MUST NOT use slow product-ACK release timing as the UDP carrier congestion
 window, MUST NOT use carrier ACK progress as proof that a stream byte is no
-longer needed for repair, and MUST NOT use the UDP carrier congestion window as
-the lead path's application-scheduler queue limit. The UDP controller limits
-packet emission; the lead product scheduler keeps enough bounded work queued
-for that controller to stay ACK-clocked.
+longer needed for repair, and MUST NOT treat the configured product envelope as
+a floor above UDP carrier credit. The UDP controller limits packet emission and
+provides an upper gate for active UDP product admission; the lead product
+scheduler keeps only enough bounded, preemptible work queued for that controller
+to stay ACK-clocked.
+
+Bulk admission also includes lane-protection debt. When another flow on the
+same session path is currently using a control, latency, or realtime lane and
+at least one flow on that path has already become throughput/background, the
+sender charges that path with an adaptive latency headroom before it compares
+ETAs, computes reorder budgets, or reads additional source bytes. This local
+headroom is the amount of product work that must remain available for small
+HTTP responses, SSH-like echo, carrier/product ACKs, FIN/RESET/DETACH, repair,
+and realtime datagrams. It is derived from the latency lane's current modeled
+inflight target for that path. Therefore a bulk stream may still use the path
+when it is clearly best, but it must compete against proven alternate paths
+after the protected latency work is accounted for. An all-startup condition
+where all streams are still classified as latency does not create
+lane-protection debt by itself; otherwise parallel downloads would reserve
+against each other before demand classification has a chance to promote them.
+This is the product-layer equivalent of QUIC/BBR keeping ACK/control feedback
+out of bulk queues and of MPTCP schedulers avoiding subflows that increase
+application-visible blocking.
 
 `stream_ordering_debt(path, chunk)` is the sender's estimate of lower-offset
 bytes in the same ordered stream whose latest outstanding copy is owned by
@@ -2034,10 +2174,29 @@ signal. MPTCP's data sequence mapping makes this distinction explicit: a
 subflow can be locally healthy while the connection-level byte stream is still
 blocked behind data mapped to another subflow. ECF/BLEST-style scheduling must
 therefore include the existing connection-level ordering debt before it admits
-a faster path for later bytes. If the debt exceeds the reorder budget, the
-sender either continues on the path that owns the lower bytes, performs bounded
-gap-targeted reinjection, or waits for ACK/path-state progress; it MUST NOT keep
-feeding later offsets to a path that will expand the ordered receive hole.
+a faster path for later bytes. In the current implementation, cross-underlay
+ordinary striping is allowed only before it would extend an existing
+connection-level ordering debt. Once later offsets would queue behind lower
+bytes owned by the other carrier family, the sender either continues on the
+path that owns the lower bytes, performs bounded gap-targeted reinjection, or
+waits for ACK/path-state progress; it MUST NOT keep feeding later offsets to a
+path that will expand the ordered receive hole.
+
+Version 1 applies this as a contiguous-frontier ownership rule for ordinary
+same-stream bulk: while any lower byte range is still outstanding on an
+attached path, the next ordinary `STREAM_DATA` quantum for that stream is sent
+only on the path that owns the oldest lower outstanding range. Other paths may
+still carry carrier ACKs, product ACKs, control frames, FIN/RESET/DETACH,
+latency traffic, realtime datagrams, and explicit gap-targeted repair. They may
+also become the ordinary owner once ACK progress reaches the frontier and
+ECF/BLEST admission selects them for the next quantum. This rule intentionally
+favours "do no worse than the best safe path" over blind same-stream striping:
+lab diagnostics showed that path hopping inside one ordered stream can create
+tens of MiB of receive-hole debt and collapse goodput even when every carrier
+is locally healthy. Aggregation in this state comes from independent flows,
+safe frontier switches, and repair/failover; broader same-stream striping
+requires stronger path-scoped proof that it will not increase completion time
+or ordered receive debt.
 
 Lead-path admission and lead-path repair are intentionally separate
 decisions. The lead path may keep a larger product queue than additional
@@ -2125,18 +2284,31 @@ candidate. This prevents active-path stickiness after a path switch, which
 diagnostics showed can otherwise alternate between a fast UDP path and a
 high-RTT or low-rate TCP path while growing tens of MiB of receive hole.
 
+Data-plane repair progress is also delivery evidence, but only for failover
+admission. When a tail-stall or path-failure repair frame is sent on an
+alternate path and the next `STREAM_ACK` advances the contiguous ACK frontier or
+releases bytes that were still in the repair cache, the sender MAY mark that
+repair path as locally delivered and promote it to the active lifecycle slot for
+future admission. This does not derive a bandwidth estimate from ACK-release
+timing and does not convert duplicated validation ACKs into high-rate evidence.
+It is the product-layer equivalent of MPTCP reinjection over a surviving subflow
+and QUIC PTO recovery: progress on a survivor path should detach active work
+from the stalled path before heartbeat liveness timers expire. If the repair
+does not advance the stream frontier, no promotion occurs.
+
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,
-mptunnel owns congestion control at the carrier packet sender, not at the
-product scheduler's lead-path queue. In both cases, lead and same-underlay
-product admission may use the configured product envelope as preemptible ready
-work, while actual encrypted-packet emission remains gated by the sender-side
-UDP controller or kernel TCP. The lead product queue MUST NOT be confused with
-carrier network flight. This matches QUIC and BBR practice: the stream scheduler
-may have ready data, while the packet sender paces and gates network flight.
-Cross-underlay ordinary striping is stricter: it is derived from carrier
-inflight evidence, live BDP, confidence, and receiver reorder budget because TCP
-and UDP expose different loss, pacing, and head-of-line behavior.
+mptunnel owns congestion control at the carrier packet sender, not at a hidden
+product queue. In both cases, lead and same-underlay product admission is derived
+from live BDP, path inflight evidence when it is smaller, the next quantum size,
+and the configured resource ceiling. The configured ceiling MUST NOT become the
+lead path's scheduling target merely because the path is attached or active.
+Actual encrypted-packet emission remains gated by the sender-side UDP controller
+or kernel TCP. This matches QUIC and BBR practice: the stream scheduler may have
+ready data, while the packet sender paces and gates network flight.
+Cross-underlay ordinary striping is stricter: it also accounts for confidence and
+receiver reorder budget because TCP and UDP expose different loss, pacing, and
+head-of-line behavior.
 
 Additional paths do not all receive the same treatment. An additional path using
 the same underlay family as the lead path may use the unscaled ACK-clocked BDP
@@ -2183,12 +2355,18 @@ path_rate = max(path.pacing_rate, path.delivery_rate)
 path_bdp = path_rate * path.srtt
 lead_path = min_eta_candidate_that_is_eligible_for_ordinary_bulk()
 if path is the lead path:
-    product_inflight_limit = max(configured_path_inflight, chunk.len)
+    product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
+                                 2 * path_bdp,
+                                 configured_path_inflight)
+    product_inflight_limit = max(product_inflight_limit, chunk.len)
 else if path uses the same underlay family as the lead path:
-    product_inflight_limit = max(configured_path_inflight, chunk.len)
+    product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
+                                 2 * path_bdp,
+                                 configured_path_inflight)
+    product_inflight_limit = max(product_inflight_limit, chunk.len)
 else:
-    modeled_inflight = max(path.carrier_inflight_limit,
-                           cross_underlay_queue_gain * path_bdp,
+    modeled_inflight = max(min(path.carrier_inflight_limit if known else infinity,
+                               2 * path_bdp),
                            chunk.len)
     product_inflight_limit = min(modeled_inflight,
                                  max(configured_path_inflight, chunk.len))
@@ -2218,14 +2396,15 @@ if path is the previously attached active path but not the lead path
     suppress stale active path for this bulk quantum
 ```
 
-The queue gains are internal model-control coefficients, not operator-visible
+Admission gains are internal model-control coefficients, not operator-visible
 traffic modes. They apply only to additional cross-underlay ordinary striping,
 where the scheduler must prove that a path with different transport semantics
-will not increase completion time. Lead and same-underlay product queues use the
-resource ceiling as preemptible scheduler work, while carrier controllers still
-enforce network flight. This follows BBR's separation between ready application
-data and paced network inflight, while preserving the ECF/BLEST rule that
-heterogeneous paths must not create avoidable head-of-line blocking.
+will not increase completion time. Lead and same-underlay product queues use a
+BDP/inflight-derived envelope capped by the configured resource ceiling, while
+carrier controllers still enforce network flight. This follows BBR's separation
+between ready application data and paced network inflight, while preserving the
+ECF/BLEST rule that heterogeneous paths must not create avoidable head-of-line
+blocking.
 
 The candidate may pass the ETA gate only when it can arrive before this
 completion horizon. This is deliberately different from both a narrow
@@ -2247,12 +2426,11 @@ derived from ETA, stream ordering debt, and the receiver's current reorder
 budget.
 
 The configured path inflight value is a product-queue resource ceiling, not a
-carrier congestion window. A conforming sender may keep lead and same-underlay
-work queued up to this ceiling only as preemptible scheduler work; control,
-ACKs, repair, and latency frames must still interleave. Cross-underlay product
-inflight is derived from the carrier's own inflight high watermark when
-available, the live BDP model, and the next chunk size, then capped by the
-configured path inflight ceiling.
+carrier congestion window and not an active-path scheduling target. A conforming
+sender derives lead, same-underlay, and cross-underlay product inflight from the
+live BDP model, path inflight evidence when present, and the next chunk size,
+then caps that result by the configured path inflight ceiling. Control, ACKs,
+repair, and latency frames must still interleave with any admitted bulk work.
 
 The reorder budget is confidence scaled for additional paths. A path with fresh
 ACK-derived delivery samples can use more of the modeled BDP/reorder envelope.
@@ -2274,9 +2452,9 @@ below-best-single-path failure mode.
 
 Product admission and carrier congestion control are separate gates, but they
 must be consistent. UDP carrier `inflight_hi` limits encrypted UDP packet
-emission inside the carrier controller. The configured product limit MUST NOT be
-treated as a floor over the carrier emission limit, and the carrier emission
-limit MUST NOT be treated as the active product queue limit. The product
+emission inside the carrier controller and also gates how much new product work
+may be admitted onto an active UDP path. The configured product limit MUST NOT be
+treated as a floor over carrier credit or BDP-derived credit. The product
 scheduler admits bounded, preemptible stream work; the carrier packetizer drains
 that work only when cwnd, pacing, and pending-byte gates permit; the stream
 repair layer separately retains product byte ranges until `STREAM_ACK` releases
@@ -2670,6 +2848,9 @@ on_stream_ack(stream_id, complete, ranges):
     release_repair_cache_entries_covered_by(ranges)
     release_path_inflight_entries_covered_by(ranges)
     do_not_lower_delivery_rate_from_feedback_only_release_timing()
+    if ack_frontier_advanced_after_tail_repair:
+        mark_repair_path_as_sender_evidence_for_failover()
+        promote_repair_path_to_active_lifecycle_slot()
     if active_carrier_is_reliable_udp:
         if not complete:
             clear_product_gap_repair_tracker()
@@ -2694,6 +2875,15 @@ on_stream_ack(stream_id, complete, ranges):
         schedule_repair(holes)
     else:
         do_not_infer_holes_from_omitted_ranges()
+
+on_tail_stall_repair(stream_id, last_complete_ack_ranges):
+    holes = unacked_chunks_below_largest_acked_not_covered_by(last_complete_ack_ranges)
+    if holes is not empty:
+        schedule_repair(holes)
+    else:
+        tail = unacked_chunks_after_largest_acked(last_complete_ack_ranges)
+        schedule_repair(tail)
+    never_replay_whole_repair_cache()
 
 on_path_failure(path):
     holes = unacked_ranges_last_sent_on(path)
@@ -2764,7 +2954,18 @@ score_for_join(path, chunk, current_stream_active_on_path):
     snapshot = path.snapshot
     if not current_stream_active_on_path:
         snapshot.active_bulk_flows += 1
-    return score(snapshot, Throughput, chunk.len)
+    payload = throughput_service_horizon(chunk.len)
+    return score(snapshot, Throughput, payload)
+
+throughput_service_horizon(chunk_len):
+    envelope = min(configured_stream_window,
+                   configured_path_inflight_envelope,
+                   configured_receiver_reorder)
+    return clamp(sqrt(chunk_len * envelope), chunk_len, envelope)
+
+safe_lead_candidate(path, stream, chunk):
+    debt = lower_offset_debt_owned_by_other_paths(stream, path, chunk)
+    return admission_allows(path, chunk, lead_data_path, debt)
 
 completion_horizon(stream, best_path, path, chunk, best_eta):
     best_rate = max(best_path.pacing_rate, best_path.delivery_rate)
@@ -2783,6 +2984,14 @@ base_reorder_budget(path, chunk):
 effective_reorder_budget(path, chunk):
     return base_reorder_budget(path, chunk) * path.confidence
 
+lane_protection_debt(path, lane):
+    if lane is not bulk_or_background:
+        return 0
+    latency_flows = local_active_latency_sensitive_flows(path)
+    if latency_flows == 0:
+        return 0
+    return latency_flows * adaptive_latency_inflight_target(path)
+
 admission_reorder_budget(path, chunk, role, ordering_debt):
     if role == lead_data_path and ordering_debt == 0:
         return product_queue_envelope(path, chunk, role)
@@ -2793,22 +3002,27 @@ admission_reorder_budget(path, chunk, role, ordering_debt):
     return effective_reorder_budget(path, chunk)
 
 product_queue_envelope(path, chunk, role):
-    if role == lead_data_path or role == additional_same_underlay:
-        return max(configured_path_inflight, chunk.len)
-    modeled = max(path.carrier_inflight_limit,
-                  cross_underlay_queue_gain * path_bdp(path),
-                  chunk.len)
-    return min(modeled, max(configured_path_inflight, chunk.len))
+    bdp_limit = max(2 * path_bdp(path), chunk.len)
+    if path.carrier_inflight_limit is known:
+        modeled = min(path.carrier_inflight_limit, bdp_limit)
+    else:
+        modeled = bdp_limit
+    return min(max(modeled, chunk.len),
+               max(configured_path_inflight, chunk.len))
 
 scheduler_inflight_debt(path, role):
+    if role == lead_data_path:
+        return path.product_bytes_in_flight + path.queue_bytes
     if path.underlay == UDP and role == additional_cross_underlay:
         return path.carrier_queue_bytes + path.carrier_bytes_in_flight
     return path.product_bytes_in_flight
 
 carrier_validation_queue_limit(path, chunk):
-    return max(path.carrier_inflight_limit,
-               2 * path_bdp(path),
-               chunk.len)
+    if path.carrier_inflight_limit is known:
+        modeled = min(path.carrier_inflight_limit, 2 * path_bdp(path))
+    else:
+        modeled = 2 * path_bdp(path)
+    return max(modeled, chunk.len)
 
 bulk_admit(path, chunk, role):
     if role == additional_cross_underlay:

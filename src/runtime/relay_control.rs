@@ -40,6 +40,7 @@ where
     let mut recv_progress = ReliableRecvProgress::default();
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
+    let mut sender_queue = TcpRelaySenderQueue::default();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -48,7 +49,12 @@ where
     let mut last_reported_receive_hole: Option<(u64, usize, usize, u64)> = None;
 
     let result = loop {
-        if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
+        if !local_open
+            && !remote_open
+            && send_stream.repair_bytes() == 0
+            && sender_queue.is_empty()
+            && !pending_local_fin
+        {
             break Ok(stats);
         }
         let path_snapshot = remotes
@@ -149,6 +155,8 @@ where
         resize_tcp_relay_buffer(&mut buf, adaptive_chunk);
         let adaptive_inflight =
             adaptive_tcp_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
+        let sender_queue_limit =
+            tcp_relay_sender_queue_limit(context.mux_limits, adaptive_inflight);
         #[cfg(feature = "lab-diagnostics")]
         if last_reported_budget != Some((relay_lane, adaptive_chunk, adaptive_inflight)) {
             lab_diagnostic(
@@ -195,41 +203,43 @@ where
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot, relay_lane),
         );
-        let mut can_read_local =
-            local_open && tcp_relay_can_read_with_limit(&send_stream, adaptive_inflight);
-        let prospective_read_budget = if can_read_local {
-            tcp_relay_read_budget_with_limit(
+        let queued_send_ready =
+            sender_queue
+                .front_stream_extent()
+                .is_some_and(|(offset, payload_bytes)| {
+                    !relay_lane_is_bulk(relay_lane)
+                        || sender.can_send_stream_data_extent(
+                            context,
+                            &remotes,
+                            relay_lane,
+                            offset,
+                            payload_bytes,
+                        )
+                });
+        let queued_send_blocked = !sender_queue.is_empty() && !queued_send_ready;
+        let can_read_by_flow = tcp_relay_can_read_product_source(
+            local_open,
+            queued_send_blocked,
+            &send_stream,
+            &sender_queue,
+            context.mux_limits,
+            sender_queue_limit,
+        );
+        let prospective_read_budget = if can_read_by_flow {
+            tcp_relay_sender_queue_read_budget(
                 &send_stream,
+                &sender_queue,
                 context.mux_limits,
-                adaptive_inflight,
+                sender_queue_limit,
                 adaptive_chunk.min(buf.len()),
             )
         } else {
             0
         };
-        if can_read_local
-            && relay_lane_is_bulk(relay_lane)
-            && !sender.can_send_stream_data_extent(
-                context,
-                &remotes,
-                relay_lane,
-                send_stream.next_offset(),
-                prospective_read_budget.max(1),
-            )
-        {
-            can_read_local = false;
-            #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "sender_admission_blocked",
-                format_args!(
-                    "stream_id={} lane={:?} reason=pre_read_bulk_no_safe_path offset={} payload_bytes={}",
-                    stream_id.0,
-                    relay_lane,
-                    send_stream.next_offset(),
-                    prospective_read_budget,
-                ),
-            );
-        }
+        let can_read_local = can_read_by_flow && prospective_read_budget > 0;
+        let can_send_pending_fin = pending_local_fin
+            && sender_queue.is_empty()
+            && (!remotes.fin_requires_repair_drain() || send_stream.repair_bytes() == 0);
         #[cfg(feature = "lab-diagnostics")]
         {
             if local_open && !can_read_local {
@@ -496,6 +506,101 @@ where
                     Err(err) => break Err(err),
                 }
             }
+            _ = std::future::ready(()), if can_send_pending_fin => {
+                match sender
+                    .send_control_frame(
+                        context,
+                        &mut remotes,
+                        Frame::StreamFin {
+                            stream_id,
+                            final_offset: send_stream.next_offset(),
+                        },
+                        RelaySendCause::StreamFin,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        pending_local_fin = false;
+                        last_stream_progress_at = Instant::now();
+                    }
+                    Err(err) if tcp_relay_error_is_migratable(&err) => {
+                        match attach_tcp_relay_paths(
+                            context,
+                            &spec,
+                            relay_lane,
+                            &mut remotes,
+                            &send_stream,
+                            true,
+                            TcpRelayAttachMode::Any,
+                        )
+                        .await
+                        {
+                            Ok(attached) if attached > 0 => {
+                                pending_local_fin = false;
+                                last_stream_progress_at = Instant::now();
+                            }
+                            Ok(_) => break Err(err),
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+            _ = std::future::ready(()), if queued_send_ready => {
+                let queued = sender_queue
+                    .pop_front()
+                    .expect("queued_send_ready requires a queued frame");
+                let retry_frame = queued.frame.clone();
+                match sender.send_stream_data(context, &mut remotes, queued.frame).await {
+                    Ok(outcome) => {
+                        last_stream_progress_at = Instant::now();
+                        stats.record_payload_bytes(queued.payload_bytes);
+                        path_stats
+                            .entry(outcome.path_key)
+                            .or_default()
+                            .record_payload_bytes(queued.payload_bytes);
+                    }
+                    Err(err) if tcp_relay_error_is_migratable(&err) => {
+                        match attach_tcp_relay_paths(
+                            context,
+                            &spec,
+                            relay_lane,
+                            &mut remotes,
+                            &send_stream,
+                            !local_open,
+                            TcpRelayAttachMode::Any,
+                        )
+                        .await
+                        {
+                            Ok(attached) if attached > 0 => {
+                                match sender
+                                    .send_stream_data(context, &mut remotes, retry_frame)
+                                    .await
+                                {
+                                    Ok(outcome) => {
+                                        last_stream_progress_at = Instant::now();
+                                        stats.record_payload_bytes(queued.payload_bytes);
+                                        path_stats
+                                            .entry(outcome.path_key)
+                                            .or_default()
+                                            .record_payload_bytes(queued.payload_bytes);
+                                    }
+                                    Err(err) if tcp_relay_error_is_migratable(&err) => {
+                                        break Err(err);
+                                    }
+                                    Err(err) => break Err(err),
+                                }
+                            }
+                            Ok(_) => break Err(err),
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+            _ = tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT), if queued_send_blocked => {
+                continue;
+            }
             read = async {
                 let read_budget = prospective_read_budget;
                 #[cfg(feature = "lab-diagnostics")]
@@ -513,43 +618,7 @@ where
                 };
                 if read == 0 {
                     local_open = false;
-                    if remotes.fin_requires_repair_drain() && send_stream.repair_bytes() > 0 {
-                        pending_local_fin = true;
-                    } else {
-                        match sender
-                            .send_control_frame(
-                                context,
-                                &mut remotes,
-                                Frame::StreamFin {
-                                    stream_id,
-                                    final_offset: send_stream.next_offset(),
-                                },
-                                RelaySendCause::StreamFin,
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                last_stream_progress_at = Instant::now();
-                            }
-                            Err(err) if tcp_relay_error_is_migratable(&err) => {
-                                if let Err(err) = attach_tcp_relay_paths(
-                                    context,
-                                    &spec,
-                                    relay_lane,
-                                    &mut remotes,
-                                    &send_stream,
-                                    !local_open,
-                                    TcpRelayAttachMode::Any,
-                                )
-                                .await
-                                {
-                                    break Err(err);
-                                }
-                                last_stream_progress_at = Instant::now();
-                            }
-                            Err(err) => break Err(err),
-                        }
-                    }
+                    pending_local_fin = true;
                 } else {
                     if tcp_relay_expects_interactive_response(relay_lane) && remote_open {
                         interactive_response_pending = true;
@@ -567,53 +636,19 @@ where
                     };
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
-                    let sent_frame = frame.clone();
-                    match sender.send_stream_data(context, &mut remotes, frame).await {
-                        Ok(outcome) => {
-                            last_stream_progress_at = Instant::now();
-                            stats.record_payload_bytes(read);
-                            path_stats
-                                .entry(outcome.path_key)
-                                .or_default()
-                                .record_payload_bytes(read);
-                        }
-                        Err(err) if tcp_relay_error_is_migratable(&err) => {
-                            match attach_tcp_relay_paths(
-                                context,
-                                &spec,
-                                relay_lane,
-                                &mut remotes,
-                                &send_stream,
-                                !local_open,
-                                TcpRelayAttachMode::Any,
-                            )
-                            .await
-                            {
-                                Ok(attached) if attached > 0 => {
-                                    match sender
-                                        .send_stream_data(context, &mut remotes, sent_frame.clone())
-                                        .await
-                                    {
-                                        Ok(outcome) => {
-                                            last_stream_progress_at = Instant::now();
-                                            stats.record_payload_bytes(read);
-                                            path_stats
-                                                .entry(outcome.path_key)
-                                                .or_default()
-                                                .record_payload_bytes(read);
-                                        }
-                                        Err(err) if tcp_relay_error_is_migratable(&err) => {
-                                            break Err(err);
-                                        }
-                                        Err(err) => break Err(err),
-                                    }
-                                }
-                                Ok(_) => break Err(err),
-                                Err(err) => break Err(err),
-                            }
-                        }
-                        Err(err) => break Err(err),
-                    }
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "client_sender_enqueue",
+                        format_args!(
+                            "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={}",
+                            stream_id.0,
+                            relay_lane,
+                            read,
+                            sender_queue.bytes().saturating_add(read),
+                            sender_queue_limit,
+                        ),
+                    );
+                    sender_queue.push(frame);
                 }
             }
             frame = async {
@@ -1023,7 +1058,10 @@ where
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
                         last_stream_progress_at = Instant::now();
-                        if pending_local_fin && send_stream.repair_bytes() == 0 {
+                        if pending_local_fin
+                            && sender_queue.is_empty()
+                            && send_stream.repair_bytes() == 0
+                        {
                             match sender
                                 .send_control_frame(
                                     context,
@@ -1250,7 +1288,7 @@ async fn attach_tcp_relay_validation_paths(
             role: StreamOpenRole::Validation,
             allow_mixed_carrier: true,
             send_attach_control: true,
-            attach_all_candidates: true,
+            attach_all_candidates: false,
         },
     )
     .await
@@ -1322,8 +1360,7 @@ pub(super) async fn attach_relay_path_candidates(
                             StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        if request.role == StreamOpenRole::Active && !request.attach_all_candidates
-                        {
+                        if !request.attach_all_candidates {
                             return Ok(attached);
                         }
                     }
@@ -1397,7 +1434,9 @@ pub(super) fn relay_path_open_error_is_retryable(
 }
 
 pub(super) fn no_schedulable_reliable_path_error(context: &ClientPathContext) -> RuntimeError {
-    if !context.tcp_paths.is_empty() {
+    if !context.tcp_paths.is_empty() && !context.udp_paths.is_empty() {
+        RuntimeError::NoSchedulableReliablePath
+    } else if !context.tcp_paths.is_empty() {
         RuntimeError::NoSchedulableTcpPath
     } else {
         RuntimeError::NoSchedulableUdpPath
@@ -1435,7 +1474,7 @@ pub(super) async fn attach_tcp_relay_paths(
                 role: StreamOpenRole::Validation,
                 allow_mixed_carrier: true,
                 send_attach_control: false,
-                attach_all_candidates: true,
+                attach_all_candidates: false,
             },
         )
         .await;
@@ -1593,7 +1632,9 @@ pub(super) async fn attach_udp_relay_paths(
                             StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        if role == StreamOpenRole::Active {
+                        if role == StreamOpenRole::Active
+                            || matches!(mode, TcpRelayAttachMode::BulkStriping)
+                        {
                             return Ok(attached);
                         }
                     }

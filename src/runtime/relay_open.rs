@@ -597,43 +597,59 @@ pub(super) async fn open_remote_stream_with_id(
     ingress: IngressKind,
     lane: FlowLane,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    if context.tcp_paths.is_empty() {
-        return open_remote_stream_with_id_over_udp(context, stream_id, target, ingress, lane)
-            .await;
-    }
     let mut attempted = Vec::new();
     let mut last_retryable_error = None;
-    while attempted.len() < context.tcp_paths.len() {
-        let Some(path_index) =
-            context.reserve_tcp_stream_path(lane, PATH_OPEN_SCORE_BYTES, &attempted)
+    let candidate_count = context
+        .tcp_paths
+        .len()
+        .saturating_add(context.udp_paths.len());
+    while attempted.len() < candidate_count {
+        let Some(key) =
+            context.reserve_reliable_stream_path(lane, PATH_OPEN_SCORE_BYTES, &attempted)
         else {
             break;
         };
-        attempted.push(path_index);
-        match open_remote_stream_on_reserved_path(
-            context,
-            stream_id,
-            target.clone(),
-            ingress,
-            lane,
-            path_index,
-            StreamOpenRole::Active,
-        )
-        .await
-        {
+        attempted.push(key);
+        let open_result = match key.underlay {
+            UnderlayProtocol::Tcp => {
+                open_remote_stream_on_reserved_path(
+                    context,
+                    stream_id,
+                    target.clone(),
+                    ingress,
+                    lane,
+                    key.index,
+                    StreamOpenRole::Active,
+                )
+                .await
+            }
+            UnderlayProtocol::Udp => {
+                open_remote_stream_on_reserved_udp_path(
+                    context,
+                    stream_id,
+                    target.clone(),
+                    ingress,
+                    lane,
+                    key.index,
+                    UdpStreamOpenOptions::ACTIVE_WAIT,
+                )
+                .await
+            }
+        };
+        match open_result {
             Ok(opened) => return Ok(opened),
-            Err(err) if stream_open_error_is_path_retryable(&err) => {
-                context.release_tcp_path_load(path_index, lane);
-                context.mark_tcp_path_failure(path_index);
+            Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
+                context.release_relay_path_load(key.underlay, key.index, lane);
+                context.mark_relay_path_failure(key.underlay, key.index);
                 last_retryable_error = Some(err);
             }
             Err(err) => {
-                context.release_tcp_path_load(path_index, lane);
+                context.release_relay_path_load(key.underlay, key.index, lane);
                 return Err(err);
             }
         }
     }
-    Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableTcpPath))
+    Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
 }
 
 pub(super) async fn open_remote_stream_on_path(
@@ -743,51 +759,6 @@ pub(super) async fn open_remote_stream_on_reserved_path(
         ),
     );
     Ok(OpenedRemoteStream { stream, path_index })
-}
-
-pub(super) async fn open_remote_stream_with_id_over_udp(
-    context: &ClientPathContext,
-    stream_id: StreamId,
-    target: TargetAddr,
-    ingress: IngressKind,
-    lane: FlowLane,
-) -> Result<OpenedRemoteStream, RuntimeError> {
-    if context.udp_paths.is_empty() {
-        return Err(RuntimeError::NoTcpPath);
-    }
-    let mut attempted = Vec::new();
-    let mut last_retryable_error = None;
-    while attempted.len() < context.udp_paths.len() {
-        let Some(path_index) =
-            context.reserve_udp_stream_path(lane, PATH_OPEN_SCORE_BYTES, &attempted)
-        else {
-            break;
-        };
-        attempted.push(path_index);
-        match open_remote_stream_on_reserved_udp_path(
-            context,
-            stream_id,
-            target.clone(),
-            ingress,
-            lane,
-            path_index,
-            UdpStreamOpenOptions::ACTIVE_WAIT,
-        )
-        .await
-        {
-            Ok(opened) => return Ok(opened),
-            Err(err) if udp_stream_open_error_is_path_retryable(&err) => {
-                context.release_udp_stream_path_load(path_index, lane);
-                context.mark_udp_path_failure(path_index);
-                last_retryable_error = Some(err);
-            }
-            Err(err) => {
-                context.release_udp_stream_path_load(path_index, lane);
-                return Err(err);
-            }
-        }
-    }
-    Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath))
 }
 
 pub(super) async fn open_remote_stream_on_udp_path(

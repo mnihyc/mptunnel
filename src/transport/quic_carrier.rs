@@ -25,6 +25,12 @@ pub struct Connection {
     connection: quinn::Connection,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CongestionMetrics {
+    pub congestion_window: u64,
+    pub pacing_rate_bps: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct SendStream {
     stream: quinn::SendStream,
@@ -66,12 +72,14 @@ impl Endpoint {
     }
 
     pub async fn accept(&self) -> Option<Connection> {
-        let incoming = self.endpoint.accept().await?;
-        match incoming.await {
-            Ok(connection) => Some(Connection { connection }),
-            Err(err) => {
-                eprintln!("warning: QUIC carrier accept failed: {err}");
-                None
+        loop {
+            let incoming = self.endpoint.accept().await?;
+            match incoming.await {
+                Ok(connection) => return Some(Connection { connection }),
+                Err(err) => {
+                    eprintln!("warning: QUIC carrier accept failed: {err}");
+                    continue;
+                }
             }
         }
     }
@@ -102,6 +110,14 @@ impl Connection {
 
     pub fn stats(&self) -> quinn::ConnectionStats {
         self.connection.stats()
+    }
+
+    pub fn congestion_metrics(&self) -> CongestionMetrics {
+        let metrics = self.connection.congestion_state().metrics();
+        CongestionMetrics {
+            congestion_window: metrics.congestion_window,
+            pacing_rate_bps: metrics.pacing_rate,
+        }
     }
 }
 
@@ -438,6 +454,7 @@ mod tests {
     async fn quic_carrier_rejects_wrong_shared_secret_before_product_frames() {
         let server_secret = b"0123456789abcdef0123456789abcdef";
         let wrong_client_secret = b"fedcba9876543210fedcba9876543210";
+        let good_client_secret = server_secret;
         let mux_limits = MuxLimits::default();
         let server = Endpoint::bind_server(
             "127.0.0.1:0".parse().expect("server addr"),
@@ -448,7 +465,10 @@ mod tests {
         .expect("server endpoint");
         let server_addr = server.local_addr().expect("server local addr");
         let server_task = tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(5), server.accept()).await;
+            timeout(Duration::from_secs(5), server.accept())
+                .await
+                .expect("server accept timeout")
+                .expect("server should accept the later valid client");
         });
 
         let client = Endpoint::bind_client(
@@ -466,6 +486,18 @@ mod tests {
             QuicCarrierError::Connection(_) => {}
             err => panic!("unexpected QUIC wrong-secret error: {err:?}"),
         }
+
+        let good_client = Endpoint::bind_client(
+            "127.0.0.1:0".parse().expect("good client addr"),
+            good_client_secret,
+            mux_limits,
+        )
+        .await
+        .expect("good client endpoint");
+        timeout(Duration::from_secs(5), good_client.connect(server_addr))
+            .await
+            .expect("good connect timeout")
+            .expect("valid client should connect after failed handshake");
 
         server_task.await.expect("server task");
     }

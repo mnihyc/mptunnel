@@ -11,6 +11,8 @@ use super::server_runtime::*;
 use super::tcp_path::*;
 use super::tun_l4::*;
 use super::udp_path::*;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
@@ -901,38 +903,6 @@ impl ClientPathContext {
         ordered_reliable_path_indices(&self.tcp_paths, &observations, lane, payload_bytes)
     }
 
-    pub(super) fn reserve_tcp_stream_path(
-        &self,
-        lane: FlowLane,
-        payload_bytes: usize,
-        excluded: &[usize],
-    ) -> Option<usize> {
-        let mut health = self.health.lock().expect("client path health lock");
-        let mut observations = health_observations(&mut health.tcp);
-        apply_tcp_bulk_isolation(&mut observations, lane, self.mux_limits);
-        let active_udp_work = health.udp.iter().any(|record| record.active_flows > 0);
-        let indices = if endpoint_only_tcp_startup_should_spread_bulk_load(
-            &self.tcp_paths,
-            &observations,
-            lane,
-            active_udp_work,
-        ) {
-            endpoint_only_reliable_startup_path_indices(
-                &self.tcp_paths,
-                &observations,
-                lane,
-                payload_bytes,
-            )
-        } else {
-            ordered_reliable_path_indices(&self.tcp_paths, &observations, lane, payload_bytes)
-        };
-        let index = indices
-            .into_iter()
-            .find(|index| !excluded.contains(index))?;
-        health.tcp.get_mut(index)?.reserve_load(lane);
-        Some(index)
-    }
-
     pub(super) fn reserve_tcp_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .health
@@ -945,22 +915,6 @@ impl ClientPathContext {
         }
     }
 
-    pub(super) fn reserve_udp_stream_path(
-        &self,
-        lane: FlowLane,
-        payload_bytes: usize,
-        excluded: &[usize],
-    ) -> Option<usize> {
-        let mut health = self.health.lock().expect("client path health lock");
-        let observations = health_observations(&mut health.udp);
-        let index =
-            ordered_reliable_path_indices(&self.udp_paths, &observations, lane, payload_bytes)
-                .into_iter()
-                .find(|index| !excluded.contains(index))?;
-        health.udp.get_mut(index)?.reserve_load(lane);
-        Some(index)
-    }
-
     pub(super) fn reserve_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .health
@@ -971,6 +925,55 @@ impl ClientPathContext {
         {
             current.reserve_load(lane);
         }
+    }
+
+    pub(super) fn reserve_reliable_stream_path(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+        excluded: &[RelayPathKey],
+    ) -> Option<RelayPathKey> {
+        let mut health = self.health.lock().expect("client path health lock");
+        let mut tcp_observations = health_observations(&mut health.tcp);
+        apply_tcp_bulk_isolation(&mut tcp_observations, lane, self.mux_limits);
+        let udp_observations = health_observations(&mut health.udp);
+        let mut candidates = reliable_stream_path_candidates(
+            &self.tcp_paths,
+            &tcp_observations,
+            &self.udp_paths,
+            &udp_observations,
+            lane,
+            payload_bytes,
+        );
+        candidates.retain(|candidate| !excluded.contains(&candidate.key));
+        candidates.sort_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| {
+                    reliable_stream_initial_underlay_order(lane, left.key.underlay).cmp(
+                        &reliable_stream_initial_underlay_order(lane, right.key.underlay),
+                    )
+                })
+                .then_with(|| left.key.index.cmp(&right.key.index))
+        });
+        let selected = candidates.first()?.key;
+        match selected.underlay {
+            UnderlayProtocol::Tcp => health.tcp.get_mut(selected.index)?.reserve_load(lane),
+            UnderlayProtocol::Udp => health.udp.get_mut(selected.index)?.reserve_load(lane),
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "reliable_stream_initial_path_selected",
+            format_args!(
+                "lane={:?} payload_bytes={} path_underlay={:?} path_index={} candidate_count={}",
+                lane,
+                payload_bytes,
+                selected.underlay,
+                selected.index,
+                candidates.len(),
+            ),
+        );
+        Some(selected)
     }
 
     pub(super) fn ordered_tcp_repair_path_indices(
@@ -1123,11 +1126,13 @@ impl ClientPathContext {
         let mut health = self.health.lock().expect("client path health lock");
         let tcp_observations = health_observations(&mut health.tcp);
         let udp_observations = health_observations(&mut health.udp);
+        let scoring_payload_bytes =
+            bulk_service_horizon_payload_bytes(payload_bytes, self.mux_limits);
         ordered_path_scores(
             &self.tcp_paths,
             &tcp_observations,
             FlowLane::Throughput,
-            payload_bytes,
+            scoring_payload_bytes,
         )
         .into_iter()
         .filter_map(|(index, eta_ms)| {
@@ -1149,7 +1154,7 @@ impl ClientPathContext {
                 &self.udp_paths,
                 &udp_observations,
                 FlowLane::Throughput,
-                payload_bytes,
+                scoring_payload_bytes,
             )
             .into_iter()
             .filter_map(|(index, eta_ms)| {
@@ -1965,26 +1970,57 @@ pub(super) fn ordered_reliable_path_indices(
     lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
+    reliable_stream_startup_path_scores(paths, observations, lane, payload_bytes)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect()
+}
+
+pub(super) fn reliable_stream_startup_path_scores(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    lane: FlowLane,
+    payload_bytes: usize,
+) -> Vec<(usize, f64)> {
     if reliable_stream_latency_startup_should_use_configured_order(paths, observations, lane) {
-        return configured_order_path_indices(paths, observations, lane, payload_bytes);
+        return configured_order_path_scores(paths, observations, lane, payload_bytes);
     }
     if reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, lane) {
-        return endpoint_only_reliable_startup_path_indices(
+        return endpoint_only_reliable_startup_path_scores(
             paths,
             observations,
             lane,
             payload_bytes,
         );
     }
-    ordered_path_indices(paths, observations, lane, payload_bytes)
+    ordered_path_scores(paths, observations, lane, payload_bytes)
 }
 
-pub(super) fn endpoint_only_reliable_startup_path_indices(
+fn reliable_stream_mixed_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
     payload_bytes: usize,
-) -> Vec<usize> {
+) -> Vec<(usize, f64)> {
+    if reliable_stream_latency_startup_should_use_configured_order(paths, observations, lane)
+        || reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, lane)
+    {
+        return endpoint_only_reliable_startup_path_scores(
+            paths,
+            observations,
+            lane,
+            payload_bytes,
+        );
+    }
+    ordered_path_scores(paths, observations, lane, payload_bytes)
+}
+
+pub(super) fn endpoint_only_reliable_startup_path_scores(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+    lane: FlowLane,
+    payload_bytes: usize,
+) -> Vec<(usize, f64)> {
     let observations = observations
         .iter()
         .copied()
@@ -2004,7 +2040,7 @@ pub(super) fn endpoint_only_reliable_startup_path_indices(
             ..observation
         })
         .collect::<Vec<_>>();
-    ordered_path_indices(paths, &observations, lane, payload_bytes)
+    ordered_path_scores(paths, &observations, lane, payload_bytes)
 }
 
 pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {
@@ -2045,18 +2081,6 @@ pub(super) fn configured_order_path_scores(
             )
             .map(|score| (index, score.eta_ms))
         })
-        .collect()
-}
-
-pub(super) fn ordered_path_indices(
-    paths: &[PathSpec],
-    observations: &[ClientPathObservation],
-    lane: FlowLane,
-    payload_bytes: usize,
-) -> Vec<usize> {
-    ordered_path_scores(paths, observations, lane, payload_bytes)
-        .into_iter()
-        .map(|(index, _)| index)
         .collect()
 }
 
@@ -2102,6 +2126,99 @@ pub(super) fn ordered_path_scores(
             .then_with(|| left.0.cmp(&right.0))
     });
     scores
+}
+
+fn reliable_stream_path_candidates(
+    tcp_paths: &[PathSpec],
+    tcp_observations: &[ClientPathObservation],
+    udp_paths: &[PathSpec],
+    udp_observations: &[ClientPathObservation],
+    lane: FlowLane,
+    payload_bytes: usize,
+) -> Vec<BulkPathCandidate> {
+    let active_udp_work = endpoint_only_startup_has_any_load(udp_observations);
+    let tcp_scores = if endpoint_only_tcp_startup_should_spread_bulk_load(
+        tcp_paths,
+        tcp_observations,
+        lane,
+        active_udp_work,
+    ) {
+        endpoint_only_reliable_startup_path_scores(tcp_paths, tcp_observations, lane, payload_bytes)
+    } else {
+        reliable_stream_mixed_startup_path_scores(tcp_paths, tcp_observations, lane, payload_bytes)
+    };
+    let udp_scores =
+        reliable_stream_mixed_startup_path_scores(udp_paths, udp_observations, lane, payload_bytes);
+
+    tcp_scores
+        .into_iter()
+        .filter_map(|(index, eta_ms)| {
+            let path = tcp_paths.get(index)?;
+            let observation = tcp_observations.get(index).copied().unwrap_or_default();
+            let snapshot = path_snapshot(path, index, observation);
+            path_can_be_auto_discovered_for_lane(path, observation, lane).then_some(
+                BulkPathCandidate {
+                    key: RelayPathKey {
+                        underlay: UnderlayProtocol::Tcp,
+                        index,
+                    },
+                    eta_ms: eta_ms
+                        + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
+                    has_evidence: bulk_candidate_has_evidence(path, observation),
+                    snapshot,
+                },
+            )
+        })
+        .chain(udp_scores.into_iter().filter_map(|(index, eta_ms)| {
+            let path = udp_paths.get(index)?;
+            let observation = udp_observations.get(index).copied().unwrap_or_default();
+            let snapshot = path_snapshot(path, index, observation);
+            let eta_ms = eta_ms
+                + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
+                    udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
+                } else {
+                    0.0
+                }
+                + reliable_stream_initial_lane_protection_penalty(snapshot, lane);
+            path_can_be_auto_discovered_for_lane(path, observation, lane).then_some(
+                BulkPathCandidate {
+                    key: RelayPathKey {
+                        underlay: UnderlayProtocol::Udp,
+                        index,
+                    },
+                    eta_ms,
+                    has_evidence: bulk_candidate_has_evidence(path, observation),
+                    snapshot,
+                },
+            )
+        }))
+        .collect()
+}
+
+fn reliable_stream_initial_underlay_order(lane: FlowLane, underlay: UnderlayProtocol) -> u8 {
+    match (lane, underlay) {
+        (
+            FlowLane::Throughput | FlowLane::Background | FlowLane::RealtimeDatagram,
+            UnderlayProtocol::Udp,
+        ) => 0,
+        (
+            FlowLane::Throughput | FlowLane::Background | FlowLane::RealtimeDatagram,
+            UnderlayProtocol::Tcp,
+        ) => 1,
+        (_, UnderlayProtocol::Tcp) => 0,
+        (_, UnderlayProtocol::Udp) => 1,
+    }
+}
+
+fn reliable_stream_initial_lane_protection_penalty(snapshot: PathSnapshot, lane: FlowLane) -> f64 {
+    if snapshot.underlay == UnderlayProtocol::Udp
+        && matches!(lane, FlowLane::Control | FlowLane::Latency)
+        && snapshot.active_latency_sensitive_flows > 0
+    {
+        snapshot.srtt_ms.max(1.0)
+    } else {
+        0.0
+    }
 }
 
 pub(super) fn path_snapshot(
@@ -2152,9 +2269,8 @@ pub(super) fn path_snapshot(
         jitter_ms,
         delivery_rate_bps,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
-        queue_bytes: observation
-            .relay_queue_bytes
-            .saturating_add(observation.carrier_queue_bytes),
+        queue_bytes: observation.carrier_queue_bytes,
+        product_queue_bytes: observation.relay_queue_bytes,
         bytes_in_flight: observation
             .relay_bytes_in_flight
             .saturating_add(observation.carrier_bytes_in_flight),
@@ -2291,6 +2407,19 @@ pub(super) fn path_can_be_auto_discovered(
         && !path.metadata.capabilities.backup
         && !path.metadata.capabilities.probe_only
         && path.metadata.capabilities.bulk_allowed
+}
+
+fn path_can_be_auto_discovered_for_lane(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+    lane: FlowLane,
+) -> bool {
+    observation.state == SchedulerPathState::Active
+        && !path.metadata.capabilities.expensive
+        && !path.metadata.capabilities.backup
+        && !path.metadata.capabilities.probe_only
+        && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
+            || path.metadata.capabilities.bulk_allowed)
 }
 
 fn bulk_candidate_has_evidence(path: &PathSpec, observation: ClientPathObservation) -> bool {

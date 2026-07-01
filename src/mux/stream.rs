@@ -199,6 +199,30 @@ impl ReliableSendStream {
         frames
     }
 
+    pub fn retransmission_frames_after_ack_frontier(
+        &self,
+        ranges: &[OffsetRange],
+        byte_limit: usize,
+    ) -> Vec<Frame> {
+        if byte_limit == 0 || self.repair_cache.is_empty() {
+            return Vec::new();
+        }
+        let ranges = normalized_offset_ranges(ranges);
+        let Some(largest_acked_end) = ranges.iter().map(|range| range.end).max() else {
+            return Vec::new();
+        };
+        if largest_acked_end >= self.next_offset {
+            return Vec::new();
+        }
+        self.retransmission_frames_for_ranges(
+            &[OffsetRange {
+                start: largest_acked_end,
+                end: self.next_offset,
+            }],
+            byte_limit,
+        )
+    }
+
     pub fn retransmission_frames_for_ranges(
         &self,
         ranges: &[OffsetRange],
@@ -422,10 +446,19 @@ impl ReliableRecvStream {
         if self.received_ranges.covers(offset, end) {
             return Ok(ReceiveOutcome::default());
         }
-        if self.overlaps_existing(offset, end) {
-            return Err(StreamError::OverlappingData);
+        let missing_ranges = self.received_ranges.uncovered_ranges(offset, end);
+        if missing_ranges.is_empty() {
+            return Ok(ReceiveOutcome::default());
         }
-        let new_reorder_bytes = self.reorder_bytes.checked_add(payload.len()).ok_or(
+        let missing_bytes = missing_ranges
+            .iter()
+            .map(|range| usize::try_from(range.len()).unwrap_or(usize::MAX))
+            .try_fold(0usize, |total, len| total.checked_add(len))
+            .ok_or(StreamError::ReorderBufferFull {
+                actual: usize::MAX,
+                limit: self.limits.max_reorder_bytes,
+            })?;
+        let new_reorder_bytes = self.reorder_bytes.checked_add(missing_bytes).ok_or(
             StreamError::ReorderBufferFull {
                 actual: usize::MAX,
                 limit: self.limits.max_reorder_bytes,
@@ -442,7 +475,25 @@ impl ReliableRecvStream {
         received_ranges.insert(offset, end);
         self.reorder_bytes = new_reorder_bytes;
         self.received_ranges = received_ranges;
-        self.buffered.insert(offset, RecvChunk { payload, flags });
+        for range in missing_ranges {
+            let start = usize::try_from(range.start.saturating_sub(offset)).unwrap_or(usize::MAX);
+            let stop = usize::try_from(range.end.saturating_sub(offset)).unwrap_or(usize::MAX);
+            let stop = stop.min(payload.len());
+            if start >= stop {
+                continue;
+            }
+            self.buffered.insert(
+                range.start,
+                RecvChunk {
+                    payload: payload.slice(start..stop),
+                    flags: if flags.fin && range.end == end {
+                        flags
+                    } else {
+                        StreamFlags::NONE
+                    },
+                },
+            );
+        }
 
         let mut delivered = Vec::new();
         let mut fin = false;
@@ -511,16 +562,6 @@ impl ReliableRecvStream {
             max_offset: self.max_data_offset(),
         }
     }
-
-    fn overlaps_existing(&self, start: u64, end: u64) -> bool {
-        if end <= self.next_offset {
-            return false;
-        }
-        self.received_ranges
-            .ranges
-            .iter()
-            .any(|(range_start, range_end)| start < *range_end && end > *range_start)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -577,6 +618,36 @@ impl RangeSet {
             .range(..=start)
             .next_back()
             .is_some_and(|(_, range_end)| *range_end >= end)
+    }
+
+    fn uncovered_ranges(&self, start: u64, end: u64) -> Vec<OffsetRange> {
+        if start >= end {
+            return Vec::new();
+        }
+        let mut cursor = start;
+        let mut ranges = Vec::new();
+        if let Some((_, range_end)) = self.ranges.range(..=start).next_back()
+            && *range_end > cursor
+        {
+            cursor = (*range_end).min(end);
+        }
+        for (&range_start, &range_end) in self.ranges.range(start..) {
+            if cursor >= end || range_start >= end {
+                break;
+            }
+            if range_start > cursor
+                && let Some(range) = OffsetRange::new(cursor, range_start.min(end))
+            {
+                ranges.push(range);
+            }
+            cursor = cursor.max(range_end.min(end));
+        }
+        if cursor < end
+            && let Some(range) = OffsetRange::new(cursor, end)
+        {
+            ranges.push(range);
+        }
+        ranges
     }
 
     fn ranges(&self) -> Vec<OffsetRange> {
@@ -776,6 +847,29 @@ mod tests {
     }
 
     #[test]
+    fn send_stream_repairs_tail_after_ack_frontier() {
+        let mut stream = ReliableSendStream::new(StreamId(10), limits());
+        for payload in [b"aaaa", b"bbbb", b"cccc"] {
+            stream
+                .send_data(Bytes::copy_from_slice(payload), StreamFlags::NONE)
+                .expect("send");
+        }
+
+        let frames =
+            stream.retransmission_frames_after_ack_frontier(&[OffsetRange { start: 0, end: 4 }], 6);
+
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(
+            &frames[0],
+            Frame::StreamData { offset: 4, payload, .. } if payload.as_ref() == b"bbbb"
+        ));
+        assert!(matches!(
+            &frames[1],
+            Frame::StreamData { offset: 8, payload, .. } if payload.as_ref() == b"cc"
+        ));
+    }
+
+    #[test]
     fn send_stream_enforces_flow_control_and_repair_limit() {
         let mut limit = limits();
         limit.max_stream_window_bytes = 4;
@@ -933,13 +1027,31 @@ mod tests {
     }
 
     #[test]
-    fn recv_stream_rejects_overlap_and_reorder_pressure() {
+    fn recv_stream_accepts_duplicate_overlap_and_rejects_reorder_pressure() {
         let mut stream = ReliableRecvStream::new(StreamId(7), limits());
         stream
             .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
             .expect("first");
         assert_eq!(
             stream.receive_data(2, Bytes::from_static(b"xx"), StreamFlags::NONE),
+            Ok(ReceiveOutcome::default())
+        );
+
+        let mut stream = ReliableRecvStream::new(StreamId(8), limits());
+        stream
+            .receive_data(5, Bytes::from_static(b"world"), StreamFlags::NONE)
+            .expect("out of order tail");
+        let outcome = stream
+            .receive_data(0, Bytes::from_static(b"hello w"), StreamFlags::NONE)
+            .expect("partially overlapping lower range");
+        assert_eq!(
+            outcome.delivered,
+            vec![Bytes::from_static(b"hello"), Bytes::from_static(b"world")]
+        );
+        assert_eq!(stream.next_offset(), 10);
+        assert_eq!(stream.reorder_bytes(), 0);
+        assert_eq!(
+            stream.receive_data(3, Bytes::from_static(b"lo wo"), StreamFlags::NONE),
             Ok(ReceiveOutcome::default())
         );
 

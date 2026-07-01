@@ -58,6 +58,75 @@ fn mixed_reliable_underlays_share_one_logical_session() {
     );
 }
 
+#[test]
+fn mixed_reliable_initial_open_uses_best_carrier_not_tcp_first() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11082?srtt-ms=240&rate-mbps=50"
+                .parse()
+                .expect("slow tcp path"),
+            "udp://127.0.0.1:11083?srtt-ms=30&rate-mbps=500"
+                .parse()
+                .expect("fast udp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let selected = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("selected path");
+
+    assert_eq!(selected.underlay, UnderlayProtocol::Udp);
+    assert_eq!(selected.index, 0);
+}
+
+#[test]
+fn reliable_initial_open_allows_no_bulk_path_for_latency_lane() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11084?srtt-ms=10&rate-mbps=1000&no-bulk"
+                .parse()
+                .expect("low latency no-bulk tcp path"),
+            "tcp://127.0.0.1:11085?srtt-ms=120&rate-mbps=100"
+                .parse()
+                .expect("bulk tcp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let low_latency_score = scheduler::score_path(
+        context.tcp_path_snapshot(0).expect("low-latency snapshot"),
+        FlowLane::Latency,
+        PATH_OPEN_SCORE_BYTES,
+        SchedulerPolicy::default(),
+    )
+    .expect("low-latency score")
+    .eta_ms;
+    let bulk_score = scheduler::score_path(
+        context.tcp_path_snapshot(1).expect("bulk snapshot"),
+        FlowLane::Latency,
+        PATH_OPEN_SCORE_BYTES,
+        SchedulerPolicy::default(),
+    )
+    .expect("bulk score")
+    .eta_ms;
+    assert!(
+        low_latency_score < bulk_score,
+        "low-latency no-bulk path should score ahead for latency: low={low_latency_score} bulk={bulk_score}"
+    );
+
+    let selected = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("selected path");
+
+    assert_eq!(selected.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(selected.index, 0);
+}
+
 #[tokio::test]
 async fn tcp_path_control_command_bypasses_saturated_data_queue() {
     let (tx, mut rx) = tcp_path_session_command_channels(1);
@@ -601,6 +670,30 @@ fn bulk_striping_orders_paths_by_bulk_eta() {
             .first()
             .copied(),
         Some(1)
+    );
+}
+
+#[test]
+fn bulk_striping_uses_service_horizon_for_realistic_fat_path() {
+    let low_latency_path = "tcp://127.0.0.1:10019?srtt-ms=20&rate-mbps=80&low-latency=true"
+        .parse::<PathSpec>()
+        .expect("low-latency path");
+    let high_bandwidth_path = "tcp://127.0.0.1:10020?srtt-ms=180&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("high-bandwidth path");
+    let context = ClientPathContext::new(
+        vec![low_latency_path, high_bandwidth_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert_eq!(
+        tcp_bulk_striping_indices(&context, 64 * 1024)
+            .first()
+            .copied(),
+        Some(1),
+        "sustained bulk must score against a service horizon, not the next tiny frame"
     );
 }
 
@@ -1278,7 +1371,7 @@ fn mixed_bulk_striping_penalizes_lossy_high_rtt_udp_carrier() {
         UdpDatagramPathObservation {
             rtt: Duration::from_millis(250),
             jitter: Duration::from_millis(60),
-            loss_rate: 0.01,
+            loss_rate: 0.15,
             rate_sample: PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(170)),
         },
     );

@@ -538,7 +538,7 @@ where
 }
 
 #[test]
-fn tcp_relay_read_budget_is_ack_gated() {
+fn tcp_relay_sender_queue_budget_is_resource_gated() {
     let mut mux_limits = MuxLimits {
         max_payload_bytes: 64 * 1024,
         max_ack_ranges: 256,
@@ -553,75 +553,110 @@ fn tcp_relay_read_budget_is_ack_gated() {
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
     };
     let mut send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
+    let mut sender_queue = TcpRelaySenderQueue::default();
+    let queue_limit =
+        tcp_relay_sender_queue_limit(mux_limits, mux_limits.max_tcp_path_inflight_bytes);
 
-    assert!(tcp_relay_can_read_with_limit(
+    assert!(tcp_relay_can_read_into_sender_queue(
         &send_stream,
-        mux_limits.max_tcp_path_inflight_bytes
+        &sender_queue,
+        mux_limits,
+        queue_limit
     ));
     assert_eq!(
-        tcp_relay_read_budget_with_limit(
+        tcp_relay_sender_queue_read_budget(
             &send_stream,
+            &sender_queue,
             mux_limits,
-            mux_limits.max_tcp_path_inflight_bytes,
+            queue_limit,
             64 * 1024
         ),
         32 * 1024
     );
 
-    send_stream
+    let first = send_stream
         .send_data(Bytes::from(vec![0u8; 8 * 1024]), StreamFlags::NONE)
         .expect("first send");
+    sender_queue.push(first);
     assert_eq!(
-        tcp_relay_read_budget_with_limit(
+        tcp_relay_sender_queue_read_budget(
             &send_stream,
+            &sender_queue,
             mux_limits,
-            mux_limits.max_tcp_path_inflight_bytes,
+            queue_limit,
             64 * 1024
         ),
         24 * 1024
     );
+    assert!(!tcp_relay_can_read_product_source(
+        true,
+        true,
+        &send_stream,
+        &sender_queue,
+        mux_limits,
+        queue_limit
+    ));
+    assert!(tcp_relay_can_read_product_source(
+        true,
+        false,
+        &send_stream,
+        &sender_queue,
+        mux_limits,
+        queue_limit
+    ));
 
-    send_stream
+    let second = send_stream
         .send_data(Bytes::from(vec![0u8; 24 * 1024]), StreamFlags::NONE)
         .expect("second send");
-    assert!(!tcp_relay_can_read_with_limit(
+    sender_queue.push(second);
+    assert!(!tcp_relay_can_read_into_sender_queue(
         &send_stream,
-        mux_limits.max_tcp_path_inflight_bytes
+        &sender_queue,
+        mux_limits,
+        queue_limit
     ));
     assert_eq!(
-        tcp_relay_read_budget_with_limit(
+        tcp_relay_sender_queue_read_budget(
             &send_stream,
+            &sender_queue,
             mux_limits,
-            mux_limits.max_tcp_path_inflight_bytes,
+            queue_limit,
             64 * 1024
         ),
         0
     );
 
+    sender_queue.pop_front();
     send_stream.apply_ack(&[crate::protocol::OffsetRange {
         start: 0,
         end: 8 * 1024,
     }]);
-    assert!(tcp_relay_can_read_with_limit(
+    assert!(tcp_relay_can_read_into_sender_queue(
         &send_stream,
-        mux_limits.max_tcp_path_inflight_bytes
+        &sender_queue,
+        mux_limits,
+        queue_limit
     ));
     assert_eq!(
-        tcp_relay_read_budget_with_limit(
+        tcp_relay_sender_queue_read_budget(
             &send_stream,
+            &sender_queue,
             mux_limits,
-            mux_limits.max_tcp_path_inflight_bytes,
+            queue_limit,
             64 * 1024
         ),
         8 * 1024
     );
 
     mux_limits.max_tcp_path_inflight_bytes = 64 * 1024;
+    let larger_queue_limit =
+        tcp_relay_sender_queue_limit(mux_limits, mux_limits.max_tcp_path_inflight_bytes);
     assert_eq!(
-        tcp_relay_read_budget_with_limit(
+        tcp_relay_sender_queue_read_budget(
             &send_stream,
+            &sender_queue,
             mux_limits,
-            mux_limits.max_tcp_path_inflight_bytes,
+            larger_queue_limit,
             16 * 1024
         ),
         16 * 1024
@@ -742,8 +777,10 @@ fn auto_tcp_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     assert!(high_bdp_threshold < high_bdp / 4);
     assert!(high_bdp_threshold >= high_bdp / 8);
 
+    let small_flow_bytes =
+        (tcp_lane_startup_chunk_bytes(FlowLane::Throughput, mux_limits) as u64 / 2).max(1);
     let before = state.refresh(
-        TcpRelayFlowSignals::new(threshold / 2, 0, 0),
+        TcpRelayFlowSignals::new(small_flow_bytes, 0, 0),
         Some(path),
         mux_limits,
     );
@@ -1250,6 +1287,74 @@ fn stream_ack_gap_repair_is_suppressed_on_udp_reliable_carrier() {
         .is_empty(),
         "non-authoritative ACK snapshots must not infer missing holes"
     );
+}
+
+#[test]
+fn tail_stall_repair_prefers_authoritative_ack_gap_before_frontier_tail() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(32), mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"aaaa"), StreamFlags::NONE)
+        .expect("first chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"bbbb"), StreamFlags::NONE)
+        .expect("second chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"cccc"), StreamFlags::NONE)
+        .expect("third chunk");
+
+    let ranges = [OffsetRange { start: 4, end: 12 }];
+    let _ = send_stream.apply_ack(&ranges);
+    let (repairs, kind) = stream_tail_stall_repair_frames(&send_stream, &ranges, usize::MAX, true);
+
+    assert_eq!(kind, "ack_gap");
+    assert_eq!(repairs.len(), 1);
+    assert!(matches!(
+        &repairs[0],
+        Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        } if payload.as_ref() == b"aaaa"
+    ));
+}
+
+#[test]
+fn tail_stall_repair_uses_frontier_tail_when_ack_has_no_authoritative_gap() {
+    let mux_limits = MuxLimits::default();
+    let mut send_stream = ReliableSendStream::new(StreamId(33), mux_limits);
+    send_stream
+        .send_data(Bytes::from_static(b"aaaa"), StreamFlags::NONE)
+        .expect("first chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"bbbb"), StreamFlags::NONE)
+        .expect("second chunk");
+    send_stream
+        .send_data(Bytes::from_static(b"cccc"), StreamFlags::NONE)
+        .expect("third chunk");
+
+    let ranges = [OffsetRange { start: 0, end: 4 }];
+    let _ = send_stream.apply_ack(&ranges);
+    let (repairs, kind) = stream_tail_stall_repair_frames(&send_stream, &ranges, 6, true);
+
+    assert_eq!(kind, "ack_frontier");
+    assert_eq!(repairs.len(), 2);
+    assert!(matches!(
+        &repairs[0],
+        Frame::StreamData {
+            offset: 4,
+            payload,
+            ..
+        } if payload.as_ref() == b"bbbb"
+    ));
+    assert!(matches!(
+        &repairs[1],
+        Frame::StreamData {
+            offset: 8,
+            payload,
+            ..
+        } if payload.as_ref() == b"cc"
+    ));
 }
 
 #[test]

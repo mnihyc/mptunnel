@@ -786,6 +786,45 @@ impl UdpDatagramClientAssociation {
             .context
             .ordered_udp_path_candidates_for_ttl(payload.len(), ttl_ms);
         if candidates.is_empty() {
+            #[cfg(feature = "lab-diagnostics")]
+            {
+                let now = Instant::now();
+                let observations = self
+                    .context
+                    .health
+                    .lock()
+                    .expect("client path health lock")
+                    .udp
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, record)| {
+                        let observation = record.observe(now);
+                        format!(
+                            "{}:{:?}:srtt={:?}:rate={:?}:carrier_rate={:?}:flows={}:failed={:?}",
+                            index,
+                            observation.state,
+                            observation.measured_srtt_ms,
+                            observation.measured_rate_bps,
+                            observation.carrier_delivery_rate_bps,
+                            observation.active_flows,
+                            record.failed_until.map(|deadline| deadline
+                                .saturating_duration_since(now)
+                                .as_millis())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                lab_diagnostic(
+                    "udp_datagram_no_candidates",
+                    format_args!(
+                        "udp_paths={} payload_bytes={} ttl_ms={} observations={}",
+                        self.context.udp_paths.len(),
+                        payload.len(),
+                        ttl_ms,
+                        observations
+                    ),
+                );
+            }
             return Err(RuntimeError::NoSchedulableUdpPath);
         }
 
@@ -1121,8 +1160,17 @@ impl UdpDatagramClientAssociation {
                 limit: model.mtu_payload_bytes,
             });
         }
+        let path_session_was_open = self.path_session_is_open(path_index);
+        let association_had_open_path = !self.paths.is_empty();
         let handshake_timeout = udp_datagram_path_open_timeout(
-            !self.paths.is_empty(),
+            association_had_open_path,
+            has_unattempted_alternative,
+            model,
+            ttl_ms,
+        );
+        let response_timeout = udp_datagram_first_response_timeout(
+            path_session_was_open,
+            association_had_open_path,
             has_unattempted_alternative,
             model,
             ttl_ms,
@@ -1178,7 +1226,7 @@ impl UdpDatagramClientAssociation {
             path.pacer.wait_for_send(model, payload.len()).await;
             let result = path
                 .session
-                .send_to(target, payload, ttl_ms, model.response_timeout)
+                .send_to(target, payload, ttl_ms, response_timeout)
                 .await;
             let observation = path.session.take_feedback_observation();
             (path.session.path_index, observation, result)
@@ -1279,6 +1327,20 @@ pub(super) fn udp_datagram_path_open_timeout(
         .max(UDP_MIN_RESPONSE_TIMEOUT)
         .min(UDP_PATH_HANDSHAKE_TIMEOUT)
         .min(ttl_timeout)
+}
+
+pub(super) fn udp_datagram_first_response_timeout(
+    path_session_was_open: bool,
+    association_had_open_path: bool,
+    has_unattempted_alternative: bool,
+    model: UdpPathRuntimeModel,
+    ttl_ms: u32,
+) -> Duration {
+    if path_session_was_open || association_had_open_path {
+        return model.response_timeout;
+    }
+    udp_datagram_path_open_timeout(false, has_unattempted_alternative, model, ttl_ms)
+        .max(model.response_timeout)
 }
 
 pub(super) struct UdpDatagramClientSession {

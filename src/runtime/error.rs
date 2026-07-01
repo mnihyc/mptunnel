@@ -39,6 +39,7 @@ pub enum RuntimeError {
     NoTcpPath,
     NoUdpPath,
     NoDatagramPath,
+    NoSchedulableReliablePath,
     NoSchedulableTcpPath,
     NoSchedulableUdpPath,
     PathIdOverflow,
@@ -180,6 +181,12 @@ impl std::fmt::Display for RuntimeError {
                     "runtime operation requires at least one TCP or UDP path for datagram relay"
                 )
             }
+            Self::NoSchedulableReliablePath => {
+                write!(
+                    f,
+                    "no configured mptunnel path is schedulable for this reliable flow"
+                )
+            }
             Self::NoSchedulableTcpPath => {
                 write!(f, "no configured TCP path is schedulable for this flow")
             }
@@ -225,6 +232,7 @@ impl std::error::Error for RuntimeError {
             Self::NoTcpPath
             | Self::NoUdpPath
             | Self::NoDatagramPath
+            | Self::NoSchedulableReliablePath
             | Self::NoSchedulableTcpPath
             | Self::NoSchedulableUdpPath
             | Self::PathIdOverflow

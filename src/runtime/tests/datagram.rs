@@ -400,6 +400,36 @@ fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
 }
 
 #[test]
+fn udp_first_datagram_response_uses_startup_budget_for_cold_association() {
+    let mut model = UdpPathRuntimeModel {
+        pacing_rate_bps: UDP_MIN_PACING_RATE_BPS,
+        response_timeout: Duration::from_millis(65),
+        mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
+        mtu_is_measured: false,
+        mtu_probe_ceiling_payload_bytes: UDP_MAX_MTU_PAYLOAD_BYTES,
+    };
+
+    assert_eq!(
+        udp_datagram_first_response_timeout(false, false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+        Duration::from_millis(520)
+    );
+    assert_eq!(
+        udp_datagram_first_response_timeout(true, false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+        Duration::from_millis(65)
+    );
+    assert_eq!(
+        udp_datagram_first_response_timeout(false, true, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+        Duration::from_millis(65)
+    );
+
+    model.response_timeout = Duration::from_millis(300);
+    assert_eq!(
+        udp_datagram_first_response_timeout(false, false, false, model, DEFAULT_SOCKS5_UDP_TTL_MS),
+        UDP_PATH_HANDSHAKE_TIMEOUT
+    );
+}
+
+#[test]
 fn udp_runtime_model_backs_off_response_timeout_after_loss() {
     let stable = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, 30_000_000.0);
     let mut lossy = stable;
@@ -762,19 +792,21 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     context.mark_tcp_path_probe_success(2, Duration::from_millis(1));
 
     let first = context
-        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("first reservation");
     let second = context
-        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("second reservation");
 
-    assert_eq!(first, 0);
-    assert_eq!(second, 1);
+    assert_eq!(first.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(first.index, 0);
+    assert_eq!(second.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(second.index, 1);
 
-    context.mark_tcp_path_reserved_open_success(first, Duration::from_millis(20));
-    context.mark_tcp_path_reserved_open_success(second, Duration::from_millis(80));
-    context.release_tcp_path_load(first, FlowLane::Latency);
-    context.release_tcp_path_load(second, FlowLane::Latency);
+    context.mark_tcp_path_reserved_open_success(first.index, Duration::from_millis(20));
+    context.mark_tcp_path_reserved_open_success(second.index, Duration::from_millis(80));
+    context.release_relay_path_load(first.underlay, first.index, FlowLane::Latency);
+    context.release_relay_path_load(second.underlay, second.index, FlowLane::Latency);
 
     let health = context.health.lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
@@ -807,9 +839,10 @@ fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
     );
 
     let reserved = context
-        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved, 1);
+    assert_eq!(reserved.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(reserved.index, 1);
 }
 
 #[test]
@@ -840,9 +873,10 @@ fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_
     context.mark_udp_path_open_success(0, Duration::from_millis(30));
 
     let reserved = context
-        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved, 0);
+    assert_eq!(reserved.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(reserved.index, 1);
 }
 
 #[test]
@@ -870,9 +904,10 @@ fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_late
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
 
     let reserved = context
-        .reserve_tcp_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved, 0);
+    assert_eq!(reserved.underlay, UnderlayProtocol::Tcp);
+    assert_eq!(reserved.index, 1);
 }
 
 #[test]

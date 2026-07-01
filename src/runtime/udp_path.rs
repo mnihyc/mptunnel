@@ -131,6 +131,26 @@ pub(super) enum UdpPathConnection {
     Quic(quic_carrier::Connection),
 }
 
+#[derive(Debug, Default)]
+struct UdpPathMetricTracker {
+    quic: QuicPathMetricTracker,
+}
+
+#[derive(Debug, Default)]
+struct QuicPathMetricTracker {
+    last_tx_bytes: u64,
+    last_rx_ack_frames: u64,
+    last_tx_stream_frames: u64,
+    last_tx_datagram_frames: u64,
+    last_observed_at: Option<Instant>,
+    app_tx_bytes_pending_sample: u64,
+    app_tx_sample_started_at: Option<Instant>,
+    delivery_rate_bps: Option<f64>,
+    delivery_sample_count: u64,
+    last_delivery_sample_at: Option<Instant>,
+    min_rtt: Option<Duration>,
+}
+
 #[derive(Debug)]
 pub(super) enum UdpPathSendStream {
     CustomLab(udp_carrier::SendStream),
@@ -272,10 +292,133 @@ impl UdpPathConnection {
         }
     }
 
-    async fn custom_tx_metrics(&self) -> Option<udp_carrier::UdpCarrierPathMetrics> {
+    async fn tx_metrics(
+        &self,
+        tracker: &mut UdpPathMetricTracker,
+        direction: u8,
+    ) -> Option<udp_carrier::UdpCarrierPathMetrics> {
         match self {
             Self::CustomLab(connection) => Some(connection.tx_metrics().await),
-            Self::Quic(_) => None,
+            Self::Quic(connection) => {
+                let stats = connection.stats();
+                let congestion = connection.congestion_metrics();
+                Some(tracker.quic.observe(stats, congestion, direction))
+            }
+        }
+    }
+}
+
+impl QuicPathMetricTracker {
+    fn observe(
+        &mut self,
+        stats: quinn::ConnectionStats,
+        congestion: quic_carrier::CongestionMetrics,
+        direction: u8,
+    ) -> udp_carrier::UdpCarrierPathMetrics {
+        let now = Instant::now();
+        let elapsed = self
+            .last_observed_at
+            .map(|seen| now.saturating_duration_since(seen))
+            .unwrap_or_default();
+        let tx_delta = stats.udp_tx.bytes.saturating_sub(self.last_tx_bytes);
+        let ack_delta = stats.frame_rx.acks.saturating_sub(self.last_rx_ack_frames);
+        let app_frame_delta = stats
+            .frame_tx
+            .stream
+            .saturating_sub(self.last_tx_stream_frames)
+            .saturating_add(
+                stats
+                    .frame_tx
+                    .datagram
+                    .saturating_sub(self.last_tx_datagram_frames),
+            );
+        self.last_tx_bytes = stats.udp_tx.bytes;
+        self.last_rx_ack_frames = stats.frame_rx.acks;
+        self.last_tx_stream_frames = stats.frame_tx.stream;
+        self.last_tx_datagram_frames = stats.frame_tx.datagram;
+        self.last_observed_at = Some(now);
+
+        if stats.path.rtt > Duration::ZERO {
+            self.min_rtt = Some(
+                self.min_rtt
+                    .map_or(stats.path.rtt, |previous| previous.min(stats.path.rtt)),
+            );
+        }
+        let rtt = stats.path.rtt.max(Duration::from_millis(1));
+        let min_rtt = self.min_rtt.unwrap_or(rtt);
+        let inflight_hi = congestion
+            .congestion_window
+            .max(stats.path.cwnd)
+            .max(stats.path.current_mtu as u64) as usize;
+        let fallback_rate = congestion
+            .pacing_rate_bps
+            .map(|rate| rate.max(1) as f64)
+            .unwrap_or_else(|| inflight_hi as f64 * 8.0 / rtt.as_secs_f64().max(0.001));
+
+        if app_frame_delta > 0 && tx_delta > 0 {
+            if self.app_tx_bytes_pending_sample == 0 {
+                self.app_tx_sample_started_at = Some(now.checked_sub(elapsed).unwrap_or(now));
+            }
+            self.app_tx_bytes_pending_sample =
+                self.app_tx_bytes_pending_sample.saturating_add(tx_delta);
+        }
+        let mut app_limited_low_sample_observed = false;
+        if ack_delta > 0 && self.app_tx_bytes_pending_sample > 0 {
+            let sample_elapsed = self
+                .app_tx_sample_started_at
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or(elapsed);
+            if sample_elapsed > Duration::ZERO {
+                let sample_bytes = self.app_tx_bytes_pending_sample;
+                let sample_rate = (self.app_tx_bytes_pending_sample as f64 * 8.0
+                    / sample_elapsed.as_secs_f64())
+                .max(1.0);
+                let app_limited_low_sample =
+                    sample_bytes < inflight_hi as u64 && sample_rate < fallback_rate;
+                app_limited_low_sample_observed = app_limited_low_sample;
+                if !app_limited_low_sample {
+                    self.delivery_sample_count =
+                        self.delivery_sample_count.saturating_add(ack_delta);
+                    self.last_delivery_sample_at = Some(now);
+                    self.delivery_rate_bps = Some(match self.delivery_rate_bps {
+                        Some(previous) if sample_rate < previous => {
+                            previous.mul_add(0.875, sample_rate * 0.125)
+                        }
+                        Some(previous) => previous.mul_add(0.25, sample_rate * 0.75),
+                        None => sample_rate,
+                    });
+                } else if self.delivery_rate_bps.is_none() {
+                    self.delivery_rate_bps = Some(fallback_rate);
+                }
+            }
+            self.app_tx_bytes_pending_sample = 0;
+            self.app_tx_sample_started_at = None;
+        }
+
+        let delivery_rate_bps = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+        udp_carrier::UdpCarrierPathMetrics {
+            direction,
+            srtt: rtt,
+            rttvar: rtt / 4,
+            min_rtt,
+            min_rtt_observed: stats.path.rtt > Duration::ZERO,
+            delivery_rate_bps,
+            pacing_rate_bps: congestion
+                .pacing_rate_bps
+                .map(|rate| rate.max(1) as f64)
+                .unwrap_or(delivery_rate_bps),
+            inflight_hi,
+            bytes_in_flight: 0,
+            pending_bytes: 0,
+            target_datagram_bytes: stats.path.current_mtu.max(1200) as usize,
+            loss_events: stats.path.congestion_events,
+            spurious_loss_events: 0,
+            packet_loss_threshold: 3,
+            pto_count: 0,
+            app_limited: app_limited_low_sample_observed
+                || (self.app_tx_bytes_pending_sample == 0 && app_frame_delta == 0),
+            delivery_sample_count: self.delivery_sample_count,
+            last_delivery_sample_at: self.last_delivery_sample_at,
         }
     }
 }
@@ -342,11 +485,12 @@ fn spawn_client_udp_path_metrics(
     connection: UdpPathConnection,
 ) {
     tokio::spawn(async move {
+        let mut tracker = UdpPathMetricTracker::default();
         loop {
             if connection.is_closed() {
                 return;
             }
-            let Some(metrics) = connection.custom_tx_metrics().await else {
+            let Some(metrics) = connection.tx_metrics(&mut tracker, 1).await else {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 continue;
             };
@@ -696,11 +840,12 @@ fn spawn_server_udp_carrier_metrics(
     connection: UdpPathConnection,
 ) {
     tokio::spawn(async move {
+        let mut tracker = UdpPathMetricTracker::default();
         loop {
             if connection.is_closed() {
                 return;
             }
-            let Some(metrics) = connection.custom_tx_metrics().await else {
+            let Some(metrics) = connection.tx_metrics(&mut tracker, 2).await else {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 continue;
             };
@@ -1425,4 +1570,84 @@ async fn resolve_first_socket_addr(path: &PathSpec) -> Result<SocketAddr, Runtim
     addrs.next().ok_or(RuntimeError::Protocol(
         "UDP carrier endpoint resolved no socket addresses",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quic_stats_feed_sender_side_udp_path_metrics() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_carrier::CongestionMetrics {
+            congestion_window: 4 * 1024 * 1024,
+            pacing_rate_bps: Some(500_000_000),
+        };
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = 4 * 1024 * 1024;
+        stats.path.current_mtu = 1400;
+
+        let startup = tracker.quic.observe(stats, congestion, 2);
+        assert_eq!(startup.direction, 2);
+        assert_eq!(startup.delivery_sample_count, 0);
+        assert_eq!(startup.delivery_rate_bps.round() as u64, 500_000_000);
+        assert_eq!(startup.inflight_hi, 4 * 1024 * 1024);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
+        stats.udp_tx.bytes = 8 * 1024 * 1024;
+        stats.frame_tx.stream = 128;
+        stats.frame_rx.acks = 4;
+        let measured = tracker.quic.observe(stats, congestion, 2);
+        assert_eq!(measured.direction, 2);
+        assert_eq!(measured.delivery_sample_count, 4);
+        assert!(measured.delivery_rate_bps > 0.0);
+        assert!(measured.last_delivery_sample_at.is_some());
+        assert!(!measured.app_limited);
+    }
+
+    #[test]
+    fn quic_ack_only_stats_do_not_create_delivery_rate_evidence() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_carrier::CongestionMetrics {
+            congestion_window: 4 * 1024 * 1024,
+            pacing_rate_bps: Some(500_000_000),
+        };
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(1);
+        stats.path.cwnd = 4 * 1024 * 1024;
+        stats.path.current_mtu = 1400;
+        let _ = tracker.quic.observe(stats, congestion, 1);
+
+        stats.frame_rx.acks = 1;
+        let ack_only = tracker.quic.observe(stats, congestion, 1);
+        assert_eq!(ack_only.delivery_sample_count, 0);
+        assert!(ack_only.last_delivery_sample_at.is_none());
+        assert_eq!(ack_only.delivery_rate_bps.round() as u64, 500_000_000);
+    }
+
+    #[test]
+    fn quic_app_limited_low_ack_sample_does_not_poison_delivery_rate() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_carrier::CongestionMetrics {
+            congestion_window: 4 * 1024 * 1024,
+            pacing_rate_bps: Some(500_000_000),
+        };
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = 4 * 1024 * 1024;
+        stats.path.current_mtu = 1400;
+        let _ = tracker.quic.observe(stats, congestion, 2);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
+        stats.udp_tx.bytes = 32 * 1024;
+        stats.frame_tx.stream = 1;
+        stats.frame_rx.acks = 1;
+        let app_limited = tracker.quic.observe(stats, congestion, 2);
+
+        assert_eq!(app_limited.delivery_sample_count, 0);
+        assert!(app_limited.last_delivery_sample_at.is_none());
+        assert_eq!(app_limited.delivery_rate_bps.round() as u64, 500_000_000);
+        assert!(app_limited.app_limited);
+    }
 }

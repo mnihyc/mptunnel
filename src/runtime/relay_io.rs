@@ -83,6 +83,24 @@ pub(super) fn stream_ack_gap_repair_frames(
     }
 }
 
+pub(super) fn stream_tail_stall_repair_frames(
+    send_stream: &ReliableSendStream,
+    ranges: &[OffsetRange],
+    byte_limit: usize,
+    complete: bool,
+) -> (Vec<Frame>, &'static str) {
+    if complete {
+        let gap_frames = send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit);
+        if !gap_frames.is_empty() {
+            return (gap_frames, "ack_gap");
+        }
+    }
+    (
+        send_stream.retransmission_frames_after_ack_frontier(ranges, byte_limit),
+        "ack_frontier",
+    )
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ReliableAckGapRepairProgress {
     first_gap_start: Option<u64>,
@@ -648,6 +666,104 @@ pub(super) fn tcp_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -
     }
 }
 
+#[derive(Debug)]
+pub(super) struct TcpRelayQueuedFrame {
+    pub(super) frame: Frame,
+    pub(super) payload_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct TcpRelaySenderQueue {
+    frames: VecDeque<TcpRelayQueuedFrame>,
+    bytes: usize,
+}
+
+impl TcpRelaySenderQueue {
+    pub(super) fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn push(&mut self, frame: Frame) {
+        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        self.bytes = self.bytes.saturating_add(payload_bytes);
+        self.frames.push_back(TcpRelayQueuedFrame {
+            frame,
+            payload_bytes,
+        });
+    }
+
+    pub(super) fn pop_front(&mut self) -> Option<TcpRelayQueuedFrame> {
+        let frame = self.frames.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(frame.payload_bytes);
+        Some(frame)
+    }
+
+    pub(super) fn front_stream_extent(&self) -> Option<(u64, usize)> {
+        let frame = self.frames.front()?;
+        match &frame.frame {
+            Frame::StreamData {
+                offset, payload, ..
+            } => Some((*offset, payload.len())),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn tcp_relay_sender_queue_limit(mux_limits: MuxLimits, inflight_limit: usize) -> usize {
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    inflight_limit
+        .max(mux_limits.max_tcp_path_inflight_bytes)
+        .min(mux_limits.max_repair_bytes)
+        .min(stream_window)
+        .max(1)
+}
+
+pub(super) fn tcp_relay_can_read_into_sender_queue(
+    send_stream: &ReliableSendStream,
+    sender_queue: &TcpRelaySenderQueue,
+    mux_limits: MuxLimits,
+    queue_limit: usize,
+) -> bool {
+    sender_queue.bytes() < queue_limit
+        && send_stream.send_credit_bytes() > 0
+        && send_stream.repair_bytes() < mux_limits.max_repair_bytes
+}
+
+pub(super) fn tcp_relay_can_read_product_source(
+    local_open: bool,
+    queued_send_blocked: bool,
+    send_stream: &ReliableSendStream,
+    sender_queue: &TcpRelaySenderQueue,
+    mux_limits: MuxLimits,
+    queue_limit: usize,
+) -> bool {
+    local_open
+        && !queued_send_blocked
+        && tcp_relay_can_read_into_sender_queue(send_stream, sender_queue, mux_limits, queue_limit)
+}
+
+pub(super) fn tcp_relay_sender_queue_read_budget(
+    send_stream: &ReliableSendStream,
+    sender_queue: &TcpRelaySenderQueue,
+    mux_limits: MuxLimits,
+    queue_limit: usize,
+    buffer_len: usize,
+) -> usize {
+    queue_limit
+        .saturating_sub(sender_queue.bytes())
+        .min(
+            mux_limits
+                .max_repair_bytes
+                .saturating_sub(send_stream.repair_bytes()),
+        )
+        .min(send_stream.send_credit_bytes())
+        .min(buffer_len)
+}
+
 pub(super) async fn relay_tcp_stream<S>(
     mut local: S,
     mut path_stream: TcpPathStream,
@@ -680,12 +796,25 @@ where
     let mut recv_progress = ReliableRecvProgress::default();
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
+    let mut last_send_ack_progress_at = Instant::now();
+    let mut last_tail_repair_at = Instant::now();
+    let mut last_tail_repair_path = None;
+    let mut last_send_ack_frontier = 0_u64;
+    let mut last_send_ack_ranges = Vec::<OffsetRange>::new();
+    let mut last_send_ack_complete = false;
     let mut flow_demand = TcpRelayFlowDemandTracker::new();
+    let mut output_updates = path_stream.subscribe_output_updates();
+    let mut sender_queue = TcpRelaySenderQueue::default();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
 
     let result = loop {
-        if !local_open && !remote_open && send_stream.repair_bytes() == 0 {
+        if !local_open
+            && !remote_open
+            && send_stream.repair_bytes() == 0
+            && sender_queue.is_empty()
+            && (!pending_local_fin || close_sent)
+        {
             break Ok(stats);
         }
         let peer_lane = path_stream.current_lane();
@@ -720,18 +849,38 @@ where
                 ),
             );
         }
+        path_stream.set_sender_queue_bytes(sender_queue.bytes());
+        let send_path_snapshot = path_stream.send_path_snapshot(
+            relay_lane,
+            tcp_lane_startup_chunk_bytes(relay_lane, mux_limits)
+                .min(path_stream.max_frame_payload_bytes),
+        );
         let recv_progress_deadline = tokio::time::Instant::from_std(
-            last_recv_progress_sent_at + reliable_stream_recv_progress_interval(None, relay_lane),
+            last_recv_progress_sent_at
+                + reliable_stream_recv_progress_interval(send_path_snapshot, relay_lane),
+        );
+        let tail_repair_active = relay_lane_is_bulk(relay_lane)
+            && remote_open
+            && send_stream.repair_bytes() > 0
+            && !last_send_ack_ranges.is_empty()
+            && last_send_ack_frontier < send_stream.next_offset()
+            && path_stream.has_multipath_repair_alternative();
+        let tail_repair_deadline = tcp_relay_stall_deadline(
+            last_send_ack_progress_at.max(last_tail_repair_at),
+            send_path_snapshot,
+            relay_lane,
         );
         let adaptive_chunk = adaptive_relay_chunk_bytes_for_underlay(
-            None,
+            send_path_snapshot,
             relay_lane,
             mux_limits,
             path_stream.underlay,
             path_stream.max_frame_payload_bytes,
         );
         resize_tcp_relay_buffer(&mut buf, adaptive_chunk);
-        let inflight_limit = adaptive_tcp_relay_inflight_bytes(None, relay_lane, mux_limits);
+        let inflight_limit =
+            adaptive_tcp_relay_inflight_bytes(send_path_snapshot, relay_lane, mux_limits);
+        let sender_queue_limit = tcp_relay_sender_queue_limit(mux_limits, inflight_limit);
         #[cfg(feature = "lab-diagnostics")]
         if last_reported_budget != Some((relay_lane, adaptive_chunk, inflight_limit)) {
             lab_diagnostic(
@@ -748,16 +897,101 @@ where
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
-        let can_read_local =
-            local_open && tcp_relay_can_read_with_limit(&send_stream, inflight_limit);
-        let read_budget = if can_read_local {
-            tcp_relay_read_budget_with_limit(&send_stream, mux_limits, inflight_limit, buf.len())
+        let queued_send_ready =
+            sender_queue
+                .front_stream_extent()
+                .is_some_and(|(offset, payload_bytes)| {
+                    !relay_lane_is_bulk(relay_lane)
+                        || path_stream.can_send_stream_data_extent(
+                            relay_lane,
+                            offset,
+                            payload_bytes,
+                        )
+                });
+        let queued_send_blocked = !sender_queue.is_empty() && !queued_send_ready;
+        let can_read_by_flow = tcp_relay_can_read_product_source(
+            local_open,
+            queued_send_blocked,
+            &send_stream,
+            &sender_queue,
+            mux_limits,
+            sender_queue_limit,
+        );
+        let read_budget = if can_read_by_flow {
+            tcp_relay_sender_queue_read_budget(
+                &send_stream,
+                &sender_queue,
+                mux_limits,
+                sender_queue_limit,
+                buf.len(),
+            )
         } else {
             0
         };
+        let can_read_local = can_read_by_flow && read_budget > 0;
+        let can_send_pending_fin = pending_local_fin
+            && sender_queue.is_empty()
+            && !close_sent
+            && (path_stream.underlay != UnderlayProtocol::Udp || send_stream.repair_bytes() == 0);
 
         tokio::select! {
             biased;
+            _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
+                let repair_limit = adaptive_relay_chunk_bytes_for_underlay(
+                    send_path_snapshot,
+                    FlowLane::Throughput,
+                    mux_limits,
+                    path_stream.underlay,
+                    path_stream.max_frame_payload_bytes,
+                )
+                .max(adaptive_tcp_relay_repair_bytes(
+                    send_path_snapshot,
+                    relay_lane,
+                    mux_limits,
+                ));
+                let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
+                    &send_stream,
+                    &last_send_ack_ranges,
+                    repair_limit,
+                    last_send_ack_complete,
+                );
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = repair_kind;
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "tail_stall_repair",
+                    format_args!(
+                        "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} repair_limit={} repair_kind={}",
+                        stream_id.0,
+                        relay_lane,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                        send_stream.repair_bytes(),
+                        repair_frames.len(),
+                        repair_limit,
+                        repair_kind,
+                    ),
+                );
+                for frame in repair_frames {
+                    if let Some(path_key) = path_stream.send_repair_frame(frame).await? {
+                        last_tail_repair_path = Some(path_key);
+                    }
+                }
+                last_tail_repair_at = Instant::now();
+                continue;
+            }
+            changed = async {
+                match output_updates.as_mut() {
+                    Some(updates) => updates
+                        .changed()
+                        .await
+                        .map_err(|_| RuntimeError::TcpPathSessionClosed),
+                    None => std::future::pending::<Result<(), RuntimeError>>().await,
+                }
+            }, if queued_send_blocked => {
+                changed?;
+                continue;
+            }
             frame = async {
                 #[cfg(feature = "lab-diagnostics")]
                 let recv_started = Instant::now();
@@ -827,6 +1061,33 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         path_stream.release_acked_ranges(&ranges);
+                        let largest_ack_end =
+                            ranges.iter().map(|range| range.end).max().unwrap_or(0);
+                        let ack_made_progress =
+                            ack.released_bytes > 0 || largest_ack_end > last_send_ack_frontier;
+                        if ack_made_progress {
+                            last_send_ack_progress_at = Instant::now();
+                            last_tail_repair_at = last_send_ack_progress_at;
+                            if let Some(path_key) = last_tail_repair_path.take()
+                                && path_stream.mark_repair_path_delivery_and_promote(path_key)
+                            {
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "repair_path_promoted",
+                                    format_args!(
+                                        "stream_id={} path_underlay={:?} path_id={} released_bytes={} largest_end={}",
+                                        stream_id.0,
+                                        path_key.underlay,
+                                        path_key.path_id.0,
+                                        ack.released_bytes,
+                                        largest_ack_end,
+                                    ),
+                                );
+                            }
+                        }
+                        last_send_ack_frontier = last_send_ack_frontier.max(largest_ack_end);
+                        last_send_ack_ranges = ranges.clone();
+                        last_send_ack_complete = complete;
                         let repair_limit =
                             adaptive_tcp_relay_repair_bytes(None, relay_lane, mux_limits);
                         let has_multipath_repair_alternative =
@@ -856,7 +1117,7 @@ where
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
-                                ranges.iter().map(|range| range.end).max().unwrap_or(0),
+                                largest_ack_end,
                                 ack.released_bytes,
                                 ack.remaining_repair_bytes,
                                 repair_frames.len(),
@@ -866,9 +1127,7 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            path_stream
-                                .send_frame_with_lane(frame, FlowLane::Latency)
-                                .await?;
+                            let _ = path_stream.send_repair_frame(frame).await?;
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
@@ -930,6 +1189,60 @@ where
                 .await?;
                 last_recv_progress_sent_at = Instant::now();
             }
+            _ = std::future::ready(()), if can_send_pending_fin => {
+                let frame = Frame::StreamFin {
+                    stream_id,
+                    final_offset: send_stream.next_offset(),
+                };
+                path_stream.send_frame(frame).await?;
+                close_sent = true;
+                pending_local_fin = false;
+            }
+            _ = std::future::ready(()), if queued_send_ready => {
+                let queued = sender_queue
+                    .pop_front()
+                    .expect("queued_send_ready requires a queued frame");
+                #[cfg(feature = "lab-diagnostics")]
+                let send_lane = tcp_path_effective_frame_lane(&queued.frame, relay_lane);
+                #[cfg(feature = "lab-diagnostics")]
+                let pacing_bytes = frame_pacing_bytes(&queued.frame);
+                #[cfg(feature = "lab-diagnostics")]
+                let stream_extent = match &queued.frame {
+                    Frame::StreamData {
+                        offset, payload, ..
+                    } => Some((*offset, payload.len())),
+                    _ => None,
+                };
+                let selected_path = path_stream.send_frame_tracked(queued.frame).await?;
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = selected_path;
+                #[cfg(feature = "lab-diagnostics")]
+                if let Some((offset, payload_bytes)) = stream_extent {
+                    lab_server_response_stream_data(
+                        session_id.0,
+                        stream_id.0,
+                        offset,
+                        payload_bytes,
+                    );
+                    if selected_path.is_none() {
+                        lab_sender_service_decision(
+                            "server",
+                            Some(session_id.0),
+                            stream_id.0,
+                            "primary",
+                            "stream_data",
+                            payload_bytes,
+                            format_args!(
+                                "path_underlay={:?} path_id=none lane={:?} pacing_bytes={} degenerate_single_path=true",
+                                path_stream.underlay,
+                                send_lane,
+                                pacing_bytes,
+                            ),
+                        );
+                    }
+                }
+                stats.record_payload_bytes(queued.payload_bytes);
+            }
             read = async {
                 #[cfg(feature = "lab-diagnostics")]
                 let read_started = Instant::now();
@@ -942,18 +1255,7 @@ where
             }, if can_read_local => {
                 let read = read?;
                 if read == 0 {
-                    if path_stream.underlay == UnderlayProtocol::Udp
-                        && send_stream.repair_bytes() > 0
-                    {
-                        pending_local_fin = true;
-                    } else {
-                            let frame = Frame::StreamFin {
-                                stream_id,
-                                final_offset: send_stream.next_offset(),
-                            };
-                            path_stream.send_frame(frame).await?;
-                            close_sent = true;
-                        }
+                    pending_local_fin = true;
                     local_open = false;
                 } else {
                     #[cfg(feature = "lab-diagnostics")]
@@ -965,44 +1267,20 @@ where
                     let mux_started = Instant::now();
                     let frame = send_stream.send_data(payload, StreamFlags::NONE)?;
                     #[cfg(feature = "lab-diagnostics")]
-                    if let Frame::StreamData {
-                        offset, payload, ..
-                    } = &frame
-                    {
-                        lab_server_response_stream_data(
-                            session_id.0,
-                            stream_id.0,
-                            *offset,
-                            payload.len(),
-                        );
-                    }
-                    #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.send_data", mux_started.elapsed(), read);
                     #[cfg(feature = "lab-diagnostics")]
-                    let send_lane = tcp_path_effective_frame_lane(&frame, relay_lane);
-                    #[cfg(feature = "lab-diagnostics")]
-                    let pacing_bytes = frame_pacing_bytes(&frame);
-                    let selected_path = path_stream.send_frame_tracked(frame).await?;
-                    #[cfg(not(feature = "lab-diagnostics"))]
-                    let _ = selected_path;
-                    #[cfg(feature = "lab-diagnostics")]
-                    if selected_path.is_none() {
-                        lab_sender_service_decision(
-                            "server",
-                            Some(session_id.0),
+                    lab_diagnostic(
+                        "server_sender_enqueue",
+                        format_args!(
+                            "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={}",
                             stream_id.0,
-                            "primary",
-                            "stream_data",
+                            relay_lane,
                             read,
-                            format_args!(
-                                "path_underlay={:?} path_id=none lane={:?} pacing_bytes={} degenerate_single_path=true",
-                                path_stream.underlay,
-                                send_lane,
-                                pacing_bytes,
-                            ),
-                        );
-                    }
-                    stats.record_payload_bytes(read);
+                            sender_queue.bytes().saturating_add(read),
+                            sender_queue_limit,
+                        ),
+                    );
+                    sender_queue.push(frame);
                 }
             }
             else => break Ok(stats),
@@ -1017,27 +1295,6 @@ where
     #[cfg(feature = "lab-diagnostics")]
     lab_assert_server_sender_service_balanced(session_id.0, stream_id.0);
     result
-}
-
-pub(super) fn tcp_relay_can_read_with_limit(
-    send_stream: &ReliableSendStream,
-    inflight_limit: usize,
-) -> bool {
-    send_stream.repair_bytes() < inflight_limit.max(1) && send_stream.send_credit_bytes() > 0
-}
-
-pub(super) fn tcp_relay_read_budget_with_limit(
-    send_stream: &ReliableSendStream,
-    mux_limits: MuxLimits,
-    inflight_limit: usize,
-    buffer_len: usize,
-) -> usize {
-    inflight_limit
-        .max(1)
-        .min(mux_limits.max_tcp_path_inflight_bytes)
-        .saturating_sub(send_stream.repair_bytes())
-        .min(send_stream.send_credit_bytes())
-        .min(buffer_len)
 }
 
 #[cfg(test)]
@@ -1067,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_relay_read_budget_respects_stream_flow_control_credit() {
+    fn tcp_relay_sender_queue_budget_respects_stream_flow_control_credit() {
         let limits = MuxLimits {
             max_stream_window_bytes: 4,
             max_repair_bytes: 16,
@@ -1076,20 +1333,31 @@ mod tests {
             ..MuxLimits::default()
         };
         let mut send_stream = ReliableSendStream::new(StreamId(7), limits);
+        let sender_queue = TcpRelaySenderQueue::default();
         send_stream
             .send_data(Bytes::from_static(b"data"), StreamFlags::NONE)
             .expect("initial window payload");
 
-        assert!(!tcp_relay_can_read_with_limit(&send_stream, 16));
+        assert!(!tcp_relay_can_read_into_sender_queue(
+            &send_stream,
+            &sender_queue,
+            limits,
+            16
+        ));
         assert_eq!(
-            tcp_relay_read_budget_with_limit(&send_stream, limits, 16, 16),
+            tcp_relay_sender_queue_read_budget(&send_stream, &sender_queue, limits, 16, 16),
             0
         );
 
         send_stream.update_max_offset(6);
-        assert!(tcp_relay_can_read_with_limit(&send_stream, 16));
+        assert!(tcp_relay_can_read_into_sender_queue(
+            &send_stream,
+            &sender_queue,
+            limits,
+            16
+        ));
         assert_eq!(
-            tcp_relay_read_budget_with_limit(&send_stream, limits, 16, 16),
+            tcp_relay_sender_queue_read_budget(&send_stream, &sender_queue, limits, 16, 16),
             2
         );
     }

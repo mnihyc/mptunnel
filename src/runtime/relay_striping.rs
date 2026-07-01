@@ -2,7 +2,7 @@
 use super::bulk_admission::bulk_completion_horizon_ms_with_ordering_debt;
 use super::bulk_admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
-    bulk_candidate_admission_suppression_with_ordering_debt,
+    bulk_candidate_admission_suppression_with_ordering_debt, bulk_service_horizon_payload_bytes,
 };
 use super::*;
 use std::collections::BTreeMap;
@@ -123,6 +123,13 @@ impl RelayPathFlightLedger {
                 let latest = flights.last()?;
                 (latest.key != key).then_some(latest.bytes as u64)
             })
+            .sum()
+    }
+
+    pub(super) fn lower_flight_debt_bytes_before_offset(&self, offset: u64) -> u64 {
+        self.flights
+            .range(..offset)
+            .filter_map(|(_, flights)| flights.last().map(|flight| flight.bytes as u64))
             .sum()
     }
 
@@ -416,6 +423,11 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     } else {
         None
     };
+    let lower_flight_owner = if normal_bulk_send {
+        path_flights.and_then(|flights| flights.oldest_lower_flight_owner_before_offset(offset))
+    } else {
+        None
+    };
     let restrict_to_admitted = normal_bulk_send
         && paths
             .iter()
@@ -523,7 +535,13 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             );
             continue;
         };
-        let Some(score) = scheduler::score_path(snapshot, lane, payload_bytes, policy) else {
+        let scoring_payload_bytes = if relay_lane_is_bulk(lane) {
+            bulk_service_horizon_payload_bytes(payload_bytes, context.mux_limits)
+        } else {
+            payload_bytes
+        };
+        let Some(score) = scheduler::score_path(snapshot, lane, scoring_payload_bytes, policy)
+        else {
             #[cfg(feature = "lab-diagnostics")]
             log_bulk_relay_candidate_decision(
                 BulkRelayCandidateDiagnostics {
@@ -547,17 +565,35 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         #[cfg(feature = "lab-diagnostics")]
         let mut candidate_diagnostics = None;
         if normal_bulk_send {
-            let role = if Some(key) == lead_key {
+            let cross_path_ordering_debt = path_flights
+                .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
+                .unwrap_or(0);
+            let lower_flight_debt = path_flights
+                .map(|flights| flights.lower_flight_debt_bytes_before_offset(offset))
+                .unwrap_or(0);
+            let owns_lower_frontier = lower_flight_owner == Some(key);
+            let role = if owns_lower_frontier
+                || (Some(key) == lead_key && cross_path_ordering_debt == 0)
+            {
                 BulkAdmissionRole::ActiveDataPath
+            } else if let Some(owner) = lower_flight_owner {
+                bulk_additional_admission_role(owner.underlay, key.underlay)
             } else if let Some(lead_key) = lead_key {
                 bulk_additional_admission_role(lead_key.underlay, key.underlay)
             } else {
                 BulkAdmissionRole::ActiveDataPath
             };
-            let (best_snapshot, best_eta_ms) = lead_baseline.unwrap_or((snapshot, score.eta_ms));
-            let ordering_debt = path_flights
-                .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
-                .unwrap_or(0);
+            let admission_ordering_debt = if role == BulkAdmissionRole::ActiveDataPath {
+                lower_flight_debt
+            } else {
+                cross_path_ordering_debt
+            };
+            let (best_snapshot, best_eta_ms) =
+                if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
+                    (snapshot, score.eta_ms)
+                } else {
+                    lead_baseline.unwrap_or((snapshot, score.eta_ms))
+                };
             #[cfg(feature = "lab-diagnostics")]
             {
                 let completion_horizon_ms = bulk_completion_horizon_ms_with_ordering_debt(
@@ -566,7 +602,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     snapshot,
                     payload_bytes,
                     context.mux_limits,
-                    ordering_debt,
+                    admission_ordering_debt,
                 );
                 candidate_diagnostics = Some(BulkRelayCandidateDiagnostics {
                     stream_id,
@@ -577,7 +613,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     eta_ms: Some(score.eta_ms),
                     best_eta_ms: Some(best_eta_ms),
                     completion_horizon_ms: Some(completion_horizon_ms),
-                    stream_ordering_debt_bytes: ordering_debt,
+                    stream_ordering_debt_bytes: admission_ordering_debt,
                     payload_bytes,
                     snapshot: Some(snapshot),
                 });
@@ -591,7 +627,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     payload_bytes,
                     mux_limits: context.mux_limits,
                     role,
-                    stream_ordering_debt_bytes: ordering_debt,
+                    stream_ordering_debt_bytes: admission_ordering_debt,
                 });
             if let Some(reason) = ordering_suppression {
                 #[cfg(feature = "lab-diagnostics")]
@@ -661,22 +697,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     if !normal_bulk_send {
         return BulkRelayPathChoice::NotApplicable;
     }
-    if let Some(owner) =
-        path_flights.and_then(|flights| flights.oldest_lower_flight_owner_before_offset(offset))
-        && let Some(position) = paths.iter().position(|path| {
-            path.key() == owner
-                && path.placement != RelayPathPlacement::Repair
-                && !avoid_keys.contains(&owner)
-        })
-    {
-        #[cfg(feature = "lab-diagnostics")]
-        log_bulk_relay_candidate_decision(
-            BulkRelayCandidateDiagnostics::skipped(stream_id, lane, owner, lead_key, payload_bytes),
-            true,
-            "lower_flight_owner_frontier",
-        );
-        return BulkRelayPathChoice::Selected(position);
-    }
     BulkRelayPathChoice::Blocked
 }
 
@@ -689,7 +709,12 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     policy: SchedulerPolicy,
 ) -> Option<(PathSnapshot, f64)> {
     let snapshot = relay_path_snapshot_for_bulk_choice(context, key, active_key)?;
-    let score = scheduler::score_path(snapshot, lane, payload_bytes, policy)?;
+    let scoring_payload_bytes = if relay_lane_is_bulk(lane) {
+        bulk_service_horizon_payload_bytes(payload_bytes, context.mux_limits)
+    } else {
+        payload_bytes
+    };
+    let score = scheduler::score_path(snapshot, lane, scoring_payload_bytes, policy)?;
     Some((snapshot, score.eta_ms))
 }
 
@@ -793,6 +818,7 @@ mod tests {
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path0, 8192), 4096);
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path1, 8192), 4096);
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path2, 8192), 8192);
+        assert_eq!(ledger.lower_flight_debt_bytes_before_offset(8192), 8192);
         assert_eq!(
             ledger.oldest_lower_flight_owner_before_offset(8192),
             Some(path0)
@@ -844,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_admission_prefers_lower_flight_owner_over_expanding_active_debt() {
+    fn bulk_admission_blocks_when_lower_flight_owner_is_not_admitted() {
         let context = context(&[
             "tcp://127.0.0.1:10110?srtt-ms=50&rate-mbps=1",
             "udp://127.0.0.1:10111?srtt-ms=50&rate-mbps=1",
@@ -872,7 +898,7 @@ mod tests {
                 avoid_keys: &[],
                 path_flights: Some(&ledger),
             }),
-            BulkRelayPathChoice::Selected(0)
+            BulkRelayPathChoice::Blocked
         );
     }
 }

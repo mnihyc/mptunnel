@@ -57,6 +57,7 @@ pub struct PathSnapshot {
     pub delivery_rate_bps: f64,
     pub loss_rate: f64,
     pub queue_bytes: u64,
+    pub product_queue_bytes: u64,
     pub bytes_in_flight: u64,
     pub product_bytes_in_flight: u64,
     pub active_flows: u32,
@@ -84,6 +85,7 @@ impl PathSnapshot {
             delivery_rate_bps,
             loss_rate: 0.0,
             queue_bytes: 0,
+            product_queue_bytes: 0,
             bytes_in_flight: 0,
             product_bytes_in_flight: 0,
             active_flows: 0,
@@ -410,7 +412,11 @@ pub fn score_path(
     } else {
         path.bytes_in_flight
     };
-    let queued_bits = path.queue_bytes.saturating_add(effective_inflight) as f64 * 8.0;
+    let queued_bits = path
+        .queue_bytes
+        .saturating_add(path.product_queue_bytes)
+        .saturating_add(effective_inflight) as f64
+        * 8.0;
     let payload_bits = payload_bytes as f64 * 8.0;
 
     let mut eta_ms = path.srtt_ms / 2.0;

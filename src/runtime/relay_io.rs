@@ -6,13 +6,13 @@ const TCP_RELAY_MAX_BACKGROUND_QUANTUM_BYTES: usize = 32 * 1024;
 const TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES: usize = 16 * 1024;
 const TCP_RELAY_MAX_CONTROL_QUANTUM_BYTES: usize = 4 * 1024;
 
-pub(super) async fn send_relay_attach_control_frames(
+pub(super) async fn send_sender_service_attach_control_frames(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
 ) -> Result<(), RuntimeError> {
     if resend_fin {
-        send_reliable_path_control_frame(
+        send_sender_service_control_frame(
             path_stream,
             Frame::StreamFin {
                 stream_id: path_stream.stream_id,

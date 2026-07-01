@@ -612,10 +612,14 @@ async fn send_sender_service_frame_to_carrier(
     commands.try_enqueue_admitted_frame(frame, lane)
 }
 
-pub(super) async fn send_reliable_path_control_frame(
+pub(super) async fn send_sender_service_control_frame(
     stream: &ReliablePathStream,
     frame: Frame,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
+    // Setup/attach control that is emitted outside a long-lived response queue
+    // still uses the same sender-service carrier gate: no blocking path permit,
+    // no path-local fairness decision, and queue-full remains explicit
+    // sender-service backpressure.
     emit_response_frame_from_sender_service(stream, frame, FlowLane::Control, "control", false)
         .await
 }

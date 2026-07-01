@@ -2055,6 +2055,18 @@ are queued sender-service control work. A target-read or path-receive handler
 MUST NOT write them directly to a carrier queue; dispatch may use the carrier's
 priority queue, but queue-full is sender-service backpressure.
 
+Session and path handshake traffic is a separate ownership domain until a
+product stream or datagram flow has been admitted. `SESSION_HELLO`,
+`SESSION_AUTH`, `SESSION_READY`, `PATH_JOIN`, `PATH_STATUS`, `PATH_METRICS`,
+`PATH_DRAIN`, `PATH_CLOSE`, `PING`, `PONG`, and the immediate accept/reject
+responses to `OPEN_STREAM` or `OPEN_DATAGRAM_FLOW` are owned by the
+session/path manager. These frames MAY be emitted by the handshake writer or by
+the sender-service control gate, but they MUST NOT carry target payload bytes,
+ordinary repair data, validation bytes, or throughput work. Once a stream or
+datagram flow is admitted, its product data, product feedback, repair,
+flow-control credit, FIN, RESET, and DETACH work is owned by the sender-service
+lane model described here.
+
 The service maintains separate logical lanes in this priority order:
 
 1. carrier ACK-only feedback;

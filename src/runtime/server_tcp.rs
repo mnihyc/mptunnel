@@ -590,7 +590,7 @@ pub(super) async fn run_server_tcp_stream(
         {
             Ok(stream) => stream,
             Err(err) => {
-                send_reliable_path_control_frame(
+                send_sender_service_control_frame(
                     &stream,
                     Frame::StreamReset {
                         stream_id,
@@ -602,7 +602,7 @@ pub(super) async fn run_server_tcp_stream(
                 return Err(RuntimeError::OutboundConnect(err));
             }
         };
-        send_reliable_path_control_frame(
+        send_sender_service_control_frame(
             &stream,
             Frame::StreamMaxData {
                 stream_id,

@@ -1321,7 +1321,7 @@ pub(super) async fn attach_relay_path_candidates(
         {
             Ok(opened) => {
                 let attach_control_result = if request.send_attach_control {
-                    send_relay_attach_control_frames(
+                    send_sender_service_attach_control_frames(
                         &opened.stream,
                         request.send_stream,
                         request.resend_fin,
@@ -1600,8 +1600,12 @@ pub(super) async fn attach_udp_relay_paths(
         .await
         {
             Ok(opened) => {
-                match send_relay_attach_control_frames(&opened.stream, send_stream, resend_fin)
-                    .await
+                match send_sender_service_attach_control_frames(
+                    &opened.stream,
+                    send_stream,
+                    resend_fin,
+                )
+                .await
                 {
                     Ok(()) => {
                         match role {

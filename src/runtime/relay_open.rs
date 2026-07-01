@@ -614,7 +614,7 @@ async fn send_open_path_metrics(
     let Some(metrics) = context.relay_path_metrics(underlay, path_index) else {
         return Ok(());
     };
-    send_reliable_path_control_frame(stream, Frame::PathMetrics { metrics })
+    send_sender_service_control_frame(stream, Frame::PathMetrics { metrics })
         .await
         .map(|_| ())
 }

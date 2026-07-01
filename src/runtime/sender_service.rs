@@ -55,6 +55,123 @@ impl RelayRecvProgressSend {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct TcpRelayQueuedFrame {
+    pub(super) frame: Frame,
+    pub(super) payload_bytes: usize,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) enqueue_id: u64,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) queued_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct TcpRelaySenderQueue {
+    frames: VecDeque<TcpRelayQueuedFrame>,
+    bytes: usize,
+    #[cfg(feature = "lab-diagnostics")]
+    next_enqueue_id: u64,
+}
+
+impl TcpRelaySenderQueue {
+    pub(super) fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn push(&mut self, frame: Frame) -> u64 {
+        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        #[cfg(feature = "lab-diagnostics")]
+        let enqueue_id = {
+            let enqueue_id = self.next_enqueue_id;
+            self.next_enqueue_id = self.next_enqueue_id.saturating_add(1);
+            enqueue_id
+        };
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let enqueue_id = 0;
+        self.bytes = self.bytes.saturating_add(payload_bytes);
+        self.frames.push_back(TcpRelayQueuedFrame {
+            frame,
+            payload_bytes,
+            #[cfg(feature = "lab-diagnostics")]
+            enqueue_id,
+            #[cfg(feature = "lab-diagnostics")]
+            queued_at: Instant::now(),
+        });
+        enqueue_id
+    }
+
+    pub(super) fn pop_front(&mut self) -> Option<TcpRelayQueuedFrame> {
+        let frame = self.frames.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(frame.payload_bytes);
+        Some(frame)
+    }
+
+    pub(super) fn front_stream_extent(&self) -> Option<(u64, usize)> {
+        let frame = self.frames.front()?;
+        match &frame.frame {
+            Frame::StreamData {
+                offset, payload, ..
+            } => Some((*offset, payload.len())),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn tcp_relay_sender_queue_limit(mux_limits: MuxLimits, inflight_limit: usize) -> usize {
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    inflight_limit
+        .max(mux_limits.max_tcp_path_inflight_bytes)
+        .min(mux_limits.max_repair_bytes)
+        .min(stream_window)
+        .max(1)
+}
+
+pub(super) fn tcp_relay_can_read_into_sender_queue(
+    send_stream: &ReliableSendStream,
+    sender_queue: &TcpRelaySenderQueue,
+    mux_limits: MuxLimits,
+    queue_limit: usize,
+) -> bool {
+    sender_queue.bytes() < queue_limit
+        && send_stream.send_credit_bytes() > 0
+        && send_stream.repair_bytes() < mux_limits.max_repair_bytes
+}
+
+pub(super) fn tcp_relay_can_read_product_source(
+    local_open: bool,
+    queued_send_blocked: bool,
+    send_stream: &ReliableSendStream,
+    sender_queue: &TcpRelaySenderQueue,
+    mux_limits: MuxLimits,
+    queue_limit: usize,
+) -> bool {
+    local_open
+        && !queued_send_blocked
+        && tcp_relay_can_read_into_sender_queue(send_stream, sender_queue, mux_limits, queue_limit)
+}
+
+pub(super) fn tcp_relay_sender_queue_read_budget(
+    send_stream: &ReliableSendStream,
+    sender_queue: &TcpRelaySenderQueue,
+    mux_limits: MuxLimits,
+    queue_limit: usize,
+    buffer_len: usize,
+) -> usize {
+    queue_limit
+        .saturating_sub(sender_queue.bytes())
+        .min(
+            mux_limits
+                .max_repair_bytes
+                .saturating_sub(send_stream.repair_bytes()),
+        )
+        .min(send_stream.send_credit_bytes())
+        .min(buffer_len)
+}
+
 impl RelaySenderService {
     pub(super) fn new(stream_id: StreamId) -> Self {
         Self {

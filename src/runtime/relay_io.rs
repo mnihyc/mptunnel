@@ -315,15 +315,15 @@ pub(super) fn reliable_stream_ack_update_bytes(
     blended.max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
-pub(super) async fn send_tcp_recv_progress(
-    path_stream: &ReliablePathStream,
+pub(super) fn enqueue_tcp_recv_progress(
+    response_sender: &mut ServerResponseSenderService,
     recv_stream: &ReliableRecvStream,
     progress: &mut ReliableRecvProgress,
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
     force_max_data: bool,
-) -> Result<bool, RuntimeError> {
+) -> bool {
     let mut sent_any = false;
     if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_max_data) {
         #[cfg(feature = "lab-diagnostics")]
@@ -331,14 +331,14 @@ pub(super) async fn send_tcp_recv_progress(
         let ack_frame = recv_stream.ack_frame();
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record("mux.ack_frames", ack_started.elapsed(), 1);
-        send_reliable_path_control_frame(path_stream, ack_frame).await?;
+        response_sender.enqueue_control_frame(ack_frame);
         sent_any = true;
     }
     if progress.should_send_max_data(recv_stream, mux_limits, force_max_data) {
-        send_reliable_path_control_frame(path_stream, recv_stream.max_data_frame()).await?;
+        response_sender.enqueue_control_frame(recv_stream.max_data_frame());
         sent_any = true;
     }
-    Ok(sent_any)
+    sent_any
 }
 
 pub(super) fn reliable_relay_recv_progress_resend_active(
@@ -958,8 +958,8 @@ where
                         local.flush().await?;
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
-                        if send_tcp_recv_progress(
-                            &path_stream,
+                        if enqueue_tcp_recv_progress(
+                            &mut response_sender,
                             &recv_stream,
                             &mut recv_progress,
                             None,
@@ -967,8 +967,8 @@ where
                             mux_limits,
                             false,
                         )
-                        .await?
                         {
+                            response_sender_retry_at = None;
                             last_recv_progress_sent_at = Instant::now();
                         }
                         if outcome.fin
@@ -1072,7 +1072,8 @@ where
                                 stream_id,
                                 final_offset: send_stream.next_offset(),
                             };
-                            send_reliable_path_control_frame(&path_stream, frame).await?;
+                            response_sender.enqueue_control_frame(frame);
+                            response_sender_retry_at = None;
                             close_sent = true;
                             pending_local_fin = false;
                         }
@@ -1130,24 +1131,26 @@ where
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
                 && reliable_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
-                send_tcp_recv_progress(
-                    &path_stream,
+                if enqueue_tcp_recv_progress(
+                    &mut response_sender,
                     &recv_stream,
                     &mut recv_progress,
                     None,
                     relay_lane,
                     mux_limits,
                     true,
-                )
-                .await?;
-                last_recv_progress_sent_at = Instant::now();
+                ) {
+                    response_sender_retry_at = None;
+                    last_recv_progress_sent_at = Instant::now();
+                }
             }
             _ = std::future::ready(()), if can_send_pending_fin => {
                 let frame = Frame::StreamFin {
                     stream_id,
                     final_offset: send_stream.next_offset(),
                 };
-                send_reliable_path_control_frame(&path_stream, frame).await?;
+                response_sender.enqueue_control_frame(frame);
+                response_sender_retry_at = None;
                 close_sent = true;
                 pending_local_fin = false;
             }
@@ -1219,9 +1222,18 @@ where
             stream_id,
             final_offset: send_stream.next_offset(),
         };
-        match send_reliable_path_control_frame(&path_stream, frame).await {
-            Ok(_) => {
+        response_sender.enqueue_control_frame(frame);
+        match response_sender
+            .dispatch_next(&path_stream, &mut send_stream, FlowLane::Control)
+            .await
+        {
+            Ok(dispatch) if dispatch.lane == ReliableRelayQueuedWorkLane::Control => {
                 close_sent = true;
+            }
+            Ok(_) => {
+                result = Err(RuntimeError::Protocol(
+                    "server response sender dispatched non-control final close",
+                ));
             }
             Err(err) => {
                 result = Err(err);

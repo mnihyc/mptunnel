@@ -80,12 +80,14 @@ impl RelayRecvProgressSend {
 
 #[derive(Debug, Clone)]
 pub(super) enum ReliableRelayQueuedWorkKind {
+    Control(Frame),
     Data(Bytes),
     Repair { frame: Frame, cause: RelaySendCause },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReliableRelayQueuedWorkLane {
+    Control,
     Data,
     Repair,
 }
@@ -113,6 +115,7 @@ pub(super) struct ReliableRelayQueuedWork {
 /// It owns queued product work and queue age before dispatch. Path command
 /// queues must receive only already-admitted frames.
 pub(super) struct ReliableRelaySenderQueue {
+    control: VecDeque<ReliableRelayQueuedWork>,
     repair: VecDeque<ReliableRelayQueuedWork>,
     data: VecDeque<ReliableRelayQueuedWork>,
     bytes: usize,
@@ -123,7 +126,7 @@ pub(super) struct ReliableRelaySenderQueue {
 
 impl ReliableRelaySenderQueue {
     pub(super) fn is_empty(&self) -> bool {
-        self.repair.is_empty() && self.data.is_empty()
+        self.control.is_empty() && self.repair.is_empty() && self.data.is_empty()
     }
 
     pub(super) fn bytes(&self) -> usize {
@@ -132,6 +135,15 @@ impl ReliableRelaySenderQueue {
 
     pub(super) fn data_bytes(&self) -> usize {
         self.data_bytes
+    }
+
+    pub(super) fn push_control(&mut self, frame: Frame) -> u64 {
+        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        self.push_work(
+            ReliableRelayQueuedWorkLane::Control,
+            ReliableRelayQueuedWorkKind::Control(frame),
+            payload_bytes,
+        )
     }
 
     pub(super) fn push_data(&mut self, payload: Bytes) -> u64 {
@@ -184,6 +196,7 @@ impl ReliableRelaySenderQueue {
             queued_at: Instant::now(),
         };
         match lane {
+            ReliableRelayQueuedWorkLane::Control => self.control.push_back(work),
             ReliableRelayQueuedWorkLane::Data => self.data.push_back(work),
             ReliableRelayQueuedWorkLane::Repair => self.repair.push_back(work),
         }
@@ -191,7 +204,9 @@ impl ReliableRelaySenderQueue {
     }
 
     pub(super) fn front(&self) -> Option<(ReliableRelayQueuedWorkLane, &ReliableRelayQueuedWork)> {
-        if let Some(work) = self.repair.front() {
+        if let Some(work) = self.control.front() {
+            Some((ReliableRelayQueuedWorkLane::Control, work))
+        } else if let Some(work) = self.repair.front() {
             Some((ReliableRelayQueuedWorkLane::Repair, work))
         } else {
             self.data
@@ -203,7 +218,9 @@ impl ReliableRelaySenderQueue {
     pub(super) fn commit_front(
         &mut self,
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
-        let (lane, work) = if let Some(work) = self.repair.pop_front() {
+        let (lane, work) = if let Some(work) = self.control.pop_front() {
+            (ReliableRelayQueuedWorkLane::Control, work)
+        } else if let Some(work) = self.repair.pop_front() {
             (ReliableRelayQueuedWorkLane::Repair, work)
         } else {
             (ReliableRelayQueuedWorkLane::Data, self.data.pop_front()?)
@@ -450,20 +467,15 @@ fn choose_response_sender_target(
     if targets.is_empty() {
         return None;
     }
-    let capacity_targets;
-    let targets = if matches!(frame, Frame::StreamData { .. }) {
-        capacity_targets = targets
-            .iter()
-            .filter(|target| target.commands.can_enqueue_frame_now(frame, lane))
-            .cloned()
-            .collect::<Vec<_>>();
-        if capacity_targets.is_empty() {
-            return None;
-        }
-        capacity_targets.as_slice()
-    } else {
-        targets
-    };
+    let capacity_targets = targets
+        .iter()
+        .filter(|target| target.commands.can_enqueue_frame_now(frame, lane))
+        .cloned()
+        .collect::<Vec<_>>();
+    if capacity_targets.is_empty() {
+        return None;
+    }
+    let targets = capacity_targets.as_slice();
     if repair || !relay_frame_is_bulk_stream_data(frame, lane) {
         return choose_lowest_eta_response_target(targets, avoid_keys, true)
             .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false));
@@ -594,11 +606,8 @@ async fn send_sender_service_frame_to_carrier(
     frame: Frame,
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
-    if matches!(frame, Frame::StreamData { .. }) {
-        commands.try_enqueue_admitted_frame(frame, lane)
-    } else {
-        commands.send_frame(frame, lane).await
-    }
+    let _ = lane;
+    commands.try_enqueue_admitted_frame(frame, lane)
 }
 
 pub(super) async fn send_reliable_path_control_frame(
@@ -699,6 +708,10 @@ impl ServerResponseSenderService {
         self.queue.push_data(payload)
     }
 
+    pub(super) fn enqueue_control_frame(&mut self, frame: Frame) -> u64 {
+        self.queue.push_control(frame)
+    }
+
     pub(super) fn enqueue_repair_frame(&mut self, frame: Frame) -> u64 {
         self.queue.push_repair(frame)
     }
@@ -718,6 +731,7 @@ impl ServerResponseSenderService {
         #[cfg(feature = "lab-diagnostics")]
         let queue_delay_ms = queued.queued_at.elapsed().as_millis();
         let (frame, dispatch_lane_name) = match &queued.kind {
+            ReliableRelayQueuedWorkKind::Control(frame) => (frame.clone(), "control"),
             ReliableRelayQueuedWorkKind::Data(payload) => {
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
@@ -729,10 +743,10 @@ impl ServerResponseSenderService {
             ReliableRelayQueuedWorkKind::Repair { frame, .. } => (frame.clone(), "repair"),
         };
         #[cfg(feature = "lab-diagnostics")]
-        let send_lane = if queued_lane == ReliableRelayQueuedWorkLane::Repair {
-            FlowLane::Latency
-        } else {
-            tcp_path_effective_frame_lane(&frame, relay_lane)
+        let send_lane = match queued_lane {
+            ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
+            ReliableRelayQueuedWorkLane::Repair => FlowLane::Latency,
+            ReliableRelayQueuedWorkLane::Data => tcp_path_effective_frame_lane(&frame, relay_lane),
         };
         #[cfg(feature = "lab-diagnostics")]
         let pacing_bytes = frame_pacing_bytes(&frame);
@@ -744,6 +758,16 @@ impl ServerResponseSenderService {
             _ => None,
         };
         let selected_path = match queued_lane {
+            ReliableRelayQueuedWorkLane::Control => {
+                emit_response_frame_from_sender_service(
+                    path_stream,
+                    frame.clone(),
+                    FlowLane::Control,
+                    "control",
+                    false,
+                )
+                .await?
+            }
             ReliableRelayQueuedWorkLane::Data => match emit_response_frame_from_sender_service(
                 path_stream,
                 frame.clone(),
@@ -886,6 +910,9 @@ impl RelaySenderService {
             .map(|(_, queued)| queued.kind.clone())
             .expect("queued_send_ready requires queued data");
         match queued_kind {
+            ReliableRelayQueuedWorkKind::Control(_) => {
+                Err(RuntimeError::Protocol("client sender queue control item"))
+            }
             ReliableRelayQueuedWorkKind::Data(payload) => {
                 self.dispatch_client_data_work(
                     context,

@@ -2050,6 +2050,10 @@ mark the carrier failed, and MUST continue polling ACK, credit, control,
 repair, and path-update feedback. A full carrier queue is backpressure, not a
 liveness failure. Control and ACK lanes may use their higher-priority emission
 path, but they MUST NOT sit behind a bulk data queue.
+For server response streams, `STREAM_ACK`, `STREAM_MAX_DATA`, and `STREAM_FIN`
+are queued sender-service control work. A target-read or path-receive handler
+MUST NOT write them directly to a carrier queue; dispatch may use the carrier's
+priority queue, but queue-full is sender-service backpressure.
 
 The service maintains separate logical lanes in this priority order:
 

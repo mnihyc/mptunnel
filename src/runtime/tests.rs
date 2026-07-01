@@ -727,6 +727,101 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
 }
 
 #[tokio::test]
+async fn server_response_sender_dispatches_control_before_repair_and_data() {
+    let stream_id = StreamId(47);
+    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(47), stream_id);
+    sender.enqueue_data(Bytes::from_static(b"ordinary"));
+    sender.enqueue_repair_frame(Frame::StreamData {
+        stream_id,
+        offset: 64,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"repair"),
+    });
+    sender.enqueue_control_frame(Frame::StreamFin {
+        stream_id,
+        final_offset: 0,
+    });
+
+    let control_dispatch = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect("dispatch control");
+    assert_eq!(control_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
+    assert_eq!(send_stream.next_offset(), 0);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamFin {
+            stream_id: id,
+            final_offset,
+        })) if id == stream_id && final_offset == 0
+    ));
+
+    let repair_dispatch = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect("dispatch repair");
+    assert_eq!(repair_dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+}
+
+#[tokio::test]
+async fn server_response_control_queue_full_is_sender_backpressure() {
+    let stream_id = StreamId(48);
+    let (commands, mut receivers) = tcp_path_session_command_channels(1);
+    commands
+        .send_frame(
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: Vec::new(),
+            },
+            FlowLane::Control,
+        )
+        .await
+        .expect("prefill priority queue");
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(48), stream_id);
+    sender.enqueue_control_frame(Frame::StreamFin {
+        stream_id,
+        final_offset: 0,
+    });
+
+    let err = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect_err("full control queue should be sender-service backpressure");
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert_eq!(sender.bytes(), 1);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+}
+
+#[tokio::test]
 async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     let stream_id = StreamId(44);
     let (commands, receivers) = tcp_path_session_command_channels(1);

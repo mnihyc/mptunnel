@@ -320,6 +320,13 @@ fn response_oldest_lower_flight_owner(
     lower_flights.first().map(|flight| flight.key)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResponseBulkLead {
+    key: CarrierPathKey,
+    snapshot: PathSnapshot,
+    eta_ms: f64,
+}
+
 fn response_bulk_admission_role(
     lead_key: CarrierPathKey,
     candidate: CarrierPathKey,
@@ -333,6 +340,69 @@ fn response_bulk_admission_role(
     } else {
         bulk_additional_admission_role(lead_key.underlay, candidate.underlay)
     }
+}
+
+fn response_active_lead_suppression(
+    target: &ResponseSenderPathTarget,
+    mux_limits: MuxLimits,
+    payload_bytes: usize,
+    stream_ordering_debt_bytes: u64,
+) -> Option<&'static str> {
+    bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+        best_snapshot: target.snapshot,
+        best_eta_ms: target.eta_ms,
+        candidate_snapshot: target.snapshot,
+        candidate_eta_ms: target.eta_ms,
+        payload_bytes,
+        mux_limits,
+        role: BulkAdmissionRole::ActiveDataPath,
+        stream_ordering_debt_bytes,
+    })
+}
+
+fn choose_response_admissible_lead(
+    candidate_targets: &[&ResponseSenderPathTarget],
+    mux_limits: MuxLimits,
+    payload_bytes: usize,
+    lower_flights: &[CarrierPathFlightDebt],
+) -> Option<ResponseBulkLead> {
+    let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    let lower_debt = response_total_lower_flight_debt_bytes(lower_flights);
+    if let Some(owner) = lower_owner {
+        let owner_target = candidate_targets
+            .iter()
+            .copied()
+            .find(|target| target.key == owner)?;
+        return response_active_lead_suppression(
+            owner_target,
+            mux_limits,
+            payload_bytes,
+            lower_debt,
+        )
+        .is_none()
+        .then_some(ResponseBulkLead {
+            key: owner_target.key,
+            snapshot: owner_target.snapshot,
+            eta_ms: owner_target.eta_ms,
+        });
+    }
+
+    candidate_targets
+        .iter()
+        .copied()
+        .filter(|target| {
+            response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .map(|target| ResponseBulkLead {
+            key: target.key,
+            snapshot: target.snapshot,
+            eta_ms: target.eta_ms,
+        })
 }
 
 fn choose_lowest_eta_response_target(
@@ -378,30 +448,12 @@ fn choose_response_sender_target(
     } else {
         proven_targets
     };
-    let lead = targets
-        .iter()
-        .filter(|target| {
-            candidate_targets
-                .iter()
-                .any(|candidate| candidate.key == target.key)
-        })
-        .filter(|target| {
-            lower_owner.is_none_or(|owner| owner == target.key)
-                || target.is_active
-                || target.has_sender_evidence
-        })
-        .min_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-        })
-        .or_else(|| {
-            candidate_targets.iter().copied().min_by(|left, right| {
-                left.eta_ms
-                    .total_cmp(&right.eta_ms)
-                    .then_with(|| carrier_path_key_order(left.key, right.key))
-            })
-        })?;
+    let lead = choose_response_admissible_lead(
+        &candidate_targets,
+        mux_limits,
+        payload_bytes,
+        lower_flights,
+    )?;
     let selected = candidate_targets
         .iter()
         .copied()
@@ -1231,5 +1283,58 @@ mod tests {
 
         assert_eq!(after.bytes_in_flight, 0);
         assert_eq!(after.delivery_rate_bps, before.delivery_rate_bps);
+    }
+
+    fn response_target(
+        path_id: u16,
+        underlay: UnderlayProtocol,
+        eta_ms: f64,
+        bytes_in_flight: u64,
+        inflight_limit_bytes: u64,
+        is_active: bool,
+    ) -> ResponseSenderPathTarget {
+        let (commands, _receivers) = tcp_path_session_command_channels(8);
+        let mut snapshot =
+            PathSnapshot::new(PathId(path_id), underlay, eta_ms.max(1.0), 500_000_000.0);
+        snapshot.bytes_in_flight = bytes_in_flight;
+        snapshot.product_bytes_in_flight = bytes_in_flight;
+        snapshot.inflight_limit_bytes = inflight_limit_bytes;
+        snapshot.confidence = 1.0;
+        ResponseSenderPathTarget {
+            key: CarrierPathKey {
+                underlay,
+                path_id: PathId(path_id),
+            },
+            commands,
+            snapshot,
+            eta_ms,
+            is_active,
+            has_sender_evidence: true,
+        }
+    }
+
+    #[test]
+    fn response_lead_must_be_admissible_not_lowest_raw_eta() {
+        let saturated_low_eta =
+            response_target(0, UnderlayProtocol::Udp, 1.0, 512 * 1024, 512 * 1024, true);
+        let admissible_higher_eta =
+            response_target(1, UnderlayProtocol::Udp, 2.0, 0, 512 * 1024, false);
+        let selected = choose_response_sender_target(
+            &[saturated_low_eta, admissible_higher_eta.clone()],
+            FlowLane::Throughput,
+            &Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![0; 64 * 1024]),
+            },
+            MuxLimits::default(),
+            &[],
+            &[],
+            false,
+        )
+        .expect("admissible higher ETA path should lead");
+
+        assert_eq!(selected.key, admissible_higher_eta.key);
     }
 }

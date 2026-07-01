@@ -4,7 +4,7 @@ Intended status: Standards Track
 
 Protocol version: 1
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 ## Abstract
 
@@ -2350,6 +2350,14 @@ being unable to accept the next quantum itself. This rule is the sender-service
 equivalent of ECF/BLEST comparing against the best usable subflow rather than
 against an unavailable one.
 
+Implementations MUST compute the lead from candidates that pass active
+ordinary-data admission against their own current product and carrier debt
+before evaluating additional paths. A raw lowest-ETA path, a previously active
+attachment, or a round-robin cursor position is not a valid lead unless it can
+accept the next ordinary quantum. If the oldest lower outstanding range has a
+path owner, that owner is the only ordinary lead candidate until it becomes
+admissible, is repaired, or ACK progress removes the lower-frontier debt.
+
 For each ordered reliable stream, lead choice is flow-level state. The sender
 does not recompute an unrelated min-ETA lead for every quantum. The current
 lead remains the ordinary-data owner while it is still attached, eligible, and
@@ -2663,7 +2671,7 @@ fixed millisecond slack:
 ```
 path_rate = max(path.pacing_rate, path.delivery_rate)
 path_bdp = path_rate * path.srtt
-lead_path = min_eta_candidate_that_is_eligible_for_ordinary_bulk()
+lead_path = min_eta_candidate_that_is_eligible_and_admissible_for_ordinary_bulk()
 if path is the lead path:
     product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
                                  2 * path_bdp,

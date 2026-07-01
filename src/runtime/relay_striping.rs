@@ -226,6 +226,13 @@ pub(super) struct BulkRelayFrameRequest<'a> {
     pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RelayBulkLead {
+    key: RelayPathKey,
+    snapshot: PathSnapshot,
+    eta_ms: f64,
+}
+
 #[cfg(feature = "lab-diagnostics")]
 #[derive(Debug, Clone, Copy)]
 struct BulkRelayCandidateDiagnostics {
@@ -418,30 +425,43 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     } else {
         Vec::new()
     };
-    let lead_key = admitted_bulk_keys.first().copied().or(active_key);
-    let lead_baseline = if normal_bulk_send {
-        lead_key.and_then(|key| {
-            scored_relay_path_snapshot_for_bulk_choice(
-                context,
-                key,
-                active_key,
-                lane,
-                payload_bytes,
-                policy,
-            )
-        })
-    } else {
-        None
-    };
     let lower_flight_owner = if normal_bulk_send {
         path_flights.and_then(|flights| flights.oldest_lower_flight_owner_before_offset(offset))
     } else {
         None
     };
+    let lower_flight_debt = if normal_bulk_send {
+        path_flights
+            .map(|flights| flights.lower_flight_debt_bytes_before_offset(offset))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let restrict_to_admitted = normal_bulk_send
         && paths
             .iter()
             .any(|path| admitted_bulk_keys.contains(&path.key()));
+    let lead = if normal_bulk_send {
+        choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
+            context,
+            paths,
+            lane,
+            payload_bytes,
+            active_key,
+            admitted_bulk_keys: &admitted_bulk_keys,
+            restrict_to_admitted,
+            lower_flight_owner,
+            lower_flight_debt,
+            policy,
+        })
+    } else {
+        None
+    };
+    if normal_bulk_send && lead.is_none() {
+        return BulkRelayPathChoice::Blocked;
+    }
+    let lead_key = lead.map(|lead| lead.key);
+    let lead_baseline = lead.map(|lead| (lead.snapshot, lead.eta_ms));
     let mut best: Option<(usize, f64, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut best_diagnostics: Option<BulkRelayCandidateDiagnostics> = None;
@@ -710,6 +730,100 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     BulkRelayPathChoice::Blocked
 }
 
+struct RelayBulkLeadRequest<'a> {
+    context: &'a ClientPathContext,
+    paths: &'a [ReliableRelayRemotePath],
+    lane: FlowLane,
+    payload_bytes: usize,
+    active_key: Option<RelayPathKey>,
+    admitted_bulk_keys: &'a [RelayPathKey],
+    restrict_to_admitted: bool,
+    lower_flight_owner: Option<RelayPathKey>,
+    lower_flight_debt: u64,
+    policy: SchedulerPolicy,
+}
+
+fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Option<RelayBulkLead> {
+    let RelayBulkLeadRequest {
+        context,
+        paths,
+        lane,
+        payload_bytes,
+        active_key,
+        admitted_bulk_keys,
+        restrict_to_admitted,
+        lower_flight_owner,
+        lower_flight_debt,
+        policy,
+    } = request;
+    paths
+        .iter()
+        .filter(|path| path.placement != RelayPathPlacement::Repair)
+        .filter(|path| {
+            let key = path.key();
+            if let Some(owner) = lower_flight_owner {
+                return key == owner;
+            }
+            if restrict_to_admitted {
+                admitted_bulk_keys.contains(&key)
+            } else {
+                Some(key) == active_key
+            }
+        })
+        .filter(|path| {
+            let key = path.key();
+            Some(key) == active_key
+                || context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
+        })
+        .filter_map(|path| {
+            let key = path.key();
+            let (snapshot, eta_ms) = scored_relay_path_snapshot_for_bulk_choice(
+                context,
+                key,
+                active_key,
+                lane,
+                payload_bytes,
+                policy,
+            )?;
+            let stream_ordering_debt_bytes = if lower_flight_owner == Some(key) {
+                lower_flight_debt
+            } else {
+                0
+            };
+            let suppression =
+                bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                    best_snapshot: snapshot,
+                    best_eta_ms: eta_ms,
+                    candidate_snapshot: snapshot,
+                    candidate_eta_ms: eta_ms,
+                    payload_bytes,
+                    mux_limits: context.mux_limits,
+                    role: BulkAdmissionRole::ActiveDataPath,
+                    stream_ordering_debt_bytes,
+                });
+            suppression.is_none().then_some(RelayBulkLead {
+                key,
+                snapshot,
+                eta_ms,
+            })
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| path_key_order(left.key).cmp(&path_key_order(right.key)))
+        })
+}
+
+fn path_key_order(key: RelayPathKey) -> (u8, usize) {
+    (
+        match key.underlay {
+            UnderlayProtocol::Tcp => 0,
+            UnderlayProtocol::Udp => 1,
+        },
+        key.index,
+    )
+}
+
 fn scored_relay_path_snapshot_for_bulk_choice(
     context: &ClientPathContext,
     key: RelayPathKey,
@@ -892,5 +1006,48 @@ mod tests {
             }),
             BulkRelayPathChoice::Blocked
         );
+    }
+
+    #[test]
+    fn relay_bulk_lead_must_be_admissible_not_lowest_raw_eta() {
+        let context = context(&[
+            "udp://127.0.0.1:10120?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10121?srtt-ms=30&rate-mbps=500",
+        ]);
+        let saturated = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let admissible = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        };
+        context.mark_relay_path_rate_sample(
+            admissible.underlay,
+            admissible.index,
+            PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(80))
+                .expect("sender evidence"),
+        );
+        context.record_relay_path_send(saturated.underlay, saturated.index, 32 * 1024 * 1024);
+        let paths = vec![
+            relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
+            relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
+        ];
+
+        let lead = choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
+            context: &context,
+            paths: &paths,
+            lane: FlowLane::Throughput,
+            payload_bytes: 64 * 1024,
+            active_key: Some(saturated),
+            admitted_bulk_keys: &[saturated, admissible],
+            restrict_to_admitted: true,
+            lower_flight_owner: None,
+            lower_flight_debt: 0,
+            policy: SchedulerPolicy::default(),
+        })
+        .expect("admissible path should become lead");
+
+        assert_eq!(lead.key, admissible);
     }
 }

@@ -275,6 +275,7 @@ where
                 .await
                 {
                     Ok(attached) if attached > 0 => {
+                        sender_retry_at = None;
                         send_stream.update_max_offset(remotes.max_offset());
                         last_receive_hole_repair_at = Instant::now();
                         receive_hole_repair_attempts = 0;
@@ -416,6 +417,7 @@ where
                 .await
                 {
                     Ok(attached) if attached > 0 => {
+                        sender_retry_at = None;
                         send_stream.update_max_offset(remotes.max_offset());
                         last_stream_progress_at = Instant::now();
                         last_response_stall_repair_at = Instant::now();
@@ -483,6 +485,7 @@ where
                         .await
                         {
                             Ok(attached) if attached > 0 => {
+                                sender_retry_at = None;
                                 send_stream.update_max_offset(remotes.max_offset());
                                 last_stream_progress_at = Instant::now();
                                 last_recv_progress_sent_at = Instant::now();
@@ -524,6 +527,7 @@ where
                         .await
                         {
                             Ok(attached) if attached > 0 => {
+                                sender_retry_at = None;
                                 pending_local_fin = false;
                                 last_stream_progress_at = Instant::now();
                             }
@@ -581,6 +585,7 @@ where
                         .await
                         {
                             Ok(attached) if attached > 0 => {
+                                sender_retry_at = None;
                                 if let Err(err) = send_stream.commit_prepared_data(&frame) {
                                     break Err(RuntimeError::Stream(err));
                                 }
@@ -696,6 +701,7 @@ where
                         .await
                         {
                             Ok(attached) if attached > 0 => {
+                                sender_retry_at = None;
                                 last_stream_progress_at = Instant::now();
                                 continue;
                             }
@@ -785,6 +791,7 @@ where
                             .await
                             {
                                 Ok(attached) if attached > 0 => {
+                                    sender_retry_at = None;
                                     send_stream.update_max_offset(remotes.max_offset());
                                     last_stream_progress_at = Instant::now();
                                     reliable_relay_refresh_path_tracking(
@@ -988,6 +995,7 @@ where
                             .await
                             {
                                     Ok(attached) if attached > 0 => {
+                                        sender_retry_at = None;
                                         last_stream_progress_at = Instant::now();
                                     }
                                     Ok(_) => break Err(err),
@@ -1100,6 +1108,7 @@ where
                                     .await
                                     {
                                         Ok(attached) if attached > 0 => {
+                                            sender_retry_at = None;
                                             match sender
                                                 .send_repair_frame(
                                                     context,
@@ -1171,6 +1180,7 @@ where
                                     .await
                                     {
                                         Ok(attached) if attached > 0 => {
+                                            sender_retry_at = None;
                                             pending_local_fin = false;
                                             last_stream_progress_at = Instant::now();
                                         }

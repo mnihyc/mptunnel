@@ -206,8 +206,10 @@ where
         if sender_retry_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
             sender_retry_at = None;
         }
+        let inbound_frame_ready = remotes.has_buffered_frame();
         let queued_send_blocked = !sender_queue.is_empty() && sender_retry_at.is_some();
-        let queued_send_ready = !sender_queue.is_empty() && !queued_send_blocked;
+        let queued_send_ready =
+            !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
         let queued_send_retry_deadline = sender_retry_at.unwrap_or_else(tokio::time::Instant::now);
         let can_read_by_flow = reliable_relay_can_read_product_source(
             local_open,
@@ -228,7 +230,8 @@ where
         } else {
             0
         };
-        let can_read_local = can_read_by_flow && prospective_read_budget > 0;
+        let can_read_local =
+            can_read_by_flow && prospective_read_budget > 0 && !inbound_frame_ready;
         let can_send_pending_fin = pending_local_fin
             && sender_queue.is_empty()
             && (!remotes.fin_requires_repair_drain() || send_stream.repair_bytes() == 0);

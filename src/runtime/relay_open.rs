@@ -226,6 +226,10 @@ impl ReliableRelayRemoteSet {
             .ok_or(RuntimeError::TcpPathSessionClosed)
     }
 
+    pub(super) fn has_buffered_frame(&self) -> bool {
+        !self.frames_rx.is_empty()
+    }
+
     pub(super) async fn close_all(&mut self) {
         let paths = std::mem::take(&mut self.paths);
         for path in paths {

@@ -2643,6 +2643,13 @@ carrier frames, product ACKs, stream credit, resets, detach/close, repair
 evidence, and path updates. Blocking the whole relay task behind a rejected
 ordinary-data quantum is prohibited because it delays exactly the feedback that
 can make the queued byte range admissible again.
+When feedback or control frames are already buffered at the product stream
+boundary, the sender MUST process them before reading more source bytes or
+dispatching another ordinary unique `STREAM_DATA` quantum. This does not give
+carrier queues scheduling authority; it preserves the sender-service invariant
+that ACK, credit, reset, detach, close, and path-update feedback can update
+flow control, repair state, ordering debt, and path admission before additional
+bulk data is committed.
 This remains true when only one carrier path is currently attached. If the
 oldest lower outstanding range is owned by a detached, failed, or otherwise
 non-serviceable path, the remaining carrier path is not automatically safe for

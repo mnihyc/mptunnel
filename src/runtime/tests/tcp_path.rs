@@ -1690,6 +1690,93 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
 }
 
 #[tokio::test]
+async fn request_sender_blocked_bulk_admission_does_not_fallback_to_eta_path() {
+    let stream_id = StreamId(147);
+    let (initial_stream, mut initial_commands, _initial_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(initial_stream, 8);
+    let (survivor_stream, mut survivor_commands, _survivor_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    remotes.attach(survivor_stream);
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11148?srtt-ms=20&rate-mbps=500"
+                .parse()
+                .expect("initial owner path"),
+            "udp://127.0.0.1:11149?srtt-ms=10&rate-mbps=500"
+                .parse()
+                .expect("survivor path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Throughput);
+    context.mark_udp_path_open_success(0, Duration::from_millis(10));
+
+    let mut sender = RelaySenderService::new(stream_id);
+    send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![1u8; 64 * 1024]),
+        },
+    )
+    .await
+    .expect("first send establishes lower-frontier owner");
+    match recv_tcp_path_command(&mut initial_commands)
+        .await
+        .expect("initial owner command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamData { offset, .. }) => {
+            assert_eq!(offset, 0);
+        }
+        _ => panic!("expected first bulk chunk on initial owner path"),
+    }
+
+    assert!(
+        remotes
+            .fail_path_key(
+                &context,
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: 0,
+                },
+            )
+            .await,
+        "initial lower-frontier owner should be removable"
+    );
+
+    let err = send_relay_stream_frame_for_test(
+        &mut sender,
+        &context,
+        &mut remotes,
+        Frame::StreamData {
+            stream_id,
+            offset: 64 * 1024,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![2u8; 64 * 1024]),
+        },
+    )
+    .await
+    .expect_err("later data must wait when no attached path owns the lower frontier");
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut survivor_commands)
+        )
+        .await
+        .is_err(),
+        "blocked admission must not fall back to the raw lowest-ETA survivor path"
+    );
+}
+
+#[tokio::test]
 async fn bulk_relay_validation_path_can_receive_admitted_probe_data() {
     let stream_id = StreamId(149);
     let (active_stream, mut active_commands, _active_frames) =

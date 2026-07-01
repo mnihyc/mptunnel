@@ -556,6 +556,11 @@ where
                             .or_default()
                             .record_payload_bytes(committed.payload_bytes);
                     }
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        let _ = send_stream.rollback_committed_data(&frame);
+                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                        continue;
+                    }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         let _ = send_stream.rollback_committed_data(&frame);
                         match attach_reliable_relay_paths(
@@ -587,6 +592,11 @@ where
                                             .entry(outcome.path_key)
                                             .or_default()
                                             .record_payload_bytes(committed.payload_bytes);
+                                    }
+                                    Err(RuntimeError::SenderServiceBlocked) => {
+                                        let _ = send_stream.rollback_committed_data(&frame);
+                                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                                        continue;
                                     }
                                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                                         let _ = send_stream.rollback_committed_data(&frame);

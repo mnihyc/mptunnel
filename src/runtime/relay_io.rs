@@ -1138,7 +1138,14 @@ where
                 pending_local_fin = false;
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let dispatch = response_sender.dispatch_next(&path_stream, &mut send_stream, relay_lane).await?;
+                let dispatch = match response_sender.dispatch_next(&path_stream, &mut send_stream, relay_lane).await {
+                    Ok(dispatch) => dispatch,
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        tokio::time::sleep(UDP_MIN_RESPONSE_TIMEOUT).await;
+                        continue;
+                    }
+                    Err(err) => break Err(err),
+                };
                 if dispatch.lane == ReliableRelayQueuedWorkLane::Repair {
                     last_tail_repair_path = dispatch.selected_path;
                 } else {

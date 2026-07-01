@@ -432,17 +432,7 @@ fn choose_response_sender_target(
                 .then_with(|| carrier_path_key_order(left.key, right.key))
         })
         .cloned();
-    selected.or_else(|| {
-        candidate_targets
-            .iter()
-            .copied()
-            .min_by(|left, right| {
-                left.eta_ms
-                    .total_cmp(&right.eta_ms)
-                    .then_with(|| carrier_path_key_order(left.key, right.key))
-            })
-            .cloned()
-    })
+    selected
 }
 
 async fn emit_response_frame_from_sender_service(
@@ -472,6 +462,9 @@ async fn emit_response_frame_from_sender_service(
             let mut last_error = None;
             loop {
                 let targets = binding.sender_path_targets(lane, payload_bytes);
+                if targets.is_empty() {
+                    return Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed));
+                }
                 let Some(target) = choose_response_sender_target(
                     &targets,
                     lane,
@@ -481,7 +474,7 @@ async fn emit_response_frame_from_sender_service(
                     &avoid_keys,
                     repair,
                 ) else {
-                    return Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed));
+                    return Err(RuntimeError::SenderServiceBlocked);
                 };
                 match target.commands.send_frame(frame.clone(), lane).await {
                     Ok(()) => {
@@ -816,15 +809,19 @@ impl RelaySenderService {
                 .last()
                 .map(|path| path.stream.lane)
                 .unwrap_or(FlowLane::Latency);
-            let Some(position) = self.choose_relay_path_position(
+            let position = match self.choose_relay_path_position(
                 context,
                 remotes,
                 &frame,
                 stream_lane,
                 cause,
                 avoid_keys,
-            ) else {
-                return Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed));
+            ) {
+                Ok(position) => position,
+                Err(RuntimeError::SenderServiceBlocked) => {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+                Err(err) => return Err(last_error.unwrap_or(err)),
             };
             let instance = remotes.paths[position].instance();
             let lane = tcp_path_effective_frame_lane(&frame, remotes.paths[position].stream.lane);
@@ -868,9 +865,9 @@ impl RelaySenderService {
         lane: FlowLane,
         cause: RelaySendCause,
         avoid_keys: &[RelayPathKey],
-    ) -> Option<usize> {
+    ) -> Result<usize, RuntimeError> {
         if remotes.paths.is_empty() {
-            return None;
+            return Err(RuntimeError::TcpPathSessionClosed);
         }
         self.next_send_index %= remotes.paths.len();
         if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
@@ -884,8 +881,9 @@ impl RelaySenderService {
                 avoid_keys,
                 path_flights: Some(&self.flights),
             }) {
-                BulkRelayPathChoice::Selected(position) => return Some(position),
-                BulkRelayPathChoice::Blocked | BulkRelayPathChoice::NotApplicable => {}
+                BulkRelayPathChoice::Selected(position) => return Ok(position),
+                BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
+                BulkRelayPathChoice::NotApplicable => {}
             }
         }
         self.choose_lowest_eta_relay_path(
@@ -896,6 +894,7 @@ impl RelaySenderService {
             avoid_keys,
             matches!(frame, Frame::StreamData { .. }) && !cause.is_repair(),
         )
+        .ok_or(RuntimeError::TcpPathSessionClosed)
     }
 
     fn choose_lowest_eta_relay_path(

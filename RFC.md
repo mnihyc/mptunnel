@@ -2629,6 +2629,12 @@ turn: the implementation MUST NOT fall through to the current active path or a
 round-robin path after declaring that no safe candidate exists. The next attempt
 is made only after a normal wake event such as stream ACK release, path metric
 refresh, attachment change, repair progress, or a short scheduler retry.
+This remains true when only one carrier path is currently attached. If the
+oldest lower outstanding range is owned by a detached, failed, or otherwise
+non-serviceable path, the remaining carrier path is not automatically safe for
+later ordinary unique bytes. The remaining path may carry explicit gap repair,
+duplicate validation, control, and ACK traffic, but ordinary later `STREAM_DATA`
+waits until repair or ACK progress resolves the lower frontier.
 
 If additional same-stream paths are not admitted but the lead data path is
 within its product-flight budget, ordinary bulk remains on the lead path. A

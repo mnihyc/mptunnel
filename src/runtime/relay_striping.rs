@@ -397,12 +397,22 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     } = request;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
-    if paths.len() <= 1 || !relay_lane_is_bulk(lane) || payload_bytes == 0 {
+    if !relay_lane_is_bulk(lane) || payload_bytes == 0 {
         return BulkRelayPathChoice::NotApplicable;
     }
     let policy = SchedulerPolicy::default();
     let active_key = paths.last().map(|path| path.key());
     let normal_bulk_send = avoid_keys.is_empty();
+    if paths.len() <= 1 {
+        if normal_bulk_send
+            && let Some(flights) = path_flights
+            && let Some(owner) = flights.oldest_lower_flight_owner_before_offset(offset)
+            && paths.first().is_none_or(|path| path.key() != owner)
+        {
+            return BulkRelayPathChoice::Blocked;
+        }
+        return BulkRelayPathChoice::NotApplicable;
+    }
     let admitted_bulk_keys = if normal_bulk_send {
         context.ordered_reliable_bulk_striping_path_keys(payload_bytes)
     } else {

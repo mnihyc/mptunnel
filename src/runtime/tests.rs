@@ -757,6 +757,81 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
 }
 
 #[tokio::test]
+async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_target() {
+    let stream_id = StreamId(45);
+    let (tcp_commands, _tcp_receivers) = tcp_path_session_command_channels(4);
+    let tcp_commands_for_detach = tcp_commands.clone();
+    let binding = ResponseStreamBinding::new(
+        SessionId(10),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        tcp_commands,
+        FlowLane::Throughput,
+    );
+    let (udp_commands, mut udp_receivers) = tcp_path_session_command_channels(4);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        udp_commands,
+        FlowLane::Throughput,
+        StreamOpenRole::Active,
+        reliable_relay_buffer_len(MuxLimits::default()),
+    );
+    let lower_owner_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    binding.record_flight(
+        lower_owner_key,
+        &Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"x"),
+        },
+        true,
+    );
+    binding.detach(lower_owner_key, &tcp_commands_for_detach);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    send_stream
+        .send_data(Bytes::from_static(b"x"), StreamFlags::NONE)
+        .expect("advance response sender past the lower-frontier byte");
+    let mut sender = ServerResponseSenderService::new(SessionId(10), stream_id);
+    sender.enqueue_data(Bytes::from_static(b"later"));
+
+    let err = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect_err("cross-underlay ordering debt must block ordinary response data");
+
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert_eq!(sender.bytes(), b"later".len());
+    assert_eq!(sender.data_bytes(), b"later".len());
+    assert_eq!(send_stream.next_offset(), 1);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_emitted_tcp_path_command(&mut udp_receivers)
+        )
+        .await
+        .is_err(),
+        "blocked response admission must not send via raw ETA fallback target"
+    );
+}
+
+#[tokio::test]
 async fn server_response_sender_dispatches_repair_before_data() {
     let stream_id = StreamId(43);
     let (commands, mut receivers) = tcp_path_session_command_channels(4);

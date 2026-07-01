@@ -45,6 +45,7 @@ pub enum RuntimeError {
     PathIdOverflow,
     PathOpenTimedOut,
     PathHeartbeatTimeout,
+    SenderServiceBlocked,
     TcpPathSessionClosed,
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
@@ -199,6 +200,9 @@ impl std::fmt::Display for RuntimeError {
             Self::PathIdOverflow => write!(f, "configured paths exceed protocol path ID space"),
             Self::PathOpenTimedOut => write!(f, "path stream open timed out"),
             Self::PathHeartbeatTimeout => write!(f, "TCP path heartbeat timed out"),
+            Self::SenderServiceBlocked => {
+                write!(f, "sender service has no currently admissible path")
+            }
             Self::TcpPathSessionClosed => write!(f, "TCP path session closed"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
@@ -238,6 +242,7 @@ impl std::error::Error for RuntimeError {
             | Self::PathIdOverflow
             | Self::PathOpenTimedOut
             | Self::PathHeartbeatTimeout
+            | Self::SenderServiceBlocked
             | Self::TcpPathSessionClosed
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)

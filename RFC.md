@@ -1493,16 +1493,14 @@ carry bulk without weakening the invariant that repair traffic is gap-targeted.
 Validation traffic remains subject to ECF/BLEST-style admission, flow control,
 and a finite validation budget. For ordered reliable streams, Validation credit
 is not throughput evidence. A validation path without sender-side delivery
-evidence MAY carry a bounded unique next `STREAM_DATA` proof only when it is in
-the same underlay family as the current ordinary lead path, no candidate has
-sender-side evidence, and the proof would not jump over lower offsets already
-owned by another path. An unproven cross-underlay validation path MUST NOT own
-the only copy of new ordered bytes while an ordinary lead from another underlay
-exists. It validates by duplicate stream data, repair data for an
-already-missing range, or carrier/control probe traffic until sender-side
-delivery evidence exists. Once any path has sender-side evidence, an unproven
-validation path MUST NOT carry new later stream offsets. Liveness from the open
-itself is not delivery evidence. A receiver MUST NOT promote a Validation or
+evidence MUST NOT own the only copy of new ordered bytes while any ordinary
+lead path exists. This is true for both same-underlay and cross-underlay
+validation. It validates by duplicate stream data that is also sent on an
+admitted ordinary path, repair data for an already-missing range, or
+carrier/control probe traffic until sender-side delivery evidence exists. Once
+any path has sender-side evidence, an unproven validation path MUST NOT carry
+new later stream offsets as unique data. Liveness from the open itself is not
+delivery evidence. A receiver MUST NOT promote a Validation or
 Repair attachment to the Active data slot merely because one frame arrived in
 order. For bulk streams, receiver-side Active promotion is allowed only after
 delivered application bytes have been accounted into the path model and the path
@@ -1970,8 +1968,11 @@ they originate from a read loop, ACK handler, repair trigger, or path reattach
 handler.
 
 A server response sender is subject to the same rule as the client sender. A
-server-to-client `STREAM_DATA` frame MUST enter the sender-service boundary
-before reaching a TCP writer or UDP controller. Diagnostics-enabled
+server-to-client target-read loop MUST enqueue raw response bytes into the
+sender service and MUST NOT construct and send ordinary `STREAM_DATA` directly.
+The sender service creates the `STREAM_DATA` frame only when dispatching an
+admitted quantum, after lane priority, flow-control credit, path admission,
+path-flight ownership, and carrier-credit checks have run. Diagnostics-enabled
 implementations MUST emit a sender decision event for every server response
 `STREAM_DATA` write so lab runs can assert that response bytes did not bypass
 the measured scheduling path.
@@ -2035,7 +2036,11 @@ same path when a receiver has an active ordering hole. Repair generation itself
 is also preemptible: one ACK gap, path failure, or stall event MUST NOT emit an
 unbounded set of cached chunks. It emits at most the adaptive repair quantum,
 normally an MSS-to-latency-quantum-sized byte range, and later progress or stall
-events may emit subsequent ranges.
+events may emit subsequent ranges. ACK handlers, receive-hole detectors, and
+stall timers create repair work items; they do not send repair frames through
+the ordinary stream-data branch. The sender service dispatches those repair
+items through the repair lane and records their path-flight ownership
+separately from ordinary throughput data.
 
 The sender service separates send quantum from send rate. This distinction is
 essential for user-space encrypted proxying: very small bulk frames can consume
@@ -2107,7 +2112,11 @@ Before a product data frame is emitted, all applicable gates must pass:
 
 For reliable bulk streams, the sender service also performs admission before it
 pulls another source byte range into a `STREAM_DATA` frame when the next offset
-and candidate service quantum are known. If the path-flight ledger shows that
+and candidate service quantum are known. Read loops may stage raw bytes only up
+to the sender-service queue, stream-credit, and repair-cache budgets. They MUST
+NOT pre-create later-offset frames because doing so would assign product
+ownership before path admission and repair priority are known. If the
+path-flight ledger shows that
 lower offsets are outstanding on other paths and no attached path can safely
 advance the ordered frontier, the sender pauses the source read and continues
 servicing control, ACK, repair, latency, and carrier events. It MUST NOT create
@@ -2198,18 +2207,14 @@ path responsible for a large unique ordered-stream range.
 Validation for ordered reliable streams is non-blocking and path-scoped. A
 validation byte range that is sent only on an unproven path can itself create
 the ordered-stream hole being measured, so the sender MUST NOT treat validation
-credit as ordinary bulk capacity. When no sender-evidence candidate exists and
-a same-underlay validation path wins the ECF/BLEST lead admission check for the
-next preemptible quantum without jumping over lower offsets owned elsewhere,
-that same-underlay validation path MAY carry the unique next `STREAM_DATA`
-quantum as a bounded primary probe. Cross-underlay validation is stricter: if
-an ordinary lead exists in another underlay family, the validation path MUST NOT
-own the only copy of a new ordered byte range. Instead, the sender duplicates
-the same `STREAM_DATA` on an admitted ordinary path and the validation path,
-sends repair for an already-missing range, or sends carrier/control probes that
-do not create a new application-data dependency. This follows QUIC path
-validation and MPTCP/MPQUIC reinjection practice while adapting it to a
-product-layer stream that must avoid creating irreversible receive-hole debt.
+credit as ordinary bulk capacity. When an ordinary lead path exists, validation
+does not compete to become the primary owner of the next unique ordered byte
+range. Instead, the sender duplicates the same `STREAM_DATA` on an admitted
+ordinary path and the validation path, sends repair for an already-missing
+range, or sends carrier/control probes that do not create a new
+application-data dependency. This follows QUIC path validation and
+MPTCP/MPQUIC reinjection practice while adapting it to a product-layer stream
+that must avoid creating irreversible receive-hole debt.
 
 A stream ACK for duplicated data proves end-to-end byte delivery but does not
 identify which underlay path delivered the bytes. It therefore releases product
@@ -2295,6 +2300,18 @@ saturated path can prevent a proven alternate from carrying traffic while also
 being unable to accept the next quantum itself. This rule is the sender-service
 equivalent of ECF/BLEST comparing against the best usable subflow rather than
 against an unavailable one.
+
+For each ordered reliable stream, lead choice is flow-level state. The sender
+does not recompute an unrelated min-ETA lead for every quantum. The current
+lead remains the ordinary-data owner while it is still attached, eligible, and
+admissible for the next quantum. The sender migrates the lead only when that
+lead fails ordinary admission, is detached, loses sender evidence, or ACK/path
+state makes another path the first admissible owner for the stream frontier.
+This prevents high-rate heterogeneous paths from alternating ownership of later
+offsets faster than the receiver can close lower holes. Additional paths still
+carry control, ACK, realtime, latency, duplicate validation, and explicit
+gap-targeted repair; they become ordinary data paths only through the same
+flow-level lead admission rule.
 
 `carrier_debt` is the sender-visible network backlog: carrier bytes in flight,
 carrier queue bytes, and locally queued carrier commands that are ahead of the

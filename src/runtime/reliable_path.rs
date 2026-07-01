@@ -315,6 +315,7 @@ pub(super) struct ResponseStreamBinding {
     outputs: Mutex<ResponseStreamOutputs>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
+    lead_path: Mutex<Option<CarrierPathKey>>,
     version: watch::Sender<u64>,
 }
 
@@ -389,6 +390,7 @@ impl ResponseStreamBinding {
             }),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
+            lead_path: Mutex::new(Some(key)),
             version,
         })
     }
@@ -467,6 +469,12 @@ impl ResponseStreamBinding {
         if !already_attached {
             self.lane_tracker.attach(self.session_id, key, lane);
         }
+        if server_stream_open_role_promotes_data_path(role) {
+            *self
+                .lead_path
+                .lock()
+                .expect("server reliable stream lead path lock") = Some(key);
+        }
         self.notify_update();
     }
 
@@ -536,6 +544,10 @@ impl ResponseStreamBinding {
             payload_bytes,
             self.mux_limits,
             &lower_flights,
+            *self
+                .lead_path
+                .lock()
+                .expect("server reliable stream lead path lock"),
         )
     }
 
@@ -584,7 +596,17 @@ impl ResponseStreamBinding {
             .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
         if outputs.entries.len() != before {
             outputs.next_index %= outputs.entries.len().max(1);
+            let still_attached = outputs
+                .entries
+                .iter()
+                .any(|entry| Some(entry.key) == *self.lead_path.lock().expect("lead path lock"));
             drop(outputs);
+            if !still_attached {
+                *self
+                    .lead_path
+                    .lock()
+                    .expect("server reliable stream lead path lock") = None;
+            }
             self.lane_tracker.detach(self.session_id, key, lane);
             self.notify_update();
         }
@@ -645,6 +667,10 @@ impl ResponseStreamBinding {
                             reliable_stream_frame_payload_bytes(&frame),
                             self.mux_limits,
                             &lower_flights,
+                            *self
+                                .lead_path
+                                .lock()
+                                .expect("server reliable stream lead path lock"),
                         )
                         .map(CarrierPathSendChoice::Bulk)
                 } else {
@@ -697,6 +723,11 @@ impl ResponseStreamBinding {
                                     }
                                 }
                                 if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
+                                    *self
+                                        .lead_path
+                                        .lock()
+                                        .expect("server reliable stream lead path lock") =
+                                        Some(primary.key);
                                     self.record_flight(
                                         primary.key,
                                         &frame,
@@ -1099,6 +1130,10 @@ impl ResponseStreamBinding {
                 payload_bytes,
                 self.mux_limits,
                 &[],
+                *self
+                    .lead_path
+                    .lock()
+                    .expect("server reliable stream lead path lock"),
             )
             .map(|choice| choice.primary.key)
     }

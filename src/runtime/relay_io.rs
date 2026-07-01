@@ -674,8 +674,9 @@ fn repair_limit_with_extra_traffic_hint(
     base_limit.saturating_add(base_limit.saturating_mul(hint) / 100)
 }
 
-async fn send_reliable_tail_repair(
-    path_stream: &ReliablePathStream,
+fn enqueue_reliable_tail_repair(
+    response_sender: &mut ServerResponseSenderService,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] stream_id: StreamId,
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
     last_send_ack_complete: bool,
@@ -683,16 +684,17 @@ async fn send_reliable_tail_repair(
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
+    underlay: UnderlayProtocol,
+    max_frame_payload_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     last_send_ack_frontier: u64,
-    last_tail_repair_path: &mut Option<CarrierPathKey>,
-) -> Result<(), RuntimeError> {
+) -> usize {
     let base_repair_limit = adaptive_relay_chunk_bytes_for_underlay(
         send_path_snapshot,
         FlowLane::Throughput,
         mux_limits,
-        path_stream.underlay,
-        path_stream.max_frame_payload_bytes,
+        underlay,
+        max_frame_payload_bytes,
     )
     .max(adaptive_reliable_relay_repair_bytes(
         send_path_snapshot,
@@ -713,7 +715,7 @@ async fn send_reliable_tail_repair(
         "tail_stall_repair",
         format_args!(
             "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind={}",
-            path_stream.stream_id.0,
+            stream_id.0,
             relay_lane,
             last_send_ack_frontier,
             send_stream.next_offset(),
@@ -725,12 +727,11 @@ async fn send_reliable_tail_repair(
             repair_kind,
         ),
     );
+    let repair_count = repair_frames.len();
     for frame in repair_frames {
-        if let Some(path_key) = path_stream.send_repair_frame(frame).await? {
-            *last_tail_repair_path = Some(path_key);
-        }
+        response_sender.enqueue_repair_frame(frame);
     }
-    Ok(())
+    repair_count
 }
 
 pub(super) async fn relay_reliable_stream<S>(
@@ -790,7 +791,9 @@ where
         let peer_lane = path_stream.current_lane();
         let demand_update = flow_demand.refresh(
             ReliableRelayFlowSignals::new(
-                send_stream.next_offset(),
+                send_stream
+                    .next_offset()
+                    .saturating_add(response_sender.data_bytes() as u64),
                 recv_stream.next_offset(),
                 send_stream.repair_bytes(),
             ),
@@ -867,7 +870,8 @@ where
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
-        let queued_send_ready = response_sender.queued_send_ready(&path_stream, relay_lane);
+        let queued_send_ready =
+            response_sender.queued_send_ready(&path_stream, &send_stream, relay_lane);
         let queued_send_blocked = response_sender.queued_send_blocked(queued_send_ready);
         let can_read_by_flow = response_sender.can_read_product_source(
             local_open,
@@ -890,8 +894,9 @@ where
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
-                send_reliable_tail_repair(
-                    &path_stream,
+                enqueue_reliable_tail_repair(
+                    &mut response_sender,
+                    stream_id,
                     &send_stream,
                     &last_send_ack_ranges,
                     last_send_ack_complete,
@@ -899,9 +904,10 @@ where
                     relay_lane,
                     mux_limits,
                     performance,
+                    path_stream.underlay,
+                    path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
-                    &mut last_tail_repair_path,
-                ).await?;
+                );
                 last_tail_repair_at = Instant::now();
                 continue;
             }
@@ -1047,7 +1053,7 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let _ = path_stream.send_repair_frame(frame).await?;
+                            response_sender.enqueue_repair_frame(frame);
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
@@ -1131,8 +1137,12 @@ where
                 pending_local_fin = false;
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let dispatch = response_sender.dispatch_next(&path_stream, relay_lane).await?;
-                stats.record_payload_bytes(dispatch.payload_bytes);
+                let dispatch = response_sender.dispatch_next(&path_stream, &mut send_stream, relay_lane).await?;
+                if dispatch.lane == ReliableRelayQueuedWorkLane::Repair {
+                    last_tail_repair_path = dispatch.selected_path;
+                } else {
+                    stats.record_payload_bytes(dispatch.payload_bytes);
+                }
             }
             read = async {
                 #[cfg(feature = "lab-diagnostics")]
@@ -1155,38 +1165,25 @@ where
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
                     #[cfg(feature = "lab-diagnostics")]
-                    let mux_started = Instant::now();
-                    let frame = send_stream.send_data(payload, StreamFlags::NONE)?;
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_perf_record("mux.send_data", mux_started.elapsed(), read);
-                    #[cfg(feature = "lab-diagnostics")]
-                    let stream_extent = match &frame {
-                        Frame::StreamData { offset, payload, .. } => Some((*offset, payload.len())),
-                        _ => None,
-                    };
-                    #[cfg(feature = "lab-diagnostics")]
-                    let enqueue_id = response_sender.enqueue_frame(frame);
+                    let enqueue_id = response_sender.enqueue_data(payload);
                     #[cfg(not(feature = "lab-diagnostics"))]
-                    response_sender.enqueue_frame(frame);
+                    response_sender.enqueue_data(payload);
                     #[cfg(feature = "lab-diagnostics")]
-                    if let Some((offset, payload_bytes)) = stream_extent {
-                        lab_diagnostic(
-                            "server_sender_enqueue",
-                            format_args!(
-                                "session_id={} stream_id={} enqueue_id={} lane={:?} offset={} payload_bytes={} queue_bytes={} queue_limit={} send_credit_bytes={} repair_bytes={}",
-                                session_id.0,
-                                stream_id.0,
-                                enqueue_id,
-                                relay_lane,
-                                offset,
-                                payload_bytes,
-                                response_sender.bytes(),
-                                sender_queue_limit,
-                                send_stream.send_credit_bytes(),
-                                send_stream.repair_bytes(),
-                            ),
-                        );
-                    }
+                    lab_diagnostic(
+                        "server_sender_enqueue",
+                        format_args!(
+                            "session_id={} stream_id={} enqueue_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={} send_credit_bytes={} repair_bytes={}",
+                            session_id.0,
+                            stream_id.0,
+                            enqueue_id,
+                            relay_lane,
+                            read,
+                            response_sender.bytes(),
+                            sender_queue_limit,
+                            send_stream.send_credit_bytes(),
+                            send_stream.repair_bytes(),
+                        ),
+                    );
                 }
             }
             else => break Ok(stats),

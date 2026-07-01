@@ -64,7 +64,9 @@ where
             .and_then(|key| relay_path_snapshot(context, key));
         let demand_update = flow_demand.refresh(
             ReliableRelayFlowSignals::new(
-                send_stream.next_offset(),
+                send_stream
+                    .next_offset()
+                    .saturating_add(sender_queue.data_bytes() as u64),
                 recv_stream.next_offset(),
                 send_stream.repair_bytes(),
             ),
@@ -207,14 +209,14 @@ where
         );
         let queued_send_ready =
             sender_queue
-                .front_stream_extent()
-                .is_some_and(|(offset, payload_bytes)| {
+                .front_data_payload_bytes()
+                .is_some_and(|payload_bytes| {
                     !relay_lane_is_bulk(relay_lane)
                         || sender.can_send_stream_data_extent(
                             context,
                             &remotes,
                             relay_lane,
-                            offset,
+                            send_stream.next_offset(),
                             payload_bytes,
                         )
                 });
@@ -549,11 +551,21 @@ where
                 }
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let queued = sender_queue
+                let (_, queued) = sender_queue
                     .pop_front()
-                    .expect("queued_send_ready requires a queued frame");
-                let retry_frame = queued.frame.clone();
-                match sender.send_stream_data(context, &mut remotes, queued.frame).await {
+                    .expect("queued_send_ready requires queued data");
+                let payload = match queued.kind {
+                    ReliableRelayQueuedWorkKind::Data(payload) => payload,
+                    ReliableRelayQueuedWorkKind::Repair(_) => {
+                        break Err(RuntimeError::Protocol("client sender queue repair item"))
+                    }
+                };
+                let frame = match send_stream.send_data(payload, StreamFlags::NONE) {
+                    Ok(frame) => frame,
+                    Err(err) => break Err(RuntimeError::Stream(err)),
+                };
+                let retry_frame = frame.clone();
+                match sender.send_stream_data(context, &mut remotes, frame).await {
                     Ok(outcome) => {
                         last_stream_progress_at = Instant::now();
                         stats.record_payload_bytes(queued.payload_bytes);
@@ -631,14 +643,6 @@ where
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
                     #[cfg(feature = "lab-diagnostics")]
-                    let mux_started = Instant::now();
-                    let frame = match send_stream.send_data(payload, StreamFlags::NONE) {
-                        Ok(frame) => frame,
-                        Err(err) => break Err(RuntimeError::Stream(err)),
-                    };
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_perf_record("mux.send_data", mux_started.elapsed(), read);
-                    #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "client_sender_enqueue",
                         format_args!(
@@ -650,7 +654,7 @@ where
                             sender_queue_limit,
                         ),
                     );
-                    sender_queue.push(frame);
+                    sender_queue.push_data(payload);
                 }
             }
             frame = async {

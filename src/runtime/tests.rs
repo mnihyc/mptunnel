@@ -563,7 +563,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
     };
-    let mut send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
+    let send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let queue_limit =
         reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_tcp_path_inflight_bytes);
@@ -585,10 +585,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         32 * 1024
     );
 
-    let first = send_stream
-        .send_data(Bytes::from(vec![0u8; 8 * 1024]), StreamFlags::NONE)
-        .expect("first send");
-    sender_queue.push(first);
+    sender_queue.push_data(Bytes::from(vec![0u8; 8 * 1024]));
     assert_eq!(
         reliable_relay_sender_queue_read_budget(
             &send_stream,
@@ -616,10 +613,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         queue_limit
     ));
 
-    let second = send_stream
-        .send_data(Bytes::from(vec![0u8; 24 * 1024]), StreamFlags::NONE)
-        .expect("second send");
-    sender_queue.push(second);
+    sender_queue.push_data(Bytes::from(vec![0u8; 24 * 1024]));
     assert!(!reliable_relay_can_read_into_sender_queue(
         &send_stream,
         &sender_queue,
@@ -638,10 +632,6 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
     );
 
     sender_queue.pop_front();
-    send_stream.apply_ack(&[crate::protocol::OffsetRange {
-        start: 0,
-        end: 8 * 1024,
-    }]);
     assert!(reliable_relay_can_read_into_sender_queue(
         &send_stream,
         &sender_queue,
@@ -672,6 +662,121 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         ),
         16 * 1024
     );
+}
+
+#[test]
+fn reliable_relay_sender_queue_prioritizes_repair_lane() {
+    let mut queue = ReliableRelaySenderQueue::default();
+    queue.push_data(Bytes::from_static(b"ordinary"));
+    queue.push_repair(Frame::StreamData {
+        stream_id: StreamId(9),
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"repair"),
+    });
+
+    let (lane, work) = queue.pop_front().expect("repair work");
+    assert_eq!(lane, ReliableRelayQueuedWorkLane::Repair);
+    assert!(matches!(
+        work.kind,
+        ReliableRelayQueuedWorkKind::Repair(Frame::StreamData { .. })
+    ));
+    assert_eq!(queue.data_bytes(), b"ordinary".len());
+}
+
+#[tokio::test]
+async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes() {
+    let stream_id = StreamId(42);
+    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(7), stream_id);
+    sender.enqueue_data(Bytes::from_static(b"response"));
+
+    assert!(sender.queued_send_ready(&path_stream, &send_stream, FlowLane::Throughput));
+    let dispatch = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect("dispatch response bytes");
+
+    assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(dispatch.payload_bytes, b"response".len());
+    assert_eq!(send_stream.next_offset(), b"response".len() as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload == Bytes::from_static(b"response")
+    ));
+}
+
+#[tokio::test]
+async fn server_response_sender_dispatches_repair_before_data() {
+    let stream_id = StreamId(43);
+    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
+    sender.enqueue_data(Bytes::from_static(b"ordinary"));
+    sender.enqueue_repair_frame(Frame::StreamData {
+        stream_id,
+        offset: 64,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"repair"),
+    });
+
+    let repair_dispatch = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect("dispatch repair");
+    assert_eq!(repair_dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(send_stream.next_offset(), 0);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 64,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"repair")
+    ));
+
+    let data_dispatch = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect("dispatch ordinary data");
+    assert_eq!(data_dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(send_stream.next_offset(), b"ordinary".len() as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"ordinary")
+    ));
 }
 
 #[test]

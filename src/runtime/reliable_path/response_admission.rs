@@ -384,6 +384,7 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
         lower_flights: &[CarrierPathFlightDebt],
+        preferred_lead: Option<CarrierPathKey>,
     ) -> bool {
         self.select_bulk_output(
             session_id,
@@ -392,6 +393,7 @@ impl ResponseStreamOutputs {
             payload_bytes,
             mux_limits,
             lower_flights,
+            preferred_lead,
             Instant::now(),
         )
         .is_some()
@@ -405,6 +407,7 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
         lower_flights: &[CarrierPathFlightDebt],
+        preferred_lead: Option<CarrierPathKey>,
     ) -> Option<CarrierPathBulkChoice> {
         let now = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
@@ -418,6 +421,7 @@ impl ResponseStreamOutputs {
                 mux_limits,
                 now,
                 active_key,
+                preferred_lead,
                 lower_flights,
             );
             self.log_bulk_candidates(
@@ -439,6 +443,7 @@ impl ResponseStreamOutputs {
             payload_bytes,
             mux_limits,
             lower_flights,
+            preferred_lead,
             now,
         )?;
         let entry = self.entries[position].clone();
@@ -494,6 +499,7 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
         lower_flights: &[CarrierPathFlightDebt],
+        preferred_lead: Option<CarrierPathKey>,
         now: Instant,
     ) -> Option<(usize, f64, PathSnapshot)> {
         let active_key = self.entries.last().map(|entry| entry.key);
@@ -552,23 +558,47 @@ impl ResponseStreamOutputs {
                 (position, eta_ms, snapshot)
             })
             .collect::<Vec<_>>();
-        let lead_candidate = normal_candidates
-            .iter()
-            .filter(|(position, eta_ms, snapshot)| {
-                let key = self.entries[*position].key;
-                server_bulk_lead_candidate_suppression(
-                    key,
-                    *snapshot,
-                    *eta_ms,
-                    payload_bytes,
-                    mux_limits,
-                    lower_flights,
-                    self.entries.len(),
-                )
-                .is_none()
+        let lead_candidate = preferred_lead
+            .and_then(|preferred| {
+                normal_candidates
+                    .iter()
+                    .find(|(position, _, _)| self.entries[*position].key == preferred)
+                    .and_then(|(position, eta_ms, snapshot)| {
+                        let key = self.entries[*position].key;
+                        server_bulk_lead_candidate_suppression(
+                            key,
+                            *snapshot,
+                            *eta_ms,
+                            payload_bytes,
+                            mux_limits,
+                            lower_flights,
+                            self.entries.len(),
+                        )
+                        .is_none()
+                        .then_some((key, *eta_ms, *snapshot))
+                    })
             })
-            .min_by(|left, right| left.1.total_cmp(&right.1))
-            .map(|(position, eta_ms, snapshot)| (self.entries[*position].key, *eta_ms, *snapshot));
+            .or_else(|| {
+                normal_candidates
+                    .iter()
+                    .filter(|(position, eta_ms, snapshot)| {
+                        let key = self.entries[*position].key;
+                        server_bulk_lead_candidate_suppression(
+                            key,
+                            *snapshot,
+                            *eta_ms,
+                            payload_bytes,
+                            mux_limits,
+                            lower_flights,
+                            self.entries.len(),
+                        )
+                        .is_none()
+                    })
+                    .min_by(|left, right| left.1.total_cmp(&right.1))
+                    .map(|(position, eta_ms, snapshot)| {
+                        (self.entries[*position].key, *eta_ms, *snapshot)
+                    })
+            });
         normal_candidates
             .into_iter()
             .filter(|(position, eta_ms, snapshot)| {
@@ -851,6 +881,7 @@ impl ResponseStreamOutputs {
         mux_limits: MuxLimits,
         now: Instant,
         active_key: Option<CarrierPathKey>,
+        preferred_lead: Option<CarrierPathKey>,
         lower_flights: &[CarrierPathFlightDebt],
     ) -> Option<(CarrierPathKey, f64, PathSnapshot)> {
         let has_sender_evidence_candidate =
@@ -889,6 +920,9 @@ impl ResponseStreamOutputs {
                 (entry.key, eta_ms, snapshot)
             })
             .filter(|(key, eta_ms, snapshot)| {
+                if preferred_lead.is_some_and(|preferred| preferred != *key) {
+                    return false;
+                }
                 server_bulk_lead_candidate_suppression(
                     *key,
                     *snapshot,
@@ -901,6 +935,23 @@ impl ResponseStreamOutputs {
                 .is_none()
             })
             .min_by(|left, right| left.1.total_cmp(&right.1))
+            .or_else(|| {
+                if preferred_lead.is_some() {
+                    self.bulk_lead_candidate(
+                        session_id,
+                        lane_tracker,
+                        lane,
+                        payload_bytes,
+                        mux_limits,
+                        now,
+                        active_key,
+                        None,
+                        lower_flights,
+                    )
+                } else {
+                    None
+                }
+            })
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -944,7 +995,7 @@ impl ResponseStreamOutputs {
                 "cross_underlay_validation_needs_sender_evidence"
             } else if Some(entry.key) != active_key
                 && !server_output_has_sender_evidence(entry)
-                && !server_output_has_primary_validation_credit(entry, payload_bytes)
+                && entry.validation_credit_bytes < payload_bytes as u64
             {
                 "validation_credit_exhausted"
             } else if Some(entry.key) != active_key
@@ -993,11 +1044,6 @@ impl ResponseStreamOutputs {
                     })
                 {
                     suppression
-                } else if entry.key == lead_key
-                    && server_output_has_primary_validation_credit(entry, payload_bytes)
-                    && !server_output_has_sender_evidence(entry)
-                {
-                    "validation_lead_admitted"
                 } else if entry.key == lead_key {
                     "lead_admitted"
                 } else if server_output_has_sender_evidence(entry) {
@@ -1234,17 +1280,10 @@ pub(super) fn server_output_has_sender_evidence(entry: &ResponseStreamOutputEntr
         )
 }
 
-fn server_output_has_primary_validation_credit(
-    entry: &ResponseStreamOutputEntry,
-    payload_bytes: usize,
-) -> bool {
-    entry.validation_credit_bytes >= payload_bytes as u64
-}
-
 fn server_output_can_carry_primary_bulk(
     entry: &ResponseStreamOutputEntry,
     active_key: Option<CarrierPathKey>,
-    payload_bytes: usize,
+    _payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
     attached_lower_flight_owner: Option<CarrierPathKey>,
     has_sender_evidence_candidate: bool,
@@ -1265,8 +1304,8 @@ fn server_output_can_carry_primary_bulk(
     if has_sender_evidence_candidate {
         return false;
     }
-    server_output_has_primary_validation_credit(entry, payload_bytes)
-        && server_stream_ordering_debt_bytes(lower_flights, entry.key) == 0
+    let _ = lower_flights;
+    false
 }
 
 pub(super) fn record_server_sender_decision(

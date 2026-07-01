@@ -62,12 +62,27 @@ impl RelayRecvProgressSend {
 }
 
 #[derive(Debug)]
-/// Byte-bounded queue for product reliable frames awaiting sender admission.
+pub(super) enum ReliableRelayQueuedWorkKind {
+    Data(Bytes),
+    Repair(Frame),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReliableRelayQueuedWorkLane {
+    Data,
+    Repair,
+}
+
+#[derive(Debug)]
+/// Byte-bounded queue for product reliable work awaiting sender admission.
 ///
 /// This is above carrier paths: it is sized by product flow-control and repair
-/// envelopes, not by TCP socket buffers or QUIC packet queues.
-pub(super) struct ReliableRelayQueuedFrame {
-    pub(super) frame: Frame,
+/// envelopes, not by TCP socket buffers or QUIC packet queues. Normal target
+/// bytes remain raw bytes until dispatch, so the sender-service executor owns
+/// the point where bytes become STREAM_DATA. Repair STREAM_DATA enters a
+/// separate lane even though its wire frame kind is still STREAM_DATA.
+pub(super) struct ReliableRelayQueuedWork {
+    pub(super) kind: ReliableRelayQueuedWorkKind,
     pub(super) payload_bytes: usize,
     #[cfg(feature = "lab-diagnostics")]
     pub(super) enqueue_id: u64,
@@ -76,28 +91,56 @@ pub(super) struct ReliableRelayQueuedFrame {
 }
 
 #[derive(Debug, Default)]
-/// FIFO staging queue used by the current response sender service.
+/// Lane staging queue used by the response sender service.
 ///
-/// It owns queued product frames and queue age before dispatch. Path command
+/// It owns queued product work and queue age before dispatch. Path command
 /// queues must receive only already-admitted frames.
 pub(super) struct ReliableRelaySenderQueue {
-    frames: VecDeque<ReliableRelayQueuedFrame>,
+    repair: VecDeque<ReliableRelayQueuedWork>,
+    data: VecDeque<ReliableRelayQueuedWork>,
     bytes: usize,
+    data_bytes: usize,
     #[cfg(feature = "lab-diagnostics")]
     next_enqueue_id: u64,
 }
 
 impl ReliableRelaySenderQueue {
     pub(super) fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.repair.is_empty() && self.data.is_empty()
     }
 
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    pub(super) fn push(&mut self, frame: Frame) -> u64 {
+    pub(super) fn data_bytes(&self) -> usize {
+        self.data_bytes
+    }
+
+    pub(super) fn push_data(&mut self, payload: Bytes) -> u64 {
+        let payload_bytes = payload.len();
+        self.push_work(
+            ReliableRelayQueuedWorkLane::Data,
+            ReliableRelayQueuedWorkKind::Data(payload),
+            payload_bytes,
+        )
+    }
+
+    pub(super) fn push_repair(&mut self, frame: Frame) -> u64 {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        self.push_work(
+            ReliableRelayQueuedWorkLane::Repair,
+            ReliableRelayQueuedWorkKind::Repair(frame),
+            payload_bytes,
+        )
+    }
+
+    fn push_work(
+        &mut self,
+        lane: ReliableRelayQueuedWorkLane,
+        kind: ReliableRelayQueuedWorkKind,
+        payload_bytes: usize,
+    ) -> u64 {
         #[cfg(feature = "lab-diagnostics")]
         let enqueue_id = {
             let enqueue_id = self.next_enqueue_id;
@@ -107,31 +150,51 @@ impl ReliableRelaySenderQueue {
         #[cfg(not(feature = "lab-diagnostics"))]
         let enqueue_id = 0;
         self.bytes = self.bytes.saturating_add(payload_bytes);
-        self.frames.push_back(ReliableRelayQueuedFrame {
-            frame,
+        if lane == ReliableRelayQueuedWorkLane::Data {
+            self.data_bytes = self.data_bytes.saturating_add(payload_bytes);
+        }
+        let work = ReliableRelayQueuedWork {
+            kind,
             payload_bytes,
             #[cfg(feature = "lab-diagnostics")]
             enqueue_id,
             #[cfg(feature = "lab-diagnostics")]
             queued_at: Instant::now(),
-        });
+        };
+        match lane {
+            ReliableRelayQueuedWorkLane::Data => self.data.push_back(work),
+            ReliableRelayQueuedWorkLane::Repair => self.repair.push_back(work),
+        }
         enqueue_id
     }
 
-    pub(super) fn pop_front(&mut self) -> Option<ReliableRelayQueuedFrame> {
-        let frame = self.frames.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(frame.payload_bytes);
-        Some(frame)
+    pub(super) fn pop_front(
+        &mut self,
+    ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
+        let (lane, work) = if let Some(work) = self.repair.pop_front() {
+            (ReliableRelayQueuedWorkLane::Repair, work)
+        } else {
+            (ReliableRelayQueuedWorkLane::Data, self.data.pop_front()?)
+        };
+        self.bytes = self.bytes.saturating_sub(work.payload_bytes);
+        if lane == ReliableRelayQueuedWorkLane::Data {
+            self.data_bytes = self.data_bytes.saturating_sub(work.payload_bytes);
+        }
+        Some((lane, work))
     }
 
-    pub(super) fn front_stream_extent(&self) -> Option<(u64, usize)> {
-        let frame = self.frames.front()?;
-        match &frame.frame {
-            Frame::StreamData {
-                offset, payload, ..
-            } => Some((*offset, payload.len())),
-            _ => None,
+    pub(super) fn front_lane(&self) -> Option<ReliableRelayQueuedWorkLane> {
+        if !self.repair.is_empty() {
+            Some(ReliableRelayQueuedWorkLane::Repair)
+        } else if !self.data.is_empty() {
+            Some(ReliableRelayQueuedWorkLane::Data)
+        } else {
+            None
         }
+    }
+
+    pub(super) fn front_data_payload_bytes(&self) -> Option<usize> {
+        self.data.front().map(|work| work.payload_bytes)
     }
 }
 
@@ -154,8 +217,11 @@ pub(super) fn reliable_relay_can_read_into_sender_queue(
     queue_limit: usize,
 ) -> bool {
     sender_queue.bytes() < queue_limit
-        && send_stream.send_credit_bytes() > 0
-        && send_stream.repair_bytes() < mux_limits.max_repair_bytes
+        && sender_queue.data_bytes() < send_stream.send_credit_bytes()
+        && send_stream
+            .repair_bytes()
+            .saturating_add(sender_queue.data_bytes())
+            < mux_limits.max_repair_bytes
 }
 
 pub(super) fn reliable_relay_can_read_product_source(
@@ -188,9 +254,14 @@ pub(super) fn reliable_relay_sender_queue_read_budget(
         .min(
             mux_limits
                 .max_repair_bytes
-                .saturating_sub(send_stream.repair_bytes()),
+                .saturating_sub(send_stream.repair_bytes())
+                .saturating_sub(sender_queue.data_bytes()),
         )
-        .min(send_stream.send_credit_bytes())
+        .min(
+            send_stream
+                .send_credit_bytes()
+                .saturating_sub(sender_queue.data_bytes()),
+        )
         .min(buffer_len)
 }
 
@@ -211,6 +282,8 @@ pub(super) struct ServerResponseSenderService {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ServerResponseDispatch {
     pub(super) payload_bytes: usize,
+    pub(super) lane: ReliableRelayQueuedWorkLane,
+    pub(super) selected_path: Option<CarrierPathKey>,
 }
 
 impl ServerResponseSenderService {
@@ -231,6 +304,10 @@ impl ServerResponseSenderService {
         self.queue.bytes()
     }
 
+    pub(super) fn data_bytes(&self) -> usize {
+        self.queue.data_bytes()
+    }
+
     pub(super) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
         path_stream.set_sender_queue_bytes(self.queue.bytes());
     }
@@ -238,14 +315,24 @@ impl ServerResponseSenderService {
     pub(super) fn queued_send_ready(
         &self,
         path_stream: &ReliablePathStream,
+        send_stream: &ReliableSendStream,
         relay_lane: FlowLane,
     ) -> bool {
-        self.queue
-            .front_stream_extent()
-            .is_some_and(|(offset, payload_bytes)| {
+        match self.queue.front_lane() {
+            Some(ReliableRelayQueuedWorkLane::Repair) => true,
+            Some(ReliableRelayQueuedWorkLane::Data) => {
+                let Some(payload_bytes) = self.queue.front_data_payload_bytes() else {
+                    return false;
+                };
                 !relay_lane_is_bulk(relay_lane)
-                    || path_stream.can_send_stream_data_extent(relay_lane, offset, payload_bytes)
-            })
+                    || path_stream.can_send_stream_data_extent(
+                        relay_lane,
+                        send_stream.next_offset(),
+                        payload_bytes,
+                    )
+            }
+            None => false,
+        }
     }
 
     pub(super) fn queued_send_blocked(&self, queued_send_ready: bool) -> bool {
@@ -286,18 +373,21 @@ impl ServerResponseSenderService {
         )
     }
 
-    pub(super) fn enqueue_frame(&mut self, frame: Frame) -> u64 {
-        self.queue.push(frame)
+    pub(super) fn enqueue_data(&mut self, payload: Bytes) -> u64 {
+        self.queue.push_data(payload)
+    }
+
+    pub(super) fn enqueue_repair_frame(&mut self, frame: Frame) -> u64 {
+        self.queue.push_repair(frame)
     }
 
     pub(super) async fn dispatch_next(
         &mut self,
         path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
         relay_lane: FlowLane,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
-        #[cfg(not(feature = "lab-diagnostics"))]
-        let _ = relay_lane;
-        let queued = self
+        let (queued_lane, queued) = self
             .queue
             .pop_front()
             .expect("queued_send_ready requires a queued frame");
@@ -305,34 +395,54 @@ impl ServerResponseSenderService {
         let enqueue_id = queued.enqueue_id;
         #[cfg(feature = "lab-diagnostics")]
         let queue_delay_ms = queued.queued_at.elapsed().as_millis();
+        let (frame, dispatch_lane_name) = match queued.kind {
+            ReliableRelayQueuedWorkKind::Data(payload) => {
+                #[cfg(feature = "lab-diagnostics")]
+                let mux_started = Instant::now();
+                let frame = send_stream.send_data(payload, StreamFlags::NONE)?;
+                #[cfg(feature = "lab-diagnostics")]
+                lab_perf_record("mux.send_data", mux_started.elapsed(), queued.payload_bytes);
+                (frame, "data")
+            }
+            ReliableRelayQueuedWorkKind::Repair(frame) => (frame, "repair"),
+        };
         #[cfg(feature = "lab-diagnostics")]
-        let send_lane = tcp_path_effective_frame_lane(&queued.frame, relay_lane);
+        let send_lane = if queued_lane == ReliableRelayQueuedWorkLane::Repair {
+            FlowLane::Latency
+        } else {
+            tcp_path_effective_frame_lane(&frame, relay_lane)
+        };
         #[cfg(feature = "lab-diagnostics")]
-        let pacing_bytes = frame_pacing_bytes(&queued.frame);
+        let pacing_bytes = frame_pacing_bytes(&frame);
         #[cfg(feature = "lab-diagnostics")]
-        let stream_extent = match &queued.frame {
+        let stream_extent = match &frame {
             Frame::StreamData {
                 offset, payload, ..
             } => Some((*offset, payload.len())),
             _ => None,
         };
-        let selected_path = path_stream.send_frame_tracked(queued.frame).await?;
+        let selected_path = match queued_lane {
+            ReliableRelayQueuedWorkLane::Data => path_stream.send_frame_tracked(frame).await?,
+            ReliableRelayQueuedWorkLane::Repair => path_stream.send_repair_frame(frame).await?,
+        };
         #[cfg(not(feature = "lab-diagnostics"))]
-        let _ = selected_path;
+        let _ = (relay_lane, dispatch_lane_name);
         #[cfg(feature = "lab-diagnostics")]
         if let Some((offset, payload_bytes)) = stream_extent {
-            lab_server_response_stream_data(
-                self.session_id.0,
-                self.stream_id.0,
-                offset,
-                payload_bytes,
-            );
+            if queued_lane == ReliableRelayQueuedWorkLane::Data {
+                lab_server_response_stream_data(
+                    self.session_id.0,
+                    self.stream_id.0,
+                    offset,
+                    payload_bytes,
+                );
+            }
             if selected_path.is_none() {
                 lab_sender_service_decision(
                     "server",
                     Some(self.session_id.0),
                     self.stream_id.0,
-                    "primary",
+                    dispatch_lane_name,
                     "stream_data",
                     payload_bytes,
                     format_args!(
@@ -347,13 +457,14 @@ impl ServerResponseSenderService {
             lab_diagnostic(
                 "server_sender_dispatch",
                 format_args!(
-                    "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
+                    "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} work_lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
                     self.session_id.0,
                     self.stream_id.0,
                     enqueue_id,
                     offset,
                     payload_bytes,
                     send_lane,
+                    queued_lane,
                     queue_delay_ms,
                     self.queue.bytes(),
                     selected_underlay,
@@ -364,6 +475,8 @@ impl ServerResponseSenderService {
         }
         Ok(ServerResponseDispatch {
             payload_bytes: queued.payload_bytes,
+            lane: queued_lane,
+            selected_path,
         })
     }
 }

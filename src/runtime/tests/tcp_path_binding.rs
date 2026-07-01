@@ -300,7 +300,7 @@ async fn server_tcp_binding_bulk_repair_reattach_keeps_repair_out_of_ordinary_da
 }
 
 #[tokio::test]
-async fn server_udp_binding_bulk_validation_credit_can_lead_bounded_probe_data() {
+async fn server_udp_binding_validation_credit_duplicates_without_owning_unique_data() {
     let max_frame_payload_bytes = reliable_relay_buffer_len(MuxLimits::default());
     let validation_credit_bytes = max_frame_payload_bytes.saturating_mul(2);
     let (path0_initial_tx, _path0_initial_rx) = tcp_path_session_command_channels(1);
@@ -355,21 +355,19 @@ async fn server_udp_binding_bulk_validation_credit_can_lead_bounded_probe_data()
         .expect("send UDP validation bulk frame");
 
     assert!(matches!(
+        recv_emitted_tcp_path_command(&mut path1_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ..
+        }))
+    ));
+    assert!(matches!(
         recv_emitted_tcp_path_command(&mut path0_validation_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
         }))
     ));
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut path1_rx)
-        )
-        .await
-        .is_err(),
-        "bounded UDP validation credit should let the faster validation path lead before the active path creates ordering debt"
-    );
 }
 
 #[tokio::test]
@@ -1439,7 +1437,7 @@ async fn server_ack_ordering_keeps_out_of_order_acked_ranges_as_debt() {
 }
 
 #[tokio::test]
-async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
+async fn server_tcp_validation_credit_does_not_own_unique_ordered_data() {
     let registry = ServerReliableStreamRegistry::default();
     let session_id = SessionId(71);
     let stream_id = StreamId(7);
@@ -1515,7 +1513,7 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
         .expect("send response bulk");
 
     assert!(matches!(
-        recv_emitted_tcp_path_command(&mut validation_rx).await,
+        recv_emitted_tcp_path_command(&mut active_rx).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
             offset: 0,
             ..
@@ -1524,11 +1522,11 @@ async fn server_binding_allows_bounded_tcp_validation_without_duplicate_data() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut active_rx)
+            recv_emitted_tcp_path_command(&mut validation_rx)
         )
         .await
         .is_err(),
-        "TCP validation credit may carry bounded primary probe data, but peer hints must not create duplicate ordered stream data"
+        "TCP validation credit must not carry the only copy of ordered response bytes"
     );
 }
 
@@ -1708,6 +1706,76 @@ async fn server_bulk_binding_uses_service_horizon_for_fat_path() {
             ..
         }))
     ));
+}
+
+#[tokio::test]
+async fn server_bulk_binding_ignores_inadmissible_low_eta_lead_candidate() {
+    let (saturated_tx, mut saturated_rx) = tcp_path_session_command_channels(128);
+    let binding = ResponseStreamBinding::new(
+        SessionId(1),
+        UnderlayProtocol::Udp,
+        PathId(0),
+        saturated_tx,
+        FlowLane::Throughput,
+    );
+    let (admissible_tx, mut admissible_rx) = tcp_path_session_command_channels(128);
+    binding.attach(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        admissible_tx,
+        FlowLane::Throughput,
+        StreamOpenRole::Validation,
+        reliable_relay_buffer_len(MuxLimits::default()),
+    );
+
+    let mut saturated = test_path_metrics(PathId(0), UnderlayProtocol::Udp, 10_000, 500_000_000);
+    saturated.bytes_in_flight = saturated.inflight_limit_bytes;
+    binding.update_path_metrics_for_test(UnderlayProtocol::Udp, PathId(0), saturated);
+    binding.update_path_metrics_for_test(
+        UnderlayProtocol::Udp,
+        PathId(1),
+        test_path_metrics(PathId(1), UnderlayProtocol::Udp, 30_000, 400_000_000),
+    );
+
+    assert_eq!(
+        binding.bulk_choice_key_for_test(64 * 1024),
+        Some(CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        }),
+        "lowest raw ETA path is not the lead when it has no carrier/product admission credit"
+    );
+
+    binding
+        .send_frame(
+            StreamId(7),
+            FlowLane::Throughput,
+            Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![1u8; 64 * 1024]),
+            },
+        )
+        .await
+        .expect("send response bulk on admissible lead");
+
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut admissible_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            ..
+        }))
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_emitted_tcp_path_command(&mut saturated_rx)
+        )
+        .await
+        .is_err(),
+        "saturated low-ETA path must not receive or suppress the admissible lead quantum"
+    );
 }
 
 #[tokio::test]

@@ -41,6 +41,18 @@ pub(super) struct RelaySendOutcome {
     pub(super) path_key: RelayPathKey,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ClientQueuedDispatch {
+    Data {
+        path_key: RelayPathKey,
+        payload_bytes: usize,
+    },
+    Repair {
+        path_key: RelayPathKey,
+        payload_bytes: usize,
+    },
+}
+
 #[derive(Debug)]
 pub(super) struct RelaySenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
@@ -857,6 +869,222 @@ impl RelaySenderService {
     ) -> Result<RelaySendOutcome, RuntimeError> {
         debug_assert!(cause.is_repair());
         self.send_frame(context, remotes, frame, cause).await
+    }
+
+    pub(super) async fn dispatch_client_queued_work(
+        &mut self,
+        context: &ClientPathContext,
+        spec: &ReliableRelayOpenSpec,
+        relay_lane: FlowLane,
+        remotes: &mut ReliableRelayRemoteSet,
+        send_stream: &mut ReliableSendStream,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        local_open: bool,
+    ) -> Result<ClientQueuedDispatch, RuntimeError> {
+        let queued_kind = sender_queue
+            .front()
+            .map(|(_, queued)| queued.kind.clone())
+            .expect("queued_send_ready requires queued data");
+        match queued_kind {
+            ReliableRelayQueuedWorkKind::Data(payload) => {
+                self.dispatch_client_data_work(
+                    context,
+                    spec,
+                    relay_lane,
+                    remotes,
+                    send_stream,
+                    sender_queue,
+                    local_open,
+                    payload,
+                )
+                .await
+            }
+            ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
+                self.dispatch_client_repair_work(
+                    context,
+                    spec,
+                    relay_lane,
+                    remotes,
+                    send_stream,
+                    sender_queue,
+                    local_open,
+                    frame,
+                    cause,
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_client_data_work(
+        &mut self,
+        context: &ClientPathContext,
+        spec: &ReliableRelayOpenSpec,
+        relay_lane: FlowLane,
+        remotes: &mut ReliableRelayRemoteSet,
+        send_stream: &mut ReliableSendStream,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        local_open: bool,
+        payload: Bytes,
+    ) -> Result<ClientQueuedDispatch, RuntimeError> {
+        let frame = send_stream
+            .send_data(payload, StreamFlags::NONE)
+            .map_err(RuntimeError::Stream)?;
+        let retry_frame = frame.clone();
+        match self.send_stream_data(context, remotes, frame.clone()).await {
+            Ok(outcome) => {
+                let (_, committed) = sender_queue
+                    .commit_front()
+                    .expect("sent queued data must still be at queue front");
+                Ok(ClientQueuedDispatch::Data {
+                    path_key: outcome.path_key,
+                    payload_bytes: committed.payload_bytes,
+                })
+            }
+            Err(RuntimeError::SenderServiceBlocked) => {
+                let _ = send_stream.rollback_committed_data(&frame);
+                Err(RuntimeError::SenderServiceBlocked)
+            }
+            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                let _ = send_stream.rollback_committed_data(&frame);
+                match attach_reliable_relay_paths(
+                    context,
+                    spec,
+                    relay_lane,
+                    remotes,
+                    send_stream,
+                    !local_open,
+                    ReliableRelayAttachMode::Any,
+                )
+                .await
+                {
+                    Ok(attached) if attached > 0 => {
+                        if let Err(err) = send_stream.commit_prepared_data(&frame) {
+                            return Err(RuntimeError::Stream(err));
+                        }
+                        match self.send_stream_data(context, remotes, retry_frame).await {
+                            Ok(outcome) => {
+                                let (_, committed) = sender_queue
+                                    .commit_front()
+                                    .expect("sent queued data must still be at queue front");
+                                Ok(ClientQueuedDispatch::Data {
+                                    path_key: outcome.path_key,
+                                    payload_bytes: committed.payload_bytes,
+                                })
+                            }
+                            Err(RuntimeError::SenderServiceBlocked) => {
+                                let _ = send_stream.rollback_committed_data(&frame);
+                                Err(RuntimeError::SenderServiceBlocked)
+                            }
+                            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                let _ = send_stream.rollback_committed_data(&frame);
+                                Err(err)
+                            }
+                            Err(err) => {
+                                let _ = send_stream.rollback_committed_data(&frame);
+                                Err(err)
+                            }
+                        }
+                    }
+                    Ok(_) => Err(err),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => {
+                let _ = send_stream.rollback_committed_data(&frame);
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_client_repair_work(
+        &mut self,
+        context: &ClientPathContext,
+        spec: &ReliableRelayOpenSpec,
+        relay_lane: FlowLane,
+        remotes: &mut ReliableRelayRemoteSet,
+        send_stream: &mut ReliableSendStream,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        local_open: bool,
+        frame: Frame,
+        cause: RelaySendCause,
+    ) -> Result<ClientQueuedDispatch, RuntimeError> {
+        let retry_frame = frame.clone();
+        match self.send_repair_frame(context, remotes, frame, cause).await {
+            Ok(outcome) => {
+                let (_, committed) = sender_queue
+                    .commit_front()
+                    .expect("sent queued repair must still be at queue front");
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "repair",
+                    format_args!(
+                        "stream_id={} path_underlay={:?} path_index={} cause={} queued_dispatch=true payload_bytes={}",
+                        self.stream_id.0,
+                        outcome.path_key.underlay,
+                        outcome.path_key.index,
+                        cause.as_str(),
+                        committed.payload_bytes,
+                    ),
+                );
+                Ok(ClientQueuedDispatch::Repair {
+                    path_key: outcome.path_key,
+                    payload_bytes: committed.payload_bytes,
+                })
+            }
+            Err(RuntimeError::SenderServiceBlocked) => Err(RuntimeError::SenderServiceBlocked),
+            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                match attach_reliable_relay_paths(
+                    context,
+                    spec,
+                    relay_lane,
+                    remotes,
+                    send_stream,
+                    !local_open,
+                    ReliableRelayAttachMode::Any,
+                )
+                .await
+                {
+                    Ok(attached) if attached > 0 => {
+                        match self
+                            .send_repair_frame(context, remotes, retry_frame, cause)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                let (_, committed) = sender_queue
+                                    .commit_front()
+                                    .expect("sent queued repair must still be at queue front");
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "repair",
+                                    format_args!(
+                                        "stream_id={} path_underlay={:?} path_index={} cause={} queued_dispatch=true after_attach=true payload_bytes={}",
+                                        self.stream_id.0,
+                                        outcome.path_key.underlay,
+                                        outcome.path_key.index,
+                                        cause.as_str(),
+                                        committed.payload_bytes,
+                                    ),
+                                );
+                                Ok(ClientQueuedDispatch::Repair {
+                                    path_key: outcome.path_key,
+                                    payload_bytes: committed.payload_bytes,
+                                })
+                            }
+                            Err(RuntimeError::SenderServiceBlocked) => {
+                                Err(RuntimeError::SenderServiceBlocked)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Ok(_) => Err(err),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn send_frame(

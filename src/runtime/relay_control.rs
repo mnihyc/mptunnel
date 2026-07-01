@@ -536,187 +536,42 @@ where
                 }
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let queued_kind = sender_queue
-                    .front()
-                    .map(|(_, queued)| queued.kind.clone())
-                    .expect("queued_send_ready requires queued data");
-                match queued_kind {
-                    ReliableRelayQueuedWorkKind::Data(payload) => {
-                        let frame = match send_stream.send_data(payload, StreamFlags::NONE) {
-                            Ok(frame) => frame,
-                            Err(err) => break Err(RuntimeError::Stream(err)),
-                        };
-                        let retry_frame = frame.clone();
-                        match sender.send_stream_data(context, &mut remotes, frame.clone()).await {
-                            Ok(outcome) => {
-                                let (_, committed) = sender_queue
-                                    .commit_front()
-                                    .expect("sent queued data must still be at queue front");
-                                last_stream_progress_at = Instant::now();
-                                stats.record_payload_bytes(committed.payload_bytes);
-                                path_stats
-                                    .entry(outcome.path_key)
-                                    .or_default()
-                                    .record_payload_bytes(committed.payload_bytes);
-                            }
-                            Err(RuntimeError::SenderServiceBlocked) => {
-                                let _ = send_stream.rollback_committed_data(&frame);
-                                sender_retry_at =
-                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                                continue;
-                            }
-                            Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                let _ = send_stream.rollback_committed_data(&frame);
-                                match attach_reliable_relay_paths(
-                                    context,
-                                    &spec,
-                                    relay_lane,
-                                    &mut remotes,
-                                    &send_stream,
-                                    !local_open,
-                                    ReliableRelayAttachMode::Any,
-                                )
-                                .await
-                                {
-                                    Ok(attached) if attached > 0 => {
-                                        sender_retry_at = None;
-                                        if let Err(err) = send_stream.commit_prepared_data(&frame) {
-                                            break Err(RuntimeError::Stream(err));
-                                        }
-                                        match sender
-                                            .send_stream_data(context, &mut remotes, retry_frame)
-                                            .await
-                                        {
-                                            Ok(outcome) => {
-                                                let (_, committed) = sender_queue
-                                                    .commit_front()
-                                                    .expect("sent queued data must still be at queue front");
-                                                last_stream_progress_at = Instant::now();
-                                                stats.record_payload_bytes(committed.payload_bytes);
-                                                path_stats
-                                                    .entry(outcome.path_key)
-                                                    .or_default()
-                                                    .record_payload_bytes(committed.payload_bytes);
-                                            }
-                                            Err(RuntimeError::SenderServiceBlocked) => {
-                                                let _ = send_stream.rollback_committed_data(&frame);
-                                                sender_retry_at =
-                                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                                                continue;
-                                            }
-                                            Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                                let _ = send_stream.rollback_committed_data(&frame);
-                                                break Err(err);
-                                            }
-                                            Err(err) => {
-                                                let _ = send_stream.rollback_committed_data(&frame);
-                                                break Err(err);
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => break Err(err),
-                                    Err(err) => break Err(err),
-                                }
-                            }
-                            Err(err) => {
-                                let _ = send_stream.rollback_committed_data(&frame);
-                                break Err(err);
-                            }
-                        }
+                match sender
+                    .dispatch_client_queued_work(
+                        context,
+                        &spec,
+                        relay_lane,
+                        &mut remotes,
+                        &mut send_stream,
+                        &mut sender_queue,
+                        local_open,
+                    )
+                    .await
+                {
+                    Ok(ClientQueuedDispatch::Data {
+                        path_key,
+                        payload_bytes,
+                    }) => {
+                        last_stream_progress_at = Instant::now();
+                        stats.record_payload_bytes(payload_bytes);
+                        path_stats
+                            .entry(path_key)
+                            .or_default()
+                            .record_payload_bytes(payload_bytes);
                     }
-                    ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
-                        let retry_frame = frame.clone();
-                        match sender
-                            .send_repair_frame(context, &mut remotes, frame, cause)
-                            .await
-                        {
-                            Ok(outcome) => {
-                                let (_, committed) = sender_queue
-                                    .commit_front()
-                                    .expect("sent queued repair must still be at queue front");
-                                #[cfg(not(feature = "lab-diagnostics"))]
-                                let _ = committed;
-                                #[cfg(not(feature = "lab-diagnostics"))]
-                                let _ = outcome;
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "repair",
-                                    format_args!(
-                                        "stream_id={} path_underlay={:?} path_index={} cause={} queued_dispatch=true payload_bytes={}",
-                                        stream_id.0,
-                                        outcome.path_key.underlay,
-                                        outcome.path_key.index,
-                                        cause.as_str(),
-                                        committed.payload_bytes,
-                                    ),
-                                );
-                                last_stream_progress_at = Instant::now();
-                            }
-                            Err(RuntimeError::SenderServiceBlocked) => {
-                                sender_retry_at =
-                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                                continue;
-                            }
-                            Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                match attach_reliable_relay_paths(
-                                    context,
-                                    &spec,
-                                    relay_lane,
-                                    &mut remotes,
-                                    &send_stream,
-                                    !local_open,
-                                    ReliableRelayAttachMode::Any,
-                                )
-                                .await
-                                {
-                                    Ok(attached) if attached > 0 => {
-                                        sender_retry_at = None;
-                                        match sender
-                                            .send_repair_frame(
-                                                context,
-                                                &mut remotes,
-                                                retry_frame,
-                                                cause,
-                                            )
-                                            .await
-                                        {
-                                            Ok(outcome) => {
-                                                let (_, committed) = sender_queue
-                                                    .commit_front()
-                                                    .expect("sent queued repair must still be at queue front");
-                                                #[cfg(not(feature = "lab-diagnostics"))]
-                                                let _ = committed;
-                                                #[cfg(not(feature = "lab-diagnostics"))]
-                                                let _ = outcome;
-                                                #[cfg(feature = "lab-diagnostics")]
-                                                lab_diagnostic(
-                                                    "repair",
-                                                    format_args!(
-                                                        "stream_id={} path_underlay={:?} path_index={} cause={} queued_dispatch=true after_attach=true payload_bytes={}",
-                                                        stream_id.0,
-                                                        outcome.path_key.underlay,
-                                                        outcome.path_key.index,
-                                                        cause.as_str(),
-                                                        committed.payload_bytes,
-                                                    ),
-                                                );
-                                                last_stream_progress_at = Instant::now();
-                                            }
-                                            Err(RuntimeError::SenderServiceBlocked) => {
-                                                sender_retry_at =
-                                                    Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                                                continue;
-                                            }
-                                            Err(err) => break Err(err),
-                                        }
-                                    }
-                                    Ok(_) => break Err(err),
-                                    Err(err) => break Err(err),
-                                }
-                            }
-                            Err(err) => break Err(err),
-                        }
+                    Ok(ClientQueuedDispatch::Repair {
+                        path_key,
+                        payload_bytes,
+                    }) => {
+                        let _ = (path_key, payload_bytes);
+                        last_stream_progress_at = Instant::now();
                     }
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        sender_retry_at =
+                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                        continue;
+                    }
+                    Err(err) => break Err(err),
                 }
             }
             _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {

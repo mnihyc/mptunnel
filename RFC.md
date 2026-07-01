@@ -1955,17 +1955,17 @@ that one endpoint's outbound samples prove the reverse direction.
 
 Each product flow is governed by exactly one sender-service ownership boundary
 between the stream/datagram layer and the carrier writers. The sender service
-is an abstract protocol role, not necessarily a dedicated asynchronous task:
-an implementation may realize it as an immediate-mode relay service, a
-switchable output binding, or a packet-sender loop, provided that one owner
-decides when product work is ready to leave on a path. Fixed single-path flows
-are the degenerate case of this model. The sender service consumes stream
-bytes, datagram payloads, ACK/control frames, repair work, path model
-snapshots, flow-control credit, and carrier availability, then emits carrier
-writes that respect lane priority, per-flow fairness, path admission, and
-carrier pacing. Product frames MUST NOT bypass this boundary merely because
-they originate from a read loop, ACK handler, repair trigger, or path reattach
-handler.
+is a concrete queued ownership boundary, not a permit wrapper around an
+immediate path-write loop. An implementation MAY run the sender service inside
+the same asynchronous task as a relay only if that code still owns product
+queues, classifies lanes before path selection, dispatches bounded quanta, and
+keeps carrier writer pipes as emission sinks only. Fixed single-path flows are
+the degenerate case of this model. The sender service consumes stream bytes,
+datagram payloads, ACK/control frames, repair work, path model snapshots,
+flow-control credit, and carrier availability, then emits carrier writes that
+respect lane priority, per-flow fairness, path admission, and carrier pacing.
+Product frames MUST NOT bypass this boundary merely because they originate from
+a read loop, ACK handler, repair trigger, or path reattach handler.
 
 A server response sender is subject to the same rule as the client sender. A
 server-to-client target-read loop MUST enqueue raw response bytes into the
@@ -2867,6 +2867,29 @@ stream queue or UDP path command queue as though every item were a 512 KiB TCP
 relay chunk, because doing so can delay carrier receive, ACK processing, loss
 repair, sender-state release, and path model feedback even when CPU and memory
 are idle.
+
+Path command queues are bounded writer pipes only. They MUST NOT implement
+product-flow fairness, lead-path selection, validation policy, repair
+generation, ECF/BLEST admission, or stream-ordering-debt policy. They MAY
+preserve separate control/priority/data pipes so already-admitted control and
+latency work is not delayed by throughput writes, but the decision that a frame
+belongs to a lane and is admissible for a path is made by the sender service
+before the command enters the path queue. Any per-flow fair queue inside a path
+writer is a stale policy layer because it moves fairness behind hidden
+backpressure and prevents the sender service from explaining why a byte range
+was dispatched.
+
+Carrier-path binding objects are registries and ledgers, not send schedulers.
+They may record which carrier paths are attached to a reliable product stream,
+which byte ranges are in product/path flight, and which local sender evidence is
+available for each path. They MUST NOT expose a method whose effect is "send
+this product frame on whichever attached path looks best" and MUST NOT expose a
+readiness predicate that asks the binding whether a future ordered byte range
+may be sent. Those APIs recreate the rejected immediate relay shape. Ordinary
+data, repair data, validation probes, stream ACKs, FIN/RESET/DETACH, and
+datagram frames enter sender-service queues first; the sender service is the
+only component that can transform a queued product item into an admitted carrier
+command.
 
 Implementations SHOULD expose path command-queue pending bytes to diagnostics
 and sender-service accounting. Those pending bytes explain local scheduling

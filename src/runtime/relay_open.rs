@@ -262,27 +262,6 @@ impl ReliableRelayRemoteSet {
             .await
     }
 
-    pub(super) fn bulk_send_ready_for_extent(
-        &self,
-        context: &ClientPathContext,
-        lane: FlowLane,
-        offset: u64,
-        payload_bytes: usize,
-        path_flights: &RelayPathFlightLedger,
-    ) -> bool {
-        bulk_relay_send_ready_for_extent(BulkRelayPathRequest {
-            stream_id: self.stream_id,
-            context,
-            paths: &self.paths,
-            lane,
-            offset,
-            payload_bytes,
-            cursor: self.next_send_index,
-            avoid_keys: &[],
-            path_flights: Some(path_flights),
-        })
-    }
-
     async fn send_frame_with_avoid(
         &mut self,
         context: &ClientPathContext,

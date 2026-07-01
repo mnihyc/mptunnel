@@ -207,19 +207,7 @@ where
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot, relay_lane),
         );
-        let queued_send_ready =
-            sender_queue
-                .front_data_payload_bytes()
-                .is_some_and(|payload_bytes| {
-                    !relay_lane_is_bulk(relay_lane)
-                        || sender.can_send_stream_data_extent(
-                            context,
-                            &remotes,
-                            relay_lane,
-                            send_stream.next_offset(),
-                            payload_bytes,
-                        )
-                });
+        let queued_send_ready = !sender_queue.is_empty();
         let queued_send_blocked = !sender_queue.is_empty() && !queued_send_ready;
         let can_read_by_flow = reliable_relay_can_read_product_source(
             local_open,

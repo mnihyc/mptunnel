@@ -319,27 +319,8 @@ impl ServerResponseSenderService {
         path_stream.set_sender_queue_bytes(self.queue.bytes());
     }
 
-    pub(super) fn queued_send_ready(
-        &self,
-        path_stream: &ReliablePathStream,
-        send_stream: &ReliableSendStream,
-        relay_lane: FlowLane,
-    ) -> bool {
-        match self.queue.front() {
-            Some((ReliableRelayQueuedWorkLane::Repair, _)) => true,
-            Some((ReliableRelayQueuedWorkLane::Data, _)) => {
-                let Some(payload_bytes) = self.queue.front_data_payload_bytes() else {
-                    return false;
-                };
-                !relay_lane_is_bulk(relay_lane)
-                    || path_stream.can_send_stream_data_extent(
-                        relay_lane,
-                        send_stream.next_offset(),
-                        payload_bytes,
-                    )
-            }
-            None => false,
-        }
+    pub(super) fn queued_send_ready(&self) -> bool {
+        self.queue.front().is_some()
     }
 
     pub(super) fn queued_send_blocked(&self, queued_send_ready: bool) -> bool {
@@ -601,17 +582,6 @@ impl RelaySenderService {
                 release.bytes,
             );
         }
-    }
-
-    pub(super) fn can_send_stream_data_extent(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        lane: FlowLane,
-        offset: u64,
-        payload_bytes: usize,
-    ) -> bool {
-        remotes.bulk_send_ready_for_extent(context, lane, offset, payload_bytes, &self.flights)
     }
 
     pub(super) async fn send_recv_progress(

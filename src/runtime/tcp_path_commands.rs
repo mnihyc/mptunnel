@@ -14,57 +14,7 @@ pub(super) struct TcpPathSessionCommandReceivers {
     control: mpsc::Receiver<TcpPathSessionCommand>,
     priority: mpsc::Receiver<TcpPathSessionCommand>,
     data: mpsc::Receiver<TcpPathSessionCommand>,
-    fair_data: TcpPathFairDataQueue,
     metrics: Arc<TcpPathSessionCommandQueueMetrics>,
-}
-
-#[derive(Default)]
-struct TcpPathFairDataQueue {
-    flows: VecDeque<TcpPathDataFlowQueue>,
-}
-
-struct TcpPathDataFlowQueue {
-    stream_id: StreamId,
-    commands: VecDeque<TcpPathSessionCommand>,
-}
-
-impl TcpPathFairDataQueue {
-    fn push(&mut self, command: TcpPathSessionCommand) {
-        let stream_id = tcp_path_command_stream_id(&command);
-        if let Some(flow) = self
-            .flows
-            .iter_mut()
-            .find(|flow| flow.stream_id == stream_id)
-        {
-            flow.commands.push_back(command);
-            return;
-        }
-        let mut commands = VecDeque::new();
-        commands.push_back(command);
-        self.flows.push_back(TcpPathDataFlowQueue {
-            stream_id,
-            commands,
-        });
-    }
-
-    fn pop_round_robin(&mut self) -> Option<TcpPathSessionCommand> {
-        let flow_count = self.flows.len();
-        for _ in 0..flow_count {
-            let mut flow = self.flows.pop_front()?;
-            let command = flow.commands.pop_front();
-            if !flow.commands.is_empty() {
-                self.flows.push_back(flow);
-            }
-            if command.is_some() {
-                return command;
-            }
-        }
-        None
-    }
-
-    fn is_empty(&self) -> bool {
-        self.flows.iter().all(|flow| flow.commands.is_empty())
-    }
 }
 
 #[derive(Default)]
@@ -263,7 +213,6 @@ pub(super) fn tcp_path_session_command_channels(
             control: control_rx,
             priority: priority_rx,
             data: data_rx,
-            fair_data: TcpPathFairDataQueue::default(),
             metrics,
         },
     )
@@ -277,7 +226,6 @@ pub(super) fn tcp_path_receivers_closed(receivers: &TcpPathSessionCommandReceive
     !tcp_receiver_may_recv(&receivers.control)
         && !tcp_receiver_may_recv(&receivers.priority)
         && !tcp_receiver_may_recv(&receivers.data)
-        && receivers.fair_data.is_empty()
 }
 
 pub(super) async fn recv_tcp_path_command(
@@ -286,62 +234,44 @@ pub(super) async fn recv_tcp_path_command(
     if let Some(command) = recv_ready_priority_command(receivers) {
         return Some(command);
     }
-    drain_ready_data_commands(receivers);
-    if let Some(command) = receivers.fair_data.pop_round_robin() {
-        return Some(command);
-    }
     let control_may_recv = tcp_receiver_may_recv(&receivers.control);
     let priority_may_recv = tcp_receiver_may_recv(&receivers.priority);
     let data_may_recv = tcp_receiver_may_recv(&receivers.data);
-    let command = match (control_may_recv, priority_may_recv, data_may_recv) {
+    match (control_may_recv, priority_may_recv, data_may_recv) {
         (true, true, true) => {
             tokio::select! {
                 biased;
-                command = receivers.control.recv() => TcpPathReceivedCommand::Priority(command),
-                command = receivers.priority.recv() => TcpPathReceivedCommand::Priority(command),
-                command = receivers.data.recv() => TcpPathReceivedCommand::Data(command),
+                command = receivers.control.recv() => command,
+                command = receivers.priority.recv() => command,
+                command = receivers.data.recv() => command,
             }
         }
         (true, true, false) => {
             tokio::select! {
                 biased;
-                command = receivers.control.recv() => TcpPathReceivedCommand::Priority(command),
-                command = receivers.priority.recv() => TcpPathReceivedCommand::Priority(command),
+                command = receivers.control.recv() => command,
+                command = receivers.priority.recv() => command,
             }
         }
         (true, false, true) => {
             tokio::select! {
                 biased;
-                command = receivers.control.recv() => TcpPathReceivedCommand::Priority(command),
-                command = receivers.data.recv() => TcpPathReceivedCommand::Data(command),
+                command = receivers.control.recv() => command,
+                command = receivers.data.recv() => command,
             }
         }
         (false, true, true) => {
             tokio::select! {
                 biased;
-                command = receivers.priority.recv() => TcpPathReceivedCommand::Priority(command),
-                command = receivers.data.recv() => TcpPathReceivedCommand::Data(command),
+                command = receivers.priority.recv() => command,
+                command = receivers.data.recv() => command,
             }
         }
-        (true, false, false) => TcpPathReceivedCommand::Priority(receivers.control.recv().await),
-        (false, true, false) => TcpPathReceivedCommand::Priority(receivers.priority.recv().await),
-        (false, false, true) => TcpPathReceivedCommand::Data(receivers.data.recv().await),
-        (false, false, false) => TcpPathReceivedCommand::Priority(None),
-    };
-    match command {
-        TcpPathReceivedCommand::Priority(command) => command,
-        TcpPathReceivedCommand::Data(Some(command)) => {
-            receivers.fair_data.push(command);
-            drain_ready_data_commands(receivers);
-            receivers.fair_data.pop_round_robin()
-        }
-        TcpPathReceivedCommand::Data(None) => receivers.fair_data.pop_round_robin(),
+        (true, false, false) => receivers.control.recv().await,
+        (false, true, false) => receivers.priority.recv().await,
+        (false, false, true) => receivers.data.recv().await,
+        (false, false, false) => None,
     }
-}
-
-enum TcpPathReceivedCommand {
-    Priority(Option<TcpPathSessionCommand>),
-    Data(Option<TcpPathSessionCommand>),
 }
 
 fn recv_ready_priority_command(
@@ -351,12 +281,6 @@ fn recv_ready_priority_command(
         return Some(command);
     }
     receivers.priority.try_recv().ok()
-}
-
-fn drain_ready_data_commands(receivers: &mut TcpPathSessionCommandReceivers) {
-    while let Ok(command) = receivers.data.try_recv() {
-        receivers.fair_data.push(command);
-    }
 }
 
 pub(super) fn tcp_path_command_pending_bytes(command: &TcpPathSessionCommand) -> usize {

@@ -870,8 +870,7 @@ where
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
-        let queued_send_ready =
-            response_sender.queued_send_ready(&path_stream, &send_stream, relay_lane);
+        let queued_send_ready = response_sender.queued_send_ready();
         let queued_send_blocked = response_sender.queued_send_blocked(queued_send_ready);
         let can_read_by_flow = response_sender.can_read_product_source(
             local_open,

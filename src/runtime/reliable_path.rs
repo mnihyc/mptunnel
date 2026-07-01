@@ -1,8 +1,3 @@
-use super::bulk_admission::{
-    BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
-    bulk_candidate_admission_suppression, bulk_candidate_admission_suppression_with_ordering_debt,
-    bulk_service_horizon_payload_bytes,
-};
 use super::*;
 use std::collections::{BTreeMap, HashMap};
 
@@ -15,9 +10,10 @@ use response_admission::*;
 // Ownership boundary:
 // This module owns carrier-neutral reliable stream bindings on the response
 // side. It tracks which carrier path carried each product byte range, records
-// ordering debt and stream-ACK release, and chooses among already joined carrier
-// paths for response frames. It must not implement TCP framing, QUIC packet
-// recovery, or target socket I/O; those belong to carrier and outbound modules.
+// ordering debt and stream-ACK release. It must not choose among joined carrier
+// paths for response frames; dispatch belongs to the sender service. It must
+// not implement TCP framing, QUIC packet recovery, or target socket I/O; those
+// belong to carrier and outbound modules.
 
 /// Product reliable stream handle after an OPEN_STREAM has been accepted.
 ///
@@ -54,43 +50,8 @@ impl ReliablePathStream {
         )
     }
 
-    pub(super) async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
-        self.send_frame_tracked(frame).await.map(|_| ())
-    }
-
-    pub(super) async fn send_frame_with_lane(
-        &self,
-        frame: Frame,
-        lane: FlowLane,
-    ) -> Result<(), RuntimeError> {
-        self.output
-            .send_frame(self.stream_id, lane, frame)
-            .await
-            .map(|_| ())
-    }
-
-    pub(super) async fn send_repair_frame(
-        &self,
-        frame: Frame,
-    ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-        self.output.send_repair_frame(self.stream_id, frame).await
-    }
-
     pub(super) fn mark_repair_path_delivery_and_promote(&self, key: CarrierPathKey) -> bool {
         self.output.mark_repair_path_delivery_and_promote(key)
-    }
-
-    pub(super) async fn send_frame_tracked(
-        &self,
-        frame: Frame,
-    ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-        self.output
-            .send_frame(
-                self.stream_id,
-                tcp_path_effective_frame_lane(&frame, self.lane),
-                frame,
-            )
-            .await
     }
 
     pub(super) async fn recv_frame(&mut self) -> Result<Frame, RuntimeError> {
@@ -115,16 +76,6 @@ impl ReliablePathStream {
 
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
         self.output.set_sender_queue_bytes(bytes);
-    }
-
-    pub(super) fn can_send_stream_data_extent(
-        &self,
-        lane: FlowLane,
-        offset: u64,
-        payload_bytes: usize,
-    ) -> bool {
-        self.output
-            .can_send_stream_data_extent(lane, offset, payload_bytes)
     }
 
     pub(super) fn subscribe_output_updates(&self) -> Option<watch::Receiver<u64>> {
@@ -159,17 +110,6 @@ pub(super) struct ReliablePathStreamHandle {
 }
 
 impl ReliablePathStreamHandle {
-    pub(super) async fn send_frame(&self, frame: Frame) -> Result<(), RuntimeError> {
-        self.output
-            .send_frame(
-                self.stream_id,
-                tcp_path_effective_frame_lane(&frame, self.lane),
-                frame,
-            )
-            .await
-            .map(|_| ())
-    }
-
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -186,35 +126,6 @@ pub(super) enum ReliablePathStreamOutput {
 }
 
 impl ReliablePathStreamOutput {
-    pub(super) async fn send_frame(
-        &self,
-        stream_id: StreamId,
-        lane: FlowLane,
-        frame: Frame,
-    ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-        match self {
-            Self::Fixed(commands) => {
-                commands.send_frame(frame, lane).await?;
-                Ok(None)
-            }
-            Self::Switchable(binding) => binding.send_frame(stream_id, lane, frame).await,
-        }
-    }
-
-    pub(super) async fn send_repair_frame(
-        &self,
-        stream_id: StreamId,
-        frame: Frame,
-    ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-        match self {
-            Self::Fixed(commands) => {
-                commands.send_frame(frame, FlowLane::Latency).await?;
-                Ok(None)
-            }
-            Self::Switchable(binding) => binding.send_repair_frame(stream_id, frame).await,
-        }
-    }
-
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
         match self {
             Self::Fixed(commands) => {
@@ -257,20 +168,6 @@ impl ReliablePathStreamOutput {
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
         if let Self::Switchable(binding) = self {
             binding.set_sender_queue_bytes(bytes);
-        }
-    }
-
-    pub(super) fn can_send_stream_data_extent(
-        &self,
-        lane: FlowLane,
-        offset: u64,
-        payload_bytes: usize,
-    ) -> bool {
-        match self {
-            Self::Fixed(_) => true,
-            Self::Switchable(binding) => {
-                binding.can_send_stream_data_extent(lane, offset, payload_bytes)
-            }
         }
     }
 
@@ -376,7 +273,6 @@ impl ResponseStreamBinding {
             mux_limits,
             lane_tracker,
             outputs: Mutex::new(ResponseStreamOutputs {
-                next_index: 0,
                 entries: vec![ResponseStreamOutputEntry {
                     key,
                     commands,
@@ -460,7 +356,6 @@ impl ResponseStreamBinding {
             .iter()
             .map(|entry| entry.key)
             .collect::<Vec<_>>();
-        outputs.next_index %= outputs.entries.len().max(1);
         drop(outputs);
         if previous_lane != lane {
             self.lane_tracker
@@ -523,34 +418,6 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn can_send_stream_data_extent(
-        &self,
-        lane: FlowLane,
-        offset: u64,
-        payload_bytes: usize,
-    ) -> bool {
-        if !relay_lane_is_bulk(lane) || payload_bytes == 0 {
-            return true;
-        }
-        let lower_flights = self.lower_flights_before_offset(offset);
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        outputs.bulk_send_ready(
-            self.session_id,
-            &self.lane_tracker,
-            lane,
-            payload_bytes,
-            self.mux_limits,
-            &lower_flights,
-            *self
-                .lead_path
-                .lock()
-                .expect("server reliable stream lead path lock"),
-        )
-    }
-
     pub(super) fn set_lane(&self, lane: FlowLane) {
         let previous_lane = {
             let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
@@ -595,7 +462,6 @@ impl ResponseStreamBinding {
             .entries
             .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
         if outputs.entries.len() != before {
-            outputs.next_index %= outputs.entries.len().max(1);
             let still_attached = outputs
                 .entries
                 .iter()
@@ -629,199 +495,10 @@ impl ResponseStreamBinding {
         if !was_active {
             let entry = outputs.entries.remove(position);
             outputs.entries.push(entry);
-            outputs.next_index %= outputs.entries.len().max(1);
         }
         drop(outputs);
         self.notify_update();
         !was_active
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) async fn send_frame(
-        &self,
-        stream_id: StreamId,
-        _lane: FlowLane,
-        frame: Frame,
-    ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-        let mut updates = self.version.subscribe();
-        loop {
-            let stream_lane = self.lane();
-            let lower_flights = if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
-                self.lower_flights_before_frame(&frame)
-            } else {
-                Vec::new()
-            };
-            let selected = {
-                let mut outputs = self
-                    .outputs
-                    .lock()
-                    .expect("server reliable stream binding lock");
-                if server_frame_prefers_current_data_path(&frame, stream_lane) {
-                    outputs.data_commands().map(CarrierPathSendChoice::Single)
-                } else if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
-                    outputs
-                        .bulk_commands(
-                            self.session_id,
-                            &self.lane_tracker,
-                            stream_lane,
-                            reliable_stream_frame_payload_bytes(&frame),
-                            self.mux_limits,
-                            &lower_flights,
-                            *self
-                                .lead_path
-                                .lock()
-                                .expect("server reliable stream lead path lock"),
-                        )
-                        .map(CarrierPathSendChoice::Bulk)
-                } else {
-                    outputs.next_commands().map(CarrierPathSendChoice::Single)
-                }
-            };
-            if let Some(choice) = selected {
-                let send_lane = tcp_path_effective_frame_lane(&frame, stream_lane);
-                let primary = match &choice {
-                    CarrierPathSendChoice::Single(target) => target,
-                    CarrierPathSendChoice::Bulk(choice) => &choice.primary,
-                };
-                tokio::select! {
-                    result = primary.commands.send_frame(frame.clone(), send_lane) => {
-                        match result {
-                            Ok(()) => {
-                                let mut primary_stream_ack_proves_path = true;
-                                if let CarrierPathSendChoice::Bulk(choice) = &choice
-                                    && let Some(duplicate) = &choice.validation_duplicate
-                                {
-                                    match duplicate.commands.try_send_frame(frame.clone(), send_lane) {
-                                        Ok(true) => {
-                                            primary_stream_ack_proves_path = false;
-                                            record_server_sender_decision(
-                                                self.session_id,
-                                                stream_id,
-                                                duplicate.key,
-                                                &frame,
-                                                send_lane,
-                                                "validation_duplicate",
-                                            );
-                                            self.record_flight(
-                                                duplicate.key,
-                                                &frame,
-                                                false,
-                                            );
-                                        }
-                                        Ok(false) => {
-                                            #[cfg(feature = "lab-diagnostics")]
-                                            lab_diagnostic(
-                                                "server_bulk_output_validation_duplicate_skipped",
-                                                format_args!(
-                                                    "path_underlay={:?} path_id={} reason=queue_full",
-                                                    duplicate.key.underlay,
-                                                    duplicate.key.path_id.0,
-                                                ),
-                                            );
-                                        }
-                                        Err(_) => self.detach(duplicate.key, &duplicate.commands),
-                                    }
-                                }
-                                if relay_frame_is_bulk_stream_data(&frame, stream_lane) {
-                                    *self
-                                        .lead_path
-                                        .lock()
-                                        .expect("server reliable stream lead path lock") =
-                                        Some(primary.key);
-                                    self.record_flight(
-                                        primary.key,
-                                        &frame,
-                                        primary_stream_ack_proves_path,
-                                    );
-                                }
-                                record_server_sender_decision(
-                                    self.session_id,
-                                    stream_id,
-                                    primary.key,
-                                    &frame,
-                                    send_lane,
-                                    "primary",
-                                );
-                                return Ok(Some(primary.key));
-                            }
-                            Err(_) => self.detach(primary.key, &primary.commands),
-                        }
-                    }
-                    changed = updates.changed() => {
-                        changed.map_err(|_| RuntimeError::TcpPathSessionClosed)?;
-                    }
-                }
-            } else {
-                updates
-                    .changed()
-                    .await
-                    .map_err(|_| RuntimeError::TcpPathSessionClosed)?;
-            }
-        }
-    }
-
-    pub(super) async fn send_repair_frame(
-        &self,
-        stream_id: StreamId,
-        frame: Frame,
-    ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-        let mut updates = self.version.subscribe();
-        loop {
-            let avoid_keys = self.flight_keys_overlapping_frame(&frame);
-            let selected = {
-                let outputs = self
-                    .outputs
-                    .lock()
-                    .expect("server reliable stream binding lock");
-                outputs.repair_commands(
-                    self.session_id,
-                    &self.lane_tracker,
-                    &avoid_keys,
-                    reliable_stream_frame_payload_bytes(&frame),
-                    self.mux_limits,
-                )
-            };
-            if let Some(target) = selected {
-                tokio::select! {
-                    result = target.commands.send_frame(frame.clone(), FlowLane::Latency) => {
-                        match result {
-                            Ok(()) => {
-                                self.record_flight(target.key, &frame, false);
-                                record_server_sender_decision(
-                                    self.session_id,
-                                    stream_id,
-                                    target.key,
-                                    &frame,
-                                    FlowLane::Latency,
-                                    "tail_repair",
-                                );
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "repair",
-                                    format_args!(
-                                        "stream_id={} path_underlay={:?} path_id={} cause=tail_stall avoided_paths={}",
-                                        stream_id.0,
-                                        target.key.underlay,
-                                        target.key.path_id.0,
-                                        avoid_keys.len(),
-                                    ),
-                                );
-                                return Ok(Some(target.key));
-                            }
-                            Err(_) => self.detach(target.key, &target.commands),
-                        }
-                    }
-                    changed = updates.changed() => {
-                        changed.map_err(|_| RuntimeError::TcpPathSessionClosed)?;
-                    }
-                }
-            } else {
-                updates
-                    .changed()
-                    .await
-                    .map_err(|_| RuntimeError::TcpPathSessionClosed)?;
-            }
-        }
     }
 
     pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
@@ -1114,28 +791,6 @@ impl ResponseStreamBinding {
                     Instant::now(),
                 )
             })
-    }
-
-    #[cfg(test)]
-    pub(super) fn bulk_choice_key_for_test(&self, payload_bytes: usize) -> Option<CarrierPathKey> {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        outputs
-            .bulk_commands(
-                self.session_id,
-                &self.lane_tracker,
-                FlowLane::Throughput,
-                payload_bytes,
-                self.mux_limits,
-                &[],
-                *self
-                    .lead_path
-                    .lock()
-                    .expect("server reliable stream lead path lock"),
-            )
-            .map(|choice| choice.primary.key)
     }
 
     #[cfg(test)]

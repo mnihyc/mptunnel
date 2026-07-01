@@ -1807,4 +1807,3 @@ mod datagram;
 mod integration;
 mod security;
 mod tcp_path;
-mod tcp_path_binding;

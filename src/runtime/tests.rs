@@ -757,6 +757,64 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
 }
 
 #[tokio::test]
+async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
+    let stream_id = StreamId(46);
+    let (commands, mut receivers) = tcp_path_session_command_channels(1);
+    commands
+        .send_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"already queued"),
+            },
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("prefill carrier data queue");
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
+    send_stream.update_max_offset(1024);
+    let mut sender = ServerResponseSenderService::new(SessionId(11), stream_id);
+    sender.enqueue_data(Bytes::from_static(b"later"));
+
+    let err = sender
+        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .await
+        .expect_err("full carrier queue should be sender-service backpressure");
+
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert_eq!(sender.bytes(), b"later".len());
+    assert_eq!(sender.data_bytes(), b"later".len());
+    assert_eq!(send_stream.next_offset(), 0);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"already queued")
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_emitted_tcp_path_command(&mut receivers)
+        )
+        .await
+        .is_err(),
+        "blocked dispatch must not enqueue another STREAM_DATA frame"
+    );
+}
+
+#[tokio::test]
 async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_target() {
     let stream_id = StreamId(45);
     let (tcp_commands, _tcp_receivers) = tcp_path_session_command_channels(4);

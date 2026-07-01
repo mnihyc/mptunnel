@@ -208,6 +208,7 @@ pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) context: &'a ClientPathContext,
     pub(super) paths: &'a [ReliableRelayRemotePath],
     pub(super) lane: FlowLane,
+    pub(super) frame: Option<&'a Frame>,
     pub(super) offset: u64,
     pub(super) payload_bytes: usize,
     pub(super) cursor: usize,
@@ -380,6 +381,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         context,
         paths,
         lane,
+        frame: Some(frame),
         offset,
         payload_bytes,
         cursor,
@@ -396,6 +398,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         context,
         paths,
         lane,
+        frame,
         offset,
         payload_bytes,
         cursor,
@@ -447,6 +450,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             paths,
             lane,
             payload_bytes,
+            frame,
             active_key,
             admitted_bulk_keys: &admitted_bulk_keys,
             restrict_to_admitted,
@@ -479,6 +483,24 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 ),
                 false,
                 "repair_path_not_for_ordinary_bulk",
+            );
+            continue;
+        }
+        if normal_bulk_send
+            && let Some(frame) = frame
+            && !path.stream.can_enqueue_frame_now(frame, lane)
+        {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics::skipped(
+                    stream_id,
+                    lane,
+                    key,
+                    lead_key,
+                    payload_bytes,
+                ),
+                false,
+                "carrier_credit",
             );
             continue;
         }
@@ -735,6 +757,7 @@ struct RelayBulkLeadRequest<'a> {
     paths: &'a [ReliableRelayRemotePath],
     lane: FlowLane,
     payload_bytes: usize,
+    frame: Option<&'a Frame>,
     active_key: Option<RelayPathKey>,
     admitted_bulk_keys: &'a [RelayPathKey],
     restrict_to_admitted: bool,
@@ -749,6 +772,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         paths,
         lane,
         payload_bytes,
+        frame,
         active_key,
         admitted_bulk_keys,
         restrict_to_admitted,
@@ -759,6 +783,11 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
     paths
         .iter()
         .filter(|path| path.placement != RelayPathPlacement::Repair)
+        .filter(|path| {
+            frame
+                .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
+                .unwrap_or(true)
+        })
         .filter(|path| {
             let key = path.key();
             if let Some(owner) = lower_flight_owner {
@@ -965,6 +994,7 @@ mod tests {
                 context: &context,
                 paths: &paths,
                 lane: FlowLane::Throughput,
+                frame: None,
                 offset: 64 * 1024,
                 payload_bytes: 64 * 1024,
                 cursor: 0,
@@ -998,6 +1028,7 @@ mod tests {
                 context: &context,
                 paths: &paths,
                 lane: FlowLane::Throughput,
+                frame: None,
                 offset: 64 * 1024,
                 payload_bytes: 64 * 1024,
                 cursor: 0,
@@ -1039,6 +1070,7 @@ mod tests {
             paths: &paths,
             lane: FlowLane::Throughput,
             payload_bytes: 64 * 1024,
+            frame: None,
             active_key: Some(saturated),
             admitted_bulk_keys: &[saturated, admissible],
             restrict_to_admitted: true,

@@ -140,6 +140,72 @@ impl TcpPathSessionCommandSender {
         result
     }
 
+    pub(super) fn try_enqueue_admitted_frame(
+        &self,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        let bytes = frame_pacing_bytes(&frame);
+        let effective_lane = tcp_path_effective_frame_lane(&frame, lane);
+        #[cfg(feature = "lab-diagnostics")]
+        let frame_kind = tcp_path_frame_kind(&frame);
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_id = tcp_path_frame_stream_id(&frame);
+        let queue = if tcp_path_frame_uses_priority_queue(effective_lane) {
+            &self.priority
+        } else {
+            &self.data
+        };
+        let result = match queue.try_reserve() {
+            Ok(permit) => {
+                self.metrics.add_pending_bytes(bytes);
+                permit.send(TcpPathSessionCommand::SendFrame(frame));
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(RuntimeError::SenderServiceBlocked)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(RuntimeError::TcpPathSessionClosed)
+            }
+        };
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            let queue_name = if tcp_path_frame_uses_priority_queue(effective_lane) {
+                "priority"
+            } else {
+                "data"
+            };
+            lab_diagnostic(
+                "path_command_queue_send",
+                format_args!(
+                    "queue={} frame_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result={}",
+                    queue_name,
+                    frame_kind,
+                    stream_id.0,
+                    lane,
+                    effective_lane,
+                    bytes,
+                    match &result {
+                        Ok(()) => "queued",
+                        Err(RuntimeError::SenderServiceBlocked) => "blocked",
+                        Err(_) => "closed",
+                    },
+                ),
+            );
+        }
+        result
+    }
+
+    pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+        let effective_lane = tcp_path_effective_frame_lane(frame, lane);
+        if tcp_path_frame_uses_priority_queue(effective_lane) {
+            self.priority.capacity() > 0
+        } else {
+            self.data.capacity() > 0
+        }
+    }
+
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
     pub(super) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()

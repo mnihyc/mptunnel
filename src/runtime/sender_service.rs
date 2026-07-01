@@ -433,6 +433,20 @@ fn choose_response_sender_target(
     if targets.is_empty() {
         return None;
     }
+    let capacity_targets;
+    let targets = if matches!(frame, Frame::StreamData { .. }) {
+        capacity_targets = targets
+            .iter()
+            .filter(|target| target.commands.can_enqueue_frame_now(frame, lane))
+            .cloned()
+            .collect::<Vec<_>>();
+        if capacity_targets.is_empty() {
+            return None;
+        }
+        capacity_targets.as_slice()
+    } else {
+        targets
+    };
     if repair || !relay_frame_is_bulk_stream_data(frame, lane) {
         return choose_lowest_eta_response_target(targets, avoid_keys, true)
             .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false));
@@ -496,7 +510,7 @@ async fn emit_response_frame_from_sender_service(
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(commands) => {
-            commands.send_frame(frame, lane).await?;
+            send_sender_service_frame_to_carrier(commands, frame, lane).await?;
             Ok(None)
         }
         ReliablePathStreamOutput::Switchable(binding) => {
@@ -528,7 +542,9 @@ async fn emit_response_frame_from_sender_service(
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
-                match target.commands.send_frame(frame.clone(), lane).await {
+                match send_sender_service_frame_to_carrier(&target.commands, frame.clone(), lane)
+                    .await
+                {
                     Ok(()) => {
                         if matches!(frame, Frame::StreamData { .. }) {
                             binding.record_flight(target.key, &frame, !repair);
@@ -543,6 +559,9 @@ async fn emit_response_frame_from_sender_service(
                         );
                         return Ok(Some(target.key));
                     }
+                    Err(RuntimeError::SenderServiceBlocked) => {
+                        return Err(RuntimeError::SenderServiceBlocked);
+                    }
                     Err(err) => {
                         last_error = Some(err);
                         binding.detach(target.key, &target.commands);
@@ -550,6 +569,18 @@ async fn emit_response_frame_from_sender_service(
                 }
             }
         }
+    }
+}
+
+async fn send_sender_service_frame_to_carrier(
+    commands: &TcpPathSessionCommandSender,
+    frame: Frame,
+    lane: FlowLane,
+) -> Result<(), RuntimeError> {
+    if matches!(frame, Frame::StreamData { .. }) {
+        commands.try_enqueue_admitted_frame(frame, lane)
+    } else {
+        commands.send_frame(frame, lane).await
     }
 }
 
@@ -567,7 +598,9 @@ async fn emit_relay_path_frame(
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(commands) => commands.send_frame(frame, lane).await,
+        ReliablePathStreamOutput::Fixed(commands) => {
+            send_sender_service_frame_to_carrier(commands, frame, lane).await
+        }
         ReliablePathStreamOutput::Switchable(_) => {
             Err(RuntimeError::Protocol("request relay path is not fixed"))
         }
@@ -890,6 +923,9 @@ impl RelaySenderService {
                         (position + 1) % remotes.paths.len()
                     };
                     return Ok(instance.key);
+                }
+                Err(RuntimeError::SenderServiceBlocked) => {
+                    return Err(RuntimeError::SenderServiceBlocked);
                 }
                 Err(err) => {
                     last_error = Some(err);

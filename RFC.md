@@ -2033,6 +2033,16 @@ local path-output update as sufficient progress. Output-update wakeups are
 scheduler housekeeping; they MUST NOT outrank feedback that can release
 product ownership, repair state, or flow-control credit.
 
+Carrier command queues are emission pipes, not permits around the sender
+service. For ordinary and repair `STREAM_DATA`, carrier queue capacity is a
+nonblocking credit gate. If the chosen carrier command queue cannot accept the
+next data quantum immediately, the sender MUST keep the product work queued,
+MUST NOT advance stream offset or product-flight ownership permanently, MUST NOT
+mark the carrier failed, and MUST continue polling ACK, credit, control,
+repair, and path-update feedback. A full carrier queue is backpressure, not a
+liveness failure. Control and ACK lanes may use their higher-priority emission
+path, but they MUST NOT sit behind a bulk data queue.
+
 The service maintains separate logical lanes in this priority order:
 
 1. carrier ACK-only feedback;

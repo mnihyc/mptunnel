@@ -1579,6 +1579,81 @@ async fn send_relay_stream_frame_for_test(
 }
 
 #[tokio::test]
+async fn relay_sender_queue_full_blocks_without_detaching_path() {
+    let path = "tcp://127.0.0.1:10270?srtt-ms=20&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let stream_id = StreamId(77);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut command_rx) = tcp_path_session_command_channels(1);
+    commands
+        .send_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"queued"),
+            },
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("prefill relay carrier queue");
+    let (_frames_tx, frames_rx) = mpsc::channel(4);
+    let opened = OpenedRemoteStream {
+        path_index: 0,
+        stream: ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::Fixed(commands),
+            frames: frames_rx,
+        },
+    };
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let mut sender = RelaySenderService::new(stream_id);
+
+    let err = sender
+        .send_stream_data(
+            &context,
+            &mut remotes,
+            Frame::StreamData {
+                stream_id,
+                offset: 1024,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"later"),
+            },
+        )
+        .await
+        .expect_err("full relay carrier queue should be sender-service backpressure");
+
+    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
+    assert!(
+        !remotes.is_empty(),
+        "queue backpressure must not detach path"
+    );
+    assert!(matches!(
+        recv_tcp_path_command(&mut command_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"queued")
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_tcp_path_command(&mut command_rx)
+        )
+        .await
+        .is_err(),
+        "blocked relay dispatch must not enqueue another STREAM_DATA frame"
+    );
+}
+
+#[tokio::test]
 async fn mixed_relay_current_carrier_tracks_latest_data_path() {
     let (tcp_stream, _tcp_commands, _tcp_frames) =
         opened_relay_stream_for_test(StreamId(44), UnderlayProtocol::Tcp, 0);

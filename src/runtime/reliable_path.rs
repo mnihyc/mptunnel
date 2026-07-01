@@ -114,6 +114,10 @@ impl ReliablePathStreamHandle {
         self.output.send_stream_detach(self.stream_id).await;
     }
 
+    pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+        self.output.can_enqueue_frame_now(frame, lane)
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -130,6 +134,13 @@ pub(super) enum ReliablePathStreamOutput {
 }
 
 impl ReliablePathStreamOutput {
+    pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+        match self {
+            Self::Fixed(commands) => commands.can_enqueue_frame_now(frame, lane),
+            Self::Switchable(_) => true,
+        }
+    }
+
     pub(super) async fn send_stream_detach(&self, stream_id: StreamId) {
         if let Self::Fixed(commands) = self {
             let _ = commands

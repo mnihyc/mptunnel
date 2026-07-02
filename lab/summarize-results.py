@@ -238,7 +238,7 @@ def best_goodput(records, prefix):
 
 
 def equal_cohort_comparisons(records):
-    profiles = ("lowlat", "balanced", "fat")
+    profiles = ("lowlat", "balanced", "fat", "unconstrained")
     workloads = {
         "download": {
             "metric": "goodput_mbps",

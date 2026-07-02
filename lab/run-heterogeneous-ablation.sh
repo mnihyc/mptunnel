@@ -1190,7 +1190,8 @@ ensure_baseline_tool() {
 run_vmess_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
-  prepare_baseline_case apply
+  local netem_mode="${3:-apply}"
+  prepare_baseline_case "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess" "xray baseline binary unavailable"
     return 0
@@ -1213,7 +1214,8 @@ run_vmess_baseline_case() {
 run_vmess_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
-  prepare_baseline_case apply
+  local netem_mode="${3:-apply}"
+  prepare_baseline_case "$netem_mode"
   if ! ensure_baseline_tool server xray || ! ensure_baseline_tool client xray; then
     append_skipped_result "$case_name" "vmess-upload" "xray baseline binary unavailable"
     return 0
@@ -1236,7 +1238,8 @@ run_vmess_baseline_upload_case() {
 run_hysteria2_baseline_case() {
   local case_name="$1"
   local server_ip="$2"
-  prepare_baseline_case apply
+  local netem_mode="${3:-apply}"
+  prepare_baseline_case "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2" "hysteria2 baseline binary unavailable"
     return 0
@@ -1262,7 +1265,8 @@ run_hysteria2_baseline_case() {
 run_hysteria2_baseline_upload_case() {
   local case_name="$1"
   local server_ip="$2"
-  prepare_baseline_case apply
+  local netem_mode="${3:-apply}"
+  prepare_baseline_case "$netem_mode"
   if ! ensure_baseline_tool server hysteria2 || ! ensure_baseline_tool client hysteria2; then
     append_skipped_result "$case_name" "hysteria2-upload" "hysteria2 baseline binary unavailable"
     return 0
@@ -1303,7 +1307,8 @@ configure_mptcp_endpoints() {
 
 run_mptcp_baseline_case() {
   local case_name="$1"
-  prepare_baseline_case apply
+  local netem_mode="${2:-apply}"
+  prepare_baseline_case "$netem_mode"
   if ! exec_in client "python3 /workspace/lab/mptcp_http.py check" || \
      ! exec_in target "python3 /workspace/lab/mptcp_http.py check"; then
     append_skipped_result "$case_name" "mptcp" "kernel MPTCP sockets unavailable"
@@ -1440,6 +1445,7 @@ record_mixed_probe_case() {
 run_direct_mixed_case() {
   local case_name="$1"
   local target_ip="$2"
+  local netem_mode="${3:-apply}"
   if [[ "$isolate_cases" == "1" ]]; then
     stop_client
     if [[ "$isolate_containers" == "1" ]]; then
@@ -1447,12 +1453,12 @@ run_direct_mixed_case() {
       compose down --remove-orphans >/dev/null 2>&1 || true
       compose up -d --remove-orphans >/dev/null
     fi
-    apply_netem apply
+    apply_netem "$netem_mode"
     start_target_services
     sleep 1
   else
     stop_client
-    apply_netem apply
+    apply_netem "$netem_mode"
   fi
 
   local telemetry_pid
@@ -1464,6 +1470,22 @@ run_direct_mixed_case() {
   stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
   append_mixed_probe_result "$case_name" "$exit_code" "$output"
+}
+
+run_direct_unconstrained_download_case() {
+  local case_name="$1"
+  local target="$2"
+  prepare_baseline_case unconstrained
+  run_unproxied_download_probe_case "$case_name" "tcp" "$target"
+  apply_netem apply
+}
+
+run_direct_unconstrained_upload_case() {
+  local case_name="$1"
+  local target="$2"
+  prepare_baseline_case unconstrained
+  run_unproxied_upload_probe_case "$case_name" "$target"
+  apply_netem apply
 }
 
 run_mixed_case() {
@@ -1491,27 +1513,26 @@ run_mixed_flapping_case() {
   stop_random_flapping
 }
 
-apply_ideal_netem_profile() {
+netem_mode_for_equal_profile() {
   local ideal_path="$1"
   case "$ideal_path" in
     lowlat)
-      exec_netem client ideal-all-lowlat
-      exec_netem server ideal-all-lowlat
+      printf 'ideal-all-lowlat\n'
       ;;
     balanced)
-      exec_netem client ideal-all-balanced
-      exec_netem server ideal-all-balanced
+      printf 'ideal-all-balanced\n'
       ;;
     fat)
-      exec_netem client ideal-all-fat
-      exec_netem server ideal-all-fat
+      printf 'ideal-all-fat\n'
       ;;
     poor)
-      exec_netem client ideal-all-poor
-      exec_netem server ideal-all-poor
+      printf 'ideal-all-poor\n'
+      ;;
+    unconstrained)
+      printf 'unconstrained\n'
       ;;
     *)
-      echo "unknown ideal path: $ideal_path" >&2
+      echo "unknown equal profile: $ideal_path" >&2
       return 2
       ;;
   esac
@@ -1520,9 +1541,10 @@ apply_ideal_netem_profile() {
 run_reliable_ideal_download_case() {
   local case_name="$1"
   local ideal_path="$2"
+  local netem_mode
   shift 2
-  apply_ideal_netem_profile "$ideal_path"
-  start_client "$case_name" "$@"
+  netem_mode="$(netem_mode_for_equal_profile "$ideal_path")"
+  start_client_with_netem "$case_name" "$netem_mode" "$@"
   run_tcp_download_probe_case "$case_name"
   apply_netem apply
 }
@@ -1530,9 +1552,10 @@ run_reliable_ideal_download_case() {
 run_reliable_ideal_upload_case() {
   local case_name="$1"
   local ideal_path="$2"
+  local netem_mode
   shift 2
-  apply_ideal_netem_profile "$ideal_path"
-  start_client "$case_name" "$@"
+  netem_mode="$(netem_mode_for_equal_profile "$ideal_path")"
+  start_client_with_netem "$case_name" "$netem_mode" "$@"
   run_tcp_upload_probe_case "$case_name"
   apply_netem apply
 }
@@ -1540,9 +1563,10 @@ run_reliable_ideal_upload_case() {
 run_mixed_ideal_case() {
   local case_name="$1"
   local ideal_path="$2"
+  local netem_mode
   shift 2
-  apply_ideal_netem_profile "$ideal_path"
-  start_client "$case_name" "$@"
+  netem_mode="$(netem_mode_for_equal_profile "$ideal_path")"
+  start_client_with_netem "$case_name" "$netem_mode" "$@"
   record_mixed_probe_case "$case_name"
   apply_netem apply
 }
@@ -1810,6 +1834,12 @@ fi
 if should_run_case "direct_upload_poor_internet"; then
   run_unproxied_upload_probe_case "direct_upload_poor_internet" "172.31.30.30:${tcp_upload_target_port}"
 fi
+if should_run_case "direct_unconstrained"; then
+  run_direct_unconstrained_download_case "direct_unconstrained" "172.31.10.30:8080"
+fi
+if should_run_case "direct_upload_unconstrained"; then
+  run_direct_unconstrained_upload_case "direct_upload_unconstrained" "172.31.10.30:${tcp_upload_target_port}"
+fi
 
 if should_run_case "direct_mixed_low_latency"; then
   run_direct_mixed_case "direct_mixed_low_latency" "172.31.10.30"
@@ -1822,6 +1852,10 @@ if should_run_case "direct_mixed_cross_continent_high_bandwidth"; then
 fi
 if should_run_case "direct_mixed_poor_internet"; then
   run_direct_mixed_case "direct_mixed_poor_internet" "172.31.30.30"
+fi
+if should_run_case "direct_mixed_unconstrained"; then
+  run_direct_mixed_case "direct_mixed_unconstrained" "172.31.10.30" unconstrained
+  apply_netem apply
 fi
 
 if should_run_case "baseline_vmess_tcp_single_balanced"; then
@@ -1839,6 +1873,12 @@ fi
 if should_run_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth_upload"; then
   run_vmess_baseline_upload_case "baseline_vmess_tcp_single_cross_continent_high_bandwidth_upload" "172.31.20.20"
 fi
+if should_run_case "baseline_vmess_tcp_single_unconstrained"; then
+  run_vmess_baseline_case "baseline_vmess_tcp_single_unconstrained" "172.31.10.20" unconstrained
+fi
+if should_run_case "baseline_vmess_tcp_single_unconstrained_upload"; then
+  run_vmess_baseline_upload_case "baseline_vmess_tcp_single_unconstrained_upload" "172.31.10.20" unconstrained
+fi
 
 if should_run_case "baseline_hysteria2_udp_single_balanced"; then
   run_hysteria2_baseline_case "baseline_hysteria2_udp_single_balanced" "172.31.15.20"
@@ -1855,9 +1895,18 @@ fi
 if should_run_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload"; then
   run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_cross_continent_high_bandwidth_upload" "172.31.20.20"
 fi
+if should_run_case "baseline_hysteria2_udp_single_unconstrained"; then
+  run_hysteria2_baseline_case "baseline_hysteria2_udp_single_unconstrained" "172.31.10.20" unconstrained
+fi
+if should_run_case "baseline_hysteria2_udp_single_unconstrained_upload"; then
+  run_hysteria2_baseline_upload_case "baseline_hysteria2_udp_single_unconstrained_upload" "172.31.10.20" unconstrained
+fi
 
 if should_run_case "baseline_mptcp_tcp_multipath_all"; then
   run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_all"
+fi
+if should_run_case "baseline_mptcp_tcp_multipath_unconstrained"; then
+  run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_unconstrained" unconstrained
 fi
 
 if should_run_case "mptunnel_tcp_single_low_latency"; then
@@ -1879,10 +1928,16 @@ if should_run_case "mptunnel_tcp_single_poor_internet"; then
   start_client "tcp_single_poor_internet" "$tcp_poor"
   run_tcp_download_probe_case "mptunnel_tcp_single_poor_internet"
 fi
+if should_run_case "mptunnel_tcp_single_unconstrained"; then
+  run_reliable_ideal_download_case "mptunnel_tcp_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat"
+fi
 
 if should_run_case "mptunnel_tcp_multipath_all"; then
   start_client "tcp_multipath_all" "$tcp_all"
   run_tcp_download_probe_case "mptunnel_tcp_multipath_all"
+fi
+if should_run_case "mptunnel_tcp_multipath_unconstrained"; then
+  run_reliable_ideal_download_case "mptunnel_tcp_multipath_unconstrained" "unconstrained" "$tcp_equal_all"
 fi
 
 if should_run_case "mptunnel_udp_stream_single_low_latency"; then
@@ -1899,10 +1954,16 @@ if should_run_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth"; 
   start_client "udp_stream_single_cross_continent_high_bandwidth" "$udp_fat"
   run_tcp_download_probe_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth"
 fi
+if should_run_case "mptunnel_udp_stream_single_unconstrained"; then
+  run_reliable_ideal_download_case "mptunnel_udp_stream_single_unconstrained" "unconstrained" "$udp_endpoint_lowlat"
+fi
 
 if should_run_case "mptunnel_udp_stream_multipath_all"; then
   start_client "udp_stream_multipath_all" "$udp_all"
   run_tcp_download_probe_case "mptunnel_udp_stream_multipath_all"
+fi
+if should_run_case "mptunnel_udp_stream_multipath_unconstrained"; then
+  run_reliable_ideal_download_case "mptunnel_udp_stream_multipath_unconstrained" "unconstrained" "$udp_equal_all"
 fi
 
 if should_run_case "mptunnel_reliable_mixed_single_low_latency"; then
@@ -1914,13 +1975,19 @@ if should_run_case "mptunnel_reliable_mixed_single_balanced"; then
   start_client "reliable_mixed_single_balanced" "$tcp_balanced $udp_balanced"
   run_tcp_download_probe_case "mptunnel_reliable_mixed_single_balanced"
 fi
+if should_run_case "mptunnel_reliable_mixed_single_unconstrained"; then
+  run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
+fi
 
 if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
   start_client "reliable_mixed_multipath_all" "$tcp_all $udp_all"
   run_tcp_download_probe_case "mptunnel_reliable_mixed_multipath_all"
 fi
+if should_run_case "mptunnel_reliable_mixed_multipath_unconstrained"; then
+  run_reliable_ideal_download_case "mptunnel_reliable_mixed_multipath_unconstrained" "unconstrained" "$tcp_equal_all $udp_equal_all"
+fi
 
-for equal_profile in lowlat balanced fat; do
+for equal_profile in lowlat balanced fat unconstrained; do
   if should_run_case "mptunnel_tcp_multipath_equal_${equal_profile}"; then
     run_reliable_ideal_download_case "mptunnel_tcp_multipath_equal_${equal_profile}" "$equal_profile" "$tcp_equal_all"
   fi
@@ -1961,10 +2028,16 @@ if should_run_case "mptunnel_tcp_single_poor_internet_upload"; then
   start_client "tcp_single_poor_internet_upload" "$tcp_poor"
   run_tcp_upload_probe_case "mptunnel_tcp_single_poor_internet_upload"
 fi
+if should_run_case "mptunnel_tcp_single_unconstrained_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_tcp_single_unconstrained_upload" "unconstrained" "$tcp_endpoint_lowlat"
+fi
 
 if should_run_case "mptunnel_tcp_multipath_all_upload"; then
   start_client "tcp_multipath_all_upload" "$tcp_all"
   run_tcp_upload_probe_case "mptunnel_tcp_multipath_all_upload"
+fi
+if should_run_case "mptunnel_tcp_multipath_unconstrained_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_tcp_multipath_unconstrained_upload" "unconstrained" "$tcp_equal_all"
 fi
 
 if should_run_case "mptunnel_udp_stream_single_low_latency_upload"; then
@@ -1981,10 +2054,16 @@ if should_run_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth_up
   start_client "udp_stream_single_cross_continent_high_bandwidth_upload" "$udp_fat"
   run_tcp_upload_probe_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth_upload"
 fi
+if should_run_case "mptunnel_udp_stream_single_unconstrained_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_udp_stream_single_unconstrained_upload" "unconstrained" "$udp_endpoint_lowlat"
+fi
 
 if should_run_case "mptunnel_udp_stream_multipath_all_upload"; then
   start_client "udp_stream_multipath_all_upload" "$udp_all"
   run_tcp_upload_probe_case "mptunnel_udp_stream_multipath_all_upload"
+fi
+if should_run_case "mptunnel_udp_stream_multipath_unconstrained_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_udp_stream_multipath_unconstrained_upload" "unconstrained" "$udp_equal_all"
 fi
 
 if should_run_case "mptunnel_reliable_mixed_single_low_latency_upload"; then
@@ -1996,13 +2075,19 @@ if should_run_case "mptunnel_reliable_mixed_single_balanced_upload"; then
   start_client "reliable_mixed_single_balanced_upload" "$tcp_balanced $udp_balanced"
   run_tcp_upload_probe_case "mptunnel_reliable_mixed_single_balanced_upload"
 fi
+if should_run_case "mptunnel_reliable_mixed_single_unconstrained_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_unconstrained_upload" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
+fi
 
 if should_run_case "mptunnel_reliable_mixed_multipath_all_upload"; then
   start_client "reliable_mixed_multipath_all_upload" "$tcp_all $udp_all"
   run_tcp_upload_probe_case "mptunnel_reliable_mixed_multipath_all_upload"
 fi
+if should_run_case "mptunnel_reliable_mixed_multipath_unconstrained_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_reliable_mixed_multipath_unconstrained_upload" "unconstrained" "$tcp_equal_all $udp_equal_all"
+fi
 
-for equal_profile in lowlat balanced fat; do
+for equal_profile in lowlat balanced fat unconstrained; do
   if should_run_case "mptunnel_tcp_multipath_equal_${equal_profile}_upload"; then
     run_reliable_ideal_upload_case "mptunnel_tcp_multipath_equal_${equal_profile}_upload" "$equal_profile" "$tcp_equal_all"
   fi
@@ -2095,6 +2180,9 @@ fi
 if should_run_case "mptunnel_mixed_single_balanced"; then
   run_mixed_case "mptunnel_mixed_single_balanced" "$tcp_balanced $udp_balanced"
 fi
+if should_run_case "mptunnel_mixed_single_unconstrained"; then
+  run_mixed_ideal_case "mptunnel_mixed_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
+fi
 if should_run_case "mptunnel_mixed_tcp_lowlat_udp_fat"; then
   run_mixed_case "mptunnel_mixed_tcp_lowlat_udp_fat" "$tcp_lowlat $udp_fat"
 fi
@@ -2113,7 +2201,10 @@ fi
 if should_run_case "mptunnel_mixed_multipath_ideal_fat"; then
   run_mixed_ideal_case "mptunnel_mixed_multipath_ideal_fat" "fat" "$tcp_all $udp_all"
 fi
-for equal_profile in lowlat balanced fat; do
+if should_run_case "mptunnel_mixed_multipath_unconstrained"; then
+  run_mixed_ideal_case "mptunnel_mixed_multipath_unconstrained" "unconstrained" "$tcp_equal_all $udp_equal_all"
+fi
+for equal_profile in lowlat balanced fat unconstrained; do
   if should_run_case "mptunnel_mixed_tcp_multipath_equal_${equal_profile}"; then
     run_mixed_ideal_case "mptunnel_mixed_tcp_multipath_equal_${equal_profile}" "$equal_profile" "$tcp_equal_all"
   fi

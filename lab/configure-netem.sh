@@ -221,7 +221,7 @@ case "$mode" in
   spike-poor)
     apply_profile "172.31.30" "$spike_poor_rate" "$spike_poor_delay" "$spike_poor_jitter" "$spike_poor_loss"
     ;;
-  clear)
+  unconstrained|unconstrained-all|clear)
     clear_profile "172.31.10"
     clear_profile "172.31.15"
     clear_profile "172.31.20"
@@ -231,7 +231,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

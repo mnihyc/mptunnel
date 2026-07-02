@@ -156,9 +156,16 @@ pub(super) fn udp_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usize {
         false,
         UDP_MAX_MTU_PAYLOAD_BYTES,
     );
-    (model.response_timeout.as_secs_f64() / UDP_MIN_RESPONSE_TIMEOUT.as_secs_f64())
-        .ceil()
-        .max(2.0) as usize
+    let response_window_bytes = (model.pacing_rate_bps.max(1.0) / 8.0
+        * model
+            .response_timeout
+            .max(QUIC_TIMER_GRANULARITY)
+            .as_secs_f64())
+    .ceil() as usize;
+    let initial_window_bytes = PATH_OPEN_SCORE_BYTES.max(model.mtu_payload_bytes).max(1);
+    response_window_bytes
+        .div_ceil(initial_window_bytes)
+        .max(QUIC_PERSISTENT_CONGESTION_THRESHOLD as usize)
 }
 
 pub(super) fn udp_edge_lane_limit(context: &ClientPathContext) -> usize {
@@ -344,7 +351,7 @@ pub(super) async fn run_tun_udp_socket(
     let flow_limit = tun_udp_flow_limit(&context);
     let flow_queue = tun_udp_flow_queue(&context);
     let response_queue = tun_udp_response_queue(&context);
-    let done_queue = flow_limit.clamp(1, 1024);
+    let done_queue = flow_limit.max(1);
     let (response_tx, mut response_rx) = mpsc::channel::<TunUdpResponse>(response_queue);
     let (done_tx, mut done_rx) = mpsc::channel::<TunUdpFlowKey>(done_queue);
 
@@ -500,15 +507,15 @@ pub(super) fn tun_udp_ttl_ms(remote: SocketAddr, tun: &TunL4Config) -> u32 {
 
 pub(super) fn tun_udp_flow_limit(context: &ClientPathContext) -> usize {
     let payload = context.mux_limits.max_payload_bytes.max(1);
-    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 4096)
+    (context.mux_limits.max_datagram_queue_bytes / payload).max(1)
 }
 
 pub(super) fn tun_udp_flow_queue(context: &ClientPathContext) -> usize {
     let payload = context.mux_limits.max_payload_bytes.max(1);
-    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 256)
+    (context.mux_limits.max_datagram_queue_bytes / payload).max(1)
 }
 
 pub(super) fn tun_udp_response_queue(context: &ClientPathContext) -> usize {
     let payload = context.mux_limits.max_payload_bytes.max(1);
-    (context.mux_limits.max_datagram_queue_bytes / payload).clamp(1, 1024)
+    (context.mux_limits.max_datagram_queue_bytes / payload).max(1)
 }

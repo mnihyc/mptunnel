@@ -1,10 +1,10 @@
 use super::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig, ConfigError,
-    DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    LocalIngressConfig, ManagementConfig, MppPerformanceConfig, NodeConfig, ResourceLimits,
-    RouteTarget, RouteTargetKind, SecurityConfig, SecurityPolicyError, ServerConfig, ServiceConfig,
-    SharedSecret,
+    DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
+    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, LocalIngressConfig, ManagementConfig, MppPerformanceConfig,
+    NodeConfig, ResourceLimits, RouteTarget, RouteTargetKind, SecurityConfig, SecurityPolicyError,
+    ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU, TunL4Config,
@@ -432,24 +432,28 @@ enum OutboundFileConfig {
     Direct {
         tag: Option<String>,
         bind_ip: Option<IpAddr>,
+        connect_timeout_ms: Option<u64>,
         #[serde(default)]
         dns: DnsFileConfig,
     },
     Socks5 {
         tag: Option<String>,
         proxy: Option<String>,
+        connect_timeout_ms: Option<u64>,
         #[serde(default)]
         dns: DnsFileConfig,
     },
     HttpConnect {
         tag: Option<String>,
         proxy: Option<String>,
+        connect_timeout_ms: Option<u64>,
         #[serde(default)]
         dns: DnsFileConfig,
     },
     HttpConnectUdp {
         tag: Option<String>,
         proxy: Option<String>,
+        connect_timeout_ms: Option<u64>,
         #[serde(default)]
         dns: DnsFileConfig,
     },
@@ -506,6 +510,7 @@ struct ParsedMppOutbound {
 struct ParsedEgressOutbound {
     outbound: OutboundConfig,
     dns: DnsConfig,
+    connect_timeout: Duration,
 }
 
 fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, ConfigFileError> {
@@ -559,7 +564,12 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
                     },
                 );
             }
-            OutboundFileConfig::Direct { tag, bind_ip, dns } => {
+            OutboundFileConfig::Direct {
+                tag,
+                bind_ip,
+                connect_timeout_ms,
+                dns,
+            } => {
                 let tag = outbound_tag(tag, "direct", index)?;
                 insert_config_tag(&parsed, &tag)?;
                 parsed.egress_order.push(tag.clone());
@@ -571,10 +581,16 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
                             None => OutboundConfig::Direct,
                         },
                         dns: dns.into_config(),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
                     },
                 );
             }
-            OutboundFileConfig::Socks5 { tag, proxy, dns } => {
+            OutboundFileConfig::Socks5 {
+                tag,
+                proxy,
+                connect_timeout_ms,
+                dns,
+            } => {
                 let tag = outbound_tag(tag, "socks5", index)?;
                 insert_config_tag(&parsed, &tag)?;
                 parsed.egress_order.push(tag.clone());
@@ -588,10 +604,16 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
                                 .map_err(ConfigFileError::Endpoint)?,
                         },
                         dns: dns.into_config(),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
                     },
                 );
             }
-            OutboundFileConfig::HttpConnect { tag, proxy, dns } => {
+            OutboundFileConfig::HttpConnect {
+                tag,
+                proxy,
+                connect_timeout_ms,
+                dns,
+            } => {
                 let tag = outbound_tag(tag, "http-connect", index)?;
                 insert_config_tag(&parsed, &tag)?;
                 parsed.egress_order.push(tag.clone());
@@ -605,10 +627,16 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
                                 .map_err(ConfigFileError::Endpoint)?,
                         },
                         dns: dns.into_config(),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
                     },
                 );
             }
-            OutboundFileConfig::HttpConnectUdp { tag, proxy, dns } => {
+            OutboundFileConfig::HttpConnectUdp {
+                tag,
+                proxy,
+                connect_timeout_ms,
+                dns,
+            } => {
                 let tag = outbound_tag(tag, "http-connect-udp", index)?;
                 insert_config_tag(&parsed, &tag)?;
                 parsed.egress_order.push(tag.clone());
@@ -622,6 +650,7 @@ fn parse_outbounds(values: Vec<OutboundFileConfig>) -> Result<ParsedOutbounds, C
                                 .map_err(ConfigFileError::Endpoint)?,
                         },
                         dns: dns.into_config(),
+                        connect_timeout: outbound_connect_timeout(connect_timeout_ms),
                     },
                 );
             }
@@ -702,6 +731,7 @@ fn apply_routing(
                     members.push(OutboundRouteMember {
                         config: Box::new(member.outbound.clone()),
                         dns: member.dns.clone(),
+                        connect_timeout: member.connect_timeout,
                     });
                 }
                 parsed.egress_balancer_order.push(balancer.tag.clone());
@@ -716,6 +746,7 @@ fn apply_routing(
                             RoutingStrategyFileValue::CombinedMpp => unreachable!(),
                         },
                         dns: DnsConfig::default(),
+                        connect_timeout: Duration::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS),
                     },
                 );
             }
@@ -907,6 +938,7 @@ fn build_node_services(
                     security: security.into_config()?,
                     outbound: egress.config.outbound.clone(),
                     outbound_dns: egress.config.dns.clone(),
+                    outbound_connect_timeout: egress.config.connect_timeout,
                     performance: performance.into_config(),
                 });
             }
@@ -1157,6 +1189,10 @@ fn proxy_auth_or_disabled(
         Some(auth) => auth.into_config(),
         None => Ok(ProxyAuthConfig::disabled()),
     }
+}
+
+fn outbound_connect_timeout(value: Option<u64>) -> Duration {
+    Duration::from_millis(value.unwrap_or(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS))
 }
 
 fn push_client_ingress(

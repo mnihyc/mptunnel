@@ -69,8 +69,9 @@
 # It is a ceiling; actual sender flight is still BDP/queue/loss/carrier adaptive.
 # max_path_flight_bytes = 67108864
 # Read-buffer ceiling only. It must not become a fixed scheduler quantum.
-# Recommended: 256 KiB to 1 MiB. Sender-service quanta are selected
-# adaptively from BDP, lane, queue/loss state, and this envelope.
+# Recommended: 256 KiB to 1 MiB. Sender-service quanta follow BBR-style
+# send-quantum sizing from live pacing/delivery rate, packet floors, lane
+# priority, queue/loss state, and this envelope.
 # max_reliable_relay_chunk_bytes = 524288
 # Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair
 # evidence, so these can stay quiet. Recommended: keep defaults unless idle path
@@ -152,6 +153,11 @@ secret = "01234567-89ab-cdef-0123-456789abcdef"
 [[outbounds]]
 tag = "direct-egress"
 protocol = "direct"
+# Optional target connect timeout for this egress outbound only. This is a
+# control-plane dial safety budget, not a data-plane pacing/failover parameter.
+# Leave unset unless a specific upstream or private network needs a different
+# setup budget. The default is 10000 ms.
+# connect_timeout_ms = 10000
 # Optional resolver used by this exact egress outbound. Keep DNS policy at the
 # outbound that owns target-name resolution; do not create a broad DNS table
 # detached from a concrete outbound.
@@ -163,22 +169,26 @@ protocol = "direct"
 # tag = "socks-chain"
 # protocol = "socks5"
 # proxy = "127.0.0.1:1081"
+# connect_timeout_ms = 10000
 # dns = { strategy = "ipv4-and-ipv6" }
 #
 # [[outbounds]]
 # tag = "http-chain"
 # protocol = "http-connect"
 # proxy = "127.0.0.1:8081"
+# connect_timeout_ms = 10000
 #
 # [[outbounds]]
 # tag = "http-udp-chain"
 # protocol = "http-connect-udp"
 # proxy = "127.0.0.1:8081"
+# connect_timeout_ms = 10000
 #
 # [[outbounds]]
 # tag = "bound-direct"
 # protocol = "direct"
 # bind_ip = "203.0.113.10"
+# connect_timeout_ms = 10000
 
 # Optional outbound routing policy. `sequence` and `random` operate on egress
 # outbounds. `combined-mpp` combines several MPP outbounds into one logical MPP

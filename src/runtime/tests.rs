@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::SharedSecret;
+use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
 use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
@@ -91,6 +91,7 @@ fn server_context(outbound: OutboundConfig) -> ServerPathContext {
         server_paths: Arc::new(Vec::new()),
         outbound,
         outbound_dns: DnsConfig::default(),
+        outbound_connect_timeout: DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
         performance: MppPerformanceConfig::default(),
         codec_limits: resources.into(),
         mux_limits: resources.into(),
@@ -873,15 +874,6 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
         .await
         .expect("dispatch ordinary data first");
     assert_eq!(data_dispatch.lane, ReliableRelayQueuedWorkLane::Data);
-    assert!(matches!(
-        recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
-            stream_id: id,
-            offset: 0,
-            payload,
-            ..
-        })) if id == stream_id && payload == Bytes::from_static(b"ordinary")
-    ));
 
     let fin_dispatch = sender
         .dispatch_next(
@@ -893,6 +885,15 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
         .await
         .expect("dispatch final FIN after data");
     assert_eq!(fin_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload == Bytes::from_static(b"ordinary")
+    ));
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
         Some(TcpPathSessionCommand::SendFrame(Frame::StreamFin {
@@ -1216,7 +1217,8 @@ fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
 
     assert_eq!(
         reliable_stream_frame_queue(mux_limits),
-        (mux_limits.max_reorder_bytes / mux_limits.max_reliable_relay_chunk_bytes) + 4
+        (mux_limits.max_reorder_bytes / mux_limits.max_reliable_relay_chunk_bytes)
+            + tcp_path_priority_headroom_frames()
     );
 }
 
@@ -1240,7 +1242,10 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
     let udp_sized_queue = reliable_stream_frame_queue_for_payload(mux_limits, 1200);
 
     assert_eq!(tcp_sized_queue, 68);
-    assert_eq!(udp_sized_queue, 1024);
+    assert_eq!(
+        udp_sized_queue,
+        mux_limits.max_reorder_bytes / 1200 + tcp_path_priority_headroom_frames()
+    );
     assert!(udp_sized_queue > tcp_sized_queue);
 }
 
@@ -1264,7 +1269,12 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
             .min(mux_limits.max_reliable_relay_chunk_bytes)
             .min(mux_limits.max_payload_bytes)
             .max(1);
-    let expected_queue = mux_limits.max_path_flight_bytes.div_ceil(frame_payload) + 4;
+    let expected_queue = (mux_limits.max_path_flight_bytes.div_ceil(frame_payload)
+        + tcp_path_priority_headroom_frames())
+    .min(tcp_path_session_frame_queue_for_payload(
+        mux_limits,
+        frame_payload,
+    ));
     assert_eq!(tcp_path_command_queue(mux_limits), expected_queue);
 
     let resources = ResourceLimits {
@@ -1302,11 +1312,17 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
             .max(1);
     assert_eq!(
         tcp_sized_queue,
-        mux_limits.max_path_flight_bytes.div_ceil(tcp_frame_payload) + 4
+        (mux_limits.max_path_flight_bytes.div_ceil(tcp_frame_payload)
+            + tcp_path_priority_headroom_frames())
+        .min(tcp_path_session_frame_queue_for_payload(
+            mux_limits,
+            tcp_frame_payload,
+        ))
     );
     assert_eq!(
         udp_sized_queue,
-        mux_limits.max_path_flight_bytes.div_ceil(1200) + 4
+        (mux_limits.max_path_flight_bytes.div_ceil(1200) + tcp_path_priority_headroom_frames())
+            .min(tcp_path_session_frame_queue_for_payload(mux_limits, 1200,))
     );
     assert!(udp_sized_queue > tcp_sized_queue);
 }
@@ -1322,12 +1338,15 @@ fn auto_tcp_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
         ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0)).ceil() as u64;
     let mut state = ReliableRelayFlowDemandTracker::new();
 
-    assert!(threshold >= (reliable_relay_buffer_len(mux_limits) as u64).saturating_mul(2));
-    assert!(high_bdp_threshold < high_bdp / 4);
-    assert!(high_bdp_threshold >= high_bdp / 8);
+    assert!(
+        threshold
+            >= reliable_relay_scheduler_quantum_cap(Some(path), FlowLane::Throughput, mux_limits)
+                as u64
+    );
+    assert_eq!(high_bdp_threshold, high_bdp);
 
     let small_flow_bytes =
-        (tcp_lane_startup_chunk_bytes(FlowLane::Throughput, mux_limits) as u64 / 2).max(1);
+        (relay_lane_startup_chunk_bytes(FlowLane::Throughput, mux_limits) as u64 / 2).max(1);
     let before = state.refresh(
         ReliableRelayFlowSignals::new(small_flow_bytes, 0, 0),
         Some(path),
@@ -1413,14 +1432,18 @@ fn adaptive_tcp_budgets_expand_for_bulk_and_shrink_under_instability() {
 fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
     let mux_limits = MuxLimits::default();
     let startup = adaptive_reliable_relay_inflight_bytes(None, FlowLane::Throughput, mux_limits);
-    let default_bdp = ((default_path_rate_bps(UnderlayProtocol::Tcp) / 8.0)
-        * (default_path_srtt_ms(UnderlayProtocol::Tcp) / 1000.0)
-        * tcp_lane_inflight_gain(FlowLane::Throughput))
-    .ceil() as usize;
+    let startup_path = PathSnapshot::new(
+        PathId(0),
+        UnderlayProtocol::Tcp,
+        default_path_srtt_ms(UnderlayProtocol::Tcp),
+        default_path_rate_bps(UnderlayProtocol::Tcp),
+    );
+    let default_bbr_target =
+        bbr_inflight_target_bytes(startup_path, FlowLane::Throughput, mux_limits).ceil() as usize;
 
     assert_eq!(
         startup,
-        default_bdp.max(reliable_relay_buffer_len(mux_limits))
+        default_bbr_target.max(reliable_relay_buffer_len(mux_limits))
     );
     assert!(
         startup < mux_limits.max_path_flight_bytes,
@@ -1570,7 +1593,7 @@ fn udp_relay_chunking_uses_quic_product_payload_envelope() {
 }
 
 #[test]
-fn reliable_relay_stall_timeout_is_adaptive_and_bounded_for_fluent_failover() {
+fn reliable_relay_stall_timeout_is_transport_pto_derived() {
     let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
     let mut cross_continent =
         PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 900.0, 300_000_000.0);
@@ -1578,13 +1601,15 @@ fn reliable_relay_stall_timeout_is_adaptive_and_bounded_for_fluent_failover() {
 
     assert_eq!(
         reliable_relay_stall_timeout(Some(low_latency), FlowLane::Latency),
-        TCP_STREAM_STALL_MIN_TIMEOUT
+        transport_pto_from_snapshot(Some(low_latency))
+    );
+    assert_eq!(
+        reliable_relay_stall_timeout(Some(cross_continent), FlowLane::Throughput),
+        transport_pto_from_snapshot(Some(cross_continent))
     );
     assert!(
-        reliable_relay_stall_timeout(Some(cross_continent), FlowLane::Throughput)
-            <= TCP_STREAM_STALL_MAX_TIMEOUT
+        reliable_relay_stall_timeout(Some(low_latency), FlowLane::Latency) < Duration::from_secs(5)
     );
-    assert!(TCP_STREAM_STALL_MAX_TIMEOUT < Duration::from_secs(5));
 }
 
 #[test]
@@ -1614,10 +1639,15 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
     let low_interval = reliable_stream_recv_progress_interval(Some(low_latency), FlowLane::Latency);
     let high_interval =
         reliable_stream_recv_progress_interval(Some(cross_continent), FlowLane::Throughput);
-    assert!(low_interval >= UDP_MIN_RESPONSE_TIMEOUT);
-    assert!(low_interval <= TCP_STREAM_STALL_MIN_TIMEOUT);
+    assert_eq!(
+        low_interval,
+        (transport_pto_from_snapshot(Some(low_latency)) / 2).max(QUIC_TIMER_GRANULARITY)
+    );
     assert!(high_interval >= low_interval);
-    assert!(high_interval <= TCP_STREAM_STALL_MIN_TIMEOUT);
+    assert_eq!(
+        high_interval,
+        (transport_pto_from_snapshot(Some(cross_continent)) / 2).max(QUIC_TIMER_GRANULARITY)
+    );
 }
 
 #[test]
@@ -1761,17 +1791,13 @@ fn reliable_recv_progress_acks_repair_horizon_advancement() {
 }
 
 #[test]
-fn tcp_sole_survivor_reannounce_budget_scales_from_stall_model() {
+fn tcp_sole_survivor_reannounce_budget_uses_persistent_congestion_threshold() {
     let low_latency_budget =
-        reliable_relay_sole_survivor_reannounce_attempts(TCP_STREAM_STALL_MIN_TIMEOUT);
+        reliable_relay_sole_survivor_reannounce_attempts(transport_pto_from_snapshot(None));
     let max_timeout_budget =
-        reliable_relay_sole_survivor_reannounce_attempts(TCP_STREAM_STALL_MAX_TIMEOUT);
-    assert!(
-        low_latency_budget > max_timeout_budget,
-        "low-latency paths should get more quick repair probes"
-    );
-    assert!(max_timeout_budget >= 2);
-    assert!(low_latency_budget <= 16);
+        reliable_relay_sole_survivor_reannounce_attempts(default_transport_pto() * 4);
+    assert_eq!(low_latency_budget, QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+    assert_eq!(max_timeout_budget, QUIC_PERSISTENT_CONGESTION_THRESHOLD);
 }
 
 #[test]
@@ -2314,8 +2340,8 @@ fn reliable_relay_bulk_admission_payload_uses_preemptible_quantum_not_inflight_c
     );
     let validation_quantum = reliable_relay_bulk_validation_payload_bytes(&send_stream, mux_limits);
     assert!(validation_quantum >= PATH_OPEN_SCORE_BYTES);
-    assert!(validation_quantum <= tcp_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits));
-    assert!(validation_quantum < expected_quantum);
+    assert!(validation_quantum <= relay_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits));
+    assert!(validation_quantum <= expected_quantum);
     assert!(expected_quantum < mux_limits.max_path_flight_bytes);
 }
 

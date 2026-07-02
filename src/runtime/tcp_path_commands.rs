@@ -86,13 +86,68 @@ impl TcpPathSessionCommandSender {
         result
     }
 
+    pub(super) async fn send_stream_ordered_close(
+        &self,
+        stream_id: StreamId,
+        lane: FlowLane,
+    ) -> Result<(), mpsc::error::SendError<TcpPathSessionCommand>> {
+        let command = TcpPathSessionCommand::CloseStream(stream_id);
+        let queue = if tcp_path_frame_uses_priority_queue(lane) {
+            &self.priority
+        } else {
+            &self.data
+        };
+        #[cfg(feature = "lab-diagnostics")]
+        let started = Instant::now();
+        let result = queue.send(command).await;
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            let elapsed = started.elapsed();
+            let queue_name = if tcp_path_frame_uses_priority_queue(lane) {
+                "priority"
+            } else {
+                "data"
+            };
+            lab_diagnostic(
+                "path_command_queue_send",
+                format_args!(
+                    "queue={} command_kind=close_stream stream_id={} lane={:?} pacing_bytes=0 wait_ms={} result={}",
+                    queue_name,
+                    stream_id.0,
+                    lane,
+                    elapsed.as_millis(),
+                    if result.is_ok() { "queued" } else { "closed" },
+                ),
+            );
+        }
+        result
+    }
+
     pub(super) fn try_enqueue_admitted_frame(
         &self,
         frame: Frame,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
+        self.try_enqueue_admitted_frame_with_effective_lane(frame, lane, None)
+    }
+
+    pub(super) fn try_enqueue_stream_ordered_frame(
+        &self,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        self.try_enqueue_admitted_frame_with_effective_lane(frame, lane, Some(lane))
+    }
+
+    fn try_enqueue_admitted_frame_with_effective_lane(
+        &self,
+        frame: Frame,
+        lane: FlowLane,
+        effective_lane_override: Option<FlowLane>,
+    ) -> Result<(), RuntimeError> {
         let bytes = frame_pacing_bytes(&frame);
-        let effective_lane = tcp_path_effective_frame_lane(&frame, lane);
+        let effective_lane =
+            effective_lane_override.unwrap_or_else(|| tcp_path_effective_frame_lane(&frame, lane));
         #[cfg(feature = "lab-diagnostics")]
         let frame_kind = tcp_path_frame_kind(&frame);
         #[cfg(feature = "lab-diagnostics")]
@@ -146,6 +201,10 @@ impl TcpPathSessionCommandSender {
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         let effective_lane = tcp_path_effective_frame_lane(frame, lane);
         self.can_enqueue_lane_now(effective_lane)
+    }
+
+    pub(super) fn can_enqueue_stream_ordered_frame_now(&self, lane: FlowLane) -> bool {
+        self.can_enqueue_lane_now(lane)
     }
 
     pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {

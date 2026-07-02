@@ -1,5 +1,7 @@
 use super::*;
 
+const UDP_DATAGRAM_RECV_BUFFER_BYTES: usize = u16::MAX as usize;
+
 pub(super) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
     match lane {
         FlowLane::Control | FlowLane::Latency => StreamDemandHint::latency(),
@@ -37,7 +39,7 @@ fn server_udp_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
     mux_limits
         .max_datagram_queue_bytes
         .saturating_div(unit)
-        .clamp(1, 1024)
+        .max(1)
 }
 
 pub(super) fn spawn_server_udp_datagram_flow_worker(
@@ -50,7 +52,12 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
         server_udp_datagram_request_queue_len(mux_limits),
     );
     tokio::spawn(async move {
-        let mut response_buffer = vec![0u8; mux_limits.max_payload_bytes.min(64 * 1024)];
+        let mut response_buffer = vec![
+            0u8;
+            mux_limits
+                .max_payload_bytes
+                .min(UDP_DATAGRAM_RECV_BUFFER_BYTES)
+        ];
         let mut pending_ttls = VecDeque::<(Instant, u32, DatagramId)>::new();
         loop {
             prune_server_udp_pending_ttls(&mut pending_ttls);

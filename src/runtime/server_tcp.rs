@@ -162,7 +162,9 @@ pub(super) async fn handle_server_path(
                                 });
                             }
                             ServerReliableStreamOpen::Existing => {
-                                attached_streams.insert(stream_id);
+                                if role != StreamOpenRole::Validation {
+                                    attached_streams.insert(stream_id);
+                                }
                                 context
                                     .reliable_streams
                                     .route_frame(
@@ -238,7 +240,7 @@ pub(super) async fn handle_server_path(
                             &context.outbound,
                             &context.outbound_dns,
                             &target,
-                            Duration::from_secs(10),
+                            context.outbound_connect_timeout,
                         )
                         .await
                         {
@@ -711,7 +713,7 @@ pub(super) async fn run_server_tcp_stream(
             &context.outbound,
             &context.outbound_dns,
             &target,
-            Duration::from_secs(10),
+            context.outbound_connect_timeout,
         )
         .await
         {

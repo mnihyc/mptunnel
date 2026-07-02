@@ -352,7 +352,7 @@ fn udp_acked_timeout_migration_requires_validated_alternative() {
 #[test]
 fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
     let mut model = UdpPathRuntimeModel {
-        pacing_rate_bps: UDP_MIN_PACING_RATE_BPS,
+        pacing_rate_bps: 1.0,
         response_timeout: Duration::from_millis(300),
         mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
         mtu_is_measured: false,
@@ -369,23 +369,23 @@ fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
     );
     assert_eq!(
         udp_datagram_path_open_timeout(false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        UDP_PATH_HANDSHAKE_TIMEOUT
+        Duration::from_millis(300)
     );
 
     model.response_timeout = Duration::from_millis(1);
     assert_eq!(
         udp_datagram_path_open_timeout(true, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        UDP_MIN_RESPONSE_TIMEOUT
+        QUIC_TIMER_GRANULARITY
     );
     assert_eq!(
         udp_datagram_path_open_timeout(false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        UDP_MIN_RESPONSE_TIMEOUT
+        QUIC_TIMER_GRANULARITY
     );
 
     model.response_timeout = Duration::from_millis(65);
     assert_eq!(
         udp_datagram_path_open_timeout(false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        Duration::from_millis(520)
+        Duration::from_millis(65)
     );
 
     model.response_timeout = UDP_PATH_HANDSHAKE_TIMEOUT + Duration::from_secs(1);
@@ -402,7 +402,7 @@ fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
 #[test]
 fn udp_first_datagram_response_uses_startup_budget_for_cold_association() {
     let mut model = UdpPathRuntimeModel {
-        pacing_rate_bps: UDP_MIN_PACING_RATE_BPS,
+        pacing_rate_bps: 1.0,
         response_timeout: Duration::from_millis(65),
         mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
         mtu_is_measured: false,
@@ -411,7 +411,7 @@ fn udp_first_datagram_response_uses_startup_budget_for_cold_association() {
 
     assert_eq!(
         udp_datagram_first_response_timeout(false, false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        Duration::from_millis(520)
+        Duration::from_millis(65)
     );
     assert_eq!(
         udp_datagram_first_response_timeout(true, false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
@@ -451,7 +451,9 @@ fn udp_runtime_model_backs_off_response_timeout_after_loss() {
     );
 
     assert!(lossy_model.response_timeout > stable_model.response_timeout);
-    assert!(lossy_model.response_timeout <= UDP_MAX_RESPONSE_TIMEOUT);
+    assert!(
+        lossy_model.response_timeout <= Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into())
+    );
     assert!(lossy_model.pacing_rate_bps < stable_model.pacing_rate_bps);
 }
 
@@ -464,7 +466,7 @@ fn udp_association_retry_budget_tracks_live_loss_model() {
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
     let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
     let stable_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
-    assert!(stable_budget >= UDP_MIN_RETRY_BUDGET);
+    assert!(stable_budget >= QUIC_TIMER_GRANULARITY);
 
     context.mark_udp_path_feedback(
         0,
@@ -491,7 +493,7 @@ fn datagram_retry_budget_scales_from_ttl_slack_and_response_model() {
     assert!(budget < Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into()));
 
     let tight_ttl_budget = datagram_retry_budget(high_rtt_timeout, 1_000);
-    assert!(tight_ttl_budget <= Duration::from_millis(900));
+    assert_eq!(tight_ttl_budget, Duration::from_millis(1_000));
 }
 
 #[test]
@@ -502,11 +504,11 @@ fn tcp_datagram_response_timeout_uses_tcp_rto_budget() {
 
     let startup_timeout =
         tcp_datagram_response_timeout(high_rtt_tcp, None, None, DEFAULT_SOCKS5_UDP_TTL_MS);
-    assert!(startup_timeout > UDP_MAX_RESPONSE_TIMEOUT);
+    assert!(startup_timeout >= transport_pto_from_snapshot(Some(high_rtt_tcp)));
     assert!(startup_timeout <= Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into()));
 
     let tight_ttl_timeout = tcp_datagram_response_timeout(high_rtt_tcp, None, None, 500);
-    assert!(tight_ttl_timeout <= Duration::from_millis(450));
+    assert!(tight_ttl_timeout <= Duration::from_millis(500));
 
     let observed_timeout = tcp_datagram_response_timeout(
         high_rtt_tcp,
@@ -514,8 +516,7 @@ fn tcp_datagram_response_timeout_uses_tcp_rto_budget() {
         Some(Duration::from_millis(80)),
         DEFAULT_SOCKS5_UDP_TTL_MS,
     );
-    assert!(observed_timeout >= Duration::from_millis(900));
-    assert!(observed_timeout <= startup_timeout);
+    assert_eq!(observed_timeout, Duration::from_millis(645));
 }
 
 #[test]
@@ -536,8 +537,11 @@ fn udp_edge_lane_limit_scales_with_realtime_response_model() {
     )
     .expect("high context");
 
-    assert_eq!(udp_edge_lane_limit(&low_context), 2);
-    assert!(udp_edge_lane_limit(&high_context) > udp_edge_lane_limit(&low_context));
+    let low_limit = udp_edge_lane_limit(&low_context);
+    let high_limit = udp_edge_lane_limit(&high_context);
+    assert!(low_limit >= QUIC_PERSISTENT_CONGESTION_THRESHOLD as usize);
+    assert!(high_limit >= low_limit);
+    assert!(high_limit <= udp_edge_queue_slots(&high_context));
 
     let capped_resources = ResourceLimits {
         max_datagram_queue_bytes: ResourceLimits::default().max_payload_bytes * 3,

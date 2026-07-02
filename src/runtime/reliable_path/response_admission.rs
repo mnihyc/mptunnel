@@ -337,22 +337,42 @@ pub(super) fn server_bulk_output_eta_ms(
     };
     eta_ms += (queued_bits + payload_bits) / effective_rate_bps * 1000.0;
     eta_ms += snapshot.jitter_ms;
-    eta_ms += snapshot.loss_rate.clamp(0.0, 1.0) * 500.0;
+    eta_ms += response_loss_penalty_ms(snapshot);
     if key.underlay == UnderlayProtocol::Udp && relay_lane_is_bulk(lane) {
         eta_ms += udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes);
     }
-    eta_ms += (1.0 - snapshot.confidence.clamp(0.0, 1.0)) * snapshot.srtt_ms;
-    if Some(key) != active_key && snapshot.confidence < 0.5 {
-        eta_ms += snapshot.srtt_ms;
+    let uncertainty = 1.0 - snapshot.confidence.clamp(0.0, 1.0);
+    let pto_ms = transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0;
+    eta_ms += uncertainty * pto_ms;
+    if Some(key) != active_key {
+        eta_ms += uncertainty * pto_ms;
         if snapshot.bytes_in_flight > 0 {
-            eta_ms += snapshot.srtt_ms;
+            eta_ms +=
+                (snapshot.bytes_in_flight as f64 * 8.0 / effective_rate_bps.max(1.0)) * 1000.0;
         }
     }
     eta_ms
 }
 
-fn server_output_confidence(entry: &ResponseStreamOutputEntry, now: Instant) -> f64 {
-    let delivery_confidence = (f64::from(entry.delivery_samples) / 8.0).clamp(0.0, 1.0);
+fn response_loss_penalty_ms(snapshot: PathSnapshot) -> f64 {
+    let loss = snapshot.loss_rate.clamp(0.0, 1.0);
+    if loss <= f64::EPSILON {
+        return 0.0;
+    }
+    let min_progress = PATH_OPEN_SCORE_BYTES as f64
+        / ((snapshot.delivery_rate_bps.max(1.0) / 8.0) * (snapshot.srtt_ms.max(1.0) / 1000.0))
+            .max(PATH_OPEN_SCORE_BYTES as f64);
+    let expected_repairs = loss / (1.0 - loss).max(min_progress);
+    expected_repairs * transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0
+}
+
+fn confidence_sample_denominator() -> f64 {
+    f64::from(QUIC_INITIAL_WINDOW_PACKETS as u32)
+}
+
+fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) -> f64 {
+    let delivery_confidence =
+        (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
     let metric_confidence = match entry.path_metrics {
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::LocalSender,
@@ -360,26 +380,18 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, now: Instant) -> 
         }) if metrics.has_ack_derived_data_sample => {
             let source_confidence =
                 f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
-            let sample_confidence = (f64::from(metrics.data_sample_count) / 8.0).clamp(0.0, 1.0);
+            let sample_confidence = (f64::from(metrics.data_sample_count)
+                / confidence_sample_denominator())
+            .clamp(0.0, 1.0);
             source_confidence * sample_confidence
         }
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::PeerHint,
             ..
-        }) => 0.1,
+        }) => 0.0,
         _ => 0.0,
     };
-    let freshness_confidence = entry
-        .last_delivery_at
-        .map(|seen| {
-            let age = now.saturating_duration_since(seen).as_secs_f64();
-            (1.0 - age / 30.0).clamp(0.0, 1.0) * 0.25
-        })
-        .unwrap_or(0.0);
-    delivery_confidence
-        .max(metric_confidence)
-        .max(freshness_confidence)
-        .clamp(0.1, 1.0)
+    delivery_confidence.max(metric_confidence).clamp(0.0, 1.0)
 }
 
 fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {

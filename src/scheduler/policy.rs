@@ -2,6 +2,11 @@ use super::FlowLane;
 use crate::protocol::{PathCapabilities, PathId, UnderlayProtocol};
 use std::collections::VecDeque;
 
+const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
+const QUIC_INITIAL_WINDOW_PACKETS: f64 = 10.0;
+const QUIC_MAX_ACK_DELAY_MS: f64 = 25.0;
+const QUIC_PERSISTENT_CONGESTION_THRESHOLD: f64 = 3.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathState {
     Active,
@@ -102,40 +107,13 @@ impl PathSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SchedulerPolicy {
-    pub expensive_penalty_ms: f64,
-    pub suspect_penalty_ms: f64,
-    pub backup_penalty_ms: f64,
-    pub tcp_reorder_penalty_ms: f64,
-    pub loss_penalty_scale_ms: f64,
-    pub tail_avoidance_threshold_bytes: usize,
-    pub duplication_max_payload_bytes: usize,
-    pub duplication_max_extra_eta_ms: f64,
-    pub shared_bottleneck_rtt_window_ms: f64,
-    pub shared_bottleneck_queue_penalty_ms: f64,
-    pub tail_avoidance_rtt_penalty_scale: f64,
-    pub low_confidence_penalty_ms: f64,
-}
-
-impl Default for SchedulerPolicy {
-    fn default() -> Self {
-        Self {
-            expensive_penalty_ms: 25.0,
-            suspect_penalty_ms: 250.0,
-            backup_penalty_ms: 100.0,
-            tcp_reorder_penalty_ms: 50.0,
-            loss_penalty_scale_ms: 500.0,
-            tail_avoidance_threshold_bytes: 512 * 1024,
-            duplication_max_payload_bytes: 4096,
-            duplication_max_extra_eta_ms: 15.0,
-            shared_bottleneck_rtt_window_ms: 8.0,
-            shared_bottleneck_queue_penalty_ms: 20.0,
-            tail_avoidance_rtt_penalty_scale: 0.75,
-            low_confidence_penalty_ms: 25.0,
-        }
-    }
-}
+/// Scheduler policy is intentionally parameter-free in production.
+///
+/// Scheduling may use live path evidence, protocol-derived timer shape, and
+/// resource envelopes. It must not hide mptunnel-only millisecond weights or
+/// byte thresholds that silently become lab-tuned modes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchedulerPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PathScore {
@@ -328,11 +306,18 @@ impl HeterogeneousScheduler {
         paths: &[PathSnapshot],
         policy: SchedulerPolicy,
     ) -> Option<SchedulerDecision> {
-        let mode = scheduling_mode(packet, policy);
+        let mode = scheduling_mode(packet, paths);
         let scheduled_lane = scheduled_lane(packet.lane, mode);
-        let scored = self.scored_paths(paths, scheduled_lane, packet.payload_bytes, mode, policy);
+        let scored = self.scored_paths(
+            paths,
+            packet.lane,
+            scheduled_lane,
+            packet.payload_bytes,
+            mode,
+            policy,
+        );
         let primary = scored.first().copied()?;
-        let duplicate_path_id = duplicate_path(packet, primary, &scored, policy);
+        let duplicate_path_id = duplicate_path(packet, primary, &scored, paths);
         Some(SchedulerDecision {
             flow_id: packet.flow_id,
             lane: packet.lane,
@@ -348,22 +333,24 @@ impl HeterogeneousScheduler {
     fn scored_paths(
         &self,
         paths: &[PathSnapshot],
-        lane: FlowLane,
+        original_lane: FlowLane,
+        scheduled_lane: FlowLane,
         payload_bytes: usize,
         mode: SchedulingMode,
         policy: SchedulerPolicy,
     ) -> Vec<PathScore> {
         let mut scored = paths
             .iter()
+            .filter(|path| original_lane != FlowLane::Throughput || path.flags.bulk_allowed)
             .filter_map(|path| {
                 let mut path = *path;
                 path.queue_bytes = path
                     .queue_bytes
                     .saturating_add(self.queued_path_bytes(path.id));
-                score_path(path, lane, payload_bytes, policy).map(|mut score| {
-                    score.eta_ms += shared_bottleneck_penalty(path, paths, policy);
+                score_path(path, scheduled_lane, payload_bytes, policy).map(|mut score| {
+                    score.eta_ms += shared_bottleneck_penalty(path, paths);
                     if mode == SchedulingMode::TailAvoidance {
-                        score.eta_ms += path.srtt_ms * policy.tail_avoidance_rtt_penalty_scale;
+                        score.eta_ms += adaptive_tail_avoidance_penalty_ms(path);
                     }
                     score
                 })
@@ -410,7 +397,7 @@ pub fn score_path(
     path: PathSnapshot,
     lane: FlowLane,
     payload_bytes: usize,
-    policy: SchedulerPolicy,
+    _policy: SchedulerPolicy,
 ) -> Option<PathScore> {
     if !path_is_schedulable(path, lane) {
         return None;
@@ -418,8 +405,10 @@ pub fn score_path(
 
     let rate = effective_path_rate_bps(path, lane);
     let effective_inflight = if path.inflight_limit_bytes > 0 {
+        let adaptive_ceiling =
+            (path.inflight_limit_bytes as f64 * BBR_DEFAULT_CWND_GAIN).ceil() as u64;
         path.bytes_in_flight
-            .min(path.inflight_limit_bytes.saturating_mul(2))
+            .min(adaptive_ceiling.max(path.inflight_limit_bytes))
     } else {
         path.bytes_in_flight
     };
@@ -434,26 +423,22 @@ pub fn score_path(
     eta_ms += queued_bits / rate * 1000.0;
     eta_ms += payload_bits / rate * 1000.0;
     eta_ms += path.jitter_ms;
-    eta_ms += path.loss_rate.clamp(0.0, 1.0) * policy.loss_penalty_scale_ms;
-    eta_ms += (1.0 - path.confidence.clamp(0.0, 1.0)) * policy.low_confidence_penalty_ms;
+    eta_ms += adaptive_loss_repair_penalty_ms(path);
+    eta_ms += adaptive_low_confidence_penalty_ms(path);
     eta_ms += active_flow_penalty_ms(path, lane);
 
     if path.state == PathState::Suspect {
-        eta_ms += suspect_penalty_ms(lane, policy);
+        eta_ms += suspect_penalty_ms(path, lane);
     }
     if path.flags.backup {
-        eta_ms += policy.backup_penalty_ms;
+        eta_ms += adaptive_backup_penalty_ms(path);
     }
     if path.flags.expensive {
-        eta_ms += policy.expensive_penalty_ms;
+        eta_ms += adaptive_expensive_path_penalty_ms(path, payload_bytes);
     }
     if path.underlay == UnderlayProtocol::Tcp && prefers_low_reorder(lane) {
-        eta_ms += policy.tcp_reorder_penalty_ms;
+        eta_ms += adaptive_tcp_reorder_penalty_ms(path, payload_bytes);
     }
-    if lane == FlowLane::Control && path.flags.low_latency {
-        eta_ms -= path.srtt_ms.min(10.0) * 0.25;
-    }
-
     Some(PathScore {
         path_id: path.id,
         eta_ms,
@@ -463,10 +448,10 @@ pub fn score_path(
 fn active_flow_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
     match lane {
         FlowLane::Throughput | FlowLane::Background => {
-            f64::from(path.active_latency_sensitive_flows) * path.srtt_ms.max(1.0)
+            f64::from(path.active_latency_sensitive_flows) * path_pto_ms(path)
         }
         FlowLane::Control | FlowLane::RealtimeDatagram | FlowLane::Latency => {
-            f64::from(path.active_flows) * path.srtt_ms.max(1.0) * 0.25
+            f64::from(path.active_flows) * path_pto_ms(path) / QUIC_INITIAL_WINDOW_PACKETS
         }
     }
 }
@@ -503,9 +488,9 @@ fn deficit_charge_bytes(lane: FlowLane, payload_bytes: usize) -> u64 {
     (payload_bytes as u64).max(1)
 }
 
-fn scheduling_mode(packet: EnqueueRequest, policy: SchedulerPolicy) -> SchedulingMode {
+fn scheduling_mode(packet: EnqueueRequest, paths: &[PathSnapshot]) -> SchedulingMode {
     if packet.lane == FlowLane::Throughput
-        && packet.remaining_flow_bytes <= policy.tail_avoidance_threshold_bytes
+        && packet.remaining_flow_bytes <= adaptive_tail_avoidance_threshold_bytes(paths, packet)
     {
         SchedulingMode::TailAvoidance
     } else {
@@ -524,40 +509,48 @@ fn duplicate_path(
     packet: EnqueueRequest,
     primary: PathScore,
     scored: &[PathScore],
-    policy: SchedulerPolicy,
+    paths: &[PathSnapshot],
 ) -> Option<PathId> {
     if !packet.duplicate_eligible
-        || packet.payload_bytes > policy.duplication_max_payload_bytes
         || !matches!(packet.lane, FlowLane::Control | FlowLane::RealtimeDatagram)
     {
         return None;
     }
+    let primary_snapshot = paths
+        .iter()
+        .copied()
+        .find(|path| path.id == primary.path_id)?;
     scored
         .iter()
         .copied()
         .find(|score| {
+            let Some(candidate) = paths.iter().copied().find(|path| path.id == score.path_id)
+            else {
+                return false;
+            };
+            let eta_slack = adaptive_duplication_eta_slack_ms(primary_snapshot, candidate);
+            let duplicate_tx = payload_tx_ms(candidate, packet.payload_bytes);
             score.path_id != primary.path_id
-                && score.eta_ms <= primary.eta_ms + policy.duplication_max_extra_eta_ms
+                && score.eta_ms <= primary.eta_ms + eta_slack
+                && duplicate_tx <= eta_slack
         })
         .map(|score| score.path_id)
 }
 
-fn shared_bottleneck_penalty(
-    path: PathSnapshot,
-    paths: &[PathSnapshot],
-    policy: SchedulerPolicy,
-) -> f64 {
-    let shares_busy_peer = paths.iter().any(|other| {
-        other.id != path.id
-            && matches!(other.state, PathState::Active | PathState::Suspect)
-            && (other.srtt_ms - path.srtt_ms).abs() <= policy.shared_bottleneck_rtt_window_ms
-            && other.queue_bytes.saturating_add(other.bytes_in_flight) > 0
-    });
-    if shares_busy_peer {
-        policy.shared_bottleneck_queue_penalty_ms
-    } else {
-        0.0
-    }
+fn shared_bottleneck_penalty(path: PathSnapshot, paths: &[PathSnapshot]) -> f64 {
+    paths
+        .iter()
+        .filter(|other| {
+            other.id != path.id
+                && matches!(other.state, PathState::Active | PathState::Suspect)
+                && other.queue_bytes.saturating_add(other.bytes_in_flight) > 0
+                && path_rtt_samples_overlap(path, **other)
+        })
+        .map(|other| {
+            let queued = other.queue_bytes.saturating_add(other.bytes_in_flight) as usize;
+            payload_tx_ms(path, queued)
+        })
+        .fold(0.0, f64::max)
 }
 
 fn path_is_schedulable(path: PathSnapshot, lane: FlowLane) -> bool {
@@ -576,11 +569,11 @@ fn path_is_schedulable(path: PathSnapshot, lane: FlowLane) -> bool {
     true
 }
 
-fn suspect_penalty_ms(lane: FlowLane, policy: SchedulerPolicy) -> f64 {
+fn suspect_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
     if prefers_low_reorder(lane) {
         0.0
     } else {
-        policy.suspect_penalty_ms
+        path_pto_ms(path) * QUIC_PERSISTENT_CONGESTION_THRESHOLD
     }
 }
 
@@ -589,6 +582,80 @@ fn prefers_low_reorder(lane: FlowLane) -> bool {
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
+}
+
+fn adaptive_loss_repair_penalty_ms(path: PathSnapshot) -> f64 {
+    let loss = path.loss_rate.clamp(0.0, 1.0);
+    if loss <= f64::EPSILON {
+        return 0.0;
+    }
+    let denominator_floor = 1.0 / QUIC_INITIAL_WINDOW_PACKETS;
+    let expected_repairs = loss / (1.0 - loss).max(denominator_floor);
+    expected_repairs * path_pto_ms(path)
+}
+
+fn adaptive_low_confidence_penalty_ms(path: PathSnapshot) -> f64 {
+    (1.0 - path.confidence.clamp(0.0, 1.0)) * path_pto_ms(path) / QUIC_INITIAL_WINDOW_PACKETS
+}
+
+fn adaptive_backup_penalty_ms(path: PathSnapshot) -> f64 {
+    path_pto_ms(path)
+}
+
+fn adaptive_expensive_path_penalty_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
+    path_pto_ms(path).max(payload_tx_ms(path, payload_bytes))
+}
+
+fn adaptive_tcp_reorder_penalty_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
+    (path.srtt_ms.max(1.0) / 2.0)
+        .max(path.jitter_ms.max(0.0))
+        .max(payload_tx_ms(path, payload_bytes))
+}
+
+fn adaptive_tail_avoidance_threshold_bytes(
+    paths: &[PathSnapshot],
+    packet: EnqueueRequest,
+) -> usize {
+    paths
+        .iter()
+        .copied()
+        .filter(|path| path_is_schedulable(*path, FlowLane::Latency))
+        .map(path_bdp_bytes)
+        .min()
+        .unwrap_or(packet.payload_bytes.max(1))
+        .max(packet.payload_bytes.max(1))
+}
+
+fn adaptive_tail_avoidance_penalty_ms(path: PathSnapshot) -> f64 {
+    path_pto_ms(path)
+}
+
+fn adaptive_duplication_eta_slack_ms(primary: PathSnapshot, candidate: PathSnapshot) -> f64 {
+    let pto = path_pto_ms(primary).min(path_pto_ms(candidate));
+    let jitter = primary.jitter_ms.max(candidate.jitter_ms).max(0.0);
+    (pto / QUIC_INITIAL_WINDOW_PACKETS).max(jitter)
+}
+
+fn path_rtt_samples_overlap(path: PathSnapshot, other: PathSnapshot) -> bool {
+    let path_window = path.jitter_ms.max(path.srtt_ms.max(1.0) / 4.0);
+    let other_window = other.jitter_ms.max(other.srtt_ms.max(1.0) / 4.0);
+    (path.srtt_ms - other.srtt_ms).abs() <= path_window.max(other_window)
+}
+
+fn path_bdp_bytes(path: PathSnapshot) -> usize {
+    ((effective_path_rate_bps(path, FlowLane::Throughput) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0))
+        .ceil()
+        .max(1.0) as usize
+}
+
+fn payload_tx_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
+    payload_bytes as f64 * 8.0 / effective_path_rate_bps(path, FlowLane::Throughput) * 1000.0
+}
+
+fn path_pto_ms(path: PathSnapshot) -> f64 {
+    let srtt = path.srtt_ms.max(1.0);
+    let rttvar = path.jitter_ms.max(srtt / 8.0);
+    srtt + (4.0 * rttvar).max(1.0) + srtt.min(QUIC_MAX_ACK_DELAY_MS)
 }
 
 #[cfg(test)]

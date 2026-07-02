@@ -35,6 +35,9 @@ pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS: u64 = 300;
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW: Duration =
     Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS);
+pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -396,6 +399,8 @@ pub struct ServerConfig {
     pub outbound: OutboundConfig,
     /// DNS policy owned by the selected egress behavior.
     pub outbound_dns: DnsConfig,
+    /// Target connect timeout owned by the selected egress behavior.
+    pub outbound_connect_timeout: Duration,
     /// MPP sender behavior for streams accepted by this inbound path group.
     pub performance: MppPerformanceConfig,
 }
@@ -456,6 +461,9 @@ fn validate_server_config(
     }
     validate_security_config(&server.security)?;
     server.outbound_dns.validate()?;
+    if server.outbound_connect_timeout.is_zero() {
+        return Err(ConfigError::OutboundConnectTimeoutZero);
+    }
     Ok(())
 }
 
@@ -584,6 +592,7 @@ pub enum ConfigError {
     TunDnsResolverPortZero,
     OutboundDnsTimeoutZero,
     OutboundDnsResolverPortZero,
+    OutboundConnectTimeoutZero,
     ProxyAuthUsernameEmpty,
     ProxyAuthPasswordEmpty,
     ProxyAuthUsernameTooLong,
@@ -699,6 +708,9 @@ impl std::fmt::Display for ConfigError {
             }
             Self::OutboundDnsResolverPortZero => {
                 write!(f, "outbound DNS resolver port must be nonzero")
+            }
+            Self::OutboundConnectTimeoutZero => {
+                write!(f, "outbound connect timeout must be greater than zero")
             }
             Self::ProxyAuthUsernameEmpty => write!(f, "proxy auth username must not be empty"),
             Self::ProxyAuthPasswordEmpty => write!(f, "proxy auth password must not be empty"),

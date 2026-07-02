@@ -104,6 +104,7 @@ pub(super) enum ReliableRelayQueuedWorkLane {
 pub(super) struct ReliableRelayQueuedWork {
     pub(super) kind: ReliableRelayQueuedWorkKind,
     pub(super) payload_bytes: usize,
+    pub(super) stream_ordered_carrier_emit: bool,
     #[cfg(feature = "lab-diagnostics")]
     pub(super) enqueue_id: u64,
     #[cfg(feature = "lab-diagnostics")]
@@ -209,6 +210,7 @@ impl ReliableRelaySenderQueue {
         let work = ReliableRelayQueuedWork {
             kind,
             payload_bytes,
+            stream_ordered_carrier_emit: final_control,
             #[cfg(feature = "lab-diagnostics")]
             enqueue_id,
             #[cfg(feature = "lab-diagnostics")]
@@ -289,6 +291,7 @@ impl ReliableRelaySenderQueue {
         Some(ReliableRelayQueuedWork {
             kind: ReliableRelayQueuedWorkKind::Data(prefix),
             payload_bytes: prefix_len,
+            stream_ordered_carrier_emit: work.stream_ordered_carrier_emit,
             #[cfg(feature = "lab-diagnostics")]
             enqueue_id: work.enqueue_id,
             #[cfg(feature = "lab-diagnostics")]
@@ -422,6 +425,21 @@ struct ResponseBulkLead {
     eta_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseCarrierEmitMode {
+    Classified,
+    StreamOrdered,
+}
+
+impl ResponseCarrierEmitMode {
+    fn effective_lane(self, frame: &Frame, lane: FlowLane) -> FlowLane {
+        match self {
+            Self::Classified => tcp_path_effective_frame_lane(frame, lane),
+            Self::StreamOrdered => lane,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ResponseDataDispatchTarget {
     Fixed(TcpPathSessionCommandSender),
@@ -529,6 +547,7 @@ fn choose_response_sender_target(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
     frame: &Frame,
+    emit_mode: ResponseCarrierEmitMode,
     mux_limits: MuxLimits,
     lower_flights: &[CarrierPathFlightDebt],
     avoid_keys: &[CarrierPathKey],
@@ -541,8 +560,8 @@ fn choose_response_sender_target(
     let capacity_targets = targets
         .iter()
         .filter(|target| {
-            let effective_lane = tcp_path_effective_frame_lane(frame, lane);
-            target.commands.can_enqueue_frame_now(frame, lane)
+            let effective_lane = emit_mode.effective_lane(frame, lane);
+            response_target_can_enqueue_frame_now(target, frame, lane, emit_mode)
                 && response_target_has_emission_credit(
                     target,
                     effective_lane,
@@ -602,6 +621,20 @@ fn choose_response_sender_target(
         })
         .cloned();
     selected
+}
+
+fn response_target_can_enqueue_frame_now(
+    target: &ResponseSenderPathTarget,
+    frame: &Frame,
+    lane: FlowLane,
+    emit_mode: ResponseCarrierEmitMode,
+) -> bool {
+    match emit_mode {
+        ResponseCarrierEmitMode::Classified => target.commands.can_enqueue_frame_now(frame, lane),
+        ResponseCarrierEmitMode::StreamOrdered => {
+            target.commands.can_enqueue_stream_ordered_frame_now(lane)
+        }
+    }
 }
 
 fn choose_response_sender_data_target(
@@ -788,10 +821,16 @@ fn response_frame_has_carrier_credit(
     stream: &ReliablePathStream,
     frame: &Frame,
     lane: FlowLane,
+    emit_mode: ResponseCarrierEmitMode,
     repair: bool,
 ) -> bool {
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(commands) => commands.can_enqueue_frame_now(frame, lane),
+        ReliablePathStreamOutput::Fixed(commands) => match emit_mode {
+            ResponseCarrierEmitMode::Classified => commands.can_enqueue_frame_now(frame, lane),
+            ResponseCarrierEmitMode::StreamOrdered => {
+                commands.can_enqueue_stream_ordered_frame_now(lane)
+            }
+        },
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_payload_bytes(frame);
             let lower_flights = if relay_frame_is_bulk_stream_data(frame, lane) && !repair {
@@ -809,6 +848,7 @@ fn response_frame_has_carrier_credit(
                 &targets,
                 lane,
                 frame,
+                emit_mode,
                 binding.mux_limits(),
                 &lower_flights,
                 &avoid_keys,
@@ -827,11 +867,23 @@ async fn emit_planned_response_data_frame(
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
     match planned {
         ResponseDataDispatchTarget::Fixed(commands) => {
-            send_sender_service_frame_to_carrier(&commands, frame, lane).await?;
+            send_sender_service_frame_to_carrier(
+                &commands,
+                frame,
+                lane,
+                ResponseCarrierEmitMode::Classified,
+            )
+            .await?;
             Ok(None)
         }
         ResponseDataDispatchTarget::Switchable { binding, target } => {
-            send_sender_service_frame_to_carrier(&target.commands, frame.clone(), lane).await?;
+            send_sender_service_frame_to_carrier(
+                &target.commands,
+                frame.clone(),
+                lane,
+                ResponseCarrierEmitMode::Classified,
+            )
+            .await?;
             binding.record_flight(target.key, &frame, true);
             if binding.ordinary_lead().is_none() {
                 binding.set_ordinary_lead(target.key);
@@ -853,12 +905,13 @@ async fn emit_response_frame_from_sender_service(
     stream: &ReliablePathStream,
     frame: Frame,
     lane: FlowLane,
+    emit_mode: ResponseCarrierEmitMode,
     reason: &'static str,
     repair: bool,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(commands) => {
-            send_sender_service_frame_to_carrier(commands, frame, lane).await?;
+            send_sender_service_frame_to_carrier(commands, frame, lane, emit_mode).await?;
             Ok(None)
         }
         ReliablePathStreamOutput::Switchable(binding) => {
@@ -883,6 +936,7 @@ async fn emit_response_frame_from_sender_service(
                     &targets,
                     lane,
                     &frame,
+                    emit_mode,
                     binding.mux_limits(),
                     &lower_flights,
                     &avoid_keys,
@@ -890,8 +944,13 @@ async fn emit_response_frame_from_sender_service(
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
-                match send_sender_service_frame_to_carrier(&target.commands, frame.clone(), lane)
-                    .await
+                match send_sender_service_frame_to_carrier(
+                    &target.commands,
+                    frame.clone(),
+                    lane,
+                    emit_mode,
+                )
+                .await
                 {
                     Ok(()) => {
                         if matches!(frame, Frame::StreamData { .. }) {
@@ -924,11 +983,17 @@ async fn send_sender_service_frame_to_carrier(
     commands: &TcpPathSessionCommandSender,
     frame: Frame,
     lane: FlowLane,
+    emit_mode: ResponseCarrierEmitMode,
 ) -> Result<(), RuntimeError> {
     // Sender-service dispatch must not await a path queue permit; queue-full is
     // explicit backpressure so the owner can keep work queued and continue
     // polling ACK/control/path feedback.
-    commands.try_enqueue_admitted_frame(frame, lane)
+    match emit_mode {
+        ResponseCarrierEmitMode::Classified => commands.try_enqueue_admitted_frame(frame, lane),
+        ResponseCarrierEmitMode::StreamOrdered => {
+            commands.try_enqueue_stream_ordered_frame(frame, lane)
+        }
+    }
 }
 
 pub(super) async fn send_sender_service_control_frame(
@@ -939,8 +1004,15 @@ pub(super) async fn send_sender_service_control_frame(
     // still uses the same sender-service carrier gate: no blocking path permit,
     // no path-local fairness decision, and queue-full remains explicit
     // sender-service backpressure.
-    emit_response_frame_from_sender_service(stream, frame, FlowLane::Control, "control", false)
-        .await
+    emit_response_frame_from_sender_service(
+        stream,
+        frame,
+        FlowLane::Control,
+        ResponseCarrierEmitMode::Classified,
+        "control",
+        false,
+    )
+    .await
 }
 
 async fn emit_relay_path_frame(
@@ -950,7 +1022,13 @@ async fn emit_relay_path_frame(
 ) -> Result<(), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(commands) => {
-            send_sender_service_frame_to_carrier(commands, frame, lane).await
+            send_sender_service_frame_to_carrier(
+                commands,
+                frame,
+                lane,
+                ResponseCarrierEmitMode::Classified,
+            )
+            .await
         }
         ReliablePathStreamOutput::Switchable(_) => {
             Err(RuntimeError::Protocol("request relay path is not fixed"))
@@ -1007,7 +1085,18 @@ impl ServerResponseSenderService {
         };
         match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => {
-                response_frame_has_carrier_credit(path_stream, frame, FlowLane::Control, false)
+                let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
+                    (relay_lane, ResponseCarrierEmitMode::StreamOrdered)
+                } else {
+                    (FlowLane::Control, ResponseCarrierEmitMode::Classified)
+                };
+                response_frame_has_carrier_credit(
+                    path_stream,
+                    frame,
+                    carrier_lane,
+                    emit_mode,
+                    false,
+                )
             }
             ReliableRelayQueuedWorkKind::Data(payload) => plan_response_data_dispatch(
                 path_stream,
@@ -1016,9 +1105,13 @@ impl ServerResponseSenderService {
                 response_dispatch_payload_bytes(path_stream, relay_lane, mux_limits, payload.len()),
             )
             .is_ok(),
-            ReliableRelayQueuedWorkKind::Repair { frame, .. } => {
-                response_frame_has_carrier_credit(path_stream, frame, FlowLane::Latency, true)
-            }
+            ReliableRelayQueuedWorkKind::Repair { frame, .. } => response_frame_has_carrier_credit(
+                path_stream,
+                frame,
+                FlowLane::Latency,
+                ResponseCarrierEmitMode::Classified,
+                true,
+            ),
         }
     }
 
@@ -1163,10 +1256,16 @@ impl ServerResponseSenderService {
         };
         let selected_path = match queued_lane {
             ReliableRelayQueuedWorkLane::Control => {
+                let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
+                    (relay_lane, ResponseCarrierEmitMode::StreamOrdered)
+                } else {
+                    (FlowLane::Control, ResponseCarrierEmitMode::Classified)
+                };
                 emit_response_frame_from_sender_service(
                     path_stream,
                     frame.clone(),
-                    FlowLane::Control,
+                    carrier_lane,
+                    emit_mode,
                     "control",
                     false,
                 )
@@ -1176,6 +1275,7 @@ impl ServerResponseSenderService {
                 path_stream,
                 frame.clone(),
                 tcp_path_effective_frame_lane(&frame, relay_lane),
+                ResponseCarrierEmitMode::Classified,
                 "data",
                 false,
             )
@@ -1192,6 +1292,7 @@ impl ServerResponseSenderService {
                     path_stream,
                     frame.clone(),
                     FlowLane::Latency,
+                    ResponseCarrierEmitMode::Classified,
                     "tail_repair",
                     true,
                 )
@@ -2083,6 +2184,7 @@ mod tests {
                 flags: StreamFlags::NONE,
                 payload: Bytes::from(vec![0; 64 * 1024]),
             },
+            ResponseCarrierEmitMode::Classified,
             MuxLimits::default(),
             &[],
             &[],

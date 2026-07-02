@@ -18,21 +18,27 @@ use super::udp_path::*;
 use crate::lab_diagnostics::lab_diagnostic;
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
-pub(super) const PATH_OPEN_SCORE_BYTES: usize = 4 * 1024;
+// RFC 9002's recommended QUIC initial congestion window is based on ten max
+// datagrams. mptunnel uses the same packet-count shape as the minimum useful
+// path-open/rate sample instead of an arbitrary byte constant.
+pub(super) const TRANSPORT_MSS_BYTES: usize = 1460;
+pub(super) const QUIC_INITIAL_WINDOW_PACKETS: usize = 10;
+pub(super) const PATH_OPEN_SCORE_BYTES: usize = QUIC_INITIAL_WINDOW_PACKETS * TRANSPORT_MSS_BYTES;
+// BBR's model explicitly separates send quantum from inflight volume. These
+// values are protocol-shape constants, not mptunnel tuning knobs: send quantum
+// is pacing_rate*1ms, capped at 64 KiB and floored at 2*MSS; MinPipeCwnd is
+// four MSS-sized packets.
+pub(super) const BBR_SEND_QUANTUM_INTERVAL: Duration = Duration::from_millis(1);
+pub(super) const BBR_MAX_SEND_QUANTUM_BYTES: usize = 64 * 1024;
+pub(super) const BBR_MIN_SEND_QUANTUM_PACKETS: usize = 2;
+pub(super) const BBR_MIN_PIPE_CWND_PACKETS: usize = 4;
+pub(super) const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
+pub(super) const QUIC_TIMER_GRANULARITY: Duration = Duration::from_millis(1);
+pub(super) const QUIC_INITIAL_RTT: Duration = Duration::from_millis(333);
+pub(super) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
+pub(super) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 pub(super) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-pub(super) const PATH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 pub(super) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
-pub(super) const MIN_RATE_SAMPLE_DURATION: Duration = Duration::from_millis(1);
-pub(super) const TCP_STREAM_STALL_MIN_TIMEOUT: Duration = Duration::from_millis(350);
-pub(super) const TCP_STREAM_STALL_MAX_TIMEOUT: Duration = Duration::from_millis(1500);
-pub(super) const UDP_DATAGRAM_MIN_TTL_FIT_RATIO: f64 = 0.9;
-pub(super) const UDP_DATAGRAM_MODEL_PACING_GAIN: f64 = 1.25;
-pub(super) const UDP_FIRST_OPEN_RTT_MULTIPLIER: f64 = 8.0;
-pub(super) const UDP_MIN_PACING_RATE_BPS: f64 = 64_000.0;
-pub(super) const UDP_MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
-pub(super) const UDP_MIN_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
-pub(super) const UDP_MIN_RETRY_BUDGET: Duration = Duration::from_millis(250);
-pub(super) const UDP_MIN_PATH_SUPPRESSION: Duration = Duration::from_millis(250);
 pub(super) const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
 pub(super) const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
 pub(super) const UDP_MAX_MTU_PAYLOAD_BYTES: usize = 65_000;
@@ -55,6 +61,7 @@ pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
                 server.bind_paths,
                 server.outbound,
                 server.outbound_dns,
+                server.outbound_connect_timeout,
                 server.security,
                 server.performance,
                 config.resources,
@@ -93,6 +100,7 @@ pub(super) async fn run_node(
             server.bind_paths.clone(),
             server.outbound,
             server.outbound_dns,
+            server.outbound_connect_timeout,
             server.security,
             server.performance,
             resources,
@@ -139,6 +147,7 @@ fn new_client_path_context(
         ProxyAuthConfig::disabled(),
         client.route_target.clone(),
         client.ingresses.clone(),
+        client.path_probe_timeout,
     )
 }
 
@@ -281,6 +290,7 @@ pub struct ClientPathContext {
     pub(super) tcp_security: Arc<Vec<SecurityConfig>>,
     pub(super) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
+    pub(super) path_connect_timeout: Duration,
     // Product ownership: reliable stream IDs live above TCP and UDP carriers.
     pub(super) next_reliable_stream_id: Arc<Mutex<u64>>,
     // Path-model ownership: health records are evidence snapshots consumed by
@@ -606,7 +616,7 @@ impl ClientPathHealthRecord {
             self.failed_until = None;
         } else {
             self.state = SchedulerPathState::Failed;
-            self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
+            self.failed_until = Some(now + path_record_failure_cooldown(self));
         }
     }
 
@@ -620,7 +630,7 @@ impl ClientPathHealthRecord {
         self.relay_queue_bytes = 0;
         if has_schedulable_alternative {
             self.state = SchedulerPathState::Failed;
-            self.failed_until = Some(now + PATH_FAILURE_COOLDOWN);
+            self.failed_until = Some(now + path_record_failure_cooldown(self));
         } else {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
@@ -649,7 +659,7 @@ impl PathRateSample {
         }
         Some(Self {
             bytes,
-            elapsed: elapsed.max(MIN_RATE_SAMPLE_DURATION),
+            elapsed: elapsed.max(QUIC_TIMER_GRANULARITY),
         })
     }
 
@@ -708,9 +718,10 @@ where
     T: Copy + Eq + Hash,
 {
     pub(super) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            capacity: capacity.max(1),
-            order: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+            order: VecDeque::new(),
             set: HashSet::new(),
         }
     }
@@ -734,7 +745,11 @@ where
 }
 
 pub(super) fn reliable_closed_stream_cache_capacity(max_streams: usize) -> usize {
-    max_streams.saturating_mul(2).clamp(128, 65_536)
+    // Closed-stream rejection state scales with the configured stream registry.
+    // The cache is lazily allocated by RecentIdCache, so small deployments stay
+    // cheap and high-fanout deployments are not silently capped by a stale
+    // fixed slot count.
+    max_streams.max(1).saturating_mul(2)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -746,7 +761,12 @@ pub(super) struct PathJoinReplayKey {
 }
 
 pub(super) fn path_join_replay_cache_capacity(max_streams: usize) -> usize {
-    max_streams.saturating_mul(4).clamp(1024, 262_144)
+    // Replay protection scales with configured session concurrency. This is a
+    // security/control-plane retention window, not a data-plane queue; keep it
+    // lazy instead of imposing arbitrary min/max slot caps.
+    max_streams
+        .max(1)
+        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD as usize + 1)
 }
 
 impl ClientPathContext {
@@ -773,7 +793,14 @@ impl ClientPathContext {
                 security: security.clone(),
             })
             .collect();
-        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None, Vec::new())
+        Self::new_with_path_configs_and_target(
+            paths,
+            resources,
+            proxy_auth,
+            None,
+            Vec::new(),
+            crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
+        )
     }
 
     pub fn new_with_path_configs_and_target(
@@ -782,6 +809,7 @@ impl ClientPathContext {
         proxy_auth: ProxyAuthConfig,
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
+        path_connect_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
@@ -834,6 +862,7 @@ impl ClientPathContext {
                         resources.max_streams,
                     ),
                     reuse_latency_session: reuse_tcp_latency_sessions,
+                    connect_timeout: path_connect_timeout,
                 })
             })
             .collect::<Vec<_>>();
@@ -864,6 +893,7 @@ impl ClientPathContext {
             tcp_security: Arc::new(tcp_security),
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
+            path_connect_timeout,
             next_reliable_stream_id: Arc::new(Mutex::new(0)),
             health,
             codec_limits,
@@ -1110,7 +1140,7 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
         let payload_bytes = payload_bytes
-            .min(tcp_lane_startup_chunk_bytes(
+            .min(relay_lane_startup_chunk_bytes(
                 FlowLane::Latency,
                 self.mux_limits,
             ))
@@ -1121,7 +1151,7 @@ impl ClientPathContext {
                 .total_cmp(&right.eta_ms)
                 .then_with(|| relay_path_key_order(left.key, right.key))
         });
-        let admitted = bulk_striping_admitted_cohort(candidates, payload_bytes, self.mux_limits)
+        let admitted = candidates
             .into_iter()
             .filter(|candidate| !candidate.has_evidence && candidate.snapshot.active_flows == 0)
             .collect::<Vec<_>>();
@@ -1282,7 +1312,7 @@ impl ClientPathContext {
                 .iter()
                 .any(udp_observation_has_datagram_feedback)
         {
-            let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
+            let freshness_budget_ms = f64::from(ttl_ms);
             return configured_order_path_indices(
                 &self.udp_paths,
                 &observations,
@@ -1367,7 +1397,7 @@ impl ClientPathContext {
             payload_bytes,
             SchedulerPolicy::default(),
         )?;
-        let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
+        let freshness_budget_ms = f64::from(ttl_ms);
         (score.eta_ms <= freshness_budget_ms).then_some(score.eta_ms)
     }
 
@@ -1818,6 +1848,7 @@ pub struct ServerPathContext {
     pub(super) server_paths: Arc<Vec<PathSpec>>,
     pub(super) outbound: OutboundConfig,
     pub(super) outbound_dns: DnsConfig,
+    pub(super) outbound_connect_timeout: Duration,
     pub(super) performance: MppPerformanceConfig,
     pub(super) codec_limits: CodecLimits,
     pub(super) mux_limits: MuxLimits,

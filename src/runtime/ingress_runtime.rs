@@ -355,10 +355,15 @@ where
 }
 
 pub(super) fn local_udp_buffer_len(mux_limits: MuxLimits) -> usize {
+    const SOCKS5_UDP_HEADER_BUDGET_BYTES: usize = 512;
+    const SOCKS5_UDP_PACKET_BUFFER_BYTES: usize = u16::MAX as usize;
     mux_limits
         .max_payload_bytes
-        .saturating_add(512)
-        .clamp(512, 65_535)
+        .saturating_add(SOCKS5_UDP_HEADER_BUDGET_BYTES)
+        .clamp(
+            SOCKS5_UDP_HEADER_BUDGET_BYTES,
+            SOCKS5_UDP_PACKET_BUFFER_BYTES,
+        )
 }
 
 pub(super) fn socks5_udp_peer_allowed(client_endpoint: &TargetAddr, peer: SocketAddr) -> bool {

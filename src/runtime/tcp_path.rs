@@ -7,6 +7,13 @@ use std::collections::HashMap;
 // shutdown. Product reliable stream identity, response path-flight ownership,
 // and cross-carrier scheduling live in `reliable_path`.
 
+const TCP_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
+    FlowLane::Control,
+    FlowLane::Latency,
+    FlowLane::RealtimeDatagram,
+    FlowLane::Background,
+];
+
 pub(super) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
     commands: Arc<Mutex<Option<TcpPathSessionCommandSender>>>,
@@ -167,6 +174,7 @@ pub(super) struct ClientTcpPathSessionRuntime {
     pub(super) stream_frame_queue: usize,
     pub(super) closed_stream_cache_capacity: usize,
     pub(super) reuse_latency_session: bool,
+    pub(super) connect_timeout: Duration,
 }
 
 struct ClientTcpPathSessionState {
@@ -441,6 +449,7 @@ async fn handle_disconnected_client_tcp_command(
             &runtime.security,
             runtime.codec_limits,
             runtime.mux_limits,
+            runtime.connect_timeout,
         )
         .await
         {
@@ -518,11 +527,8 @@ async fn handle_connected_client_tcp_command(
             Ok(())
         }
         TcpPathSessionCommand::CloseStream(stream_id) => {
-            if let Some(state) = streams.get_mut(&stream_id) {
-                state.local_close_pending = true;
-            } else {
-                closed_streams.insert(stream_id);
-            }
+            streams.remove(&stream_id);
+            closed_streams.insert(stream_id);
             Ok(())
         }
     }
@@ -535,8 +541,16 @@ pub(super) async fn connect_client_tcp_path(
     security: &SecurityConfig,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
+    connect_timeout: Duration,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
-    let tcp_stream = tcp::connect_path(path, TcpConnectOptions::default()).await?;
+    let tcp_stream = tcp::connect_path(
+        path,
+        TcpConnectOptions {
+            timeout: connect_timeout,
+            ..TcpConnectOptions::default()
+        },
+    )
+    .await?;
     let mut framed = EncryptedFramedStream::with_cipher_suite(
         tcp_stream,
         security.secret.as_bytes(),
@@ -985,14 +999,18 @@ pub(super) fn tcp_path_command_queue_for_payload(
     frame_payload_bytes: usize,
 ) -> usize {
     let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
+    let priority_headroom = tcp_path_priority_headroom_frames();
     let inflight_frames = mux_limits
         .max_path_flight_bytes
         .saturating_add(frame_payload - 1)
         / frame_payload;
-    inflight_frames.saturating_add(4).clamp(
-        4,
-        tcp_path_session_frame_queue_for_payload(mux_limits, frame_payload).max(4),
-    )
+    inflight_frames
+        .saturating_add(priority_headroom)
+        .max(priority_headroom)
+        .min(tcp_path_session_frame_queue_for_payload(
+            mux_limits,
+            frame_payload,
+        ))
 }
 
 pub(super) fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
@@ -1012,8 +1030,8 @@ pub(super) fn tcp_path_session_frame_queue_for_payload(
     frame_payload_bytes: usize,
 ) -> usize {
     reliable_stream_frame_queue_for_payload(mux_limits, frame_payload_bytes)
-        .saturating_mul(4)
-        .clamp(16, 4096)
+        .saturating_mul(tcp_path_writer_lane_count())
+        .max(tcp_path_writer_lane_count())
 }
 
 pub(super) fn reliable_stream_frame_queue(mux_limits: MuxLimits) -> usize {
@@ -1029,9 +1047,18 @@ pub(super) fn reliable_stream_frame_queue_for_payload(
     frame_payload_bytes: usize,
 ) -> usize {
     let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
+    let priority_headroom = tcp_path_priority_headroom_frames();
     (mux_limits.max_reorder_bytes / frame_payload)
-        .saturating_add(4)
-        .clamp(4, 1024)
+        .saturating_add(priority_headroom)
+        .max(priority_headroom)
+}
+
+pub(super) fn tcp_path_priority_headroom_frames() -> usize {
+    TCP_PATH_PRIORITY_HEADROOM_LANES.len()
+}
+
+fn tcp_path_writer_lane_count() -> usize {
+    TCP_PATH_PRIORITY_HEADROOM_LANES.len().saturating_add(1)
 }
 
 #[cfg(test)]

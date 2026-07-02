@@ -630,7 +630,7 @@ fn set_client_path_state(
         PathControlState::Failed => {
             record.manual_disabled = false;
             record.state = SchedulerPathState::Failed;
-            record.failed_until = Some(Instant::now() + PATH_FAILURE_COOLDOWN);
+            record.failed_until = Some(Instant::now() + path_record_failure_cooldown(record));
         }
         PathControlState::Disabled => {
             record.manual_disabled = true;
@@ -1186,6 +1186,7 @@ mod tests {
                 tag: "edge-mpp".to_string(),
             }),
             Vec::new(),
+            crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         )
         .expect("context");
         let target = ManagementTarget::Node {
@@ -1231,6 +1232,7 @@ mod tests {
                     ),
                 },
             }],
+            crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         )
         .expect("context");
         let target = ManagementTarget::Client {

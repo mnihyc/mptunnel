@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::DEFAULT_OUTBOUND_CONNECT_TIMEOUT;
 
 #[tokio::test]
 async fn path_probe_refreshes_tcp_health_without_stream_load() {
@@ -1107,6 +1108,7 @@ async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
         vec![path.clone()],
         OutboundConfig::Direct,
         DnsConfig::default(),
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
@@ -1140,6 +1142,7 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
         vec![path.clone()],
         OutboundConfig::Direct,
         DnsConfig::default(),
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
@@ -1245,6 +1248,7 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
         vec![path.clone()],
         OutboundConfig::Direct,
         DnsConfig::default(),
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
@@ -1335,6 +1339,7 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
                 server_paths: Arc::new(vec![server_path]),
                 outbound: OutboundConfig::Direct,
                 outbound_dns: DnsConfig::default(),
+                outbound_connect_timeout: DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
                 performance: MppPerformanceConfig::default(),
                 codec_limits: CodecLimits::default(),
                 mux_limits: ResourceLimits::default().into(),

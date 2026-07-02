@@ -106,6 +106,10 @@ impl ReliablePathStream {
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
+
+    pub(super) async fn close_ordered(&self, lane: FlowLane) {
+        self.output.close_stream_ordered(self.stream_id, lane).await;
+    }
 }
 
 pub(super) struct ReliablePathStreamHandle {
@@ -194,6 +198,15 @@ impl ReliablePathStreamOutput {
                     .await;
             }
             Self::Switchable(binding) => binding.close_stream(stream_id).await,
+        }
+    }
+
+    pub(super) async fn close_stream_ordered(&self, stream_id: StreamId, lane: FlowLane) {
+        match self {
+            Self::Fixed(commands) => {
+                let _ = commands.send_stream_ordered_close(stream_id, lane).await;
+            }
+            Self::Switchable(binding) => binding.close_stream_ordered(stream_id, lane).await,
         }
     }
 
@@ -932,6 +945,25 @@ impl ResponseStreamBinding {
             let _ = entry
                 .commands
                 .send_control(TcpPathSessionCommand::CloseStream(stream_id))
+                .await;
+            self.lane_tracker.detach(self.session_id, entry.key, lane);
+        }
+        if let Ok(mut lead) = self.ordinary_lead.lock() {
+            *lead = None;
+        }
+    }
+
+    pub(super) async fn close_stream_ordered(&self, stream_id: StreamId, lane: FlowLane) {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .clone();
+        for entry in outputs {
+            let _ = entry
+                .commands
+                .send_stream_ordered_close(stream_id, lane)
                 .await;
             self.lane_tracker.detach(self.session_id, entry.key, lane);
         }

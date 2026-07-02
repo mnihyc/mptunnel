@@ -37,6 +37,8 @@ pub struct OutboundRouteMember {
     pub config: Box<OutboundConfig>,
     /// DNS policy scoped to this exact egress member.
     pub dns: DnsConfig,
+    /// Target connect timeout scoped to this exact egress member.
+    pub connect_timeout: Duration,
 }
 
 impl OutboundConfig {
@@ -114,11 +116,10 @@ pub async fn connect_tcp(
     config.ensure_supports(TargetProtocol::Tcp)?;
     validate_target(target)?;
     if let OutboundConfig::Sequence { members } = config {
-        return connect_tcp_route_members(members, target, timeout, RouteMemberOrder::Sequence)
-            .await;
+        return connect_tcp_route_members(members, target, RouteMemberOrder::Sequence).await;
     }
     if let OutboundConfig::Random { members } = config {
-        return connect_tcp_route_members(members, target, timeout, RouteMemberOrder::Random).await;
+        return connect_tcp_route_members(members, target, RouteMemberOrder::Random).await;
     }
     connect_tcp_leaf(config, dns, target, timeout).await
 }
@@ -153,11 +154,10 @@ pub async fn connect_udp(
     config.ensure_supports(TargetProtocol::Udp)?;
     validate_target(target)?;
     if let OutboundConfig::Sequence { members } = config {
-        return connect_udp_route_members(members, target, timeout, RouteMemberOrder::Sequence)
-            .await;
+        return connect_udp_route_members(members, target, RouteMemberOrder::Sequence).await;
     }
     if let OutboundConfig::Random { members } = config {
-        return connect_udp_route_members(members, target, timeout, RouteMemberOrder::Random).await;
+        return connect_udp_route_members(members, target, RouteMemberOrder::Random).await;
     }
     connect_udp_leaf(config, dns, target, timeout).await
 }
@@ -199,13 +199,12 @@ enum RouteMemberOrder {
 async fn connect_tcp_route_members(
     members: &[OutboundRouteMember],
     target: &TargetAddr,
-    timeout: Duration,
     order: RouteMemberOrder,
 ) -> Result<TcpStream, OutboundConnectError> {
     let mut last_error = None;
     for index in route_member_indices(members.len(), order) {
         let member = &members[index];
-        match connect_tcp_leaf(&member.config, &member.dns, target, timeout).await {
+        match connect_tcp_leaf(&member.config, &member.dns, target, member.connect_timeout).await {
             Ok(stream) => return Ok(stream),
             Err(err) => last_error = Some(err),
         }
@@ -216,7 +215,6 @@ async fn connect_tcp_route_members(
 async fn connect_udp_route_members(
     members: &[OutboundRouteMember],
     target: &TargetAddr,
-    timeout: Duration,
     order: RouteMemberOrder,
 ) -> Result<OutboundUdpSocket, OutboundConnectError> {
     let mut last_error = None;
@@ -225,7 +223,7 @@ async fn connect_udp_route_members(
         if !member.config.supports_udp_targets() {
             continue;
         }
-        match connect_udp_leaf(&member.config, &member.dns, target, timeout).await {
+        match connect_udp_leaf(&member.config, &member.dns, target, member.connect_timeout).await {
             Ok(socket) => return Ok(socket),
             Err(err) => last_error = Some(err),
         }
@@ -872,10 +870,12 @@ mod tests {
                         proxy: proxy_addr.to_string().parse().expect("proxy"),
                     }),
                     dns: DnsConfig::default(),
+                    connect_timeout: Duration::from_secs(1),
                 },
                 OutboundRouteMember {
                     config: Box::new(OutboundConfig::Direct),
                     dns: DnsConfig::default(),
+                    connect_timeout: Duration::from_secs(1),
                 },
             ],
         };
@@ -924,10 +924,12 @@ mod tests {
                         proxy: proxy_addr.to_string().parse().expect("proxy"),
                     }),
                     dns: DnsConfig::default(),
+                    connect_timeout: Duration::from_secs(1),
                 },
                 OutboundRouteMember {
                     config: Box::new(OutboundConfig::Direct),
                     dns: DnsConfig::default(),
+                    connect_timeout: Duration::from_secs(1),
                 },
             ],
         };

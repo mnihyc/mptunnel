@@ -16,6 +16,7 @@ fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSession
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
         reuse_latency_session,
+        connect_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
     }
 }
 
@@ -349,6 +350,48 @@ async fn tcp_path_stream_fin_bypasses_saturated_bulk_queue() {
         }
         _ => panic!("expected prioritized stream FIN"),
     }
+}
+
+#[tokio::test]
+async fn tcp_path_stream_ordered_fin_and_close_do_not_overtake_bulk_data() {
+    let (tx, mut rx) = tcp_path_session_command_channels(3);
+    tx.try_enqueue_admitted_frame(
+        Frame::StreamData {
+            stream_id: StreamId(31),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"bulk"),
+        },
+        FlowLane::Throughput,
+    )
+    .expect("queue bulk data");
+    tx.try_enqueue_stream_ordered_frame(
+        Frame::StreamFin {
+            stream_id: StreamId(31),
+            final_offset: 4,
+        },
+        FlowLane::Throughput,
+    )
+    .expect("queue ordered FIN");
+    tx.send_stream_ordered_close(StreamId(31), FlowLane::Throughput)
+        .await
+        .expect("queue ordered close");
+
+    assert!(matches!(
+        recv_tcp_path_command(&mut rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert!(matches!(
+        recv_tcp_path_command(&mut rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamFin {
+            stream_id: StreamId(31),
+            final_offset: 4,
+        }))
+    ));
+    assert!(matches!(
+        recv_tcp_path_command(&mut rx).await,
+        Some(TcpPathSessionCommand::CloseStream(StreamId(31)))
+    ));
 }
 
 #[tokio::test]
@@ -811,6 +854,14 @@ fn bulk_striping_orders_paths_by_bulk_eta() {
         ResourceLimits::default(),
     )
     .expect("context");
+    context.mark_tcp_path_delivery(
+        1,
+        PathDeliveryStats {
+            payload_bytes: 4 * 1024 * 1024,
+            first_payload_at: Some(Instant::now()),
+            last_payload_at: Some(Instant::now() + Duration::from_millis(100)),
+        },
+    );
 
     assert_eq!(
         tcp_bulk_striping_indices(
@@ -837,6 +888,14 @@ fn bulk_striping_uses_service_horizon_for_realistic_fat_path() {
         ResourceLimits::default(),
     )
     .expect("context");
+    context.mark_tcp_path_delivery(
+        1,
+        PathDeliveryStats {
+            payload_bytes: 8 * 1024 * 1024,
+            first_payload_at: Some(Instant::now()),
+            last_payload_at: Some(Instant::now() + Duration::from_millis(100)),
+        },
+    );
 
     assert_eq!(
         tcp_bulk_striping_indices(&context, 64 * 1024)
@@ -998,9 +1057,9 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
             },
             FlowLane::Latency,
         ),
-        TCP_STREAM_STALL_MIN_TIMEOUT
+        transport_pto_from_snapshot(context.tcp_path_snapshot(0))
     );
-    assert!(
+    assert_eq!(
         reliable_relay_attach_open_timeout(
             &context,
             RelayPathKey {
@@ -1008,7 +1067,8 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
                 index: 1,
             },
             FlowLane::Throughput,
-        ) <= TCP_STREAM_STALL_MAX_TIMEOUT
+        ),
+        transport_pto_from_snapshot(context.tcp_path_snapshot(1))
     );
 }
 

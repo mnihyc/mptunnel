@@ -59,8 +59,11 @@ impl ReliableRelayFlowDemandTracker {
         let observed_bytes = signals.observed_bytes();
         let delta_bytes = observed_bytes.saturating_sub(self.last_observed_bytes);
         let elapsed = now.duration_since(self.last_refresh_at);
-        if delta_bytes > 0 || elapsed >= Duration::from_millis(1) {
-            let sample_rate = delta_bytes as f64 * 8.0 / elapsed.as_secs_f64().max(0.001);
+        if delta_bytes > 0 || elapsed >= QUIC_TIMER_GRANULARITY {
+            let sample_rate = delta_bytes as f64 * 8.0
+                / elapsed
+                    .as_secs_f64()
+                    .max(QUIC_TIMER_GRANULARITY.as_secs_f64());
             self.send_rate_bps = if self.send_rate_bps <= 0.0 {
                 sample_rate
             } else {
@@ -82,7 +85,7 @@ impl ReliableRelayFlowDemandTracker {
         let rate_proven_bulk = self.send_rate_bps >= rate_threshold;
         let rate_evidence_bytes = tcp_auto_rate_bulk_evidence_bytes(path, mux_limits, threshold);
         let byte_proven_bulk = observed_bytes >= threshold
-            && (rate_proven_bulk || flow_age >= tcp_auto_interactive_idle_gap(path) * 2);
+            && (rate_proven_bulk || flow_age >= tcp_auto_bulk_sustained_age(path));
         let rate_proven_sustained_bulk = rate_proven_bulk && observed_bytes >= rate_evidence_bytes;
         let sustained_bulk = byte_proven_bulk || rate_proven_sustained_bulk;
         if self.current == FlowLane::Throughput && !idle_gap {
@@ -138,10 +141,12 @@ impl ReliableRelayFlowDemandTracker {
 }
 
 fn tcp_auto_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxLimits) -> f64 {
-    path.map_or_else(
-        || reliable_relay_buffer_len(mux_limits) as f64 * 8.0 * 4.0,
-        |path| path.delivery_rate_bps.max(1.0) * 0.125,
-    )
+    let service_quantum =
+        reliable_relay_scheduler_quantum_cap(path, FlowLane::Throughput, mux_limits).max(1);
+    service_quantum as f64 * 8.0
+        / transport_pto_from_snapshot(path)
+            .as_secs_f64()
+            .max(QUIC_TIMER_GRANULARITY.as_secs_f64())
 }
 
 fn tcp_auto_rate_bulk_evidence_bytes(
@@ -151,18 +156,16 @@ fn tcp_auto_rate_bulk_evidence_bytes(
 ) -> u64 {
     let service_quantum =
         reliable_relay_scheduler_quantum_cap(path, FlowLane::Throughput, mux_limits) as u64;
-    let relay_chunk = reliable_relay_buffer_len(mux_limits) as u64;
-    let floor = service_quantum
-        .saturating_mul(2)
-        .max(relay_chunk.saturating_div(8))
-        .max(service_quantum)
-        .max(1);
+    let floor = service_quantum.max(PATH_OPEN_SCORE_BYTES as u64).max(1);
     floor.min(full_threshold.max(1))
 }
 
 fn tcp_auto_interactive_idle_gap(path: Option<PathSnapshot>) -> Duration {
-    let srtt_ms = path.map_or(100.0, |path| path.srtt_ms.max(1.0));
-    Duration::from_secs_f64((srtt_ms / 1000.0 * 4.0).clamp(0.05, 2.0))
+    transport_pto_from_snapshot(path)
+}
+
+fn tcp_auto_bulk_sustained_age(path: Option<PathSnapshot>) -> Duration {
+    tcp_auto_interactive_idle_gap(path).mul_f64(BBR_DEFAULT_CWND_GAIN)
 }
 
 fn tcp_auto_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
@@ -189,12 +192,15 @@ pub(super) fn tcp_auto_bulk_threshold_bytes(
 ) -> u64 {
     let relay_chunk = reliable_relay_buffer_len(mux_limits) as u64;
     let window = mux_limits.max_stream_window_bytes.max(relay_chunk);
+    let service_quantum =
+        reliable_relay_scheduler_quantum_cap(path, FlowLane::Throughput, mux_limits) as u64;
     let bdp_bytes = path.map_or(relay_chunk, |path| {
         ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)).ceil() as u64
     });
-    let ramp_floor = relay_chunk.saturating_mul(2).min(window);
-    let ramp_bdp = bdp_bytes.saturating_div(8).max(relay_chunk).max(ramp_floor);
-    ramp_bdp.min(window)
+    bdp_bytes
+        .max(service_quantum)
+        .max(PATH_OPEN_SCORE_BYTES as u64)
+        .min(window)
 }
 
 #[cfg(test)]

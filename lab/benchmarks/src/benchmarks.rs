@@ -342,34 +342,25 @@ pub fn run_ablation_study() -> AblationReport {
             SchedulerPolicy::default(),
         ),
         ablation_row(
-            "multipath_no_tail_avoidance",
-            "heterogeneous_all_links",
-            "tail_avoidance_disabled",
-            download_paths(),
-            SchedulerPolicy {
-                tail_avoidance_threshold_bytes: 0,
-                ..SchedulerPolicy::default()
-            },
+            "multipath_good_links",
+            "heterogeneous_good_links",
+            "default",
+            download_paths().into_iter().take(2).collect(),
+            SchedulerPolicy::default(),
         ),
         ablation_row(
-            "multipath_no_duplication",
-            "heterogeneous_all_links",
-            "duplication_disabled",
-            download_paths(),
-            SchedulerPolicy {
-                duplication_max_payload_bytes: 0,
-                ..SchedulerPolicy::default()
-            },
+            "multipath_unstable_mix",
+            "low_latency_plus_unstable",
+            "default",
+            vec![download_paths()[0], download_paths()[2]],
+            SchedulerPolicy::default(),
         ),
         ablation_row(
-            "multipath_no_shared_bottleneck_penalty",
-            "heterogeneous_all_links",
-            "shared_bottleneck_penalty_disabled",
-            download_paths(),
-            SchedulerPolicy {
-                shared_bottleneck_queue_penalty_ms: 0.0,
-                ..SchedulerPolicy::default()
-            },
+            "ideal_lab_same_protocol_group",
+            "ideal_udp_udp_tcp_group",
+            "default",
+            ideal_lab_paths(),
+            SchedulerPolicy::default(),
         ),
     ];
     AblationReport {

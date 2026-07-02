@@ -18,18 +18,13 @@ impl UdpPathRuntimeModel {
         mtu_is_measured: bool,
         mtu_probe_ceiling_payload_bytes: usize,
     ) -> Self {
-        let loss_backoff = (1.0 - snapshot.loss_rate.clamp(0.0, 1.0)).clamp(0.25, 1.0);
-        let pacing_rate_bps =
-            (snapshot.delivery_rate_bps * UDP_DATAGRAM_MODEL_PACING_GAIN * loss_backoff)
-                .max(UDP_MIN_PACING_RATE_BPS);
-        let timeout_loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
-        let model_timeout = Duration::from_secs_f64(
-            (((snapshot.srtt_ms + snapshot.jitter_ms.mul_add(4.0, 25.0)) * timeout_loss_gain)
-                / 1000.0)
-                .max(UDP_MIN_RESPONSE_TIMEOUT.as_secs_f64()),
-        );
         let ttl_timeout = Duration::from_millis(u64::from(ttl_ms));
-        let response_timeout = model_timeout.min(UDP_MAX_RESPONSE_TIMEOUT).min(ttl_timeout);
+        let pto = transport_pto_from_snapshot(Some(snapshot));
+        let loss_backoff = datagram_loss_backoff(snapshot, mtu_payload_bytes);
+        let min_pacing_rate_bps = datagram_min_pacing_rate_bps(mtu_payload_bytes, pto);
+        let pacing_rate_bps = (snapshot.delivery_rate_bps * loss_backoff).max(min_pacing_rate_bps);
+        let timeout_loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
+        let response_timeout = pto.mul_f64(timeout_loss_gain).min(ttl_timeout);
         Self {
             pacing_rate_bps,
             response_timeout,
@@ -50,6 +45,68 @@ impl UdpPathRuntimeModel {
         }
         Duration::from_secs_f64(payload_bytes as f64 * 8.0 / self.pacing_rate_bps)
     }
+}
+
+fn datagram_loss_backoff(snapshot: PathSnapshot, payload_bytes: usize) -> f64 {
+    let loss = snapshot.loss_rate.clamp(0.0, 1.0);
+    let min_progress = adaptive_transport_byte_floor_factor(
+        payload_bytes.max(1) as f64,
+        path_bdp_floor_bytes(snapshot),
+    );
+    (1.0 - loss).max(min_progress)
+}
+
+fn datagram_min_pacing_rate_bps(payload_bytes: usize, pto: Duration) -> f64 {
+    let payload_bits = payload_bytes.max(1) as f64 * 8.0;
+    payload_bits / pto.max(QUIC_TIMER_GRANULARITY).as_secs_f64()
+}
+
+fn path_bdp_floor_bytes(path: PathSnapshot) -> f64 {
+    let rate = path.delivery_rate_bps.max(path.pacing_rate_bps).max(1.0);
+    rate / 8.0 * path.srtt_ms.max(1.0) / 1000.0
+}
+
+fn adaptive_transport_byte_floor_factor(minimum_bytes: f64, model_bytes: f64) -> f64 {
+    minimum_bytes.max(1.0) / model_bytes.max(minimum_bytes).max(1.0)
+}
+
+pub(super) fn transport_pto_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
+    let srtt = Duration::from_secs_f64(srtt_ms.max(0.0) / 1000.0);
+    let rttvar = Duration::from_secs_f64(rttvar_ms.max(0.0) / 1000.0);
+    srtt + (rttvar * 4).max(QUIC_TIMER_GRANULARITY) + QUIC_MAX_ACK_DELAY
+}
+
+pub(super) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
+    path.map(|path| {
+        let srtt_ms = path.srtt_ms.max(1.0);
+        let rttvar_ms = path.jitter_ms.max(srtt_ms / 8.0);
+        transport_pto_from_ms(srtt_ms, rttvar_ms)
+    })
+    .unwrap_or_else(default_transport_pto)
+}
+
+pub(super) fn default_transport_pto() -> Duration {
+    transport_pto_from_ms(
+        QUIC_INITIAL_RTT.as_secs_f64() * 1000.0,
+        QUIC_INITIAL_RTT.as_secs_f64() * 1000.0 / 2.0,
+    )
+}
+
+pub(super) fn path_record_failure_cooldown(record: &ClientPathHealthRecord) -> Duration {
+    let srtt_ms = record
+        .carrier_srtt_ms
+        .or(record.measured_srtt_ms)
+        .unwrap_or(QUIC_INITIAL_RTT.as_secs_f64() * 1000.0);
+    let rttvar_ms = record
+        .carrier_rttvar_ms
+        .or(record.measured_jitter_ms)
+        .unwrap_or(srtt_ms / 2.0);
+    let pto = transport_pto_from_ms(srtt_ms, rttvar_ms);
+    let failure_exponent = record
+        .consecutive_failures
+        .saturating_sub(1)
+        .min(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+    pto.saturating_mul(2_u32.saturating_pow(failure_exponent))
 }
 
 pub(super) fn udp_mtu_payload_bytes(
@@ -313,7 +370,7 @@ pub(super) fn ordered_path_scores_for_ttl(
     ttl_ms: u32,
 ) -> Vec<(usize, f64)> {
     let scores = ordered_path_scores(paths, observations, lane, payload_bytes);
-    let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
+    let freshness_budget_ms = f64::from(ttl_ms);
     scores
         .iter()
         .copied()
@@ -479,21 +536,19 @@ pub(super) fn path_snapshot(
     let bdp_bytes = (delivery_rate_bps / 8.0 * srtt_ms.max(1.0) / 1000.0)
         .ceil()
         .max(PATH_OPEN_SCORE_BYTES as f64) as u64;
-    let pacing_rate_bps = delivery_rate_bps
-        * (1.0
-            - observation
-                .measured_loss_rate
-                .unwrap_or(0.0)
-                .clamp(0.0, 0.75)
-                * 0.5)
-            .clamp(0.25, 1.0);
+    let loss = observation
+        .measured_loss_rate
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let min_progress =
+        adaptive_transport_byte_floor_factor(PATH_OPEN_SCORE_BYTES as f64, bdp_bytes.max(1) as f64);
+    let pacing_rate_bps = delivery_rate_bps * (1.0 - loss).max(min_progress);
     let inflight_limit_bytes = if observation.carrier_inflight_limit_bytes > 0 {
         observation.carrier_inflight_limit_bytes
     } else {
-        bdp_bytes
-            .saturating_mul(2)
-            .max(PATH_OPEN_SCORE_BYTES as u64)
+        ((bdp_bytes as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64
     };
+    let inflight_limit_bytes = inflight_limit_bytes.max(PATH_OPEN_SCORE_BYTES as u64);
     PathSnapshot {
         id: PathId(index as u16),
         underlay: path.underlay,
@@ -586,28 +641,18 @@ pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
         observation
             .delivery_samples
             .saturating_add(observation.carrier_delivery_samples),
-    ) / 8.0)
+    ) / QUIC_INITIAL_WINDOW_PACKETS as f64)
         .clamp(0.0, 1.0);
     let rtt_confidence = if observation
         .carrier_srtt_ms
         .or(observation.measured_srtt_ms)
         .is_some()
     {
-        0.35
+        1.0 / QUIC_INITIAL_WINDOW_PACKETS as f64
     } else {
         0.0
     };
-    let freshness_confidence = observation
-        .last_delivery_at
-        .into_iter()
-        .chain(observation.carrier_last_delivery_at)
-        .max()
-        .map(|seen| {
-            let age = Instant::now().saturating_duration_since(seen).as_secs_f64();
-            (1.0 - age / 30.0).clamp(0.0, 1.0) * 0.25
-        })
-        .unwrap_or(0.0);
-    (delivery_confidence + rtt_confidence + freshness_confidence).clamp(0.1, 1.0)
+    (delivery_confidence + rtt_confidence).clamp(0.0, 1.0)
 }
 
 pub(super) fn udp_path_has_realtime_model(
@@ -764,26 +809,26 @@ pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
     snapshot: scheduler::PathSnapshot,
     payload_bytes: usize,
 ) -> f64 {
-    let loss = snapshot.loss_rate.clamp(0.0, 0.75);
+    let loss = snapshot.loss_rate.clamp(0.0, 1.0);
     if loss <= f64::EPSILON {
         return 0.0;
     }
     let fragment_count = (payload_bytes as f64 / UDP_DEFAULT_MTU_PAYLOAD_BYTES as f64)
         .ceil()
         .max(1.0);
-    let expected_repairs = fragment_count * loss / (1.0 - loss).max(0.01);
-    let repair_rtt_ms = snapshot.srtt_ms + snapshot.jitter_ms.max(0.0) * 4.0;
+    let bdp_bytes = path_bdp_floor_bytes(snapshot).max(UDP_DEFAULT_MTU_PAYLOAD_BYTES as f64);
+    let progress_floor = (UDP_DEFAULT_MTU_PAYLOAD_BYTES as f64 / bdp_bytes).min(1.0);
+    let expected_repairs = fragment_count * loss / (1.0 - loss).max(progress_floor);
+    let repair_rtt_ms = transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0;
     expected_repairs * repair_rtt_ms
 }
 
 pub(super) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
-    match underlay {
-        UnderlayProtocol::Tcp | UnderlayProtocol::Udp => 50.0,
-    }
+    let _ = underlay;
+    QUIC_INITIAL_RTT.as_secs_f64() * 1000.0
 }
 
 pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
-    match underlay {
-        UnderlayProtocol::Tcp | UnderlayProtocol::Udp => 100_000_000.0,
-    }
+    let _ = underlay;
+    PATH_OPEN_SCORE_BYTES as f64 * 8.0 / QUIC_INITIAL_RTT.as_secs_f64()
 }

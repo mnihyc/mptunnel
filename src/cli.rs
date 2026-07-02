@@ -2,9 +2,9 @@ use crate::config::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
     DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
-    DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
-    DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
-    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
+    DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
+    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
+    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
     DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
     LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig,
     ServerConfig, ServiceConfig, SharedSecret,
@@ -630,6 +630,13 @@ pub struct ServerArgs {
     pub outbound_dns_timeout_ms: u64,
 
     #[arg(
+        long,
+        env = "MPTUNNEL_OUTBOUND_CONNECT_TIMEOUT_MS",
+        default_value_t = DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS
+    )]
+    pub outbound_connect_timeout_ms: u64,
+
+    #[arg(
         long = "extra-traffic-hint-percent",
         env = "MPTUNNEL_EXTRA_TRAFFIC_HINT_PERCENT",
         default_value_t = DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT
@@ -672,6 +679,7 @@ impl ServerArgs {
                 strategy: self.outbound_dns_strategy.into(),
                 timeout: Duration::from_millis(self.outbound_dns_timeout_ms),
             },
+            outbound_connect_timeout: Duration::from_millis(self.outbound_connect_timeout_ms),
             performance: MppPerformanceConfig {
                 extra_traffic_hint_percent: self.extra_traffic_hint_percent,
             },

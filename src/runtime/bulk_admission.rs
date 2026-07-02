@@ -1,3 +1,4 @@
+use super::BBR_DEFAULT_CWND_GAIN;
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
 #[cfg(feature = "lab-diagnostics")]
@@ -131,9 +132,7 @@ pub(super) fn bulk_service_horizon_payload_bytes(
         .min(stream_window)
         .max(payload_bytes)
         .max(1);
-    let payload = payload_bytes.max(1) as f64;
-    let horizon = (payload * envelope as f64).sqrt().ceil() as usize;
-    horizon.clamp(payload_bytes.max(1), envelope)
+    envelope
 }
 
 pub(super) fn bulk_candidate_admission_suppression(
@@ -283,7 +282,7 @@ fn bulk_product_inflight_limit_bytes(
     let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
     let payload_floor = payload_bytes as u64;
     let bdp = bulk_path_bdp_bytes(candidate);
-    let bdp_limit = bdp.saturating_mul(2).max(payload_floor);
+    let bdp_limit = bulk_bbr_inflight_bytes(bdp).max(payload_floor);
     let modeled_limit = if candidate.inflight_limit_bytes > 0 {
         candidate
             .inflight_limit_bytes
@@ -314,7 +313,7 @@ fn bulk_carrier_inflight_limit_bytes(
     let carrier_limit = if candidate.inflight_limit_bytes > 0 {
         candidate.inflight_limit_bytes
     } else {
-        bulk_path_bdp_bytes(candidate).saturating_mul(2)
+        bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate))
     };
     carrier_limit
         .max(payload_floor)
@@ -495,15 +494,18 @@ fn bulk_reorder_budget_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> u64 {
-    let adaptive_budget = bulk_path_bdp_bytes(candidate)
-        .saturating_mul(2)
-        .max(payload_bytes as u64);
+    let adaptive_budget =
+        bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate)).max(payload_bytes as u64);
     adaptive_budget.min(mux_limits.max_reorder_bytes as u64)
 }
 
 fn bulk_path_bdp_bytes(candidate: PathSnapshot) -> u64 {
     let rate = bulk_effective_rate_bps(candidate);
     (rate / 8.0 * candidate.srtt_ms.max(1.0) / 1000.0).ceil() as u64
+}
+
+fn bulk_bbr_inflight_bytes(bdp_bytes: u64) -> u64 {
+    ((bdp_bytes as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64
 }
 
 #[cfg(test)]
@@ -600,9 +602,10 @@ mod tests {
 
         assert_eq!(
             limit,
-            bulk_service_horizon_payload_bytes(payload, mux_limits) as u64
+            bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate))
         );
-        assert!(limit < bulk_path_bdp_bytes(candidate));
+        assert!(limit <= bulk_service_horizon_payload_bytes(payload, mux_limits) as u64);
+        assert!(limit >= bulk_path_bdp_bytes(candidate));
     }
 
     #[test]
@@ -771,6 +774,8 @@ mod tests {
     #[test]
     fn best_active_path_can_continue_across_small_existing_hole() {
         let active = candidate(0, 100.0, 170.0, 180.0);
+        let payload = 16 * 1024;
+        let stream_ordering_debt_bytes = 64 * 1024;
 
         assert_eq!(
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -778,10 +783,10 @@ mod tests {
                 best_eta_ms: active.eta_ms,
                 candidate_snapshot: active.snapshot,
                 candidate_eta_ms: active.eta_ms,
-                payload_bytes: 16 * 1024,
+                payload_bytes: payload,
                 mux_limits: MuxLimits::default(),
                 role: BulkAdmissionRole::ActiveDataPath,
-                stream_ordering_debt_bytes: 64 * 1024,
+                stream_ordering_debt_bytes,
             },),
             None
         );
@@ -1076,6 +1081,7 @@ mod tests {
     fn active_path_with_ordering_debt_must_still_beat_lead_completion_horizon() {
         let best = candidate(0, 10.0, 10.0, 1000.0);
         let active_with_debt = candidate(1, 100.0, 10.0, 1000.0);
+        let payload = 32 * 1024;
 
         assert_eq!(
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -1083,10 +1089,10 @@ mod tests {
                 best_eta_ms: best.eta_ms,
                 candidate_snapshot: active_with_debt.snapshot,
                 candidate_eta_ms: active_with_debt.eta_ms,
-                payload_bytes: 64 * 1024,
+                payload_bytes: payload,
                 mux_limits: MuxLimits::default(),
                 role: BulkAdmissionRole::ActiveDataPath,
-                stream_ordering_debt_bytes: 128 * 1024,
+                stream_ordering_debt_bytes: 16 * 1024,
             }),
             Some("completion_horizon")
         );

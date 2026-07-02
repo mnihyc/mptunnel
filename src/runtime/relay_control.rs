@@ -637,7 +637,7 @@ where
                 }
                 if blocked_by_carrier {
                     sender_retry_at =
-                        Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                        Some(tokio::time::Instant::now() + sender_service_retry_delay(path_snapshot, relay_lane));
                 }
                 if let Some(err) = dispatch_error {
                     break Err(err);
@@ -1180,6 +1180,22 @@ where
                         if outcome.fin
                             || pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset)
                         {
+                            match sender.send_recv_progress(
+                                &mut remotes,
+                                context,
+                                &recv_stream,
+                                &mut recv_progress,
+                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                            )
+                            .await
+                            {
+                                Ok(sent) => {
+                                    if sent {
+                                        last_recv_progress_sent_at = Instant::now();
+                                    }
+                                }
+                                Err(err) => break Err(err),
+                            }
                             if let Err(err) = local.shutdown().await {
                                 break Err(RuntimeError::Io(err));
                             }
@@ -1359,6 +1375,22 @@ where
                         );
                         if fin_ready {
                             last_delivery_progress_at = Instant::now();
+                            match sender.send_recv_progress(
+                                &mut remotes,
+                                context,
+                                &recv_stream,
+                                &mut recv_progress,
+                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                            )
+                            .await
+                            {
+                                Ok(sent) => {
+                                    if sent {
+                                        last_recv_progress_sent_at = Instant::now();
+                                    }
+                                }
+                                Err(err) => break Err(err),
+                            }
                             if let Err(err) = local.shutdown().await {
                                 break Err(RuntimeError::Io(err));
                             }
@@ -2049,7 +2081,7 @@ pub(super) fn reliable_relay_bulk_validation_payload_bytes(
     send_stream: &ReliableSendStream,
     mux_limits: MuxLimits,
 ) -> usize {
-    let proof_ceiling = tcp_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits);
+    let proof_ceiling = relay_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits);
     let proof_payload = reliable_relay_bulk_striping_payload_bytes(send_stream, mux_limits)
         .min(proof_ceiling)
         .max(PATH_OPEN_SCORE_BYTES);
@@ -2126,11 +2158,8 @@ pub(super) fn reliable_relay_receive_hole_failure_attempts(_lane: FlowLane) -> u
 }
 
 pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Duration) -> u32 {
-    let timeout = stall_timeout.max(TCP_STREAM_STALL_MIN_TIMEOUT);
-    let stall_scale = (TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64() / timeout.as_secs_f64())
-        .max(1.0)
-        .sqrt();
-    (2.0 + stall_scale * 4.0).round().clamp(2.0, 16.0) as u32
+    let _ = stall_timeout;
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD
 }
 
 pub(super) fn reliable_relay_refresh_path_tracking(
@@ -2273,19 +2302,6 @@ pub(super) fn reliable_relay_stall_deadline(
 }
 
 pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
-    let (srtt_ms, jitter_ms) = path.map_or((250.0, 50.0), |path| {
-        (path.srtt_ms.max(1.0), path.jitter_ms.max(0.0))
-    });
-    let rtt_gain = match lane {
-        FlowLane::Control | FlowLane::RealtimeDatagram => 1.5,
-        FlowLane::Latency => 2.0,
-        FlowLane::Throughput => 1.5,
-        FlowLane::Background => 3.0,
-    };
-    Duration::from_secs_f64(
-        ((srtt_ms * rtt_gain + jitter_ms * 4.0 + 100.0) / 1000.0).clamp(
-            TCP_STREAM_STALL_MIN_TIMEOUT.as_secs_f64(),
-            TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64(),
-        ),
-    )
+    let _ = lane;
+    transport_pto_from_snapshot(path)
 }

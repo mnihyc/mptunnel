@@ -129,8 +129,6 @@ pub(super) struct UdpPathConnection {
     connection: quic_carrier::Connection,
 }
 
-const QUIC_STATS_STARTUP_PACING_GAIN: f64 = 2.0;
-
 #[derive(Debug, Default)]
 struct UdpPathMetricTracker {
     quic: QuicPathMetricTracker,
@@ -283,7 +281,7 @@ impl QuicPathMetricTracker {
                     .map_or(stats.path.rtt, |previous| previous.min(stats.path.rtt)),
             );
         }
-        let rtt = stats.path.rtt.max(Duration::from_millis(1));
+        let rtt = stats.path.rtt.max(QUIC_TIMER_GRANULARITY);
         let min_rtt = self.min_rtt.unwrap_or(rtt);
         let congestion_window = congestion.congestion_window.max(stats.path.cwnd);
         let carrier_capacity_known = congestion.pacing_rate_bps.is_some() || congestion_window > 0;
@@ -303,7 +301,8 @@ impl QuicPathMetricTracker {
         });
         let fallback_rate = usable_pacing_rate.unwrap_or_else(|| {
             if carrier_capacity_known {
-                let cwnd_rate = inflight_hi as f64 * 8.0 / rtt.as_secs_f64().max(0.001);
+                let cwnd_rate = inflight_hi as f64 * 8.0
+                    / rtt.as_secs_f64().max(QUIC_TIMER_GRANULARITY.as_secs_f64());
                 if self.delivery_sample_count == 0 {
                     cwnd_rate.max(startup_rate)
                 } else {
@@ -316,7 +315,7 @@ impl QuicPathMetricTracker {
         let evidence_inflight_hi = if inflight_hi > 0 {
             inflight_hi as u64
         } else {
-            (fallback_rate / 8.0 * rtt.as_secs_f64().max(0.001))
+            (fallback_rate / 8.0 * rtt.as_secs_f64().max(QUIC_TIMER_GRANULARITY.as_secs_f64()))
                 .ceil()
                 .max(1.0) as u64
         };
@@ -339,13 +338,17 @@ impl QuicPathMetricTracker {
                 let sample_rate = (self.app_tx_bytes_pending_sample as f64 * 8.0
                     / sample_elapsed.as_secs_f64())
                 .max(1.0);
-                let app_limited_low_sample =
-                    sample_bytes < evidence_inflight_hi && sample_rate < fallback_rate;
+                let delivery_evidence_floor = if self.delivery_sample_count == 0 {
+                    evidence_inflight_hi.max(PATH_OPEN_SCORE_BYTES as u64)
+                } else {
+                    evidence_inflight_hi
+                };
+                let app_limited_low_sample = sample_bytes < delivery_evidence_floor
+                    || (sample_bytes < evidence_inflight_hi && sample_rate < fallback_rate);
                 app_limited_low_sample_observed = app_limited_low_sample;
                 if !app_limited_low_sample {
                     let current_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
-                    let bounded_sample =
-                        sample_rate.min(current_rate * QUIC_STATS_STARTUP_PACING_GAIN);
+                    let bounded_sample = sample_rate.min(current_rate * BBR_DEFAULT_CWND_GAIN);
                     self.delivery_sample_count =
                         self.delivery_sample_count.saturating_add(ack_delta);
                     self.last_delivery_sample_at = Some(now);
@@ -424,7 +427,7 @@ fn spawn_client_udp_path_metrics(
                 return;
             }
             let Some(metrics) = connection.tx_metrics(&mut tracker, 1).await else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(default_transport_pto()).await;
                 continue;
             };
             if let Some(record) = runtime
@@ -442,9 +445,14 @@ fn spawn_client_udp_path_metrics(
 }
 
 fn udp_carrier_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
-    (metrics.srtt / 2)
-        .max(Duration::from_millis(10))
-        .min(Duration::from_millis(250))
+    if metrics.app_limited {
+        transport_pto_from_ms(
+            metrics.srtt.as_secs_f64() * 1000.0,
+            metrics.rttvar.as_secs_f64() * 1000.0,
+        )
+    } else {
+        (metrics.srtt / 2).max(QUIC_TIMER_GRANULARITY)
+    }
 }
 
 pub(super) struct ClientUdpDatagramStream {
@@ -926,7 +934,7 @@ fn spawn_server_udp_carrier_metrics(
                 return;
             }
             let Some(metrics) = connection.tx_metrics(&mut tracker, 2).await else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(default_transport_pto()).await;
                 continue;
             };
             if metrics.delivery_sample_count > 0 {
@@ -973,7 +981,10 @@ fn path_metrics_from_udp_carrier(path_id: PathId, metrics: UdpPathMetrics) -> Pa
             .saturating_sub(metrics.bytes_in_flight) as u64,
         inflight_limit_bytes: metrics.inflight_hi as u64,
         inflight_hi_bytes: metrics.inflight_hi as u64,
-        confidence_ppm: ratio_to_ppm((metrics.delivery_sample_count as f64 / 8.0).clamp(0.0, 1.0)),
+        confidence_ppm: ratio_to_ppm(
+            (metrics.delivery_sample_count as f64 / QUIC_INITIAL_WINDOW_PACKETS as f64)
+                .clamp(0.0, 1.0),
+        ),
         app_limited: metrics.app_limited,
         has_ack_derived_data_sample: metrics.delivery_sample_count > 0,
         data_sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
@@ -1849,7 +1860,7 @@ async fn open_server_udp_datagram_flow(
         &context.outbound,
         &context.outbound_dns,
         &target,
-        Duration::from_secs(10),
+        context.outbound_connect_timeout,
     )
     .await
     {
@@ -2101,10 +2112,7 @@ mod tests {
         let measured = tracker.quic.observe(stats, congestion, 2);
 
         assert_eq!(measured.delivery_sample_count, 64);
-        assert!(
-            measured.delivery_rate_bps
-                <= startup.delivery_rate_bps * QUIC_STATS_STARTUP_PACING_GAIN
-        );
+        assert!(measured.delivery_rate_bps <= startup.delivery_rate_bps * BBR_DEFAULT_CWND_GAIN);
     }
 
     #[test]

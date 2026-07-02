@@ -40,7 +40,12 @@ async fn client_udp_datagram_round_trip_with_limits(
     )
     .await?;
     let response = session
-        .send_to(target, payload, ttl_ms, UDP_MAX_RESPONSE_TIMEOUT)
+        .send_to(
+            target,
+            payload,
+            ttl_ms,
+            default_transport_pto().min(Duration::from_millis(u64::from(ttl_ms))),
+        )
         .await
         .map_err(|err| match err {
             UdpPathSendError::Runtime(err) => err,
@@ -290,6 +295,7 @@ impl TcpDatagramClientSession {
             security,
             context.codec_limits,
             context.mux_limits,
+            context.path_connect_timeout,
         )
         .await?;
         Ok(Self {
@@ -342,153 +348,133 @@ impl TcpDatagramClientSession {
             _ => return Err(RuntimeError::Protocol("unexpected queued datagram frame")),
         };
         let request_key = (flow_id, request_datagram_id);
-        let request_started_at = Instant::now();
-        let mut request_acked = false;
-        let mut retransmit_count = 0_u32;
+        let sent_at = Instant::now();
+        let response_budget = datagram_retry_budget(response_timeout, ttl_ms)
+            .max(response_timeout)
+            .min(datagram_useful_ttl_budget(ttl_ms));
+        let response_deadline = sent_at + response_budget;
+        self.sent_datagrams.insert(
+            request_key,
+            UdpSentDatagram {
+                sent_at,
+                bytes: request_len,
+                ttl: Duration::from_millis(u64::from(ttl_ms)),
+            },
+        );
+        self.connection.writer.write_frame(&frame).await?;
+        self.connection.writer.flush().await?;
         loop {
-            self.sent_datagrams.insert(
-                request_key,
-                UdpSentDatagram {
-                    sent_at: Instant::now(),
-                    bytes: request_len,
-                    ttl: Duration::from_millis(u64::from(ttl_ms)),
-                },
-            );
-            self.connection.writer.write_frame(&frame).await?;
-            self.connection.writer.flush().await?;
-            loop {
-                let attempt_timeout = datagram_attempt_timeout(response_timeout, retransmit_count);
-                let received = match tokio::time::timeout(
-                    attempt_timeout,
-                    self.connection.frames.recv(),
-                )
-                .await
-                {
-                    Ok(Some(Ok(frame))) => frame,
-                    Ok(Some(Err(err))) => return Err(RuntimeError::Encrypted(err)),
-                    Ok(None) => return Err(RuntimeError::TcpPathSessionClosed),
-                    Err(_)
-                        if request_acked
-                            && datagram_retry_deadline_allows(
-                                request_started_at,
-                                response_timeout,
-                                ttl_ms,
-                                retransmit_count.saturating_add(1),
-                            ) =>
-                    {
-                        retransmit_count = retransmit_count.saturating_add(1);
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "tcp_datagram_retransmit_after_timeout",
-                            format_args!(
-                                "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} attempt_timeout_ms={} request_acked={} retransmit_count={}",
-                                self.path_id.0,
-                                self.path_index,
-                                flow_id.0,
-                                request_datagram_id.0,
-                                response_timeout.as_millis(),
-                                attempt_timeout.as_millis(),
-                                request_acked,
-                                retransmit_count
-                            ),
-                        );
-                        break;
-                    }
-                    Err(_) => {
-                        self.sent_datagrams.remove(&request_key);
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "tcp_datagram_response_timeout",
-                            format_args!(
-                                "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} attempt_timeout_ms={} request_acked={} retransmit_count={}",
-                                self.path_id.0,
-                                self.path_index,
-                                flow_id.0,
-                                request_datagram_id.0,
-                                response_timeout.as_millis(),
-                                attempt_timeout.as_millis(),
-                                request_acked,
-                                retransmit_count
-                            ),
-                        );
-                        return Err(RuntimeError::Protocol("TCP datagram response timed out"));
-                    }
-                };
-                refresh_client_tcp_path_liveness(&mut self.connection, self.mux_limits);
-                match received {
-                    Frame::DatagramFeedback { flow_id, received } => {
-                        if flow_id == request_key.0
-                            && datagram_id_is_in_ranges(request_datagram_id, &received)
-                        {
-                            request_acked = true;
-                        }
-                        self.handle_datagram_feedback(flow_id, &received)?;
-                    }
-                    Frame::DatagramData {
-                        flow_id: response_flow_id,
-                        datagram_id,
-                        payload,
-                        ..
-                    } if response_flow_id == flow_id && datagram_id == request_datagram_id => {
-                        let now = Instant::now();
-                        let lost = self.expire_unacked_datagrams(now);
-                        if let Some(sent) = self.sent_datagrams.remove(&request_key) {
-                            self.observe_datagram_response(sent, now, lost);
-                        }
-                        self.connection
-                            .writer
-                            .write_frame(&Frame::DatagramFeedback {
-                                flow_id,
-                                received: vec![datagram_ack_range(datagram_id)?],
-                            })
-                            .await?;
-                        self.connection.writer.flush().await?;
-                        self.stats.record_payload_bytes(request_len);
-                        self.stats.record_payload_bytes(payload.len());
-                        return Ok(payload);
-                    }
-                    Frame::DatagramData {
-                        flow_id: response_flow_id,
-                        datagram_id,
-                        ..
-                    } if response_flow_id == flow_id => {
-                        self.connection
-                            .writer
-                            .write_frame(&Frame::DatagramFeedback {
-                                flow_id,
-                                received: vec![datagram_ack_range(datagram_id)?],
-                            })
-                            .await?;
-                        self.connection.writer.flush().await?;
-                    }
-                    Frame::DatagramClose {
-                        flow_id: closed_flow_id,
-                    } if closed_flow_id == flow_id => {
-                        return Err(RuntimeError::Protocol("TCP datagram flow closed"));
-                    }
-                    Frame::Ping { nonce } => {
-                        self.connection
-                            .writer
-                            .write_frame(&Frame::Pong { nonce })
-                            .await?;
-                        self.connection.writer.flush().await?;
-                    }
-                    Frame::Pong { nonce } => {
-                        if self
-                            .connection
-                            .pending_heartbeat
-                            .is_some_and(|(pending_nonce, _)| pending_nonce == nonce)
-                        {
-                            self.connection.pending_heartbeat = None;
-                        }
-                    }
-                    Frame::PathStatus { .. } | Frame::SessionReady => {}
-                    Frame::PathClose { .. } => return Err(RuntimeError::TcpPathSessionClosed),
-                    Frame::SessionClose { reason } => {
-                        return Err(RuntimeError::RemoteClosed(reason));
-                    }
-                    _ => return Err(RuntimeError::Protocol("unexpected TCP datagram frame")),
+            let now = Instant::now();
+            if now >= response_deadline {
+                self.sent_datagrams.remove(&request_key);
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "tcp_datagram_response_timeout",
+                    format_args!(
+                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={}",
+                        self.path_id.0,
+                        self.path_index,
+                        flow_id.0,
+                        request_datagram_id.0,
+                        response_timeout.as_millis(),
+                        response_budget.as_millis(),
+                    ),
+                );
+                return Err(RuntimeError::DatagramResponseTimedOut);
+            }
+            let wait_for = response_deadline.saturating_duration_since(now);
+            let received = match tokio::time::timeout(wait_for, self.connection.frames.recv()).await
+            {
+                Ok(Some(Ok(frame))) => frame,
+                Ok(Some(Err(err))) => return Err(RuntimeError::Encrypted(err)),
+                Ok(None) => return Err(RuntimeError::TcpPathSessionClosed),
+                Err(_) => {
+                    self.sent_datagrams.remove(&request_key);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "tcp_datagram_response_timeout",
+                        format_args!(
+                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={}",
+                            self.path_id.0,
+                            self.path_index,
+                            flow_id.0,
+                            request_datagram_id.0,
+                            response_timeout.as_millis(),
+                            response_budget.as_millis(),
+                        ),
+                    );
+                    return Err(RuntimeError::DatagramResponseTimedOut);
                 }
+            };
+            refresh_client_tcp_path_liveness(&mut self.connection, self.mux_limits);
+            match received {
+                Frame::DatagramFeedback { flow_id, received } => {
+                    self.handle_datagram_feedback(flow_id, &received)?;
+                }
+                Frame::DatagramData {
+                    flow_id: response_flow_id,
+                    datagram_id,
+                    payload,
+                    ..
+                } if response_flow_id == flow_id && datagram_id == request_datagram_id => {
+                    let now = Instant::now();
+                    let lost = self.expire_unacked_datagrams(now);
+                    if let Some(sent) = self.sent_datagrams.remove(&request_key) {
+                        self.observe_datagram_response(sent, now, lost);
+                    }
+                    self.connection
+                        .writer
+                        .write_frame(&Frame::DatagramFeedback {
+                            flow_id,
+                            received: vec![datagram_ack_range(datagram_id)?],
+                        })
+                        .await?;
+                    self.connection.writer.flush().await?;
+                    self.stats.record_payload_bytes(request_len);
+                    self.stats.record_payload_bytes(payload.len());
+                    return Ok(payload);
+                }
+                Frame::DatagramData {
+                    flow_id: response_flow_id,
+                    datagram_id,
+                    ..
+                } if response_flow_id == flow_id => {
+                    self.connection
+                        .writer
+                        .write_frame(&Frame::DatagramFeedback {
+                            flow_id,
+                            received: vec![datagram_ack_range(datagram_id)?],
+                        })
+                        .await?;
+                    self.connection.writer.flush().await?;
+                }
+                Frame::DatagramClose {
+                    flow_id: closed_flow_id,
+                } if closed_flow_id == flow_id => {
+                    return Err(RuntimeError::Protocol("TCP datagram flow closed"));
+                }
+                Frame::Ping { nonce } => {
+                    self.connection
+                        .writer
+                        .write_frame(&Frame::Pong { nonce })
+                        .await?;
+                    self.connection.writer.flush().await?;
+                }
+                Frame::Pong { nonce } => {
+                    if self
+                        .connection
+                        .pending_heartbeat
+                        .is_some_and(|(pending_nonce, _)| pending_nonce == nonce)
+                    {
+                        self.connection.pending_heartbeat = None;
+                    }
+                }
+                Frame::PathStatus { .. } | Frame::SessionReady => {}
+                Frame::PathClose { .. } => return Err(RuntimeError::TcpPathSessionClosed),
+                Frame::SessionClose { reason } => {
+                    return Err(RuntimeError::RemoteClosed(reason));
+                }
+                _ => return Err(RuntimeError::Protocol("unexpected TCP datagram frame")),
             }
         }
     }
@@ -585,9 +571,7 @@ impl TcpDatagramClientSession {
     }
 
     fn observe_datagram_response(&mut self, sent: UdpSentDatagram, now: Instant, _lost: u64) {
-        let rtt = now
-            .duration_since(sent.sent_at)
-            .max(MIN_RATE_SAMPLE_DURATION);
+        let rtt = now.duration_since(sent.sent_at).max(QUIC_TIMER_GRANULARITY);
         let previous_srtt = self.last_datagram_rtt;
         let sample_var = previous_srtt
             .map(|previous| previous.abs_diff(rtt))
@@ -613,30 +597,16 @@ pub(super) fn tcp_datagram_response_timeout(
     if ttl.is_zero() {
         return ttl;
     }
-    let ttl_budget = ttl
-        .mul_f64(UDP_DATAGRAM_MIN_TTL_FIT_RATIO)
-        .max(UDP_MIN_RESPONSE_TIMEOUT.min(ttl));
-    let initial_response_rtt = Duration::from_secs_f64(
-        ((snapshot.srtt_ms * 2.0 + snapshot.jitter_ms.mul_add(4.0, 25.0)) / 1000.0)
-            .max(UDP_MIN_RESPONSE_TIMEOUT.as_secs_f64()),
-    );
-    let srtt = response_srtt.unwrap_or(initial_response_rtt);
-    let rttvar = response_rttvar.unwrap_or_else(|| initial_response_rtt.div_f64(2.0));
+    let ttl_budget = ttl;
+    let initial_response_pto = transport_pto_from_snapshot(Some(snapshot));
+    let srtt = response_srtt.unwrap_or(initial_response_pto);
+    let rttvar = response_rttvar.unwrap_or_else(|| {
+        Duration::from_secs_f64((snapshot.jitter_ms.max(snapshot.srtt_ms.max(1.0) / 8.0)) / 1000.0)
+    });
     let loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
-    let hol_slack = Duration::from_secs_f64(
-        ((snapshot.srtt_ms + snapshot.jitter_ms * 4.0) / 1000.0)
-            .max(TCP_STREAM_STALL_MIN_TIMEOUT.as_secs_f64())
-            .min(TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64()),
-    );
-    let fluent_cap = Duration::from_secs_f64(
-        ((snapshot.srtt_ms * 4.0 + snapshot.jitter_ms * 4.0) / 1000.0)
-            .max(TCP_STREAM_STALL_MAX_TIMEOUT.as_secs_f64())
-            .min(TCP_STREAM_STALL_MAX_TIMEOUT.mul_f64(3.0).as_secs_f64()),
-    );
-    (srtt + rttvar.mul_f64(4.0) + hol_slack)
+    (srtt + rttvar.mul_f64(4.0) + QUIC_MAX_ACK_DELAY)
         .mul_f64(loss_gain)
-        .max(UDP_MIN_RESPONSE_TIMEOUT.min(ttl))
-        .min(fluent_cap)
+        .max(QUIC_TIMER_GRANULARITY.min(ttl))
         .min(ttl_budget)
 }
 
@@ -645,13 +615,9 @@ pub(super) fn datagram_retry_budget(response_timeout: Duration, ttl_ms: u32) -> 
     if ttl_budget.is_zero() {
         return ttl_budget;
     }
-    let response_timeout = response_timeout
-        .max(UDP_MIN_RESPONSE_TIMEOUT.min(ttl_budget))
-        .min(ttl_budget);
-    let geometric_budget =
-        Duration::from_secs_f64((ttl_budget.as_secs_f64() * response_timeout.as_secs_f64()).sqrt());
-    geometric_budget
-        .max(UDP_MIN_RETRY_BUDGET.min(ttl_budget))
+    let response_timeout = response_timeout.max(QUIC_TIMER_GRANULARITY).min(ttl_budget);
+    response_timeout
+        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
         .min(ttl_budget)
 }
 
@@ -660,15 +626,26 @@ fn datagram_useful_ttl_budget(ttl_ms: u32) -> Duration {
     if ttl.is_zero() {
         return ttl;
     }
-    Duration::from_secs_f64(ttl.as_secs_f64() * UDP_DATAGRAM_MIN_TTL_FIT_RATIO)
-        .max(UDP_MIN_RESPONSE_TIMEOUT.min(ttl))
-        .min(ttl)
+    ttl
 }
 
-fn datagram_attempt_timeout(response_timeout: Duration, retransmit_count: u32) -> Duration {
-    response_timeout
-        .max(UDP_MIN_RESPONSE_TIMEOUT)
-        .saturating_mul(2_u32.saturating_pow(retransmit_count.min(10)))
+fn datagram_attempt_timeout(
+    response_timeout: Duration,
+    retransmit_count: u32,
+    budget: Duration,
+) -> Duration {
+    if budget.is_zero() {
+        return budget;
+    }
+    let mut timeout = response_timeout.max(QUIC_TIMER_GRANULARITY).min(budget);
+    for _ in 0..retransmit_count {
+        let doubled = timeout.saturating_mul(2);
+        if doubled >= budget {
+            return budget;
+        }
+        timeout = doubled;
+    }
+    timeout
 }
 
 fn datagram_retry_deadline_allows(
@@ -683,7 +660,7 @@ fn datagram_retry_deadline_allows(
         return false;
     }
     let remaining = budget.saturating_sub(elapsed);
-    remaining >= datagram_attempt_timeout(response_timeout, next_retransmit_count).min(budget)
+    remaining >= datagram_attempt_timeout(response_timeout, next_retransmit_count, budget)
 }
 
 fn tcp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
@@ -928,7 +905,7 @@ impl UdpDatagramClientAssociation {
                     if udp_datagram_error_is_path_retryable(&err) =>
                 {
                     self.remove_path(path_index).await;
-                    self.suppress_path_after_timeout(path_index, UDP_MIN_RESPONSE_TIMEOUT, ttl_ms);
+                    self.suppress_path_after_timeout(path_index, default_transport_pto(), ttl_ms);
                     self.context.mark_udp_path_failure(path_index);
                     last_retryable_error = Some(err);
                 }
@@ -970,7 +947,7 @@ impl UdpDatagramClientAssociation {
                     .map(|model| model.response_timeout)
             })
             .min()
-            .unwrap_or(UDP_MAX_RESPONSE_TIMEOUT);
+            .unwrap_or_else(default_transport_pto);
         datagram_retry_budget(response_timeout, ttl_ms).min(ttl)
     }
 
@@ -1020,7 +997,7 @@ impl UdpDatagramClientAssociation {
         ttl_ms: u32,
     ) -> Option<usize> {
         let now = Instant::now();
-        let freshness_budget_ms = f64::from(ttl_ms) * UDP_DATAGRAM_MIN_TTL_FIT_RATIO;
+        let freshness_budget_ms = f64::from(ttl_ms);
         let mut viable = candidates
             .iter()
             .enumerate()
@@ -1106,9 +1083,10 @@ impl UdpDatagramClientAssociation {
         ttl_ms: u32,
     ) {
         let ttl = Duration::from_millis(u64::from(ttl_ms));
-        let adaptive = Duration::from_secs_f64(response_timeout.as_secs_f64() * 4.0)
-            .max(UDP_MIN_PATH_SUPPRESSION);
-        let duration = adaptive.min(PATH_FAILURE_COOLDOWN).min(ttl);
+        let duration = response_timeout
+            .max(QUIC_TIMER_GRANULARITY)
+            .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+            .min(ttl);
         self.suppressed_paths
             .insert(path_index, Instant::now() + duration);
     }
@@ -1321,12 +1299,10 @@ pub(super) fn udp_datagram_path_open_timeout(
     let response_timeout = if association_has_open_path {
         model.response_timeout
     } else {
-        Duration::from_secs_f64(
-            model.response_timeout.as_secs_f64() * UDP_FIRST_OPEN_RTT_MULTIPLIER,
-        )
+        model.response_timeout
     };
     response_timeout
-        .max(UDP_MIN_RESPONSE_TIMEOUT)
+        .max(QUIC_TIMER_GRANULARITY)
         .min(UDP_PATH_HANDSHAKE_TIMEOUT)
         .min(ttl_timeout)
 }
@@ -1493,6 +1469,7 @@ impl UdpDatagramClientSession {
         let mut request_acked = false;
         let mut retransmit_count = 0_u32;
         let mut observed_response_timeout = false;
+        let retry_budget = datagram_retry_budget(response_timeout, ttl_ms);
 
         loop {
             self.sent_datagrams.insert(
@@ -1511,7 +1488,8 @@ impl UdpDatagramClientSession {
             .await
             .map_err(UdpPathSendError::Runtime)?;
             loop {
-                let attempt_timeout = datagram_attempt_timeout(response_timeout, retransmit_count);
+                let attempt_timeout =
+                    datagram_attempt_timeout(response_timeout, retransmit_count, retry_budget);
                 let received = match tokio::time::timeout(
                     attempt_timeout,
                     self.stream.frames.recv(),
@@ -1819,9 +1797,7 @@ impl UdpDatagramClientSession {
     }
 
     fn observe_datagram_ack(&mut self, sent: UdpSentDatagram, now: Instant, lost: u64) {
-        let rtt = now
-            .duration_since(sent.sent_at)
-            .max(MIN_RATE_SAMPLE_DURATION);
+        let rtt = now.duration_since(sent.sent_at).max(QUIC_TIMER_GRANULARITY);
         let jitter = self
             .last_datagram_rtt
             .map(|previous| previous.abs_diff(rtt))

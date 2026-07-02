@@ -99,6 +99,10 @@ impl ReliablePathStream {
         self.output.has_multipath_repair_alternative()
     }
 
+    pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        self.output.has_repair_output_for_frame(frame)
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -249,6 +253,13 @@ impl ReliablePathStreamOutput {
             Self::Switchable(binding) => binding.has_multipath_repair_alternative(),
         }
     }
+
+    pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(_) => true,
+            Self::Switchable(binding) => binding.has_repair_output_for_frame(frame),
+        }
+    }
 }
 
 pub(super) fn reliable_work_lane_to_carrier_lane(
@@ -389,6 +400,24 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         let key = CarrierPathKey { underlay, path_id };
+        if role == StreamOpenRole::Validation {
+            let attached_keys = outputs
+                .entries
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>();
+            drop(outputs);
+            if previous_lane != lane {
+                self.lane_tracker.change_lanes(
+                    self.session_id,
+                    &attached_keys,
+                    previous_lane,
+                    lane,
+                );
+            }
+            self.notify_update();
+            return;
+        }
         let mut was_active = false;
         let mut already_attached = false;
         let entry =
@@ -526,6 +555,18 @@ impl ResponseStreamBinding {
             .entries
             .len()
             > 1
+    }
+
+    pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        let avoid_keys = self.flight_keys_overlapping_frame(frame);
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
     pub(super) fn detach(&self, key: CarrierPathKey, commands: &TcpPathSessionCommandSender) {

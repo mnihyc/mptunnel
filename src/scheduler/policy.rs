@@ -239,20 +239,27 @@ impl HeterogeneousScheduler {
             if flow_count == 0 {
                 continue;
             }
+            let lane_quantum = self.lanes[lane_index]
+                .flows
+                .iter()
+                .filter_map(|flow| flow.packets.front())
+                .map(|packet| deficit_charge_bytes(packet.lane, packet.payload_bytes))
+                .max()
+                .unwrap_or(1);
             self.lanes[lane_index].deficit_bytes = self.lanes[lane_index]
                 .deficit_bytes
-                .saturating_add(lane_quantum_bytes(lane));
+                .saturating_add(lane_quantum);
 
             for _ in 0..flow_count {
                 let mut flow = self.lanes[lane_index]
                     .flows
                     .pop_front()
                     .expect("flow exists");
-                flow.deficit_bytes = flow.deficit_bytes.saturating_add(flow_quantum_bytes(lane));
                 let Some(packet) = flow.packets.front().copied() else {
                     continue;
                 };
                 let charge_bytes = deficit_charge_bytes(packet.lane, packet.payload_bytes);
+                flow.deficit_bytes = flow.deficit_bytes.saturating_add(charge_bytes);
                 if charge_bytes > self.lanes[lane_index].deficit_bytes
                     || charge_bytes > flow.deficit_bytes
                 {
@@ -488,31 +495,12 @@ fn priority_order() -> [FlowLane; 5] {
     ]
 }
 
-fn lane_quantum_bytes(lane: FlowLane) -> u64 {
-    match lane {
-        FlowLane::Control => 128 * 1024,
-        FlowLane::RealtimeDatagram => 96 * 1024,
-        FlowLane::Latency => 96 * 1024,
-        FlowLane::Throughput => 64 * 1024,
-        FlowLane::Background => 64 * 1024,
-    }
-}
-
-fn flow_quantum_bytes(lane: FlowLane) -> u64 {
-    match lane {
-        FlowLane::Control => 64 * 1024,
-        FlowLane::RealtimeDatagram => 64 * 1024,
-        FlowLane::Latency => 64 * 1024,
-        FlowLane::Throughput => 64 * 1024,
-        FlowLane::Background => 32 * 1024,
-    }
-}
-
 fn deficit_charge_bytes(lane: FlowLane, payload_bytes: usize) -> u64 {
-    // DRR fairness assumes bounded transport frames; callers may model a larger logical chunk.
-    // Path scoring and queue pressure still use the actual payload bytes.
-    let payload_bytes = payload_bytes as u64;
-    payload_bytes.min(flow_quantum_bytes(lane)).max(1)
+    // Fairness charges the actual sender-service quantum. The sender service is
+    // responsible for keeping product frames preemptible; this scheduler does
+    // not hide another fixed byte quantum underneath it.
+    let _ = lane;
+    (payload_bytes as u64).max(1)
 }
 
 fn scheduling_mode(packet: EnqueueRequest, policy: SchedulerPolicy) -> SchedulingMode {

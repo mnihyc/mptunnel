@@ -68,8 +68,9 @@
 # from max_repair_bytes. Recommended: 64 MiB to 256 MiB on high-BDP paths.
 # It is a ceiling; actual sender flight is still BDP/queue/loss/carrier adaptive.
 # max_path_flight_bytes = 67108864
-# Read-buffer ceiling only. It must not become a scheduler quantum. Recommended:
-# 256 KiB to 1 MiB. Scheduler quanta stay smaller and preemptible.
+# Read-buffer ceiling only. It must not become a fixed scheduler quantum.
+# Recommended: 256 KiB to 1 MiB. Sender-service quanta are selected
+# adaptively from BDP, lane, queue/loss state, and this envelope.
 # max_reliable_relay_chunk_bytes = 524288
 # Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair
 # evidence, so these can stay quiet. Recommended: keep defaults unless idle path

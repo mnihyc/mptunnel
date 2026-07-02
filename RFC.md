@@ -515,10 +515,11 @@ hard-coding lab pass/fail behavior:
   delivery rate create a self-reinforcing tiny-frame loop for sustained bulk
   streams. For throughput lanes, the send quantum is chosen from path BDP,
   configured relay capacity, and observed stability/queue pressure: healthy
-  ordinary paths use CPU-amortizing quanta up to the 64 KiB bulk quantum ceiling,
-  while lossy, jittery, or queued paths shrink toward smaller preemptible
-  quanta. Inflight limits and carrier pacing control network pressure; the
-  frame quantum controls scheduling preemption and per-byte processing cost.
+  ordinary paths use CPU-amortizing quanta up to the configured read/payload
+  envelope, while lossy, jittery, or queued paths shrink toward smaller
+  preemptible quanta. Inflight limits and carrier pacing control network
+  pressure; the frame quantum controls scheduling preemption and per-byte
+  processing cost.
   Receiver-side stream input queues and path command queues follow the same
   rule. Their depth is sized from the relevant byte window divided by the
   actual maximum product-frame payload used by the attachment, not from the TCP
@@ -556,59 +557,59 @@ uses those mechanism classes, but most exact thresholds and weights below are
 mptunnel policy choices and MUST be treated as suspect until lab diagnostics
 and production evidence justify them.
 
-| Parameter or family | Current value or formula | Common design? | Exact value origin | Can limit performance? | Adaptation status |
-| --- | --- | --- | --- | --- | --- |
-| Product frame limit | `max_frame_bytes = 1,048,576` | Common bounded-frame design; QUIC also bounds transport frames | mptunnel | Yes, if too small for CPU-efficient bulk records; too large increases allocation risk | Static resource envelope |
-| Product payload limit | `max_payload_bytes = 1,048,512` | Common frame payload envelope | mptunnel | Yes, if it forces excessive records; currently above scheduler quantum so not the hot cap | Static envelope |
-| Product ACK ranges | `max_ack_ranges = 256` | Common sparse ACK/SACK/QUIC ACK-range design | mptunnel | Yes, under severe reorder/loss if ACK compression hides holes; too high can make ACKs bulky | Static cap; ACK emission is adaptive |
-| Path count | `max_paths = 64` | Common multipath path/subflow bound | mptunnel | Usually no; can cap unusually large path groups | Static registry cap |
-| Stream count | `max_streams = 65,536` | Common QUIC stream/connection scaling bound | mptunnel | Usually no; can cap very large fan-out | Static registry cap |
-| Stream window | `max_stream_window_bytes = 64 MiB` | Common QUIC/MPTCP receive-window/flow-control envelope | mptunnel | Yes on high-BDP paths if below bandwidth-delay product | Static envelope; actual credit release is adaptive |
-| Repair cache | `max_repair_bytes = 64 MiB` | Common MPTCP reinjection/stream repair capacity | mptunnel | Yes if heterogeneous or lossy paths need more unacked byte history | Static envelope; repair scheduling is adaptive |
-| Reorder budget | `max_reorder_bytes = 64 MiB` | Common receive-reorder budget in multipath byte streams | mptunnel | Yes if lower than real cross-path ordering debt; too high may mask harmful striping | Static envelope; admission uses dynamic debt |
-| Datagram queue | `max_datagram_queue_bytes = 16 MiB` | Common datagram/backlog protection | mptunnel | Yes for bursty UDP/TUN; too high can hurt latency | Static envelope; queue occupancy is dynamic |
-| Path/product flight ceiling | `max_path_flight_bytes = 64 MiB` by default; config-file omission derives it from `max_repair_bytes` | Common sender inflight/window concept | mptunnel envelope over TCP and QUIC | Yes if below real BDP or writer needs | Static envelope with coherent derived defaults; actual product/carrier flight is adaptive |
-| Reliable relay read ceiling | `max_reliable_relay_chunk_bytes = 512 KiB` | Common large read buffer, not common as a scheduling quantum | mptunnel | Yes if it becomes an indivisible write; conforming sender MUST split into service quanta | Static ceiling; scheduler quantum is adaptive |
-| TCP idle heartbeat | 10s interval, 30s timeout | Common idle keepalive/liveness timer | mptunnel | Not for active traffic; active failover MUST use data-plane stall/PTO evidence | Static idle timer; active failure is adaptive |
-| Path probe timer | 10s interval, 2s timeout | Common path-manager validation | mptunnel | Can delay discovery of idle paths; MUST NOT gate active-path failover | Static probe schedule; path model updates dynamically |
-| Extra traffic hint | `extra_traffic_hint_percent = 1` by default; values such as 100 or 200 are allowed hints | Common reinjection/duplication idea in MPTCP/MPQUIC; numeric hint is mptunnel-specific | mptunnel | Yes if interpreted as a hard cap; conforming implementations MUST treat it as a hint | Adaptive; sender may spend extra traffic only with evidence |
-| Security freshness | `auth_freshness_window_seconds = 300` | Common replay/freshness window | mptunnel | No data-plane cap; can affect clock-skew tolerance | Static security policy |
-| Cipher default | AES-256-GCM default, ChaCha20-Poly1305 optional | Common AEAD transport security | common cryptographic practice; product default selected by mptunnel | CPU can matter on CPUs without AES acceleration | Static operator choice |
-| QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight and relay chunk | Common QUIC flow-control/congestion split | mptunnel mapping over QUIC | Yes if product envelope or QUIC send window is too small for high BDP | Static envelope; QUIC BBR/pacing is dynamic |
-| QUIC BBR controller | Quinn BBR when available | Common BBR/Hysteria-like UDP transport design | library/common mechanism selected by mptunnel | Usually improves performance; library implementation can still cap or behave differently by platform | Dynamic carrier controller |
-| QUIC minimum datagram model | 1200 byte default payload, 512 minimum, 65,000 maximum/probe ceiling | QUIC requires paths support at least 1200-byte UDP datagrams; PMTU probing is common | lower/upper implementation bounds by mptunnel | Yes if MTU remains low and product frames fragment too much | Startup default plus path MTU observation/probing |
-| TUN defaults | IPv4 `10.88.0.1/24`, MTU 1500, DNS TTL 5s | Common local-interface defaults | mptunnel | MTU and TTL can affect TUN throughput/DNS behavior | Static operator defaults |
-| Outbound DNS timeout | 5s default | Common resolver timeout | mptunnel | Yes for slow/bad resolvers; not hot path after resolution | Static per outbound |
-| SOCKS5 UDP/TUN idle TTLs | SOCKS5 UDP TTL 30s, TUN UDP flow idle 60s | Common NAT/flow expiry | mptunnel | Can drop idle UDP associations too early/late | Static expiry policy |
-| Management API bounds | request 64 KiB, trend 300 samples, sample interval 1s | Common control-plane bounding | mptunnel | Not data-plane hot path; can limit observability resolution | Static low-overhead sampling |
+| Parameter or family | Current value or formula | Design source and exact origin | Performance risk | Final handling |
+| --- | --- | --- | --- | --- |
+| Product frame limit | `max_frame_bytes = 1,048,576` | Mechanism is common bounded-frame design; exact value is mptunnel policy | Can waste CPU if too small or memory if too large | Keep as configurable safety envelope; not a scheduler quantum |
+| Product payload limit | `max_payload_bytes = 1,048,512`; config omission derives it from frame size | Mechanism is common; exact default is derived mptunnel envelope | Can force excessive records if set too low | Keep as configurable decode/allocation envelope only |
+| Product ACK ranges | `max_ack_ranges = 256` | Sparse ACK/SACK/QUIC ACK ranges are common; exact cap is mptunnel policy | Too low can hide holes under severe reorder/loss; too high makes ACKs bulky | Keep as encoding cap; ACK emission cadence remains adaptive |
+| Path count | `max_paths = 64` | Finite path/subflow state is common in MPTCP/MPQUIC; exact cap is mptunnel policy | Can cap unusual path groups, not normal performance | Keep as registry cap; not a target path count |
+| Stream count | `max_streams = 65,536` | QUIC-style stream registries are common; exact cap is mptunnel policy | Can cap very large fan-out; otherwise not hot path | Keep as non-preallocated registry cap |
+| Stream window | `max_stream_window_bytes = 64 MiB` | Flow-control windows are common in QUIC and MPTCP; exact envelope is mptunnel policy | Can limit high-BDP paths if below real BDP | Keep as configurable receive/flow-control envelope; credit release is adaptive |
+| Repair cache | `max_repair_bytes = 64 MiB` | MPTCP-style reinjection requires retained unacked data; exact envelope is mptunnel policy | Can limit repair on lossy/heterogeneous paths | Keep as repair envelope; repair choice and spending are adaptive |
+| Reorder budget | `max_reorder_bytes = 64 MiB` | Multipath byte streams need receive-hole bounds; exact envelope is mptunnel policy | Too low rejects useful paths; too high masks harmful striping | Keep as reorder envelope; admission uses live debt |
+| Datagram queue | `max_datagram_queue_bytes = 16 MiB` | Datagram transports commonly bound queues; exact envelope is mptunnel policy | Too low drops bursts; too high hurts latency/memory | Keep as burst envelope; path choice and draining are adaptive |
+| Path/product flight ceiling | `max_path_flight_bytes = 64 MiB`; omitted config derives it from repair capacity | Sender inflight/window concepts are common; exact envelope is mptunnel/operator policy | Can limit high-BDP transfers if below required flight | Keep as upper resource envelope; actual flight is BDP/queue/loss/carrier adaptive |
+| Reliable relay read ceiling | `max_reliable_relay_chunk_bytes = 512 KiB` | Large reads are common user-space amortization; exact ceiling is mptunnel policy | Bad only if treated as indivisible send/AEAD quantum | Keep as read-buffer ceiling; sender service splits into adaptive preemptible quanta |
+| TCP idle heartbeat | 10s interval, 30s timeout | Idle keepalive/liveness is common; exact timers are mptunnel policy | Would violate failover target if used for active data | Keep for idle liveness only; active failover uses data-plane stall/PTO/repair evidence |
+| Path probe timer | 10s interval, 2s timeout | Path validation is common in MPTCP/MPQUIC; exact timers are mptunnel policy | Can delay idle-path discovery; must not gate active recovery | Keep as idle path-manager default; active path recovery is adaptive |
+| Extra traffic hint | `extra_traffic_hint_percent = 1` default; 100/200 allowed | Reinjection/duplication is common in MPTCP/MPQUIC; numeric hint is mptunnel/operator policy | Bad if treated as hard cap or blind duplication allowance | Keep as adaptive hint; sender spends extra traffic only with evidence |
+| Security freshness | `auth_freshness_window_seconds = 300` | Replay freshness windows are common security controls; exact window is mptunnel policy | Affects clock-skew/replay tolerance, not data-plane rate | Keep as security policy; not data-plane adaptive |
+| Cipher default | AES-256-GCM default; ChaCha20-Poly1305 optional | AEAD is mandatory; AES-GCM default follows modern hardware acceleration practice | CPU can matter on CPUs without AES acceleration | Keep as operator choice; no plaintext unless explicit |
+| QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight/read ceiling | QUIC flow-control/congestion split is common; mapping is mptunnel policy | Can cap QUIC if mapped envelope is too small | Keep resource mapping; QUIC BBR/pacing remains dynamic |
+| QUIC BBR controller | Quinn BBR when available | BBR-style rate/RTT/inflight control is mature practice; implementation is library-owned | Library/platform behavior can still cap performance | Keep as dynamic carrier controller |
+| QUIC datagram MTU model | Startup 1200 byte payload; lower 512 and upper 65,000 path-spec bounds | 1200-byte UDP support is a QUIC requirement; mptunnel sets lower/upper guardrails | Low MTU can increase fragmentation/overhead | Keep startup safety plus path MTU observation/probing |
+| TUN defaults | IPv4 `10.88.0.1/24`, MTU 1500, DNS TTL 5s | Local-interface defaults are common deployment choices; exact values are mptunnel examples | MTU/TTL can affect TUN behavior but not sender scheduling | Keep as operator defaults, scoped to TUN |
+| Outbound DNS timeout | 5s default | Resolver timeouts are common control-plane safety; exact value is mptunnel policy | Slow resolvers may fail resolution; not hot path after resolve | Keep per outbound, not global data-plane behavior |
+| SOCKS5 UDP/TUN idle TTLs | SOCKS5 UDP TTL 30s, TUN UDP flow idle 60s | NAT-style UDP state expiry is common; exact TTLs are mptunnel policy | Too short/long affects idle UDP associations | Keep as flow expiry policy; not a throughput cap |
+| Management API bounds | request 64 KiB, trend 300 samples, sample interval 1s | Control-plane bounding is common; exact values are mptunnel policy | Can limit observability resolution, not packet throughput | Keep as low-overhead management-plane bounds |
 
 The implementation also contains adaptive policy constants that are not exposed
 as primary operator knobs. They are allowed only when they remain measurement
 driven and do not become hidden modes.
 
-| Parameter or family | Current value or formula | Common design? | Exact value origin | Can limit performance? | Adaptation status |
-| --- | --- | --- | --- | --- | --- |
-| Path scoring | ETA = RTT/2 + queued/product/inflight time + payload time + jitter + loss/confidence/state penalties | ECF/BLEST-style multipath admission; BBR-like evidence inputs | formula and weights are mptunnel | Yes if weights reject useful capacity or admit harmful paths | Dynamic inputs; fixed weights |
-| Scheduler penalties | expensive 25ms, suspect 250ms, backup 100ms, TCP reorder 50ms, loss scale 500ms, low-confidence 25ms, shared-bottleneck 20ms | Common state/quality penalties; exact weights are not standardized | mptunnel | Yes; these are policy weights, not protocol truths | Dynamic scoring with fixed weights |
-| Tail/duplication thresholds | tail avoidance 512 KiB, duplicate payload <= 4 KiB, duplicate extra ETA <= 15ms | Common tail-repair/duplication idea | mptunnel | Yes if too conservative for unstable paths or too aggressive for capacity | Dynamic eligibility with fixed clamps |
-| Lane priority order | control, realtime datagram, latency, throughput, background | Common QoS/ACK-control separation | mptunnel | Should improve latency; can underfeed bulk if implementation blocks behind lanes | Dynamic queues; fixed priority |
-| DRR lane/flow quanta | lane quanta 128/96/96/64/64 KiB; flow quanta 64/64/64/64/32 KiB by lane | Common DRR/fair-queue design | mptunnel | Yes if quanta are too small for 1 Gbps CPU amortization or too large for latency | Dynamic queues; fixed quanta |
-| Service frame quanta | control 4 KiB, latency 16 KiB, background 32 KiB, throughput <= 64 KiB | BBR send-quantum reasoning and QUIC packetization separation | mptunnel | Yes; this is a likely high-rate CPU/syscall ceiling if writers are not sufficiently batched | Adaptive below fixed ceilings |
-| TCP MSS floor | 1460 bytes; throughput floor uses at least 8*MSS where possible | Common Ethernet MSS assumption | mptunnel assumption | Yes on jumbo/offload environments or unusual MTU | Static floor |
-| Chunk gains by lane | control/realtime 1/256 BDP, latency 1/128, throughput 1/4, background 1/16 | Common BDP-based pacing idea | mptunnel | Yes if gains underfeed high-rate QUIC/TCP or create tiny-frame loops | Dynamic BDP input; fixed gains |
-| Inflight gains by lane | control/realtime 0.0625 BDP, latency 0.125, throughput 2.0, background 1.0 | Common BDP/cwnd-style envelope | mptunnel | Yes if cap/floor underfeeds or queues too much | Dynamic BDP input; fixed gains |
-| Stability/backlog factors | loss and jitter factors clamp 0.125..1.0; queue/backlog factors clamp 0.125/0.25..1.0 | Common congestion/queue-sensitive adaptation | mptunnel | Yes if clamps are too conservative under high BDP or too lenient under loss | Dynamic |
-| Auto bulk classification | EWMA 75/25; rate bulk threshold = 12.5% of path rate; byte threshold from relay chunk and BDP/8; idle gap = 4*SRTT clamped 50ms..2s | Common adaptive traffic classification; exact thresholds are mptunnel | mptunnel | Yes if bulk promotion is late or early | Dynamic |
-| ACK progress cadence | non-bulk ACKs can send after 1 byte; bulk ACK step blends window/repair/max-ACK-range capacity and BDP, floored at 4 KiB | Common ACK range/ACK frequency control | mptunnel | Yes if ACKs are too sparse under loss or too chatty under high rate | Dynamic |
-| MAX_DATA cadence | max-data update after max(window/4, relay chunk), capped by stream window | Common flow-control credit update | mptunnel | Yes if credit refresh is too coarse under high BDP | Dynamic from window/chunk |
-| Active stall detection | 350ms minimum, 1500ms maximum, response/progress intervals derived from path and lane | Common data-plane stall detection/PTO-like recovery | mptunnel | Yes for very high RTT or severe jitter; should not replace carrier PTO | Dynamic timeout bounded by fixed clamps |
-| Path failure cooldown | 5s | Common path-manager dampening | mptunnel | Yes if a recovered path is withheld too long; too short can flap | Static cooldown fed by dynamic failures |
-| Path open scoring sample | 4 KiB; minimum rate sample 4 KiB over 1ms | Common probe/sample floor idea | mptunnel | Yes if too small to estimate high-rate paths; too large would hurt latency | Static sample floor |
-| UDP target/datagram path model | gain 1.25, minimum 64 Kbps, response timeout 50ms..1s, retry/suppression 250ms, first-open timeout 8*SRTT | Common BBR-like pacing and retry concepts; not QUIC's own congestion controller | mptunnel | Yes for UDP target/TUN datagram behavior; MUST NOT cap QUIC stream bulk | Dynamic path inputs with fixed clamps |
-| QUIC metric sampler | poll interval SRTT/2 clamped 10..250ms; startup sample gain 2.0; app-limited low samples do not reduce bulk model | Common BBR app-limited filtering and pacing evidence | mptunnel mapping from Quinn stats | Yes if polling is too slow or startup cap suppresses true rate discovery | Dynamic evidence with fixed clamps |
-| Bulk admission | product/carrier inflight <= min(2*BDP or carrier cwnd model, configured ceiling); reorder budget <= min(2*BDP, configured reorder); cross-underlay stricter; service horizon = sqrt(payload*envelope) | MPTCP ECF/BLEST-style "do no worse than best path" scheduling | mptunnel formula | Yes; this is one of the highest-risk performance governors | Dynamic |
-| Validation traffic | carrier/control probes, duplicate stream data, or repair data; no unique future bytes when an admitted ordinary path exists | Common MPTCP reinjection/MPQUIC path validation principle | mptunnel invariant | Protects performance; if violated, it causes HOL debt | Dynamic and invariant |
-| Connect/header safety | TCP/UDP connect timeout 10s; HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527 bytes; SOCKS5 UDP packet 65,535 bytes; target host 255 bytes | Common parser/protocol safety bounds | protocol/common plus mptunnel | Usually no hot-path limit except slow connect timeout | Static safety limits |
+| Parameter or family | Current value or formula | Design source and exact origin | Performance risk | Final handling |
+| --- | --- | --- | --- | --- |
+| Path scoring | ETA = RTT/2 + queued/product/inflight time + payload time + jitter + loss/confidence/state penalties | ECF/BLEST/BBR-style evidence is accepted; exact formula/weights are mptunnel policy | Wrong weights admit harmful paths or reject useful capacity | Keep adaptive formula; diagnostics must expose inputs and rejection reasons |
+| Scheduler penalties | expensive/suspect/backup/reorder/loss/confidence/shared-bottleneck penalties | State penalties are common; exact weights are mptunnel policy and not standardized | Hidden weights can become lab-tuned modes | Keep as suspect policy until learned/validated by diagnostics |
+| Tail/duplication thresholds | tail avoidance, small duplicate eligibility, duplicate ETA slack | Reinjection/duplication is common; exact slack is mptunnel policy | Too conservative hurts failover; too aggressive wastes capacity | Keep as adaptive eligibility gates under extra-traffic evidence |
+| Lane priority order | control, realtime datagram, latency, throughput, background | ACK/control protection is common; exact lane taxonomy is mptunnel policy | Incorrect implementation can starve bulk or control | Keep as fixed priority invariant with dynamic queues |
+| DRR lane/flow quanta | Deficit charge equals actual sender-service packet quantum | DRR/fair queuing is common; fixed byte quanta were mptunnel policy and removed | Fixed quanta previously underfed high-rate carriers | Keep adaptive charge based on actual queued frame size |
+| Service frame quanta | Chunk target derives from BDP, lane gain, stability, queue pressure, and configured read/payload envelope | BBR send-quantum reasoning is common; formula is mptunnel policy | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-BDP paths grow and unstable paths shrink |
+| TCP MSS floor | 1460 bytes; throughput floor uses at least a small multiple where possible | MSS-style lower bound is common; exact value is portability policy | Can be suboptimal on jumbo/offload paths, but only affects floor | Keep only as floor below adaptive chunking |
+| Chunk gains by lane | control/realtime 1/256 BDP, latency 1/128, throughput 1/4, background 1/16 | BDP scaling is common; exact fractions are mptunnel policy | Fractions can still underfeed or over-burst | Keep suspect adaptive policy; labs must justify or refine |
+| Inflight gains by lane | control/realtime 0.0625 BDP, latency 0.125, throughput 2.0, background 1.0 | BDP/cwnd envelopes are common; exact multipliers are mptunnel policy | Multipliers can cap bulk or queue too much | Keep dynamic BDP input under resource ceilings |
+| Stability/backlog factors | loss/jitter/queue/backlog factors shrink toward 0.125/0.25 and grow to 1.0 | Congestion-sensitive adaptation is common; lower clamps are mptunnel policy | Over-shrinking can cause low-rate loops | Keep dynamic; diagnostics must show shrink reason |
+| Auto bulk classification | EWMA/rate/byte/idle-gap evidence promotes or demotes flow demand | Traffic-demand inference is product-specific but measurement-based | Late/early promotion affects latency/throughput tradeoff | Keep adaptive; no user-visible mode tag or port rule |
+| ACK progress cadence | ACK step blends window/repair/max-ACK-range capacity and BDP; immediate non-bulk ACKs allowed | ACK ranges/frequency are QUIC/SACK-like; blend is mptunnel policy | Sparse ACKs delay repair; chatty ACKs waste reverse bandwidth | Keep dynamic from receive progress |
+| MAX_DATA cadence | Update after a window/chunk-derived threshold | QUIC flow-control credit update logic is common; threshold formula is mptunnel policy | Coarse credit can stall high-BDP streams | Keep adaptive from window/chunk |
+| Active stall detection | Timeout derives from path/lane and is bounded | PTO/stall recovery is common; exact bounds are mptunnel policy | Too long breaks failover, too short causes false repair | Keep dynamic with lab-justified bounds |
+| Path failure cooldown | 5s dampening | Flap dampening is common; exact duration is mptunnel policy | Can withhold recovered path too long or flap too often | Keep only after dynamic failure evidence |
+| Path open scoring sample | 4 KiB / 1ms minimum useful sample | Probing/sampling is common; exact sample floor is mptunnel policy | Too small misestimates high-rate paths; too large hurts startup | Keep as evidence seed, not bulk cap |
+| UDP target/datagram path model | gain 1.25, minimum 64 Kbps, response timeout 50ms..1s, retry/suppression 250ms, first-open timeout 8*SRTT | BBR-like inputs are accepted; clamps are mptunnel UDP-target policy | Can affect SOCKS/TUN datagram behavior; must not cap QUIC stream bulk | Keep as suspect adaptive model separate from QUIC congestion |
+| QUIC metric sampler | poll interval SRTT/2 clamped 10..250ms; startup sample gain 2.0; app-limited filtering | BBR app-limited filtering is accepted; polling clamps are mptunnel policy | Slow/stale samples mislead scheduler | Keep adaptive evidence with provenance |
+| Bulk admission | product/carrier inflight <= BDP/cwnd/resource ceiling; reorder budget and completion horizon are live | ECF/BLEST "do no worse than best path" scheduling is accepted; formula is mptunnel policy | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection |
+| Validation traffic | probes, duplicate STREAM_DATA, or repair data; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation motivate this invariant | Violations create HOL debt | Keep invariant, not an optional heuristic |
+| Connect/header safety | TCP/UDP connect timeout 10s; HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common; exact timeout is mptunnel policy | Not hot-path except connect timeout | Keep as control-plane safety, not scheduler input |
 
 The following items were found during the parameter audit and are resolved in
 protocol version 1. They are listed so stale implementations do not reintroduce
@@ -623,7 +624,7 @@ them.
 | Lab diagnostics constants | Remain lab-only. Lab sample intervals, Docker profiles, benchmark durations, and failure thresholds are not production protocol parameters and MUST NOT ship as release-bundle behavior unless explicitly part of the management API contract. |
 
 The current highest-risk parameters for throughput are the path/product flight
-envelope, QUIC send-window mapping, service-frame quantum ceilings, DRR quanta,
+envelope, QUIC send-window mapping, adaptive service-frame quantum formula,
 bulk admission formula, and QUIC metric sampling/provenance. The current
 highest-risk parameters for latency and failover are ACK cadence, lane priority,
 active stall bounds, path cooldown, validation proof shape, and repair quantum.
@@ -1571,7 +1572,13 @@ the ACK frontier. Bytes after the largest ACKed end are eligible for tail repair
 only when no authoritative lower gap is known. This keeps receive-hole repair
 ahead of continuation replay and matches the same ordering principle used by
 QUIC ACK ranges and MPTCP reinjection: recover the earliest missing logical
-offset before spending repair budget on later stream bytes.
+offset before spending repair budget on later stream bytes. Repair candidate
+selection is prefix-preserving: if the lowest unresolved repair frame cannot be
+sent on an alternate eligible output, the sender MUST NOT skip it and send a
+later ordered range instead. If a data-plane stall/PTO timer has fired and no
+alternate output can carry the frontier range, the sender MAY retransmit that
+same lowest frontier range on the current survivor output, then stop that repair
+pass. This is targeted duplicate repair, not whole-cache replay.
 
 ## 14. Datagram Flow Layer
 
@@ -1997,7 +2004,7 @@ model: feedback remains timely, but the byte-producing side is not limited to
 one frame per select wakeup when a healthy carrier has queued work. A narrower
 writer-feed quantum is valid only when experiments show it reduces delay without
 underfeeding the carrier; the July 2026 single-link lab rejected making the
-writer-feed quantum equal to one 64 KiB sender-service quantum for QUIC UDP
+writer-feed quantum equal to one formerly fixed small sender-service quantum for QUIC UDP
 because it reduced balanced throughput and increased read gaps.
 
 A carrier event loop MUST NOT let ordinary data commands outrank already
@@ -2083,11 +2090,12 @@ preserve QUIC/BBR-style lane isolation while still allowing a low-RTT/high-rate
 QUIC UDP carrier to become the initial lead when it is genuinely the best
 completion candidate.
 
-The DRR service quantum for throughput data is capped at the preemptible bulk
-quantum ceiling, currently 64 KiB, and is independent from the 512 KiB TCP
-read-buffer ceiling. Larger local reads may be split into multiple service
-quanta; batching or vectored writes may reduce syscall overhead, but they MUST
-NOT remove lane preemption points.
+The DRR service quantum for throughput data is the actual preemptible
+sender-service packet quantum selected from live BDP, stability, queue pressure,
+and the configured read/payload envelope. It is independent from the 512 KiB
+default TCP read-buffer ceiling. Larger local reads may be split into multiple
+service quanta; batching or vectored writes may reduce syscall overhead, but
+they MUST NOT remove lane preemption points.
 
 Gap repair is often encoded as `STREAM_DATA` because it carries the same stream
 offset bytes as original transmission. Its scheduling lane is nevertheless
@@ -2614,7 +2622,10 @@ another eligible path exists, repair prefers a path that did not carry the last
 outstanding copy of the repaired range. This is the MPTCP reinjection rule
 applied only after loss, failure, or stall evidence exists, with the QUIC-style
 recovery constraint that a repair action is small, ACK-clocked, and never a
-replay of unrelated cached bytes. A sender MUST NOT duplicate every lower
+replay of unrelated cached bytes. If no alternate output exists after stall/PTO
+evidence, the sender may resend the same lowest unresolved repair range on the
+current survivor output; it MUST NOT substitute a later range merely because the
+frontier range is already in flight. A sender MUST NOT duplicate every lower
 outstanding byte merely because a faster active path is available. Speculative
 reinjection outside the sender-service queue is prohibited because it can occupy
 path queues before the receiver has proven useful repair. A queued sender may
@@ -3339,10 +3350,14 @@ on_tail_stall_repair(stream_id, last_complete_ack_ranges):
     repair_budget = base_repair_budget * (1 + extra_traffic_hint_percent / 100)
     holes = unacked_chunks_below_largest_acked_not_covered_by(last_complete_ack_ranges)
     if holes is not empty:
-        schedule_repair(holes, repair_budget)
+        schedule_prefix_repair(holes, repair_budget)
     else:
         tail = unacked_chunks_after_largest_acked(last_complete_ack_ranges)
-        schedule_repair(tail, repair_budget)
+        schedule_prefix_repair(tail, repair_budget)
+    if lowest_repair_range_is_already_in_flight_on_only_survivor
+       and stall_or_PTO_evidence_exists:
+        retransmit_same_lowest_range_once()
+    never_skip_lowest_range_to_send_later_ordered_bytes()
     never_replay_whole_repair_cache()
 
 on_path_failure(path):

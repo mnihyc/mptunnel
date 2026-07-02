@@ -843,6 +843,7 @@ where
                                 if reliable_relay_can_finish_after_path_loss(
                                     local_open,
                                     remote_open,
+                                    pending_remote_fin_offset,
                                     &send_stream,
                                     &recv_stream,
                                     &sender_queue,
@@ -856,6 +857,7 @@ where
                                 if reliable_relay_can_finish_after_path_loss(
                                     local_open,
                                     remote_open,
+                                    pending_remote_fin_offset,
                                     &send_stream,
                                     &recv_stream,
                                     &sender_queue,
@@ -871,6 +873,7 @@ where
                         if reliable_relay_can_finish_after_path_loss(
                             local_open,
                             remote_open,
+                            pending_remote_fin_offset,
                             &send_stream,
                             &recv_stream,
                             &sender_queue,
@@ -945,9 +948,28 @@ where
                                     continue;
                                 }
                                 Ok(_) => {
+                                    if reliable_relay_should_wait_for_pending_path_recovery(
+                                        remote_open,
+                                        &pending_validation_opens,
+                                    ) {
+                                        #[cfg(feature = "lab-diagnostics")]
+                                        lab_diagnostic(
+                                            "client_path_loss_waits_for_pending_recovery",
+                                            format_args!(
+                                                "stream_id={} path_underlay={:?} path_index={} pending_validation_opens={} cause=no_immediate_attach",
+                                                stream_id.0,
+                                                path_key.underlay,
+                                                path_key.index,
+                                                pending_validation_opens.len(),
+                                            ),
+                                        );
+                                        path_last_delivery_at.remove(&path_key);
+                                        continue;
+                                    }
                                     if reliable_relay_can_finish_after_path_loss(
                                         local_open,
                                         remote_open,
+                                        pending_remote_fin_offset,
                                         &send_stream,
                                         &recv_stream,
                                         &sender_queue,
@@ -958,9 +980,28 @@ where
                                     break Err(err);
                                 }
                                 Err(_attach_err) => {
+                                    if reliable_relay_should_wait_for_pending_path_recovery(
+                                        remote_open,
+                                        &pending_validation_opens,
+                                    ) {
+                                        #[cfg(feature = "lab-diagnostics")]
+                                        lab_diagnostic(
+                                            "client_path_loss_waits_for_pending_recovery",
+                                            format_args!(
+                                                "stream_id={} path_underlay={:?} path_index={} pending_validation_opens={} cause=attach_error",
+                                                stream_id.0,
+                                                path_key.underlay,
+                                                path_key.index,
+                                                pending_validation_opens.len(),
+                                            ),
+                                        );
+                                        path_last_delivery_at.remove(&path_key);
+                                        continue;
+                                    }
                                     if reliable_relay_can_finish_after_path_loss(
                                         local_open,
                                         remote_open,
+                                        pending_remote_fin_offset,
                                         &send_stream,
                                         &recv_stream,
                                         &sender_queue,
@@ -1174,7 +1215,7 @@ where
                             path_snapshot,
                             relay_lane,
                         );
-                        let repair_frames = stream_ack_gap_repair_frames(
+                        let mut repair_frames = stream_ack_gap_repair_frames(
                             &send_stream,
                             &ranges,
                             repair_limit,
@@ -1183,11 +1224,30 @@ where
                             has_multipath_repair_alternative,
                             udp_gap_repair_ready,
                         );
+                        let repair_kind = if repair_frames.is_empty() {
+                            let fin_tail_frames = stream_final_offset_tail_repair_frames(
+                                &send_stream,
+                                &ranges,
+                                repair_limit,
+                                !local_open,
+                                has_multipath_repair_alternative,
+                            );
+                            if fin_tail_frames.is_empty() {
+                                "ack_gap"
+                            } else {
+                                repair_frames = fin_tail_frames;
+                                "fin_tail"
+                            }
+                        } else {
+                            "ack_gap"
+                        };
+                        #[cfg(not(feature = "lab-diagnostics"))]
+                        let _ = repair_kind;
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_before={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_before={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
@@ -1196,6 +1256,7 @@ where
                                 previous_repair_bytes,
                                 ack.remaining_repair_bytes,
                                 repair_frames.len(),
+                                repair_kind,
                                 remotes.active_carrier_underlay(),
                                 has_multipath_repair_alternative,
                                 udp_gap_repair_ready,
@@ -1208,8 +1269,8 @@ where
                             lab_diagnostic(
                                 "repair",
                                 format_args!(
-                                    "stream_id={} cause=ack_gap queued=true",
-                                    stream_id.0,
+                                    "stream_id={} cause={} queued=true",
+                                    stream_id.0, repair_kind,
                                 ),
                             );
                             sender_retry_at = None;
@@ -1274,6 +1335,8 @@ where
                         final_offset,
                     } if fin_stream_id == stream_id => {
                         last_stream_progress_at = Instant::now();
+                        #[cfg(feature = "lab-diagnostics")]
+                        let receive_frontier = recv_stream.next_offset();
                         let fin_ready = match receive_stream_fin(
                             &recv_stream,
                             &mut pending_remote_fin_offset,
@@ -1282,6 +1345,18 @@ where
                             Ok(ready) => ready,
                             Err(err) => break Err(err),
                         };
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "client_stream_fin_received",
+                            format_args!(
+                                "stream_id={} final_offset={} receive_frontier_before={} pending_remote_fin_offset={:?} fin_ready={}",
+                                stream_id.0,
+                                final_offset,
+                                receive_frontier,
+                                pending_remote_fin_offset,
+                                fin_ready,
+                            ),
+                        );
                         if fin_ready {
                             last_delivery_progress_at = Instant::now();
                             if let Err(err) = local.shutdown().await {
@@ -1343,6 +1418,31 @@ where
     }
     if result.is_ok() {
         remotes.close_all().await;
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "client_relay_result",
+        format_args!(
+            "stream_id={} ok={} local_open={} remote_open={} pending_local_fin={} pending_remote_fin_offset={:?} recv_next_offset={} recv_reorder_bytes={} sender_queue_bytes={} send_repair_bytes={} payload_bytes={}",
+            stream_id.0,
+            result.is_ok(),
+            local_open,
+            remote_open,
+            pending_local_fin,
+            pending_remote_fin_offset,
+            recv_stream.next_offset(),
+            recv_stream.reorder_bytes(),
+            sender_queue.bytes(),
+            send_stream.repair_bytes(),
+            stats.payload_bytes,
+        ),
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    if let Err(err) = &result {
+        lab_diagnostic(
+            "client_relay_error",
+            format_args!("stream_id={} error={:?}", stream_id.0, err),
+        );
     }
     sender.release_all(context);
     for (key, lane) in remaining_paths {
@@ -1411,17 +1511,26 @@ fn maybe_mark_live_relay_path_delivery(
 fn reliable_relay_can_finish_after_path_loss(
     local_open: bool,
     remote_open: bool,
+    pending_remote_fin_offset: Option<u64>,
     send_stream: &ReliableSendStream,
     recv_stream: &ReliableRecvStream,
     sender_queue: &ReliableRelaySenderQueue,
     stats: PathDeliveryStats,
 ) -> bool {
     !local_open
-        && remote_open
+        && !remote_open
+        && pending_remote_fin_offset.is_none()
         && sender_queue.is_empty()
         && send_stream.repair_bytes() == 0
         && recv_stream.reorder_bytes() == 0
         && stats.payload_bytes > 0
+}
+
+fn reliable_relay_should_wait_for_pending_path_recovery(
+    remote_open: bool,
+    pending_validation_opens: &HashSet<RelayPathKey>,
+) -> bool {
+    remote_open && !pending_validation_opens.is_empty()
 }
 
 fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {

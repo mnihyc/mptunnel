@@ -1,10 +1,6 @@
 use super::*;
 
 const TCP_RELAY_MSS_BYTES: usize = 1460;
-const TCP_RELAY_MAX_BULK_QUANTUM_BYTES: usize = 64 * 1024;
-const TCP_RELAY_MAX_BACKGROUND_QUANTUM_BYTES: usize = 32 * 1024;
-const TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES: usize = 16 * 1024;
-const TCP_RELAY_MAX_CONTROL_QUANTUM_BYTES: usize = 4 * 1024;
 
 pub(super) async fn send_sender_service_attach_control_frames(
     path_stream: &ReliablePathStream,
@@ -101,6 +97,23 @@ pub(super) fn stream_tail_stall_repair_frames(
         send_stream.retransmission_frames_after_ack_frontier(ranges, byte_limit),
         "ack_frontier",
     )
+}
+
+pub(super) fn stream_final_offset_tail_repair_frames(
+    send_stream: &ReliableSendStream,
+    ranges: &[OffsetRange],
+    byte_limit: usize,
+    final_offset_known: bool,
+    has_multipath_repair_alternative: bool,
+) -> Vec<Frame> {
+    if !final_offset_known || !has_multipath_repair_alternative || byte_limit == 0 {
+        return Vec::new();
+    }
+    let largest_ack_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
+    if largest_ack_end >= send_stream.next_offset() {
+        return Vec::new();
+    }
+    send_stream.retransmission_frames_after_ack_frontier(ranges, byte_limit)
 }
 
 #[derive(Debug, Default)]
@@ -489,24 +502,11 @@ pub(super) fn adaptive_reliable_relay_repair_bytes(
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> usize {
-    let read_ceiling = reliable_relay_buffer_len(mux_limits).max(1);
-    let mss_floor = TCP_RELAY_MSS_BYTES.min(read_ceiling).max(1);
-    let cap = match lane {
-        FlowLane::Control | FlowLane::RealtimeDatagram | FlowLane::Latency => {
-            TCP_RELAY_MAX_CONTROL_QUANTUM_BYTES
-        }
-        FlowLane::Throughput => TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES,
-        FlowLane::Background => TCP_RELAY_MAX_CONTROL_QUANTUM_BYTES,
-    }
-    .min(read_ceiling)
-    .max(mss_floor);
-    let Some(path) = path else {
-        return cap;
+    let repair_lane = match lane {
+        FlowLane::Throughput | FlowLane::Background => FlowLane::Latency,
+        other => other,
     };
-    let bdp_bytes = tcp_path_bdp_bytes(path);
-    let condition =
-        (tcp_path_stability_factor(path) * tcp_path_queue_factor(path, bdp_bytes)).clamp(0.25, 1.0);
-    ((cap as f64) * condition).ceil() as usize
+    adaptive_reliable_relay_chunk_bytes(path, repair_lane, mux_limits).max(1)
 }
 
 pub(super) fn tcp_path_bdp_bytes(path: PathSnapshot) -> f64 {
@@ -563,7 +563,6 @@ pub(super) fn tcp_throughput_amortized_chunk_floor(
     let cpu_floor = read_ceiling
         .saturating_div(8)
         .max(protocol_floor)
-        .min(TCP_RELAY_MAX_BULK_QUANTUM_BYTES)
         .min(read_ceiling)
         .max(1);
     let Some(path) = path else {
@@ -586,12 +585,15 @@ pub(super) fn tcp_throughput_amortized_chunk_floor(
 pub(super) fn tcp_lane_startup_chunk_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let cap = reliable_relay_scheduler_quantum_cap(None, lane, mux_limits);
     let floor = tcp_lane_min_chunk_bytes(lane, mux_limits);
-    match lane {
-        FlowLane::Control | FlowLane::RealtimeDatagram => floor,
-        FlowLane::Latency => TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES.min(cap).max(floor),
-        FlowLane::Throughput => TCP_RELAY_MAX_BULK_QUANTUM_BYTES.min(cap).max(floor),
-        FlowLane::Background => TCP_RELAY_MAX_BACKGROUND_QUANTUM_BYTES.min(cap).max(floor),
-    }
+    let startup = PathSnapshot::new(
+        PathId(0),
+        UnderlayProtocol::Tcp,
+        default_path_srtt_ms(UnderlayProtocol::Tcp),
+        default_path_rate_bps(UnderlayProtocol::Tcp),
+    );
+    let bdp_bytes = tcp_path_product_bdp_bytes(startup);
+    let target = (bdp_bytes * tcp_lane_chunk_gain(lane)).ceil() as usize;
+    target.clamp(floor.min(cap).max(1), cap)
 }
 
 pub(super) fn reliable_relay_scheduler_quantum_cap(
@@ -600,23 +602,17 @@ pub(super) fn reliable_relay_scheduler_quantum_cap(
     mux_limits: MuxLimits,
 ) -> usize {
     let read_ceiling = reliable_relay_buffer_len(mux_limits).max(1);
-    let lane_ceiling = match lane {
-        FlowLane::Control | FlowLane::RealtimeDatagram => TCP_RELAY_MAX_CONTROL_QUANTUM_BYTES,
-        FlowLane::Latency => TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES,
-        FlowLane::Background => TCP_RELAY_MAX_BACKGROUND_QUANTUM_BYTES,
-        FlowLane::Throughput => {
-            let base = TCP_RELAY_MAX_BULK_QUANTUM_BYTES.min(read_ceiling).max(1);
-            let Some(path) = path else {
-                return base;
-            };
-            let bdp = tcp_path_bdp_bytes(path);
-            let condition_factor = tcp_path_quantum_condition_factor(path, bdp);
-            ((base as f64) * condition_factor)
-                .ceil()
-                .max((TCP_RELAY_MSS_BYTES * 8).min(base).max(1) as f64) as usize
-        }
+    let Some(path) = path else {
+        return read_ceiling;
     };
-    lane_ceiling.min(read_ceiling).max(1)
+    if lane != FlowLane::Throughput {
+        return read_ceiling;
+    }
+    let bdp = tcp_path_bdp_bytes(path);
+    let condition_factor = tcp_path_quantum_condition_factor(path, bdp);
+    ((read_ceiling as f64) * condition_factor)
+        .ceil()
+        .max((TCP_RELAY_MSS_BYTES * 8).min(read_ceiling).max(1) as f64) as usize
 }
 
 pub(super) fn tcp_lane_inflight_gain(lane: FlowLane) -> f64 {
@@ -698,8 +694,31 @@ fn repair_limit_with_extra_traffic_hint(
     base_limit.saturating_add(base_limit.saturating_mul(hint) / 100)
 }
 
+pub(super) fn prefix_repair_frames_with_available_output(
+    path_stream: &ReliablePathStream,
+    repair_frames: Vec<Frame>,
+    allow_same_output_frontier_retransmit: bool,
+) -> (Vec<Frame>, Option<u64>) {
+    let mut accepted = Vec::with_capacity(repair_frames.len());
+    for frame in repair_frames {
+        if !path_stream.has_repair_output_for_frame(&frame) {
+            if allow_same_output_frontier_retransmit && accepted.is_empty() {
+                accepted.push(frame);
+                return (accepted, None);
+            }
+            return (
+                accepted,
+                reliable_stream_frame_extent(&frame).map(|(offset, _, _)| offset),
+            );
+        }
+        accepted.push(frame);
+    }
+    (accepted, None)
+}
+
 fn enqueue_reliable_tail_repair(
     response_sender: &mut ServerResponseSenderService,
+    path_stream: &ReliablePathStream,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] stream_id: StreamId,
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
@@ -712,6 +731,7 @@ fn enqueue_reliable_tail_repair(
     max_frame_payload_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     last_send_ack_frontier: u64,
+    allow_same_output_frontier_retransmit: bool,
 ) -> usize {
     let base_repair_limit = adaptive_relay_chunk_bytes_for_underlay(
         send_path_snapshot,
@@ -732,19 +752,28 @@ fn enqueue_reliable_tail_repair(
         repair_limit,
         last_send_ack_complete,
     );
+    let (repair_frames, blocked_frontier_offset) = prefix_repair_frames_with_available_output(
+        path_stream,
+        repair_frames,
+        allow_same_output_frontier_retransmit,
+    );
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = repair_kind;
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = blocked_frontier_offset;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "tail_stall_repair",
         format_args!(
-            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind={}",
+            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind={}",
             stream_id.0,
             relay_lane,
             last_send_ack_frontier,
             send_stream.next_offset(),
             send_stream.repair_bytes(),
             repair_frames.len(),
+            blocked_frontier_offset,
+            allow_same_output_frontier_retransmit,
             base_repair_limit,
             repair_limit,
             performance.extra_traffic_hint_percent,
@@ -863,6 +892,7 @@ where
     let mut last_send_ack_complete = false;
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut output_updates = path_stream.subscribe_output_updates();
+    let mut multipath_repair_alternative_available = path_stream.has_multipath_repair_alternative();
     let mut response_sender = ServerResponseSenderService::new(session_id, stream_id);
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -922,11 +952,9 @@ where
                 + reliable_stream_recv_progress_interval(send_path_snapshot, relay_lane),
         );
         let tail_repair_active = relay_lane_is_bulk(relay_lane)
-            && remote_open
             && send_stream.repair_bytes() > 0
             && !last_send_ack_ranges.is_empty()
-            && last_send_ack_frontier < send_stream.next_offset()
-            && path_stream.has_multipath_repair_alternative();
+            && last_send_ack_frontier < send_stream.next_offset();
         let tail_repair_deadline = reliable_relay_stall_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
             send_path_snapshot,
@@ -1011,6 +1039,7 @@ where
             _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
                 enqueue_reliable_tail_repair(
                     &mut response_sender,
+                    &path_stream,
                     stream_id,
                     &send_stream,
                     &last_send_ack_ranges,
@@ -1022,6 +1051,7 @@ where
                     path_stream.underlay,
                     path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
+                    true,
                 );
                 last_tail_repair_at = Instant::now();
                 if drain_server_response_sender_ready(
@@ -1155,7 +1185,7 @@ where
                             None,
                             relay_lane,
                         );
-                        let repair_frames = stream_ack_gap_repair_frames(
+                        let mut repair_frames = stream_ack_gap_repair_frames(
                             &send_stream,
                             &ranges,
                             repair_limit,
@@ -1164,11 +1194,47 @@ where
                             has_multipath_repair_alternative,
                             udp_gap_repair_ready,
                         );
+                        let repair_kind = if repair_frames.is_empty() {
+                            let (fin_tail_frames, blocked_frontier_offset) =
+                                prefix_repair_frames_with_available_output(
+                                    &path_stream,
+                                    stream_final_offset_tail_repair_frames(
+                                        &send_stream,
+                                        &ranges,
+                                        repair_limit,
+                                        close_sent || pending_local_fin,
+                                        true,
+                                    ),
+                                    false,
+                                );
+                            #[cfg(feature = "lab-diagnostics")]
+                            if blocked_frontier_offset.is_some() {
+                                lab_diagnostic(
+                                    "tail_stall_repair_blocked_frontier",
+                                    format_args!(
+                                        "stream_id={} blocked_frontier_offset={:?} repair_kind=fin_tail",
+                                        stream_id.0, blocked_frontier_offset,
+                                    ),
+                                );
+                            }
+                            #[cfg(not(feature = "lab-diagnostics"))]
+                            let _ = blocked_frontier_offset;
+                            if fin_tail_frames.is_empty() {
+                                "ack_gap"
+                            } else {
+                                repair_frames = fin_tail_frames;
+                                "fin_tail"
+                            }
+                        } else {
+                            "ack_gap"
+                        };
+                        #[cfg(not(feature = "lab-diagnostics"))]
+                        let _ = repair_kind;
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
@@ -1178,6 +1244,7 @@ where
                                 response_sender.bytes(),
                                 ack.remaining_repair_bytes,
                                 repair_frames.len(),
+                                repair_kind,
                                 Some(path_stream.underlay),
                                 has_multipath_repair_alternative,
                                 udp_gap_repair_ready,
@@ -1188,6 +1255,14 @@ where
                         );
                         for frame in repair_frames {
                             response_sender.enqueue_repair_frame(frame);
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "repair",
+                                format_args!(
+                                    "stream_id={} cause={} queued=true",
+                                    stream_id.0, repair_kind,
+                                ),
+                            );
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
@@ -1266,9 +1341,77 @@ where
                         .map_err(|_| RuntimeError::TcpPathSessionClosed),
                     None => std::future::pending::<Result<(), RuntimeError>>().await,
                 }
-            }, if queued_send_blocked => {
+            }, if output_updates.is_some() => {
                 changed?;
+                let now_has_repair_alternative = path_stream.has_multipath_repair_alternative();
+                let gained_repair_alternative =
+                    now_has_repair_alternative && !multipath_repair_alternative_available;
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = gained_repair_alternative;
+                multipath_repair_alternative_available = now_has_repair_alternative;
                 response_sender_retry_at = None;
+                let final_tail_repair_ready = (close_sent || pending_local_fin)
+                    && send_stream.repair_bytes() > 0
+                    && !last_send_ack_ranges.is_empty()
+                    && last_send_ack_frontier < send_stream.next_offset();
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_output_update",
+                    format_args!(
+                        "stream_id={} now_has_repair_alternative={} gained_repair_alternative={} final_tail_repair_ready={} close_sent={} pending_local_fin={} repair_bytes={} ack_ranges={} ack_frontier={} sent_offset={} queue_bytes={}",
+                        stream_id.0,
+                        now_has_repair_alternative,
+                        gained_repair_alternative,
+                        final_tail_repair_ready,
+                        close_sent,
+                        pending_local_fin,
+                        send_stream.repair_bytes(),
+                        last_send_ack_ranges.len(),
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                        response_sender.bytes(),
+                    ),
+                );
+                if final_tail_repair_ready {
+                    let repair_count = enqueue_reliable_tail_repair(
+                        &mut response_sender,
+                        &path_stream,
+                        stream_id,
+                        &send_stream,
+                        &last_send_ack_ranges,
+                        last_send_ack_complete,
+                        send_path_snapshot,
+                        relay_lane,
+                        mux_limits,
+                        performance,
+                        path_stream.underlay,
+                        path_stream.max_frame_payload_bytes,
+                        last_send_ack_frontier,
+                        false,
+                    );
+                    if repair_count > 0 {
+                        last_tail_repair_at = Instant::now();
+                    }
+                }
+                if response_sender.queued_send_ready() {
+                    if drain_server_response_sender_ready(
+                        &mut response_sender,
+                        &path_stream,
+                        &mut send_stream,
+                        relay_lane,
+                        mux_limits,
+                        sender_dispatch_byte_budget,
+                        sender_dispatch_item_budget,
+                        &mut stats,
+                        &mut last_tail_repair_path,
+                        session_id,
+                    )
+                    .await?
+                    {
+                        response_sender_retry_at =
+                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                    }
+                }
                 continue;
             }
             _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked => {
@@ -1750,7 +1893,7 @@ mod tests {
 
     #[test]
     fn tail_repair_hint_scales_repair_budget_by_percent() {
-        let base = TCP_RELAY_MAX_LATENCY_QUANTUM_BYTES;
+        let base = tcp_lane_startup_chunk_bytes(FlowLane::Latency, MuxLimits::default());
         let low_hint = MppPerformanceConfig {
             extra_traffic_hint_percent: 1,
         };

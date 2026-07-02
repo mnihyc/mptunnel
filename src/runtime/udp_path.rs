@@ -2044,15 +2044,16 @@ mod tests {
         let codec_limits = CodecLimits::default();
         let tcp_queue = tcp_path_command_queue(mux_limits);
         let quic_udp_queue = udp_path_command_queue(mux_limits, codec_limits);
+        let sender_quantum =
+            reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
+        let engine_payload = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
+        let expected = tcp_path_command_queue_for_payload(
+            mux_limits,
+            sender_quantum.min(engine_payload).max(1),
+        );
 
         assert_eq!(quic_udp_queue, tcp_queue);
-        assert!(
-            quic_udp_queue
-                > tcp_path_command_queue_for_payload(
-                    mux_limits,
-                    udp_path_max_stream_payload_bytes(codec_limits, mux_limits)
-                )
-        );
+        assert_eq!(quic_udp_queue, expected);
     }
 
     #[test]

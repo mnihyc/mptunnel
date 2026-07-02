@@ -118,7 +118,7 @@ Recommended production ranges:
 | `max_reorder_bytes` | 64 MiB | 64-256 MiB | Receive-hole/order debt envelope for multipath scheduling. Too high can hide harmful striping; too low can reject useful paths. |
 | `max_datagram_queue_bytes` | 16 MiB | 16-64 MiB | Datagram burst envelope for SOCKS5 UDP, TUN UDP, and realtime traffic. |
 | `max_path_flight_bytes` | 64 MiB | 64-256 MiB | Per-path product-flight ceiling and QUIC send-window resource input. Actual sender flight remains BDP/queue/loss adaptive. |
-| `max_reliable_relay_chunk_bytes` | 512 KiB | 256 KiB-1 MiB | Read-buffer ceiling only. Scheduler quanta stay smaller and preemptible. |
+| `max_reliable_relay_chunk_bytes` | 512 KiB | 256 KiB-1 MiB | Read-buffer ceiling only. Sender-service quanta are selected adaptively from BDP, lane, queue/loss state, and this envelope. |
 | TCP heartbeat timers | 10s / 30s | keep default | Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair evidence. |
 
 For a high-bandwidth VPS path, increase `max_stream_window_bytes`,

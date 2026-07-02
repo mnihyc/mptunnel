@@ -735,7 +735,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
 async fn server_response_sender_slices_large_reads_to_service_quantum() {
     let stream_id = StreamId(42);
     let mux_limits = MuxLimits::default();
-    let quantum = reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
+    let quantum = adaptive_reliable_relay_chunk_bytes(None, FlowLane::Throughput, mux_limits);
     let (commands, mut receivers) = tcp_path_session_command_channels(16);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -1259,7 +1259,13 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
     };
-    assert_eq!(tcp_path_command_queue(mux_limits), 68);
+    let frame_payload =
+        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+            .min(mux_limits.max_reliable_relay_chunk_bytes)
+            .min(mux_limits.max_payload_bytes)
+            .max(1);
+    let expected_queue = mux_limits.max_path_flight_bytes.div_ceil(frame_payload) + 4;
+    assert_eq!(tcp_path_command_queue(mux_limits), expected_queue);
 
     let resources = ResourceLimits {
         max_streams: 65_536,
@@ -1267,7 +1273,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         max_reliable_relay_chunk_bytes: mux_limits.max_reliable_relay_chunk_bytes,
         ..ResourceLimits::default()
     };
-    assert_eq!(tcp_session_command_queue(resources), 68);
+    assert_eq!(tcp_session_command_queue(resources), expected_queue);
 }
 
 #[test]
@@ -1289,9 +1295,14 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
     let tcp_sized_queue = tcp_path_command_queue(mux_limits);
     let udp_sized_queue = tcp_path_command_queue_for_payload(mux_limits, 1200);
 
+    let tcp_frame_payload =
+        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+            .min(mux_limits.max_reliable_relay_chunk_bytes)
+            .min(mux_limits.max_payload_bytes)
+            .max(1);
     assert_eq!(
         tcp_sized_queue,
-        mux_limits.max_path_flight_bytes.div_ceil(64 * 1024) + 4
+        mux_limits.max_path_flight_bytes.div_ceil(tcp_frame_payload) + 4
     );
     assert_eq!(
         udp_sized_queue,
@@ -2043,6 +2054,70 @@ fn tail_stall_repair_uses_frontier_tail_when_ack_has_no_authoritative_gap() {
             payload,
             ..
         } if payload.as_ref() == b"cc"
+    ));
+}
+
+#[test]
+fn tail_stall_repair_retransmits_same_frontier_only_after_stall_evidence() {
+    let stream_id = StreamId(34);
+    let (commands, _receivers) = tcp_path_session_command_channels(4);
+    let binding = ResponseStreamBinding::new(
+        SessionId(34),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        commands,
+        FlowLane::Throughput,
+    );
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: 1024,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx,
+    };
+    let frame = Frame::StreamData {
+        stream_id,
+        offset: 128,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"frontier"),
+    };
+    binding.record_flight(
+        CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        },
+        &frame,
+        true,
+    );
+    let later_frame = Frame::StreamData {
+        stream_id,
+        offset: 136,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"later"),
+    };
+
+    let (without_stall, blocked_offset) = prefix_repair_frames_with_available_output(
+        &path_stream,
+        vec![frame.clone(), later_frame.clone()],
+        false,
+    );
+    assert!(without_stall.is_empty());
+    assert_eq!(blocked_offset, Some(128));
+
+    let (with_stall, blocked_offset) =
+        prefix_repair_frames_with_available_output(&path_stream, vec![frame, later_frame], true);
+    assert_eq!(blocked_offset, None);
+    assert_eq!(with_stall.len(), 1);
+    assert!(matches!(
+        &with_stall[0],
+        Frame::StreamData {
+            offset: 128,
+            payload,
+            ..
+        } if payload.as_ref() == b"frontier"
     ));
 }
 

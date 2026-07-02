@@ -199,9 +199,9 @@ and mixed links with substantially different latency, bandwidth, and loss.
 Cross-platform support is a product requirement because the local edge is
 usually a user device or workstation, while the remote edge is often a VPS. TCP
 and UDP underlays are both first-class because they solve different operational
-problems: TCP is widely reachable and proxy-friendly, while UDP allows the
-protocol to observe packet numbers, ACK ranges, loss, pacing, and roaming
-directly.
+problems: TCP is widely reachable and proxy-friendly, while UDP lets QUIC own
+packet recovery, pacing, congestion control, and roaming without waiting for
+kernel TCP behavior.
 
 Encryption is default because the internal protocol carries target metadata and
 payloads. Plaintext is reserved for explicit lab use so that performance
@@ -315,12 +315,11 @@ target sockets and does not directly schedule product bytes; it provides the
 identity and registries used by the sender service and carrier engines.
 
 A path owns one concrete underlay association inside a session. For TCP this is
-one encrypted framed stream session. For UDP this is one QUIC production engine
-association or one custom-lab UDP carrier association. A path owns path ID,
-underlay family, bind/peer address, liveness, carrier-local RTT/loss/rate/queue
-samples, carrier credit, and path-specific authentication. A path MUST NOT own
-product stream offsets or decide that a reliable stream should stripe onto it
-merely because it has capacity.
+one encrypted framed stream session. For UDP this is one QUIC association. A
+path owns path ID, underlay family, bind/peer address, liveness,
+carrier-local RTT/loss/rate/queue samples, carrier credit, and path-specific
+authentication. A path MUST NOT own product stream offsets or decide that a
+reliable stream should stripe onto it merely because it has capacity.
 
 A path group or carrier cohort is not a long-lived owner. It is a scheduler
 decision for one flow at one dispatch epoch: the lead path and any admitted extra
@@ -364,10 +363,8 @@ state and ordering debt; it is not by itself carrier bandwidth proof.
 Carrier engines own underlay mechanics. TCP owns encrypted framed records,
 writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
 QUIC packets, QUIC TLS, connection IDs, packet recovery, congestion control,
-pacing, ACKs, and roaming. The custom-lab UDP engine owns its experimental packet
-numbers, ACK ranges, loss detection, and PTO state. Carrier engines report
-credit and metrics upward; they do not decide product flow fairness or rewrite
-stream ordering rules.
+pacing, ACKs, and roaming. Carrier engines report credit and metrics upward;
+they do not decide product flow fairness or rewrite stream ordering rules.
 
 Buffers are owned by the layer whose invariant they protect:
 
@@ -551,47 +548,42 @@ Supported path metadata query parameters are:
 * Rate hints: `rate-bps`, `rate-kbps`, `rate-mbps`, `rate=unknown`,
   `rate=unlimited`
 * MTU hints: `mtu`, `mtu-bytes`, `payload-mtu`
-* UDP engine: `engine=quic`, `engine=custom-lab`
 * Capabilities: `backup`, `expensive`, `low-latency`, `bulk-allowed`, `bulk`,
   `no-bulk`, `probe-only`, `no-udp`
 
 Boolean values MAY be explicit (`true`, `false`, `1`, `0`, `yes`, `no`, `on`,
 `off`) or bare; a bare boolean means true.
 
-The `engine` parameter is valid only on `udp://` paths. It selects the internal
-UDP control engine while preserving the product-level UDP underlay contract. If
-`engine` is omitted on a UDP path, the implementation MUST use `engine=quic`.
-`engine=quic` denotes the QUIC/Hysteria-style production carrier track:
-reliable streams and datagrams over UDP with mature packet ACK, loss recovery,
-pacing, congestion control, connection ID, and roaming behavior. `engine=custom-lab`
-selects the current custom UDP carrier and is experimental/lab-only until it
-reaches at least 80% of Hysteria2 or direct throughput on the same
-high-bandwidth single-path lab while preserving browsing, upload, datagram,
-failover, and resource behavior. Implementations MUST NOT silently treat a
-requested engine as another engine. A production build MUST support the QUIC
-runtime; custom-lab is opt-in and MUST NOT be the default UDP engine. The QUIC
-client MUST NOT emit a fixed product-identifying SNI value. The QUIC server
-certificate and client trust anchor MUST be derived from the configured
-mptunnel shared secret, and the client MUST reject any server certificate that
-does not match that derived identity. This binds QUIC confidentiality to the
-same operator secret used by the product `SESSION_AUTH` and `PATH_JOIN`
-transcripts, so an active relay cannot terminate QUIC and inspect product
-frames without knowing the shared secret. Product authentication remains
-mandatory after the QUIC handshake; it provides per-session and per-path
-freshness, replay resistance, and authorization.
+`udp://` paths always use the QUIC carrier. Protocol version 1 has no UDP
+engine selector; `engine=` is an unknown path query parameter and MUST be
+rejected. The QUIC client MUST NOT emit a fixed product-identifying SNI value.
+The QUIC server certificate and client trust anchor MUST be derived from the
+configured mptunnel shared secret, and the client MUST reject any server
+certificate that does not match that derived identity. This binds QUIC
+confidentiality to the same operator secret used by the product `SESSION_AUTH`
+and `PATH_JOIN` transcripts, so an active relay cannot terminate QUIC and
+inspect product frames without knowing the shared secret. Product
+authentication remains mandatory after the QUIC handshake; it provides
+per-session and per-path freshness, replay resistance, and authorization.
 
 The QUIC production engine MUST configure its QUIC transport envelope from the
 same resource model used by the product stream layer. The QUIC per-stream
 receive window is the configured mptunnel stream window. The QUIC connection
-receive window and local send window are derived from the configured stream,
-repair, reorder, datagram queue, and path-inflight byte budgets so a high-BDP
-UDP path is not silently constrained by generic library defaults. The admitted
-concurrent QUIC bidirectional stream count is derived from that byte envelope
-and the stream window, then bounded by the configured stream limit. QUIC
-unidirectional streams are not used by protocol version 1. The production QUIC
-engine SHOULD use a BBR-style congestion controller when the implementation
-library provides one, because mptunnel's UDP goal is Hysteria-like high-BDP
-delivery with model-based pacing rather than loss-only growth.
+receive window is derived from the configured stream, repair, reorder, datagram
+queue, and path-inflight byte budgets so high-BDP UDP receive-side correctness
+is not silently constrained by generic library defaults. The local QUIC send
+window is not the same aggregate receive envelope. It is derived from the
+configured per-path inflight budget and reliable relay quantum, then QUIC's own
+congestion controller and pacing decide packet emission inside that sender
+envelope. This preserves the ownership split used by MPTCP and MPQUIC:
+product scheduling keeps the stream fed, while the carrier owns packet flight
+and pacing. The admitted concurrent QUIC bidirectional stream count is derived
+from the receive byte envelope and the stream window, then bounded by the
+configured stream limit. QUIC unidirectional streams are not used by protocol
+version 1. The production QUIC engine SHOULD use a BBR-style congestion
+controller when the implementation library provides one, because mptunnel's UDP
+goal is Hysteria-like high-BDP delivery with model-based pacing rather than
+loss-only growth.
 
 Hints seed the path model before measurements exist. They MUST NOT permanently
 override live observations. Auto scheduling MUST correct stale hints from health
@@ -1030,387 +1022,137 @@ TCP paths unless measurements prove that doing so improves completion time.
 
 ## 11. UDP Carrier Transport
 
-The UDP carrier is a product-level UDP abstraction below product frames. Its
-wire packet exposes no product magic string, target name, fixed product SNI, or
-proxy protocol metadata.
+The UDP carrier is QUIC. A `udp://` path establishes a QUIC connection and
+carries mptunnel product frames inside QUIC bidirectional streams. Protocol
+version 1 does not define an alternate UDP engine selector. Configuration or
+path strings containing `engine=` MUST be rejected rather than silently mapped
+to another carrier. This keeps the product surface honest: every production UDP
+optimization targets the QUIC path, and no stale custom UDP carrier can remain
+as a hidden runtime branch.
 
-UDP is the performance carrier. It gives the protocol direct control of packet
-numbers, ACK ranges, pacing, PTO, PMTU, and NAT rebinding. This is the same
-broad reason QUIC and Hysteria2 build above UDP: the transport can recover loss
-and pace data without waiting for kernel TCP behavior.
+The QUIC wire packet exposes no product magic string, target name, proxy
+protocol metadata, or fixed product SNI. The client MUST disable SNI or use an
+implementation behavior with the same privacy property. The server certificate
+and the client trust anchor are deterministically derived from the configured
+mptunnel shared secret. The client MUST reject a server certificate that does
+not match this derived identity. Product `SESSION_AUTH` and `PATH_JOIN` remain
+mandatory after the QUIC handshake, so QUIC authentication and product session
+authentication are separate but bound to the same operator secret.
 
-Protocol version 1 defines two UDP engine contracts:
+UDP remains the performance carrier because QUIC owns packet numbers, ACKs,
+loss recovery, PTO, pacing, congestion control, PMTU, connection IDs, and NAT
+rebinding above UDP. mptunnel MUST NOT implement a second packet-level reliable
+transport above QUIC. Above QUIC, mptunnel owns only product semantics:
+reliable stream offsets, stream ACK ranges, FIN/final offsets, repair byte
+ranges, datagram IDs, flow control, sender-service lanes, path admission, and
+path-model interpretation.
 
-* `engine=quic`, the production UDP carrier. It uses standard QUIC wire packets
-  and QUIC TLS 1.3, but product frames remain mptunnel frames carried inside
-  QUIC bidirectional streams. QUIC certificates and trust anchors are derived
-  from the shared secret as specified in Section 6, and product `SESSION_AUTH`
-  and `PATH_JOIN` are still required after the QUIC connection is established.
-  The QUIC transport profile MUST use the product resource envelope and
-  BBR-style congestion control as specified in Section 6.
-* `engine=custom-lab`, the experimental custom UDP carrier. It uses the packet
-  and ACK formats in Sections 11.1 through 11.8. It is not the production
-  default until it reaches the release gate stated in Section 6.
+### 11.1 QUIC Connection Profile
 
-mptunnel keeps the UDP carrier boundary explicit: future UDP engines MAY be
-added only when the product-frame contract, authentication, replay protection,
-scheduling semantics, and security properties remain conformant with this
-specification.
+Each configured `udp://host:port` path creates one QUIC carrier association
+inside an MPP session. The QUIC transport profile MUST be derived from the
+mptunnel resource envelope:
 
-### 11.1 Custom-Lab UDP Packet Format
+* QUIC stream receive window is based on `max_stream_window_bytes`.
+* QUIC connection receive window covers stream window, repair budget, reorder
+  budget, datagram queue budget, and path-flight budget.
+* QUIC send window is at least the configured path-flight budget and the
+  reliable relay chunk budget.
+* QUIC bidirectional stream concurrency is bounded by the resource envelope and
+  configured stream count.
+* QUIC datagram buffers, when enabled by the implementation, are bounded by the
+  configured datagram queue budget.
+* QUIC congestion control SHOULD use BBR-style control when the library and
+  platform provide it.
 
-This section applies to `engine=custom-lab`.
+The reason for this profile is the same as Hysteria2 and MPQUIC-style designs:
+packet recovery and congestion control belong in the UDP transport, while proxy
+and tunnel semantics remain above it. The QUIC controller provides mature ACK,
+loss, pacing, and congestion behavior. mptunnel consumes that behavior through
+carrier credit and telemetry; it does not duplicate it with a custom packet
+number space.
 
-Each UDP packet has:
+### 11.2 Product Frames over QUIC Streams
 
-```
-0       version = 1
-1       direction
-2..10   connection_id u64
-10..18  packet_number u64
-18..    encrypted_payload || tag16
-```
+A QUIC bidirectional stream carries length-prefixed mptunnel product frames. The
+length prefix is four bytes in network byte order followed by one encoded
+product frame. The product frame codec and product frame limits are specified in
+Sections 8 and 9.
 
-The first 18 bytes are AEAD additional authenticated data. The encrypted payload
-is one UDP carrier payload. The receiver uses `connection_id` for demultiplexing
-before decryption.
+The path handshake is carried on a QUIC bidirectional stream using
+`SESSION_HELLO`, `SESSION_AUTH`, and `PATH_JOIN`; the peer replies with
+`SESSION_READY` and `PATH_STATUS`. Reliable product streams are opened with
+`OPEN_STREAM` on their QUIC carrier stream and then exchange `STREAM_DATA`,
+`STREAM_ACK`, `STREAM_MAX_DATA`, `STREAM_FIN`, `STREAM_RESET`, and related
+control frames. Datagram flows are opened with `OPEN_DGRAM_FLOW` and exchange
+`DATAGRAM_DATA`, `DATAGRAM_FEEDBACK`, and `DATAGRAM_CLOSE` product frames over
+the QUIC carrier stream.
 
-### 11.2 UDP Carrier Payload Registry
-
-Payload kind values are encrypted:
-
-| Kind | Name | Fields |
-| ---: | --- | --- |
-| 1 | ACK | `largest_acked:u64`, `ack_delay_us:u32`, `u16 count`, packet ACK ranges |
-| 2 | ordered frame fragment | stream ID, frame ID, fragment offset, total frame length, bytes |
-| 3 | close stream | stream ID |
-| 4 | unreliable unordered frame fragment | same fragment fields |
-| 5 | reliable unordered frame fragment | same fragment fields |
-
-Packet ACK ranges use `u64 start`, `u64 end`, with `start < end`.
-
-Frame fragment fields are:
-
-```
-stream_id:u64
-frame_id:u64
-offset:u32
-total_len:u32
-payload:bytes
-```
-
-`ordered` fragments are ACK-eliciting. Reliable unordered fragments are
-ACK-eliciting. Unreliable unordered fragments are not ACK-eliciting.
-
-When product frames are carried over UDP, `STREAM_DATA` uses reliable unordered
-carrier fragments because product stream offsets provide the ordering and repair
-identity. `STREAM_ACK` uses unreliable unordered carrier fragments because it is
-feedback, not payload: later ACKs cover earlier state, and retransmitting stale
-ACK snapshots can consume reverse-path capacity and corrupt the sender's
-congestion model. Receivers compensate by sending ACKs promptly on gap changes,
-delivery progress, and repair-horizon advancement. Carrier ACK-only feedback
-remains a separate UDP carrier payload and is not itself reliable or congestion
-controlled.
-
-A product-bearing UDP carrier stream is established by an ordered control frame,
-normally `OPEN_STREAM`, `OPEN_DGRAM_FLOW`, or `PING`. Reliable unordered
-fragments, such as `STREAM_DATA`, MUST NOT create a new product carrier stream
-by themselves. If an endpoint receives a fresh, successfully decrypted,
-ACK-eliciting packet that contains a reliable unordered fragment for an unknown
-carrier stream, it MUST queue the carrier ACK for that packet. The product
-fragment is then stored in a bounded orphan/reorder buffer until the ordered
-control frame arrives, or it is dropped when the buffer or age bound is
-exceeded. Dropping an orphaned product fragment is a product-layer event and
-MUST NOT be represented as carrier packet loss. This preserves the product
-invariant that target metadata and stream role are known before data is routed
-without corrupting the carrier RTT, delivery-rate, PTO, or congestion model.
-
-The same layering applies to TCP and QUIC stream carriers. A valid encrypted
-carrier frame whose product stream is unknown, already closed, or not yet
-opened by ordered control MUST NOT tear down the carrier path merely because the
-product layer cannot route it. The receiver either associates it with a bounded
+A valid decrypted QUIC stream frame whose product stream is unknown, already
+closed, or not yet opened by ordered product control MUST NOT be treated as a
+carrier-path packet loss. The product layer either associates it with a bounded
 orphan/reorder context, drops it as stale product work, or returns a product
-reset when the carrier writer is available. This rule prevents late
-`STREAM_MAX_DATA`, `STREAM_ACK`, `STREAM_FIN`, `STREAM_RESET`, or `STREAM_DATA`
-frames from converting normal stream-close races into path failure. It does not
-permit unknown frames to create target sockets or ordinary data ownership.
+reset when the carrier writer is available. Unknown product data MUST NOT create
+target sockets or ordinary stream ownership. This preserves transport layering:
+QUIC packet delivery is not the same thing as product stream admissibility.
 
-### 11.3 Packet Numbers and ACKs
+### 11.3 Product Quantum and Writer Feed
 
-Each direction has a monotonically increasing packet number. Receivers collect
-packet numbers of ACK-eliciting packets and send ACK ranges. ACKs are encrypted
-carrier payloads and are not themselves reliable product frames.
+mptunnel product `STREAM_DATA` payloads over QUIC are application records, not
+UDP datagrams. QUIC decides how those bytes become packets. The sender service
+therefore sizes product quanta from product flow-control credit, lane priority,
+repair priority, adaptive relay chunking, and the configured product envelope.
+The QUIC writer may receive more than one product quantum in a writer drain when
+there is already admitted work, but admission and fairness occur above the path
+queue. A path command queue is only an emission pipe for already-admitted work.
 
-An ACK-only carrier packet is pure feedback. It MUST NOT be counted as bytes in
-flight, MUST NOT be stored in the retransmission pending set, MUST NOT wait for
-congestion-window or pending-byte capacity, and MUST NOT wait for a bulk pacer
-token. The implementation MAY coalesce or rate-limit pathological ACK floods,
-but bulk data MUST NOT delay ACK feedback. Timely ACK delivery is part of loss
-recovery, RTT measurement, delivery-rate sampling, and failover.
+Control, stream ACKs, FIN, RESET, DETACH, tail repair, latency data, and realtime
+datagram work MUST be able to interleave ahead of ordinary throughput work at
+the sender-service boundary. Bulk product quanta MUST remain preemptible by the
+sender service; implementations MUST NOT rely on QUIC stream FIFO order alone to
+protect small HTTP, SSH-like, datagram, control, or repair traffic during bulk
+transfer.
 
-`largest_acked` is the largest packet number covered by the ACK ranges.
-`ack_delay_us` is the receiver-side time between receiving `largest_acked` and
-emitting the ACK packet. The timestamp used for `ack_delay_us` MUST belong to
-the largest packet in the emitted ACK batch, not merely the largest packet ever
-seen on the connection. The sender computes a raw RTT sample from
-`now - sent_time[largest_acked]`, then subtracts at most the configured maximum
-ACK delay when doing so would not reduce the sample below the path minimum RTT:
+This design intentionally avoids TCP-over-TCP-style behavior in the UDP path.
+The product stream may be reliable, but QUIC owns packet loss recovery below it.
+Product repair and stream ACKs exist for multipath stream-offset correctness and
+cross-path reinjection; they do not replace QUIC packet ACKs, congestion control,
+or PTO.
 
-```
-latest_rtt = now - sent_time[largest_acked]
-ack_delay = min(ack_delay_us, max_ack_delay_us)
-if latest_rtt >= min_rtt + ack_delay:
-    adjusted_rtt = latest_rtt - ack_delay
-else:
-    adjusted_rtt = latest_rtt
-```
+### 11.4 QUIC Metrics and Scheduling Evidence
 
-Receivers SHOULD batch ACKs during in-order delivery to reduce overhead, but
-MUST send an ACK promptly when a newly received packet reveals reordering or a
-gap. This mirrors the practical reason QUIC ACK ranges exist: gap feedback must
-reach the sender quickly enough for packet-threshold loss detection and
-survivor-path repair.
+The local path model consumes QUIC sender telemetry as carrier evidence. At
+minimum, scheduling-visible UDP path snapshots use QUIC RTT, RTT variance,
+minimum RTT, congestion window or inflight-high equivalent, pacing rate when
+available, bytes sent, ACK progress, and application data frame progress.
 
-ACK frames MUST describe recent received packet ranges, not only packets
-received since the previous ACK flush. Because UDP ACK packets can themselves be
-lost, a receiver MUST retain a bounded recent receive history and repeat those
-ranges in later ACKs until they age out of the history. If an ACK frame cannot
-carry every recent range, it MUST prefer the newest ranges, including the range
-that contains `largest_acked`. This keeps RTT sampling and loss detection tied
-to current delivery and prevents a lost ACK from turning already delivered
-packets into artificial loss.
+Carrier ACK-only progress may update liveness and RTT. It MUST NOT by itself be
+used as bulk throughput proof. A UDP path becomes ordinary bulk evidence only
+after the sender has observed ACK-derived data delivery samples or an
+unpolluted product delivery sample that the scheduler can attribute to that path
+and direction. Application-limited and pure-control samples MUST NOT reduce the
+bulk delivery-rate estimate. Peer `PATH_METRICS` remain validation hints unless
+freshness, direction, confidence, and provenance make them safe for a specific
+admission decision.
 
-On ACK, the sender releases pending packets, updates RTT, derives delivery-rate
-samples from ACKed data packets, and performs packet-threshold and
-time-threshold loss detection.
-Treating every packet below an ACK frontier as lost is prohibited. A pending
-packet is declared lost only when all of the following hold:
+STREAM_ACK and QUIC ACKs release different ledgers. QUIC ACKs release carrier
+packet flight and feed the QUIC congestion controller. STREAM_ACK releases
+product repair and product path-flight ownership for stream byte ranges.
+Contiguous delivery advances the receiver/application frontier. One ledger MUST
+NOT be substituted for another.
 
-```
-packet.unacked
-packet.in_flight
-packet.pn < largest_acked
-largest_acked - packet.pn >= packet_loss_threshold
-    OR now - packet.sent_at >= max(9/8 * max(srtt, latest_rtt), granularity)
-```
+### 11.5 QUIC Roaming and NAT Rebinding
 
-The initial packet threshold is 3. If a packet declared lost is later ACKed, the
-path has demonstrated reordering; the sender MUST record the spurious loss and
-increase the path's reordering tolerance within bounded limits. A packet number
-that has already produced a confirmed loss event MUST NOT be declared lost or
-charged to congestion control again while it remains in the outstanding packet
-window. Repeated loss accounting for the same packet number is prohibited
-because it converts ordinary reordering into artificial congestion collapse. On
-timeout, the sender uses PTO-style probes rather than treating every timeout as
-confirmed loss. PTO expiration sends one or two ACK-eliciting probe packets and
-MUST NOT mark old packets lost solely because the PTO fired.
+UDP roaming is provided by QUIC connection IDs and QUIC path validation. Client
+IP changes caused by NAT rebinding, CGNAT, Wi-Fi changes, mobile networks, or
+VPS load balancers MUST NOT immediately terminate logical streams when the QUIC
+connection remains authenticated and live. Product sessions and product stream
+IDs remain stable across QUIC path changes.
 
-PTO is a per-direction path timer, not one independent repeating timer per
-outstanding packet. The sender MAY use per-packet deadlines to select useful
-probe payloads, but it MUST gate timeout probes through a single path-level PTO
-deadline. After a PTO probe batch is sent, additional timeout probes for that
-direction MUST wait until the next PTO deadline. PTO backoff is exponential and
-ACK progress resets the backoff. This prevents a large outstanding window from
-turning into a probe storm where every expired packet emits fresh recovery
-traffic while the path is already not producing feedback.
-
-Recovery retransmits payload, not old packets. A sender MUST NOT replay a stale
-encrypted UDP datagram with the old packet number as its normal loss-recovery
-mechanism. When a packet is declared lost, the sender releases that packet's
-pending-byte and bytes-in-flight ownership, records the packet number for
-spurious-loss detection, and schedules the recoverable payload in a fresh UDP
-packet with a fresh packet number and AEAD nonce. If the old packet is later
-ACKed, the ACK is reordering evidence and MUST NOT release ownership a second
-time. PTO probes also use fresh packet numbers; they do not mark the original
-packet lost and they do not mutate the original packet's packet number.
-
-This rule follows from the reason packet numbers exist. Packet-number spaces
-measure delivery of packets, while stream offsets and carrier frame identifiers
-identify recoverable content. Replaying old ciphertext keeps stale packet
-numbers alive in the loss detector, hides whether the probe itself arrived, and
-can repeatedly charge the same bytes to congestion control. Fresh-number
-recovery lets the peer ACK the recovery attempt independently while product
-stream offsets continue to deduplicate payload correctness.
-
-ACK ranges are used because burst loss and reordering are common on real
-Internet paths. A single cumulative ACK would hide sparse delivery and delay
-repair. PTO-style timeout probes are separated from confirmed loss because
-timeouts can also mean ACK delay, path jitter, CPU scheduling delay, or
-application-limited behavior; collapsing the model on every timeout is too
-conservative for fluent browsing.
-
-### 11.4 Fragmentation and Stream Packetization
-
-The safe startup target datagram size is 1200 bytes. The maximum probed datagram
-size is 1400 bytes. The fragment payload limit is:
-
-```
-target_datagram_bytes - UDP_HEADER_LEN(18) - AEAD_TAG_LEN(16) - fragment_prefix(25)
-```
-
-For latency-sensitive reliable stream data over UDP, the implementation MUST
-choose product `STREAM_DATA` payload sizes that fit one safe UDP carrier packet
-after product frame overhead. This keeps short requests, SSH-like interaction,
-tail repair, and control-adjacent stream data visible at fine stream-offset
-granularity.
-
-For sustained throughput lanes on a healthy UDP carrier, the sender MAY use a
-larger product stream quantum and fragment that product frame across multiple
-UDP carrier packets. The carrier packets remain independently numbered,
-ACKed, paced, and recovered; the larger product frame is only a CPU and
-scheduler amortization unit. The throughput quantum MUST be adaptive: it is
-bounded by flow-control credit, sender queue budget, the configured relay
-envelope, receiver reorder tolerance, live loss/jitter/queue pressure, and the
-current carrier inflight model. If loss, reordering, queue pressure, or tail
-latency rises, the sender MUST shrink back toward the safe single-packet stream
-quantum. Control frames, ACKs, repair for latency/tail holes, and realtime
-datagrams MUST remain able to interleave before ordinary bulk fragments.
-
-PMTU probes MAY raise the packet target when ACKed; loss MAY reduce it. A PMTU
-change MUST remain path-local.
-
-The 1200-byte startup size follows modern UDP transport practice and is safe
-across ordinary Internet paths. The 1400-byte probe ceiling targets common
-Ethernet/VPS paths while leaving IP/UDP and tunnel overhead margin. The
-single-packet rule is kept for latency-sensitive data because hiding a short
-request behind multiple UDP fragments would make one lost fragment stall the
-whole user-visible operation. Bulk data has the opposite pressure: forcing every
-stream quantum to be one packet can burn CPU, syscalls, queue operations, and
-AEAD setup before the path reaches capacity. The adaptive bulk quantum follows
-the same rationale as BBR send quanta and QUIC stream packetization: packet
-recovery remains at the transport layer, while stream writes become large
-enough to amortize userspace overhead only when the path has evidence that this
-does not harm latency or loss recovery.
-
-### 11.5 UDP Controller
-
-Each UDP path maintains an independent sender-side controller per direction.
-The client-to-server controller and server-to-client controller MUST NOT share
-bytes-in-flight, delivery-rate, loss, or PTO state because forward and reverse
-congestion can differ. Each controller maintains:
-
-* direction;
-* smoothed RTT, minimum RTT, and RTT variance;
-* delivery rate;
-* pacing rate;
-* send quantum;
-* bytes in flight;
-* inflight high watermark;
-* next send time;
-* target datagram bytes;
-* PMTU acknowledged bytes;
-* loss-event count;
-* PTO count;
-* application-limited state.
-
-The controller is mandatory for reliable and bulk UDP data. Reliable or bulk
-UDP data MUST NOT be sent when `bytes_in_flight + packet_size` exceeds the
-current inflight limit, except for PTO probes or an explicit recovery allowance.
-The controller MUST pace sends and enforce pending-byte capacity for data
-packets. It MUST derive delivery-rate samples from ACKed data packets using
-valid delivered-data timing. In protocol version 1, valid
-non-application-limited data samples MAY raise the delivery-rate model when
-they exceed the current model, subject to the startup growth bound below.
-Lower samples MUST be recorded for diagnostics, admission confidence, and
-future controller revisions, but they MUST NOT directly lower the bulk pacing
-rate. A conforming v1 implementation instead responds to poor delivery by
-reducing inflight allowance, PMTU probe state, repair admission, path
-confidence, or striping admission. This rule is intentional: experiments showed
-that scalar delivery-rate decay from isolated low epochs creates a
-self-reinforcing tiny-rate loop under ordinary single-path UDP traffic. A future
-revision MAY specify a lower-rate estimator only if it is stable under sustained
-full-pipe traffic, ACK compression, repair traffic, and heterogeneous path
-reordering. Application-limited samples MAY raise the estimate when they exceed
-the current model, but they MUST NOT reduce it. Pure-control samples and delayed
-feedback-only releases MUST NOT change the bulk bandwidth estimate. Control and
-ACK-only packets may update liveness, but they are not evidence of bulk data
-throughput.
-
-The local Auto path model MUST consume sender-controller telemetry from each
-active UDP carrier connection. At minimum, the scheduling-visible path snapshot
-uses the controller's ACK-corrected smoothed RTT, RTT variance, delivery-rate
-model, bytes in flight, pending queue bytes, inflight high watermark, and
-application-limited state. The carrier inflight high watermark is authoritative
-when present; a higher default BDP guess MUST NOT override it. A carrier
-delivery-rate value becomes bulk throughput evidence only after the controller
-has accepted at least one ACK-derived data delivery sample. RTT-only carrier
-telemetry may improve latency scoring, but it MUST NOT promote an unknown path
-into ordinary bulk striping or repair.
-
-Delivery-rate sampling MUST be resistant to ACK compression. A controller does
-not calculate bandwidth from `acked_bytes / time_since_previous_ack` alone.
-For a sample epoch, it accumulates ACKed data bytes and computes the sampling
-interval as the larger of ACK elapsed time and send elapsed time for the packets
-covered by that epoch. The epoch MUST span a meaningful fraction of the current
-minimum-RTT model before it can raise the delivery-rate estimate. If many ACK
-ranges arrive back-to-back for packets that were sent over a longer interval,
-the send elapsed time dominates; if packets were sent in a tight burst and ACKed
-in a tight burst, the sample is held until enough ACK time has elapsed. This is
-the same reason BBR uses delivery-rate samples rather than raw ACK arrival
-spacing.
-
-Startup growth is aggressive but bounded. A valid non-application-limited sample
-MAY raise the delivery-rate model, but a single sample epoch MUST NOT raise it
-by more than the controller's startup pacing gain. The inflight high watermark
-MUST grow from ACKed data delivery and MUST be capped by the delivery-rate
-model, observed minimum RTT, active bytes in flight, and the configured pending
-budget. Pacing rate MUST be derived from the delivery-rate model; it MUST NOT be
-raised merely because an already-inflated inflight watermark implies a larger
-BDP. Otherwise ACK compression can falsely inflate `inflight_hi`, which then
-inflates pacing, which creates loss and repair churn without increasing useful
-goodput. Conversely, pacing rate MUST NOT be lowered by isolated low-rate
-samples in v1; the controller should prefer temporary inflight and admission
-pressure over reducing the sender to a rate that cannot refill the path.
-
-Confirmed packet loss is congestion and repair evidence, but it is not by
-itself a lower bottleneck-bandwidth sample. Loss response MAY reduce inflight
-allowance, PMTU probe state, and repair admission according to the measured lost
-byte fraction; it MUST NOT reduce the delivery-rate estimate unless ACK-derived
-data delivery produces a valid lower model through a specified controller
-revision. This follows the BBR-style separation between bandwidth estimation
-and inflight control and prevents random wireless/VPS loss from collapsing
-pacing rate under otherwise continuing delivery.
-
-The controller algorithm is replaceable only behind the conformance boundary
-defined by this section. A change that alters UDP packet encoding, product-frame
-semantics, authentication, replay protection, or scheduling-visible behavior
-requires a revision of this specification.
-
-The controller follows the same principles as QUIC loss recovery and BBR-style
-control: pace by a path model, update the model from delivery samples, bound
-inflight data, and distinguish confirmed loss from probe timeout. The goal is
-aggressive fluency, not passive safety. When links are unstable, the controller
-MAY spend extra probe, repair, or duplicate traffic if the expected
-latency/failover benefit justifies it. The sender interprets
-`extra_traffic_hint_percent` as a bias for that decision, but MUST keep the
-decision evidence-driven: ACK progress, ordered-frontier debt, carrier loss/PTO,
-path failure, and queue pressure are inputs; the hint alone is not sufficient
-evidence.
-
-Startup is part of the controller, not a lab constant. A UDP sender MUST NOT
-use the full pending-byte, stream-window, repair-cache, or production memory
-budget as the initial congestion flight. The initial reliable-data flight is
-derived from the safe datagram payload size and a bounded fraction of available
-sender budget, then grows from ACKed data delivery. This is the same reason QUIC
-starts with a bounded initial congestion window and BBR enters Startup by
-probing from measured delivery rather than by dumping the whole application
-buffer into the network. Aggressive probing is allowed, but startup must remain
-paced and ACK-grown so ordinary 1% loss paths do not begin with self-inflicted
-queue loss and long ordered-stream repair tails.
-
-### 11.6 NAT Rebinding and Roaming
-
-The UDP receiver updates the peer socket address from the authenticated packet
-source after successful packet processing. Therefore client IP changes caused by
-NAT rebinding, CGNAT, Wi-Fi changes, or mobile roaming MUST NOT immediately
-terminate logical streams. A server MUST continue accepting authenticated packets
-with the same connection ID and valid direction/packet number from a new source
-address, subject to replay and freshness checks.
-
-Client address changes are routine with CGNAT, Wi-Fi handoff, mobile networks,
-and VPS load balancers. Binding a logical session to one UDP five-tuple would
-unnecessarily terminate streams that can otherwise be validated
-cryptographically.
+mptunnel path health observes QUIC connection state and product progress. Idle
+path liveness may use ordinary path probes. Active data-path failover MUST use
+data-plane stall, PTO, carrier close, and product ACK/repair evidence rather
+than waiting for a coarse TCP-style heartbeat.
 
 ## 12. Session and Path State Machines
 
@@ -1601,8 +1343,10 @@ new data beyond this offset. Receivers update the maximum offset from delivered
 progress and configured window size.
 
 Stream flow control limits memory exposure while still letting a receiver
-advertise enough window for high-BDP bulk transfer. The window is a capacity
-envelope; the scheduler decides how aggressively to fill it from live path
+advertise enough window for high-BDP bulk transfer. The configured stream window
+is a capacity envelope, not proof that the sender should fill it blindly. The
+sender-service scheduler, repair ledger, path admission, and carrier-credit
+gates decide how aggressively to use the advertised credit from live path
 state.
 
 ### 13.5 Stream Close
@@ -1625,6 +1369,14 @@ debt exists, and the receiver has already delivered contiguous response bytes,
 the stream MAY complete without waiting for a late remote FIN that can no
 longer be recovered. This is a product-level close race rule: it releases stale
 teardown bookkeeping, not unread data or repair debt.
+
+Because `STREAM_FIN` carries the final offset, it is not generic urgent control
+inside a sender-service queue. A sender MAY encode and dispatch FIN through the
+carrier's control or priority queue after it is selected, but the sender service
+MUST stage that final-close work behind all already queued data and repair work
+for the same stream direction. Otherwise a receiver can observe EOF before the
+bytes below the advertised final offset have arrived, which violates the
+product stream contract even when the carrier delivered the FIN correctly.
 
 ### 13.6 Repair Cache
 
@@ -1658,11 +1410,11 @@ the sender may compute holes below the largest end offset carried in that frame
 and schedule only those unacknowledged ranges for repair when the active carrier
 does not already own reliable packet recovery for that data. For ordinary
 reliable streams over the UDP carrier, an ACK gap by itself MUST NOT trigger
-product-level `STREAM_DATA` reinjection, because the UDP carrier is already
-recovering lost packet payloads with packet numbers, ACK ranges, threshold loss,
-and PTO. Product-level reinjection over UDP is reserved for explicit path
-failure, active stall, migration, or multipath repair where carrier ownership of
-the original flight is no longer sufficient. A fresh ACK gap below the largest
+product-level `STREAM_DATA` reinjection, because QUIC is already recovering
+lost packets with QUIC ACKs, loss detection, congestion control, and PTO.
+Product-level reinjection over UDP is reserved for explicit path failure,
+active stall, migration, or multipath repair where carrier ownership of the
+original flight is no longer sufficient. A fresh ACK gap below the largest
 carried end offset is evidence of a possible receive hole, not by itself proof
 that product-level repair should race the UDP carrier. When a reliable stream
 has more than one attached path and a repair-authoritative `STREAM_ACK` exposes
@@ -1959,11 +1711,14 @@ keep small control and interactive work fluent.
 Frame lane classification is derived from frame semantics at the sender-service
 boundary. A caller's local flow label can raise or lower the priority of
 ordinary `STREAM_DATA`, but it cannot convert control-shaped frames into bulk
-data. `STREAM_FIN`, `STREAM_RESET`, `STREAM_DETACH`, stream credit, and product
+data. `STREAM_RESET`, `STREAM_DETACH`, stream credit, product ACKs, and product
 control frames therefore bypass saturated throughput queues even when the
-stream had previously been promoted to throughput demand. This rule prevents a
-bulk data queue from delaying stream teardown, flow-control release, or repair
-state transitions.
+stream had previously been promoted to throughput demand. `STREAM_FIN` is
+control-shaped on the wire but tail-ordered in the product stream: it may bypass
+unrelated bulk work, but it MUST NOT overtake already-owned data or repair work
+for the same stream direction. This rule prevents a bulk data queue from
+delaying flow-control release or repair state transitions while preserving the
+final-offset ordering guarantee.
 
 ### 17.5 Mixed TCP and UDP Underlay
 
@@ -2050,10 +1805,100 @@ mark the carrier failed, and MUST continue polling ACK, credit, control,
 repair, and path-update feedback. A full carrier queue is backpressure, not a
 liveness failure. Control and ACK lanes may use their higher-priority emission
 path, but they MUST NOT sit behind a bulk data queue.
+
+The size of a carrier command queue is derived from the sender-service quantum
+that will actually be emitted on that carrier, bounded by the carrier's legal
+frame size and the path inflight envelope. An implementation MUST NOT size a
+QUIC UDP writer pipe from the maximum product frame that QUIC can carry if the
+sender-service bulk quantum is smaller; doing so undercounts the number of
+commands needed to keep the carrier fed and turns a healthy reliable carrier
+into a bursty sender. In the single-path/same-underlay case, TCP and QUIC UDP
+therefore use the same product quantum sizing rule, while their carrier engines
+remain responsible for their own packet congestion control and pacing.
+
+A sender-service dispatch pass MUST emit at most one preemptible service
+quantum of ordinary throughput work for a flow before yielding back to the
+feedback loop. The dispatch-pass byte budget is not the path inflight envelope,
+the carrier congestion window, or the full sender queue limit. Those larger
+values describe how much product or carrier flight may exist over time; they do
+not authorize one scheduling pass to move tens of MiB into a writer pipe. This
+keeps product ACKs, carrier ACKs, FIN/RESET/DETACH, repair, and latency work
+observable between bulk quanta while still allowing a high-rate carrier to stay
+fed through repeated nonblocking dispatches.
+
+Carrier command-queue credit is event-driven. When a carrier writer consumes or
+discards a queued command and releases queue capacity, that release is a sender
+wakeup for streams whose next queued work could use that carrier lane. The
+sender service MUST check current carrier capacity before remaining in a
+blocked state. For ordinary throughput data, carrier capacity is a byte-credit
+predicate: the selected writer pipe must have both queue-slot capacity and
+pending writer bytes below the path-model emission budget for that flow. That
+budget is byte-based and evidence-based; it is not a count of mpsc slots. A
+carrier with free mpsc slots but a large pending data backlog is not considered
+ready for unlimited ordinary throughput data. Implementations MAY incorporate
+carrier inflight-high or congestion-window evidence into this gate, but MUST
+avoid treating a transiently small carrier window as a second product receive
+window that starves a healthy QUIC/BBR sender. Control, product ACK,
+FIN/RESET/DETACH, and bounded repair lanes remain priority work and MUST NOT be
+delayed behind bulk writer-pipe debt. If capacity is unavailable, the sender
+SHOULD wait on carrier capacity release or path-output feedback rather than
+sleeping for a coarse fixed retry interval. A fixed retry timer MAY exist only
+as a race fallback; it MUST NOT be the primary pacing mechanism for a high-rate
+reliable stream. This rule follows the same ownership split as QUIC and MPTCP:
+product bytes remain in the sender queue while the carrier is full, but the
+byte-producing side is credit-clocked by actual carrier progress instead of by
+an unrelated timer.
+
+Once a carrier writer is selected by its event loop, it SHOULD drain a bounded
+run of already-admitted commands before yielding back to the event selector.
+This writer-feed run is not a sender-service admission pass: every command in
+the queue has already passed lane priority, flow control, path admission, and
+carrier-credit checks. The writer-feed budget MAY be larger than one
+sender-service quantum so that TCP and QUIC/BBR remain fed, but it MUST remain
+bounded, MUST NOT create product-flow fairness or lead-path ownership inside the
+writer pipe, and MUST continue to prefer control and priority commands over data
+commands between drained items. It MUST yield when the run budget is exhausted,
+the command queues are empty, or the carrier reports backpressure or closure.
+TCP writers MAY flush once at the end of such a run instead of after every
+product frame. This is the degenerate single-path form of the sender-service
+model: feedback remains timely, but the byte-producing side is not limited to
+one frame per select wakeup when a healthy carrier has queued work. A narrower
+writer-feed quantum is valid only when experiments show it reduces delay without
+underfeeding the carrier; the July 2026 single-link lab rejected making the
+writer-feed quantum equal to one 64 KiB sender-service quantum for QUIC UDP
+because it reduced balanced throughput and increased read gaps.
+
+A carrier event loop MUST NOT let ordinary data commands outrank already
+available inbound feedback. The loop first services ready control and priority
+commands, because local ACK/control/latency work must bypass bulk. If no such
+command is ready, inbound carrier frames that may contain product ACKs, stream
+credit, resets, path metrics, datagram feedback, or close signals are selected
+before ordinary data commands. Only after those feedback opportunities are not
+ready may the loop drain throughput data commands. This ordering prevents a
+continuously ready bulk queue from delaying ACK/credit processing and inflating
+repair or product-flight debt while preserving the higher-priority local
+control path.
+
+Feedback that can release sender work is also a send wakeup. After a carrier
+loop processes an inbound product ACK, stream credit update, path metric,
+datagram feedback, path status update, or other frame that can release product
+flight, repair state, flow-control credit, validation state, or path admission,
+it MUST attempt one bounded drain of already-admitted carrier commands before
+returning to an idle selector wait. The drain uses the same priority ordering
+and service envelope as the ordinary writer run. This rule prevents an
+ACK-heavy receiver loop from repeatedly consuming feedback while newly released
+response bytes remain queued until a separate command event wins the selector.
+It does not authorize unbounded sending, does not let data outrank feedback, and
+does not convert ACK timing into a delivery-rate estimate; it only connects
+feedback progress to the sender-service emission gate.
+
 For server response streams, `STREAM_ACK`, `STREAM_MAX_DATA`, and `STREAM_FIN`
-are queued sender-service control work. A target-read or path-receive handler
-MUST NOT write them directly to a carrier queue; dispatch may use the carrier's
-priority queue, but queue-full is sender-service backpressure.
+are queued sender-service work. A target-read or path-receive handler MUST NOT
+write them directly to a carrier queue. `STREAM_ACK` and `STREAM_MAX_DATA` use
+the product control lane. `STREAM_FIN` uses final-close staging: it can use the
+carrier priority queue once dispatched, but it remains behind already-owned
+same-direction data and repair until the final offset is safe to expose.
+Queue-full is sender-service backpressure.
 
 Session and path handshake traffic is a separate ownership domain until a
 product stream or datagram flow has been admitted. `SESSION_HELLO`,
@@ -2070,7 +1915,9 @@ lane model described here.
 The service maintains separate logical lanes in this priority order:
 
 1. carrier ACK-only feedback;
-2. product control, stream ACKs, connection credit, FIN, RESET, and DETACH;
+2. product control, stream ACKs, connection credit, RESET, DETACH, and
+   final-close FIN when same-stream data and repair ahead of that final offset
+   have drained;
 3. latency or tail-critical gap repair;
 4. latency-sensitive stream data and realtime datagrams;
 5. throughput stream data;
@@ -2344,11 +2191,19 @@ from its own UDP packet controller. Once the server has ACK-derived carrier
 delivery samples for a UDP path, those sender-side metrics take precedence for
 response scheduling over peer hints and over ordered stream-ACK timing alone.
 Stream ACKs still release product flight and prove end-to-end stream progress,
-but they MUST NOT be the only source of per-path delivery rate in a same-stream
-multipath transfer because ordered-stream holes from another path can pollute
-that signal. This mirrors QUIC and BBR practice: congestion and pacing decisions
-are sender-side and packet/path scoped, while stream ordering is a separate
-correctness layer.
+but they MUST NOT initialize, raise, or replace the UDP/QUIC carrier delivery
+rate or RTT model. Ordered stream ACK timing can be delayed by receiver reorder
+holes, product queueing, and application flow-control, so using it as UDP carrier
+rate evidence can inflate product queues or collapse pacing independently of the
+actual QUIC packet controller. It is product evidence only: it may release repair
+state, update contiguous-progress diagnostics, validate that some copy of a byte
+range reached the peer, and maintain a product-progress rate used only to bound
+source-read and product-backlog horizons. That product-progress rate MUST NOT be
+exported as UDP/QUIC carrier delivery rate, MUST NOT replace packet ACK-derived
+congestion evidence, and MUST NOT drive QUIC pacing. This mirrors QUIC and BBR
+practice: congestion and pacing decisions are sender-side and packet/path
+scoped, while stream ordering and product backlog are separate correctness
+layers.
 
 When the UDP production engine is QUIC, the response sender MUST preserve both
 ACK-derived delivery rate and QUIC pacing/cwnd-derived pacing rate in its path
@@ -2446,6 +2301,21 @@ outside the single shared lead. An implementation MUST NOT use slow product-ACK
 release timing as the UDP carrier congestion window, MUST NOT use carrier ACK
 progress as proof that a stream byte is no longer needed for repair, and MUST
 NOT treat the configured product envelope as a floor above UDP carrier credit.
+The product source-read horizon MUST NOT be capped by the carrier congestion
+window, inflight-high, or send-window equivalent. Those values belong to the
+carrier emission gate and to multipath admission, where they describe whether a
+specific carrier path can accept another admitted quantum. They are not a
+second product-layer receive window. On a single reliable carrier, applying the
+same carrier horizon at the product source-read layer makes the byte-producing
+side application-limited before QUIC or TCP can exercise its own pacing and
+congestion control. The source-read horizon is therefore computed from the
+path's sender-side delivery or pacing evidence, path quality, stream flow
+control, repair-cache/resource envelopes, and configured product ceiling.
+Ordered `STREAM_ACK` product progress MAY raise confidence or expose lag, but a
+low product-progress sample MUST NOT downshift the source-read horizon below
+credible carrier evidence. The product-progress rate remains a backlog and
+diagnostic signal only; it MUST NOT be treated as UDP/QUIC packet delivery or
+congestion evidence.
 
 The sender-service admission model also applies session-level lane pressure.
 When a session has active latency-sensitive or realtime flows, an active bulk
@@ -2807,6 +2677,13 @@ sender derives lead, same-underlay, and cross-underlay product inflight from the
 live BDP model, path inflight evidence when present, and the next chunk size,
 then caps that result by the configured path inflight ceiling. Control, ACKs,
 repair, and latency frames must still interleave with any admitted bulk work.
+The configured ceiling MUST be applied as an upper bound over the adaptive
+product-flight model. It MUST NOT be implemented as a floor that expands a
+smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
+When no live path snapshot exists yet, startup product flight is derived from
+the normal startup path model and lane gain, then capped by the same ceiling.
+Unknown-path startup MUST NOT jump directly to the configured maximum merely
+because the operator allowed that maximum for proven high-BDP paths.
 
 The reorder budget is confidence scaled for additional paths. A path with fresh
 ACK-derived delivery samples can use more of the modeled BDP/reorder envelope.
@@ -3227,15 +3104,7 @@ number.
 
 See Section 9.
 
-### A.2 UDP Carrier Payload Kinds
-
-* 1: ACK
-* 2: ordered frame fragment
-* 3: close stream
-* 4: unreliable unordered frame fragment
-* 5: reliable unordered frame fragment
-
-### A.3 Direction Values
+### A.2 Direction Values
 
 * 1: client to server
 * 2: server to client

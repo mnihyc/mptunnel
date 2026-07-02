@@ -126,13 +126,6 @@ impl RelayPathFlightLedger {
             .sum()
     }
 
-    pub(super) fn lower_flight_debt_bytes_before_offset(&self, offset: u64) -> u64 {
-        self.flights
-            .range(..offset)
-            .filter_map(|(_, flights)| flights.last().map(|flight| flight.bytes as u64))
-            .sum()
-    }
-
     pub(super) fn oldest_lower_flight_owner_before_offset(
         &self,
         offset: u64,
@@ -433,9 +426,11 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     } else {
         None
     };
-    let lower_flight_debt = if normal_bulk_send {
-        path_flights
-            .map(|flights| flights.lower_flight_debt_bytes_before_offset(offset))
+    let lower_owner_cross_path_debt = if normal_bulk_send {
+        lower_flight_owner
+            .and_then(|owner| {
+                path_flights.map(|flights| flights.ordering_debt_bytes_before_offset(owner, offset))
+            })
             .unwrap_or(0)
     } else {
         0
@@ -455,7 +450,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             admitted_bulk_keys: &admitted_bulk_keys,
             restrict_to_admitted,
             lower_flight_owner,
-            lower_flight_debt,
+            lower_owner_cross_path_debt,
             policy,
         })
     } else {
@@ -620,9 +615,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             let cross_path_ordering_debt = path_flights
                 .map(|flights| flights.ordering_debt_bytes_before_offset(key, offset))
                 .unwrap_or(0);
-            let lower_flight_debt = path_flights
-                .map(|flights| flights.lower_flight_debt_bytes_before_offset(offset))
-                .unwrap_or(0);
             let owns_lower_frontier = lower_flight_owner == Some(key);
             let role = if owns_lower_frontier
                 || (Some(key) == lead_key && cross_path_ordering_debt == 0)
@@ -635,11 +627,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             } else {
                 BulkAdmissionRole::ActiveDataPath
             };
-            let admission_ordering_debt = if role == BulkAdmissionRole::ActiveDataPath {
-                lower_flight_debt
-            } else {
-                cross_path_ordering_debt
-            };
+            let admission_ordering_debt = cross_path_ordering_debt;
             let (best_snapshot, best_eta_ms) =
                 if owns_lower_frontier && role == BulkAdmissionRole::ActiveDataPath {
                     (snapshot, score.eta_ms)
@@ -762,7 +750,7 @@ struct RelayBulkLeadRequest<'a> {
     admitted_bulk_keys: &'a [RelayPathKey],
     restrict_to_admitted: bool,
     lower_flight_owner: Option<RelayPathKey>,
-    lower_flight_debt: u64,
+    lower_owner_cross_path_debt: u64,
     policy: SchedulerPolicy,
 }
 
@@ -777,7 +765,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         admitted_bulk_keys,
         restrict_to_admitted,
         lower_flight_owner,
-        lower_flight_debt,
+        lower_owner_cross_path_debt,
         policy,
     } = request;
     paths
@@ -791,7 +779,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         .filter(|path| {
             let key = path.key();
             if let Some(owner) = lower_flight_owner {
-                return key == owner;
+                return key == owner && path.placement == RelayPathPlacement::Active;
             }
             if restrict_to_admitted {
                 admitted_bulk_keys.contains(&key)
@@ -815,7 +803,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
                 policy,
             )?;
             let stream_ordering_debt_bytes = if lower_flight_owner == Some(key) {
-                lower_flight_debt
+                lower_owner_cross_path_debt
             } else {
                 0
             };
@@ -964,7 +952,6 @@ mod tests {
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path0, 8192), 4096);
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path1, 8192), 4096);
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path2, 8192), 8192);
-        assert_eq!(ledger.lower_flight_debt_bytes_before_offset(8192), 8192);
         assert_eq!(
             ledger.oldest_lower_flight_owner_before_offset(8192),
             Some(path0)
@@ -1075,11 +1062,55 @@ mod tests {
             admitted_bulk_keys: &[saturated, admissible],
             restrict_to_admitted: true,
             lower_flight_owner: None,
-            lower_flight_debt: 0,
+            lower_owner_cross_path_debt: 0,
             policy: SchedulerPolicy::default(),
         })
         .expect("admissible path should become lead");
 
         assert_eq!(lead.key, admissible);
+    }
+
+    #[test]
+    fn relay_lower_owner_uses_sliding_window_not_ordering_debt() {
+        let context = context(&[
+            "udp://127.0.0.1:10130?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10131?srtt-ms=30&rate-mbps=500",
+        ]);
+        let owner = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let alternate = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        };
+        context.mark_relay_path_rate_sample(
+            alternate.underlay,
+            alternate.index,
+            PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(80))
+                .expect("sender evidence"),
+        );
+        context.record_relay_path_send(owner.underlay, owner.index, 2 * 1024 * 1024);
+        let paths = vec![
+            relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
+            relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
+        ];
+
+        let lead = choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
+            context: &context,
+            paths: &paths,
+            lane: FlowLane::Throughput,
+            payload_bytes: 64 * 1024,
+            frame: None,
+            active_key: Some(owner),
+            admitted_bulk_keys: &[owner, alternate],
+            restrict_to_admitted: true,
+            lower_flight_owner: Some(owner),
+            lower_owner_cross_path_debt: 0,
+            policy: SchedulerPolicy::default(),
+        })
+        .expect("same-carrier lower flight is sliding-window flight");
+
+        assert_eq!(lead.key, owner);
     }
 }

@@ -19,6 +19,7 @@ mod server_tcp;
 mod tcp_path;
 mod tcp_path_commands;
 mod tun_l4;
+mod udp_metrics;
 mod udp_path;
 
 pub use core::run;
@@ -47,6 +48,7 @@ use server_tcp::*;
 use tcp_path::*;
 use tcp_path_commands::*;
 use tun_l4::*;
+use udp_metrics::*;
 use udp_path::*;
 
 #[cfg(test)]

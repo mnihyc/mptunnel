@@ -94,138 +94,176 @@ pub(super) async fn handle_server_path(
         };
         match event {
             ServerTcpPathEvent::Command(command) => {
-                let pending_bytes = tcp_path_command_pending_bytes(&command);
-                if let TcpPathSessionCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command
-                {
-                    datagram_flows.retain(|flow| flow.flow_id != *flow_id);
-                }
-                let result = handle_server_tcp_path_command(
+                let keep_running = drain_server_tcp_path_commands(
                     command,
+                    &mut commands_rx,
                     &mut writer,
                     &context,
                     &mut attached_streams,
+                    &mut datagram_flows,
                     ServerTcpPathCommandContext {
                         session_id,
                         path_id,
                         commands_tx: &commands_tx,
                         draining,
-                        active_datagram_flows: datagram_flows.len(),
+                        active_datagram_flows: 0,
                     },
                 )
-                .await;
-                commands_rx.release_pending_command_bytes(pending_bytes);
-                let keep_running = result?;
+                .await?;
                 if !keep_running {
                     return Ok(());
                 }
             }
-            ServerTcpPathEvent::Frame(frame) => match frame {
-                Frame::OpenStream {
-                    stream_id,
-                    target,
-                    demand,
-                    role,
-                    ..
-                } if !draining => {
-                    outbound::validate_target(&target)?;
-                    context.outbound.ensure_supports(TargetProtocol::Tcp)?;
-                    let lane = flow_lane_from_stream_demand_hint(demand);
-                    match context.reliable_streams.open_or_attach(
-                        ServerReliableStreamOpenRequest {
-                            session_id,
-                            stream_id,
-                            target: &target,
-                            lane,
-                            attachment: ServerReliablePathAttachment {
-                                path_id,
-                                underlay: UnderlayProtocol::Tcp,
-                                commands: commands_tx.clone(),
-                                max_frame_payload_bytes: reliable_relay_buffer_len(
-                                    context.mux_limits,
-                                ),
-                                role,
+            ServerTcpPathEvent::Frame(frame) => {
+                match frame {
+                    Frame::OpenStream {
+                        stream_id,
+                        target,
+                        demand,
+                        role,
+                        ..
+                    } if !draining => {
+                        outbound::validate_target(&target)?;
+                        context.outbound.ensure_supports(TargetProtocol::Tcp)?;
+                        let lane = flow_lane_from_stream_demand_hint(demand);
+                        match context.reliable_streams.open_or_attach(
+                            ServerReliableStreamOpenRequest {
+                                session_id,
+                                stream_id,
+                                target: &target,
+                                lane,
+                                attachment: ServerReliablePathAttachment {
+                                    path_id,
+                                    underlay: UnderlayProtocol::Tcp,
+                                    commands: commands_tx.clone(),
+                                    max_frame_payload_bytes: reliable_relay_buffer_len(
+                                        context.mux_limits,
+                                    ),
+                                    role,
+                                },
                             },
-                        },
-                        context.mux_limits,
-                        context.max_reliable_streams,
-                    )? {
-                        ServerReliableStreamOpen::New(stream) => {
-                            attached_streams.insert(stream_id);
-                            let stream_context = context.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = run_server_tcp_stream(
-                                    stream_context,
-                                    session_id,
-                                    stream,
-                                    target,
-                                )
-                                .await
-                                {
-                                    eprintln!("warning: server reliable stream failed: {err}");
-                                }
-                            });
-                        }
-                        ServerReliableStreamOpen::Existing => {
-                            attached_streams.insert(stream_id);
-                            context
-                                .reliable_streams
-                                .route_frame(
-                                    session_id,
-                                    stream_id,
-                                    Frame::PathStatus {
-                                        path_id,
-                                        status: crate::protocol::PathStatus::Active,
-                                        capabilities: path_capabilities,
+                            context.mux_limits,
+                            context.max_reliable_streams,
+                        )? {
+                            ServerReliableStreamOpen::New(stream) => {
+                                attached_streams.insert(stream_id);
+                                let stream_context = context.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = run_server_tcp_stream(
+                                        stream_context,
+                                        session_id,
+                                        stream,
+                                        target,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("warning: server reliable stream failed: {err}");
+                                    }
+                                });
+                            }
+                            ServerReliableStreamOpen::Existing => {
+                                attached_streams.insert(stream_id);
+                                context
+                                    .reliable_streams
+                                    .route_frame(
+                                        session_id,
+                                        stream_id,
+                                        Frame::PathStatus {
+                                            path_id,
+                                            status: crate::protocol::PathStatus::Active,
+                                            capabilities: path_capabilities,
+                                        },
+                                    )
+                                    .await?;
+                                if !server_write_tcp_path_frame(
+                                    &mut writer,
+                                    &Frame::StreamMaxData {
+                                        stream_id,
+                                        max_offset: context.mux_limits.max_stream_window_bytes,
                                     },
                                 )
-                                .await?;
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            ServerReliableStreamOpen::Rejected => {
+                                if !server_write_tcp_path_frame(
+                                    &mut writer,
+                                    &Frame::StreamReset {
+                                        stream_id,
+                                        reason: ResetReason::Refused,
+                                    },
+                                )
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Frame::OpenStream { stream_id, .. } => {
+                        if !server_write_tcp_path_frame(
+                            &mut writer,
+                            &Frame::StreamReset {
+                                stream_id,
+                                reason: ResetReason::Refused,
+                            },
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Frame::OpenDatagramFlow {
+                        flow_id, target, ..
+                    } if !draining => {
+                        if datagram_flows.iter().any(|flow| flow.flow_id == flow_id) {
+                            return Err(RuntimeError::Protocol("duplicate TCP datagram flow"));
+                        }
+                        if datagram_flows.len() >= context.max_udp_flows_per_session {
                             if !server_write_tcp_path_frame(
                                 &mut writer,
-                                &Frame::StreamMaxData {
-                                    stream_id,
-                                    max_offset: context.mux_limits.max_stream_window_bytes,
-                                },
+                                &Frame::DatagramClose { flow_id },
                             )
                             .await?
                             {
                                 return Ok(());
                             }
+                            continue;
                         }
-                        ServerReliableStreamOpen::Rejected => {
-                            if !server_write_tcp_path_frame(
-                                &mut writer,
-                                &Frame::StreamReset {
-                                    stream_id,
-                                    reason: ResetReason::Refused,
-                                },
-                            )
-                            .await?
-                            {
-                                return Ok(());
+                        outbound::validate_target(&target)?;
+                        context.outbound.ensure_supports(TargetProtocol::Udp)?;
+                        let outbound_socket = match outbound::connect_udp(
+                            &context.outbound,
+                            &context.outbound_dns,
+                            &target,
+                            Duration::from_secs(10),
+                        )
+                        .await
+                        {
+                            Ok(socket) => socket,
+                            Err(err) => {
+                                if !server_write_tcp_path_frame(
+                                    &mut writer,
+                                    &Frame::DatagramClose { flow_id },
+                                )
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                                return Err(RuntimeError::OutboundConnect(err));
                             }
-                        }
+                        };
+                        let requests = spawn_server_udp_datagram_flow_worker(
+                            flow_id,
+                            outbound_socket,
+                            commands_tx.clone(),
+                            context.mux_limits,
+                        );
+                        datagram_flows.push(ServerUdpDatagramFlow { flow_id, requests });
                     }
-                }
-                Frame::OpenStream { stream_id, .. } => {
-                    if !server_write_tcp_path_frame(
-                        &mut writer,
-                        &Frame::StreamReset {
-                            stream_id,
-                            reason: ResetReason::Refused,
-                        },
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                Frame::OpenDatagramFlow {
-                    flow_id, target, ..
-                } if !draining => {
-                    if datagram_flows.iter().any(|flow| flow.flow_id == flow_id) {
-                        return Err(RuntimeError::Protocol("duplicate TCP datagram flow"));
-                    }
-                    if datagram_flows.len() >= context.max_udp_flows_per_session {
+                    Frame::OpenDatagramFlow { flow_id, .. } => {
                         if !server_write_tcp_path_frame(
                             &mut writer,
                             &Frame::DatagramClose { flow_id },
@@ -234,260 +272,246 @@ pub(super) async fn handle_server_path(
                         {
                             return Ok(());
                         }
-                        continue;
                     }
-                    outbound::validate_target(&target)?;
-                    context.outbound.ensure_supports(TargetProtocol::Udp)?;
-                    let outbound_socket = match outbound::connect_udp(
-                        &context.outbound,
-                        &context.outbound_dns,
-                        &target,
-                        Duration::from_secs(10),
-                    )
-                    .await
-                    {
-                        Ok(socket) => socket,
-                        Err(err) => {
-                            if !server_write_tcp_path_frame(
-                                &mut writer,
-                                &Frame::DatagramClose { flow_id },
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-                            return Err(RuntimeError::OutboundConnect(err));
-                        }
-                    };
-                    let requests = spawn_server_udp_datagram_flow_worker(
+                    Frame::DatagramData {
                         flow_id,
-                        outbound_socket,
-                        commands_tx.clone(),
-                        context.mux_limits,
-                    );
-                    datagram_flows.push(ServerUdpDatagramFlow { flow_id, requests });
-                }
-                Frame::OpenDatagramFlow { flow_id, .. } => {
-                    if !server_write_tcp_path_frame(&mut writer, &Frame::DatagramClose { flow_id })
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                Frame::DatagramData {
-                    flow_id,
-                    datagram_id,
-                    ttl_ms,
-                    payload,
-                } => {
-                    if ttl_ms == 0 {
-                        return Err(RuntimeError::Protocol("expired TCP datagram received"));
-                    }
-                    let flow_index = datagram_flows
-                        .iter()
-                        .position(|flow| flow.flow_id == flow_id)
-                        .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?;
-                    let requests = datagram_flows
-                        .get(flow_index)
-                        .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?
-                        .requests
-                        .clone();
-                    match requests.try_send(ServerUdpDatagramRequest {
                         datagram_id,
                         ttl_ms,
                         payload,
-                    }) {
-                        Ok(()) => {
+                    } => {
+                        if ttl_ms == 0 {
+                            return Err(RuntimeError::Protocol("expired TCP datagram received"));
+                        }
+                        let flow_index = datagram_flows
+                            .iter()
+                            .position(|flow| flow.flow_id == flow_id)
+                            .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?;
+                        let requests = datagram_flows
+                            .get(flow_index)
+                            .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?
+                            .requests
+                            .clone();
+                        match requests.try_send(ServerUdpDatagramRequest {
+                            datagram_id,
+                            ttl_ms,
+                            payload,
+                        }) {
+                            Ok(()) => {
+                                if !server_write_tcp_path_frame(
+                                    &mut writer,
+                                    &Frame::DatagramFeedback {
+                                        flow_id,
+                                        received: vec![datagram_ack_range(datagram_id)?],
+                                    },
+                                )
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                eprintln!(
+                                    "warning: TCP datagram worker queue full; dropping request"
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                datagram_flows.retain(|flow| flow.flow_id != flow_id);
+                                if !server_write_tcp_path_frame(
+                                    &mut writer,
+                                    &Frame::DatagramClose { flow_id },
+                                )
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Frame::DatagramFeedback { .. } => {}
+                    Frame::DatagramClose { flow_id } => {
+                        datagram_flows.retain(|flow| flow.flow_id != flow_id);
+                        if draining && attached_streams.is_empty() && datagram_flows.is_empty() {
                             if !server_write_tcp_path_frame(
                                 &mut writer,
-                                &Frame::DatagramFeedback {
-                                    flow_id,
-                                    received: vec![datagram_ack_range(datagram_id)?],
+                                &Frame::PathClose {
+                                    path_id,
+                                    reason: CloseReason::Normal,
                                 },
                             )
                             .await?
                             {
                                 return Ok(());
                             }
+                            return Ok(());
                         }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            eprintln!("warning: TCP datagram worker queue full; dropping request");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            datagram_flows.retain(|flow| flow.flow_id != flow_id);
+                    }
+                    Frame::StreamData {
+                        stream_id,
+                        offset,
+                        flags,
+                        payload,
+                    } => {
+                        context
+                            .reliable_streams
+                            .route_frame(
+                                session_id,
+                                stream_id,
+                                Frame::StreamData {
+                                    stream_id,
+                                    offset,
+                                    flags,
+                                    payload,
+                                },
+                            )
+                            .await?;
+                    }
+                    Frame::StreamAck {
+                        stream_id,
+                        complete,
+                        ranges,
+                    } => {
+                        context
+                            .reliable_streams
+                            .route_frame(
+                                session_id,
+                                stream_id,
+                                Frame::StreamAck {
+                                    stream_id,
+                                    complete,
+                                    ranges,
+                                },
+                            )
+                            .await?;
+                    }
+                    Frame::StreamMaxData {
+                        stream_id,
+                        max_offset,
+                    } => {
+                        context
+                            .reliable_streams
+                            .route_frame(
+                                session_id,
+                                stream_id,
+                                Frame::StreamMaxData {
+                                    stream_id,
+                                    max_offset,
+                                },
+                            )
+                            .await?;
+                    }
+                    Frame::StreamFin {
+                        stream_id,
+                        final_offset,
+                    } => {
+                        context
+                            .reliable_streams
+                            .route_frame(
+                                session_id,
+                                stream_id,
+                                Frame::StreamFin {
+                                    stream_id,
+                                    final_offset,
+                                },
+                            )
+                            .await?;
+                    }
+                    Frame::StreamDetach { stream_id } => {
+                        attached_streams.remove(&stream_id);
+                        context.reliable_streams.detach_path(
+                            session_id,
+                            stream_id,
+                            UnderlayProtocol::Tcp,
+                            path_id,
+                            &commands_tx,
+                        );
+                        if draining && attached_streams.is_empty() && datagram_flows.is_empty() {
                             if !server_write_tcp_path_frame(
                                 &mut writer,
-                                &Frame::DatagramClose { flow_id },
+                                &Frame::PathClose {
+                                    path_id,
+                                    reason: CloseReason::Normal,
+                                },
                             )
                             .await?
                             {
                                 return Ok(());
                             }
+                            return Ok(());
                         }
                     }
-                }
-                Frame::DatagramFeedback { .. } => {}
-                Frame::DatagramClose { flow_id } => {
-                    datagram_flows.retain(|flow| flow.flow_id != flow_id);
-                    if draining && attached_streams.is_empty() && datagram_flows.is_empty() {
-                        if !server_write_tcp_path_frame(
-                            &mut writer,
-                            &Frame::PathClose {
-                                path_id,
-                                reason: CloseReason::Normal,
-                            },
-                        )
-                        .await?
+                    Frame::StreamReset { stream_id, reason } => {
+                        context
+                            .reliable_streams
+                            .route_frame(
+                                session_id,
+                                stream_id,
+                                Frame::StreamReset { stream_id, reason },
+                            )
+                            .await?;
+                    }
+                    Frame::Ping { nonce } => {
+                        if !server_write_tcp_path_frame(&mut writer, &Frame::Pong { nonce }).await?
                         {
                             return Ok(());
                         }
-                        return Ok(());
                     }
-                }
-                Frame::StreamData {
-                    stream_id,
-                    offset,
-                    flags,
-                    payload,
-                } => {
-                    context
-                        .reliable_streams
-                        .route_frame(
+                    Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
+                        context.reliable_streams.record_path_metrics(
                             session_id,
-                            stream_id,
-                            Frame::StreamData {
-                                stream_id,
-                                offset,
-                                flags,
-                                payload,
-                            },
-                        )
-                        .await?;
-                }
-                Frame::StreamAck {
-                    stream_id,
-                    complete,
-                    ranges,
-                } => {
-                    context
-                        .reliable_streams
-                        .route_frame(
-                            session_id,
-                            stream_id,
-                            Frame::StreamAck {
-                                stream_id,
-                                complete,
-                                ranges,
-                            },
-                        )
-                        .await?;
-                }
-                Frame::StreamMaxData {
-                    stream_id,
-                    max_offset,
-                } => {
-                    context
-                        .reliable_streams
-                        .route_frame(
-                            session_id,
-                            stream_id,
-                            Frame::StreamMaxData {
-                                stream_id,
-                                max_offset,
-                            },
-                        )
-                        .await?;
-                }
-                Frame::StreamFin {
-                    stream_id,
-                    final_offset,
-                } => {
-                    context
-                        .reliable_streams
-                        .route_frame(
-                            session_id,
-                            stream_id,
-                            Frame::StreamFin {
-                                stream_id,
-                                final_offset,
-                            },
-                        )
-                        .await?;
-                }
-                Frame::StreamDetach { stream_id } => {
-                    attached_streams.remove(&stream_id);
-                    context.reliable_streams.detach_path(
-                        session_id,
-                        stream_id,
-                        UnderlayProtocol::Tcp,
-                        path_id,
-                        &commands_tx,
-                    );
-                    if draining && attached_streams.is_empty() && datagram_flows.is_empty() {
-                        if !server_write_tcp_path_frame(
-                            &mut writer,
-                            &Frame::PathClose {
-                                path_id,
-                                reason: CloseReason::Normal,
-                            },
-                        )
-                        .await?
-                        {
-                            return Ok(());
-                        }
-                        return Ok(());
-                    }
-                }
-                Frame::StreamReset { stream_id, reason } => {
-                    context
-                        .reliable_streams
-                        .route_frame(
-                            session_id,
-                            stream_id,
-                            Frame::StreamReset { stream_id, reason },
-                        )
-                        .await?;
-                }
-                Frame::Ping { nonce } => {
-                    if !server_write_tcp_path_frame(&mut writer, &Frame::Pong { nonce }).await? {
-                        return Ok(());
-                    }
-                }
-                Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
-                    context.reliable_streams.record_path_metrics(
-                        session_id,
-                        UnderlayProtocol::Tcp,
-                        path_id,
-                        metrics,
-                    );
-                }
-                Frame::PathDrain {
-                    path_id: drain_path_id,
-                } if drain_path_id == path_id => {
-                    draining = true;
-                    if !server_write_tcp_path_frame(
-                        &mut writer,
-                        &Frame::PathStatus {
+                            UnderlayProtocol::Tcp,
                             path_id,
-                            status: crate::protocol::PathStatus::Draining,
-                            capabilities: path_capabilities,
+                            metrics,
+                        );
+                    }
+                    Frame::PathDrain {
+                        path_id: drain_path_id,
+                    } if drain_path_id == path_id => {
+                        draining = true;
+                        if !server_write_tcp_path_frame(
+                            &mut writer,
+                            &Frame::PathStatus {
+                                path_id,
+                                status: crate::protocol::PathStatus::Draining,
+                                capabilities: path_capabilities,
+                            },
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        if attached_streams.is_empty() && datagram_flows.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    Frame::PathClose {
+                        path_id: close_path_id,
+                        ..
+                    } if close_path_id == path_id => return Ok(()),
+                    Frame::SessionClose { .. } => return Ok(()),
+                    _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
+                }
+                if let Some(command) = try_recv_tcp_path_command(&mut commands_rx) {
+                    let keep_running = drain_server_tcp_path_commands(
+                        command,
+                        &mut commands_rx,
+                        &mut writer,
+                        &context,
+                        &mut attached_streams,
+                        &mut datagram_flows,
+                        ServerTcpPathCommandContext {
+                            session_id,
+                            path_id,
+                            commands_tx: &commands_tx,
+                            draining,
+                            active_datagram_flows: 0,
                         },
                     )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                    if attached_streams.is_empty() && datagram_flows.is_empty() {
+                    .await?;
+                    if !keep_running {
                         return Ok(());
                     }
                 }
-                Frame::PathClose {
-                    path_id: close_path_id,
-                    ..
-                } if close_path_id == path_id => return Ok(()),
-                Frame::SessionClose { .. } => return Ok(()),
-                _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
-            },
+            }
         }
     }
 }
@@ -500,16 +524,95 @@ pub(super) struct ServerTcpPathCommandContext<'a> {
     active_datagram_flows: usize,
 }
 
+async fn drain_server_tcp_path_commands(
+    first_command: TcpPathSessionCommand,
+    commands_rx: &mut TcpPathSessionCommandReceivers,
+    writer: &mut EncryptedTcpWriter,
+    context: &ServerPathContext,
+    attached_streams: &mut HashSet<StreamId>,
+    datagram_flows: &mut Vec<ServerUdpDatagramFlow>,
+    command_context: ServerTcpPathCommandContext<'_>,
+) -> Result<bool, RuntimeError> {
+    #[cfg(feature = "lab-diagnostics")]
+    let drain_started = Instant::now();
+    let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
+    let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
+    let mut next_command = Some(first_command);
+    let mut sent_bytes = 0usize;
+    let mut sent_items = 0usize;
+    let mut wrote_frame = false;
+
+    loop {
+        let Some(command) = next_command
+            .take()
+            .or_else(|| try_recv_tcp_path_command(commands_rx))
+        else {
+            break;
+        };
+        let pending_bytes = tcp_path_command_pending_bytes(&command);
+        if let TcpPathSessionCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
+            datagram_flows.retain(|flow| flow.flow_id != *flow_id);
+        }
+        let is_frame = matches!(command, TcpPathSessionCommand::SendFrame(_));
+        let keep_running = handle_server_tcp_path_command(
+            command,
+            writer,
+            context,
+            attached_streams,
+            ServerTcpPathCommandContext {
+                active_datagram_flows: datagram_flows.len(),
+                ..command_context
+            },
+            false,
+        )
+        .await?;
+        commands_rx.release_pending_command_bytes(pending_bytes);
+        if !keep_running {
+            return Ok(false);
+        }
+        if is_frame {
+            wrote_frame = true;
+            sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+        }
+        sent_items = sent_items.saturating_add(1);
+        if sent_bytes >= byte_budget || sent_items >= item_budget {
+            break;
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "path_writer_drain",
+        format_args!(
+            "role=server underlay=Tcp path_id={} sent_items={} sent_bytes={} byte_budget={} item_budget={} pending_bytes_after={} elapsed_us={} hit_byte_budget={} hit_item_budget={}",
+            command_context.path_id.0,
+            sent_items,
+            sent_bytes,
+            byte_budget,
+            item_budget,
+            commands_rx.pending_bytes(),
+            drain_started.elapsed().as_micros(),
+            sent_bytes >= byte_budget,
+            sent_items >= item_budget,
+        ),
+    );
+    if wrote_frame && !server_flush_tcp_path_writer(writer).await? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub(super) async fn handle_server_tcp_path_command(
     command: TcpPathSessionCommand,
     writer: &mut EncryptedTcpWriter,
     context: &ServerPathContext,
     attached_streams: &mut HashSet<StreamId>,
     command_context: ServerTcpPathCommandContext<'_>,
+    flush_after_frame: bool,
 ) -> Result<bool, RuntimeError> {
     match command {
         TcpPathSessionCommand::SendFrame(frame) => {
-            server_write_tcp_path_frame(writer, &frame).await
+            server_write_tcp_path_frame_maybe_flush(writer, &frame, flush_after_frame).await
         }
         TcpPathSessionCommand::CloseStream(stream_id) => {
             attached_streams.remove(&stream_id);
@@ -546,11 +649,28 @@ pub(super) async fn server_write_tcp_path_frame(
     framed: &mut EncryptedTcpWriter,
     frame: &Frame,
 ) -> Result<bool, RuntimeError> {
+    server_write_tcp_path_frame_maybe_flush(framed, frame, true).await
+}
+
+async fn server_write_tcp_path_frame_maybe_flush(
+    framed: &mut EncryptedTcpWriter,
+    frame: &Frame,
+    flush_after_frame: bool,
+) -> Result<bool, RuntimeError> {
     match framed.write_frame(frame).await {
         Ok(()) => {}
         Err(err) if encrypted_framed_peer_closed(&err) => return Ok(false),
         Err(err) => return Err(RuntimeError::Encrypted(err)),
     }
+    if !flush_after_frame {
+        return Ok(true);
+    }
+    server_flush_tcp_path_writer(framed).await
+}
+
+async fn server_flush_tcp_path_writer(
+    framed: &mut EncryptedTcpWriter,
+) -> Result<bool, RuntimeError> {
     match framed.flush().await {
         Ok(()) => Ok(true),
         Err(err) if encrypted_framed_peer_closed(&err) => Ok(false),

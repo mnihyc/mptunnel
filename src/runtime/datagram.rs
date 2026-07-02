@@ -166,9 +166,6 @@ fn udp_datagram_should_try_tcp_underlay(err: &RuntimeError, context: &ClientPath
                 | RuntimeError::NoSchedulableUdpPath
                 | RuntimeError::Io(_)
                 | RuntimeError::Udp(_)
-                | RuntimeError::UdpCarrierTransport(_)
-                | RuntimeError::UdpCarrierFrame(_)
-                | RuntimeError::UdpCarrierConnection(_)
                 | RuntimeError::QuicCarrier(_)
                 | RuntimeError::Auth(_)
                 | RuntimeError::RemoteClosed(_)
@@ -1304,9 +1301,6 @@ fn udp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
         err,
         RuntimeError::Io(_)
             | RuntimeError::Udp(_)
-            | RuntimeError::UdpCarrierTransport(_)
-            | RuntimeError::UdpCarrierFrame(_)
-            | RuntimeError::UdpCarrierConnection(_)
             | RuntimeError::QuicCarrier(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)

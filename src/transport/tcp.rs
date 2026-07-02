@@ -92,10 +92,12 @@ pub async fn connect_addr(
             None => TcpStream::connect(addr).await,
         }
     };
-    timeout(options.timeout, connect)
+    let stream = timeout(options.timeout, connect)
         .await
         .map_err(|_| TcpTransportError::ConnectTimedOut(addr))?
-        .map_err(TcpTransportError::Io)
+        .map_err(TcpTransportError::Io)?;
+    stream.set_nodelay(options.nodelay)?;
+    Ok(stream)
 }
 
 #[derive(Debug)]

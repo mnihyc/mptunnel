@@ -232,12 +232,63 @@ async fn run_client_tcp_path_session(
         let mut drop_connection = false;
         tokio::select! {
             biased;
+            frame = state.connection.as_mut().expect("checked connected TCP path session").frames.recv() => {
+                match frame {
+                    Some(Ok(frame)) => {
+                        if let Err(err) = handle_client_tcp_path_frame(
+                            frame,
+                            state.connection.as_mut().expect("checked connected TCP path session"),
+                            &mut state.streams,
+                            &mut state.closed_streams,
+                            runtime.mux_limits,
+                        )
+                        .await
+                        {
+                            fail_client_tcp_streams(&mut state.streams, &err);
+                            eprintln!("warning: TCP path session frame handling failed: {err}");
+                            drop_connection = true;
+                        } else if command_may_recv
+                            && let Some(command) = try_recv_tcp_path_command(&mut commands)
+                        {
+                            let result = handle_connected_client_tcp_command_run(
+                                command,
+                                &mut commands,
+                                state
+                                    .connection
+                                    .as_mut()
+                                    .expect("checked connected TCP path session"),
+                                &mut state.streams,
+                                &mut state.closed_streams,
+                                runtime.stream_frame_queue,
+                                runtime.mux_limits,
+                            )
+                            .await;
+                            if let Err(err) = result {
+                                fail_client_tcp_streams(&mut state.streams, &err);
+                                eprintln!("warning: TCP path session command failed: {err}");
+                                drop_connection = true;
+                            }
+                        }
+                    }
+                    Some(Err(err)) => {
+                        let err = RuntimeError::Encrypted(err);
+                        fail_client_tcp_streams(&mut state.streams, &err);
+                        eprintln!("warning: TCP path session read failed: {err}");
+                        drop_connection = true;
+                    }
+                    None => {
+                        let err = RuntimeError::TcpPathSessionClosed;
+                        fail_client_tcp_streams(&mut state.streams, &err);
+                        drop_connection = true;
+                    }
+                }
+            }
             command = recv_tcp_path_command(&mut commands), if command_may_recv => {
                 match command {
                     Some(command) => {
-                        let pending_bytes = tcp_path_command_pending_bytes(&command);
-                        let result = handle_connected_client_tcp_command(
+                        let result = handle_connected_client_tcp_command_run(
                             command,
+                            &mut commands,
                             state.connection.as_mut().expect("checked connected TCP path session"),
                             &mut state.streams,
                             &mut state.closed_streams,
@@ -245,7 +296,6 @@ async fn run_client_tcp_path_session(
                             runtime.mux_limits,
                         )
                         .await;
-                        commands.release_pending_command_bytes(pending_bytes);
                         if let Err(err) = result {
                             fail_client_tcp_streams(&mut state.streams, &err);
                             eprintln!("warning: TCP path session command failed: {err}");
@@ -264,36 +314,6 @@ async fn run_client_tcp_path_session(
                             }
                             return;
                         }
-                    }
-                }
-            }
-            frame = state.connection.as_mut().expect("checked connected TCP path session").frames.recv() => {
-                match frame {
-                    Some(Ok(frame)) => {
-                        if let Err(err) = handle_client_tcp_path_frame(
-                            frame,
-                            state.connection.as_mut().expect("checked connected TCP path session"),
-                            &mut state.streams,
-                            &mut state.closed_streams,
-                            runtime.mux_limits,
-                        )
-                        .await
-                        {
-                            fail_client_tcp_streams(&mut state.streams, &err);
-                            eprintln!("warning: TCP path session frame handling failed: {err}");
-                            drop_connection = true;
-                        }
-                    }
-                    Some(Err(err)) => {
-                        let err = RuntimeError::Encrypted(err);
-                        fail_client_tcp_streams(&mut state.streams, &err);
-                        eprintln!("warning: TCP path session read failed: {err}");
-                        drop_connection = true;
-                    }
-                    None => {
-                        let err = RuntimeError::TcpPathSessionClosed;
-                        fail_client_tcp_streams(&mut state.streams, &err);
-                        drop_connection = true;
                     }
                 }
             }
@@ -316,6 +336,75 @@ async fn run_client_tcp_path_session(
             state.connection = None;
         }
     }
+}
+
+async fn handle_connected_client_tcp_command_run(
+    first_command: TcpPathSessionCommand,
+    commands: &mut TcpPathSessionCommandReceivers,
+    connection: &mut ClientTcpPathConnection,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    stream_frame_queue: usize,
+    mux_limits: MuxLimits,
+) -> Result<(), RuntimeError> {
+    #[cfg(feature = "lab-diagnostics")]
+    let drain_started = Instant::now();
+    let byte_budget = tcp_path_command_writer_run_budget_bytes(mux_limits);
+    let item_budget = tcp_path_command_writer_run_budget_items(mux_limits);
+    let mut next_command = Some(first_command);
+    let mut sent_bytes = 0usize;
+    let mut sent_items = 0usize;
+    let mut wrote_frame = false;
+
+    loop {
+        let Some(command) = next_command
+            .take()
+            .or_else(|| try_recv_tcp_path_command(commands))
+        else {
+            break;
+        };
+        let pending_bytes = tcp_path_command_pending_bytes(&command);
+        let is_frame = matches!(command, TcpPathSessionCommand::SendFrame(_));
+        handle_connected_client_tcp_command(
+            command,
+            connection,
+            streams,
+            closed_streams,
+            stream_frame_queue,
+            mux_limits,
+            false,
+        )
+        .await?;
+        commands.release_pending_command_bytes(pending_bytes);
+        if is_frame {
+            wrote_frame = true;
+            sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+        }
+        sent_items = sent_items.saturating_add(1);
+        if sent_bytes >= byte_budget || sent_items >= item_budget {
+            break;
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "path_writer_drain",
+        format_args!(
+            "role=client underlay=Tcp sent_items={} sent_bytes={} byte_budget={} item_budget={} pending_bytes_after={} elapsed_us={} hit_byte_budget={} hit_item_budget={}",
+            sent_items,
+            sent_bytes,
+            byte_budget,
+            item_budget,
+            commands.pending_bytes(),
+            drain_started.elapsed().as_micros(),
+            sent_bytes >= byte_budget,
+            sent_items >= item_budget,
+        ),
+    );
+    if wrote_frame {
+        connection.writer.flush().await?;
+    }
+    Ok(())
 }
 
 async fn handle_disconnected_client_tcp_command(
@@ -381,6 +470,7 @@ async fn handle_connected_client_tcp_command(
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_frame_queue: usize,
     mux_limits: MuxLimits,
+    flush_after_frame: bool,
 ) -> Result<(), RuntimeError> {
     match command {
         TcpPathSessionCommand::OpenStream {
@@ -408,7 +498,9 @@ async fn handle_connected_client_tcp_command(
         }
         TcpPathSessionCommand::SendFrame(frame) => {
             connection.writer.write_frame(&frame).await?;
-            connection.writer.flush().await?;
+            if flush_after_frame {
+                connection.writer.flush().await?;
+            }
             record_client_tcp_path_outbound_activity(connection, mux_limits);
             Ok(())
         }
@@ -844,10 +936,7 @@ pub(super) fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
 }
 
 pub(super) fn tcp_path_command_queue(mux_limits: MuxLimits) -> usize {
-    let frame_payload = mux_limits
-        .max_reliable_relay_chunk_bytes
-        .min(mux_limits.max_payload_bytes)
-        .max(1);
+    let frame_payload = tcp_path_reliable_stream_queue_payload(mux_limits);
     tcp_path_command_queue_for_payload(mux_limits, frame_payload)
 }
 
@@ -867,11 +956,15 @@ pub(super) fn tcp_path_command_queue_for_payload(
 }
 
 pub(super) fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
-    let frame_payload = mux_limits
-        .max_reliable_relay_chunk_bytes
-        .min(mux_limits.max_payload_bytes)
-        .max(1);
+    let frame_payload = tcp_path_reliable_stream_queue_payload(mux_limits);
     tcp_path_session_frame_queue_for_payload(mux_limits, frame_payload)
+}
+
+fn tcp_path_reliable_stream_queue_payload(mux_limits: MuxLimits) -> usize {
+    reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+        .min(mux_limits.max_reliable_relay_chunk_bytes)
+        .min(mux_limits.max_payload_bytes)
+        .max(1)
 }
 
 pub(super) fn tcp_path_session_frame_queue_for_payload(

@@ -82,6 +82,10 @@ impl ReliablePathStream {
         self.output.subscribe_updates()
     }
 
+    pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        self.output.capacity_notifies()
+    }
+
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
         self.lane = lane;
         self.output.set_lane(lane);
@@ -118,6 +122,19 @@ impl ReliablePathStreamHandle {
         self.output.can_enqueue_frame_now(frame, lane)
     }
 
+    pub(super) fn can_enqueue_work_lane_now(
+        &self,
+        work_lane: ReliableRelayQueuedWorkLane,
+        relay_lane: FlowLane,
+    ) -> bool {
+        self.output
+            .can_enqueue_lane_now(reliable_work_lane_to_carrier_lane(work_lane, relay_lane))
+    }
+
+    pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        self.output.capacity_notifies()
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -138,6 +155,20 @@ impl ReliablePathStreamOutput {
         match self {
             Self::Fixed(commands) => commands.can_enqueue_frame_now(frame, lane),
             Self::Switchable(_) => true,
+        }
+    }
+
+    pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
+        match self {
+            Self::Fixed(commands) => commands.can_enqueue_lane_now(lane),
+            Self::Switchable(_) => false,
+        }
+    }
+
+    pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        match self {
+            Self::Fixed(commands) => vec![commands.capacity_notify()],
+            Self::Switchable(binding) => binding.capacity_notifies(),
         }
     }
 
@@ -215,6 +246,29 @@ impl ReliablePathStreamOutput {
             Self::Switchable(binding) => binding.has_multipath_repair_alternative(),
         }
     }
+}
+
+pub(super) fn reliable_work_lane_to_carrier_lane(
+    work_lane: ReliableRelayQueuedWorkLane,
+    relay_lane: FlowLane,
+) -> FlowLane {
+    match work_lane {
+        ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
+        ReliableRelayQueuedWorkLane::Repair => FlowLane::Latency,
+        ReliableRelayQueuedWorkLane::Data => relay_lane,
+    }
+}
+
+pub(super) async fn wait_for_carrier_capacity_notifies(notifies: Vec<Arc<Notify>>) {
+    if notifies.is_empty() {
+        tokio::task::yield_now().await;
+        return;
+    }
+    let waits = notifies
+        .into_iter()
+        .map(|notify| Box::pin(async move { notify.notified().await }))
+        .collect::<Vec<_>>();
+    let _ = futures::future::select_all(waits).await;
 }
 
 /// Server-side response owner for one product reliable stream.
@@ -296,6 +350,9 @@ impl ResponseStreamBinding {
                     commands,
                     bytes_in_flight: 0,
                     product_queue_bytes: 0,
+                    product_progress_rate_bps: None,
+                    delivery_rate_bps: None,
+                    srtt_ms: None,
                     delivery_samples: 0,
                     last_delivery_at: None,
                     path_metrics: None,
@@ -342,6 +399,9 @@ impl ResponseStreamBinding {
                     commands,
                     bytes_in_flight: 0,
                     product_queue_bytes: 0,
+                    product_progress_rate_bps: None,
+                    delivery_rate_bps: None,
+                    srtt_ms: None,
                     delivery_samples: 0,
                     last_delivery_at: None,
                     path_metrics: None,
@@ -415,6 +475,16 @@ impl ResponseStreamBinding {
         if changed {
             self.notify_update();
         }
+    }
+
+    fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .map(|entry| entry.commands.capacity_notify())
+            .collect()
     }
 
     pub(super) fn set_lane(&self, lane: FlowLane) {
@@ -563,6 +633,28 @@ impl ResponseStreamBinding {
                 .find(|entry| entry.key == flight.key)
             {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
+                if flight.stream_ack_proves_path {
+                    let elapsed = now.saturating_duration_since(flight.sent_at);
+                    if let Some(sample) = PathRateSample::new(flight.bytes as u64, elapsed) {
+                        let sample_bps = sample.rate_bps();
+                        entry.product_progress_rate_bps =
+                            Some(match entry.product_progress_rate_bps {
+                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                                None => sample_bps,
+                            });
+                        if entry.key.underlay == UnderlayProtocol::Tcp {
+                            entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
+                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                                None => sample_bps,
+                            });
+                            let sample_rtt_ms = elapsed.as_secs_f64() * 1000.0;
+                            entry.srtt_ms = Some(match entry.srtt_ms {
+                                Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
+                                None => sample_rtt_ms,
+                            });
+                        }
+                    }
+                }
                 changed = true;
             }
         }
@@ -615,6 +707,7 @@ impl ResponseStreamBinding {
                 key,
                 end,
                 bytes,
+                sent_at: Instant::now(),
                 stream_ack_proves_path,
             });
     }
@@ -646,7 +739,7 @@ impl ResponseStreamBinding {
         keys
     }
 
-    fn lower_flights_before_offset(&self, offset: u64) -> Vec<CarrierPathFlightDebt> {
+    pub(super) fn lower_flights_before_offset(&self, offset: u64) -> Vec<CarrierPathFlightDebt> {
         let mut debts = BTreeMap::<u64, CarrierPathFlightDebt>::new();
         {
             let flights = self
@@ -899,5 +992,89 @@ impl ServerPathLaneTracker {
                     .saturating_add(load.active_latency_sensitive_flows);
                 total
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    fn binding_for_underlay(
+        underlay: UnderlayProtocol,
+    ) -> (Arc<ResponseStreamBinding>, CarrierPathKey) {
+        let (commands, _receivers) = tcp_path_session_command_channels(8);
+        let key = CarrierPathKey {
+            underlay,
+            path_id: PathId(0),
+        };
+        let binding = ResponseStreamBinding::new(
+            SessionId(42),
+            underlay,
+            key.path_id,
+            commands,
+            FlowLane::Throughput,
+        );
+        (binding, key)
+    }
+
+    fn stream_data_frame(payload_len: usize) -> Frame {
+        Frame::StreamData {
+            stream_id: StreamId(7),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x5a; payload_len]),
+        }
+    }
+
+    fn first_output_entry(binding: &ResponseStreamBinding) -> ResponseStreamOutputEntry {
+        binding
+            .outputs
+            .lock()
+            .expect("test response outputs lock")
+            .entries
+            .first()
+            .expect("test response binding has output")
+            .clone()
+    }
+
+    #[test]
+    fn udp_stream_ack_releases_product_flight_without_seeding_carrier_rate() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Udp);
+        let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
+
+        binding.record_flight(key, &frame, true);
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: reliable_stream_frame_payload_bytes(&frame) as u64,
+        }]);
+
+        let entry = first_output_entry(&binding);
+        assert_eq!(entry.bytes_in_flight, 0);
+        assert_eq!(entry.delivery_samples, 1);
+        assert!(entry.product_progress_rate_bps.is_some());
+        assert!(entry.delivery_rate_bps.is_none());
+        assert!(entry.srtt_ms.is_none());
+    }
+
+    #[test]
+    fn tcp_stream_ack_can_seed_response_path_rate_when_no_packet_carrier_exists() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
+
+        binding.record_flight(key, &frame, true);
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: reliable_stream_frame_payload_bytes(&frame) as u64,
+        }]);
+
+        let entry = first_output_entry(&binding);
+        assert_eq!(entry.bytes_in_flight, 0);
+        assert_eq!(entry.delivery_samples, 1);
+        assert!(entry.delivery_rate_bps.is_some());
+        assert!(entry.srtt_ms.is_some());
     }
 }

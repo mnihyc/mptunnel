@@ -58,7 +58,7 @@ pub(crate) fn lab_sender_service_decision(
         return;
     }
     if role == "server"
-        && decision_kind == "primary"
+        && matches!(decision_kind, "primary" | "data")
         && frame_kind == "stream_data"
         && let Some(session_id) = session_id
     {

@@ -141,6 +141,7 @@ pub(super) async fn run_server_tcp_listener(
 ) -> Result<(), RuntimeError> {
     loop {
         let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         let context = context.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_server_path(stream, context).await {

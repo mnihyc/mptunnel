@@ -945,7 +945,7 @@ fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
 
     {
         let mut health = context.health.lock().expect("health lock");
-        health.udp[0].mark_udp_carrier_metrics(udp_carrier::UdpCarrierPathMetrics {
+        health.udp[0].mark_udp_carrier_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(42),
             rttvar: Duration::from_millis(7),
@@ -956,11 +956,6 @@ fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
             inflight_hi: 512 * 1024,
             bytes_in_flight: 48 * 1024,
             pending_bytes: 64 * 1024,
-            target_datagram_bytes: 1400,
-            loss_events: 0,
-            spurious_loss_events: 0,
-            packet_loss_threshold: 3,
-            pto_count: 0,
             app_limited: true,
             delivery_sample_count: 0,
             last_delivery_sample_at: None,
@@ -980,7 +975,7 @@ fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
 
     {
         let mut health = context.health.lock().expect("health lock");
-        health.udp[0].mark_udp_carrier_metrics(udp_carrier::UdpCarrierPathMetrics {
+        health.udp[0].mark_udp_carrier_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(42),
             rttvar: Duration::from_millis(7),
@@ -991,11 +986,6 @@ fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
             inflight_hi: 512 * 1024,
             bytes_in_flight: 48 * 1024,
             pending_bytes: 64 * 1024,
-            target_datagram_bytes: 1400,
-            loss_events: 0,
-            spurious_loss_events: 0,
-            packet_loss_threshold: 3,
-            pto_count: 0,
             app_limited: false,
             delivery_sample_count: 2,
             last_delivery_sample_at: Some(now),

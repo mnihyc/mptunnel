@@ -145,7 +145,7 @@ def collect_metrics(
                 event == "sender_service_decision"
                 and parsed.get("role") == "server"
                 and parsed.get("frame_kind") == "stream_data"
-                and parsed.get("decision_kind") == "primary"
+                and parsed.get("decision_kind") in {"primary", "data"}
             ):
                 sender_decisions += 1
             elif event == "receive_hole":

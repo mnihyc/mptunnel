@@ -11,9 +11,6 @@ use crate::transport::encrypted::EncryptedFramedTransportError;
 use crate::transport::quic_carrier::QuicCarrierError;
 use crate::transport::tcp::TcpTransportError;
 use crate::transport::udp::UdpTransportError;
-use crate::transport::udp_carrier::{
-    UdpCarrierConnectionError, UdpCarrierFrameError, UdpCarrierTransportError,
-};
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -21,9 +18,6 @@ pub enum RuntimeError {
     Tcp(TcpTransportError),
     Udp(UdpTransportError),
     Encrypted(EncryptedFramedTransportError),
-    UdpCarrierTransport(UdpCarrierTransportError),
-    UdpCarrierFrame(UdpCarrierFrameError),
-    UdpCarrierConnection(UdpCarrierConnectionError),
     QuicCarrier(QuicCarrierError),
     Auth(AuthError),
     Random(getrandom::Error),
@@ -73,24 +67,6 @@ impl From<UdpTransportError> for RuntimeError {
 impl From<EncryptedFramedTransportError> for RuntimeError {
     fn from(value: EncryptedFramedTransportError) -> Self {
         Self::Encrypted(value)
-    }
-}
-
-impl From<UdpCarrierTransportError> for RuntimeError {
-    fn from(value: UdpCarrierTransportError) -> Self {
-        Self::UdpCarrierTransport(value)
-    }
-}
-
-impl From<UdpCarrierFrameError> for RuntimeError {
-    fn from(value: UdpCarrierFrameError) -> Self {
-        Self::UdpCarrierFrame(value)
-    }
-}
-
-impl From<UdpCarrierConnectionError> for RuntimeError {
-    fn from(value: UdpCarrierConnectionError) -> Self {
-        Self::UdpCarrierConnection(value)
     }
 }
 
@@ -155,9 +131,6 @@ impl std::fmt::Display for RuntimeError {
             Self::Tcp(err) => write!(f, "{err}"),
             Self::Udp(err) => write!(f, "{err}"),
             Self::Encrypted(err) => write!(f, "{err}"),
-            Self::UdpCarrierTransport(err) => write!(f, "{err}"),
-            Self::UdpCarrierFrame(err) => write!(f, "{err}"),
-            Self::UdpCarrierConnection(err) => write!(f, "{err}"),
             Self::QuicCarrier(err) => write!(f, "{err}"),
             Self::Auth(err) => write!(f, "{err}"),
             Self::Random(err) => write!(f, "random source failed: {err}"),
@@ -218,9 +191,6 @@ impl std::error::Error for RuntimeError {
             Self::Tcp(err) => Some(err),
             Self::Udp(err) => Some(err),
             Self::Encrypted(err) => Some(err),
-            Self::UdpCarrierTransport(err) => Some(err),
-            Self::UdpCarrierFrame(err) => Some(err),
-            Self::UdpCarrierConnection(err) => Some(err),
             Self::QuicCarrier(err) => Some(err),
             Self::Auth(err) => Some(err),
             Self::Random(_) => None,

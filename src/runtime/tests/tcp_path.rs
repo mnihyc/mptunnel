@@ -177,6 +177,45 @@ async fn tcp_path_control_command_bypasses_saturated_data_queue() {
 }
 
 #[tokio::test]
+async fn tcp_path_priority_probe_does_not_consume_bulk_data() {
+    let (tx, mut rx) = tcp_path_session_command_channels(2);
+    tx.try_enqueue_admitted_frame(
+        Frame::StreamData {
+            stream_id: StreamId(10),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"bulk"),
+        },
+        FlowLane::Throughput,
+    )
+    .expect("queue bulk data");
+
+    assert!(
+        try_recv_tcp_path_priority_command(&mut rx).is_none(),
+        "priority-only probe must not consume ordinary data"
+    );
+
+    tx.try_enqueue_admitted_frame(
+        Frame::StreamAck {
+            stream_id: StreamId(10),
+            complete: false,
+            ranges: Vec::new(),
+        },
+        FlowLane::Throughput,
+    )
+    .expect("queue product feedback");
+
+    assert!(matches!(
+        try_recv_tcp_path_priority_command(&mut rx),
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+    assert!(matches!(
+        recv_tcp_path_command(&mut rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+}
+
+#[tokio::test]
 async fn fixed_reliable_path_close_is_carrier_local_without_hidden_detach() {
     let (commands, mut commands_rx) = tcp_path_session_command_channels(4);
     let stream = ReliablePathStreamHandle {

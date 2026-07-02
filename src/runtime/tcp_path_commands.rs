@@ -20,6 +20,7 @@ pub(super) struct TcpPathSessionCommandReceivers {
 #[derive(Default)]
 struct TcpPathSessionCommandQueueMetrics {
     pending_bytes: AtomicU64,
+    capacity_released: Arc<Notify>,
 }
 
 impl TcpPathSessionCommandQueueMetrics {
@@ -35,6 +36,7 @@ impl TcpPathSessionCommandQueueMetrics {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(bytes))
             });
+        self.capacity_released.notify_waiters();
     }
 
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
@@ -46,6 +48,11 @@ impl TcpPathSessionCommandQueueMetrics {
 impl TcpPathSessionCommandReceivers {
     pub(super) fn release_pending_command_bytes(&self, bytes: usize) {
         self.metrics.release_pending_bytes(bytes);
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn pending_bytes(&self) -> u64 {
+        self.metrics.pending_bytes()
     }
 }
 
@@ -138,11 +145,19 @@ impl TcpPathSessionCommandSender {
 
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         let effective_lane = tcp_path_effective_frame_lane(frame, lane);
-        if tcp_path_frame_uses_priority_queue(effective_lane) {
+        self.can_enqueue_lane_now(effective_lane)
+    }
+
+    pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
+        if tcp_path_frame_uses_priority_queue(lane) {
             self.priority.capacity() > 0
         } else {
             self.data.capacity() > 0
         }
+    }
+
+    pub(super) fn capacity_notify(&self) -> Arc<Notify> {
+        self.metrics.capacity_released.clone()
     }
 
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
@@ -254,6 +269,26 @@ pub(super) async fn recv_tcp_path_command(
         (false, false, true) => receivers.data.recv().await,
         (false, false, false) => None,
     }
+}
+
+pub(super) fn try_recv_tcp_path_command(
+    receivers: &mut TcpPathSessionCommandReceivers,
+) -> Option<TcpPathSessionCommand> {
+    recv_ready_priority_command(receivers).or_else(|| receivers.data.try_recv().ok())
+}
+
+pub(super) fn try_recv_tcp_path_priority_command(
+    receivers: &mut TcpPathSessionCommandReceivers,
+) -> Option<TcpPathSessionCommand> {
+    recv_ready_priority_command(receivers)
+}
+
+pub(super) fn tcp_path_command_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
+    reliable_relay_buffer_len(mux_limits).max(1)
+}
+
+pub(super) fn tcp_path_command_writer_run_budget_items(mux_limits: MuxLimits) -> usize {
+    tcp_path_command_queue(mux_limits).max(1)
 }
 
 fn recv_ready_priority_command(

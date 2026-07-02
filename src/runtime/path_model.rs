@@ -501,6 +501,7 @@ pub(super) fn path_snapshot(
         srtt_ms,
         jitter_ms,
         delivery_rate_bps,
+        product_progress_rate_bps: None,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
         queue_bytes: observation.carrier_queue_bytes,
         product_queue_bytes: observation.relay_queue_bytes,

@@ -192,7 +192,9 @@ fn quic_transport_config(mux_limits: MuxLimits) -> TransportConfig {
         .saturating_add(mux_limits.max_reorder_bytes as u64)
         .saturating_add(mux_limits.max_datagram_queue_bytes as u64)
         .saturating_add(mux_limits.max_tcp_path_inflight_bytes as u64);
-    let send_window = connection_receive_window.max(stream_receive_window);
+    let send_window = (mux_limits.max_tcp_path_inflight_bytes as u64)
+        .max(mux_limits.max_reliable_relay_chunk_bytes as u64)
+        .max(1);
     let concurrent_streams = (connection_receive_window / stream_receive_window)
         .max(1)
         .min(mux_limits.max_streams as u64);
@@ -509,7 +511,7 @@ mod tests {
         let rendered = format!("{transport:?}");
         assert!(rendered.contains("stream_receive_window: 67108864"));
         assert!(rendered.contains("receive_window: 251658240"));
-        assert!(rendered.contains("send_window: 251658240"));
+        assert!(rendered.contains("send_window: 33554432"));
         assert!(rendered.contains("max_concurrent_bidi_streams: 3"));
         assert!(rendered.contains("max_concurrent_uni_streams: 0"));
     }

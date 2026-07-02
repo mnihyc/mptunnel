@@ -21,14 +21,13 @@ pub(super) use crate::protocol::{
 pub(super) use crate::scheduler::{
     self, FlowDemand, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };
+pub(super) use crate::transport::PathSpec;
 pub(super) use crate::transport::encrypted::{
     EncryptedFramedReader, EncryptedFramedStream, EncryptedFramedTransportError,
     EncryptedFramedWriter, PeerRole,
 };
 pub(super) use crate::transport::quic_carrier;
 pub(super) use crate::transport::tcp::{self, TcpConnectOptions};
-pub(super) use crate::transport::udp_carrier;
-pub(super) use crate::transport::{PathSpec, UdpEngine};
 pub(super) use bytes::{Bytes, BytesMut};
 pub(super) use futures::{SinkExt, StreamExt};
 pub(super) use netstack_smoltcp::{
@@ -41,6 +40,6 @@ pub(super) use std::sync::{Arc, Mutex};
 pub(super) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(super) use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub(super) use tokio::net::{TcpListener, TcpStream, UdpSocket};
-pub(super) use tokio::sync::{mpsc, oneshot, watch};
+pub(super) use tokio::sync::{Notify, mpsc, oneshot, watch};
 pub(super) use tun_rs::DeviceBuilder;
 pub(super) use tun_rs::async_framed::{BytesCodec, DeviceFramed};

@@ -230,6 +230,18 @@ impl ReliableRelayRemoteSet {
         !self.frames_rx.is_empty()
     }
 
+    pub(super) fn can_enqueue_work_lane_now(
+        &self,
+        work_lane: ReliableRelayQueuedWorkLane,
+        relay_lane: FlowLane,
+    ) -> bool {
+        self.paths.len() == 1
+            && self
+                .paths
+                .first()
+                .is_some_and(|path| path.stream.can_enqueue_work_lane_now(work_lane, relay_lane))
+    }
+
     pub(super) async fn close_all(&mut self) {
         let paths = std::mem::take(&mut self.paths);
         for path in paths {
@@ -691,9 +703,7 @@ pub(super) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> boo
         err,
         RuntimeError::Io(_)
             | RuntimeError::Udp(_)
-            | RuntimeError::UdpCarrierTransport(_)
-            | RuntimeError::UdpCarrierFrame(_)
-            | RuntimeError::UdpCarrierConnection(_)
+            | RuntimeError::QuicCarrier(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)

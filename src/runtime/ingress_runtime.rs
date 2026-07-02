@@ -31,6 +31,7 @@ pub(super) async fn run_socks5_client_listener(
 ) -> Result<(), RuntimeError> {
     loop {
         let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         let context = context.clone();
         let proxy_auth = proxy_auth.clone();
         tokio::spawn(async move {
@@ -75,6 +76,7 @@ pub(super) async fn run_http_connect_client_listener(
 ) -> Result<(), RuntimeError> {
     loop {
         let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         let context = context.clone();
         let proxy_auth = proxy_auth.clone();
         tokio::spawn(async move {

@@ -781,28 +781,24 @@ mod tests {
     }
 
     #[test]
-    fn udp_quic_and_custom_lab_engines_are_supported() {
+    fn udp_paths_use_quic_without_engine_selector() {
         let default_path = "udp://127.0.0.1:443"
             .parse::<PathSpec>()
             .expect("default udp path parses");
-        let quic_path = "udp://127.0.0.1:443?engine=quic"
-            .parse::<PathSpec>()
-            .expect("quic path parses");
-        let custom_lab_path = "udp://127.0.0.1:443?engine=custom-lab"
-            .parse::<PathSpec>()
-            .expect("custom lab path parses");
 
         assert_eq!(
-            default_path.metadata.udp_engine,
-            crate::transport::UdpEngine::Quic
+            default_path.underlay,
+            crate::protocol::UnderlayProtocol::Udp
         );
-        assert_eq!(
-            quic_path.metadata.udp_engine,
-            crate::transport::UdpEngine::Quic
+        assert!(
+            "udp://127.0.0.1:443?engine=quic"
+                .parse::<PathSpec>()
+                .is_err()
         );
-        assert_eq!(
-            custom_lab_path.metadata.udp_engine,
-            crate::transport::UdpEngine::CustomLab
+        assert!(
+            "udp://127.0.0.1:443?engine=custom-lab"
+                .parse::<PathSpec>()
+                .is_err()
         );
     }
 }

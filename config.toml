@@ -82,9 +82,8 @@ outbound = "edge-mpp"
 [[outbounds]]
 tag = "edge-mpp"
 protocol = "mpp"
-# udp:// uses the production QUIC engine by default. The custom-lab UDP engine
-# is opt-in for experiments only:
-# endpoints = ["udp://edge.example.com:7443?engine=custom-lab"]
+# udp:// uses the production QUIC carrier. There is no UDP engine selector in
+# production config; all UDP optimization work targets QUIC.
 endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
 # path_probe_interval_ms = 10000
 # path_probe_timeout_ms = 2000

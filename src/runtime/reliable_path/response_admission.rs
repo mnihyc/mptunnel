@@ -11,6 +11,9 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) commands: TcpPathSessionCommandSender,
     pub(super) bytes_in_flight: u64,
     pub(super) product_queue_bytes: u64,
+    pub(super) product_progress_rate_bps: Option<f64>,
+    pub(super) delivery_rate_bps: Option<f64>,
+    pub(super) srtt_ms: Option<f64>,
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) path_metrics: Option<ServerPathMetricsEntry>,
@@ -39,6 +42,7 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) key: CarrierPathKey,
     pub(super) end: u64,
     pub(super) bytes: usize,
+    pub(super) sent_at: Instant,
     pub(super) stream_ack_proves_path: bool,
 }
 
@@ -222,15 +226,19 @@ pub(super) fn server_bulk_output_snapshot(
     mux_limits: MuxLimits,
     now: Instant,
 ) -> PathSnapshot {
-    let local_sender_metrics = entry.path_metrics.and_then(|path_metrics| {
+    let local_carrier_metrics = entry.path_metrics.and_then(|path_metrics| {
         (path_metrics.source == ServerPathMetricsSource::LocalSender).then_some(path_metrics)
     });
     let validation_hint_metrics = entry
         .path_metrics
         .and_then(|path_metrics| (entry.delivery_samples == 0).then_some(path_metrics));
-    let model_metrics = local_sender_metrics.or(validation_hint_metrics);
+    let model_metrics = local_carrier_metrics.or(validation_hint_metrics);
     let srtt_ms = model_metrics.map_or_else(
-        || default_path_srtt_ms(entry.key.underlay),
+        || {
+            entry
+                .srtt_ms
+                .unwrap_or_else(|| default_path_srtt_ms(entry.key.underlay))
+        },
         |path_metrics| f64::from(path_metrics.metrics.srtt_us.max(1)) / 1000.0,
     );
     let jitter_ms = model_metrics.map_or(0.0, |path_metrics| {
@@ -242,14 +250,19 @@ pub(super) fn server_bulk_output_snapshot(
         })
         .clamp(0.0, 1.0);
     let model_rate_bps = model_metrics.map(server_path_metrics_rate_bps);
-    let local_sender_rate_bps = local_sender_metrics.map(server_path_metrics_rate_bps);
+    let local_sender_rate_bps = local_carrier_metrics
+        .map(server_path_metrics_rate_bps)
+        .or(entry.delivery_rate_bps);
+    let prior_rate_bps =
+        model_rate_bps.unwrap_or_else(|| default_path_rate_bps(entry.key.underlay));
     let rate_bps = match entry.key.underlay {
         UnderlayProtocol::Udp => local_sender_rate_bps,
-        UnderlayProtocol::Tcp => model_rate_bps,
+        UnderlayProtocol::Tcp => local_sender_rate_bps.map(|rate| rate.max(prior_rate_bps)),
     }
-    .unwrap_or_else(|| default_path_rate_bps(entry.key.underlay))
+    .unwrap_or(prior_rate_bps)
     .max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
+    snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
     if let Some(path_metrics) = model_metrics {
@@ -263,7 +276,7 @@ pub(super) fn server_bulk_output_snapshot(
     snapshot.product_queue_bytes = entry.product_queue_bytes;
     snapshot.bytes_in_flight = match entry.key.underlay {
         UnderlayProtocol::Udp => {
-            local_sender_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
+            local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
         }
         UnderlayProtocol::Tcp => entry.bytes_in_flight,
     };
@@ -385,6 +398,7 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
     entry.delivery_samples > 0
+        || entry.delivery_rate_bps.is_some()
         || matches!(
             entry.path_metrics,
             Some(ServerPathMetricsEntry {

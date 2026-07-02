@@ -12,6 +12,7 @@ use super::reliable_path::*;
 use super::server_runtime::*;
 use super::tcp_path::*;
 use super::tun_l4::*;
+use super::udp_metrics::UdpPathMetrics;
 use super::udp_path::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -571,7 +572,7 @@ impl ClientPathHealthRecord {
         self.measured_mtu_payload_bytes = Some(payload_bytes);
     }
 
-    pub(super) fn mark_udp_carrier_metrics(&mut self, metrics: udp_carrier::UdpCarrierPathMetrics) {
+    pub(super) fn mark_udp_carrier_metrics(&mut self, metrics: UdpPathMetrics) {
         if self.manual_disabled {
             return;
         }

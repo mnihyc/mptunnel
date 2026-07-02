@@ -157,6 +157,14 @@ where
             adaptive_reliable_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
         let sender_queue_limit =
             reliable_relay_sender_queue_limit(context.mux_limits, adaptive_inflight);
+        let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
+            reliable_relay_sender_dispatch_budget(
+                context.mux_limits,
+                relay_lane,
+                adaptive_chunk,
+                adaptive_inflight,
+                sender_queue_limit,
+            );
         #[cfg(feature = "lab-diagnostics")]
         if last_reported_budget != Some((relay_lane, adaptive_chunk, adaptive_inflight)) {
             lab_diagnostic(
@@ -207,10 +215,24 @@ where
             sender_retry_at = None;
         }
         let inbound_frame_ready = remotes.has_buffered_frame();
-        let queued_send_blocked = !sender_queue.is_empty() && sender_retry_at.is_some();
+        let queued_front_has_carrier_credit = sender_queue
+            .front_lane()
+            .is_some_and(|work_lane| remotes.can_enqueue_work_lane_now(work_lane, relay_lane));
+        let queued_send_blocked = !sender_queue.is_empty()
+            && sender_retry_at.is_some()
+            && !queued_front_has_carrier_credit;
         let queued_send_ready =
             !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
         let queued_send_retry_deadline = sender_retry_at.unwrap_or_else(tokio::time::Instant::now);
+        let carrier_capacity_notifies = if queued_send_blocked {
+            remotes
+                .paths
+                .iter()
+                .flat_map(|path| path.stream.capacity_notifies())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let can_read_by_flow = reliable_relay_can_read_product_source(
             local_open,
             queued_send_blocked,
@@ -536,45 +558,89 @@ where
                 }
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                match sender
-                    .dispatch_client_queued_work(
-                        context,
-                        &spec,
-                        relay_lane,
-                        &mut remotes,
-                        &mut send_stream,
-                        &mut sender_queue,
-                        local_open,
-                    )
-                    .await
+                let mut dispatched_items = 0usize;
+                let mut dispatched_payload_bytes = 0usize;
+                let mut blocked_by_carrier = false;
+                let mut dispatch_error = None;
+                while !sender_queue.is_empty()
+                    && dispatched_items < sender_dispatch_item_budget
+                    && (dispatched_payload_bytes < sender_dispatch_byte_budget
+                        || dispatched_items == 0)
                 {
-                    Ok(ClientQueuedDispatch::Data {
-                        path_key,
-                        payload_bytes,
-                    }) => {
-                        last_stream_progress_at = Instant::now();
-                        stats.record_payload_bytes(payload_bytes);
-                        path_stats
-                            .entry(path_key)
-                            .or_default()
-                            .record_payload_bytes(payload_bytes);
+                    match sender
+                        .dispatch_client_queued_work(
+                            context,
+                            &spec,
+                            relay_lane,
+                            &mut remotes,
+                            &mut send_stream,
+                            &mut sender_queue,
+                            local_open,
+                        )
+                        .await
+                    {
+                        Ok(ClientQueuedDispatch::Data {
+                            path_key,
+                            payload_bytes,
+                        }) => {
+                            dispatched_items = dispatched_items.saturating_add(1);
+                            dispatched_payload_bytes =
+                                dispatched_payload_bytes.saturating_add(payload_bytes);
+                            last_stream_progress_at = Instant::now();
+                            stats.record_payload_bytes(payload_bytes);
+                            path_stats
+                                .entry(path_key)
+                                .or_default()
+                                .record_payload_bytes(payload_bytes);
+                        }
+                        Ok(ClientQueuedDispatch::Repair {
+                            path_key,
+                            payload_bytes,
+                        }) => {
+                            let _ = (path_key, payload_bytes);
+                            dispatched_items = dispatched_items.saturating_add(1);
+                            last_stream_progress_at = Instant::now();
+                        }
+                        Err(RuntimeError::SenderServiceBlocked) => {
+                            blocked_by_carrier = true;
+                            break;
+                        }
+                        Err(err) => {
+                            dispatch_error = Some(err);
+                            break;
+                        }
                     }
-                    Ok(ClientQueuedDispatch::Repair {
-                        path_key,
-                        payload_bytes,
-                    }) => {
-                        let _ = (path_key, payload_bytes);
-                        last_stream_progress_at = Instant::now();
-                    }
-                    Err(RuntimeError::SenderServiceBlocked) => {
-                        sender_retry_at =
-                            Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
-                        continue;
-                    }
-                    Err(err) => break Err(err),
+                }
+                #[cfg(feature = "lab-diagnostics")]
+                if dispatched_items > 0 {
+                    lab_diagnostic(
+                        "client_sender_drain",
+                        format_args!(
+                            "stream_id={} lane={:?} dispatches={} payload_bytes={} byte_budget={} item_budget={} queue_bytes_after={} blocked_by_carrier={}",
+                            stream_id.0,
+                            relay_lane,
+                            dispatched_items,
+                            dispatched_payload_bytes,
+                            sender_dispatch_byte_budget,
+                            sender_dispatch_item_budget,
+                            sender_queue.bytes(),
+                            blocked_by_carrier,
+                        ),
+                    );
+                }
+                if blocked_by_carrier {
+                    sender_retry_at =
+                        Some(tokio::time::Instant::now() + UDP_MIN_RESPONSE_TIMEOUT);
+                }
+                if let Some(err) = dispatch_error {
+                    break Err(err);
                 }
             }
             _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
+                sender_retry_at = None;
+                continue;
+            }
+            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked => {
                 sender_retry_at = None;
                 continue;
             }
@@ -609,7 +675,7 @@ where
                     lab_diagnostic(
                         "client_sender_enqueue",
                         format_args!(
-                            "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={}",
+                            "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={} opportunistic=false",
                             stream_id.0,
                             relay_lane,
                             read,
@@ -618,6 +684,63 @@ where
                         ),
                     );
                     sender_queue.push_data(payload);
+                    let mut opportunistic_reads = 1usize;
+                    while local_open
+                        && opportunistic_reads < sender_dispatch_item_budget
+                        && reliable_relay_can_read_product_source(
+                            local_open,
+                            false,
+                            &send_stream,
+                            &sender_queue,
+                            context.mux_limits,
+                            sender_queue_limit,
+                        )
+                        && sender_queue.data_bytes() < sender_dispatch_byte_budget
+                    {
+                        let next_read_budget = reliable_relay_sender_queue_read_budget(
+                            &send_stream,
+                            &sender_queue,
+                            context.mux_limits,
+                            sender_queue_limit,
+                            adaptive_chunk.min(buf.len()),
+                        );
+                        if next_read_budget == 0 {
+                            break;
+                        }
+                        let read = tokio::select! {
+                            biased;
+                            read = local.read(&mut buf[..next_read_budget]) => read,
+                            _ = std::future::ready(()) => break,
+                        };
+                        let read = read.map_err(RuntimeError::Io)?;
+                        if read == 0 {
+                            local_open = false;
+                            pending_local_fin = true;
+                            break;
+                        }
+                        if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
+                            interactive_response_pending = true;
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        let copy_started = Instant::now();
+                        let payload = Bytes::copy_from_slice(&buf[..read]);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "client_sender_enqueue",
+                            format_args!(
+                                "stream_id={} lane={:?} payload_bytes={} queue_bytes={} queue_limit={} opportunistic=true",
+                                stream_id.0,
+                                relay_lane,
+                                read,
+                                sender_queue.bytes().saturating_add(read),
+                                sender_queue_limit,
+                            ),
+                        );
+                        sender_queue.push_data(payload);
+                        opportunistic_reads = opportunistic_reads.saturating_add(1);
+                    }
                 }
             }
             frame = async {

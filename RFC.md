@@ -144,9 +144,9 @@ TCP underlay:
   A TCP connection carrying `MPTE` encrypted product frames.
 
 UDP carrier:
-  A UDP packet transport with encrypted packet headers/payloads, packet numbers,
-  ACK ranges, frame fragmentation/reassembly, retransmission, pacing, and
-  connection continuity below product frames.
+  A QUIC transport association over UDP. QUIC owns packet numbers, packet ACKs,
+  packet loss recovery, PTO, congestion control, pacing, PMTU, and connection
+  continuity below product frames.
 
 Reliable stream:
   An ordered byte stream identified by `StreamId`, carried as `STREAM_DATA`
@@ -236,15 +236,16 @@ Scheduler/path model
 
 Underlay carrier
   TCP: MPTE encrypted framed stream
-  UDP: encrypted packet carrier with ACK ranges and retransmission
+  UDP: QUIC carrier stream over UDP
 
 Cryptographic layer
   AES-256-GCM by default, ChaCha20-Poly1305 optional
 ```
 
 The same product frames are used over TCP and UDP underlays. TCP underlay gives
-reachability and a reliable byte pipe. UDP underlay lets mptunnel own packet
-numbers, ACKs, pacing, loss recovery, and NAT rebinding behavior.
+reachability and a reliable byte pipe. UDP underlay lets QUIC own packet
+numbers, packet ACKs, pacing, loss recovery, congestion control, PMTU, and NAT
+rebinding behavior while mptunnel owns product semantics above the QUIC stream.
 
 Using one product frame grammar above both underlays prevents feature drift. A
 stream opened over TCP can later be repaired or reattached over UDP because
@@ -258,7 +259,8 @@ This mirrors the useful separation in mature transports: MPTCP separates the
 logical byte stream from subflow sequence spaces, QUIC separates streams from
 packet recovery, and BBR-style controllers separate delivery-rate models from
 application semantics. mptunnel applies the same separation while preserving
-proxy and TUN compatibility.
+proxy and TUN compatibility; it does not define a second UDP reliability
+protocol underneath QUIC.
 
 ### 4.1 Ownership Model
 
@@ -517,15 +519,17 @@ hard-coding lab pass/fail behavior:
   Receiver-side stream input queues and path command queues follow the same
   rule. Their depth is sized from the relevant byte window divided by the
   actual maximum product-frame payload used by the attachment, not from the TCP
-  relay chunk ceiling. A UDP carrier delivering roughly-MTU reliable fragments
-  therefore receives many more queue slots than a TCP path delivering large
-  relay frames for the same byte budget. This preserves byte-bounded memory
-  while preventing the carrier input loop or relay sender task from blocking
-  behind an artificially TCP-sized frame count.
+  relay chunk ceiling. A QUIC carrier may internally packetize one product frame
+  into many QUIC packets, but the mptunnel path command queue is still sized by
+  product-frame bytes and sender-service preemption points, not by a custom UDP
+  packet count. This preserves byte-bounded memory while preventing the carrier
+  input loop or relay sender task from blocking behind an artificially
+  TCP-sized frame count.
 * The 10s heartbeat interval and 30s timeout avoid noisy idle traffic while
   still detecting silent TCP path death fast enough for Auto to shift new work
-  before users experience long stalls. UDP paths use packet ACK/PTO state for
-  finer-grained data-plane recovery.
+  before users experience long stalls. UDP paths use QUIC connection state,
+  QUIC loss/PTO progress, and product ACK/repair evidence for finer-grained
+  data-plane recovery.
 
 ## 6. Path Specifications and Capabilities
 
@@ -647,20 +651,19 @@ in the internal transport. The framed AEAD envelope gives confidentiality,
 integrity, replay detection by counter, and deterministic record boundaries
 without relying on external TLS behavior.
 
-### 7.4 UDP Carrier Key Derivation
+### 7.4 QUIC Carrier Keying
 
-UDP carrier packets derive a per-connection key:
+UDP carrier packet protection is QUIC packet protection. QUIC TLS derives the
+packet-protection keys and nonces according to the QUIC and TLS specifications.
+mptunnel binds that QUIC identity to the operator secret by deriving the server
+certificate and client trust anchor from the shared secret, then requiring the
+normal product `SESSION_AUTH` and `PATH_JOIN` transcript after the QUIC
+handshake. mptunnel MUST NOT define or negotiate a separate UDP packet AEAD key
+below QUIC.
 
-```
-SHA256("mptunnel udp carrier packet key v1" ||
-       cipher_suite_context ||
-       connection_id_be64 ||
-       master_secret)
-```
+### 7.5 TCP Nonce Construction
 
-### 7.5 Nonce Construction
-
-TCP framed encryption and UDP carrier packet encryption use a 12-byte nonce:
+TCP framed encryption uses a 12-byte nonce:
 
 ```
 byte 0      direction
@@ -673,12 +676,12 @@ Direction values are:
 * 1: client to server
 * 2: server to client
 
-Counters and packet numbers MUST NOT repeat for the same key and direction.
+Counters MUST NOT repeat for the same key and direction.
 
-The direction byte and monotonic counter or packet number make nonce uniqueness
-easy to audit. Direction separation prevents a packet emitted by one peer from
-being valid as a replay in the opposite direction under the same session
-material.
+The direction byte and monotonic counter make nonce uniqueness easy to audit.
+Direction separation prevents a record emitted by one peer from being valid as
+a replay in the opposite direction under the same session material. QUIC packet
+nonces are owned by QUIC and are not part of the `MPTE` TCP framed envelope.
 
 ### 7.6 Session Authentication
 
@@ -2011,27 +2014,26 @@ enforced by bounded product-frame quanta and DRR/ECF admission at frame
 boundaries, not by letting unrelated bulk streams or a sustained urgent backlog
 indefinitely overtake the missing tail of one partially sent product frame.
 
-UDP segmentation offload is allowed only as a carrier submission optimization.
-When the platform supports a safe primitive such as Linux `UDP_SEGMENT`, a
-sender MAY hand a run of already-due UDP carrier packets to the kernel as one
-segmented write. Each segment is still exactly one encoded carrier packet with
-its own packet number, AEAD nonce, ACK-eliciting property, pending record, loss
-state, and PTO state. The receiver observes ordinary UDP carrier packets; the
-protocol does not define a larger wire datagram or a different reliability mode.
-Segmentation MUST NOT be used for carrier ACK-only feedback, MUST stop at
-controller pacing or inflight gates, and MUST fall back to ordinary datagram
-writes with identical wire semantics when the operating system or path does not
-support it.
+QUIC batching, generic segmentation offload, and platform-specific send
+coalescing are allowed only as carrier implementation optimizations. They do
+not create a mptunnel UDP packet format. The sender service may hand a bounded
+run of already-admitted product frames to the QUIC implementation, and QUIC may
+packetize, pace, segment, or coalesce that work according to its own transport
+state. mptunnel MUST NOT rely on a platform segmentation primitive for protocol
+correctness, MUST preserve sender-service preemption before admitting the next
+product-frame run, and MUST treat QUIC packet ACK/loss/PTO as carrier telemetry
+rather than product stream delivery.
 
 The sender service owns queued-but-not-sent product bytes. The stream repair
 cache owns unacknowledged stream ranges. The path flight ledger owns the mapping
 from stream ranges to the last path that carried them. The receiver flow-control
-state owns advertised stream and connection credit. A UDP controller owns
-carrier packet bytes in flight, cwnd or inflight-high state, pacing state, PTO
-state, and ACK-derived delivery samples. TCP path state owns encrypted frame
-write pressure and path-level inflight accounting. An implementation MUST NOT
-count the same byte as free in more than one owner, and MUST release ownership
-only from the corresponding ACK, loss, failure, expiry, or local-delivery event.
+state owns advertised stream and connection credit. A QUIC carrier owns UDP
+packet bytes in flight, congestion-window or inflight-high state, pacing state,
+PTO state, and ACK-derived delivery samples below the product stream. TCP path
+state owns encrypted frame write pressure and path-level inflight accounting. An
+implementation MUST NOT count the same byte as free in more than one owner, and
+MUST release ownership only from the corresponding ACK, loss, failure, expiry,
+or local-delivery event.
 For reliable streams, ownership moves in this order: raw source byte in the
 sender queue, prepared dispatch candidate, repair-cache and product-flight entry
 immediately before carrier visibility, carrier-command acceptance, stream-ACK
@@ -2418,10 +2420,10 @@ evidence changes the frontier. This prevents a TCP or QUIC UDP writer from
 turning one lost or delayed lower byte into tens of MiB of undeliverable later
 offsets while still avoiding carrier starvation.
 
-Lead-path admission and lead-path repair are intentionally separate
-decisions. The lead path may keep a larger product queue than additional
-paths so that a UDP controller or TCP writer is not starved by slow product
-ACKs. A sender MUST NOT treat ordinary queued response bytes blocked by
+Lead-path admission and lead-path repair are intentionally separate decisions.
+The lead path may keep a larger product queue than additional paths so that a
+QUIC carrier stream or TCP writer is not starved by slow product ACKs. A sender
+MUST NOT treat ordinary queued response bytes blocked by
 unresolved lower-frontier debt as loss evidence by itself. In that condition it
 continues servicing carrier ACKs, product ACKs, control frames, flow-control
 updates, explicit gap repair, duplicate validation, and path events while the
@@ -2525,14 +2527,15 @@ does not advance the stream frontier, no promotion occurs.
 
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,
-mptunnel owns congestion control at the carrier packet sender, not at a hidden
-product queue. In both cases, lead and same-underlay product admission is derived
-from live BDP, path inflight evidence when it is smaller, the next quantum size,
-and the configured resource ceiling. The configured ceiling MUST NOT become the
-lead path's scheduling target merely because the path is attached or active.
-Actual encrypted-packet emission remains gated by the sender-side UDP controller
-or kernel TCP. This matches QUIC and BBR practice: the stream scheduler may have
-ready data, while the packet sender paces and gates network flight.
+QUIC owns carrier congestion control and packet pacing; mptunnel owns only the
+product work admitted to the QUIC stream. In both cases, lead and same-underlay
+product admission is derived from live BDP, path inflight evidence when it is
+smaller, the next quantum size, and the configured resource ceiling. The
+configured ceiling MUST NOT become the lead path's scheduling target merely
+because the path is attached or active. Actual network emission remains gated by
+the QUIC sender or kernel TCP. This matches QUIC and BBR practice: the stream
+scheduler may have ready data, while the packet sender paces and gates network
+flight.
 Cross-underlay ordinary striping is stricter: it also accounts for confidence and
 receiver reorder budget because TCP and UDP expose different loss, pacing, and
 head-of-line behavior.
@@ -2704,16 +2707,17 @@ into mixed-carrier reorder permission and reintroduce the all-path
 below-best-single-path failure mode.
 
 Product admission and carrier congestion control are separate gates, but they
-must be consistent. UDP carrier `inflight_hi` limits encrypted UDP packet
-emission inside the carrier controller and also gates how much new product work
-may be admitted onto an active UDP path. The configured product limit MUST NOT be
+must be consistent. QUIC carrier inflight or congestion-window state limits UDP
+packet emission inside QUIC and also constrains how much new product work may be
+admitted onto an active UDP path. The configured product limit MUST NOT be
 treated as a floor over carrier credit or BDP-derived credit. The product
-scheduler admits bounded, preemptible stream work; the carrier packetizer drains
-that work only when cwnd, pacing, and pending-byte gates permit; the stream
-repair layer separately retains product byte ranges until `STREAM_ACK` releases
-them. Cross-underlay additional paths remain stricter and may be rejected when
-carrier queue debt plus the next chunk exceeds the validation queue limit,
-because a heterogeneous speculative path can create head-of-line debt without
+scheduler admits bounded, preemptible stream work; the QUIC or TCP carrier
+drains that work only when its own send, pacing, and congestion gates permit;
+the stream repair layer separately retains product byte ranges until
+`STREAM_ACK` releases them. Cross-underlay additional paths remain stricter and
+may be rejected when carrier queue debt plus the next chunk exceeds the
+validation queue limit, because a heterogeneous speculative path can create
+head-of-line debt without
 improving completion time.
 
 Per-stream striping admission MUST NOT be confused with independent-flow
@@ -2828,10 +2832,9 @@ Backpressure points include:
 * stream flow-control offset;
 * repair cache bytes;
 * reorder buffer bytes;
-* UDP carrier orphan fragment bytes;
 * datagram queue bytes;
 * TCP path inflight bytes;
-* UDP carrier pending bytes;
+* QUIC carrier send pressure exposed by the QUIC library;
 * stream input queues sized by actual frame payload and reorder byte budget;
 * path command queues sized by actual frame payload and path inflight budget.
 
@@ -2980,9 +2983,11 @@ Lab diagnostics MAY expose:
 * timestamped scheduler decisions;
 * path model snapshots;
 * sender lane occupancy, deficit, flow ID, selected path, and rejection reason;
-* UDP carrier and controller ACK/loss/PTO events, including connection identity,
-  ACK ranges, ACK delay, released bytes, declared loss, spurious loss, pending
-  bytes, and probe batch size;
+* QUIC carrier ACK/loss/PTO/congestion events, including connection identity,
+  RTT, RTT variance, congestion window or inflight-high equivalent, pacing rate
+  when available, bytes sent, bytes acknowledged, application data progress,
+  close reason, and path validation or migration events exposed by the QUIC
+  library;
 * stream ACK and repair events, including `complete`, ACK range count,
   largest repair horizon, released bytes, repair-cache bytes before and after
   ACK application, generated repair frame count, active carrier, whether a
@@ -3039,11 +3044,12 @@ Implementations MUST:
 * reject short non-UUID secrets;
 * redact secrets and passwords in debug output;
 * use fresh AEAD nonces;
-* reject counter or packet-number replay;
+* reject TCP envelope counter replay and rely on QUIC packet protection to
+  reject QUIC packet replay;
 * validate authentication freshness;
 * maintain replay protection for path joins;
 * validate target ports and outbound policy support;
-* avoid exposing product metadata in UDP carrier plaintext;
+* avoid exposing product metadata in UDP carrier plaintext or QUIC SNI;
 * treat upstream proxy authentication and local proxy authentication separately.
 
 UUID-derived secrets are accepted for operator usability, but deployments SHOULD
@@ -3052,8 +3058,9 @@ decrypt with foreseeable computation when strong secrets and modern AEAD suites
 are used.
 
 mptunnel does not attempt to hide packet sizes, timing, endpoint IPs, or all
-traffic analysis signals. The UDP carrier removes protocol strings such as SNI
-from internal packets, but it is not a complete anonymity system.
+traffic analysis signals. The QUIC carrier disables fixed product-identifying
+SNI and carries product metadata only inside encrypted product frames, but it is
+not a complete anonymity system.
 
 ## 23. IANA Considerations
 
@@ -3063,7 +3070,8 @@ private to mptunnel protocol version 1.
 ## 24. Versioning and Compatibility
 
 Product frames use version 1 in the `MPTF` header. TCP envelopes use version 1
-in the `MPTE` header. UDP carrier packets use version 1 in byte 0.
+in the `MPTE` header. UDP carrier packets are QUIC packets and are versioned by
+QUIC; mptunnel does not define a separate UDP packet version byte.
 
 Receivers MUST reject unsupported versions. The project does not preserve
 backward compatibility for internal experimental versions. A later version that
@@ -3339,67 +3347,48 @@ on_ordered_delivery(stream, path, delivered_bytes):
     promote_path_to_active(path)
 ```
 
-### B.5 UDP Carrier Send
+### B.5 QUIC Carrier Send
 
 ```
-send_udp_payload(payload, reliable, ack_only):
-    packet_number = next_packet_number++
-    encrypted = AEAD(packet_header, payload)
-    if ack_only:
-        socket.send_to(encrypted, peer)
+send_product_frame_over_quic(frame, lane):
+    assert frame was admitted by sender_service
+    assert path_command_queue has emission credit for lane
+    encoded = length_prefix(encode_product_frame(frame))
+    quic_send_stream.write(encoded)
+    observe_quic_sender_metrics()
+
+on_quic_sender_metrics(path, metrics):
+    path_model.update_carrier_evidence(metrics)
+    notify_sender_service_capacity_if_credit_released()
+
+on_quic_connection_closed(path, reason):
+    mark_path_closed_or_suspect(reason)
+    queue_product_repair_for_unacked_stream_ranges_owned_by(path)
+```
+
+### B.6 QUIC Carrier Receive
+
+```
+receive_product_frame_from_quic():
+    encoded = quic_recv_stream.read_length_prefixed_frame()
+    frame = decode_product_frame(encoded)
+    if frame targets unknown_or_closed_product_object:
+        handle_as_product_orphan_or_reset()
         return
-    if reliable:
-        wait_until_controller_allows(packet_len)
-        pending[packet_number] = recoverable_payload, encoded_len, sent_at, deadline
-        controller.on_packet_sent(packet_len)
-    socket.send_to(encrypted, peer)
-
-on_confirmed_packet_loss(packet_number):
-    lost = pending.remove(packet_number)
-    controller.release_and_charge_loss(lost.encoded_len)
-    remember_recent_declared_loss(packet_number)
-    send_udp_recovery_payload(lost.recoverable_payload, fresh_packet_number)
+    deliver_frame_to_product_layer(frame)
+    if frame releases product_credit_or_path_flight:
+        notify_sender_service_capacity()
 ```
 
-### B.6 UDP Carrier Receive
+### B.7 QUIC Stall and Product Repair
 
 ```
-receive_udp_packet(packet, source):
-    header = parse_clear_header(packet)
-    plaintext = AEAD_decrypt(header, packet.payload)
-    peer = source
-    if payload.ack:
-        release_pending_ack_ranges(payload.ranges)
-        latest_rtt = now - sent_time[payload.largest_acked]
-        ack_delay = min(payload.ack_delay_us, max_ack_delay_us)
-        adjusted_rtt = adjust_rtt(latest_rtt, ack_delay, min_rtt)
-        update_rtt_and_delivery_rate(adjusted_rtt, acked_data_packets_only)
-        for lost in detect_packet_threshold_and_time_threshold_loss():
-            release_old_packet_ownership(lost.packet_number)
-            requeue_payload_with_fresh_packet_number(lost.payload)
-        if ack_covers_recent_declared_loss:
-            record_spurious_loss_and_raise_reordering_tolerance()
-    if payload.frame_fragment:
-        if payload.ack_eliciting:
-            queue_packet_ack(header.packet_number)
-            if packet_reveals_gap_or_reordering(header.packet_number):
-                flush_ack_immediately()
-        reassemble_frame_fragment()
-        deliver_complete_product_frame()
-```
-
-### B.7 UDP PTO
-
-```
-on_pto(path):
-    if now < path.next_pto_deadline:
-        return
-    controller.pto_count += 1
-    mark_path_suspect_for_new_bulk()
-    send_one_or_two_ack_eliciting_probe_packets_with_fresh_packet_numbers()
-    path.next_pto_deadline = now + backed_off_pto(controller.pto_count)
-    do_not_mark_old_packets_lost_only_because_pto_fired()
-    if repeated_pto_or_absolute_active_stall_budget_exceeded:
+on_quic_or_product_stall(path, stream):
+    if quic_reports_connection_closed_or_path_failed(path):
+        mark_path_suspect_for_new_bulk()
+    if product_stream_ack_frontier_stalls_while_survivor_exists(stream):
+        queue_gap_targeted_product_repair_for_unacked_ranges(path, stream)
+    if active_stall_budget_exceeded(path, stream):
         detach_active_work_to_survivor_path()
         cool_failed_active_path_for_data_scheduling()
 

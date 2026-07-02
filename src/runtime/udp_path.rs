@@ -285,14 +285,41 @@ impl QuicPathMetricTracker {
         }
         let rtt = stats.path.rtt.max(Duration::from_millis(1));
         let min_rtt = self.min_rtt.unwrap_or(rtt);
-        let inflight_hi = congestion
-            .congestion_window
-            .max(stats.path.cwnd)
-            .max(stats.path.current_mtu as u64) as usize;
-        let fallback_rate = congestion
-            .pacing_rate_bps
-            .map(|rate| rate.max(1) as f64)
-            .unwrap_or_else(|| inflight_hi as f64 * 8.0 / rtt.as_secs_f64().max(0.001));
+        let congestion_window = congestion.congestion_window.max(stats.path.cwnd);
+        let carrier_capacity_known = congestion.pacing_rate_bps.is_some() || congestion_window > 0;
+        let inflight_hi = if carrier_capacity_known {
+            congestion_window.max(stats.path.current_mtu as u64) as usize
+        } else {
+            0
+        };
+        let startup_rate = default_path_rate_bps(UnderlayProtocol::Udp);
+        let raw_pacing_rate = congestion.pacing_rate_bps.map(|rate| rate.max(1) as f64);
+        let usable_pacing_rate = raw_pacing_rate.map(|rate| {
+            if self.delivery_sample_count == 0 {
+                rate.max(startup_rate)
+            } else {
+                rate
+            }
+        });
+        let fallback_rate = usable_pacing_rate.unwrap_or_else(|| {
+            if carrier_capacity_known {
+                let cwnd_rate = inflight_hi as f64 * 8.0 / rtt.as_secs_f64().max(0.001);
+                if self.delivery_sample_count == 0 {
+                    cwnd_rate.max(startup_rate)
+                } else {
+                    cwnd_rate
+                }
+            } else {
+                startup_rate
+            }
+        });
+        let evidence_inflight_hi = if inflight_hi > 0 {
+            inflight_hi as u64
+        } else {
+            (fallback_rate / 8.0 * rtt.as_secs_f64().max(0.001))
+                .ceil()
+                .max(1.0) as u64
+        };
 
         if app_frame_delta > 0 && tx_delta > 0 {
             if self.app_tx_bytes_pending_sample == 0 {
@@ -313,7 +340,7 @@ impl QuicPathMetricTracker {
                     / sample_elapsed.as_secs_f64())
                 .max(1.0);
                 let app_limited_low_sample =
-                    sample_bytes < inflight_hi as u64 && sample_rate < fallback_rate;
+                    sample_bytes < evidence_inflight_hi && sample_rate < fallback_rate;
                 app_limited_low_sample_observed = app_limited_low_sample;
                 if !app_limited_low_sample {
                     let current_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
@@ -338,6 +365,9 @@ impl QuicPathMetricTracker {
         }
 
         let delivery_rate_bps = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+        let pacing_rate_bps = usable_pacing_rate
+            .unwrap_or(delivery_rate_bps)
+            .max(delivery_rate_bps);
         UdpPathMetrics {
             direction,
             srtt: rtt,
@@ -345,10 +375,7 @@ impl QuicPathMetricTracker {
             min_rtt,
             min_rtt_observed: stats.path.rtt > Duration::ZERO,
             delivery_rate_bps,
-            pacing_rate_bps: congestion
-                .pacing_rate_bps
-                .map(|rate| rate.max(1) as f64)
-                .unwrap_or(delivery_rate_bps),
+            pacing_rate_bps,
             inflight_hi,
             bytes_in_flight: 0,
             pending_bytes: 0,
@@ -1948,6 +1975,67 @@ mod tests {
         assert_eq!(ack_only.delivery_sample_count, 0);
         assert!(ack_only.last_delivery_sample_at.is_none());
         assert_eq!(ack_only.delivery_rate_bps.round() as u64, 500_000_000);
+    }
+
+    #[test]
+    fn quic_unknown_capacity_ack_sample_does_not_create_bulk_evidence() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_carrier::CongestionMetrics {
+            congestion_window: 0,
+            pacing_rate_bps: None,
+        };
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+
+        let _ = tracker.quic.observe(stats, congestion, 2);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(500));
+        stats.udp_tx.bytes = 4096;
+        stats.frame_tx.stream = 1;
+        stats.frame_rx.acks = 1;
+        let unknown_capacity = tracker.quic.observe(stats, congestion, 2);
+
+        assert_eq!(unknown_capacity.delivery_sample_count, 0);
+        assert!(unknown_capacity.last_delivery_sample_at.is_none());
+        assert_eq!(
+            unknown_capacity.delivery_rate_bps.round() as u64,
+            default_path_rate_bps(UnderlayProtocol::Udp).round() as u64
+        );
+        assert!(unknown_capacity.app_limited);
+    }
+
+    #[test]
+    fn quic_tiny_startup_pacing_does_not_poison_product_scheduler_rate() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_carrier::CongestionMetrics {
+            congestion_window: 0,
+            pacing_rate_bps: Some(4),
+        };
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+
+        let startup = tracker.quic.observe(stats, congestion, 2);
+        let udp_startup_rate = default_path_rate_bps(UnderlayProtocol::Udp).round() as u64;
+
+        assert_eq!(startup.delivery_sample_count, 0);
+        assert!(startup.last_delivery_sample_at.is_none());
+        assert_eq!(startup.delivery_rate_bps.round() as u64, udp_startup_rate);
+        assert_eq!(startup.pacing_rate_bps.round() as u64, udp_startup_rate);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(500));
+        stats.udp_tx.bytes = 4096;
+        stats.frame_tx.stream = 1;
+        stats.frame_rx.acks = 1;
+        let app_limited = tracker.quic.observe(stats, congestion, 2);
+
+        assert_eq!(app_limited.delivery_sample_count, 0);
+        assert!(app_limited.last_delivery_sample_at.is_none());
+        assert_eq!(
+            app_limited.delivery_rate_bps.round() as u64,
+            udp_startup_rate
+        );
+        assert_eq!(app_limited.pacing_rate_bps.round() as u64, udp_startup_rate);
+        assert!(app_limited.app_limited);
     }
 
     #[test]

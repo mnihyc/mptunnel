@@ -362,7 +362,7 @@ pub(super) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
     mux_limits
         .max_reliable_relay_chunk_bytes
         .min(mux_limits.max_payload_bytes)
-        .min(mux_limits.max_tcp_path_inflight_bytes)
+        .min(mux_limits.max_path_flight_bytes)
         .max(1)
 }
 
@@ -451,7 +451,7 @@ pub(super) fn adaptive_reliable_relay_inflight_bytes(
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> usize {
-    let cap = mux_limits.max_tcp_path_inflight_bytes.max(1);
+    let cap = mux_limits.max_path_flight_bytes.max(1);
     let floor = tcp_lane_min_inflight_bytes(lane, mux_limits)
         .min(cap)
         .max(1);
@@ -645,7 +645,7 @@ pub(super) fn tcp_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits)
 }
 
 pub(super) fn tcp_lane_startup_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
-    let cap = mux_limits.max_tcp_path_inflight_bytes.max(1);
+    let cap = mux_limits.max_path_flight_bytes.max(1);
     let floor = tcp_lane_min_inflight_bytes(lane, mux_limits);
     let startup = PathSnapshot::new(
         PathId(0),
@@ -764,6 +764,7 @@ async fn drain_server_response_sender_ready(
     path_stream: &ReliablePathStream,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
+    mux_limits: MuxLimits,
     sender_dispatch_byte_budget: usize,
     sender_dispatch_item_budget: usize,
     stats: &mut PathDeliveryStats,
@@ -779,7 +780,7 @@ async fn drain_server_response_sender_ready(
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
         let dispatch = match response_sender
-            .dispatch_next(path_stream, send_stream, relay_lane)
+            .dispatch_next(path_stream, send_stream, relay_lane, mux_limits)
             .await
         {
             Ok(dispatch) => dispatch,
@@ -970,8 +971,12 @@ where
         {
             response_sender_retry_at = None;
         }
-        let queued_front_has_carrier_credit =
-            response_sender.front_has_carrier_credit(&path_stream, &send_stream, relay_lane);
+        let queued_front_has_carrier_credit = response_sender.front_has_carrier_credit(
+            &path_stream,
+            &send_stream,
+            relay_lane,
+            mux_limits,
+        );
         let queued_send_blocked = !response_sender.is_empty()
             && response_sender_retry_at.is_some()
             && !queued_front_has_carrier_credit;
@@ -1024,6 +1029,7 @@ where
                     &path_stream,
                     &mut send_stream,
                     relay_lane,
+                    mux_limits,
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
@@ -1238,6 +1244,7 @@ where
                         &path_stream,
                         &mut send_stream,
                         relay_lane,
+                        mux_limits,
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
@@ -1292,6 +1299,7 @@ where
                         &path_stream,
                         &mut send_stream,
                         relay_lane,
+                        mux_limits,
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
@@ -1319,6 +1327,7 @@ where
                     &path_stream,
                     &mut send_stream,
                     relay_lane,
+                    mux_limits,
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
@@ -1337,6 +1346,7 @@ where
                     &path_stream,
                     &mut send_stream,
                     relay_lane,
+                    mux_limits,
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
@@ -1454,6 +1464,7 @@ where
                             &path_stream,
                             &mut send_stream,
                             relay_lane,
+                            mux_limits,
                             sender_dispatch_byte_budget,
                             sender_dispatch_item_budget,
                             &mut stats,
@@ -1480,7 +1491,12 @@ where
         };
         response_sender.enqueue_final_control_frame(frame);
         match response_sender
-            .dispatch_next(&path_stream, &mut send_stream, FlowLane::Control)
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Control,
+                mux_limits,
+            )
             .await
         {
             Ok(dispatch) if dispatch.lane == ReliableRelayQueuedWorkLane::Control => {
@@ -1537,7 +1553,7 @@ mod tests {
         let limits = MuxLimits {
             max_stream_window_bytes: 4,
             max_repair_bytes: 16,
-            max_tcp_path_inflight_bytes: 16,
+            max_path_flight_bytes: 16,
             max_reliable_relay_chunk_bytes: 16,
             ..MuxLimits::default()
         };

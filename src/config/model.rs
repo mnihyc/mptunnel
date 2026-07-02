@@ -19,11 +19,8 @@ pub const DEFAULT_STREAM_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_REPAIR_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_REORDER_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_DATAGRAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_TCP_PATH_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_PATH_FLIGHT_BYTES: usize = DEFAULT_REPAIR_BYTES;
 pub const DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES: usize = 512 * 1024;
-pub const MIN_UDP_REPLAY_WINDOW_PACKETS: u64 = 1_024;
-pub const MAX_UDP_REPLAY_WINDOW_PACKETS: u64 = 65_536;
-pub const UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES: usize = 512;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
@@ -38,14 +35,6 @@ pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS: u64 = 300;
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW: Duration =
     Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS);
-
-pub fn udp_replay_window_packets_for_inflight(inflight_bytes: usize) -> u64 {
-    let packets = inflight_bytes.saturating_add(UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES - 1)
-        / UDP_REPLAY_WINDOW_TARGET_PACKET_BYTES;
-    (packets as u64)
-        .saturating_mul(2)
-        .clamp(MIN_UDP_REPLAY_WINDOW_PACKETS, MAX_UDP_REPLAY_WINDOW_PACKETS)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -192,7 +181,7 @@ pub struct ResourceLimits {
     pub max_repair_bytes: usize,
     pub max_reorder_bytes: usize,
     pub max_datagram_queue_bytes: usize,
-    pub max_tcp_path_inflight_bytes: usize,
+    pub max_path_flight_bytes: usize,
     pub max_reliable_relay_chunk_bytes: usize,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
@@ -210,7 +199,7 @@ impl Default for ResourceLimits {
             max_repair_bytes: DEFAULT_REPAIR_BYTES,
             max_reorder_bytes: DEFAULT_REORDER_BYTES,
             max_datagram_queue_bytes: DEFAULT_DATAGRAM_QUEUE_BYTES,
-            max_tcp_path_inflight_bytes: DEFAULT_TCP_PATH_INFLIGHT_BYTES,
+            max_path_flight_bytes: DEFAULT_PATH_FLIGHT_BYTES,
             max_reliable_relay_chunk_bytes: DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
@@ -256,11 +245,11 @@ impl ResourceLimits {
         if self.max_reliable_relay_chunk_bytes > self.max_payload_bytes {
             return Err(ConfigError::MaxReliableRelayChunkExceedsPayloadLimit);
         }
-        if self.max_tcp_path_inflight_bytes < self.max_reliable_relay_chunk_bytes {
-            return Err(ConfigError::TcpPathInflightLimitTooSmall);
+        if self.max_path_flight_bytes < self.max_reliable_relay_chunk_bytes {
+            return Err(ConfigError::PathFlightLimitTooSmall);
         }
-        if self.max_tcp_path_inflight_bytes > self.max_repair_bytes {
-            return Err(ConfigError::TcpPathInflightLimitExceedsRepairLimit);
+        if self.max_path_flight_bytes > self.max_repair_bytes {
+            return Err(ConfigError::PathFlightLimitExceedsRepairLimit);
         }
         if self.tcp_path_heartbeat_interval.is_zero() {
             return Err(ConfigError::TcpPathHeartbeatIntervalZero);
@@ -282,9 +271,6 @@ impl From<ResourceLimits> for CodecLimits {
             max_payload_bytes: value.max_payload_bytes,
             max_ack_ranges: value.max_ack_ranges,
             max_host_bytes: 255,
-            max_udp_replay_window_packets: udp_replay_window_packets_for_inflight(
-                value.max_tcp_path_inflight_bytes,
-            ),
         }
     }
 }
@@ -575,8 +561,8 @@ pub enum ConfigError {
     DatagramQueueLimitTooSmall,
     MaxReliableRelayChunkBytesZero,
     MaxReliableRelayChunkExceedsPayloadLimit,
-    TcpPathInflightLimitTooSmall,
-    TcpPathInflightLimitExceedsRepairLimit,
+    PathFlightLimitTooSmall,
+    PathFlightLimitExceedsRepairLimit,
     TcpPathHeartbeatIntervalZero,
     TcpPathHeartbeatTimeoutZero,
     TcpPathHeartbeatTimeoutTooSmall,
@@ -656,16 +642,13 @@ impl std::fmt::Display for ConfigError {
                     "max reliable relay chunk bytes must be no greater than max payload bytes"
                 )
             }
-            Self::TcpPathInflightLimitTooSmall => {
-                write!(
-                    f,
-                    "max TCP path inflight bytes must be at least one relay chunk"
-                )
+            Self::PathFlightLimitTooSmall => {
+                write!(f, "max path flight bytes must be at least one relay chunk")
             }
-            Self::TcpPathInflightLimitExceedsRepairLimit => {
+            Self::PathFlightLimitExceedsRepairLimit => {
                 write!(
                     f,
-                    "max TCP path inflight bytes must be no greater than max repair bytes"
+                    "max path flight bytes must be no greater than max repair bytes"
                 )
             }
             Self::TcpPathHeartbeatIntervalZero => {
@@ -746,39 +729,6 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn udp_replay_window_tracks_path_inflight_budget() {
-        assert_eq!(
-            udp_replay_window_packets_for_inflight(0),
-            MIN_UDP_REPLAY_WINDOW_PACKETS
-        );
-        assert_eq!(
-            udp_replay_window_packets_for_inflight(DEFAULT_TCP_PATH_INFLIGHT_BYTES),
-            MAX_UDP_REPLAY_WINDOW_PACKETS
-        );
-        assert_eq!(
-            udp_replay_window_packets_for_inflight(usize::MAX),
-            MAX_UDP_REPLAY_WINDOW_PACKETS
-        );
-
-        let default_codec: CodecLimits = ResourceLimits::default().into();
-        assert_eq!(
-            default_codec.max_udp_replay_window_packets,
-            udp_replay_window_packets_for_inflight(DEFAULT_TCP_PATH_INFLIGHT_BYTES)
-        );
-
-        let compact_codec: CodecLimits = ResourceLimits {
-            max_tcp_path_inflight_bytes: 256 * 1024,
-            max_reliable_relay_chunk_bytes: 64 * 1024,
-            ..ResourceLimits::default()
-        }
-        .into();
-        assert_eq!(
-            compact_codec.max_udp_replay_window_packets,
-            MIN_UDP_REPLAY_WINDOW_PACKETS
-        );
-    }
 
     #[test]
     fn udp_paths_use_quic_without_engine_selector() {

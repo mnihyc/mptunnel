@@ -262,26 +262,22 @@ async fn fixed_reliable_path_detach_is_explicit_product_control() {
     stream.send_detach().await;
     stream.close().await;
 
-    let mut saw_detach = false;
-    let mut saw_close = false;
-    for _ in 0..2 {
-        match recv_tcp_path_command(&mut commands_rx)
-            .await
-            .expect("detach/close command")
-        {
-            TcpPathSessionCommand::SendFrame(Frame::StreamDetach { stream_id }) => {
-                assert_eq!(stream_id, StreamId(45));
-                saw_detach = true;
-            }
-            TcpPathSessionCommand::CloseStream(stream_id) => {
-                assert_eq!(stream_id, StreamId(45));
-                saw_close = true;
-            }
-            _ => panic!("unexpected command"),
+    match recv_tcp_path_command(&mut commands_rx)
+        .await
+        .expect("detach command")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamDetach { stream_id }) => {
+            assert_eq!(stream_id, StreamId(45));
         }
+        _ => panic!("expected detach before close"),
     }
-    assert!(saw_detach);
-    assert!(saw_close);
+    match recv_tcp_path_command(&mut commands_rx)
+        .await
+        .expect("close command")
+    {
+        TcpPathSessionCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(45)),
+        _ => panic!("expected close after detach"),
+    }
 }
 
 #[tokio::test]
@@ -425,6 +421,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
         ClientTcpPathStreamState {
             frames: frames_tx,
             pending_open: None,
+            local_close_pending: false,
         },
     );
     let mut closed_streams = RecentIdCache::new(8);
@@ -470,6 +467,73 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     .await
     .expect("unknown product stream frame should be dropped at product layer");
     assert!(closed_streams.contains(&unknown));
+}
+
+#[tokio::test]
+async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
+    let stream_id = StreamId(70);
+    let (frames_tx, mut frames_rx) = mpsc::channel(4);
+    let mut streams = HashMap::new();
+    streams.insert(
+        stream_id,
+        ClientTcpPathStreamState {
+            frames: frames_tx,
+            pending_open: None,
+            local_close_pending: true,
+        },
+    );
+    let mut closed_streams = RecentIdCache::new(8);
+
+    route_client_tcp_stream_frame(
+        &mut streams,
+        &mut closed_streams,
+        stream_id,
+        Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"inflight"),
+        },
+    )
+    .await
+    .expect("locally closing path should still drain in-flight data");
+
+    match frames_rx
+        .recv()
+        .await
+        .expect("in-flight frame")
+        .expect("frame")
+    {
+        Frame::StreamData {
+            stream_id: routed,
+            payload,
+            ..
+        } => {
+            assert_eq!(routed, stream_id);
+            assert_eq!(&payload[..], b"inflight");
+        }
+        other => panic!("expected routed stream data, got {other:?}"),
+    }
+    assert!(
+        streams.contains_key(&stream_id),
+        "local close is a drain state, not receive-route deletion"
+    );
+
+    route_client_tcp_stream_frame(
+        &mut streams,
+        &mut closed_streams,
+        stream_id,
+        Frame::StreamFin {
+            stream_id,
+            final_offset: 8,
+        },
+    )
+    .await
+    .expect("FIN routes before cleanup");
+    assert!(
+        streams.contains_key(&stream_id),
+        "plain routing alone does not apply terminal cleanup"
+    );
 }
 
 #[tokio::test]
@@ -2070,6 +2134,24 @@ async fn request_sender_blocked_bulk_admission_does_not_fallback_to_eta_path() {
             .await,
         "initial lower-frontier owner should be removable"
     );
+    match recv_tcp_path_command(&mut initial_commands)
+        .await
+        .expect("detach command for failed owner")
+    {
+        TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
+            stream_id: detached,
+        }) => {
+            assert_eq!(detached, stream_id);
+        }
+        _ => panic!("failed owner must detach before local close"),
+    }
+    match recv_tcp_path_command(&mut initial_commands)
+        .await
+        .expect("close command for failed owner")
+    {
+        TcpPathSessionCommand::CloseStream(closed) => assert_eq!(closed, stream_id),
+        _ => panic!("failed owner must close after detach"),
+    }
 
     let err = send_relay_stream_frame_for_test(
         &mut sender,

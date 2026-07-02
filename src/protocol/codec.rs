@@ -17,7 +17,6 @@ pub struct CodecLimits {
     pub max_payload_bytes: usize,
     pub max_ack_ranges: usize,
     pub max_host_bytes: usize,
-    pub max_udp_replay_window_packets: u64,
 }
 
 impl Default for CodecLimits {
@@ -27,7 +26,6 @@ impl Default for CodecLimits {
             max_payload_bytes: 1_048_512,
             max_ack_ranges: 256,
             max_host_bytes: 255,
-            max_udp_replay_window_packets: 16_384,
         }
     }
 }

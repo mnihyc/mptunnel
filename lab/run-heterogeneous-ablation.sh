@@ -212,7 +212,7 @@ resource_config_toml() {
     MPTUNNEL_MAX_REPAIR_BYTES:max_repair_bytes
     MPTUNNEL_MAX_REORDER_BYTES:max_reorder_bytes
     MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES:max_datagram_queue_bytes
-    MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES:max_tcp_path_inflight_bytes
+    MPTUNNEL_MAX_PATH_FLIGHT_BYTES:max_path_flight_bytes
     MPTUNNEL_MAX_RELIABLE_RELAY_CHUNK_BYTES:max_reliable_relay_chunk_bytes
     MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS:tcp_path_heartbeat_interval_ms
     MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS:tcp_path_heartbeat_timeout_ms

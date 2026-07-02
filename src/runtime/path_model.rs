@@ -19,8 +19,9 @@ impl UdpPathRuntimeModel {
         mtu_probe_ceiling_payload_bytes: usize,
     ) -> Self {
         let loss_backoff = (1.0 - snapshot.loss_rate.clamp(0.0, 1.0)).clamp(0.25, 1.0);
-        let pacing_rate_bps = (snapshot.delivery_rate_bps * UDP_BBR_PACING_GAIN * loss_backoff)
-            .max(UDP_MIN_PACING_RATE_BPS);
+        let pacing_rate_bps =
+            (snapshot.delivery_rate_bps * UDP_DATAGRAM_MODEL_PACING_GAIN * loss_backoff)
+                .max(UDP_MIN_PACING_RATE_BPS);
         let timeout_loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
         let model_timeout = Duration::from_secs_f64(
             (((snapshot.srtt_ms + snapshot.jitter_ms.mul_add(4.0, 25.0)) * timeout_loss_gain)

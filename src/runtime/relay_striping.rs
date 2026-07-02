@@ -207,6 +207,7 @@ pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) cursor: usize,
     pub(super) avoid_keys: &'a [RelayPathKey],
     pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
+    pub(super) ordinary_lead: Option<RelayPathKey>,
 }
 
 pub(super) struct BulkRelayFrameRequest<'a> {
@@ -218,6 +219,7 @@ pub(super) struct BulkRelayFrameRequest<'a> {
     pub(super) cursor: usize,
     pub(super) avoid_keys: &'a [RelayPathKey],
     pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
+    pub(super) ordinary_lead: Option<RelayPathKey>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -365,6 +367,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         cursor,
         avoid_keys,
         path_flights,
+        ordinary_lead,
     } = request;
     let Some((offset, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return BulkRelayPathChoice::NotApplicable;
@@ -380,6 +383,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         cursor,
         avoid_keys,
         path_flights,
+        ordinary_lead,
     })
 }
 
@@ -397,6 +401,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         cursor,
         avoid_keys,
         path_flights,
+        ordinary_lead,
     } = request;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
@@ -439,6 +444,76 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         && paths
             .iter()
             .any(|path| admitted_bulk_keys.contains(&path.key()));
+    if normal_bulk_send
+        && lower_flight_owner.is_none()
+        && let Some(lead_key) = ordinary_lead
+        && let Some(position) = paths.iter().position(|path| path.key() == lead_key)
+    {
+        let path = &paths[position];
+        if path.placement == RelayPathPlacement::Repair {
+            return BulkRelayPathChoice::Blocked;
+        }
+        if let Some(frame) = frame
+            && !path.stream.can_enqueue_frame_now(frame, lane)
+        {
+            return BulkRelayPathChoice::Blocked;
+        }
+        if Some(lead_key) != active_key
+            && !context.relay_path_has_bulk_model_evidence(lead_key.underlay, lead_key.index)
+        {
+            return BulkRelayPathChoice::Blocked;
+        }
+        let Some((snapshot, eta_ms)) = scored_relay_path_snapshot_for_bulk_choice(
+            context,
+            lead_key,
+            active_key,
+            lane,
+            payload_bytes,
+            policy,
+        ) else {
+            return BulkRelayPathChoice::Blocked;
+        };
+        let suppression =
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: snapshot,
+                best_eta_ms: eta_ms,
+                candidate_snapshot: snapshot,
+                candidate_eta_ms: eta_ms,
+                payload_bytes,
+                mux_limits: context.mux_limits,
+                role: BulkAdmissionRole::ActiveDataPath,
+                stream_ordering_debt_bytes: 0,
+            });
+        if suppression.is_none() {
+            #[cfg(feature = "lab-diagnostics")]
+            log_bulk_relay_candidate_decision(
+                BulkRelayCandidateDiagnostics {
+                    stream_id,
+                    lane,
+                    key: lead_key,
+                    lead_key: Some(lead_key),
+                    role: Some(BulkAdmissionRole::ActiveDataPath),
+                    eta_ms: Some(eta_ms),
+                    best_eta_ms: Some(eta_ms),
+                    completion_horizon_ms: Some(bulk_completion_horizon_ms_with_ordering_debt(
+                        snapshot,
+                        eta_ms,
+                        snapshot,
+                        payload_bytes,
+                        context.mux_limits,
+                        0,
+                    )),
+                    stream_ordering_debt_bytes: 0,
+                    payload_bytes,
+                    snapshot: Some(snapshot),
+                },
+                true,
+                "selected_stream_lead",
+            );
+            return BulkRelayPathChoice::Selected(position);
+        }
+        return BulkRelayPathChoice::Blocked;
+    }
     let lead = if normal_bulk_send {
         choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
             context,
@@ -987,6 +1062,7 @@ mod tests {
                 cursor: 0,
                 avoid_keys: &[],
                 path_flights: Some(&ledger),
+                ordinary_lead: None,
             }),
             BulkRelayPathChoice::Blocked
         );
@@ -1021,6 +1097,7 @@ mod tests {
                 cursor: 0,
                 avoid_keys: &[],
                 path_flights: Some(&ledger),
+                ordinary_lead: None,
             }),
             BulkRelayPathChoice::Blocked
         );
@@ -1112,5 +1189,38 @@ mod tests {
         .expect("same-carrier lower flight is sliding-window flight");
 
         assert_eq!(lead.key, owner);
+    }
+
+    #[test]
+    fn relay_ordinary_bulk_keeps_stream_lead_when_frontier_is_clear() {
+        let context = context(&[
+            "udp://127.0.0.1:10140?srtt-ms=50&rate-mbps=500",
+            "udp://127.0.0.1:10141?srtt-ms=5&rate-mbps=500",
+        ]);
+        let lead_key = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let paths = vec![
+            relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
+            relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
+        ];
+
+        assert_eq!(
+            choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
+                stream_id: StreamId(7),
+                context: &context,
+                paths: &paths,
+                lane: FlowLane::Throughput,
+                frame: None,
+                offset: 64 * 1024,
+                payload_bytes: 64 * 1024,
+                cursor: 1,
+                avoid_keys: &[],
+                path_flights: Some(&RelayPathFlightLedger::default()),
+                ordinary_lead: Some(lead_key),
+            }),
+            BulkRelayPathChoice::Selected(0)
+        );
     }
 }

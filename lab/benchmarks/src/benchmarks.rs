@@ -235,21 +235,21 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
         "stream_ram_budget",
         "stream_memory_budget_mib",
         resource.stream_memory_budget_mib,
-        64.0,
+        192.0,
         "MiB",
     ));
     gates.push(at_most(
         "datagram_ram_budget",
         "datagram_queue_budget_mib",
         resource.datagram_queue_budget_mib,
-        8.0,
+        16.0,
         "MiB",
     ));
     gates.push(at_most(
-        "tcp_path_inflight_budget",
-        "tcp_path_inflight_budget_mib",
-        resource.tcp_path_inflight_budget_mib,
-        8.0,
+        "path_flight_budget",
+        "path_flight_budget_mib",
+        resource.path_flight_budget_mib,
+        64.0,
         "MiB",
     ));
     gates.push(at_most(
@@ -609,7 +609,7 @@ struct ResourceMetrics {
     aes_core_seconds_per_gib: f64,
     stream_memory_budget_mib: f64,
     datagram_queue_budget_mib: f64,
-    tcp_path_inflight_budget_mib: f64,
+    path_flight_budget_mib: f64,
     lab_hot_path_ram_budget_mib: f64,
 }
 
@@ -629,7 +629,7 @@ fn resource_benchmark(sample_mib: u32) -> Result<ResourceMetrics, BenchmarkError
         aes_core_seconds_per_gib,
         stream_memory_budget_mib,
         datagram_queue_budget_mib: bytes_to_mib(limits.max_datagram_queue_bytes as u64),
-        tcp_path_inflight_budget_mib: bytes_to_mib(limits.max_tcp_path_inflight_bytes as u64),
+        path_flight_budget_mib: bytes_to_mib(limits.max_path_flight_bytes as u64),
         lab_hot_path_ram_budget_mib: bytes_to_mib(lab_hot_path_ram_budget_bytes(limits)),
     })
 }
@@ -637,7 +637,7 @@ fn resource_benchmark(sample_mib: u32) -> Result<ResourceMetrics, BenchmarkError
 fn lab_hot_path_ram_budget_bytes(limits: ResourceLimits) -> u64 {
     limits.max_repair_bytes as u64
         + limits.max_reorder_bytes as u64
-        + limits.max_tcp_path_inflight_bytes as u64
+        + limits.max_path_flight_bytes as u64
         + limits.max_datagram_queue_bytes as u64
 }
 

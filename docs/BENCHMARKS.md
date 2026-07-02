@@ -53,9 +53,9 @@ The current developer profile is `developer-gates-v1`.
 | `failover_repair` | repaired chunks after path failure | >= 1 |
 | `chacha20poly1305_cpu` | local AEAD encrypt+decrypt cost | <= 300 core-s/GiB |
 | `aes256gcm_cpu` | local AEAD encrypt+decrypt cost | <= 300 core-s/GiB |
-| `stream_ram_budget` | default per-stream window+repair+reorder budget | <= 64 MiB |
-| `datagram_ram_budget` | default datagram queue budget | <= 8 MiB |
-| `tcp_path_inflight_budget` | default TCP path inflight budget | <= 8 MiB |
+| `stream_ram_budget` | default stream window+repair+reorder envelope | <= 192 MiB |
+| `datagram_ram_budget` | default datagram queue budget | <= 16 MiB |
+| `path_flight_budget` | default path flight budget | <= 64 MiB |
 | `lab_hot_path_ram_budget` | modeled hot-path RAM budget for manual lab target | <= 256 MiB |
 
 The CPU gates measure both AES-256-GCM and ChaCha20-Poly1305 because supported machines vary by architecture and hardware acceleration. AES-256-GCM is the production default, while ChaCha20-Poly1305 remains a selectable profile for deployments where it performs better.

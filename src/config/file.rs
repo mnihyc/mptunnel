@@ -141,7 +141,7 @@ struct ResourceFileConfig {
     max_repair_bytes: Option<usize>,
     max_reorder_bytes: Option<usize>,
     max_datagram_queue_bytes: Option<usize>,
-    max_tcp_path_inflight_bytes: Option<usize>,
+    max_path_flight_bytes: Option<usize>,
     max_reliable_relay_chunk_bytes: Option<usize>,
     tcp_path_heartbeat_interval_ms: Option<u64>,
     tcp_path_heartbeat_timeout_ms: Option<u64>,
@@ -150,26 +150,44 @@ struct ResourceFileConfig {
 impl ResourceFileConfig {
     fn into_limits(self) -> ResourceLimits {
         let defaults = ResourceLimits::default();
+        let max_frame_bytes = self.max_frame_bytes.unwrap_or(defaults.max_frame_bytes);
+        let max_payload_bytes = self.max_payload_bytes.unwrap_or_else(|| {
+            defaults
+                .max_payload_bytes
+                .min(max_frame_bytes.saturating_sub(16))
+                .max(1)
+        });
+        let max_repair_bytes = self
+            .max_repair_bytes
+            .unwrap_or(defaults.max_repair_bytes.max(max_payload_bytes));
+        let max_reorder_bytes = self
+            .max_reorder_bytes
+            .unwrap_or(defaults.max_reorder_bytes.max(max_payload_bytes));
+        let max_datagram_queue_bytes = self
+            .max_datagram_queue_bytes
+            .unwrap_or(defaults.max_datagram_queue_bytes.max(max_payload_bytes));
+        let max_reliable_relay_chunk_bytes =
+            self.max_reliable_relay_chunk_bytes.unwrap_or_else(|| {
+                defaults
+                    .max_reliable_relay_chunk_bytes
+                    .min(max_payload_bytes)
+                    .max(1)
+            });
+        let max_path_flight_bytes = self.max_path_flight_bytes.unwrap_or(max_repair_bytes);
         ResourceLimits {
-            max_frame_bytes: self.max_frame_bytes.unwrap_or(defaults.max_frame_bytes),
-            max_payload_bytes: self.max_payload_bytes.unwrap_or(defaults.max_payload_bytes),
+            max_frame_bytes,
+            max_payload_bytes,
             max_ack_ranges: self.max_ack_ranges.unwrap_or(defaults.max_ack_ranges),
             max_paths: self.max_paths.unwrap_or(defaults.max_paths),
             max_streams: self.max_streams.unwrap_or(defaults.max_streams),
             max_stream_window_bytes: self
                 .max_stream_window_bytes
                 .unwrap_or(defaults.max_stream_window_bytes),
-            max_repair_bytes: self.max_repair_bytes.unwrap_or(defaults.max_repair_bytes),
-            max_reorder_bytes: self.max_reorder_bytes.unwrap_or(defaults.max_reorder_bytes),
-            max_datagram_queue_bytes: self
-                .max_datagram_queue_bytes
-                .unwrap_or(defaults.max_datagram_queue_bytes),
-            max_tcp_path_inflight_bytes: self
-                .max_tcp_path_inflight_bytes
-                .unwrap_or(defaults.max_tcp_path_inflight_bytes),
-            max_reliable_relay_chunk_bytes: self
-                .max_reliable_relay_chunk_bytes
-                .unwrap_or(defaults.max_reliable_relay_chunk_bytes),
+            max_repair_bytes,
+            max_reorder_bytes,
+            max_datagram_queue_bytes,
+            max_path_flight_bytes,
+            max_reliable_relay_chunk_bytes,
             tcp_path_heartbeat_interval: Duration::from_millis(
                 self.tcp_path_heartbeat_interval_ms
                     .unwrap_or(defaults.tcp_path_heartbeat_interval.as_millis() as u64),
@@ -1422,6 +1440,30 @@ mod tests {
             .iter()
             .map(|ingress| ingress.config.clone())
             .collect()
+    }
+
+    #[test]
+    fn resource_file_config_derives_path_flight_from_repair_envelope() {
+        let limits = ResourceFileConfig {
+            max_repair_bytes: Some(128 * 1024 * 1024),
+            ..ResourceFileConfig::default()
+        }
+        .into_limits();
+
+        assert_eq!(limits.max_repair_bytes, 128 * 1024 * 1024);
+        assert_eq!(limits.max_path_flight_bytes, limits.max_repair_bytes);
+    }
+
+    #[test]
+    fn resource_file_config_derives_payload_and_chunk_from_frame_envelope() {
+        let limits = ResourceFileConfig {
+            max_frame_bytes: Some(4096),
+            ..ResourceFileConfig::default()
+        }
+        .into_limits();
+
+        assert_eq!(limits.max_payload_bytes, 4080);
+        assert_eq!(limits.max_reliable_relay_chunk_bytes, 4080);
     }
 
     #[test]

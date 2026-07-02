@@ -44,6 +44,14 @@ where
     let mut last_recv_progress_sent_at = Instant::now();
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let mut sender_retry_at: Option<tokio::time::Instant> = None;
+    let (validation_open_tx, mut validation_open_rx) = mpsc::channel(
+        context
+            .tcp_paths
+            .len()
+            .saturating_add(context.udp_paths.len())
+            .max(1),
+    );
+    let mut pending_validation_opens = HashSet::<RelayPathKey>::new();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -113,7 +121,19 @@ where
                 ),
             );
             flow_demand.mark_rebalance_attempted();
-            if let Err(err) = switch_reliable_relay_to_best_path(
+            if relay_lane_is_bulk(relay_lane) {
+                if spawn_reliable_relay_validation_opens(
+                    context,
+                    &spec,
+                    relay_lane,
+                    &remotes,
+                    &send_stream,
+                    &mut pending_validation_opens,
+                    &validation_open_tx,
+                ) {
+                    last_stream_progress_at = Instant::now();
+                }
+            } else if let Err(err) = switch_reliable_relay_to_best_path(
                 context,
                 &spec,
                 relay_lane,
@@ -127,19 +147,6 @@ where
                 eprintln!("warning: TCP auto path attachment failed: {err}");
             } else {
                 last_stream_progress_at = Instant::now();
-            }
-            if relay_lane_is_bulk(relay_lane)
-                && let Err(err) = attach_reliable_relay_validation_paths(
-                    context,
-                    &spec,
-                    relay_lane,
-                    &mut remotes,
-                    &send_stream,
-                    !local_open,
-                )
-                .await
-            {
-                eprintln!("warning: TCP auto validation attachment failed: {err}");
             }
             send_stream.update_max_offset(remotes.max_offset());
         }
@@ -644,6 +651,65 @@ where
                 sender_retry_at = None;
                 continue;
             }
+            validation_open = validation_open_rx.recv(), if !pending_validation_opens.is_empty() => {
+                let Some(validation_open) = validation_open else {
+                    pending_validation_opens.clear();
+                    continue;
+                };
+                pending_validation_opens.remove(&validation_open.key);
+                match validation_open.result {
+                    Ok(opened) => {
+                        if !remotes.contains_path_key(validation_open.key) {
+                            remotes.attach_for_validation(opened);
+                            send_stream.update_max_offset(remotes.max_offset());
+                            last_stream_progress_at = Instant::now();
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "relay_validation_open_attached",
+                                format_args!(
+                                    "stream_id={} path_underlay={:?} path_index={} pending={}",
+                                    stream_id.0,
+                                    validation_open.key.underlay,
+                                    validation_open.key.index,
+                                    pending_validation_opens.len(),
+                                ),
+                            );
+                        }
+                    }
+                    Err(err) if relay_path_open_error_is_retryable(validation_open.key.underlay, &err) => {
+                        context.mark_relay_path_failure(
+                            validation_open.key.underlay,
+                            validation_open.key.index,
+                        );
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "relay_validation_open_failed",
+                            format_args!(
+                                "stream_id={} path_underlay={:?} path_index={} retryable=true error={}",
+                                stream_id.0,
+                                validation_open.key.underlay,
+                                validation_open.key.index,
+                                err,
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        #[cfg(not(feature = "lab-diagnostics"))]
+                        let _ = &err;
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "relay_validation_open_failed",
+                            format_args!(
+                                "stream_id={} path_underlay={:?} path_index={} retryable=false error={}",
+                                stream_id.0,
+                                validation_open.key.underlay,
+                                validation_open.key.index,
+                                err,
+                            ),
+                        );
+                    }
+                }
+            }
             read = async {
                 let read_budget = prospective_read_budget;
                 #[cfg(feature = "lab-diagnostics")]
@@ -686,6 +752,7 @@ where
                     sender_queue.push_data(payload);
                     let mut opportunistic_reads = 1usize;
                     while local_open
+                        && !relay_lane_is_bulk(relay_lane)
                         && opportunistic_reads < sender_dispatch_item_budget
                         && reliable_relay_can_read_product_source(
                             local_open,
@@ -1361,43 +1428,82 @@ fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
     reliable_relay_buffer_len(mux_limits) as u64
 }
 
-async fn attach_reliable_relay_validation_paths(
+struct RelayValidationOpenResult {
+    key: RelayPathKey,
+    result: Result<OpenedRemoteStream, RuntimeError>,
+}
+
+fn spawn_reliable_relay_validation_opens(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lane: FlowLane,
-    remotes: &mut ReliableRelayRemoteSet,
+    remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
-    resend_fin: bool,
-) -> Result<usize, RuntimeError> {
+    pending: &mut HashSet<RelayPathKey>,
+    result_tx: &mpsc::Sender<RelayValidationOpenResult>,
+) -> bool {
     if !relay_lane_is_bulk(lane) {
-        return Ok(0);
+        return false;
     }
+    let stream_id = remotes.stream_id();
     let payload_bytes =
         reliable_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
-    let candidates = context
-        .ordered_reliable_bulk_validation_path_keys(payload_bytes)
+    let mut candidates = context
+        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
+        .into_iter()
+        .chain(context.ordered_reliable_bulk_validation_path_keys(payload_bytes))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        relay_underlay_order(left.underlay)
+            .cmp(&relay_underlay_order(right.underlay))
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    candidates.dedup();
+    let candidates = candidates
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
+        .filter(|key| !pending.contains(key))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Ok(0);
+        return false;
     }
-    attach_relay_path_candidates(
-        context,
-        remotes,
-        RelayPathAttachRequest {
-            spec,
-            lane,
-            send_stream,
-            resend_fin,
-            candidates,
-            role: StreamOpenRole::Validation,
-            allow_mixed_carrier: true,
-            send_attach_control: true,
-            attach_all_candidates: false,
-        },
-    )
-    .await
+    let mut spawned = false;
+    for key in candidates {
+        pending.insert(key);
+        let context = context.clone();
+        let target = spec.target.clone();
+        let ingress = spec.ingress;
+        let result_tx = result_tx.clone();
+        tokio::spawn(async move {
+            let result = open_remote_stream_for_relay_path(
+                &context,
+                stream_id,
+                target,
+                ingress,
+                lane,
+                key,
+                StreamOpenRole::Validation,
+            )
+            .await;
+            let _ = result_tx
+                .send(RelayValidationOpenResult { key, result })
+                .await;
+        });
+        spawned = true;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "relay_validation_open_spawned",
+            format_args!(
+                "stream_id={} path_underlay={:?} path_index={} lane={:?} pending={}",
+                stream_id.0,
+                key.underlay,
+                key.index,
+                lane,
+                pending.len(),
+            ),
+        );
+    }
+    spawned
 }
 
 pub(super) struct RelayPathAttachRequest<'a> {

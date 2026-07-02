@@ -554,6 +554,10 @@ async fn drain_server_tcp_path_commands(
             datagram_flows.retain(|flow| flow.flow_id != *flow_id);
         }
         let is_frame = matches!(command, TcpPathSessionCommand::SendFrame(_));
+        let is_stream_detach = matches!(
+            &command,
+            TcpPathSessionCommand::SendFrame(Frame::StreamDetach { .. })
+        );
         let keep_running = handle_server_tcp_path_command(
             command,
             writer,
@@ -575,6 +579,9 @@ async fn drain_server_tcp_path_commands(
             sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
         }
         sent_items = sent_items.saturating_add(1);
+        if is_stream_detach {
+            break;
+        }
         if sent_bytes >= byte_budget || sent_items >= item_budget {
             break;
         }

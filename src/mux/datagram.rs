@@ -174,7 +174,7 @@ mod tests {
             max_repair_bytes: 2048,
             max_reorder_bytes: 2048,
             max_datagram_queue_bytes: 16,
-            max_tcp_path_inflight_bytes: 2048,
+            max_path_flight_bytes: 2048,
             max_reliable_relay_chunk_bytes: 1024,
             tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,

@@ -58,6 +58,7 @@ pub(super) struct RelaySenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     stream_id: StreamId,
     flights: RelayPathFlightLedger,
+    ordinary_lead: Option<RelayPathKey>,
     next_send_index: usize,
 }
 
@@ -267,6 +268,34 @@ impl ReliableRelaySenderQueue {
         Some((lane, work))
     }
 
+    fn commit_front_data_prefix(&mut self, prefix_len: usize) -> Option<ReliableRelayQueuedWork> {
+        let work = self.data.front_mut()?;
+        let ReliableRelayQueuedWorkKind::Data(payload) = &mut work.kind else {
+            return None;
+        };
+        let prefix_len = prefix_len.min(payload.len()).max(1);
+        if prefix_len >= payload.len() {
+            let (_, work) = self.commit_front()?;
+            return Some(work);
+        }
+
+        let prefix = payload.slice(..prefix_len);
+        let remaining = payload.slice(prefix_len..);
+        *payload = remaining;
+        work.payload_bytes = work.payload_bytes.saturating_sub(prefix_len);
+        self.bytes = self.bytes.saturating_sub(prefix_len);
+        self.data_bytes = self.data_bytes.saturating_sub(prefix_len);
+
+        Some(ReliableRelayQueuedWork {
+            kind: ReliableRelayQueuedWorkKind::Data(prefix),
+            payload_bytes: prefix_len,
+            #[cfg(feature = "lab-diagnostics")]
+            enqueue_id: work.enqueue_id,
+            #[cfg(feature = "lab-diagnostics")]
+            queued_at: work.queued_at,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn pop_front(
         &mut self,
@@ -284,7 +313,7 @@ pub(super) fn reliable_relay_sender_queue_limit(
         .max(reliable_relay_buffer_len(mux_limits))
         .min(mux_limits.max_repair_bytes)
         .min(stream_window)
-        .min(mux_limits.max_tcp_path_inflight_bytes)
+        .min(mux_limits.max_path_flight_bytes)
         .max(1)
 }
 
@@ -581,6 +610,7 @@ fn choose_response_sender_data_target(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     lower_flights: &[CarrierPathFlightDebt],
+    ordinary_lead: Option<CarrierPathKey>,
 ) -> Option<ResponseSenderPathTarget> {
     if targets.is_empty() {
         return None;
@@ -621,6 +651,18 @@ fn choose_response_sender_data_target(
     } else {
         proven_targets
     };
+    if lower_owner.is_none()
+        && let Some(lead_key) = ordinary_lead
+        && targets.iter().any(|target| target.key == lead_key)
+    {
+        let lead_target = candidate_targets
+            .iter()
+            .copied()
+            .find(|target| target.key == lead_key)?;
+        return response_active_lead_suppression(lead_target, mux_limits, payload_bytes, 0)
+            .is_none()
+            .then_some(lead_target.clone());
+    }
     let lead = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
@@ -712,6 +754,7 @@ fn plan_response_data_dispatch(
                 payload_bytes,
                 binding.mux_limits(),
                 &lower_flights,
+                binding.ordinary_lead(),
             ) else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
@@ -721,6 +764,24 @@ fn plan_response_data_dispatch(
             })
         }
     }
+}
+
+fn response_dispatch_payload_bytes(
+    path_stream: &ReliablePathStream,
+    relay_lane: FlowLane,
+    mux_limits: MuxLimits,
+    queued_payload_bytes: usize,
+) -> usize {
+    let snapshot = path_stream.send_path_snapshot(relay_lane, queued_payload_bytes);
+    adaptive_relay_chunk_bytes_for_underlay(
+        snapshot,
+        relay_lane,
+        mux_limits,
+        path_stream.underlay,
+        path_stream.max_frame_payload_bytes,
+    )
+    .min(queued_payload_bytes)
+    .max(1)
 }
 
 fn response_frame_has_carrier_credit(
@@ -772,6 +833,9 @@ async fn emit_planned_response_data_frame(
         ResponseDataDispatchTarget::Switchable { binding, target } => {
             send_sender_service_frame_to_carrier(&target.commands, frame.clone(), lane).await?;
             binding.record_flight(target.key, &frame, true);
+            if binding.ordinary_lead().is_none() {
+                binding.set_ordinary_lead(target.key);
+            }
             record_server_sender_decision(
                 binding.session_id(),
                 stream.stream_id,
@@ -936,6 +1000,7 @@ impl ServerResponseSenderService {
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         relay_lane: FlowLane,
+        mux_limits: MuxLimits,
     ) -> bool {
         let Some((_, queued)) = self.queue.front() else {
             return false;
@@ -948,7 +1013,7 @@ impl ServerResponseSenderService {
                 path_stream,
                 relay_lane,
                 send_stream.next_offset(),
-                payload.len(),
+                response_dispatch_payload_bytes(path_stream, relay_lane, mux_limits, payload.len()),
             )
             .is_ok(),
             ReliableRelayQueuedWorkKind::Repair { frame, .. } => {
@@ -1012,6 +1077,7 @@ impl ServerResponseSenderService {
         path_stream: &ReliablePathStream,
         send_stream: &mut ReliableSendStream,
         relay_lane: FlowLane,
+        mux_limits: MuxLimits,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
@@ -1040,17 +1106,28 @@ impl ServerResponseSenderService {
         let (frame, dispatch_lane_name) = match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => (frame.clone(), "control"),
             ReliableRelayQueuedWorkKind::Data(payload) => {
+                let dispatch_payload_bytes = response_dispatch_payload_bytes(
+                    path_stream,
+                    relay_lane,
+                    mux_limits,
+                    payload.len(),
+                );
+                let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 let planned = plan_response_data_dispatch(
                     path_stream,
                     relay_lane,
                     send_stream.next_offset(),
-                    payload.len(),
+                    dispatch_payload.len(),
                 )?;
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
-                let frame = send_stream.send_data(payload.clone(), StreamFlags::NONE)?;
+                let frame = send_stream.send_data(dispatch_payload, StreamFlags::NONE)?;
                 #[cfg(feature = "lab-diagnostics")]
-                lab_perf_record("mux.send_data", mux_started.elapsed(), queued.payload_bytes);
+                lab_perf_record(
+                    "mux.send_data",
+                    mux_started.elapsed(),
+                    dispatch_payload_bytes,
+                );
                 match emit_planned_response_data_frame(
                     path_stream,
                     planned,
@@ -1060,10 +1137,10 @@ impl ServerResponseSenderService {
                 .await
                 {
                     Ok(selected_path) => {
-                        let (_, committed) = self
+                        let committed = self
                             .queue
-                            .commit_front()
-                            .expect("dispatched queued work must still be at queue front");
+                            .commit_front_data_prefix(dispatch_payload_bytes)
+                            .expect("dispatched queued data must still be at queue front");
                         return self.finish_dispatched_work(
                             path_stream,
                             relay_lane,
@@ -1234,6 +1311,7 @@ impl RelaySenderService {
         Self {
             stream_id,
             flights: RelayPathFlightLedger::default(),
+            ordinary_lead: None,
             next_send_index: 0,
         }
     }
@@ -1551,6 +1629,9 @@ impl RelaySenderService {
                             instance.key.index,
                             sent_bytes,
                         );
+                        if !cause.is_repair() && self.ordinary_lead.is_none() {
+                            self.ordinary_lead = Some(instance.key);
+                        }
                     }
                     self.next_send_index = if remotes.paths.is_empty() {
                         0
@@ -1564,6 +1645,9 @@ impl RelaySenderService {
                 }
                 Err(err) => {
                     last_error = Some(err);
+                    if self.ordinary_lead == Some(instance.key) {
+                        self.ordinary_lead = None;
+                    }
                     remotes.fail_path_instance(context, instance).await;
                     if !remotes.paths.is_empty() {
                         self.next_send_index %= remotes.paths.len();
@@ -1589,6 +1673,12 @@ impl RelaySenderService {
             return Err(RuntimeError::TcpPathSessionClosed);
         }
         self.next_send_index %= remotes.paths.len();
+        if self
+            .ordinary_lead
+            .is_some_and(|lead| !remotes.contains_path_key(lead))
+        {
+            self.ordinary_lead = None;
+        }
         if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
             match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
                 stream_id: remotes.stream_id(),
@@ -1599,6 +1689,7 @@ impl RelaySenderService {
                 cursor: self.next_send_index,
                 avoid_keys,
                 path_flights: Some(&self.flights),
+                ordinary_lead: self.ordinary_lead,
             }) {
                 BulkRelayPathChoice::Selected(position) => return Ok(position),
                 BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
@@ -2048,6 +2139,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             &[],
+            None,
         )
         .expect("higher-ETA target with writer credit should be selected");
 
@@ -2079,6 +2171,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             &lower_flights,
+            Some(target.key),
         )
         .expect("single carrier lower flight is normal sliding-window debt");
 
@@ -2107,9 +2200,29 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             &lower_flights,
+            Some(owner.key),
         )
         .expect("same-carrier lower flight remains admissible with other carriers attached");
 
         assert_eq!(selected.key, owner.key);
+    }
+
+    #[test]
+    fn response_ordinary_bulk_keeps_stream_lead_when_frontier_is_clear() {
+        let lead = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let lower_eta_alternate =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = choose_response_sender_data_target(
+            &[lead.clone(), lower_eta_alternate],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(lead.key),
+        )
+        .expect("existing stream lead should remain selected");
+
+        assert_eq!(selected.key, lead.key);
     }
 }

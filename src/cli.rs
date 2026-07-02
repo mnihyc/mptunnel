@@ -2,12 +2,12 @@ use crate::config::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
     DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
-    DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES,
-    DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
-    DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
-    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DEFAULT_TCP_PATH_INFLIGHT_BYTES, LocalIngressConfig,
-    ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig, ServerConfig,
-    ServiceConfig, SharedSecret,
+    DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
+    DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
+    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
+    LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig,
+    ServerConfig, ServiceConfig, SharedSecret,
 };
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
@@ -259,10 +259,10 @@ pub struct ResourceArgs {
     #[arg(
         long,
         global = true,
-        env = "MPTUNNEL_MAX_TCP_PATH_INFLIGHT_BYTES",
-        default_value_t = DEFAULT_TCP_PATH_INFLIGHT_BYTES
+        env = "MPTUNNEL_MAX_PATH_FLIGHT_BYTES",
+        default_value_t = DEFAULT_PATH_FLIGHT_BYTES
     )]
-    pub max_tcp_path_inflight_bytes: usize,
+    pub max_path_flight_bytes: usize,
 
     #[arg(
         long,
@@ -301,7 +301,7 @@ impl ResourceArgs {
             max_repair_bytes: self.max_repair_bytes,
             max_reorder_bytes: self.max_reorder_bytes,
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
-            max_tcp_path_inflight_bytes: self.max_tcp_path_inflight_bytes,
+            max_path_flight_bytes: self.max_path_flight_bytes,
             max_reliable_relay_chunk_bytes: self.max_reliable_relay_chunk_bytes,
             tcp_path_heartbeat_interval: Duration::from_millis(self.tcp_path_heartbeat_interval_ms),
             tcp_path_heartbeat_timeout: Duration::from_millis(self.tcp_path_heartbeat_timeout_ms),
@@ -1434,7 +1434,7 @@ mod tests {
             "4096",
             "--max-reliable-relay-chunk-bytes",
             "1024",
-            "--max-tcp-path-inflight-bytes",
+            "--max-path-flight-bytes",
             "512",
             "client",
             "--path",
@@ -1445,7 +1445,7 @@ mod tests {
         assert!(matches!(
             cli.into_config(),
             Err(CliConfigError::Config(
-                crate::config::ConfigError::TcpPathInflightLimitTooSmall
+                crate::config::ConfigError::PathFlightLimitTooSmall
             ))
         ));
 
@@ -1459,7 +1459,7 @@ mod tests {
             "4096",
             "--max-reliable-relay-chunk-bytes",
             "1024",
-            "--max-tcp-path-inflight-bytes",
+            "--max-path-flight-bytes",
             "8192",
             "client",
             "--path",
@@ -1470,7 +1470,7 @@ mod tests {
         assert!(matches!(
             cli.into_config(),
             Err(CliConfigError::Config(
-                crate::config::ConfigError::TcpPathInflightLimitExceedsRepairLimit
+                crate::config::ConfigError::PathFlightLimitExceedsRepairLimit
             ))
         ));
 

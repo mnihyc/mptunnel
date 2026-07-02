@@ -27,21 +27,53 @@
 # listen = ["127.0.0.1:7600"]
 # token = "replace-with-operator-token"
 
-# Optional resource envelopes. These are adaptive capacity envelopes, not fixed
-# production tuning constants. Leave unset unless the deployment has a specific
-# resource constraint.
+# Optional resource envelopes. These are capacity envelopes for adaptive
+# scheduling, not fixed transmission modes. Leave this whole section unset for
+# normal deployments. The runtime derives omitted dependent values from the
+# configured parent envelope so operators do not have to tune every field.
+#
+# Performance rule:
+# - Increase byte envelopes only when high-BDP paths or many concurrent flows
+#   need more room. These values are not preallocated per stream.
+# - Decrease them only for constrained devices after checking throughput and
+#   failover with the management API or lab diagnostics.
+# - Do not use these fields to force latency/bulk behavior. Auto scheduling uses
+#   live RTT, delivery rate, queue, loss, ACK, repair, and carrier evidence.
 # [resources]
+# Product frame safety envelope. Recommended: 1 MiB to 4 MiB. Larger values can
+# reduce framing overhead only if scheduler quanta and writers are also healthy.
 # max_frame_bytes = 1048576
+# Defaults to max_frame_bytes - 64-ish header room when omitted after changing
+# max_frame_bytes. Recommended: leave unset unless embedding very large records.
 # max_payload_bytes = 1048512
+# Sparse stream ACK range cap. Recommended: 128 to 1024. Raise only if lossy or
+# heavily reordered paths show truncated ACK range diagnostics.
 # max_ack_ranges = 256
+# Registry caps, not scheduling policy. Recommended: 8 to 64 paths, 4096+
+# streams for proxy/TUN use. Raise only for intentional large fan-out.
 # max_paths = 64
 # max_streams = 65536
+# Product flow-control window. Recommended: 64 MiB to 256 MiB for high-BDP VPS
+# paths; lower only for memory-constrained clients.
 # max_stream_window_bytes = 67108864
+# Repair and reorder envelopes for MPTCP-like reinjection and receive-hole debt.
+# Recommended: at least one high-BDP path worth of data; 64 MiB is the default.
 # max_repair_bytes = 67108864
 # max_reorder_bytes = 67108864
+# Datagram burst envelope for SOCKS5 UDP/TUN UDP/realtime traffic.
+# Recommended: 16 MiB to 64 MiB for video/game/TUN workloads.
 # max_datagram_queue_bytes = 16777216
-# max_tcp_path_inflight_bytes = 33554432
+# Per-path product flight envelope used by TCP framed paths and by the QUIC
+# send-window resource profile. When omitted, config-file parsing derives this
+# from max_repair_bytes. Recommended: 64 MiB to 256 MiB on high-BDP paths.
+# It is a ceiling; actual sender flight is still BDP/queue/loss/carrier adaptive.
+# max_path_flight_bytes = 67108864
+# Read-buffer ceiling only. It must not become a scheduler quantum. Recommended:
+# 256 KiB to 1 MiB. Scheduler quanta stay smaller and preemptible.
 # max_reliable_relay_chunk_bytes = 524288
+# Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair
+# evidence, so these can stay quiet. Recommended: keep defaults unless idle path
+# recovery is too noisy or too slow for your environment.
 # tcp_path_heartbeat_interval_ms = 10000
 # tcp_path_heartbeat_timeout_ms = 30000
 

@@ -87,6 +87,11 @@ impl ClientTcpPathSessionHandle {
             && !commands.is_closed()
         {
             let _ = commands
+                .send_control(TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
+                    stream_id,
+                }))
+                .await;
+            let _ = commands
                 .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                 .await;
         }
@@ -140,6 +145,7 @@ pub(super) type EncryptedTcpWriter = EncryptedFramedWriter<tokio::io::WriteHalf<
 pub(super) struct ClientTcpPathStreamState {
     pub(super) frames: mpsc::Sender<Result<Frame, RuntimeError>>,
     pub(super) pending_open: Option<ClientTcpPendingOpen>,
+    pub(super) local_close_pending: bool,
 }
 
 pub(super) struct ClientTcpPendingOpen {
@@ -365,6 +371,10 @@ async fn handle_connected_client_tcp_command_run(
         };
         let pending_bytes = tcp_path_command_pending_bytes(&command);
         let is_frame = matches!(command, TcpPathSessionCommand::SendFrame(_));
+        let is_stream_detach = matches!(
+            &command,
+            TcpPathSessionCommand::SendFrame(Frame::StreamDetach { .. })
+        );
         handle_connected_client_tcp_command(
             command,
             connection,
@@ -381,6 +391,9 @@ async fn handle_connected_client_tcp_command_run(
             sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
         }
         sent_items = sent_items.saturating_add(1);
+        if is_stream_detach {
+            break;
+        }
         if sent_bytes >= byte_budget || sent_items >= item_budget {
             break;
         }
@@ -505,7 +518,9 @@ async fn handle_connected_client_tcp_command(
             Ok(())
         }
         TcpPathSessionCommand::CloseStream(stream_id) => {
-            if streams.remove(&stream_id).is_some() {
+            if let Some(state) = streams.get_mut(&stream_id) {
+                state.local_close_pending = true;
+            } else {
                 closed_streams.insert(stream_id);
             }
             Ok(())
@@ -595,6 +610,7 @@ async fn open_client_tcp_stream_on_connection(
                 session_commands: open.session_commands,
                 lane: open.lane,
             }),
+            local_close_pending: false,
         },
     );
     connection
@@ -627,23 +643,28 @@ async fn handle_client_tcp_path_frame(
             max_offset,
         } => {
             if let Some(state) = streams.get_mut(&stream_id)
-                && let Some(mut pending) = state.pending_open.take()
+                && state.pending_open.is_some()
             {
-                let frames = pending
-                    .frames
-                    .take()
-                    .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
-                let stream = ReliablePathStream {
-                    stream_id,
-                    max_offset,
-                    lane: pending.lane,
-                    underlay: UnderlayProtocol::Tcp,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
-                    output: ReliablePathStreamOutput::Fixed(pending.session_commands),
-                    frames,
-                };
-                let _ = pending.response.send(Ok(stream));
-                return Ok(());
+                if state.local_close_pending {
+                    return Ok(());
+                }
+                if let Some(mut pending) = state.pending_open.take() {
+                    let frames = pending
+                        .frames
+                        .take()
+                        .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
+                    let stream = ReliablePathStream {
+                        stream_id,
+                        max_offset,
+                        lane: pending.lane,
+                        underlay: UnderlayProtocol::Tcp,
+                        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+                        output: ReliablePathStreamOutput::Fixed(pending.session_commands),
+                        frames,
+                    };
+                    let _ = pending.response.send(Ok(stream));
+                    return Ok(());
+                }
             }
             route_client_tcp_stream_frame(
                 streams,
@@ -666,13 +687,18 @@ async fn handle_client_tcp_path_frame(
                     .send(Err(RuntimeError::RemoteReset(reason)));
                 return Ok(());
             }
-            route_client_tcp_stream_frame(
+            let result = route_client_tcp_stream_frame(
                 streams,
                 closed_streams,
                 stream_id,
                 Frame::StreamReset { stream_id, reason },
             )
-            .await
+            .await;
+            if result.is_ok() {
+                streams.remove(&stream_id);
+                closed_streams.insert(stream_id);
+            }
+            result
         }
         Frame::StreamData {
             stream_id,
@@ -714,7 +740,7 @@ async fn handle_client_tcp_path_frame(
             stream_id,
             final_offset,
         } => {
-            route_client_tcp_stream_frame(
+            let result = route_client_tcp_stream_frame(
                 streams,
                 closed_streams,
                 stream_id,
@@ -723,7 +749,17 @@ async fn handle_client_tcp_path_frame(
                     final_offset,
                 },
             )
-            .await
+            .await;
+            if result.is_ok() {
+                streams.remove(&stream_id);
+                closed_streams.insert(stream_id);
+            }
+            result
+        }
+        Frame::StreamDetach { stream_id } => {
+            streams.remove(&stream_id);
+            closed_streams.insert(stream_id);
+            Ok(())
         }
         Frame::Ping { nonce } => {
             connection
@@ -801,16 +837,20 @@ pub(super) async fn route_client_tcp_stream_frame(
     frame: Frame,
 ) -> Result<(), RuntimeError> {
     let Some(state) = streams.get_mut(&stream_id) else {
+        #[cfg(feature = "lab-diagnostics")]
+        let was_recently_closed = closed_streams.contains(&stream_id);
         closed_streams.insert(stream_id);
         #[cfg(feature = "lab-diagnostics")]
-        lab_diagnostic(
-            "client_tcp_unknown_stream_frame_drop",
-            format_args!(
-                "stream_id={} frame_kind={}",
-                stream_id.0,
-                frame_kind_name(&frame),
-            ),
-        );
+        if !was_recently_closed {
+            lab_diagnostic(
+                "client_tcp_unknown_stream_frame_drop",
+                format_args!(
+                    "stream_id={} frame_kind={}",
+                    stream_id.0,
+                    frame_kind_name(&frame),
+                ),
+            );
+        }
         return Ok(());
     };
     #[cfg(feature = "lab-diagnostics")]
@@ -946,7 +986,7 @@ pub(super) fn tcp_path_command_queue_for_payload(
 ) -> usize {
     let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
     let inflight_frames = mux_limits
-        .max_tcp_path_inflight_bytes
+        .max_path_flight_bytes
         .saturating_add(frame_payload - 1)
         / frame_payload;
     inflight_frames.saturating_add(4).clamp(

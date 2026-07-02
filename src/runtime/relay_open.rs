@@ -260,6 +260,7 @@ impl ReliableRelayRemoteSet {
         };
         context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
         context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
+        path.stream.send_detach().await;
         path.stream.close().await;
         true
     }
@@ -274,6 +275,7 @@ impl ReliableRelayRemoteSet {
         };
         context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
         context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
+        path.stream.send_detach().await;
         path.stream.close().await;
         true
     }

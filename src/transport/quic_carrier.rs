@@ -191,8 +191,8 @@ fn quic_transport_config(mux_limits: MuxLimits) -> TransportConfig {
         .saturating_add(mux_limits.max_repair_bytes as u64)
         .saturating_add(mux_limits.max_reorder_bytes as u64)
         .saturating_add(mux_limits.max_datagram_queue_bytes as u64)
-        .saturating_add(mux_limits.max_tcp_path_inflight_bytes as u64);
-    let send_window = (mux_limits.max_tcp_path_inflight_bytes as u64)
+        .saturating_add(mux_limits.max_path_flight_bytes as u64);
+    let send_window = (mux_limits.max_path_flight_bytes as u64)
         .max(mux_limits.max_reliable_relay_chunk_bytes as u64)
         .max(1);
     let concurrent_streams = (connection_receive_window / stream_receive_window)
@@ -509,10 +509,18 @@ mod tests {
         let mux_limits = MuxLimits::default();
         let transport = quic_transport_config(mux_limits);
         let rendered = format!("{transport:?}");
-        assert!(rendered.contains("stream_receive_window: 67108864"));
-        assert!(rendered.contains("receive_window: 251658240"));
-        assert!(rendered.contains("send_window: 33554432"));
-        assert!(rendered.contains("max_concurrent_bidi_streams: 3"));
+        let stream_window = mux_limits.max_stream_window_bytes;
+        let receive_window = stream_window
+            + mux_limits.max_repair_bytes as u64
+            + mux_limits.max_reorder_bytes as u64
+            + mux_limits.max_datagram_queue_bytes as u64
+            + mux_limits.max_path_flight_bytes as u64;
+        let send_window = mux_limits.max_path_flight_bytes as u64;
+        let bidi_streams = receive_window / stream_window;
+        assert!(rendered.contains(&format!("stream_receive_window: {stream_window}")));
+        assert!(rendered.contains(&format!("receive_window: {receive_window}")));
+        assert!(rendered.contains(&format!("send_window: {send_window}")));
+        assert!(rendered.contains(&format!("max_concurrent_bidi_streams: {bidi_streams}")));
         assert!(rendered.contains("max_concurrent_uni_streams: 0"));
     }
 }

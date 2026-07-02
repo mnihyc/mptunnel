@@ -175,7 +175,10 @@ impl ReliablePathStreamOutput {
     pub(super) async fn send_stream_detach(&self, stream_id: StreamId) {
         if let Self::Fixed(commands) = self {
             let _ = commands
-                .try_enqueue_admitted_frame(Frame::StreamDetach { stream_id }, FlowLane::Control);
+                .send_control(TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
+                    stream_id,
+                }))
+                .await;
         }
     }
 
@@ -283,6 +286,7 @@ pub(super) struct ResponseStreamBinding {
     mux_limits: MuxLimits,
     lane_tracker: Arc<ServerPathLaneTracker>,
     outputs: Mutex<ResponseStreamOutputs>,
+    ordinary_lead: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
     version: watch::Sender<u64>,
@@ -358,6 +362,7 @@ impl ResponseStreamBinding {
                     path_metrics: None,
                 }],
             }),
+            ordinary_lead: Mutex::new(Some(key)),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
@@ -428,6 +433,9 @@ impl ResponseStreamBinding {
         }
         if !already_attached {
             self.lane_tracker.attach(self.session_id, key, lane);
+        }
+        if server_stream_open_role_promotes_data_path(role) && self.can_migrate_ordinary_lead() {
+            self.set_ordinary_lead(key);
         }
         self.notify_update();
     }
@@ -533,6 +541,7 @@ impl ResponseStreamBinding {
         if outputs.entries.len() != before {
             drop(outputs);
             self.lane_tracker.detach(self.session_id, key, lane);
+            self.clear_ordinary_lead_if(key);
             self.notify_update();
         }
     }
@@ -678,6 +687,48 @@ impl ResponseStreamBinding {
         if changed || ordering_update.changed {
             self.notify_update();
         }
+    }
+
+    pub(super) fn ordinary_lead(&self) -> Option<CarrierPathKey> {
+        *self
+            .ordinary_lead
+            .lock()
+            .expect("server reliable stream ordinary lead lock")
+    }
+
+    pub(super) fn set_ordinary_lead(&self, key: CarrierPathKey) {
+        let mut lead = self
+            .ordinary_lead
+            .lock()
+            .expect("server reliable stream ordinary lead lock");
+        if *lead != Some(key) {
+            *lead = Some(key);
+            drop(lead);
+            self.notify_update();
+        }
+    }
+
+    fn clear_ordinary_lead_if(&self, key: CarrierPathKey) {
+        let mut lead = self
+            .ordinary_lead
+            .lock()
+            .expect("server reliable stream ordinary lead lock");
+        if *lead == Some(key) {
+            *lead = None;
+        }
+    }
+
+    fn can_migrate_ordinary_lead(&self) -> bool {
+        self.flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .is_empty()
+            && self
+                .ack_ordering
+                .lock()
+                .expect("server response ACK ordering lock")
+                .acked_holes
+                .is_empty()
     }
 
     pub(super) fn record_flight(
@@ -842,6 +893,9 @@ impl ResponseStreamBinding {
                 .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                 .await;
             self.lane_tracker.detach(self.session_id, entry.key, lane);
+        }
+        if let Ok(mut lead) = self.ordinary_lead.lock() {
+            *lead = None;
         }
     }
 

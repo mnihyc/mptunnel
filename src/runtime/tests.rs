@@ -558,7 +558,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         max_repair_bytes: 1024 * 1024,
         max_reorder_bytes: 1024 * 1024,
         max_datagram_queue_bytes: 1024 * 1024,
-        max_tcp_path_inflight_bytes: 32 * 1024,
+        max_path_flight_bytes: 32 * 1024,
         max_reliable_relay_chunk_bytes: 32 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
@@ -566,7 +566,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
     let send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let queue_limit =
-        reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_tcp_path_inflight_bytes);
+        reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_path_flight_bytes);
 
     assert!(reliable_relay_can_read_into_sender_queue(
         &send_stream,
@@ -649,9 +649,9 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         8 * 1024
     );
 
-    mux_limits.max_tcp_path_inflight_bytes = 64 * 1024;
+    mux_limits.max_path_flight_bytes = 64 * 1024;
     let larger_queue_limit =
-        reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_tcp_path_inflight_bytes);
+        reliable_relay_sender_queue_limit(mux_limits, mux_limits.max_path_flight_bytes);
     assert_eq!(
         reliable_relay_sender_queue_read_budget(
             &send_stream,
@@ -708,7 +708,12 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
 
     assert!(sender.queued_send_ready());
     let dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch response bytes");
 
@@ -723,6 +728,53 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
             payload,
             ..
         })) if id == stream_id && payload == Bytes::from_static(b"response")
+    ));
+}
+
+#[tokio::test]
+async fn server_response_sender_slices_large_reads_to_service_quantum() {
+    let stream_id = StreamId(42);
+    let mux_limits = MuxLimits::default();
+    let quantum = reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
+    let (commands, mut receivers) = tcp_path_session_command_channels(16);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: mux_limits.max_stream_window_bytes,
+        lane: FlowLane::Throughput,
+        underlay: UnderlayProtocol::Udp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+        output: ReliablePathStreamOutput::Fixed(commands),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    let mut sender = ServerResponseSenderService::new(SessionId(17), stream_id);
+    let queued_bytes = mux_limits.max_reliable_relay_chunk_bytes;
+    sender.enqueue_data(Bytes::from(vec![0x5a; queued_bytes]));
+
+    let dispatch = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            mux_limits,
+        )
+        .await
+        .expect("dispatch first service quantum");
+
+    assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(dispatch.payload_bytes, quantum);
+    assert_eq!(sender.data_bytes(), queued_bytes - quantum);
+    assert_eq!(send_stream.next_offset(), quantum as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut receivers).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload.len() == quantum
     ));
 }
 
@@ -757,7 +809,12 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     });
 
     let control_dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch control");
     assert_eq!(control_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
@@ -772,7 +829,12 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     ));
 
     let repair_dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch repair");
     assert_eq!(repair_dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
@@ -802,7 +864,12 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     });
 
     let data_dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch ordinary data first");
     assert_eq!(data_dispatch.lane, ReliableRelayQueuedWorkLane::Data);
@@ -817,7 +884,12 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     ));
 
     let fin_dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch final FIN after data");
     assert_eq!(fin_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
@@ -864,7 +936,12 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
     });
 
     let err = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect_err("full control queue should be sender-service backpressure");
     assert!(matches!(err, RuntimeError::SenderServiceBlocked));
@@ -898,7 +975,12 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     assert_eq!(sender.bytes(), b"response".len());
     assert!(
         sender
-            .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                MuxLimits::default()
+            )
             .await
             .is_err()
     );
@@ -939,7 +1021,12 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
     sender.enqueue_data(Bytes::from_static(b"later"));
 
     let err = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect_err("full carrier queue should be sender-service backpressure");
 
@@ -1021,7 +1108,12 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
     sender.enqueue_data(Bytes::from_static(b"later"));
 
     let err = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect_err("cross-underlay ordering debt must block ordinary response data");
 
@@ -1066,7 +1158,12 @@ async fn server_response_sender_dispatches_repair_before_data() {
     });
 
     let repair_dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch repair");
     assert_eq!(repair_dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
@@ -1081,7 +1178,12 @@ async fn server_response_sender_dispatches_repair_before_data() {
     ));
 
     let data_dispatch = sender
-        .dispatch_next(&path_stream, &mut send_stream, FlowLane::Throughput)
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+        )
         .await
         .expect("dispatch ordinary data");
     assert_eq!(data_dispatch.lane, ReliableRelayQueuedWorkLane::Data);
@@ -1106,7 +1208,7 @@ fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
-        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
@@ -1128,7 +1230,7 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
-        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
@@ -1152,7 +1254,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
-        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
@@ -1161,7 +1263,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
 
     let resources = ResourceLimits {
         max_streams: 65_536,
-        max_tcp_path_inflight_bytes: mux_limits.max_tcp_path_inflight_bytes,
+        max_path_flight_bytes: mux_limits.max_path_flight_bytes,
         max_reliable_relay_chunk_bytes: mux_limits.max_reliable_relay_chunk_bytes,
         ..ResourceLimits::default()
     };
@@ -1178,7 +1280,7 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
-        max_tcp_path_inflight_bytes: 4 * 1024 * 1024,
+        max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
@@ -1189,11 +1291,11 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
 
     assert_eq!(
         tcp_sized_queue,
-        mux_limits.max_tcp_path_inflight_bytes.div_ceil(64 * 1024) + 4
+        mux_limits.max_path_flight_bytes.div_ceil(64 * 1024) + 4
     );
     assert_eq!(
         udp_sized_queue,
-        mux_limits.max_tcp_path_inflight_bytes.div_ceil(1200) + 4
+        mux_limits.max_path_flight_bytes.div_ceil(1200) + 4
     );
     assert!(udp_sized_queue > tcp_sized_queue);
 }
@@ -1310,7 +1412,7 @@ fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
         default_bdp.max(reliable_relay_buffer_len(mux_limits))
     );
     assert!(
-        startup < mux_limits.max_tcp_path_inflight_bytes,
+        startup < mux_limits.max_path_flight_bytes,
         "configured inflight is a ceiling, not an unknown-path startup target"
     );
 }
@@ -1326,7 +1428,7 @@ fn carrier_inflight_evidence_does_not_cap_product_source_read_horizon() {
 
     assert!(inflight > path.inflight_limit_bytes as usize);
     assert!(
-        inflight <= mux_limits.max_tcp_path_inflight_bytes,
+        inflight <= mux_limits.max_path_flight_bytes,
         "carrier cwnd is a carrier emission gate, not a product source-read cap"
     );
 }
@@ -1336,13 +1438,13 @@ fn product_progress_does_not_downshift_source_read_below_carrier_evidence() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, 4_000_000_000.0);
     path.pacing_rate_bps = 4_000_000_000.0;
-    path.inflight_limit_bytes = mux_limits.max_tcp_path_inflight_bytes as u64;
+    path.inflight_limit_bytes = mux_limits.max_path_flight_bytes as u64;
     path.product_progress_rate_bps = Some(160_000_000.0);
 
     let inflight =
         adaptive_reliable_relay_inflight_bytes(Some(path), FlowLane::Throughput, mux_limits);
 
-    assert_eq!(inflight, mux_limits.max_tcp_path_inflight_bytes);
+    assert_eq!(inflight, mux_limits.max_path_flight_bytes);
     assert_eq!(
         path.delivery_rate_bps, 4_000_000_000.0,
         "carrier rate remains carrier evidence; product progress is a separate field"
@@ -1354,12 +1456,14 @@ fn udp_source_read_startup_can_fill_reliable_carrier_without_double_cwnd() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 50.0, 4_000_000_000.0);
     path.pacing_rate_bps = 4_000_000_000.0;
-    path.inflight_limit_bytes = mux_limits.max_tcp_path_inflight_bytes as u64;
+    path.inflight_limit_bytes = mux_limits.max_path_flight_bytes as u64;
 
     let inflight =
         adaptive_reliable_relay_inflight_bytes(Some(path), FlowLane::Throughput, mux_limits);
 
-    assert_eq!(inflight, mux_limits.max_tcp_path_inflight_bytes);
+    let expected = ((path.delivery_rate_bps / 8.0) * (path.srtt_ms / 1000.0) * 2.0) as usize;
+    assert_eq!(inflight, expected);
+    assert!(inflight < mux_limits.max_path_flight_bytes);
 }
 
 #[test]
@@ -1510,7 +1614,7 @@ fn reliable_recv_progress_batches_max_data_updates() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024,
         max_reliable_relay_chunk_bytes: 1024,
-        max_tcp_path_inflight_bytes: 4096,
+        max_path_flight_bytes: 4096,
         max_stream_window_bytes: 4096,
         max_repair_bytes: 4096,
         max_reorder_bytes: 4096,
@@ -1543,7 +1647,7 @@ fn reliable_recv_progress_batches_bulk_acks_by_window_and_ack_capacity() {
         max_stream_window_bytes: 64 * 1024,
         max_repair_bytes: 64 * 1024,
         max_reorder_bytes: 64 * 1024,
-        max_tcp_path_inflight_bytes: 64 * 1024,
+        max_path_flight_bytes: 64 * 1024,
         max_reliable_relay_chunk_bytes: 64 * 1024,
         ..MuxLimits::default()
     };
@@ -1579,7 +1683,7 @@ fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
         max_stream_window_bytes: 64 * 1024,
         max_repair_bytes: 64 * 1024,
         max_reorder_bytes: 64 * 1024,
-        max_tcp_path_inflight_bytes: 64 * 1024,
+        max_path_flight_bytes: 64 * 1024,
         max_reliable_relay_chunk_bytes: 64 * 1024,
         ..MuxLimits::default()
     };
@@ -1604,7 +1708,7 @@ fn reliable_recv_progress_acks_repair_horizon_advancement() {
         max_stream_window_bytes: 64 * 1024,
         max_repair_bytes: 64 * 1024,
         max_reorder_bytes: 64 * 1024,
-        max_tcp_path_inflight_bytes: 64 * 1024,
+        max_path_flight_bytes: 64 * 1024,
         max_reliable_relay_chunk_bytes: 64 * 1024,
         ..MuxLimits::default()
     };
@@ -2137,7 +2241,7 @@ fn reliable_relay_bulk_admission_payload_uses_preemptible_quantum_not_inflight_c
     assert!(validation_quantum >= PATH_OPEN_SCORE_BYTES);
     assert!(validation_quantum <= tcp_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits));
     assert!(validation_quantum < expected_quantum);
-    assert!(expected_quantum < mux_limits.max_tcp_path_inflight_bytes);
+    assert!(expected_quantum < mux_limits.max_path_flight_bytes);
 }
 
 #[test]

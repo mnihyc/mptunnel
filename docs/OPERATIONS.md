@@ -96,6 +96,39 @@ Running `mptunnel` with no arguments reads `./config.toml`. Use `--config PATH` 
 
 MPP endpoints and security belong to `protocol = "mpp"` outbounds. Routing balancers reference outbound tags: `combined-mpp` combines MPP outbounds, while `sequence` and `random` select among egress outbounds. DNS resolver policy belongs to the egress outbound that resolves target names, usually as an inline `dns = { ... }` table on that outbound.
 
+## Resource Envelope Guide
+
+Leave `[resources]` unset for normal operation. These fields are byte/time
+envelopes for Auto, not manual transmission modes. The sender still adapts from
+live RTT, delivery rate, queue depth, loss, ACK ranges, repair state, and
+carrier credit. Raising an envelope permits more high-BDP or high-concurrency
+work; it does not force mptunnel to fill that memory.
+
+Recommended production ranges:
+
+| Field | Default | Practical range | How it works |
+| --- | ---: | ---: | --- |
+| `max_frame_bytes` | 1 MiB | 1-4 MiB | Hard product-frame safety cap. Keep small unless profiling shows framing overhead. |
+| `max_payload_bytes` | frame minus header room | leave unset | Product payload cap. When omitted in `config.toml`, it derives from `max_frame_bytes`. |
+| `max_ack_ranges` | 256 | 128-1024 | Sparse stream ACK cap. Raise only if diagnostics show ACK range truncation under loss/reorder. |
+| `max_paths` | 64 | 8-64 | Path registry cap. It is not an aggregation target. |
+| `max_streams` | 65,536 | 4096+ | Logical stream registry cap for proxy/TUN fan-out. |
+| `max_stream_window_bytes` | 64 MiB | 64-256 MiB | Product flow-control receive window. Increase for high-BDP paths and many streams. |
+| `max_repair_bytes` | 64 MiB | 64-256 MiB | Repair-cache envelope for MPTCP-like reinjection. Config-file `max_path_flight_bytes` derives from this when omitted. |
+| `max_reorder_bytes` | 64 MiB | 64-256 MiB | Receive-hole/order debt envelope for multipath scheduling. Too high can hide harmful striping; too low can reject useful paths. |
+| `max_datagram_queue_bytes` | 16 MiB | 16-64 MiB | Datagram burst envelope for SOCKS5 UDP, TUN UDP, and realtime traffic. |
+| `max_path_flight_bytes` | 64 MiB | 64-256 MiB | Per-path product-flight ceiling and QUIC send-window resource input. Actual sender flight remains BDP/queue/loss adaptive. |
+| `max_reliable_relay_chunk_bytes` | 512 KiB | 256 KiB-1 MiB | Read-buffer ceiling only. Scheduler quanta stay smaller and preemptible. |
+| TCP heartbeat timers | 10s / 30s | keep default | Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair evidence. |
+
+For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
+`max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together
+instead of only raising the frame or read chunk. For a memory-constrained local
+device, lower the same envelopes together and verify file-download goodput,
+small-request latency, and failover through the management API or lab runs.
+Do not lower `max_path_flight_bytes` below `max_reliable_relay_chunk_bytes`; the
+config validator rejects incoherent envelopes.
+
 The release management API is enabled only when `--management-listen` or `[management].listen` is configured. Keep it on loopback unless an operator network explicitly protects it. Set `--management-token` or `[management].token` for bearer-token authentication. Release endpoints expose JSON status and bounded traffic trends without lab-only component timing. Status includes local inbound tags, listener addresses, route targets, path health, and traffic summaries; local proxy credentials are not exposed. When one process has both local inbounds using MPP outbounds and MPP inbounds using egress outbounds, the API reports a self-contained node snapshot with both service groups:
 
 ```bash

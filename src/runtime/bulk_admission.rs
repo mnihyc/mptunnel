@@ -126,7 +126,7 @@ pub(super) fn bulk_service_horizon_payload_bytes(
 ) -> usize {
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
     let envelope = mux_limits
-        .max_tcp_path_inflight_bytes
+        .max_path_flight_bytes
         .min(mux_limits.max_reorder_bytes)
         .min(stream_window)
         .max(payload_bytes)
@@ -280,7 +280,7 @@ fn bulk_product_inflight_limit_bytes(
     mux_limits: MuxLimits,
     role: BulkAdmissionRole,
 ) -> u64 {
-    let configured_ceiling = mux_limits.max_tcp_path_inflight_bytes as u64;
+    let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
     let payload_floor = payload_bytes as u64;
     let bdp = bulk_path_bdp_bytes(candidate);
     let bdp_limit = bdp.saturating_mul(2).max(payload_floor);
@@ -309,7 +309,7 @@ fn bulk_carrier_inflight_limit_bytes(
     if candidate.underlay != UnderlayProtocol::Udp {
         return bulk_product_inflight_limit_bytes(candidate, payload_bytes, mux_limits, role);
     }
-    let configured_ceiling = mux_limits.max_tcp_path_inflight_bytes as u64;
+    let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
     let payload_floor = payload_bytes as u64;
     let carrier_limit = if candidate.inflight_limit_bytes > 0 {
         candidate.inflight_limit_bytes
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn active_tcp_product_inflight_limit_is_model_based() {
         let mux_limits = MuxLimits {
-            max_tcp_path_inflight_bytes: 32 * 1024 * 1024,
+            max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
         };
         let candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 50.0, mbps(50.0));
@@ -578,14 +578,14 @@ mod tests {
             BulkAdmissionRole::ActiveDataPath,
         );
 
-        assert!(limit < mux_limits.max_tcp_path_inflight_bytes as u64);
+        assert!(limit < mux_limits.max_path_flight_bytes as u64);
         assert_eq!(limit, 625_000);
     }
 
     #[test]
     fn active_tcp_with_session_latency_pressure_uses_preemptible_service_horizon() {
         let mux_limits = MuxLimits {
-            max_tcp_path_inflight_bytes: 32 * 1024 * 1024,
+            max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
         };
         let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn active_udp_path_obeys_carrier_credit() {
         let mux_limits = MuxLimits {
-            max_tcp_path_inflight_bytes: 32 * 1024 * 1024,
+            max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
         };
         let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, mbps(500.0));
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn cross_underlay_product_inflight_limit_is_bdp_modeled() {
         let mux_limits = MuxLimits {
-            max_tcp_path_inflight_bytes: 32 * 1024 * 1024,
+            max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
         };
         let candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 50.0, mbps(50.0));
@@ -666,7 +666,7 @@ mod tests {
             BulkAdmissionRole::AdditionalCrossUnderlay,
         );
 
-        assert!(limit < mux_limits.max_tcp_path_inflight_bytes as u64);
+        assert!(limit < mux_limits.max_path_flight_bytes as u64);
         assert_eq!(limit, 625_000);
     }
 
@@ -690,8 +690,7 @@ mod tests {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut saturated = candidate(1, 110.0, 50.0, 500.0);
         saturated.snapshot.inflight_limit_bytes = 64 * 1024;
-        saturated.snapshot.bytes_in_flight =
-            MuxLimits::default().max_tcp_path_inflight_bytes as u64;
+        saturated.snapshot.bytes_in_flight = MuxLimits::default().max_path_flight_bytes as u64;
 
         let admitted =
             bulk_striping_admitted_cohort(vec![best, saturated], 16 * 1024, MuxLimits::default());
@@ -705,8 +704,7 @@ mod tests {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut extra = candidate(1, 100.0, 50.0, 50.0);
         extra.snapshot.confidence = 1.0;
-        extra.snapshot.inflight_limit_bytes =
-            MuxLimits::default().max_tcp_path_inflight_bytes as u64;
+        extra.snapshot.inflight_limit_bytes = MuxLimits::default().max_path_flight_bytes as u64;
         extra.snapshot.bytes_in_flight = 1024 * 1024;
 
         assert_eq!(
@@ -729,8 +727,7 @@ mod tests {
         let mut active = candidate(0, 100.0, 50.0, 50.0);
         active.snapshot.underlay = UnderlayProtocol::Tcp;
         active.snapshot.confidence = 1.0;
-        active.snapshot.inflight_limit_bytes =
-            MuxLimits::default().max_tcp_path_inflight_bytes as u64;
+        active.snapshot.inflight_limit_bytes = MuxLimits::default().max_path_flight_bytes as u64;
         active.snapshot.bytes_in_flight = 1024 * 1024;
 
         assert_eq!(
@@ -754,7 +751,7 @@ mod tests {
         stale_active.snapshot.underlay = UnderlayProtocol::Tcp;
         stale_active.snapshot.confidence = 1.0;
         stale_active.snapshot.inflight_limit_bytes =
-            MuxLimits::default().max_tcp_path_inflight_bytes as u64;
+            MuxLimits::default().max_path_flight_bytes as u64;
 
         assert_eq!(
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -1100,7 +1097,7 @@ mod tests {
         let mut saturated_best = candidate(0, 100.0, 50.0, 500.0);
         saturated_best.snapshot.inflight_limit_bytes = 64 * 1024;
         saturated_best.snapshot.product_bytes_in_flight =
-            MuxLimits::default().max_tcp_path_inflight_bytes as u64;
+            MuxLimits::default().max_path_flight_bytes as u64;
         let backup = candidate(1, 130.0, 50.0, 500.0);
 
         let admitted = bulk_striping_admitted_cohort(

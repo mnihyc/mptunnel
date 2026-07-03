@@ -1960,9 +1960,13 @@ clear failure state and update active-flow counts, but they MUST NOT by
 themselves create RTT, delivery-rate, or freshness confidence samples. Stream
 ACKs release inflight ownership and repair-cache entries, but delayed, compressed,
 or tiny ACK-release timing MUST NOT raise or lower the bulk delivery-rate
-estimate. Probe
-responses, ACK-derived carrier data samples, datagram feedback, and other
-data-plane observations are the inputs that raise path-model confidence.
+estimate. Probe responses, ACK-derived carrier data samples, datagram feedback,
+and other data-plane observations are the inputs that raise path-model
+confidence. Datagram feedback is path-scoped evidence for realtime/datagram
+scheduling, but it is not by itself proof that the same path may own new ordered
+reliable-stream bytes; reliable bulk ownership requires ordered-stream product
+delivery evidence or carrier ACK-derived data evidence from the reliable
+carrier.
 
 Long-lived streams update path delivery evidence while they are active. Once a
 receiver has delivered enough ordered stream bytes to form a meaningful rate
@@ -2658,14 +2662,20 @@ layers.
 When the UDP production engine is QUIC, the response sender MUST preserve both
 ACK-derived delivery rate and QUIC pacing/cwnd-derived pacing rate in its path
 snapshot. Application-limited ACK samples MUST NOT initialize or reduce the
-bulk delivery-rate model to a tiny value. Until a non-application-limited data
-sample exists, and until the local QUIC stack exposes usable pacing or
-congestion-window capacity, ACK progress proves liveness and RTT only; it MUST
-NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not bulk
-capacity evidence, and MUST NOT by itself initialize the QUIC/UDP delivery-rate
-model. The scheduler MAY use the QUIC pacing/cwnd rate or the normal UDP
-startup model for bounded admission, but it MUST keep the app-limited or
-capacity-unknown provenance visible to diagnostics and admission.
+bulk delivery-rate model to a tiny value. The sender keeps two separate facts:
+ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
+duplicate-discovery copy that is acknowledged by the local QUIC carrier may set
+ACK-derived data seen for that carrier path, which proves the path can carry
+data and may make it eligible for a bounded trial when the ordered frontier is
+safe. It does not set bulk-rate evidence and does not overwrite the delivery
+rate. Until a non-application-limited data sample exists, and until the local
+QUIC stack exposes usable pacing or congestion-window capacity, ACK progress
+MUST NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not
+bulk capacity evidence, and MUST NOT by itself initialize the QUIC/UDP
+delivery-rate model. The scheduler MAY use the QUIC pacing/cwnd rate or the
+normal UDP startup model for bounded admission, but it MUST keep the
+app-limited or capacity-unknown provenance visible to diagnostics and
+admission.
 Before a non-application-limited ACK-derived data sample exists, a QUIC
 pacing/cwnd value that is below the normal UDP startup model is carrier-local
 startup state, not product-scheduler bulk capacity proof. The product scheduler
@@ -2996,17 +3006,18 @@ candidate. This prevents active-path stickiness after a path switch, which
 diagnostics showed can otherwise alternate between a fast UDP path and a
 high-RTT or low-rate TCP path while growing tens of MiB of receive hole.
 
-Data-plane repair progress is also delivery evidence, but only for failover
-admission. When a tail-stall or path-failure repair frame is sent on an
-alternate path and the next `STREAM_ACK` advances the contiguous ACK frontier or
-releases bytes that were still in the repair cache, the sender MAY mark that
-repair path as locally delivered and promote it to the active lifecycle slot for
-future admission. This does not derive a bandwidth estimate from ACK-release
-timing and does not convert duplicated validation ACKs into high-rate evidence.
-It is the product-layer equivalent of MPTCP reinjection over a surviving subflow
-and QUIC PTO recovery: progress on a survivor path should detach active work
-from the stalled path before heartbeat liveness timers expire. If the repair
-does not advance the stream frontier, no promotion occurs.
+Data-plane repair progress releases product repair state, but it is not
+path-scoped delivery proof when the repaired byte range was duplicated. When a
+tail-stall or path-failure repair frame is sent on an alternate path and the
+next `STREAM_ACK` advances the contiguous ACK frontier or releases bytes that
+were still in the repair cache, the sender MUST release product flight and may
+clear stall diagnostics, but it MUST NOT increment the repair path's ordinary
+delivery sample count, move that path to the active output slot, or change the
+ordinary lead from this ambiguous product ACK. Promotion requires path-scoped
+sender evidence: for QUIC, local ACK-derived carrier data samples; for TCP, an
+explicit path proof followed by evidence that is not merely an ACK of duplicated
+repair data. This preserves the MPTCP reinjection lesson without pretending a
+data-level ACK identifies which duplicate carrier delivered the byte.
 
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,

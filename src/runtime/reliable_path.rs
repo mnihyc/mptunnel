@@ -50,10 +50,6 @@ impl ReliablePathStream {
         )
     }
 
-    pub(super) fn mark_repair_path_delivery_and_promote(&self, key: CarrierPathKey) -> bool {
-        self.output.mark_repair_path_delivery_and_promote(key)
-    }
-
     pub(super) async fn recv_frame(&mut self) -> Result<Frame, RuntimeError> {
         match self.frames.recv().await {
             Some(Ok(frame)) => Ok(frame),
@@ -444,13 +440,6 @@ impl ReliablePathStreamOutput {
                     .await;
             }
             Self::Switchable(binding) => binding.close_stream_ordered(stream_id, lane).await,
-        }
-    }
-
-    pub(super) fn mark_repair_path_delivery_and_promote(&self, key: CarrierPathKey) -> bool {
-        match self {
-            Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.mark_repair_path_delivery_and_promote(key),
         }
     }
 
@@ -898,28 +887,6 @@ impl ResponseStreamBinding {
             self.clear_ordered_data_owner_if(key);
             self.notify_update();
         }
-    }
-
-    fn mark_repair_path_delivery_and_promote(&self, key: CarrierPathKey) -> bool {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) else {
-            return false;
-        };
-        let was_active = position + 1 == outputs.entries.len();
-        let now = Instant::now();
-        outputs.entries[position].delivery_samples =
-            outputs.entries[position].delivery_samples.saturating_add(1);
-        outputs.entries[position].last_delivery_at = Some(now);
-        if !was_active {
-            let entry = outputs.entries.remove(position);
-            outputs.entries.push(entry);
-        }
-        drop(outputs);
-        self.notify_update();
-        !was_active
     }
 
     pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
@@ -1764,6 +1731,63 @@ mod tests {
             duplicate_entry.delivery_samples, 0,
             "duplicate validation STREAM_ACK must not become response bulk evidence"
         );
+    }
+
+    #[test]
+    fn repair_stream_ack_progress_does_not_promote_repair_output() {
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Udp);
+        let repair = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            repair.underlay,
+            repair.path_id,
+            repair_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Repair,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+        let frame = stream_data_frame_at(0, 4096);
+
+        let before_order = binding
+            .outputs
+            .lock()
+            .expect("test response outputs lock")
+            .entries
+            .iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
+
+        binding.record_flight_with_ordering_owner(repair, &frame, false, false);
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 4096,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let after_order = outputs
+            .entries
+            .iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
+        let owner_entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == owner)
+            .expect("owner output exists");
+        let repair_entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == repair)
+            .expect("repair output exists");
+
+        assert_eq!(after_order, before_order);
+        assert_eq!(owner_entry.delivery_samples, 0);
+        assert_eq!(repair_entry.delivery_samples, 0);
+        assert_eq!(repair_entry.bytes_in_flight, 0);
+        assert_eq!(binding.ordered_data_owner(), Some(owner));
     }
 
     #[test]

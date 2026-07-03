@@ -989,7 +989,6 @@ async fn drain_server_response_sender_ready(
     sender_dispatch_byte_budget: usize,
     sender_dispatch_item_budget: usize,
     stats: &mut PathDeliveryStats,
-    last_tail_repair_path: &mut Option<CarrierPathKey>,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] session_id: SessionId,
 ) -> Result<bool, RuntimeError> {
     let mut dispatched_items = 0usize;
@@ -1013,7 +1012,18 @@ async fn drain_server_response_sender_ready(
         };
         dispatched_items = dispatched_items.saturating_add(1);
         if dispatch.lane == ReliableRelayQueuedWorkLane::Repair {
-            *last_tail_repair_path = dispatch.selected_path;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "repair_frame_dispatched",
+                format_args!(
+                    "session_id={} stream_id={} path_underlay={:?} path_id={} payload_bytes={}",
+                    session_id.0,
+                    path_stream.stream_id.0,
+                    dispatch.selected_path.underlay,
+                    dispatch.selected_path.path_id.0,
+                    dispatch.payload_bytes,
+                ),
+            );
         } else {
             dispatched_payload_bytes =
                 dispatched_payload_bytes.saturating_add(dispatch.payload_bytes);
@@ -1077,14 +1087,14 @@ where
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_progress_at = Instant::now();
     let mut last_tail_repair_at = Instant::now();
-    let mut last_tail_repair_path = None;
     let mut last_send_ack_frontier = 0_u64;
     let mut last_send_ack_ranges = Vec::<OffsetRange>::new();
     let mut last_send_ack_complete = false;
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut output_updates = path_stream.subscribe_output_updates();
     let mut multipath_repair_alternative_available = path_stream.has_multipath_repair_alternative();
-    let mut response_sender = ServerResponseSenderService::new(session_id, stream_id);
+    let mut response_sender =
+        ServerResponseSenderService::new_with_performance(session_id, stream_id, performance);
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
     let mut last_relay_lane = path_stream.current_lane();
     let mut last_sender_dispatch_byte_budget =
@@ -1282,7 +1292,6 @@ where
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
-                    &mut last_tail_repair_path,
                     session_id,
                 )
                 .await?
@@ -1388,22 +1397,6 @@ where
                         if ack_made_progress {
                             last_send_ack_progress_at = Instant::now();
                             last_tail_repair_at = last_send_ack_progress_at;
-                            if let Some(path_key) = last_tail_repair_path.take()
-                                && path_stream.mark_repair_path_delivery_and_promote(path_key)
-                            {
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "repair_path_promoted",
-                                    format_args!(
-                                        "stream_id={} path_underlay={:?} path_id={} released_bytes={} largest_end={}",
-                                        stream_id.0,
-                                        path_key.underlay,
-                                        path_key.path_id.0,
-                                        ack.released_bytes,
-                                        largest_ack_end,
-                                    ),
-                                );
-                            }
                         }
                         last_send_ack_frontier = last_send_ack_frontier.max(largest_ack_end);
                         last_send_ack_ranges = normalized_ranges.clone();
@@ -1593,7 +1586,6 @@ where
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
-                        &mut last_tail_repair_path,
                         session_id,
                     )
                     .await?
@@ -1672,7 +1664,6 @@ where
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
-                        &mut last_tail_repair_path,
                         session_id,
                     )
                     .await?
@@ -1715,7 +1706,6 @@ where
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
-                        &mut last_tail_repair_path,
                         session_id,
                     )
                     .await?
@@ -1743,7 +1733,6 @@ where
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
-                    &mut last_tail_repair_path,
                     session_id,
                 )
                 .await?
@@ -1762,7 +1751,6 @@ where
                     sender_dispatch_byte_budget,
                     sender_dispatch_item_budget,
                     &mut stats,
-                    &mut last_tail_repair_path,
                     session_id,
                 )
                 .await?
@@ -1872,7 +1860,6 @@ where
                             sender_dispatch_byte_budget,
                             sender_dispatch_item_budget,
                             &mut stats,
-                            &mut last_tail_repair_path,
                             session_id,
                         )
                         .await?
@@ -1899,7 +1886,6 @@ where
                 last_sender_dispatch_byte_budget,
                 last_sender_dispatch_item_budget,
                 &mut stats,
-                &mut last_tail_repair_path,
                 session_id,
             )
             .await

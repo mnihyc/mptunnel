@@ -1065,6 +1065,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             loss_ppm: None,
             ecn_ppm: None,
             app_limited: true,
+            ack_derived_data_seen: false,
             delivery_sample_count: 0,
             last_delivery_sample_at: None,
         });
@@ -1097,6 +1098,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             loss_ppm: Some(0),
             ecn_ppm: None,
             app_limited: false,
+            ack_derived_data_seen: true,
             delivery_sample_count: 2,
             last_delivery_sample_at: Some(now),
         });

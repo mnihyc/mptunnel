@@ -1537,6 +1537,17 @@ fn path_proof_observation_does_not_promote_tcp_candidate_without_delivery_eviden
         !context.relay_path_has_bulk_model_evidence(UnderlayProtocol::Tcp, 1),
         "path-scoped proof ACK creates liveness evidence, not unique bulk-model permission"
     );
+    assert!(
+        context
+            .ordered_reliable_bulk_validation_path_keys(reliable_relay_buffer_len(
+                MuxLimits::default()
+            ))
+            .contains(&RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            }),
+        "proof-success path remains eligible for validation/discovery until ACK-data evidence arrives"
+    );
     {
         let health = context.health.lock().expect("client path health lock");
         let record = &health.tcp[1];
@@ -1580,6 +1591,17 @@ fn path_proof_observation_does_not_promote_udp_candidate_without_carrier_sample(
     assert!(
         !context.relay_path_has_bulk_model_evidence(UnderlayProtocol::Udp, 1),
         "UDP proof ACK is reachability evidence; QUIC UDP needs ACK-derived data samples before unique bulk"
+    );
+    assert!(
+        context
+            .ordered_reliable_bulk_validation_path_keys(reliable_relay_buffer_len(
+                MuxLimits::default()
+            ))
+            .contains(&RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 1,
+            }),
+        "proof-success QUIC UDP path remains eligible for validation/discovery until ACK-data evidence arrives"
     );
 }
 

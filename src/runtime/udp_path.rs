@@ -140,6 +140,7 @@ struct QuicPathMetricTracker {
     last_tx_datagram_frames: u64,
     last_observed_at: Option<Instant>,
     delivery_rate_bps: Option<f64>,
+    ack_derived_data_seen: bool,
     delivery_sample_count: u64,
     last_delivery_sample_at: Option<Instant>,
     min_rtt: Option<Duration>,
@@ -316,6 +317,9 @@ impl QuicPathMetricTracker {
 
         let newly_acked_bytes = congestion.newly_acked_bytes.unwrap_or(0);
         let mut app_limited = congestion.app_limited || app_frame_delta == 0;
+        if newly_acked_bytes > 0 && app_frame_delta > 0 {
+            self.ack_derived_data_seen = true;
+        }
         if newly_acked_bytes > 0 && !congestion.app_limited {
             let sample_elapsed = elapsed.max(QUIC_TIMER_GRANULARITY);
             let sample_rate =
@@ -365,6 +369,7 @@ impl QuicPathMetricTracker {
             loss_ppm: congestion.loss_ppm,
             ecn_ppm: congestion.ecn_ppm,
             app_limited,
+            ack_derived_data_seen: self.ack_derived_data_seen,
             delivery_sample_count: self.delivery_sample_count,
             last_delivery_sample_at: self.last_delivery_sample_at,
         }
@@ -1106,7 +1111,7 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
                 .clamp(0.0, 1.0),
         ),
         app_limited: metrics.app_limited,
-        has_ack_derived_data_sample: metrics.delivery_sample_count > 0,
+        has_ack_derived_data_sample: metrics.ack_derived_data_seen,
         data_sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
     }
 }
@@ -2319,6 +2324,7 @@ mod tests {
             loss_ppm: None,
             ecn_ppm: None,
             app_limited: true,
+            ack_derived_data_seen: false,
             delivery_sample_count: 0,
             last_delivery_sample_at: None,
         };
@@ -2432,6 +2438,33 @@ mod tests {
         assert!(app_limited.last_delivery_sample_at.is_none());
         assert_eq!(app_limited.delivery_rate_bps.round() as u64, 500_000_000);
         assert!(app_limited.app_limited);
+    }
+
+    #[test]
+    fn quic_app_limited_duplicate_ack_counts_as_ack_data_seen_not_bulk_rate() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_congestion(4 * 1024 * 1024, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = 4 * 1024 * 1024;
+        stats.path.current_mtu = 1400;
+        let _ = tracker.quic.observe(stats, congestion, 2);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
+        stats.udp_tx.bytes = 32 * 1024;
+        stats.frame_tx.stream = 1;
+        stats.frame_rx.acks = 1;
+        let app_limited =
+            tracker
+                .quic
+                .observe(stats, with_acked_bytes(congestion, 32 * 1024, 1), 2);
+        let product_metrics = path_metrics_from_quic_path(PathId(7), app_limited);
+
+        assert!(app_limited.ack_derived_data_seen);
+        assert_eq!(app_limited.delivery_sample_count, 0);
+        assert!(app_limited.app_limited);
+        assert!(product_metrics.has_ack_derived_data_sample);
+        assert_eq!(product_metrics.data_sample_count, 0);
     }
 
     #[test]

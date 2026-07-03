@@ -303,7 +303,7 @@ pub(super) fn endpoint_only_reliable_startup_path_scores(
 fn endpoint_only_startup_observation_for_scoring(
     observation: ClientPathObservation,
 ) -> ClientPathObservation {
-    if bulk_candidate_has_sender_delivery_evidence(observation) {
+    if observation_has_sender_delivery_evidence(observation) {
         return observation;
     }
     ClientPathObservation {
@@ -428,18 +428,16 @@ pub(super) fn reliable_stream_path_candidates(
             let observation = tcp_observations.get(*index).copied().unwrap_or_default();
             let snapshot = path_snapshot(path, *index, observation);
             path_can_be_auto_discovered_for_lane(path, observation, lane).then_some(
-                BulkPathCandidate {
-                    key: RelayPathKey {
+                bulk_path_candidate(
+                    RelayPathKey {
                         underlay: UnderlayProtocol::Tcp,
                         index: *index,
                     },
-                    eta_ms: *eta_ms,
-                    has_evidence: bulk_candidate_has_evidence(path, observation),
-                    has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
-                        observation,
-                    ),
+                    *eta_ms,
+                    path,
+                    observation,
                     snapshot,
-                },
+                ),
             )
         })
         .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
@@ -453,70 +451,88 @@ pub(super) fn reliable_stream_path_candidates(
                     0.0
                 };
             path_can_be_auto_discovered_for_lane(path, observation, lane).then_some(
-                BulkPathCandidate {
-                    key: RelayPathKey {
+                bulk_path_candidate(
+                    RelayPathKey {
                         underlay: UnderlayProtocol::Udp,
                         index: *index,
                     },
                     eta_ms,
-                    has_evidence: bulk_candidate_has_evidence(path, observation),
-                    has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
-                        observation,
-                    ),
+                    path,
+                    observation,
                     snapshot,
-                },
+                ),
             )
         }))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        candidates =
-            tcp_scores
-                .iter()
-                .filter_map(|(index, eta_ms)| {
-                    let path = tcp_paths.get(*index)?;
-                    let observation = tcp_observations.get(*index).copied().unwrap_or_default();
-                    let snapshot = path_snapshot(path, *index, observation);
-                    path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
-                        BulkPathCandidate {
-                            key: RelayPathKey {
-                                underlay: UnderlayProtocol::Tcp,
-                                index: *index,
-                            },
-                            eta_ms: *eta_ms,
-                            has_evidence: bulk_candidate_has_evidence(path, observation),
-                            has_sender_delivery_evidence:
-                                bulk_candidate_has_sender_delivery_evidence(observation),
-                            snapshot,
+        candidates = tcp_scores
+            .iter()
+            .filter_map(|(index, eta_ms)| {
+                let path = tcp_paths.get(*index)?;
+                let observation = tcp_observations.get(*index).copied().unwrap_or_default();
+                let snapshot = path_snapshot(path, *index, observation);
+                path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
+                    bulk_path_candidate(
+                        RelayPathKey {
+                            underlay: UnderlayProtocol::Tcp,
+                            index: *index,
                         },
-                    )
-                })
-                .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
-                    let path = udp_paths.get(*index)?;
-                    let observation = udp_observations.get(*index).copied().unwrap_or_default();
-                    let snapshot = path_snapshot(path, *index, observation);
-                    let eta_ms = *eta_ms
-                        + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
-                            udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
-                        } else {
-                            0.0
-                        };
-                    path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
-                        BulkPathCandidate {
-                            key: RelayPathKey {
-                                underlay: UnderlayProtocol::Udp,
-                                index: *index,
-                            },
-                            eta_ms,
-                            has_evidence: bulk_candidate_has_evidence(path, observation),
-                            has_sender_delivery_evidence:
-                                bulk_candidate_has_sender_delivery_evidence(observation),
-                            snapshot,
+                        *eta_ms,
+                        path,
+                        observation,
+                        snapshot,
+                    ),
+                )
+            })
+            .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
+                let path = udp_paths.get(*index)?;
+                let observation = udp_observations.get(*index).copied().unwrap_or_default();
+                let snapshot = path_snapshot(path, *index, observation);
+                let eta_ms = *eta_ms
+                    + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
+                        udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
+                    } else {
+                        0.0
+                    };
+                path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
+                    bulk_path_candidate(
+                        RelayPathKey {
+                            underlay: UnderlayProtocol::Udp,
+                            index: *index,
                         },
-                    )
-                }))
-                .collect();
+                        eta_ms,
+                        path,
+                        observation,
+                        snapshot,
+                    ),
+                )
+            }))
+            .collect();
     }
     candidates
+}
+
+pub(super) fn bulk_path_candidate(
+    key: RelayPathKey,
+    eta_ms: f64,
+    path: &PathSpec,
+    observation: ClientPathObservation,
+    snapshot: PathSnapshot,
+) -> BulkPathCandidate {
+    BulkPathCandidate {
+        key,
+        eta_ms,
+        has_liveness_evidence: bulk_candidate_has_liveness_evidence(path, observation),
+        has_path_proof_evidence: bulk_candidate_has_path_proof_evidence(observation),
+        has_ack_data_evidence: bulk_candidate_has_ack_data_evidence(path, observation),
+        has_bulk_rate_evidence: bulk_candidate_has_bulk_rate_evidence(path, observation),
+        has_unique_data_evidence: bulk_candidate_has_unique_data_evidence(path, observation),
+        has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+            path,
+            observation,
+        ),
+        snapshot,
+    }
 }
 
 pub(super) fn path_snapshot(
@@ -621,6 +637,8 @@ pub(super) fn path_metrics_from_snapshot(
     let data_sample_count = observation
         .delivery_samples
         .saturating_add(observation.carrier_delivery_samples);
+    let has_ack_derived_data_sample =
+        data_sample_count > 0 || observation.carrier_ack_derived_data_seen;
     PathMetrics {
         path_id: snapshot.id,
         underlay: snapshot.underlay,
@@ -643,7 +661,7 @@ pub(super) fn path_metrics_from_snapshot(
         inflight_hi_bytes: snapshot.inflight_limit_bytes,
         confidence_ppm: ratio_to_ppm(snapshot.confidence),
         app_limited: snapshot.app_limited,
-        has_ack_derived_data_sample: data_sample_count > 0,
+        has_ack_derived_data_sample,
         data_sample_count,
     }
 }
@@ -754,14 +772,11 @@ fn path_can_be_recovery_candidate_for_lane(
             || path.metadata.capabilities.bulk_allowed)
 }
 
-pub(super) fn bulk_candidate_has_evidence(
+pub(super) fn bulk_candidate_has_liveness_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    observation.delivery_samples > 0
-        || observation.carrier_delivery_samples > 0
-        || observation.last_delivery_at.is_some()
-        || observation.carrier_last_delivery_at.is_some()
+    observation.path_proof_success
         || observation.measured_srtt_ms.is_some()
         || observation.carrier_srtt_ms.is_some()
         || observation.measured_jitter_ms.is_some()
@@ -774,34 +789,64 @@ pub(super) fn bulk_candidate_has_evidence(
         || path.metadata.initial_rate != RateHint::Unknown
 }
 
-pub(super) fn bulk_candidate_has_delivery_evidence(
+pub(super) fn bulk_candidate_has_path_proof_evidence(observation: ClientPathObservation) -> bool {
+    observation.path_proof_success
+}
+
+pub(super) fn bulk_candidate_has_ack_data_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    observation.delivery_samples > 0
+    reliable_product_delivery_samples(path, observation) > 0
         || observation.carrier_delivery_samples > 0
         || observation.last_delivery_at.is_some()
         || observation.carrier_last_delivery_at.is_some()
-        || observation.measured_rate_bps.is_some()
-        || observation.carrier_delivery_rate_bps.is_some()
+        || observation.carrier_ack_derived_data_seen
+}
+
+pub(super) fn bulk_candidate_has_bulk_rate_evidence(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+) -> bool {
+    let product_rate = observation.measured_rate_bps.is_some()
+        && reliable_product_delivery_samples(path, observation) > 0;
+    product_rate
         || path.metadata.initial_rate != RateHint::Unknown
+        || (observation.carrier_delivery_rate_bps.is_some() && !observation.carrier_app_limited)
 }
 
 pub(super) fn bulk_candidate_has_unique_data_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    bulk_candidate_has_delivery_evidence(path, observation)
+    bulk_candidate_has_bulk_rate_evidence(path, observation)
 }
 
 pub(super) fn bulk_candidate_has_sender_delivery_evidence(
+    path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
+    bulk_candidate_has_ack_data_evidence(path, observation)
+        || bulk_candidate_has_bulk_rate_evidence(path, observation)
+}
+
+fn observation_has_sender_delivery_evidence(observation: ClientPathObservation) -> bool {
     observation.delivery_samples > 0
         || observation.carrier_delivery_samples > 0
         || observation.last_delivery_at.is_some()
         || observation.carrier_last_delivery_at.is_some()
-        || observation.carrier_delivery_rate_bps.is_some()
+        || observation.carrier_ack_derived_data_seen
+        || observation.measured_rate_bps.is_some()
+        || (observation.carrier_delivery_rate_bps.is_some() && !observation.carrier_app_limited)
+}
+
+fn reliable_product_delivery_samples(path: &PathSpec, observation: ClientPathObservation) -> u32 {
+    match path.underlay {
+        UnderlayProtocol::Udp => observation
+            .delivery_samples
+            .saturating_sub(observation.datagram_feedback_samples),
+        UnderlayProtocol::Tcp => observation.delivery_samples,
+    }
 }
 
 pub(super) fn bulk_candidate_has_active_bulk_work(candidate: &BulkPathCandidate) -> bool {

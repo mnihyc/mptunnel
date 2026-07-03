@@ -399,12 +399,14 @@ pub(super) struct ServerResponseSenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     stream_id: StreamId,
     queue: ReliableRelaySenderQueue,
+    performance: MppPerformanceConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ServerResponseDispatch {
     pub(super) payload_bytes: usize,
     pub(super) lane: ReliableRelayQueuedWorkLane,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) selected_path: Option<CarrierPathKey>,
 }
 
@@ -747,6 +749,7 @@ fn choose_response_sender_data_target(
     lane: FlowLane,
     payload_bytes: usize,
     mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
     lower_flights: &[CarrierPathFlightDebt],
     ordered_data_owner: Option<CarrierPathKey>,
 ) -> Option<ResponseSenderPathTarget> {
@@ -827,6 +830,7 @@ fn choose_response_sender_data_target(
                     lead.key,
                     payload_bytes,
                     mux_limits,
+                    performance,
                 )
             })
             .min_by(|left, right| {
@@ -860,6 +864,7 @@ fn response_target_needs_same_underlay_bulk_discovery(
     lead_key: CarrierPathKey,
     payload_bytes: usize,
     mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
 ) -> bool {
     if target.is_active
         || !target.has_sender_evidence
@@ -870,7 +875,7 @@ fn response_target_needs_same_underlay_bulk_discovery(
     {
         return false;
     }
-    response_target_has_discovery_credit(target, payload_bytes, mux_limits)
+    response_target_has_discovery_credit(target, payload_bytes, mux_limits, performance)
 }
 
 fn response_target_needs_quic_duplicate_bulk_discovery(
@@ -878,6 +883,7 @@ fn response_target_needs_quic_duplicate_bulk_discovery(
     primary_key: CarrierPathKey,
     payload_bytes: usize,
     mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
 ) -> bool {
     target.key.underlay == UnderlayProtocol::Udp
         && target.key != primary_key
@@ -891,7 +897,7 @@ fn response_target_needs_quic_duplicate_bulk_discovery(
             payload_bytes,
             mux_limits,
         )
-        && response_target_has_discovery_credit(target, payload_bytes, mux_limits)
+        && response_target_has_discovery_credit(target, payload_bytes, mux_limits, performance)
 }
 
 fn choose_quic_duplicate_discovery_targets(
@@ -899,6 +905,7 @@ fn choose_quic_duplicate_discovery_targets(
     primary_key: CarrierPathKey,
     payload_bytes: usize,
     mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
 ) -> smallvec::SmallVec<[ResponseSenderPathTarget; 2]> {
     let mut selected = targets
         .iter()
@@ -908,6 +915,7 @@ fn choose_quic_duplicate_discovery_targets(
                 primary_key,
                 payload_bytes,
                 mux_limits,
+                performance,
             )
         })
         .cloned()
@@ -927,16 +935,32 @@ fn response_target_has_discovery_credit(
     target: &ResponseSenderPathTarget,
     payload_bytes: usize,
     mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
 ) -> bool {
-    let discovery_credit = response_bulk_discovery_credit_bytes(payload_bytes, mux_limits) as u64;
+    let discovery_credit =
+        response_bulk_discovery_credit_bytes(payload_bytes, mux_limits, performance) as u64;
     target.bulk_discovery_sent_bytes < discovery_credit
         && response_target_discovery_debt_bytes(target) < discovery_credit
 }
 
-fn response_bulk_discovery_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> usize {
-    reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
+fn response_bulk_discovery_credit_bytes(
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
+) -> usize {
+    let hint = performance.extra_traffic_hint_percent as usize;
+    if hint == 0 {
+        return 0;
+    }
+    let service_quantum = reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
         .max(payload_bytes)
-        .max(1)
+        .max(1);
+    let percent_budget = service_quantum.saturating_mul(hint) / 100;
+    let startup_floor = payload_bytes
+        .max(PATH_OPEN_SCORE_BYTES)
+        .min(service_quantum)
+        .max(1);
+    percent_budget.max(startup_floor)
 }
 
 fn response_target_discovery_debt_bytes(target: &ResponseSenderPathTarget) -> u64 {
@@ -1032,6 +1056,7 @@ fn plan_response_data_dispatch(
     relay_lane: FlowLane,
     next_offset: u64,
     payload_bytes: usize,
+    performance: MppPerformanceConfig,
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
@@ -1055,6 +1080,7 @@ fn plan_response_data_dispatch(
                 relay_lane,
                 payload_bytes,
                 binding.mux_limits(),
+                performance,
                 &lower_flights,
                 ordered_data_owner,
             ) else {
@@ -1066,6 +1092,7 @@ fn plan_response_data_dispatch(
                     lead_key,
                     payload_bytes,
                     binding.mux_limits(),
+                    performance,
                 )
             });
             let duplicate_discovery = choose_quic_duplicate_discovery_targets(
@@ -1073,6 +1100,7 @@ fn plan_response_data_dispatch(
                 target.key,
                 payload_bytes,
                 binding.mux_limits(),
+                performance,
             );
             Ok(ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
@@ -1401,11 +1429,21 @@ fn relay_cursor_distance(position: usize, cursor: usize, len: usize) -> usize {
 }
 
 impl ServerResponseSenderService {
+    #[cfg(test)]
     pub(super) fn new(session_id: SessionId, stream_id: StreamId) -> Self {
+        Self::new_with_performance(session_id, stream_id, MppPerformanceConfig::default())
+    }
+
+    pub(super) fn new_with_performance(
+        session_id: SessionId,
+        stream_id: StreamId,
+        performance: MppPerformanceConfig,
+    ) -> Self {
         Self {
             session_id,
             stream_id,
             queue: ReliableRelaySenderQueue::default(),
+            performance,
         }
     }
 
@@ -1465,6 +1503,7 @@ impl ServerResponseSenderService {
                     mux_limits,
                     payload.len(),
                 ),
+                self.performance,
             )
             .is_ok(),
             ReliableRelayQueuedWorkKind::Repair { frame, .. } => response_frame_has_carrier_credit(
@@ -1574,6 +1613,7 @@ impl ServerResponseSenderService {
                     data_lane,
                     send_stream.next_offset(),
                     dispatch_payload.len(),
+                    self.performance,
                 )?;
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
@@ -2663,6 +2703,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &[],
             None,
         );
@@ -2720,6 +2761,7 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
             &[],
             None,
         )
@@ -2805,6 +2847,7 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
             &[],
             Some(active.key),
         )
@@ -2822,6 +2865,7 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
             &[],
             Some(active.key),
         )
@@ -2853,6 +2897,7 @@ mod tests {
             active.key,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
         );
 
         assert_eq!(duplicates.len(), 1);
@@ -2879,6 +2924,7 @@ mod tests {
             primary.key,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
         );
 
         assert_eq!(duplicates.len(), 1);
@@ -2914,6 +2960,7 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Tcp,
@@ -2955,6 +3002,7 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -3092,11 +3140,31 @@ mod tests {
             active.key,
             payload_bytes,
             mux_limits,
+            MppPerformanceConfig::default(),
         );
 
         assert!(
             duplicates.is_empty(),
             "a proof-success QUIC path gets one bounded duplicate-discovery credit until real bulk evidence arrives"
+        );
+
+        let mut generous = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
+        generous.has_bulk_rate_evidence = false;
+        generous.bulk_discovery_sent_bytes = payload_bytes as u64;
+        let duplicates = choose_quic_duplicate_discovery_targets(
+            &[active.clone(), generous],
+            active.key,
+            payload_bytes,
+            mux_limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 200,
+            },
+        );
+
+        assert_eq!(
+            duplicates.len(),
+            1,
+            "aggressive extra-traffic mode intentionally permits additional bounded duplicate discovery"
         );
     }
 
@@ -3168,8 +3236,14 @@ mod tests {
             frames: frames_rx,
         };
 
-        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("active path should remain dispatchable");
+        let plan = plan_response_data_dispatch(
+            &stream,
+            FlowLane::Throughput,
+            0,
+            payload_bytes,
+            MppPerformanceConfig::default(),
+        )
+        .expect("active path should remain dispatchable");
 
         assert_eq!(
             plan.primary_key(),
@@ -3288,8 +3362,14 @@ mod tests {
             frames: frames_rx,
         };
 
-        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("TCP primary remains dispatchable");
+        let plan = plan_response_data_dispatch(
+            &stream,
+            FlowLane::Throughput,
+            0,
+            payload_bytes,
+            MppPerformanceConfig::default(),
+        )
+        .expect("TCP primary remains dispatchable");
 
         assert_eq!(
             plan.primary_key(),
@@ -3375,8 +3455,14 @@ mod tests {
             output: ReliablePathStreamOutput::Switchable(binding.clone()),
             frames: frames_rx,
         };
-        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("active path should remain dispatchable");
+        let plan = plan_response_data_dispatch(
+            &stream,
+            FlowLane::Throughput,
+            0,
+            payload_bytes,
+            MppPerformanceConfig::default(),
+        )
+        .expect("active path should remain dispatchable");
         let frame = Frame::StreamData {
             stream_id: StreamId(7),
             offset: 0,
@@ -3446,6 +3532,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &lower_flights,
             Some(target.key),
         )
@@ -3475,6 +3562,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &lower_flights,
             Some(owner.key),
         )
@@ -3505,6 +3593,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &lower_flights,
             Some(owner.key),
         )
@@ -3536,6 +3625,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &lower_flights,
             Some(owner.key),
         )
@@ -3558,6 +3648,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &[],
             Some(bulk_proven_udp.key),
         )
@@ -3577,6 +3668,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &[],
             Some(lead.key),
         )
@@ -3598,6 +3690,7 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
+            MppPerformanceConfig::default(),
             &[],
             Some(lead.key),
         )

@@ -8,7 +8,15 @@ use crate::lab_diagnostics::lab_diagnostic;
 pub(super) struct BulkPathCandidate {
     pub(super) key: RelayPathKey,
     pub(super) eta_ms: f64,
-    pub(super) has_evidence: bool,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) has_liveness_evidence: bool,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) has_path_proof_evidence: bool,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) has_ack_data_evidence: bool,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) has_bulk_rate_evidence: bool,
+    pub(super) has_unique_data_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) has_sender_delivery_evidence: bool,
     pub(super) snapshot: PathSnapshot,
@@ -584,7 +592,11 @@ mod tests {
                 index,
             },
             eta_ms,
-            has_evidence: true,
+            has_liveness_evidence: true,
+            has_path_proof_evidence: false,
+            has_ack_data_evidence: true,
+            has_bulk_rate_evidence: true,
+            has_unique_data_evidence: true,
             has_sender_delivery_evidence: true,
             snapshot: PathSnapshot::new(
                 PathId(index as u16),

@@ -15,6 +15,7 @@ pub(super) struct UdpPathMetrics {
     pub(super) loss_ppm: Option<u32>,
     pub(super) ecn_ppm: Option<u32>,
     pub(super) app_limited: bool,
+    pub(super) ack_derived_data_seen: bool,
     pub(super) delivery_sample_count: u64,
     pub(super) last_delivery_sample_at: Option<Instant>,
 }

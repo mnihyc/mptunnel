@@ -63,28 +63,39 @@ async fn client_udp_datagram_round_trip_with_limits(
     Ok(response)
 }
 
-pub(super) enum DatagramClientAssociation {
-    Udp {
-        primary: Box<UdpDatagramClientAssociation>,
-        tcp_underlay_relay: Option<Box<TcpDatagramClientAssociation>>,
-    },
-    Tcp(Box<TcpDatagramClientAssociation>),
+pub(super) struct DatagramClientAssociation {
+    context: ClientPathContext,
+    udp: Option<Box<UdpDatagramClientAssociation>>,
+    tcp: Option<Box<TcpDatagramClientAssociation>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DatagramUnderlayCandidate {
+    key: RelayPathKey,
+    eta_ms: f64,
 }
 
 impl DatagramClientAssociation {
     pub(super) async fn new(context: ClientPathContext) -> Result<Self, RuntimeError> {
-        if !context.udp_paths.is_empty() {
-            return Ok(Self::Udp {
-                primary: Box::new(UdpDatagramClientAssociation::new(context)?),
-                tcp_underlay_relay: None,
-            });
-        }
-        if context.tcp_paths.is_empty() {
+        if context.udp_paths.is_empty() && context.tcp_paths.is_empty() {
             return Err(RuntimeError::NoDatagramPath);
         }
-        Ok(Self::Tcp(Box::new(
-            TcpDatagramClientAssociation::open_best(context, PATH_OPEN_SCORE_BYTES).await?,
-        )))
+        Ok(Self {
+            context,
+            udp: None,
+            tcp: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn select_underlay(
+        context: &ClientPathContext,
+        payload_bytes: usize,
+        ttl_ms: u32,
+    ) -> Option<UnderlayProtocol> {
+        datagram_underlay_candidates(context, payload_bytes, ttl_ms)
+            .first()
+            .map(|candidate| candidate.key.underlay)
     }
 
     pub(super) async fn send_to_with_adaptive_retries(
@@ -93,89 +104,167 @@ impl DatagramClientAssociation {
         payload: Bytes,
         ttl_ms: u32,
     ) -> Result<Bytes, RuntimeError> {
-        match self {
-            Self::Udp {
-                primary,
-                tcp_underlay_relay,
-            } => {
-                match primary
-                    .send_to_with_adaptive_retries(target.clone(), payload.clone(), ttl_ms)
-                    .await
-                {
-                    Ok(response) => Ok(response),
-                    Err(err) if udp_datagram_should_try_tcp_underlay(&err, &primary.context) => {
-                        if tcp_underlay_relay.is_none() {
-                            match TcpDatagramClientAssociation::open_best(
-                                primary.context.clone(),
-                                payload.len(),
-                            )
-                            .await
-                            {
-                                Ok(association) => {
-                                    *tcp_underlay_relay = Some(Box::new(association))
-                                }
-                                Err(tcp_err)
-                                    if matches!(
-                                        err,
-                                        RuntimeError::NoUdpPath
-                                            | RuntimeError::NoSchedulableUdpPath
-                                    ) =>
-                                {
-                                    return Err(tcp_err);
-                                }
-                                Err(_) => return Err(err),
-                            }
+        let mut last_retryable_error = None;
+        for candidate in datagram_underlay_candidates(&self.context, payload.len(), ttl_ms) {
+            match candidate.key.underlay {
+                UnderlayProtocol::Tcp => {
+                    let result = self
+                        .send_to_tcp(target.clone(), payload.clone(), ttl_ms)
+                        .await;
+                    match result {
+                        Ok(response) => return Ok(response),
+                        Err(err) if datagram_underlay_error_is_retryable(&err) => {
+                            last_retryable_error = Some(err);
                         }
-                        let relay = tcp_underlay_relay
-                            .as_mut()
-                            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-                        relay
-                            .send_to_with_adaptive_retries(target, payload, ttl_ms)
-                            .await
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => Err(err),
+                }
+                UnderlayProtocol::Udp => {
+                    let result = self
+                        .send_to_udp(target.clone(), payload.clone(), ttl_ms)
+                        .await;
+                    match result {
+                        Ok(response) => return Ok(response),
+                        Err(err) if datagram_underlay_error_is_retryable(&err) => {
+                            last_retryable_error = Some(err);
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
             }
-            Self::Tcp(association) => {
-                association
-                    .send_to_with_adaptive_retries(target, payload, ttl_ms)
-                    .await
-            }
         }
+        Err(last_retryable_error.unwrap_or(RuntimeError::NoDatagramPath))
+    }
+
+    async fn send_to_udp(
+        &mut self,
+        target: TargetAddr,
+        payload: Bytes,
+        ttl_ms: u32,
+    ) -> Result<Bytes, RuntimeError> {
+        if self.udp.is_none() {
+            self.udp = Some(Box::new(UdpDatagramClientAssociation::new(
+                self.context.clone(),
+            )?));
+        }
+        let udp = self
+            .udp
+            .as_mut()
+            .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+        udp.send_to_with_adaptive_retries(target, payload, ttl_ms)
+            .await
+    }
+
+    async fn send_to_tcp(
+        &mut self,
+        target: TargetAddr,
+        payload: Bytes,
+        ttl_ms: u32,
+    ) -> Result<Bytes, RuntimeError> {
+        if self.tcp.is_none() {
+            self.tcp = Some(Box::new(
+                TcpDatagramClientAssociation::open_best(self.context.clone(), payload.len())
+                    .await?,
+            ));
+        }
+        let tcp = self
+            .tcp
+            .as_mut()
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        tcp.send_to_with_adaptive_retries(target, payload, ttl_ms)
+            .await
     }
 
     pub(super) async fn close(&mut self) -> Result<(), RuntimeError> {
-        match self {
-            Self::Udp {
-                primary,
-                tcp_underlay_relay,
-            } => {
-                let primary_result = primary.close().await;
-                let reliable_relay_result = if let Some(relay) = tcp_underlay_relay {
-                    relay.close().await
-                } else {
-                    Ok(())
-                };
-                primary_result.and(reliable_relay_result)
-            }
-            Self::Tcp(association) => association.close().await,
-        }
+        let udp_result = if let Some(udp) = &mut self.udp {
+            udp.close().await
+        } else {
+            Ok(())
+        };
+        let tcp_result = if let Some(tcp) = &mut self.tcp {
+            tcp.close().await
+        } else {
+            Ok(())
+        };
+        udp_result.and(tcp_result)
     }
 }
 
-fn udp_datagram_should_try_tcp_underlay(err: &RuntimeError, context: &ClientPathContext) -> bool {
-    !context.tcp_paths.is_empty()
-        && matches!(
-            err,
-            RuntimeError::NoUdpPath
-                | RuntimeError::NoSchedulableUdpPath
-                | RuntimeError::Io(_)
-                | RuntimeError::Udp(_)
-                | RuntimeError::QuicCarrier(_)
-                | RuntimeError::Auth(_)
-                | RuntimeError::RemoteClosed(_)
-                | RuntimeError::Protocol(_)
-        )
+fn datagram_underlay_candidates(
+    context: &ClientPathContext,
+    payload_bytes: usize,
+    ttl_ms: u32,
+) -> Vec<DatagramUnderlayCandidate> {
+    if ttl_ms == 0 {
+        return Vec::new();
+    }
+    let payload_bytes = payload_bytes.max(PATH_OPEN_SCORE_BYTES);
+    let freshness_budget_ms = f64::from(ttl_ms);
+    let mut candidates = Vec::new();
+
+    if let Some(path_index) = context
+        .ordered_tcp_path_indices(FlowLane::RealtimeDatagram, payload_bytes)
+        .first()
+        .copied()
+    {
+        let key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: path_index,
+        };
+        if let Some(eta_ms) =
+            context.reliable_relay_path_eta_ms(key, FlowLane::RealtimeDatagram, payload_bytes)
+            && eta_ms <= freshness_budget_ms
+        {
+            candidates.push(DatagramUnderlayCandidate { key, eta_ms });
+        }
+    }
+
+    if let Some(candidate) = context
+        .ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms)
+        .first()
+        .copied()
+    {
+        candidates.push(DatagramUnderlayCandidate {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: candidate.path_index,
+            },
+            eta_ms: candidate.eta_ms,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        left.eta_ms
+            .total_cmp(&right.eta_ms)
+            .then_with(|| {
+                context
+                    .relay_path_config_ordinal(left.key)
+                    .cmp(&context.relay_path_config_ordinal(right.key))
+            })
+            .then_with(|| left.key.index.cmp(&right.key.index))
+            .then_with(|| relay_underlay_identity_order(left.key.underlay, right.key.underlay))
+    });
+    candidates
+}
+
+fn datagram_underlay_error_is_retryable(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::NoTcpPath
+            | RuntimeError::NoUdpPath
+            | RuntimeError::NoSchedulableTcpPath
+            | RuntimeError::NoSchedulableUdpPath
+            | RuntimeError::Io(_)
+            | RuntimeError::Tcp(_)
+            | RuntimeError::Udp(_)
+            | RuntimeError::Encrypted(_)
+            | RuntimeError::QuicCarrier(_)
+            | RuntimeError::Auth(_)
+            | RuntimeError::RemoteClosed(_)
+            | RuntimeError::Protocol(_)
+            | RuntimeError::PathHeartbeatTimeout
+            | RuntimeError::ReliablePathSessionClosed
+    )
 }
 
 pub(super) struct TcpDatagramClientAssociation {
@@ -1033,26 +1122,33 @@ impl UdpDatagramClientAssociation {
                 })
             })
             .collect::<Vec<_>>();
-        if viable.iter().any(|candidate| {
-            self.path_has_datagram_feedback_or_hint(candidate.path_index)
-                && !self.path_is_temporarily_suppressed(candidate.path_index, now)
-        }) {
-            viable
-                .retain(|candidate| self.path_has_datagram_feedback_or_hint(candidate.path_index));
-        }
-        if self.context.udp_paths.iter().all(path_is_endpoint_only)
-            && let Some(candidate) = viable
-                .iter()
-                .filter(|candidate| !self.path_is_temporarily_suppressed(candidate.path_index, now))
-                .min_by(|left, right| left.path_index.cmp(&right.path_index))
+        let evidenced_paths = viable
+            .iter()
+            .filter_map(|candidate| {
+                self.path_has_datagram_feedback_or_hint(candidate.path_index)
+                    .then_some(candidate.path_index)
+            })
+            .collect::<Vec<_>>();
+        if evidenced_paths
+            .iter()
+            .any(|path_index| !self.path_is_temporarily_suppressed(*path_index, now))
         {
-            return Some(candidate.path_index);
+            viable.retain(|candidate| evidenced_paths.contains(&candidate.path_index));
         }
         if let Some(path_index) = self.last_successful_path
             && let Some(candidate) = viable.iter().find(|candidate| {
                 candidate.path_index == path_index
                     && !self.path_is_temporarily_suppressed(candidate.path_index, now)
             })
+        {
+            return Some(candidate.path_index);
+        }
+        if evidenced_paths.is_empty()
+            && self.context.udp_paths.iter().all(path_is_endpoint_only)
+            && let Some(candidate) = viable
+                .iter()
+                .filter(|candidate| !self.path_is_temporarily_suppressed(candidate.path_index, now))
+                .min_by(|left, right| left.path_index.cmp(&right.path_index))
         {
             return Some(candidate.path_index);
         }

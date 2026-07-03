@@ -132,15 +132,6 @@ fn realtime_udp_datagram_feedback_beats_probe_only_paths() {
         },
     );
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
-    context.mark_udp_path_feedback(
-        1,
-        UdpDatagramPathObservation {
-            rtt: Duration::from_millis(20),
-            jitter: Duration::from_millis(2),
-            loss_rate: 0.0,
-            rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(10)),
-        },
-    );
 
     let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
     let candidates = context.ordered_udp_path_candidates_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS);
@@ -161,6 +152,97 @@ fn realtime_udp_datagram_feedback_beats_probe_only_paths() {
             DEFAULT_SOCKS5_UDP_TTL_MS,
         ),
         Some(1)
+    );
+}
+
+#[test]
+fn endpoint_only_udp_datagram_uses_measured_eta_after_feedback() {
+    let first_path = "udp://127.0.0.1:10146"
+        .parse::<PathSpec>()
+        .expect("first path");
+    let second_path = "udp://127.0.0.1:10147"
+        .parse::<PathSpec>()
+        .expect("second path");
+    let context = ClientPathContext::new(
+        vec![first_path, second_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.mark_udp_path_feedback(
+        0,
+        UdpDatagramPathObservation {
+            rtt: Duration::from_millis(80),
+            jitter: Duration::from_millis(4),
+            loss_rate: 0.0,
+            rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(20)),
+        },
+    );
+    context.mark_udp_path_feedback(
+        1,
+        UdpDatagramPathObservation {
+            rtt: Duration::from_millis(20),
+            jitter: Duration::from_millis(2),
+            loss_rate: 0.0,
+            rate_sample: PathRateSample::new(1024 * 1024, Duration::from_millis(10)),
+        },
+    );
+
+    let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+    let candidates = context.ordered_udp_path_candidates_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+    assert_eq!(
+        association.select_path_candidate(
+            &candidates,
+            &HashSet::new(),
+            512,
+            DEFAULT_SOCKS5_UDP_TTL_MS,
+        ),
+        Some(1),
+        "endpoint-only startup order must stop dominating after path-scoped datagram feedback exists"
+    );
+}
+
+#[test]
+fn mixed_datagram_underlay_uses_tcp_when_tcp_eta_is_better() {
+    let slow_udp = "udp://127.0.0.1:10148?srtt-ms=90&rate-mbps=20"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let fast_tcp = "tcp://127.0.0.1:10149?srtt-ms=15&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let context = ClientPathContext::new(
+        vec![slow_udp, fast_tcp],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert_eq!(
+        DatagramClientAssociation::select_underlay(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS),
+        Some(UnderlayProtocol::Tcp),
+        "datagram underlay selection must be ETA/evidence driven, not UDP-first"
+    );
+}
+
+#[test]
+fn mixed_datagram_underlay_uses_udp_when_udp_eta_is_better() {
+    let fast_udp = "udp://127.0.0.1:10150?srtt-ms=15&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let slow_tcp = "tcp://127.0.0.1:10151?srtt-ms=90&rate-mbps=20"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let context = ClientPathContext::new(
+        vec![fast_udp, slow_tcp],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert_eq!(
+        DatagramClientAssociation::select_underlay(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS),
+        Some(UnderlayProtocol::Udp)
     );
 }
 

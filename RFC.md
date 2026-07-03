@@ -92,9 +92,14 @@ The product model is:
 any ingress x any underlay x any outbound x TCP/UDP target
 ```
 
-TCP targets use the reliable stream layer. UDP targets use datagram flows and
-prefer UDP underlay, but MAY use TCP underlay as best-effort UDP-in-TCP relay
-when that is the only available or surviving option.
+TCP targets use the reliable stream layer. UDP targets use datagram flows. A
+datagram flow MAY run over any reliable-stream-capable underlay carrier,
+including TCP or QUIC UDP, and the selected carrier is determined by live path
+metrics, TTL/freshness, loss, queue/flight state, and demand. There is no
+hardcoded TCP-vs-UDP underlay preference: fresh realtime traffic starts
+latency-first, sustained demand may move toward higher measured bandwidth, and
+the scheduler may shrink back to latency/realtime behavior when bulk demand
+disappears.
 
 ### 1.1 Design Goals and Operating Model
 
@@ -1792,23 +1797,28 @@ from becoming a hidden realtime head-of-line blocker.
 `DGRAM_CLOSE` closes a flow. A closed flow MUST release scheduler load and
 delivery statistics.
 
-UDP targets prefer UDP underlay. When no UDP path exists or a UDP carrier error
-is retryable and TCP paths exist, a client MAY relay datagram flow frames over
-TCP underlay. This is best-effort and may suffer TCP head-of-line blocking.
-While using TCP underlay, a sender MUST NOT treat an absent UDP target response
-as carrier-loss proof. TCP already owns byte retransmission for the
-`DGRAM_DATA` frame. The client sends one product datagram ID once on the
-reliable carrier, waits for response or expiry using the PTO/TTL-derived useful
-budget, and reopens or migrates the TCP carrier only for actual carrier,
+Datagram flows are freshness-aware product objects, not a request to prefer a
+UDP underlay carrier. When TCP and QUIC UDP carriers are both available, the
+client chooses the carrier from live RTT, jitter, loss, delivery-rate, queue,
+flight, TTL, and demand evidence. Fresh realtime datagrams start latency-first;
+sustained volume may move toward a higher-bandwidth carrier; when that demand
+falls away, the flow can shrink back to latency/realtime behavior. If the
+selected carrier fails in a retryable path-level way, the client MAY try the
+next schedulable TCP or QUIC UDP carrier by the same evidence order.
+
+While using any reliable carrier, a sender MUST NOT treat an absent UDP target
+response as carrier-loss proof. TCP and QUIC already own retransmission for the
+carried `DGRAM_DATA` frame. The client sends one product datagram ID once on
+the selected carrier, waits for response or expiry using the PTO/TTL-derived
+useful budget, and reopens or migrates the carrier only for actual carrier,
 encryption, authentication, or session errors. This prevents product-level
 duplicates from consuming target UDP state and prevents response absence from
 poisoning path health.
 
-UDP targets need unordered, freshness-aware delivery. Reliable streams are the
-wrong abstraction because old datagrams should expire rather than block later
-datagrams. UDP-over-TCP remains supported because the product model requires any
-ingress by any underlay, but the scheduler prefers UDP underlay whenever it is
-healthy.
+UDP targets need unordered, freshness-aware product delivery. Old datagrams
+should expire rather than block later datagrams, but the underlay carrier used
+for each product datagram is selected by path evidence and demand, not by the
+target protocol family.
 
 ## 15. Ingress Behavior
 

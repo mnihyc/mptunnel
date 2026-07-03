@@ -1,6 +1,7 @@
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId};
 use bytes::Bytes;
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +173,10 @@ impl ReliableSendStream {
 
     pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
         let ranges = normalized_offset_ranges(ranges);
+        self.apply_normalized_ack(&ranges)
+    }
+
+    pub fn apply_normalized_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
         if ranges.is_empty() || self.repair_cache.is_empty() {
             return AckOutcome {
                 released_bytes: 0,
@@ -182,22 +187,38 @@ impl ReliableSendStream {
 
         let mut released_chunks = 0usize;
         let previous_repair_bytes = self.repair_bytes;
-        let mut retained = BTreeMap::new();
-        let mut retained_bytes = 0usize;
-        for chunk in self.repair_cache.values() {
-            let pieces = unacked_chunk_slices(chunk, &ranges);
-            if pieces.is_empty() {
-                released_chunks += 1;
-                continue;
-            }
-            for piece in pieces {
-                retained_bytes = retained_bytes.saturating_add(piece.payload.len());
-                retained.insert(piece.offset, piece);
+        let mut released_bytes = 0usize;
+        for range in ranges {
+            while let Some(offset) =
+                first_overlapping_repair_chunk(&self.repair_cache, range.start, range.end)
+            {
+                let Some(chunk) = self.repair_cache.remove(&offset) else {
+                    break;
+                };
+                let chunk_start = chunk.offset;
+                let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
+                let acked_start = chunk_start.max(range.start);
+                let acked_end = chunk_end.min(range.end);
+                if acked_start >= acked_end {
+                    self.repair_cache.insert(chunk.offset, chunk);
+                    break;
+                }
+                released_bytes = released_bytes.saturating_add(
+                    usize::try_from(acked_end.saturating_sub(acked_start)).unwrap_or(usize::MAX),
+                );
+                if acked_start == chunk_start && acked_end == chunk_end {
+                    released_chunks += 1;
+                    continue;
+                }
+                if let Some(left) = sent_chunk_slice(&chunk, chunk_start, acked_start) {
+                    self.repair_cache.insert(left.offset, left);
+                }
+                if let Some(right) = sent_chunk_slice(&chunk, acked_end, chunk_end) {
+                    self.repair_cache.insert(right.offset, right);
+                }
             }
         }
-        self.repair_cache = retained;
-        self.repair_bytes = retained_bytes;
-        let released_bytes = previous_repair_bytes.saturating_sub(retained_bytes);
+        self.repair_bytes = previous_repair_bytes.saturating_sub(released_bytes);
         AckOutcome {
             released_bytes,
             released_chunks,
@@ -214,6 +235,17 @@ impl ReliableSendStream {
             return Vec::new();
         }
         let ranges = normalized_offset_ranges(ranges);
+        self.retransmission_frames_for_normalized_ack_gaps(&ranges, byte_limit)
+    }
+
+    pub fn retransmission_frames_for_normalized_ack_gaps(
+        &self,
+        ranges: &[OffsetRange],
+        byte_limit: usize,
+    ) -> Vec<Frame> {
+        if byte_limit == 0 {
+            return Vec::new();
+        }
         let Some(largest_acked_end) = ranges.iter().map(|range| range.end).max() else {
             return Vec::new();
         };
@@ -279,6 +311,17 @@ impl ReliableSendStream {
             return Vec::new();
         }
         let ranges = normalized_offset_ranges(ranges);
+        self.retransmission_frames_after_normalized_ack_frontier(&ranges, byte_limit)
+    }
+
+    pub fn retransmission_frames_after_normalized_ack_frontier(
+        &self,
+        ranges: &[OffsetRange],
+        byte_limit: usize,
+    ) -> Vec<Frame> {
+        if byte_limit == 0 || self.repair_cache.is_empty() {
+            return Vec::new();
+        }
         let Some(largest_acked_end) = ranges.iter().map(|range| range.end).max() else {
             return Vec::new();
         };
@@ -345,44 +388,18 @@ impl ReliableSendStream {
     }
 }
 
-fn unacked_chunk_slices(chunk: &SentChunk, ranges: &[OffsetRange]) -> Vec<SentChunk> {
-    let chunk_start = chunk.offset;
-    let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
-    let mut cursor = chunk_start;
-    let mut pieces = Vec::new();
-    for range in ranges {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start >= chunk_end {
-            break;
-        }
-        if range.start > cursor {
-            push_sent_chunk_slice(&mut pieces, chunk, cursor, range.start.min(chunk_end));
-        }
-        cursor = cursor.max(range.end.min(chunk_end));
-        if cursor >= chunk_end {
-            break;
-        }
-    }
-    if cursor < chunk_end {
-        push_sent_chunk_slice(&mut pieces, chunk, cursor, chunk_end);
-    }
-    pieces
-}
-
-fn push_sent_chunk_slice(pieces: &mut Vec<SentChunk>, chunk: &SentChunk, start: u64, end: u64) {
+fn sent_chunk_slice(chunk: &SentChunk, start: u64, end: u64) -> Option<SentChunk> {
     if start >= end {
-        return;
+        return None;
     }
     let slice_start = usize::try_from(start.saturating_sub(chunk.offset)).unwrap_or(usize::MAX);
     let slice_end = usize::try_from(end.saturating_sub(chunk.offset)).unwrap_or(usize::MAX);
     let slice_end = slice_end.min(chunk.payload.len());
     if slice_start >= slice_end {
-        return;
+        return None;
     }
     let full_chunk = slice_start == 0 && slice_end == chunk.payload.len();
-    pieces.push(SentChunk {
+    Some(SentChunk {
         offset: start,
         payload: chunk.payload.slice(slice_start..slice_end),
         flags: if full_chunk {
@@ -390,7 +407,26 @@ fn push_sent_chunk_slice(pieces: &mut Vec<SentChunk>, chunk: &SentChunk, start: 
         } else {
             StreamFlags::NONE
         },
-    });
+    })
+}
+
+fn first_overlapping_repair_chunk(
+    repair_cache: &BTreeMap<u64, SentChunk>,
+    start: u64,
+    end: u64,
+) -> Option<u64> {
+    if start >= end {
+        return None;
+    }
+    if let Some((&offset, chunk)) = repair_cache.range(..=start).next_back()
+        && chunk.offset.saturating_add(chunk.payload.len() as u64) > start
+    {
+        return Some(offset);
+    }
+    repair_cache
+        .range(start..end)
+        .next()
+        .map(|(&offset, _)| offset)
 }
 
 fn push_retransmission_slice(
@@ -521,6 +557,24 @@ impl ReliableRecvStream {
         if missing_ranges.is_empty() {
             return Ok(ReceiveOutcome::default());
         }
+        if offset == self.next_offset
+            && missing_ranges.len() == 1
+            && missing_ranges[0].start == offset
+            && missing_ranges[0].end == end
+        {
+            self.received_ranges.insert(offset, end);
+            self.next_offset = end;
+            let mut delivered = SmallVec::new();
+            delivered.push(payload);
+            let mut fin = flags.fin;
+            while let Some(chunk) = self.buffered.remove(&self.next_offset) {
+                self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
+                self.next_offset = self.next_offset.saturating_add(chunk.payload.len() as u64);
+                fin |= chunk.flags.fin;
+                delivered.push(chunk.payload);
+            }
+            return Ok(ReceiveOutcome { delivered, fin });
+        }
         let missing_bytes = missing_ranges
             .iter()
             .map(|range| usize::try_from(range.len()).unwrap_or(usize::MAX))
@@ -542,10 +596,8 @@ impl ReliableRecvStream {
             });
         }
 
-        let mut received_ranges = self.received_ranges.clone();
-        received_ranges.insert(offset, end);
+        self.received_ranges.insert(offset, end);
         self.reorder_bytes = new_reorder_bytes;
-        self.received_ranges = received_ranges;
         for range in missing_ranges {
             let start = usize::try_from(range.start.saturating_sub(offset)).unwrap_or(usize::MAX);
             let stop = usize::try_from(range.end.saturating_sub(offset)).unwrap_or(usize::MAX);
@@ -566,7 +618,7 @@ impl ReliableRecvStream {
             );
         }
 
-        let mut delivered = Vec::new();
+        let mut delivered = SmallVec::new();
         let mut fin = false;
         while let Some(chunk) = self.buffered.remove(&self.next_offset) {
             self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
@@ -582,18 +634,19 @@ impl ReliableRecvStream {
         self.received_ranges.ranges()
     }
 
+    pub fn ack_range_summary(&self) -> AckRangeSummary {
+        self.received_ranges.summary()
+    }
+
     pub fn ack_ranges_limited(&self, limit: usize) -> Vec<OffsetRange> {
         if limit == 0 {
             return Vec::new();
         }
-        let mut limited = self.received_ranges.ranges();
-        limited.truncate(limit);
-        limited
+        self.received_ranges.ranges_limited(limit)
     }
 
     pub fn ack_frame(&self) -> Frame {
-        let mut ranges = self.ack_ranges();
-        ranges.truncate(self.limits.max_ack_ranges);
+        let ranges = self.ack_ranges_limited(self.limits.max_ack_ranges);
         Frame::StreamAck {
             stream_id: self.stream_id,
             complete: true,
@@ -643,8 +696,14 @@ struct RecvChunk {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReceiveOutcome {
-    pub delivered: Vec<Bytes>,
+    pub delivered: SmallVec<[Bytes; 1]>,
     pub fin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AckRangeSummary {
+    pub count: usize,
+    pub largest_end: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -669,14 +728,15 @@ impl RangeSet {
             self.ranges.remove(&prev_start);
         }
 
-        let overlapping = self
-            .ranges
-            .range(start..)
-            .map(|(&range_start, &range_end)| (range_start, range_end))
-            .take_while(|(range_start, _)| *range_start <= merged_end)
-            .collect::<Vec<_>>();
-
-        for (range_start, range_end) in overlapping {
+        loop {
+            let next = self
+                .ranges
+                .range(start..=merged_end)
+                .next()
+                .map(|(&range_start, &range_end)| (range_start, range_end));
+            let Some((range_start, range_end)) = next else {
+                break;
+            };
             merged_end = merged_end.max(range_end);
             self.ranges.remove(&range_start);
         }
@@ -722,10 +782,22 @@ impl RangeSet {
     }
 
     fn ranges(&self) -> Vec<OffsetRange> {
+        self.ranges_limited(usize::MAX)
+    }
+
+    fn ranges_limited(&self, limit: usize) -> Vec<OffsetRange> {
         self.ranges
             .iter()
+            .take(limit)
             .filter_map(|(&start, &end)| OffsetRange::new(start, end))
             .collect()
+    }
+
+    fn summary(&self) -> AckRangeSummary {
+        AckRangeSummary {
+            count: self.ranges.len(),
+            largest_end: self.ranges.last_key_value().map_or(0, |(_, &end)| end),
+        }
     }
 }
 
@@ -1023,8 +1095,8 @@ mod tests {
             .expect("first chunk");
 
         assert_eq!(
-            second.delivered,
-            vec![Bytes::from_static(b"hello"), Bytes::from_static(b" world")]
+            second.delivered.as_slice(),
+            &[Bytes::from_static(b"hello"), Bytes::from_static(b" world")]
         );
         assert!(second.fin);
         assert_eq!(stream.next_offset(), 11);
@@ -1154,8 +1226,8 @@ mod tests {
             .receive_data(0, Bytes::from_static(b"hello w"), StreamFlags::NONE)
             .expect("partially overlapping lower range");
         assert_eq!(
-            outcome.delivered,
-            vec![Bytes::from_static(b"hello"), Bytes::from_static(b"world")]
+            outcome.delivered.as_slice(),
+            &[Bytes::from_static(b"hello"), Bytes::from_static(b"world")]
         );
         assert_eq!(stream.next_offset(), 10);
         assert_eq!(stream.reorder_bytes(), 0);

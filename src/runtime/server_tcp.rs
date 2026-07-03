@@ -63,13 +63,15 @@ pub(super) async fn handle_server_path(
         }
         _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
     };
-    framed.write_frame(&Frame::SessionReady).await?;
     framed
-        .write_frame(&Frame::PathStatus {
-            path_id,
-            status: crate::protocol::PathStatus::Active,
-            capabilities: path_capabilities,
-        })
+        .write_frames(&[
+            Frame::SessionReady,
+            Frame::PathStatus {
+                path_id,
+                status: crate::protocol::PathStatus::Active,
+                capabilities: path_capabilities,
+            },
+        ])
         .await?;
     if let Err(err) = framed.flush().await {
         if encrypted_framed_peer_closed(&err) {
@@ -86,6 +88,7 @@ pub(super) async fn handle_server_path(
     let mut attached_streams = HashSet::new();
     let mut datagram_flows = Vec::<ServerUdpDatagramFlow>::new();
     let mut draining = false;
+    let mut pending_frames = Vec::<Frame>::new();
 
     loop {
         let Some(event) = recv_server_tcp_path_event(&mut path_frames, &mut commands_rx).await?
@@ -108,6 +111,7 @@ pub(super) async fn handle_server_path(
                         draining,
                         active_datagram_flows: 0,
                     },
+                    &mut pending_frames,
                 )
                 .await?;
                 if !keep_running {
@@ -510,6 +514,7 @@ pub(super) async fn handle_server_path(
                             draining,
                             active_datagram_flows: 0,
                         },
+                        &mut pending_frames,
                     )
                     .await?;
                     if !keep_running {
@@ -537,13 +542,14 @@ async fn drain_server_tcp_path_commands(
     attached_streams: &mut HashSet<StreamId>,
     datagram_flows: &mut Vec<ServerUdpDatagramFlow>,
     command_context: ServerTcpPathCommandContext<'_>,
+    pending_frames: &mut Vec<Frame>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
     let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
-    let mut pending_frames = Vec::<Frame>::new();
+    pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut wrote_frame = false;
@@ -573,7 +579,7 @@ async fn drain_server_tcp_path_commands(
                 continue;
             }
             command => {
-                if !server_write_tcp_path_frame_batch(writer, &mut pending_frames).await? {
+                if !server_write_tcp_path_frame_batch(writer, pending_frames).await? {
                     return Ok(false);
                 }
                 let keep_running = handle_server_tcp_path_command(
@@ -600,7 +606,7 @@ async fn drain_server_tcp_path_commands(
         }
     }
 
-    if !server_write_tcp_path_frame_batch(writer, &mut pending_frames).await? {
+    if !server_write_tcp_path_frame_batch(writer, pending_frames).await? {
         return Ok(false);
     }
 

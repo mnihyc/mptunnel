@@ -1264,6 +1264,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "socket2",
  "tokio",
  "toml",

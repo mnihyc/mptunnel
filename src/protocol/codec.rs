@@ -51,6 +51,10 @@ pub fn encode_frames_into(
     out: &mut Vec<u8>,
 ) -> Result<(), CodecError> {
     out.clear();
+    let capacity_hint = frames.iter().fold(0usize, |total, frame| {
+        total.saturating_add(encoded_frame_capacity_hint(frame))
+    });
+    out.reserve(capacity_hint);
     for frame in frames {
         encode_frame_into(frame, limits, out)?;
         if out.len() > limits.max_frame_bytes {
@@ -68,6 +72,7 @@ pub fn encode_frame_into(
     limits: CodecLimits,
     out: &mut Vec<u8>,
 ) -> Result<(), CodecError> {
+    out.reserve(encoded_frame_capacity_hint(frame));
     let frame_start = out.len();
     out.resize(frame_start + FRAME_HEADER_LEN, 0);
     let kind = encode_payload(frame, limits, &mut *out)?;
@@ -94,6 +99,10 @@ pub fn encode_frame_into(
     out[frame_start + 5] = kind as u8;
     out[frame_start + 6..frame_start + 10].copy_from_slice(&(payload_len as u32).to_be_bytes());
     Ok(())
+}
+
+pub(crate) fn encoded_frame_capacity_hint(frame: &Frame) -> usize {
+    FRAME_HEADER_LEN.saturating_add(encoded_payload_capacity_hint(frame))
 }
 
 fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
@@ -137,6 +146,33 @@ pub fn decode_frame(bytes: &[u8], limits: CodecLimits) -> Result<Frame, CodecErr
     }
 
     let mut reader = Reader::new(&bytes[FRAME_HEADER_LEN..]);
+    let frame = decode_payload(kind, limits, &mut reader)?;
+    reader.finish()?;
+    Ok(frame)
+}
+
+pub fn decode_frame_bytes(bytes: Bytes, limits: CodecLimits) -> Result<Frame, CodecError> {
+    if bytes.len() < FRAME_HEADER_LEN {
+        return Err(CodecError::UnexpectedEof);
+    }
+    if bytes.len() > limits.max_frame_bytes {
+        return Err(CodecError::FrameTooLarge {
+            actual: bytes.len(),
+            limit: limits.max_frame_bytes,
+        });
+    }
+    let payload_len = decode_payload_len_from_header(&bytes[..FRAME_HEADER_LEN], limits)?;
+    let expected_len = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(CodecError::LengthOverflow)?;
+    match bytes.len().cmp(&expected_len) {
+        std::cmp::Ordering::Less => return Err(CodecError::UnexpectedEof),
+        std::cmp::Ordering::Greater => return Err(CodecError::TrailingBytes),
+        std::cmp::Ordering::Equal => {}
+    }
+
+    let kind = FrameKind::from_u8(bytes[5])?;
+    let mut reader = Reader::with_source(&bytes, FRAME_HEADER_LEN, bytes.len());
     let frame = decode_payload(kind, limits, &mut reader)?;
     reader.finish()?;
     Ok(frame)
@@ -1465,6 +1501,30 @@ mod tests {
         assert!(payload_start >= source_start);
         assert!(payload_end <= source_end);
         assert_eq!(payload.as_ref(), b"zero-copy-payload");
+    }
+
+    #[test]
+    fn owned_single_frame_decode_slices_payload_without_copying() {
+        let data = Frame::StreamData {
+            stream_id: StreamId(7),
+            offset: 1024,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"quic-zero-copy-payload"),
+        };
+        let encoded = Bytes::from(encode_frame(&data, CodecLimits::default()).expect("encode"));
+        let source_start = encoded.as_ptr() as usize;
+        let source_end = source_start + encoded.len();
+
+        let decoded = decode_frame_bytes(encoded, CodecLimits::default()).expect("decode");
+        let Frame::StreamData { payload, .. } = decoded else {
+            panic!("expected stream data frame");
+        };
+        let payload_start = payload.as_ptr() as usize;
+        let payload_end = payload_start + payload.len();
+
+        assert!(payload_start >= source_start);
+        assert!(payload_end <= source_end);
+        assert_eq!(payload.as_ref(), b"quic-zero-copy-payload");
     }
 
     #[test]

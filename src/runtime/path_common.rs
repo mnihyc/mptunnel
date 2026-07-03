@@ -52,18 +52,19 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
         server_udp_datagram_request_queue_len(mux_limits),
     );
     tokio::spawn(async move {
-        let mut response_buffer = vec![
-            0u8;
-            mux_limits
-                .max_payload_bytes
-                .min(UDP_DATAGRAM_RECV_BUFFER_BYTES)
-        ];
+        let response_buffer_len = mux_limits
+            .max_payload_bytes
+            .min(UDP_DATAGRAM_RECV_BUFFER_BYTES);
+        let mut response_buffer = bytes::BytesMut::zeroed(response_buffer_len);
         let mut pending_ttls = VecDeque::<(Instant, u32, DatagramId)>::new();
         loop {
             prune_server_udp_pending_ttls(&mut pending_ttls);
             tokio::select! {
                 biased;
-                received = outbound_socket.recv(&mut response_buffer) => {
+                received = async {
+                    response_buffer.resize(response_buffer_len, 0);
+                    outbound_socket.recv(&mut response_buffer[..]).await
+                } => {
                     let len = match received {
                         Ok(len) => len,
                         Err(err) => {
@@ -75,16 +76,18 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
                             break;
                         }
                     };
+                    response_buffer.truncate(len);
                     let Some((ttl_ms, datagram_id)) =
                         server_udp_next_response_ttl(&mut pending_ttls)
                     else {
                         continue;
                     };
+                    let payload = response_buffer.split_to(len).freeze();
                     let frame = Frame::DatagramData {
                         flow_id,
                         datagram_id,
                         ttl_ms,
-                        payload: Bytes::copy_from_slice(&response_buffer[..len]),
+                        payload,
                     };
                     match try_send_server_datagram_realtime_frame(&commands, frame) {
                         Ok(()) => {}

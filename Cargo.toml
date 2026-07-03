@@ -31,6 +31,7 @@ rustls-pki-types = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+smallvec = "1.15"
 socket2 = "0.6"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"

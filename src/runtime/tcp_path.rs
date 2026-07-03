@@ -204,6 +204,7 @@ async fn run_client_tcp_path_session(
         streams: HashMap::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
     };
+    let mut pending_frames = Vec::<Frame>::new();
 
     loop {
         if state.connection.is_none() {
@@ -277,6 +278,7 @@ async fn run_client_tcp_path_session(
                                 &mut state.closed_streams,
                                 runtime.stream_frame_queue,
                                 runtime.mux_limits,
+                                &mut pending_frames,
                             )
                             .await;
                             if let Err(err) = result {
@@ -310,6 +312,7 @@ async fn run_client_tcp_path_session(
                             &mut state.closed_streams,
                             runtime.stream_frame_queue,
                             runtime.mux_limits,
+                            &mut pending_frames,
                         )
                         .await;
                         if let Err(err) = result {
@@ -362,13 +365,14 @@ async fn handle_connected_client_tcp_command_run(
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_frame_queue: usize,
     mux_limits: MuxLimits,
+    pending_frames: &mut Vec<Frame>,
 ) -> Result<(), RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
     let byte_budget = tcp_path_command_writer_run_budget_bytes(mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(mux_limits);
     let mut next_command = Some(first_command);
-    let mut pending_frames = Vec::<Frame>::new();
+    pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut wrote_frame = false;
@@ -395,7 +399,7 @@ async fn handle_connected_client_tcp_command_run(
                 continue;
             }
             command => {
-                flush_client_tcp_frame_batch(connection, &mut pending_frames, mux_limits).await?;
+                flush_client_tcp_frame_batch(connection, pending_frames, mux_limits).await?;
                 handle_connected_client_tcp_command(
                     command,
                     connection,
@@ -415,7 +419,7 @@ async fn handle_connected_client_tcp_command_run(
         }
     }
 
-    flush_client_tcp_frame_batch(connection, &mut pending_frames, mux_limits).await?;
+    flush_client_tcp_frame_batch(connection, pending_frames, mux_limits).await?;
 
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -591,9 +595,9 @@ pub(super) async fn connect_client_tcp_path(
         session_id,
     )?;
 
-    framed.write_frame(&session_hello).await?;
-    framed.write_frame(&session_auth).await?;
-    framed.write_frame(&path_join).await?;
+    framed
+        .write_frames(&[session_hello, session_auth, path_join])
+        .await?;
     framed.flush().await?;
 
     let mut session_ready = false;

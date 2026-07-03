@@ -433,10 +433,14 @@ pub(super) async fn probe_tcp_client_path(
             authenticated_path_join_frames(security, path, path_id, UnderlayProtocol::Tcp)?;
         let nonce = random_u64()?;
 
-        framed.write_frame(&session_hello).await?;
-        framed.write_frame(&session_auth).await?;
-        framed.write_frame(&path_join).await?;
-        framed.write_frame(&Frame::Ping { nonce }).await?;
+        framed
+            .write_frames(&[
+                session_hello,
+                session_auth,
+                path_join,
+                Frame::Ping { nonce },
+            ])
+            .await?;
         framed.flush().await?;
 
         let mut session_ready = false;

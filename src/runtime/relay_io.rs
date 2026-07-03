@@ -61,6 +61,7 @@ pub(super) fn stream_ack_gap_repair_allowed(
     udp_gap_repair_ready
 }
 
+#[cfg(test)]
 pub(super) fn stream_ack_gap_repair_frames(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
@@ -77,6 +78,27 @@ pub(super) fn stream_ack_gap_repair_frames(
         udp_gap_repair_ready,
     ) {
         send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit)
+    } else {
+        Vec::new()
+    }
+}
+
+pub(super) fn stream_ack_gap_repair_frames_normalized(
+    send_stream: &ReliableSendStream,
+    ranges: &[OffsetRange],
+    byte_limit: usize,
+    complete: bool,
+    active_underlay: Option<UnderlayProtocol>,
+    has_multipath_repair_alternative: bool,
+    udp_gap_repair_ready: bool,
+) -> Vec<Frame> {
+    if stream_ack_gap_repair_allowed(
+        complete,
+        active_underlay,
+        has_multipath_repair_alternative,
+        udp_gap_repair_ready,
+    ) {
+        send_stream.retransmission_frames_for_normalized_ack_gaps(ranges, byte_limit)
     } else {
         Vec::new()
     }
@@ -241,9 +263,9 @@ impl ReliableRecvProgress {
         let now = Instant::now();
         let next_offset = recv_stream.next_offset();
         let reorder_bytes = recv_stream.reorder_bytes();
-        let ack_ranges = recv_stream.ack_ranges();
-        let range_count = ack_ranges.len();
-        let largest_end = ack_ranges.last().map_or(0, |range| range.end);
+        let ack_summary = recv_stream.ack_range_summary();
+        let range_count = ack_summary.count;
+        let largest_end = ack_summary.largest_end;
         let has_progress = next_offset > 0 || reorder_bytes > 0;
         let first_ack = self.last_ack_at.is_none() && has_progress;
         let ack_step = reliable_stream_ack_update_bytes(path, lane, mux_limits);
@@ -383,22 +405,91 @@ pub(super) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
-pub(super) fn resize_reliable_relay_buffer(buffer: &mut Vec<u8>, target_len: usize) {
+pub(super) fn resize_reliable_relay_buffer(buffer: &mut bytes::BytesMut, target_len: usize) {
     let target_len = target_len.max(1);
-    if buffer.len() == target_len {
-        return;
+    buffer.clear();
+    if buffer.capacity() < target_len {
+        buffer.reserve(target_len.saturating_sub(buffer.capacity()));
     }
-    if target_len > buffer.len() {
-        buffer.resize(target_len, 0);
-        return;
+}
+
+pub(super) async fn read_reliable_relay_payload<S>(
+    local: &mut S,
+    buffer: &mut bytes::BytesMut,
+    read_budget: usize,
+) -> std::io::Result<(usize, Option<Bytes>)>
+where
+    S: AsyncRead + Unpin,
+{
+    resize_reliable_relay_buffer(buffer, read_budget);
+    let read = (&mut *local)
+        .take(read_budget.max(1) as u64)
+        .read_buf(buffer)
+        .await?;
+    if read == 0 {
+        Ok((0, None))
+    } else {
+        Ok((read, Some(buffer.split_to(read).freeze())))
     }
-    buffer.truncate(target_len);
-    let shrink_threshold = target_len
-        .saturating_mul(BBR_MIN_PIPE_CWND_PACKETS)
-        .max(BBR_MAX_SEND_QUANTUM_BYTES);
-    if buffer.capacity() > shrink_threshold {
-        buffer.shrink_to(target_len);
+}
+
+pub(super) async fn write_delivered_payloads<S>(
+    local: &mut S,
+    delivered: &[Bytes],
+) -> std::io::Result<usize>
+where
+    S: AsyncWrite + Unpin,
+{
+    let total_bytes = delivered
+        .iter()
+        .map(|chunk| chunk.len())
+        .fold(0usize, usize::saturating_add);
+    match delivered {
+        [] => return Ok(0),
+        [single] => {
+            local.write_all(single).await?;
+            return Ok(total_bytes);
+        }
+        _ => {}
     }
+
+    let mut chunk_index = 0usize;
+    let mut chunk_offset = 0usize;
+    while chunk_index < delivered.len() {
+        let mut slices = smallvec::SmallVec::<[std::io::IoSlice<'_>; 8]>::new();
+        if chunk_offset < delivered[chunk_index].len() {
+            slices.push(std::io::IoSlice::new(
+                &delivered[chunk_index][chunk_offset..],
+            ));
+        }
+        for chunk in delivered.iter().skip(chunk_index + 1) {
+            if !chunk.is_empty() {
+                slices.push(std::io::IoSlice::new(chunk.as_ref()));
+                if slices.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        if slices.is_empty() {
+            break;
+        }
+        let mut written = local.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        while written > 0 && chunk_index < delivered.len() {
+            let remaining = delivered[chunk_index].len().saturating_sub(chunk_offset);
+            if written < remaining {
+                chunk_offset = chunk_offset.saturating_add(written);
+                written = 0;
+            } else {
+                written = written.saturating_sub(remaining);
+                chunk_index = chunk_index.saturating_add(1);
+                chunk_offset = 0;
+            }
+        }
+    }
+    Ok(total_bytes)
 }
 
 pub(super) fn receive_stream_fin(
@@ -935,7 +1026,7 @@ where
         path_stream.underlay,
         path_stream.max_frame_payload_bytes,
     );
-    let mut buf = vec![0u8; chunk_size];
+    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut local_open = true;
     let mut remote_open = true;
     let mut stats = PathDeliveryStats::default();
@@ -1113,7 +1204,12 @@ where
             sender_queue_limit,
         );
         let read_budget = if can_read_by_flow {
-            response_sender.read_budget(&send_stream, mux_limits, sender_queue_limit, buf.len())
+            response_sender.read_budget(
+                &send_stream,
+                mux_limits,
+                sender_queue_limit,
+                source_read_ceiling,
+            )
         } else {
             0
         };
@@ -1185,13 +1281,19 @@ where
                         let outcome = recv_stream.receive_data(offset, payload, flags)?;
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
-                        for chunk in outcome.delivered {
+                        let delivered = outcome.delivered;
+                        for chunk in delivered.iter() {
                             stats.record_payload_bytes(chunk.len());
-                            #[cfg(feature = "lab-diagnostics")]
-                            let write_started = Instant::now();
-                            local.write_all(&chunk).await?;
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_perf_record("relay.local_write_wait", write_started.elapsed(), chunk.len());
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        let write_started = Instant::now();
+                        let written = write_delivered_payloads(&mut local, delivered.as_slice()).await?;
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record("relay.local_write_wait", write_started.elapsed(), written);
+                        #[cfg(not(feature = "lab-diagnostics"))]
+                        let _ = written;
+                        if !delivered.is_empty() {
+                            local.flush().await?;
                         }
                         #[cfg(feature = "lab-diagnostics")]
                         let flush_started = Instant::now();
@@ -1236,14 +1338,14 @@ where
                         complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
+                        let normalized_ranges = normalized_offset_ranges(&ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         let mux_started = Instant::now();
-                        let ack = send_stream.apply_ack(&ranges);
+                        let ack = send_stream.apply_normalized_ack(&normalized_ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        path_stream.release_acked_ranges(&ranges);
-                        let largest_ack_end =
-                            ranges.iter().map(|range| range.end).max().unwrap_or(0);
+                        path_stream.release_acked_ranges(&normalized_ranges);
+                        let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
                         let ack_made_progress =
                             ack.released_bytes > 0 || largest_ack_end > last_send_ack_frontier;
                         if ack_made_progress {
@@ -1267,7 +1369,7 @@ where
                             }
                         }
                         last_send_ack_frontier = last_send_ack_frontier.max(largest_ack_end);
-                        last_send_ack_ranges = ranges.clone();
+                        last_send_ack_ranges = normalized_ranges.clone();
                         last_send_ack_complete = complete;
                         let base_repair_limit =
                             adaptive_reliable_relay_repair_bytes(None, relay_lane, mux_limits);
@@ -1277,15 +1379,15 @@ where
                             path_stream.has_multipath_repair_alternative();
                         let udp_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
-                            &ranges,
+                            &normalized_ranges,
                             Some(path_stream.underlay),
                             has_multipath_repair_alternative,
                             None,
                             relay_lane,
                         );
-                        let mut repair_frames = stream_ack_gap_repair_frames(
+                        let mut repair_frames = stream_ack_gap_repair_frames_normalized(
                             &send_stream,
-                            &ranges,
+                            &normalized_ranges,
                             repair_limit,
                             complete,
                             Some(path_stream.underlay),
@@ -1615,23 +1717,19 @@ where
             read = async {
                 #[cfg(feature = "lab-diagnostics")]
                 let read_started = Instant::now();
-                let result = local.read(&mut buf[..read_budget]).await;
+                let result = read_reliable_relay_payload(&mut local, &mut buf, read_budget).await;
                 #[cfg(feature = "lab-diagnostics")]
-                if let Ok(read) = &result {
+                if let Ok((read, _)) = &result {
                     lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
                 }
                 result
             }, if can_read_local => {
-                let read = read?;
+                let (read, payload) = read?;
                 if read == 0 {
                     pending_local_fin = true;
                     local_open = false;
                 } else {
-                    #[cfg(feature = "lab-diagnostics")]
-                    let copy_started = Instant::now();
-                    let payload = Bytes::copy_from_slice(&buf[..read]);
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                    let payload = payload.expect("positive read returns payload");
                     #[cfg(feature = "lab-diagnostics")]
                     let enqueue_id = response_sender.enqueue_data(payload);
                     #[cfg(not(feature = "lab-diagnostics"))]
@@ -1675,20 +1773,16 @@ where
                         }
                         let read = tokio::select! {
                             biased;
-                            read = local.read(&mut buf[..next_read_budget]) => read,
+                            read = read_reliable_relay_payload(&mut local, &mut buf, next_read_budget) => read,
                             _ = std::future::ready(()) => break,
                         };
-                        let read = read?;
+                        let (read, payload) = read?;
                         if read == 0 {
                             pending_local_fin = true;
                             local_open = false;
                             break;
                         }
-                        #[cfg(feature = "lab-diagnostics")]
-                        let copy_started = Instant::now();
-                        let payload = Bytes::copy_from_slice(&buf[..read]);
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                        let payload = payload.expect("positive read returns payload");
                         #[cfg(feature = "lab-diagnostics")]
                         let enqueue_id = response_sender.enqueue_data(payload);
                         #[cfg(not(feature = "lab-diagnostics"))]

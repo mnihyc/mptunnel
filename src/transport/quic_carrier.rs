@@ -2,7 +2,10 @@
 use crate::lab_diagnostics::lab_perf_record;
 use crate::mux::MuxLimits;
 use crate::protocol::Frame;
-use crate::protocol::codec::{CodecLimits, decode_frame, encode_frame_into};
+use crate::protocol::codec::{
+    CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
+};
+use bytes::BytesMut;
 use quinn::{
     ClientConfig, ConnectionError, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt,
 };
@@ -48,6 +51,7 @@ pub struct CongestionMetrics {
 pub struct SendStream {
     stream: quinn::SendStream,
     write_backlog: Arc<AtomicU64>,
+    encode_buffer: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -289,6 +293,7 @@ impl Connection {
             SendStream {
                 stream: send,
                 write_backlog: self.write_backlog.clone(),
+                encode_buffer: Vec::new(),
             },
             RecvStream { stream: recv },
         ))
@@ -300,6 +305,7 @@ impl Connection {
             SendStream {
                 stream: send,
                 write_backlog: self.write_backlog.clone(),
+                encode_buffer: Vec::new(),
             },
             RecvStream { stream: recv },
         ))
@@ -367,21 +373,30 @@ pub async fn write_frames(
     }
     #[cfg(feature = "lab-diagnostics")]
     let encode_started = std::time::Instant::now();
-    let mut packet = Vec::new();
-    for frame in frames {
-        encode_length_prefixed_frame(frame, limits, &mut packet)?;
-    }
+    let packet_len = {
+        let packet = &mut send.encode_buffer;
+        packet.clear();
+        let capacity_hint = frames.iter().fold(0usize, |total, frame| {
+            total
+                .saturating_add(FRAME_LEN_BYTES)
+                .saturating_add(encoded_frame_capacity_hint(frame))
+        });
+        packet.reserve(capacity_hint);
+        for frame in frames {
+            encode_length_prefixed_frame(frame, limits, packet)?;
+        }
+        packet.len() as u64
+    };
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.encode_frames",
         encode_started.elapsed(),
-        packet.len(),
+        packet_len as usize,
     );
     #[cfg(feature = "lab-diagnostics")]
     let write_started = std::time::Instant::now();
-    let packet_len = packet.len() as u64;
     send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
-    let write_result = send.stream.write_all(&packet).await;
+    let write_result = send.stream.write_all(&send.encode_buffer).await;
     let _ = send
         .write_backlog
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -392,7 +407,7 @@ pub async fn write_frames(
     lab_perf_record(
         "transport.quic.write_frames_wait",
         write_started.elapsed(),
-        packet.len(),
+        packet_len as usize,
     );
     Ok(())
 }
@@ -425,12 +440,13 @@ pub async fn read_frame(
     if len > limits.max_frame_bytes {
         return Err(QuicCarrierError::FrameTooLarge);
     }
-    let mut encoded = vec![0u8; len];
+    let mut encoded = BytesMut::with_capacity(len);
+    encoded.resize(len, 0);
     recv.stream
         .read_exact(&mut encoded)
         .await
         .map_err(QuicCarrierError::ReadExact)?;
-    Ok(decode_frame(&encoded, limits)?)
+    Ok(decode_frame_bytes(encoded.freeze(), limits)?)
 }
 
 pub fn finish_stream(send: &mut SendStream) -> Result<(), QuicCarrierError> {

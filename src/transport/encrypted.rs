@@ -48,6 +48,8 @@ pub struct EncryptedFramedStream<S> {
     recv_direction: u8,
     send_counter: u64,
     recv_counter: u64,
+    encode_buffer: Vec<u8>,
+    pending_frames: std::collections::VecDeque<Frame>,
 }
 
 pub struct EncryptedFramedReader<R> {
@@ -102,6 +104,8 @@ impl<S> EncryptedFramedStream<S> {
             recv_direction: role.recv_direction(),
             send_counter: 0,
             recv_counter: 0,
+            encode_buffer: Vec::new(),
+            pending_frames: std::collections::VecDeque::new(),
         }
     }
 
@@ -130,6 +134,8 @@ impl<S> EncryptedFramedStream<S> {
             recv_direction,
             send_counter,
             recv_counter,
+            encode_buffer: _,
+            pending_frames,
         } = self;
         let (read_half, write_half) = tokio::io::split(stream);
         (
@@ -139,7 +145,7 @@ impl<S> EncryptedFramedStream<S> {
                 limits,
                 recv_direction,
                 recv_counter,
-                pending_frames: std::collections::VecDeque::new(),
+                pending_frames,
             },
             EncryptedFramedWriter {
                 stream: write_half,
@@ -158,14 +164,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
-        read_frame_from(
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Ok(frame);
+        }
+        let mut frames = read_frames_from(
             &mut self.stream,
             &self.cipher,
             self.limits,
             self.recv_direction,
             &mut self.recv_counter,
         )
-        .await
+        .await?;
+        if frames.is_empty() {
+            return Err(EncryptedFramedTransportError::Codec(
+                CodecError::UnexpectedEof,
+            ));
+        }
+        for frame in frames.drain(1..) {
+            self.pending_frames.push_back(frame);
+        }
+        Ok(frames.remove(0))
     }
 
     pub async fn write_frame(
@@ -179,7 +197,23 @@ where
             self.send_direction,
             &mut self.send_counter,
             frame,
-            &mut Vec::new(),
+            &mut self.encode_buffer,
+        )
+        .await
+    }
+
+    pub async fn write_frames(
+        &mut self,
+        frames: &[Frame],
+    ) -> Result<(), EncryptedFramedTransportError> {
+        write_frames_to(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.send_direction,
+            &mut self.send_counter,
+            frames,
+            &mut self.encode_buffer,
         )
         .await
     }
@@ -280,25 +314,6 @@ where
         lab_perf_record("transport.tcp.flush_wait", started.elapsed(), 0);
         Ok(())
     }
-}
-
-async fn read_frame_from<R>(
-    stream: &mut R,
-    cipher: &TransportAead,
-    limits: CodecLimits,
-    recv_direction: u8,
-    recv_counter: &mut u64,
-) -> Result<Frame, EncryptedFramedTransportError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut frames = read_frames_from(stream, cipher, limits, recv_direction, recv_counter).await?;
-    if frames.len() != 1 {
-        return Err(EncryptedFramedTransportError::Codec(
-            CodecError::TrailingBytes,
-        ));
-    }
-    Ok(frames.remove(0))
 }
 
 async fn read_frames_from<R>(

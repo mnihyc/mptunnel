@@ -45,10 +45,7 @@ pub async fn connect_endpoint(
             continue;
         }
         match connect_addr(addr, options).await {
-            Ok(stream) => {
-                stream.set_nodelay(options.nodelay)?;
-                return Ok(stream);
-            }
+            Ok(stream) => return Ok(stream),
             Err(err) => last_error = Some(err),
         }
     }

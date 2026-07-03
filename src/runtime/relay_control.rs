@@ -17,7 +17,7 @@ where
     let mut recv_stream = ReliableRecvStream::new(stream_id, context.mux_limits);
     let chunk_size =
         adaptive_reliable_relay_chunk_bytes(None, FlowLane::Latency, context.mux_limits);
-    let mut buf = vec![0u8; chunk_size];
+    let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut local_open = true;
     let mut remote_open = true;
     let mut pending_local_fin = false;
@@ -747,14 +747,14 @@ where
                 let read_budget = prospective_read_budget;
                 #[cfg(feature = "lab-diagnostics")]
                 let read_started = Instant::now();
-                let result = local.read(&mut buf[..read_budget]).await;
+                let result = read_reliable_relay_payload(&mut local, &mut buf, read_budget).await;
                 #[cfg(feature = "lab-diagnostics")]
-                if let Ok(read) = &result {
+                if let Ok((read, _)) = &result {
                     lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
                 }
                 result
             }, if can_read_local => {
-                let read = match read {
+                let (read, payload) = match read {
                     Ok(read) => read,
                     Err(err) => break Err(RuntimeError::Io(err)),
                 };
@@ -765,11 +765,7 @@ where
                     if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
                         interactive_response_pending = true;
                     }
-                    #[cfg(feature = "lab-diagnostics")]
-                    let copy_started = Instant::now();
-                    let payload = Bytes::copy_from_slice(&buf[..read]);
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                    let payload = payload.expect("positive read returns payload");
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "client_sender_enqueue",
@@ -809,10 +805,10 @@ where
                         }
                         let read = tokio::select! {
                             biased;
-                            read = local.read(&mut buf[..next_read_budget]) => read,
+                            read = read_reliable_relay_payload(&mut local, &mut buf, next_read_budget) => read,
                             _ = std::future::ready(()) => break,
                         };
-                        let read = read.map_err(RuntimeError::Io)?;
+                        let (read, payload) = read.map_err(RuntimeError::Io)?;
                         if read == 0 {
                             local_open = false;
                             pending_local_fin = true;
@@ -821,11 +817,7 @@ where
                         if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
                             interactive_response_pending = true;
                         }
-                        #[cfg(feature = "lab-diagnostics")]
-                        let copy_started = Instant::now();
-                        let payload = Bytes::copy_from_slice(&buf[..read]);
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_perf_record("relay.copy_local_chunk", copy_started.elapsed(), read);
+                        let payload = payload.expect("positive read returns payload");
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "client_sender_enqueue",
@@ -1059,12 +1051,12 @@ where
                         {
                             let reorder_bytes = recv_stream.reorder_bytes();
                             if reorder_bytes > 0 {
-                                let ack_ranges = recv_stream.ack_ranges();
+                                let ack_summary = recv_stream.ack_range_summary();
                                 let hole_state = (
                                     recv_stream.next_offset(),
                                     reorder_bytes,
-                                    ack_ranges.len(),
-                                    ack_ranges.last().map_or(0, |range| range.end),
+                                    ack_summary.count,
+                                    ack_summary.largest_end,
                                 );
                                 if last_reported_receive_hole != Some(hole_state) {
                                     lab_diagnostic(
@@ -1097,7 +1089,8 @@ where
                         }
                         let mut write_error = None;
                         let mut delivered_payload_bytes = 0usize;
-                        for chunk in outcome.delivered {
+                        let delivered = outcome.delivered;
+                        for chunk in delivered.iter() {
                             stats.record_payload_bytes(chunk.len());
                             let path_stat = path_stats
                                 .entry(path_key)
@@ -1111,15 +1104,20 @@ where
                                 *path_stat,
                                 &mut path_next_live_sample_bytes,
                             );
-                            #[cfg(feature = "lab-diagnostics")]
-                            let write_started = Instant::now();
-                            if let Err(err) = local.write_all(&chunk).await {
-                                write_error = Some(err);
-                                break;
-                            }
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_perf_record("relay.local_write_wait", write_started.elapsed(), chunk.len());
                         }
+                        #[cfg(feature = "lab-diagnostics")]
+                        let write_started = Instant::now();
+                        if let Err(err) =
+                            write_delivered_payloads(&mut local, delivered.as_slice()).await
+                        {
+                            write_error = Some(err);
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_perf_record(
+                            "relay.local_write_wait",
+                            write_started.elapsed(),
+                            delivered_payload_bytes,
+                        );
                         if let Some(err) = write_error {
                             break Err(RuntimeError::Io(err));
                         }
@@ -1228,14 +1226,15 @@ where
                         complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
+                        let normalized_ranges = normalized_offset_ranges(&ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         let previous_repair_bytes = send_stream.repair_bytes();
                         #[cfg(feature = "lab-diagnostics")]
                         let mux_started = Instant::now();
-                        let ack = send_stream.apply_ack(&ranges);
+                        let ack = send_stream.apply_normalized_ack(&normalized_ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        sender.release_acked_ranges(context, &ranges);
+                        sender.release_acked_ranges(context, &normalized_ranges);
                         let repair_limit = adaptive_reliable_relay_repair_bytes(
                             path_snapshot,
                             relay_lane,
@@ -1244,15 +1243,15 @@ where
                         let has_multipath_repair_alternative = remotes.path_keys().len() > 1;
                         let udp_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
-                            &ranges,
+                            &normalized_ranges,
                             remotes.active_carrier_underlay(),
                             has_multipath_repair_alternative,
                             path_snapshot,
                             relay_lane,
                         );
-                        let mut repair_frames = stream_ack_gap_repair_frames(
+                        let mut repair_frames = stream_ack_gap_repair_frames_normalized(
                             &send_stream,
-                            &ranges,
+                            &normalized_ranges,
                             repair_limit,
                             complete,
                             remotes.active_carrier_underlay(),

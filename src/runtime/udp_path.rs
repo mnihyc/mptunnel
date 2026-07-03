@@ -674,6 +674,7 @@ async fn run_client_udp_stream(
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
     let mut carrier_frames = spawn_udp_carrier_reader(recv, codec_limits, reader_queue_size);
+    let mut pending_frames = Vec::<Frame>::new();
     loop {
         let command_may_recv = !tcp_path_receivers_closed(&commands);
         if !command_may_recv {
@@ -688,6 +689,7 @@ async fn run_client_udp_stream(
                 stream_id,
                 codec_limits,
                 mux_limits,
+                &mut pending_frames,
             )
             .await;
             match result {
@@ -753,6 +755,7 @@ async fn run_client_udp_stream(
                         stream_id,
                         codec_limits,
                         mux_limits,
+                        &mut pending_frames,
                     )
                     .await;
                     match result {
@@ -775,6 +778,7 @@ async fn run_client_udp_stream(
                             stream_id,
                             codec_limits,
                             mux_limits,
+                            &mut pending_frames,
                         ).await;
                         match result {
                             Ok(false) => {}
@@ -799,13 +803,14 @@ async fn drain_client_udp_stream_commands(
     stream_id: StreamId,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
+    pending_frames: &mut Vec<Frame>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
     let byte_budget = tcp_path_command_writer_run_budget_bytes(mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(mux_limits);
     let mut next_command = Some(first_command);
-    let mut pending_frames = Vec::<Frame>::new();
+    pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
 
@@ -814,7 +819,7 @@ async fn drain_client_udp_stream_commands(
             .take()
             .or_else(|| try_recv_tcp_path_command(commands))
         else {
-            flush_udp_frame_batch(send, &mut pending_frames, codec_limits).await?;
+            flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -841,7 +846,7 @@ async fn drain_client_udp_stream_commands(
                 sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch(send, &mut pending_frames, codec_limits).await?;
+                    flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "path_writer_drain",
@@ -863,7 +868,7 @@ async fn drain_client_udp_stream_commands(
                 continue;
             }
             TcpPathSessionCommand::CloseStream(close_stream_id) => {
-                flush_udp_frame_batch(send, &mut pending_frames, codec_limits).await?;
+                flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
                 if close_stream_id == stream_id {
                     let _ = udp_path_finish_stream(send);
                     true
@@ -899,7 +904,7 @@ async fn drain_client_udp_stream_commands(
         }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch(send, &mut pending_frames, codec_limits).await?;
+            flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1318,6 +1323,7 @@ async fn run_server_udp_reliable_stream_loop(
         context.codec_limits,
         reliable_stream_frame_queue(context.mux_limits),
     );
+    let mut pending_frames = Vec::<Frame>::new();
 
     loop {
         let command_may_recv = !tcp_path_receivers_closed(&commands_rx);
@@ -1331,6 +1337,7 @@ async fn run_server_udp_reliable_stream_loop(
                 stream_id,
                 path_id,
                 &commands_tx,
+                &mut pending_frames,
             )
             .await;
             if result? {
@@ -1483,6 +1490,7 @@ async fn run_server_udp_reliable_stream_loop(
                         stream_id,
                         path_id,
                         &commands_tx,
+                        &mut pending_frames,
                     )
                     .await?;
                     if result {
@@ -1502,6 +1510,7 @@ async fn run_server_udp_reliable_stream_loop(
                             stream_id,
                             path_id,
                             &commands_tx,
+                            &mut pending_frames,
                         ).await;
                         if result? {
                             return Ok(());
@@ -1523,13 +1532,14 @@ async fn drain_server_udp_reliable_commands(
     stream_id: StreamId,
     path_id: PathId,
     commands_tx: &TcpPathSessionCommandSender,
+    pending_frames: &mut Vec<Frame>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
     let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
-    let mut pending_frames = Vec::<Frame>::new();
+    pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
 
@@ -1538,7 +1548,7 @@ async fn drain_server_udp_reliable_commands(
             .take()
             .or_else(|| try_recv_tcp_path_command(commands))
         else {
-            flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1566,7 +1576,7 @@ async fn drain_server_udp_reliable_commands(
                 sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+                    flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "path_writer_drain",
@@ -1589,7 +1599,7 @@ async fn drain_server_udp_reliable_commands(
                 continue;
             }
             TcpPathSessionCommand::CloseStream(close_stream_id) => {
-                flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+                flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
                 if close_stream_id == stream_id {
                     context.reliable_streams.detach_path(
                         session_id,
@@ -1633,7 +1643,7 @@ async fn drain_server_udp_reliable_commands(
         }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1679,6 +1689,7 @@ async fn handle_server_udp_datagram_stream(
         udp_path_command_queue(context.mux_limits, context.codec_limits),
     );
     let mut flows = Vec::<ServerUdpDatagramFlow>::new();
+    let mut pending_frames = Vec::<Frame>::new();
     open_server_udp_datagram_flow(
         &context,
         &commands_tx,
@@ -1762,6 +1773,7 @@ async fn handle_server_udp_datagram_stream(
                         &mut send,
                         &context,
                         &mut flows,
+                        &mut pending_frames,
                     )
                     .await?;
                     if result {
@@ -1778,6 +1790,7 @@ async fn handle_server_udp_datagram_stream(
                             &mut send,
                             &context,
                             &mut flows,
+                            &mut pending_frames,
                         ).await;
                         if result? {
                             return Ok(());
@@ -1796,13 +1809,14 @@ async fn drain_server_udp_datagram_commands(
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
     flows: &mut Vec<ServerUdpDatagramFlow>,
+    pending_frames: &mut Vec<Frame>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
     let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
-    let mut pending_frames = Vec::<Frame>::new();
+    pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
 
@@ -1811,7 +1825,7 @@ async fn drain_server_udp_datagram_commands(
             .take()
             .or_else(|| try_recv_tcp_path_command(commands))
         else {
-            flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1840,7 +1854,7 @@ async fn drain_server_udp_datagram_commands(
                 sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+                    flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "path_writer_drain",
@@ -1861,7 +1875,7 @@ async fn drain_server_udp_datagram_commands(
                 continue;
             }
             TcpPathSessionCommand::CloseStream(_) => {
-                flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+                flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
                 let _ = udp_path_finish_stream(send);
                 true
             }
@@ -1892,7 +1906,7 @@ async fn drain_server_udp_datagram_commands(
         }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch(send, &mut pending_frames, context.codec_limits).await?;
+            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",

@@ -22,6 +22,15 @@ pub(super) struct RelayPathFlightLedger {
 
 impl RelayPathFlightLedger {
     pub(super) fn record_frame(&mut self, key: RelayPathKey, frame: &Frame) -> usize {
+        self.record_frame_with_ordering_owner(key, frame, true)
+    }
+
+    pub(super) fn record_frame_with_ordering_owner(
+        &mut self,
+        key: RelayPathKey,
+        frame: &Frame,
+        owns_ordering_frontier: bool,
+    ) -> usize {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return 0;
         };
@@ -33,6 +42,7 @@ impl RelayPathFlightLedger {
                 end,
                 bytes,
                 sent_at: Instant::now(),
+                owns_ordering_frontier,
             });
         bytes
     }
@@ -103,7 +113,7 @@ impl RelayPathFlightLedger {
     pub(super) fn latest_unacked_ranges_for_path(&self, key: RelayPathKey) -> Vec<OffsetRange> {
         let mut ranges = Vec::new();
         for (offset, flights) in &self.flights {
-            let Some(latest) = flights.last() else {
+            let Some(latest) = latest_ordering_owner(flights) else {
                 continue;
             };
             if latest.key == key {
@@ -120,7 +130,7 @@ impl RelayPathFlightLedger {
         self.flights
             .range(..offset)
             .filter_map(|(_, flights)| {
-                let latest = flights.last()?;
+                let latest = latest_ordering_owner(flights)?;
                 (latest.key != key).then_some(latest.bytes as u64)
             })
             .sum()
@@ -132,8 +142,15 @@ impl RelayPathFlightLedger {
     ) -> Option<RelayPathKey> {
         self.flights
             .range(..offset)
-            .find_map(|(_, flights)| flights.last().map(|flight| flight.key))
+            .find_map(|(_, flights)| latest_ordering_owner(flights).map(|flight| flight.key))
     }
+}
+
+fn latest_ordering_owner(flights: &[RelayPathFlight]) -> Option<&RelayPathFlight> {
+    flights
+        .iter()
+        .rev()
+        .find(|flight| flight.owns_ordering_frontier)
 }
 
 pub(super) fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
@@ -160,6 +177,7 @@ struct RelayPathFlight {
     end: u64,
     bytes: usize,
     sent_at: Instant,
+    owns_ordering_frontier: bool,
 }
 
 pub(super) fn reliable_stream_frame_extent(frame: &Frame) -> Option<(u64, u64, usize)> {
@@ -1036,6 +1054,40 @@ mod tests {
             ledger.oldest_lower_flight_owner_before_offset(8192),
             Some(path0)
         );
+    }
+
+    #[test]
+    fn duplicate_validation_copy_does_not_become_ordering_owner() {
+        let owner = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let duplicate = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        };
+        let frame = data_frame(0, 4096);
+        let mut ledger = RelayPathFlightLedger::default();
+        ledger.record_frame(owner, &frame);
+        ledger.record_frame_with_ordering_owner(duplicate, &frame, false);
+
+        assert_eq!(
+            ledger.oldest_lower_flight_owner_before_offset(4096),
+            Some(owner)
+        );
+        assert_eq!(ledger.ordering_debt_bytes_before_offset(owner, 4096), 0);
+        assert_eq!(
+            ledger.ordering_debt_bytes_before_offset(duplicate, 4096),
+            4096
+        );
+
+        let released = ledger.release_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 4096,
+        }]);
+        assert_eq!(released.len(), 2);
+        assert!(released.iter().any(|release| release.key == owner));
+        assert!(released.iter().any(|release| release.key == duplicate));
     }
 
     #[test]

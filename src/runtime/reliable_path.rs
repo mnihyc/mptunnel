@@ -278,6 +278,7 @@ impl FixedReliablePathOutput {
                 bytes,
                 sent_at: Instant::now(),
                 stream_ack_proves_path,
+                owns_ordering_frontier: true,
             });
     }
 
@@ -1069,6 +1070,16 @@ impl ResponseStreamBinding {
         frame: &Frame,
         stream_ack_proves_path: bool,
     ) {
+        self.record_flight_with_ordering_owner(key, frame, stream_ack_proves_path, true)
+    }
+
+    pub(super) fn record_flight_with_ordering_owner(
+        &self,
+        key: CarrierPathKey,
+        frame: &Frame,
+        stream_ack_proves_path: bool,
+        owns_ordering_frontier: bool,
+    ) {
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
@@ -1092,6 +1103,7 @@ impl ResponseStreamBinding {
                 bytes,
                 sent_at: Instant::now(),
                 stream_ack_proves_path,
+                owns_ordering_frontier,
             });
     }
 
@@ -1130,7 +1142,7 @@ impl ResponseStreamBinding {
                 .lock()
                 .expect("server reliable stream flight lock");
             for (flight_offset, path_flights) in flights.range(..offset) {
-                if let Some(latest) = path_flights.last() {
+                if let Some(latest) = response_latest_ordering_flight(path_flights) {
                     debts.insert(
                         *flight_offset,
                         CarrierPathFlightDebt {
@@ -1147,7 +1159,7 @@ impl ResponseStreamBinding {
                 .lock()
                 .expect("server response ACK ordering lock");
             for (hole_offset, holes) in ack_ordering.acked_holes.range(..offset) {
-                if let Some(latest) = holes.last() {
+                if let Some(latest) = response_latest_ordering_hole(holes) {
                     debts.insert(
                         *hole_offset,
                         CarrierPathFlightDebt {
@@ -1444,9 +1456,13 @@ mod tests {
     }
 
     fn stream_data_frame(payload_len: usize) -> Frame {
+        stream_data_frame_at(0, payload_len)
+    }
+
+    fn stream_data_frame_at(offset: u64, payload_len: usize) -> Frame {
         Frame::StreamData {
             stream_id: StreamId(7),
-            offset: 0,
+            offset,
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0x5a; payload_len]),
         }
@@ -1503,7 +1519,140 @@ mod tests {
     }
 
     #[test]
-    fn tcp_peer_metrics_remain_send_quantum_prior_after_low_product_sample() {
+    fn duplicate_response_validation_copy_does_not_become_ordering_owner() {
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Udp);
+        let duplicate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (duplicate_commands, _duplicate_receivers) = tcp_path_session_command_channels(8);
+        binding.attach(
+            duplicate.underlay,
+            duplicate.path_id,
+            duplicate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Repair,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+        let frame = stream_data_frame_at(0, 4096);
+
+        binding.record_flight(owner, &frame, true);
+        binding.record_flight_with_ordering_owner(duplicate, &frame, false, false);
+
+        let lower = binding.lower_flights_before_offset(4096);
+        assert_eq!(lower.len(), 1);
+        assert_eq!(lower[0].key, owner);
+        assert_eq!(lower[0].bytes, 4096);
+
+        binding.release_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 4096,
+        }]);
+        let entries = binding.outputs.lock().expect("test response outputs lock");
+        let owner_entry = entries
+            .entries
+            .iter()
+            .find(|entry| entry.key == owner)
+            .expect("owner output exists");
+        let duplicate_entry = entries
+            .entries
+            .iter()
+            .find(|entry| entry.key == duplicate)
+            .expect("duplicate output exists");
+        assert_eq!(owner_entry.bytes_in_flight, 0);
+        assert_eq!(duplicate_entry.bytes_in_flight, 0);
+        assert_eq!(owner_entry.delivery_samples, 1);
+        assert_eq!(
+            duplicate_entry.delivery_samples, 0,
+            "duplicate validation STREAM_ACK must not become response bulk evidence"
+        );
+    }
+
+    #[test]
+    fn response_acked_hole_debt_counts_unique_ordering_owner_only() {
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Udp);
+        let duplicate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (duplicate_commands, _duplicate_receivers) = tcp_path_session_command_channels(8);
+        binding.attach(
+            duplicate.underlay,
+            duplicate.path_id,
+            duplicate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Repair,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+        let lower_missing = stream_data_frame_at(0, 1024);
+        let later = stream_data_frame_at(1024, 4096);
+        binding.record_flight(owner, &lower_missing, true);
+        binding.record_flight(owner, &later, true);
+        binding.record_flight_with_ordering_owner(duplicate, &later, false, false);
+
+        binding.release_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 5120,
+        }]);
+
+        let lower = binding.lower_flights_before_offset(5120);
+        assert_eq!(lower.len(), 2);
+        assert_eq!(lower[0].key, owner);
+        assert_eq!(lower[0].bytes, 1024);
+        assert_eq!(lower[1].key, owner);
+        assert_eq!(
+            lower[1].bytes, 4096,
+            "acked hole debt must not double-count duplicate validation copies"
+        );
+        let ordering = binding
+            .ack_ordering
+            .lock()
+            .expect("server response ACK ordering lock");
+        assert_eq!(ordering.acked_hole_bytes(), 4096);
+    }
+
+    #[test]
+    fn peer_app_limited_metrics_do_not_seed_response_bulk_rate_or_envelope() {
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let (binding, key) = binding_for_underlay(underlay);
+            let metrics = PathMetrics {
+                path_id: key.path_id,
+                underlay: key.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 614_000,
+                pacing_rate_bps: 614_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
+                queue_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                confidence_ppm: 900_000,
+                app_limited: true,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 142,
+            };
+            binding.update_path_metrics(key, metrics, ServerPathMetricsSource::PeerHint);
+
+            let snapshot = binding
+                .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+                .expect("peer metrics remain validation hints");
+            assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps(underlay));
+            assert_eq!(snapshot.pacing_rate_bps, snapshot.delivery_rate_bps);
+            assert_eq!(snapshot.inflight_limit_bytes, 0);
+            assert_eq!(snapshot.bytes_in_flight, 0);
+            assert!(snapshot.app_limited);
+        }
+    }
+
+    #[test]
+    fn tcp_local_sender_metrics_remain_send_quantum_prior_after_low_product_sample() {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
         let mux_limits = binding.mux_limits();
         let metrics = PathMetrics {
@@ -1525,11 +1674,11 @@ mod tests {
             inflight_limit_bytes: 0,
             inflight_hi_bytes: 0,
             confidence_ppm: 0,
-            app_limited: true,
-            has_ack_derived_data_sample: false,
-            data_sample_count: 0,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: QUIC_INITIAL_WINDOW_PACKETS as u32,
         };
-        binding.update_path_metrics(key, metrics, ServerPathMetricsSource::PeerHint);
+        binding.update_path_metrics(key, metrics, ServerPathMetricsSource::LocalSender);
 
         let before_ack = binding
             .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)

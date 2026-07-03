@@ -4,7 +4,7 @@ Intended status: Standards Track
 
 Protocol version: 1
 
-Last updated: 2026-07-02
+Last updated: 2026-07-03
 
 ## Abstract
 
@@ -1265,7 +1265,11 @@ unpolluted product delivery sample that the scheduler can attribute to that path
 and direction. Application-limited and pure-control samples MUST NOT reduce the
 bulk delivery-rate estimate. Peer `PATH_METRICS` remain validation hints unless
 freshness, direction, confidence, and provenance make them safe for a specific
-admission decision.
+admission decision. A response sender MUST NOT use peer metrics, app-limited
+metrics, or control-only metrics as authority for ordinary bulk delivery rate,
+pacing rate, bytes in flight, inflight limit, or product-flight cap. Those values
+come from local sender evidence for the same direction, or from unpolluted
+product delivery samples where no packet-level carrier metric exists.
 
 STREAM_ACK and QUIC ACKs release different ledgers. QUIC ACKs release carrier
 packet flight and feed the QUIC congestion controller. STREAM_ACK releases
@@ -1427,16 +1431,18 @@ active replacement overlap is unavoidable, the sender service must repair or
 avoid the resulting product ordering debt.
 
 Product-level stall evidence alone MUST NOT create a replacement carrier stream
-for the same product stream on the same sole QUIC UDP path. On a single live
+for the same product stream on the same sole reliable carrier. On a single live
 QUIC carrier, QUIC owns packet loss recovery, stream ordering, PTO, congestion
-control, and NAT rebinding. A product sender may reannounce stream metadata on
-the existing carrier stream, but it MUST keep queued bytes and repair ownership
-on that carrier until QUIC reports carrier close/error or a distinct survivor
-path is available. Opening a fresh QUIC stream for later unique product offsets
-while the previous QUIC stream may still deliver lower offsets defeats QUIC's
-per-stream ordering guarantee and recreates above-QUIC head-of-line debt. Real
-carrier teardown remains a carrier event and may attach a replacement path; a
-product repair-cache stall is not by itself proof of carrier teardown.
+control, and NAT rebinding. On a single live TCP carrier, TCP owns byte
+retransmission, stream ordering, write pressure, and connection teardown. A
+product sender may reannounce stream metadata on the existing carrier stream,
+but it MUST keep queued bytes and repair ownership on that carrier until the
+carrier reports close/error or a distinct survivor path is available. Opening a
+fresh reliable carrier stream for later unique product offsets while the
+previous carrier stream may still deliver lower offsets defeats the carrier's
+ordering guarantee and recreates above-carrier head-of-line debt. Real carrier
+teardown remains a carrier event and may attach a replacement path; a product
+repair-cache stall is not by itself proof of carrier teardown.
 
 Stream IDs are stable logical identifiers, not carrier connection identifiers.
 Reattaching the same stream ID is what lets mptunnel repair over a survivor path
@@ -2401,6 +2407,16 @@ application-data dependency. This follows QUIC path validation and
 MPTCP/MPQUIC reinjection practice while adapting it to a product-layer stream
 that must avoid creating irreversible receive-hole debt.
 
+Same-underlay validation is still subject to this rule. A path that uses the
+same underlay family as the lead path may be cheaper and safer to validate than a
+cross-underlay path, but it MUST NOT receive the only copy of a new future
+ordered byte range before path-local sender evidence exists. If the sender wants
+to spend traffic to prove that path, it sends duplicate `STREAM_DATA`, repair for
+an already-missing range, or carrier/control proof traffic. Duplicate validation
+copies MUST be recorded as non-owners of the ordered frontier so they can release
+carrier/product flight on ACK without making the validation path the lower
+frontier owner for later unique bytes.
+
 Validation path opens are also non-blocking with respect to the byte-producing
 sender path. A target-read loop, local-read loop, sender-service drain, ACK
 handler, or carrier writer MUST NOT await a long-running validation open before
@@ -2833,6 +2849,12 @@ fast and stable. An additional path crossing underlay families, such as TCP
 lead to UDP additional or the reverse, uses the stricter confidence-scaled
 budget until sender-side evidence proves that it will not create harmful
 ordered-stream debt.
+
+Before same-underlay sender evidence exists, the scheduler may spend bounded
+extra traffic on duplicate validation, but it MUST NOT borrow the lead path's
+rate as proof for unique ordinary data on the candidate. The candidate's stored
+path model changes only after local sender evidence or unpolluted product
+delivery evidence exists.
 
 When no active, evidenced, or validation candidate passes admission, the sender
 keeps the frame queued and wakes the scheduler when stream ACKs release product

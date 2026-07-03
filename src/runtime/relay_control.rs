@@ -2380,7 +2380,10 @@ pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Du
 pub(super) fn reliable_relay_product_stall_keeps_sole_carrier(
     active_underlay: Option<UnderlayProtocol>,
 ) -> bool {
-    active_underlay == Some(UnderlayProtocol::Udp)
+    matches!(
+        active_underlay,
+        Some(UnderlayProtocol::Tcp | UnderlayProtocol::Udp)
+    )
 }
 
 pub(super) fn reliable_relay_refresh_path_tracking(
@@ -2532,11 +2535,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn product_stall_keeps_sole_quic_carrier_instead_of_reopening_same_path() {
+    fn product_stall_keeps_sole_reliable_carrier_instead_of_reopening_same_path() {
         assert!(reliable_relay_product_stall_keeps_sole_carrier(Some(
             UnderlayProtocol::Udp
         )));
-        assert!(!reliable_relay_product_stall_keeps_sole_carrier(Some(
+        assert!(reliable_relay_product_stall_keeps_sole_carrier(Some(
             UnderlayProtocol::Tcp
         )));
         assert!(!reliable_relay_product_stall_keeps_sole_carrier(None));

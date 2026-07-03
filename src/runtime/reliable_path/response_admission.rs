@@ -44,6 +44,7 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) bytes: usize,
     pub(super) sent_at: Instant,
     pub(super) stream_ack_proves_path: bool,
+    pub(super) owns_ordering_frontier: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +59,7 @@ pub(in crate::runtime) struct CarrierPathAckedHole {
     pub(super) end: u64,
     pub(super) bytes: u64,
     pub(super) stream_ack_proves_path: bool,
+    pub(super) owns_ordering_frontier: bool,
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +92,7 @@ impl ResponseAckOrderingState {
                 end: flight.end,
                 bytes: flight.bytes as u64,
                 stream_ack_proves_path: flight.stream_ack_proves_path,
+                owns_ordering_frontier: flight.owns_ordering_frontier,
             };
             if hole.end <= self.contiguous_frontier {
                 newly_contiguous.push(hole);
@@ -155,10 +158,25 @@ impl ResponseAckOrderingState {
     pub(super) fn acked_hole_bytes(&self) -> u64 {
         self.acked_holes
             .values()
-            .flat_map(|holes| holes.iter())
+            .filter_map(|holes| response_latest_ordering_hole(holes))
             .map(|hole| hole.bytes)
             .sum()
     }
+}
+
+pub(in crate::runtime) fn response_latest_ordering_flight(
+    flights: &[CarrierPathFlight],
+) -> Option<&CarrierPathFlight> {
+    flights
+        .iter()
+        .rev()
+        .find(|flight| flight.owns_ordering_frontier)
+}
+
+pub(in crate::runtime) fn response_latest_ordering_hole(
+    holes: &[CarrierPathAckedHole],
+) -> Option<&CarrierPathAckedHole> {
+    holes.iter().rev().find(|hole| hole.owns_ordering_frontier)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +251,8 @@ pub(super) fn server_bulk_output_snapshot(
         .path_metrics
         .and_then(|path_metrics| (entry.delivery_samples == 0).then_some(path_metrics));
     let model_metrics = local_carrier_metrics.or(validation_hint_metrics);
-    let rate_prior_metrics = local_carrier_metrics.or(entry.path_metrics);
+    let bulk_rate_metrics = local_carrier_metrics
+        .filter(|path_metrics| server_path_metrics_has_bulk_rate_evidence(*path_metrics));
     let srtt_ms = model_metrics.map_or_else(
         || {
             entry
@@ -250,8 +269,8 @@ pub(super) fn server_bulk_output_snapshot(
             f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
         })
         .clamp(0.0, 1.0);
-    let model_rate_bps = rate_prior_metrics.map(server_path_metrics_rate_bps);
-    let local_sender_rate_bps = local_carrier_metrics
+    let model_rate_bps = bulk_rate_metrics.map(server_path_metrics_rate_bps);
+    let local_sender_rate_bps = bulk_rate_metrics
         .map(server_path_metrics_rate_bps)
         .or(entry.delivery_rate_bps);
     let prior_rate_bps =
@@ -266,9 +285,11 @@ pub(super) fn server_bulk_output_snapshot(
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
-    if let Some(path_metrics) = model_metrics {
+    if let Some(path_metrics) = bulk_rate_metrics {
         snapshot.pacing_rate_bps =
             (path_metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
+    }
+    if let Some(path_metrics) = model_metrics {
         snapshot.app_limited = path_metrics.metrics.app_limited;
     }
     let metric_queue_bytes =
@@ -288,7 +309,7 @@ pub(super) fn server_bulk_output_snapshot(
     };
     snapshot.product_bytes_in_flight = entry.bytes_in_flight;
     snapshot.inflight_limit_bytes =
-        model_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes);
+        bulk_rate_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes);
     snapshot.confidence = server_output_confidence(entry, now);
     let lane_load = lane_tracker.snapshot(session_id, entry.key);
     let session_lane_load = lane_tracker.session_snapshot(session_id);
@@ -313,7 +334,7 @@ pub(super) fn server_bulk_output_snapshot(
     snapshot
 }
 
-pub(super) fn server_bulk_output_eta_ms(
+pub(in crate::runtime) fn server_bulk_output_eta_ms(
     key: CarrierPathKey,
     snapshot: PathSnapshot,
     active_key: Option<CarrierPathKey>,
@@ -401,15 +422,14 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
 }
 
 fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
-    let delivery_rate_bps = path_metrics.metrics.delivery_rate_bps.max(1) as f64;
-    let pacing_rate_bps = path_metrics.metrics.pacing_rate_bps.max(1) as f64;
-    if path_metrics.source == ServerPathMetricsSource::LocalSender
-        && path_metrics.metrics.app_limited
-    {
-        delivery_rate_bps.max(pacing_rate_bps)
-    } else {
-        delivery_rate_bps
-    }
+    path_metrics.metrics.delivery_rate_bps.max(1) as f64
+}
+
+fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
+    path_metrics.source == ServerPathMetricsSource::LocalSender
+        && path_metrics.metrics.has_ack_derived_data_sample
+        && path_metrics.metrics.data_sample_count > 0
+        && !path_metrics.metrics.app_limited
 }
 
 pub(in crate::runtime) fn server_output_has_sender_evidence(
@@ -419,14 +439,7 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         || entry.delivery_rate_bps.is_some()
         || matches!(
             entry.path_metrics,
-            Some(ServerPathMetricsEntry {
-                source: ServerPathMetricsSource::LocalSender,
-                metrics: PathMetrics {
-                    delivery_rate_bps: 1..,
-                    has_ack_derived_data_sample: true,
-                    ..
-                },
-            })
+            Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
         )
 }
 

@@ -2918,7 +2918,10 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         .send_path_snapshot(FlowLane::Throughput, 1)
         .expect("switchable output exposes seeded path model");
 
-    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(
+        snapshot.delivery_rate_bps,
+        default_path_rate_bps(UnderlayProtocol::Tcp)
+    );
     assert_eq!(snapshot.srtt_ms, 20.0);
     assert!(
         adaptive_reliable_relay_chunk_bytes(
@@ -2926,7 +2929,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
             FlowLane::Throughput,
             MuxLimits::default(),
         ) > bbr_min_send_quantum_bytes(MuxLimits::default()),
-        "server response bytes must not start from the unknown-path 2*MSS model when path startup evidence exists"
+        "server response bytes keep the bulk feed quantum while startup metrics remain validation-only rate hints"
     );
 
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {

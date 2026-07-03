@@ -117,40 +117,6 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
     }
 }
 
-pub fn decode_frame(bytes: &[u8], limits: CodecLimits) -> Result<Frame, CodecError> {
-    if bytes.len() < FRAME_HEADER_LEN {
-        return Err(CodecError::UnexpectedEof);
-    }
-    if bytes.len() > limits.max_frame_bytes {
-        return Err(CodecError::FrameTooLarge {
-            actual: bytes.len(),
-            limit: limits.max_frame_bytes,
-        });
-    }
-    if &bytes[0..4] != MAGIC {
-        return Err(CodecError::InvalidMagic);
-    }
-    if bytes[4] != VERSION {
-        return Err(CodecError::UnsupportedVersion(bytes[4]));
-    }
-
-    let kind = FrameKind::from_u8(bytes[5])?;
-    let payload_len = decode_payload_len_from_header(&bytes[..FRAME_HEADER_LEN], limits)?;
-    let expected_len = FRAME_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or(CodecError::LengthOverflow)?;
-    match bytes.len().cmp(&expected_len) {
-        std::cmp::Ordering::Less => return Err(CodecError::UnexpectedEof),
-        std::cmp::Ordering::Greater => return Err(CodecError::TrailingBytes),
-        std::cmp::Ordering::Equal => {}
-    }
-
-    let mut reader = Reader::new(&bytes[FRAME_HEADER_LEN..]);
-    let frame = decode_payload(kind, limits, &mut reader)?;
-    reader.finish()?;
-    Ok(frame)
-}
-
 pub fn decode_frame_bytes(bytes: Bytes, limits: CodecLimits) -> Result<Frame, CodecError> {
     if bytes.len() < FRAME_HEADER_LEN {
         return Err(CodecError::UnexpectedEof);
@@ -176,32 +142,6 @@ pub fn decode_frame_bytes(bytes: Bytes, limits: CodecLimits) -> Result<Frame, Co
     let frame = decode_payload(kind, limits, &mut reader)?;
     reader.finish()?;
     Ok(frame)
-}
-
-pub fn decode_frames(bytes: &[u8], limits: CodecLimits) -> Result<Vec<Frame>, CodecError> {
-    if bytes.is_empty() {
-        return Err(CodecError::UnexpectedEof);
-    }
-    let mut frames = Vec::new();
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let header_end = pos
-            .checked_add(FRAME_HEADER_LEN)
-            .ok_or(CodecError::LengthOverflow)?;
-        if header_end > bytes.len() {
-            return Err(CodecError::UnexpectedEof);
-        }
-        let payload_len = decode_payload_len_from_header(&bytes[pos..header_end], limits)?;
-        let frame_end = header_end
-            .checked_add(payload_len)
-            .ok_or(CodecError::LengthOverflow)?;
-        if frame_end > bytes.len() {
-            return Err(CodecError::UnexpectedEof);
-        }
-        frames.push(decode_frame(&bytes[pos..frame_end], limits)?);
-        pos = frame_end;
-    }
-    Ok(frames)
 }
 
 pub fn decode_frames_bytes(bytes: Bytes, limits: CodecLimits) -> Result<Vec<Frame>, CodecError> {
@@ -1064,25 +1004,16 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
-    source: Option<&'a Bytes>,
+    source: &'a Bytes,
     absolute_start: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            pos: 0,
-            source: None,
-            absolute_start: 0,
-        }
-    }
-
     fn with_source(source: &'a Bytes, start: usize, end: usize) -> Self {
         Self {
             bytes: &source[start..end],
             pos: 0,
-            source: Some(source),
+            source,
             absolute_start: start,
         }
     }
@@ -1137,18 +1068,14 @@ impl<'a> Reader<'a> {
         }
         let start = self.pos;
         let _ = self.get_exact(len)?;
-        if let Some(source) = self.source {
-            let absolute_start = self
-                .absolute_start
-                .checked_add(start)
-                .ok_or(CodecError::LengthOverflow)?;
-            let absolute_end = absolute_start
-                .checked_add(len)
-                .ok_or(CodecError::LengthOverflow)?;
-            Ok(source.slice(absolute_start..absolute_end))
-        } else {
-            Ok(Bytes::copy_from_slice(&self.bytes[start..start + len]))
-        }
+        let absolute_start = self
+            .absolute_start
+            .checked_add(start)
+            .ok_or(CodecError::LengthOverflow)?;
+        let absolute_end = absolute_start
+            .checked_add(len)
+            .ok_or(CodecError::LengthOverflow)?;
+        Ok(self.source.slice(absolute_start..absolute_end))
     }
 
     fn get_exact(&mut self, len: usize) -> Result<&'a [u8], CodecError> {
@@ -1436,7 +1363,8 @@ mod tests {
 
     fn round_trip(frame: Frame) {
         let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
-        let decoded = decode_frame(&encoded, CodecLimits::default()).expect("decode");
+        let decoded =
+            decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode");
         assert_eq!(decoded, frame);
     }
 
@@ -1546,7 +1474,7 @@ mod tests {
         let encoded = encode_frame(&data, CodecLimits::default()).expect("encode");
         assert!(encoded.len() < 40);
         assert_eq!(
-            decode_frame(&encoded, CodecLimits::default()).expect("decode"),
+            decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
             data
         );
     }
@@ -1712,7 +1640,7 @@ mod tests {
         encoded[capability_offset] = 0x80;
 
         assert_eq!(
-            decode_frame(&encoded, CodecLimits::default()),
+            decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
             Err(CodecError::InvalidEnum)
         );
     }
@@ -1724,7 +1652,7 @@ mod tests {
         encoded.push(0);
 
         assert_eq!(
-            decode_frame(&encoded, CodecLimits::default()),
+            decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
             Err(CodecError::TrailingBytes)
         );
     }

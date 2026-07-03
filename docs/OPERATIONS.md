@@ -88,7 +88,7 @@ Local proxy authentication is off by default. To require browser/tool authentica
 
 Server path bindings use the same explicit model through repeated or comma-separated `--bind-path` values, for example `tcp://0.0.0.0:443`, `tcp://[::]:443`, `udp://0.0.0.0:443`, and `udp://[::]:443`.
 
-UDP targets are not limited to UDP underlay. mptunnel prefers UDP-target relay over UDP carrier paths when schedulable UDP paths exist, but it can carry UDP-target datagram flow frames over encrypted TCP underlay as best-effort relay. Use UDP underlay for the lowest latency and fastest packet-level recovery; keep TCP underlay available when reachability is more important than datagram-native behavior.
+UDP targets are not limited to UDP underlay. mptunnel prefers UDP-target relay over QUIC UDP paths when schedulable UDP paths exist, but it can carry UDP-target datagram flow frames over encrypted TCP underlay as best-effort relay. Use UDP underlay for the lowest latency and fastest packet-level recovery; keep TCP underlay available when reachability is more important than datagram-native behavior.
 
 ## Config File And Management API
 

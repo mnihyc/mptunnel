@@ -43,14 +43,14 @@ Important component groups:
 - `runtime.server_stream.route_frame` and `runtime.tcp_stream.route_frame`: per-stream frame routing queue time.
 - `relay.local_read_wait`, `relay.local_write_wait`, `relay.local_flush_wait`: local ingress/egress I/O wait.
 - `relay.copy_local_chunk`: payload copy cost from local socket buffers into frame payloads.
-- `relay.path_recv_frame_wait`: relay wait for a TCP path frame or UDP carrier stream frame to arrive.
+- `relay.path_recv_frame_wait`: relay wait for a TCP path frame or QUIC UDP path stream frame to arrive.
 - `mux.send_data`, `mux.receive_data`, `mux.apply_ack`, `mux.ack_frames`, `mux.retransmit_*`: reliable-stream bookkeeping, ACK generation, and repair-frame generation.
 
 Interpretation:
 
 - High `transport.tcp.*.socket_wait` with low CPU components points at TCP carrier/network limits.
 - High `transport.*.encrypt`, `decrypt`, `encode_frame`, or `decode_frame` points at per-frame CPU or allocation cost.
-- High `relay.path_recv_frame_wait` on UDP carrier rows now points at carrier/network wait, remote-side backpressure, or UDP-engine scheduling/congestion behavior rather than mptunnel overlay pacing.
+- High `relay.path_recv_frame_wait` on QUIC UDP path rows now points at QUIC/network wait, remote-side backpressure, or QUIC scheduling/congestion behavior rather than mptunnel overlay pacing.
 - High `runtime.path_queue.*` or route-frame time means internal queues/backpressure are limiting throughput.
 - High `mux.receive_data` or `mux.retransmit_*` under loss means reorder/repair work is the hot path.
 

@@ -58,7 +58,7 @@ impl ReliablePathStream {
         match self.frames.recv().await {
             Some(Ok(frame)) => Ok(frame),
             Some(Err(err)) => Err(err),
-            None => Err(RuntimeError::TcpPathSessionClosed),
+            None => Err(RuntimeError::ReliablePathSessionClosed),
         }
     }
 
@@ -126,6 +126,10 @@ impl ReliablePathStreamHandle {
         self.output.send_stream_detach(self.stream_id).await;
     }
 
+    pub(super) fn enqueue_path_proof(&self) -> Result<(), RuntimeError> {
+        self.output.enqueue_path_proof()
+    }
+
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         self.output.can_enqueue_frame_now(frame, lane)
     }
@@ -161,7 +165,7 @@ pub(super) enum ReliablePathStreamOutput {
 pub(super) struct FixedReliablePathOutput {
     key: CarrierPathKey,
     startup: PathSnapshot,
-    commands: TcpPathSessionCommandSender,
+    commands: ReliablePathCommandSender,
     mux_limits: MuxLimits,
     model: Mutex<FixedReliablePathModel>,
 }
@@ -177,12 +181,18 @@ struct FixedReliablePathModel {
     flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
 }
 
+pub(in crate::runtime) fn tcp_delivery_samples_override_startup_prior(
+    delivery_samples: u32,
+) -> bool {
+    delivery_samples >= RELIABLE_INITIAL_WINDOW_PACKETS as u32
+}
+
 impl FixedReliablePathOutput {
     #[cfg(test)]
     pub(super) fn new(
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         mux_limits: MuxLimits,
     ) -> Arc<Self> {
         let startup = PathSnapshot::new(
@@ -196,7 +206,7 @@ impl FixedReliablePathOutput {
 
     pub(super) fn new_with_snapshot(
         startup: PathSnapshot,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         mux_limits: MuxLimits,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -215,19 +225,25 @@ impl FixedReliablePathOutput {
         self.key
     }
 
-    pub(super) fn commands(&self) -> &TcpPathSessionCommandSender {
+    pub(super) fn commands(&self) -> &ReliablePathCommandSender {
         &self.commands
+    }
+
+    fn enqueue_path_proof(&self) -> Result<(), RuntimeError> {
+        enqueue_path_proof_frame(&self.commands, self.key.path_id, self.mux_limits)
     }
 
     fn send_path_snapshot(&self) -> PathSnapshot {
         let model = self.model.lock().expect("fixed reliable path model lock");
         let prior_rate_bps = self.startup.delivery_rate_bps.max(1.0);
-        let delivery_rate_bps = match self.key.underlay {
-            UnderlayProtocol::Tcp => model
-                .delivery_rate_bps
-                .map(|rate| rate.max(prior_rate_bps))
-                .unwrap_or(prior_rate_bps),
-            UnderlayProtocol::Udp => model.delivery_rate_bps.unwrap_or(prior_rate_bps),
+        let delivery_rate_bps = match (self.key.underlay, model.delivery_rate_bps) {
+            (UnderlayProtocol::Tcp, Some(rate))
+                if !tcp_delivery_samples_override_startup_prior(model.delivery_samples) =>
+            {
+                rate.max(prior_rate_bps)
+            }
+            (_, Some(rate)) => rate,
+            (_, None) => prior_rate_bps,
         }
         .max(1.0);
         let srtt_ms = model.srtt_ms.unwrap_or(self.startup.srtt_ms);
@@ -248,7 +264,7 @@ impl FixedReliablePathOutput {
                 .max(PATH_OPEN_SCORE_BYTES as f64) as u64,
         );
         let learned_confidence = (f64::from(model.delivery_samples)
-            / f64::from(QUIC_INITIAL_WINDOW_PACKETS as u32))
+            / f64::from(RELIABLE_INITIAL_WINDOW_PACKETS as u32))
         .clamp(0.0, 1.0);
         snapshot.confidence = snapshot.confidence.max(learned_confidence);
         snapshot.app_limited = model.bytes_in_flight == 0
@@ -350,7 +366,7 @@ impl ReliablePathStreamOutput {
     pub(super) fn fixed(
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         mux_limits: MuxLimits,
     ) -> Self {
         Self::Fixed(FixedReliablePathOutput::new(
@@ -360,7 +376,7 @@ impl ReliablePathStreamOutput {
 
     pub(super) fn fixed_with_snapshot(
         startup: PathSnapshot,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         mux_limits: MuxLimits,
     ) -> Self {
         Self::Fixed(FixedReliablePathOutput::new_with_snapshot(
@@ -372,6 +388,13 @@ impl ReliablePathStreamOutput {
         match self {
             Self::Fixed(fixed) => fixed.commands().can_enqueue_frame_now(frame, lane),
             Self::Switchable(_) => true,
+        }
+    }
+
+    fn enqueue_path_proof(&self) -> Result<(), RuntimeError> {
+        match self {
+            Self::Fixed(fixed) => fixed.enqueue_path_proof(),
+            Self::Switchable(_) => Ok(()),
         }
     }
 
@@ -393,7 +416,7 @@ impl ReliablePathStreamOutput {
         if let Self::Fixed(fixed) = self {
             let _ = fixed
                 .commands()
-                .send_control(TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
+                .send_control(ReliablePathCommand::SendFrame(Frame::StreamDetach {
                     stream_id,
                 }))
                 .await;
@@ -405,7 +428,7 @@ impl ReliablePathStreamOutput {
             Self::Fixed(fixed) => {
                 let _ = fixed
                     .commands()
-                    .send_control(TcpPathSessionCommand::CloseStream(stream_id))
+                    .send_control(ReliablePathCommand::CloseStream(stream_id))
                     .await;
             }
             Self::Switchable(binding) => binding.close_stream(stream_id).await,
@@ -530,7 +553,7 @@ pub(super) struct ResponseStreamBinding {
     mux_limits: MuxLimits,
     lane_tracker: Arc<ServerPathLaneTracker>,
     outputs: Mutex<ResponseStreamOutputs>,
-    ordinary_lead: Mutex<Option<CarrierPathKey>>,
+    ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
     version: watch::Sender<u64>,
@@ -548,7 +571,7 @@ impl ResponseStreamBinding {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         lane: FlowLane,
     ) -> Arc<Self> {
         Self::new_with_limits(
@@ -566,7 +589,7 @@ impl ResponseStreamBinding {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         lane: FlowLane,
         mux_limits: MuxLimits,
     ) -> Arc<Self> {
@@ -585,7 +608,7 @@ impl ResponseStreamBinding {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         lane: FlowLane,
         mux_limits: MuxLimits,
         lane_tracker: Arc<ServerPathLaneTracker>,
@@ -610,9 +633,10 @@ impl ResponseStreamBinding {
                     delivery_samples: 0,
                     last_delivery_at: None,
                     path_metrics: None,
+                    bulk_discovery_sent_bytes: 0,
                 }],
             }),
-            ordinary_lead: Mutex::new(Some(key)),
+            ordered_data_owner: Mutex::new(Some(key)),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
@@ -623,12 +647,13 @@ impl ResponseStreamBinding {
         &self,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: TcpPathSessionCommandSender,
+        commands: ReliablePathCommandSender,
         lane: FlowLane,
         role: StreamOpenRole,
         _max_frame_payload_bytes: usize,
     ) -> ResponseStreamAttachOutcome {
         let previous_lane = *self.lane.lock().expect("server reliable stream lane lock");
+        let proof_commands = commands.clone();
         let mut outputs = self
             .outputs
             .lock()
@@ -717,6 +742,7 @@ impl ResponseStreamBinding {
                 delivery_samples: 0,
                 last_delivery_at: None,
                 path_metrics: None,
+                bulk_discovery_sent_bytes: 0,
             }
         };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
@@ -745,8 +771,12 @@ impl ResponseStreamBinding {
         if !already_attached {
             self.lane_tracker.attach(self.session_id, key, lane);
         }
-        if server_stream_open_role_promotes_data_path(role) && self.can_migrate_ordinary_lead() {
-            self.set_ordinary_lead(key);
+        if server_stream_open_role_promotes_data_path(role) && self.can_migrate_ordered_data_owner()
+        {
+            self.set_ordered_data_owner(key);
+        }
+        if role == StreamOpenRole::Validation {
+            let _ = enqueue_path_proof_frame(&proof_commands, path_id, self.mux_limits);
         }
         self.notify_update();
         ResponseStreamAttachOutcome::Attached
@@ -852,7 +882,7 @@ impl ResponseStreamBinding {
             .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
-    pub(super) fn detach(&self, key: CarrierPathKey, commands: &TcpPathSessionCommandSender) {
+    pub(super) fn detach(&self, key: CarrierPathKey, commands: &ReliablePathCommandSender) {
         let lane = self.lane();
         let mut outputs = self
             .outputs
@@ -865,7 +895,7 @@ impl ResponseStreamBinding {
         if outputs.entries.len() != before {
             drop(outputs);
             self.lane_tracker.detach(self.session_id, key, lane);
-            self.clear_ordinary_lead_if(key);
+            self.clear_ordered_data_owner_if(key);
             self.notify_update();
         }
     }
@@ -1023,18 +1053,18 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn ordinary_lead(&self) -> Option<CarrierPathKey> {
+    pub(super) fn ordered_data_owner(&self) -> Option<CarrierPathKey> {
         *self
-            .ordinary_lead
+            .ordered_data_owner
             .lock()
-            .expect("server reliable stream ordinary lead lock")
+            .expect("server reliable stream ordered data owner lock")
     }
 
-    pub(super) fn set_ordinary_lead(&self, key: CarrierPathKey) {
+    pub(super) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
         let mut lead = self
-            .ordinary_lead
+            .ordered_data_owner
             .lock()
-            .expect("server reliable stream ordinary lead lock");
+            .expect("server reliable stream ordered data owner lock");
         if *lead != Some(key) {
             *lead = Some(key);
             drop(lead);
@@ -1042,17 +1072,17 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn clear_ordinary_lead_if(&self, key: CarrierPathKey) {
+    fn clear_ordered_data_owner_if(&self, key: CarrierPathKey) {
         let mut lead = self
-            .ordinary_lead
+            .ordered_data_owner
             .lock()
-            .expect("server reliable stream ordinary lead lock");
+            .expect("server reliable stream ordered data owner lock");
         if *lead == Some(key) {
             *lead = None;
         }
     }
 
-    fn can_migrate_ordinary_lead(&self) -> bool {
+    fn can_migrate_ordered_data_owner(&self) -> bool {
         self.flights
             .lock()
             .expect("server reliable stream flight lock")
@@ -1106,6 +1136,20 @@ impl ResponseStreamBinding {
                 stream_ack_proves_path,
                 owns_ordering_frontier,
             });
+    }
+
+    pub(super) fn record_bulk_discovery_bytes(&self, key: CarrierPathKey, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.bulk_discovery_sent_bytes =
+                entry.bulk_discovery_sent_bytes.saturating_add(bytes as u64);
+        }
     }
 
     pub(super) fn lower_flights_before_frame(&self, frame: &Frame) -> Vec<CarrierPathFlightDebt> {
@@ -1179,11 +1223,11 @@ impl ResponseStreamBinding {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<ResponseSenderPathTarget> {
+        let active_key = self.ordered_data_owner();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let active_key = outputs.entries.last().map(|entry| entry.key);
         let now = Instant::now();
         outputs
             .entries
@@ -1211,6 +1255,8 @@ impl ResponseStreamBinding {
                     ),
                     is_active: Some(entry.key) == active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
+                    has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
+                    bulk_discovery_sent_bytes: entry.bulk_discovery_sent_bytes,
                 }
             })
             .collect()
@@ -1235,11 +1281,11 @@ impl ResponseStreamBinding {
         for entry in outputs {
             let _ = entry
                 .commands
-                .send_control(TcpPathSessionCommand::CloseStream(stream_id))
+                .send_control(ReliablePathCommand::CloseStream(stream_id))
                 .await;
             self.lane_tracker.detach(self.session_id, entry.key, lane);
         }
-        if let Ok(mut lead) = self.ordinary_lead.lock() {
+        if let Ok(mut lead) = self.ordered_data_owner.lock() {
             *lead = None;
         }
     }
@@ -1258,7 +1304,7 @@ impl ResponseStreamBinding {
                 .await;
             self.lane_tracker.detach(self.session_id, entry.key, lane);
         }
-        if let Ok(mut lead) = self.ordinary_lead.lock() {
+        if let Ok(mut lead) = self.ordered_data_owner.lock() {
             *lead = None;
         }
     }
@@ -1268,7 +1314,7 @@ impl ResponseStreamBinding {
         let _ = self.version.send(current.wrapping_add(1));
     }
 
-    fn update_path_metrics(
+    pub(super) fn update_path_metrics(
         &self,
         key: CarrierPathKey,
         metrics: PathMetrics,
@@ -1441,7 +1487,7 @@ mod tests {
     fn binding_for_underlay(
         underlay: UnderlayProtocol,
     ) -> (Arc<ResponseStreamBinding>, CarrierPathKey) {
-        let (commands, _receivers) = tcp_path_session_command_channels(8);
+        let (commands, _receivers) = reliable_path_command_channels(8);
         let key = CarrierPathKey {
             underlay,
             path_id: PathId(0),
@@ -1487,9 +1533,9 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
-        let (validation_commands, _validation_receivers) = tcp_path_session_command_channels(8);
+        let (validation_commands, mut validation_receivers) = reliable_path_command_channels(8);
 
-        assert_eq!(binding.ordinary_lead(), Some(active));
+        assert_eq!(binding.ordered_data_owner(), Some(active));
         assert_eq!(
             binding.attach(
                 validation.underlay,
@@ -1507,9 +1553,74 @@ mod tests {
         assert!(outputs.entries.iter().any(|entry| entry.key == validation));
         drop(outputs);
         assert_eq!(
-            binding.ordinary_lead(),
+            binding.ordered_data_owner(),
             Some(active),
             "validation attachment opens a carrier output but is not scheduler ownership"
+        );
+        match try_recv_reliable_path_priority_command(&mut validation_receivers) {
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
+                path_id, payload, ..
+            })) => {
+                assert_eq!(path_id, validation.path_id);
+                assert!(!payload.is_empty());
+            }
+            _ => panic!("validation attach must enqueue carrier path proof"),
+        }
+    }
+
+    #[test]
+    fn response_sender_targets_active_path_follows_ordered_data_owner_not_output_tail() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Udp);
+        let validation = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (validation_commands, _validation_receivers) = reliable_path_command_channels(8);
+
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let targets = binding.sender_path_targets(FlowLane::Throughput, 4096);
+        assert!(
+            targets
+                .iter()
+                .find(|target| target.key == active)
+                .is_some_and(|target| target.is_active),
+            "the initial active output remains the scheduler-active target"
+        );
+        assert!(
+            targets
+                .iter()
+                .find(|target| target.key == validation)
+                .is_some_and(|target| !target.is_active),
+            "validation output must not be active before lead migration"
+        );
+
+        binding.set_ordered_data_owner(validation);
+
+        let targets = binding.sender_path_targets(FlowLane::Throughput, 4096);
+        assert!(
+            targets
+                .iter()
+                .find(|target| target.key == validation)
+                .is_some_and(|target| target.is_active),
+            "scheduler-active target must follow ordered_data_owner after migration"
+        );
+        assert!(
+            targets
+                .iter()
+                .find(|target| target.key == active)
+                .is_some_and(|target| !target.is_active),
+            "output list tail must not override ordered_data_owner"
         );
     }
 
@@ -1520,7 +1631,7 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
-        let (validation_commands, _validation_receivers) = tcp_path_session_command_channels(8);
+        let (validation_commands, _validation_receivers) = reliable_path_command_channels(8);
         assert_eq!(
             binding.attach(
                 validation.underlay,
@@ -1540,7 +1651,7 @@ mod tests {
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>()
         };
-        let (duplicate_commands, _duplicate_receivers) = tcp_path_session_command_channels(8);
+        let (duplicate_commands, _duplicate_receivers) = reliable_path_command_channels(8);
 
         assert_eq!(
             binding.attach(
@@ -1563,7 +1674,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(after, before);
-        assert_eq!(binding.ordinary_lead(), Some(active));
+        assert_eq!(binding.ordered_data_owner(), Some(active));
     }
 
     #[test]
@@ -1612,7 +1723,7 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
-        let (duplicate_commands, _duplicate_receivers) = tcp_path_session_command_channels(8);
+        let (duplicate_commands, _duplicate_receivers) = reliable_path_command_channels(8);
         binding.attach(
             duplicate.underlay,
             duplicate.path_id,
@@ -1662,7 +1773,7 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
-        let (duplicate_commands, _duplicate_receivers) = tcp_path_session_command_channels(8);
+        let (duplicate_commands, _duplicate_receivers) = reliable_path_command_channels(8);
         binding.attach(
             duplicate.underlay,
             duplicate.path_id,
@@ -1767,7 +1878,7 @@ mod tests {
             confidence_ppm: 0,
             app_limited: false,
             has_ack_derived_data_sample: true,
-            data_sample_count: QUIC_INITIAL_WINDOW_PACKETS as u32,
+            data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         };
         binding.update_path_metrics(key, metrics, ServerPathMetricsSource::LocalSender);
 
@@ -1798,6 +1909,44 @@ mod tests {
             adaptive_reliable_relay_chunk_bytes(Some(after_ack), FlowLane::Throughput, mux_limits)
                 > bbr_min_send_quantum_bytes(mux_limits),
             "a low product ACK sample must not collapse TCP send quantum below the path-rate prior"
+        );
+    }
+
+    #[test]
+    fn tcp_fixed_output_startup_prior_yields_after_persistent_local_delivery_samples() {
+        let mux_limits = MuxLimits::default();
+        let (commands, _receivers) = reliable_path_command_channels(64);
+        let startup_rate = 500_000_000.0;
+        let startup = PathSnapshot::new(PathId(8), UnderlayProtocol::Tcp, 20.0, startup_rate);
+        let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
+        let ReliablePathStreamOutput::Fixed(fixed) = &output else {
+            panic!("expected fixed output");
+        };
+        let mut offset = 0_u64;
+
+        for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
+            let frame = stream_data_frame_at(offset, MIN_RATE_SAMPLE_BYTES as usize);
+            let end = offset + reliable_stream_frame_payload_bytes(&frame) as u64;
+            fixed.record_flight(&frame, true);
+            std::thread::sleep(Duration::from_millis(20));
+            fixed.release_normalized_acked_ranges(&[OffsetRange { start: offset, end }]);
+            offset = end;
+        }
+
+        let learned_rate = fixed
+            .model
+            .lock()
+            .expect("fixed output model lock")
+            .delivery_rate_bps
+            .expect("persistent samples produce a delivery model");
+        assert!(learned_rate < startup_rate * 0.5);
+
+        let snapshot = output
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("response binding exposes learned path model");
+        assert!(
+            snapshot.delivery_rate_bps < startup_rate * 0.5,
+            "startup/default rate is only a hint; persistent local delivery samples must correct it downward"
         );
     }
 }

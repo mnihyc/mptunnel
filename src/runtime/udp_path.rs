@@ -409,6 +409,23 @@ async fn flush_udp_frame_batch(
     Ok(())
 }
 
+async fn flush_udp_frame_batch_with_path_proofs(
+    send: &mut UdpPathSendStream,
+    frames: &mut Vec<Frame>,
+    codec_limits: CodecLimits,
+    path_proofs: &mut PathProofTracker,
+) -> Result<(), RuntimeError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    udp_path_write_frames(send, frames, codec_limits).await?;
+    for frame in frames.iter() {
+        path_proofs.record_sent_frame(frame);
+    }
+    frames.clear();
+    Ok(())
+}
+
 pub(super) fn udp_path_finish_stream(send: &mut UdpPathSendStream) -> Result<(), RuntimeError> {
     Ok(quic_carrier::finish_stream(&mut send.stream)?)
 }
@@ -592,7 +609,7 @@ async fn open_client_udp_stream_on_connection(
             }
         }
     };
-    let (commands, receivers) = tcp_path_session_command_channels(udp_path_command_queue(
+    let (commands, receivers) = reliable_path_command_channels(udp_path_command_queue(
         runtime.mux_limits,
         runtime.codec_limits,
     ));
@@ -601,9 +618,11 @@ async fn open_client_udp_stream_on_connection(
         send,
         recv,
         stream_id,
+        runtime.path_index,
         runtime.codec_limits,
         runtime.mux_limits,
         runtime.stream_frame_queue,
+        runtime.health.clone(),
         receivers,
         frames_tx,
     ));
@@ -650,7 +669,7 @@ fn spawn_quic_path_reader(
             let frame = match udp_path_read_frame(&mut recv, codec_limits).await {
                 Ok(frame) => Ok(frame),
                 Err(err) if udp_path_frame_finished(&err) => {
-                    Err(RuntimeError::TcpPathSessionClosed)
+                    Err(RuntimeError::ReliablePathSessionClosed)
                 }
                 Err(err) => Err(err),
             };
@@ -667,21 +686,25 @@ async fn run_client_udp_stream(
     mut send: UdpPathSendStream,
     recv: UdpPathRecvStream,
     stream_id: StreamId,
+    path_index: usize,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     reader_queue_size: usize,
-    mut commands: TcpPathSessionCommandReceivers,
+    health: Arc<Mutex<ClientPathHealth>>,
+    mut commands: ReliablePathCommandReceivers,
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
+    let mut path_proofs = PathProofTracker::default();
+    let path_id = PathId(path_index as u16);
     loop {
-        let command_may_recv = !tcp_path_receivers_closed(&commands);
+        let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
             let _ = udp_path_finish_stream(&mut send);
             return;
         }
-        if let Some(command) = try_recv_tcp_path_priority_command(&mut commands) {
+        if let Some(command) = try_recv_reliable_path_priority_command(&mut commands) {
             let result = drain_client_udp_stream_commands(
                 command,
                 &mut commands,
@@ -690,6 +713,7 @@ async fn run_client_udp_stream(
                 codec_limits,
                 mux_limits,
                 &mut pending_frames,
+                &mut path_proofs,
             )
             .await;
             match result {
@@ -710,6 +734,36 @@ async fn run_client_udp_stream(
                         if let Err(err) = udp_path_write_frame(&mut send, &Frame::Pong { nonce }, codec_limits).await {
                             let _ = frames.send(Err(err)).await;
                             return;
+                        }
+                    }
+                    Some(Ok(Frame::PathProofData {
+                        path_id: proof_path_id,
+                        proof_id,
+                        payload,
+                    })) if proof_path_id == path_id => {
+                        if let Err(err) = udp_path_write_frame(
+                            &mut send,
+                            &path_proof_ack_frame(path_id, proof_id, payload.len()),
+                            codec_limits,
+                        ).await {
+                            let _ = frames.send(Err(err)).await;
+                            return;
+                        }
+                    }
+                    Some(Ok(Frame::PathProofAck {
+                        path_id: proof_path_id,
+                        proof_id,
+                        payload_bytes,
+                    })) if proof_path_id == path_id => {
+                        if let Some(observation) =
+                            path_proofs.acknowledge(path_id, proof_id, payload_bytes)
+                            && let Some(record) = health
+                                .lock()
+                                .expect("client path health lock")
+                                .udp
+                                .get_mut(path_index)
+                        {
+                            record.mark_path_proof_success(observation.elapsed);
                         }
                     }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
@@ -743,20 +797,21 @@ async fn run_client_udp_stream(
                         return;
                     }
                     None => {
-                        let _ = frames.send(Err(RuntimeError::TcpPathSessionClosed)).await;
+                        let _ = frames.send(Err(RuntimeError::ReliablePathSessionClosed)).await;
                         return;
                     }
                 }
-                if let Some(command) = try_recv_tcp_path_command(&mut commands) {
+                if let Some(command) = try_recv_reliable_path_command(&mut commands) {
                     let result = drain_client_udp_stream_commands(
                         command,
                         &mut commands,
                         &mut send,
                         stream_id,
-                        codec_limits,
-                        mux_limits,
-                        &mut pending_frames,
-                    )
+                            codec_limits,
+                            mux_limits,
+                            &mut pending_frames,
+                            &mut path_proofs,
+                        )
                     .await;
                     match result {
                         Ok(false) => {}
@@ -768,7 +823,7 @@ async fn run_client_udp_stream(
                     }
                 }
             }
-            command = recv_tcp_path_command(&mut commands), if command_may_recv => {
+            command = recv_reliable_path_command(&mut commands), if command_may_recv => {
                 match command {
                     Some(command) => {
                         let result = drain_client_udp_stream_commands(
@@ -779,6 +834,7 @@ async fn run_client_udp_stream(
                             codec_limits,
                             mux_limits,
                             &mut pending_frames,
+                            &mut path_proofs,
                         ).await;
                         match result {
                             Ok(false) => {}
@@ -797,18 +853,19 @@ async fn run_client_udp_stream(
 }
 
 async fn drain_client_udp_stream_commands(
-    first_command: TcpPathSessionCommand,
-    commands: &mut TcpPathSessionCommandReceivers,
+    first_command: ReliablePathCommand,
+    commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     stream_id: StreamId,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     pending_frames: &mut Vec<Frame>,
+    path_proofs: &mut PathProofTracker,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
-    let byte_budget = tcp_path_command_writer_run_budget_bytes(mux_limits);
-    let item_budget = tcp_path_command_writer_run_budget_items(mux_limits);
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
     let mut next_command = Some(first_command);
     pending_frames.clear();
     let mut sent_bytes = 0usize;
@@ -817,9 +874,22 @@ async fn drain_client_udp_stream_commands(
     loop {
         let Some(command) = next_command
             .take()
-            .or_else(|| try_recv_tcp_path_command(commands))
+            .or_else(|| try_recv_reliable_path_command(commands))
         else {
-            flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
+            if try_coalesce_reliable_path_writer_run(
+                commands,
+                &mut next_command,
+                sent_items,
+                sent_bytes,
+                byte_budget,
+                item_budget,
+            )
+            .await
+            {
+                continue;
+            }
+            flush_udp_frame_batch_with_path_proofs(send, pending_frames, codec_limits, path_proofs)
+                .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -838,15 +908,21 @@ async fn drain_client_udp_stream_commands(
             );
             return Ok(false);
         };
-        let pending_bytes = tcp_path_command_pending_bytes(&command);
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
         let should_close = match command {
-            TcpPathSessionCommand::SendFrame(frame) => {
+            ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
                 sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
+                    flush_udp_frame_batch_with_path_proofs(
+                        send,
+                        pending_frames,
+                        codec_limits,
+                        path_proofs,
+                    )
+                    .await?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "path_writer_drain",
@@ -867,8 +943,14 @@ async fn drain_client_udp_stream_commands(
                 }
                 continue;
             }
-            TcpPathSessionCommand::CloseStream(close_stream_id) => {
-                flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
+            ReliablePathCommand::CloseStream(close_stream_id) => {
+                flush_udp_frame_batch_with_path_proofs(
+                    send,
+                    pending_frames,
+                    codec_limits,
+                    path_proofs,
+                )
+                .await?;
                 if close_stream_id == stream_id {
                     let _ = udp_path_finish_stream(send);
                     true
@@ -876,7 +958,7 @@ async fn drain_client_udp_stream_commands(
                     false
                 }
             }
-            TcpPathSessionCommand::OpenStream { .. } => {
+            ReliablePathCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
                     "client QUIC UDP path stream received open command",
                 ));
@@ -904,7 +986,8 @@ async fn drain_client_udp_stream_commands(
         }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch(send, pending_frames, codec_limits).await?;
+            flush_udp_frame_batch_with_path_proofs(send, pending_frames, codec_limits, path_proofs)
+                .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1197,7 +1280,7 @@ async fn handle_server_udp_reliable_stream(
     outbound::validate_target(&target)?;
     context.outbound.ensure_supports(TargetProtocol::Tcp)?;
     let duplicate_open_target = target.clone();
-    let (commands_tx, commands_rx) = tcp_path_session_command_channels(udp_path_command_queue(
+    let (commands_tx, commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,
         context.codec_limits,
     ));
@@ -1301,8 +1384,8 @@ struct ServerUdpReliableStreamLoop {
     target: TargetAddr,
     lane: FlowLane,
     role: StreamOpenRole,
-    commands_tx: TcpPathSessionCommandSender,
-    commands_rx: TcpPathSessionCommandReceivers,
+    commands_tx: ReliablePathCommandSender,
+    commands_rx: ReliablePathCommandReceivers,
 }
 
 async fn run_server_udp_reliable_stream_loop(
@@ -1328,10 +1411,11 @@ async fn run_server_udp_reliable_stream_loop(
         reliable_stream_frame_queue(context.mux_limits),
     );
     let mut pending_frames = Vec::<Frame>::new();
+    let mut path_proofs = PathProofTracker::default();
 
     loop {
-        let command_may_recv = !tcp_path_receivers_closed(&commands_rx);
-        if let Some(command) = try_recv_tcp_path_priority_command(&mut commands_rx) {
+        let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
+        if let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx) {
             let result = drain_server_udp_reliable_commands(
                 command,
                 &mut commands_rx,
@@ -1342,6 +1426,7 @@ async fn run_server_udp_reliable_stream_loop(
                 path_id,
                 &commands_tx,
                 &mut pending_frames,
+                &mut path_proofs,
             )
             .await;
             if result? {
@@ -1463,6 +1548,40 @@ async fn run_server_udp_reliable_stream_loop(
                     Some(Ok(Frame::Ping { nonce })) => {
                         udp_path_write_frame(&mut send, &Frame::Pong { nonce }, context.codec_limits).await?;
                     }
+                    Some(Ok(Frame::PathProofData {
+                        path_id: proof_path_id,
+                        proof_id,
+                        payload,
+                    })) if proof_path_id == path_id => {
+                        udp_path_write_frame(
+                            &mut send,
+                            &path_proof_ack_frame(path_id, proof_id, payload.len()),
+                            context.codec_limits,
+                        )
+                        .await?;
+                    }
+                    Some(Ok(Frame::PathProofAck {
+                        path_id: proof_path_id,
+                        proof_id,
+                        payload_bytes,
+                    })) if proof_path_id == path_id => {
+                        if let Some(observation) =
+                            path_proofs.acknowledge(path_id, proof_id, payload_bytes)
+                            && let Some(metrics) = path_proof_metrics(
+                                path_id,
+                                UnderlayProtocol::Udp,
+                                PathMetricDirection::ServerToClient,
+                                observation,
+                            )
+                        {
+                            context.reliable_streams.record_local_path_metrics(
+                                session_id,
+                                UnderlayProtocol::Udp,
+                                path_id,
+                                metrics,
+                            );
+                        }
+                    }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
                         log_unexpected_stream_relay_frame(
@@ -1472,7 +1591,7 @@ async fn run_server_udp_reliable_stream_loop(
                         );
                         return Err(RuntimeError::Protocol("unexpected server QUIC UDP path reliable stream frame"));
                     }
-                    Some(Err(RuntimeError::TcpPathSessionClosed)) | None => {
+                    Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => {
                         context.reliable_streams.detach_path(
                             session_id,
                             stream_id,
@@ -1484,7 +1603,7 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Err(err)) => return Err(err),
                 }
-                if let Some(command) = try_recv_tcp_path_command(&mut commands_rx) {
+                if let Some(command) = try_recv_reliable_path_command(&mut commands_rx) {
                     let result = drain_server_udp_reliable_commands(
                         command,
                         &mut commands_rx,
@@ -1492,17 +1611,18 @@ async fn run_server_udp_reliable_stream_loop(
                         &context,
                         session_id,
                         stream_id,
-                        path_id,
-                        &commands_tx,
-                        &mut pending_frames,
-                    )
+                            path_id,
+                            &commands_tx,
+                            &mut pending_frames,
+                            &mut path_proofs,
+                        )
                     .await?;
                     if result {
                         return Ok(());
                     }
                 }
             }
-            command = recv_tcp_path_command(&mut commands_rx), if command_may_recv => {
+            command = recv_reliable_path_command(&mut commands_rx), if command_may_recv => {
                 match command {
                     Some(command) => {
                         let result = drain_server_udp_reliable_commands(
@@ -1515,6 +1635,7 @@ async fn run_server_udp_reliable_stream_loop(
                             path_id,
                             &commands_tx,
                             &mut pending_frames,
+                            &mut path_proofs,
                         ).await;
                         if result? {
                             return Ok(());
@@ -1528,20 +1649,21 @@ async fn run_server_udp_reliable_stream_loop(
 }
 
 async fn drain_server_udp_reliable_commands(
-    first_command: TcpPathSessionCommand,
-    commands: &mut TcpPathSessionCommandReceivers,
+    first_command: ReliablePathCommand,
+    commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
     session_id: SessionId,
     stream_id: StreamId,
     path_id: PathId,
-    commands_tx: &TcpPathSessionCommandSender,
+    commands_tx: &ReliablePathCommandSender,
     pending_frames: &mut Vec<Frame>,
+    path_proofs: &mut PathProofTracker,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
-    let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
-    let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(context.mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
     pending_frames.clear();
     let mut sent_bytes = 0usize;
@@ -1550,9 +1672,27 @@ async fn drain_server_udp_reliable_commands(
     loop {
         let Some(command) = next_command
             .take()
-            .or_else(|| try_recv_tcp_path_command(commands))
+            .or_else(|| try_recv_reliable_path_command(commands))
         else {
-            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+            if try_coalesce_reliable_path_writer_run(
+                commands,
+                &mut next_command,
+                sent_items,
+                sent_bytes,
+                byte_budget,
+                item_budget,
+            )
+            .await
+            {
+                continue;
+            }
+            flush_udp_frame_batch_with_path_proofs(
+                send,
+                pending_frames,
+                context.codec_limits,
+                path_proofs,
+            )
+            .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1572,15 +1712,21 @@ async fn drain_server_udp_reliable_commands(
             );
             return Ok(false);
         };
-        let pending_bytes = tcp_path_command_pending_bytes(&command);
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
         let should_close = match command {
-            TcpPathSessionCommand::SendFrame(frame) => {
+            ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
                 sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+                    flush_udp_frame_batch_with_path_proofs(
+                        send,
+                        pending_frames,
+                        context.codec_limits,
+                        path_proofs,
+                    )
+                    .await?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "path_writer_drain",
@@ -1602,8 +1748,14 @@ async fn drain_server_udp_reliable_commands(
                 }
                 continue;
             }
-            TcpPathSessionCommand::CloseStream(close_stream_id) => {
-                flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+            ReliablePathCommand::CloseStream(close_stream_id) => {
+                flush_udp_frame_batch_with_path_proofs(
+                    send,
+                    pending_frames,
+                    context.codec_limits,
+                    path_proofs,
+                )
+                .await?;
                 if close_stream_id == stream_id {
                     context.reliable_streams.detach_path(
                         session_id,
@@ -1618,7 +1770,7 @@ async fn drain_server_udp_reliable_commands(
                     false
                 }
             }
-            TcpPathSessionCommand::OpenStream { .. } => {
+            ReliablePathCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
                     "server QUIC UDP path stream received client open command",
                 ));
@@ -1647,7 +1799,13 @@ async fn drain_server_udp_reliable_commands(
         }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+            flush_udp_frame_batch_with_path_proofs(
+                send,
+                pending_frames,
+                context.codec_limits,
+                path_proofs,
+            )
+            .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -1682,7 +1840,7 @@ async fn handle_server_udp_datagram_stream(
     context: ServerPathContext,
     stream_context: ServerUdpDatagramStreamContext,
 ) -> Result<(), RuntimeError> {
-    let (commands_tx, mut commands_rx) = tcp_path_session_command_channels(udp_path_command_queue(
+    let (commands_tx, mut commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,
         context.codec_limits,
     ));
@@ -1705,7 +1863,7 @@ async fn handle_server_udp_datagram_stream(
     )
     .await?;
     loop {
-        let command_may_recv = !tcp_path_receivers_closed(&commands_rx);
+        let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
         tokio::select! {
             biased;
             frame = carrier_frames.recv() => {
@@ -1767,10 +1925,10 @@ async fn handle_server_udp_datagram_stream(
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server QUIC UDP path datagram stream frame")),
-                    Some(Err(RuntimeError::TcpPathSessionClosed)) | None => return Ok(()),
+                    Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => return Ok(()),
                     Some(Err(err)) => return Err(err),
                 }
-                if let Some(command) = try_recv_tcp_path_command(&mut commands_rx) {
+                if let Some(command) = try_recv_reliable_path_command(&mut commands_rx) {
                     let result = drain_server_udp_datagram_commands(
                         command,
                         &mut commands_rx,
@@ -1785,7 +1943,7 @@ async fn handle_server_udp_datagram_stream(
                     }
                 }
             }
-            command = recv_tcp_path_command(&mut commands_rx), if command_may_recv => {
+            command = recv_reliable_path_command(&mut commands_rx), if command_may_recv => {
                 match command {
                     Some(command) => {
                         let result = drain_server_udp_datagram_commands(
@@ -1808,8 +1966,8 @@ async fn handle_server_udp_datagram_stream(
 }
 
 async fn drain_server_udp_datagram_commands(
-    first_command: TcpPathSessionCommand,
-    commands: &mut TcpPathSessionCommandReceivers,
+    first_command: ReliablePathCommand,
+    commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
     flows: &mut Vec<ServerUdpDatagramFlow>,
@@ -1817,8 +1975,8 @@ async fn drain_server_udp_datagram_commands(
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
-    let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
-    let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(context.mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
     pending_frames.clear();
     let mut sent_bytes = 0usize;
@@ -1827,8 +1985,20 @@ async fn drain_server_udp_datagram_commands(
     loop {
         let Some(command) = next_command
             .take()
-            .or_else(|| try_recv_tcp_path_command(commands))
+            .or_else(|| try_recv_reliable_path_command(commands))
         else {
+            if try_coalesce_reliable_path_writer_run(
+                commands,
+                &mut next_command,
+                sent_items,
+                sent_bytes,
+                byte_budget,
+                item_budget,
+            )
+            .await
+            {
+                continue;
+            }
             flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -1847,9 +2017,9 @@ async fn drain_server_udp_datagram_commands(
             );
             return Ok(false);
         };
-        let pending_bytes = tcp_path_command_pending_bytes(&command);
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
         let should_close = match command {
-            TcpPathSessionCommand::SendFrame(frame) => {
+            ReliablePathCommand::SendFrame(frame) => {
                 if let Frame::DatagramClose { flow_id } = frame {
                     flows.retain(|flow| flow.flow_id != flow_id);
                 }
@@ -1878,12 +2048,12 @@ async fn drain_server_udp_datagram_commands(
                 }
                 continue;
             }
-            TcpPathSessionCommand::CloseStream(_) => {
+            ReliablePathCommand::CloseStream(_) => {
                 flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
                 let _ = udp_path_finish_stream(send);
                 true
             }
-            TcpPathSessionCommand::OpenStream { .. } => {
+            ReliablePathCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
                     "server QUIC UDP path datagram stream received open command",
                 ));
@@ -1933,7 +2103,7 @@ async fn drain_server_udp_datagram_commands(
 
 async fn open_server_udp_datagram_flow(
     context: &ServerPathContext,
-    commands_tx: &TcpPathSessionCommandSender,
+    commands_tx: &ReliablePathCommandSender,
     send: &mut UdpPathSendStream,
     flows: &mut Vec<ServerUdpDatagramFlow>,
     flow_id: DatagramFlowId,
@@ -2016,7 +2186,7 @@ fn quic_path_open_error_is_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::QuicCarrier(_)
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
-            | RuntimeError::TcpPathSessionClosed
+            | RuntimeError::ReliablePathSessionClosed
     )
 }
 
@@ -2024,7 +2194,7 @@ fn udp_path_command_queue(mux_limits: MuxLimits, codec_limits: CodecLimits) -> u
     let sender_quantum =
         reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
     let engine_payload = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
-    tcp_path_command_queue_for_payload(mux_limits, sender_quantum.min(engine_payload).max(1))
+    reliable_path_command_queue_for_payload(mux_limits, sender_quantum.min(engine_payload).max(1))
 }
 
 async fn resolve_first_socket_addr(path: &PathSpec) -> Result<SocketAddr, RuntimeError> {
@@ -2225,17 +2395,17 @@ mod tests {
     fn quic_udp_command_queue_tracks_sender_quantum_not_max_frame_size() {
         let mux_limits = MuxLimits::default();
         let codec_limits = CodecLimits::default();
-        let tcp_queue = tcp_path_command_queue(mux_limits);
+        let product_queue = reliable_path_command_queue(mux_limits);
         let quic_udp_queue = udp_path_command_queue(mux_limits, codec_limits);
         let sender_quantum =
             reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
         let engine_payload = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
-        let expected = tcp_path_command_queue_for_payload(
+        let expected = reliable_path_command_queue_for_payload(
             mux_limits,
             sender_quantum.min(engine_payload).max(1),
         );
 
-        assert_eq!(quic_udp_queue, tcp_queue);
+        assert_eq!(quic_udp_queue, product_queue);
         assert_eq!(quic_udp_queue, expected);
     }
 

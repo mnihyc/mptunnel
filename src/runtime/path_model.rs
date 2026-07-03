@@ -87,8 +87,8 @@ pub(super) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duratio
 
 pub(super) fn default_transport_pto() -> Duration {
     transport_pto_from_ms(
-        QUIC_INITIAL_RTT.as_secs_f64() * 1000.0,
-        QUIC_INITIAL_RTT.as_secs_f64() * 1000.0 / 2.0,
+        RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0,
+        RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0 / 2.0,
     )
 }
 
@@ -96,7 +96,7 @@ pub(super) fn path_record_failure_cooldown(record: &ClientPathHealthRecord) -> D
     let srtt_ms = record
         .carrier_srtt_ms
         .or(record.measured_srtt_ms)
-        .unwrap_or(QUIC_INITIAL_RTT.as_secs_f64() * 1000.0);
+        .unwrap_or(RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0);
     let rttvar_ms = record
         .carrier_rttvar_ms
         .or(record.measured_jitter_ms)
@@ -156,7 +156,7 @@ pub(super) fn path_observation_is_idle_for_probe(observation: ClientPathObservat
     observation.active_flows == 0
 }
 
-pub(super) fn apply_tcp_bulk_isolation(
+pub(super) fn apply_bulk_latency_isolation(
     observations: &mut [ClientPathObservation],
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -180,18 +180,18 @@ pub(super) fn apply_tcp_bulk_isolation(
     }
 }
 
-pub(super) fn reliable_stream_latency_startup_should_use_configured_order(
+pub(super) fn endpoint_only_reliable_startup_should_preserve_configured_order(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
 ) -> bool {
     reliable_relay_expects_interactive_response(lane)
         && paths.iter().all(path_is_endpoint_only)
-        && (!endpoint_only_startup_has_latency_sensitive_load(observations)
-            || endpoint_only_startup_has_bulk_load(observations))
+        && !endpoint_only_startup_has_latency_sensitive_load(observations)
+        && !endpoint_only_startup_has_bulk_load(observations)
 }
 
-pub(super) fn reliable_stream_latency_startup_should_use_load_balanced_order(
+pub(super) fn endpoint_only_reliable_startup_should_spread_latency_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -222,18 +222,16 @@ pub(super) fn endpoint_only_startup_has_bulk_load(observations: &[ClientPathObse
         .any(|observation| observation.active_flows > observation.active_latency_sensitive_flows)
 }
 
-pub(super) fn endpoint_only_tcp_startup_should_spread_bulk_load(
+pub(super) fn endpoint_only_reliable_startup_should_spread_bulk_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
-    active_udp_work: bool,
 ) -> bool {
     reliable_relay_expects_interactive_response(lane)
         && paths.iter().all(path_is_endpoint_only)
         && endpoint_only_startup_has_any_load(observations)
         && endpoint_only_startup_has_bulk_load(observations)
         && !endpoint_only_startup_has_latency_sensitive_load(observations)
-        && !active_udp_work
 }
 
 pub(super) fn ordered_reliable_path_indices(
@@ -254,10 +252,10 @@ pub(super) fn reliable_stream_startup_path_scores(
     lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
-    if reliable_stream_latency_startup_should_use_configured_order(paths, observations, lane) {
+    if endpoint_only_reliable_startup_should_preserve_configured_order(paths, observations, lane) {
         return configured_order_path_scores(paths, observations, lane, payload_bytes);
     }
-    if reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, lane) {
+    if endpoint_only_reliable_startup_should_spread_latency_load(paths, observations, lane) {
         return endpoint_only_reliable_startup_path_scores(
             paths,
             observations,
@@ -274,8 +272,9 @@ fn reliable_stream_mixed_startup_path_scores(
     lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
-    if reliable_stream_latency_startup_should_use_configured_order(paths, observations, lane)
-        || reliable_stream_latency_startup_should_use_load_balanced_order(paths, observations, lane)
+    if endpoint_only_reliable_startup_should_preserve_configured_order(paths, observations, lane)
+        || endpoint_only_reliable_startup_should_spread_latency_load(paths, observations, lane)
+        || endpoint_only_reliable_startup_should_spread_bulk_load(paths, observations, lane)
     {
         return endpoint_only_reliable_startup_path_scores(
             paths,
@@ -320,12 +319,6 @@ pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {
         && path.metadata.initial_jitter_ms.is_none()
         && path.metadata.initial_rate == RateHint::Unknown
         && path.metadata.capabilities == crate::protocol::PathCapabilities::default()
-}
-
-pub(super) fn path_has_configured_performance_hint(path: &PathSpec) -> bool {
-    path.metadata.initial_srtt_ms.is_some()
-        || path.metadata.initial_jitter_ms.is_some()
-        || path.metadata.initial_rate != RateHint::Unknown
 }
 
 pub(super) fn configured_order_path_indices(
@@ -414,17 +407,8 @@ pub(super) fn reliable_stream_path_candidates(
     lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<BulkPathCandidate> {
-    let active_udp_work = endpoint_only_startup_has_any_load(udp_observations);
-    let tcp_scores = if endpoint_only_tcp_startup_should_spread_bulk_load(
-        tcp_paths,
-        tcp_observations,
-        lane,
-        active_udp_work,
-    ) {
-        endpoint_only_reliable_startup_path_scores(tcp_paths, tcp_observations, lane, payload_bytes)
-    } else {
-        reliable_stream_mixed_startup_path_scores(tcp_paths, tcp_observations, lane, payload_bytes)
-    };
+    let tcp_scores =
+        reliable_stream_mixed_startup_path_scores(tcp_paths, tcp_observations, lane, payload_bytes);
     let udp_scores =
         reliable_stream_mixed_startup_path_scores(udp_paths, udp_observations, lane, payload_bytes);
 
@@ -446,7 +430,6 @@ pub(super) fn reliable_stream_path_candidates(
                     has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
                         observation,
                     ),
-                    has_configured_performance_hint: path_has_configured_performance_hint(path),
                     snapshot,
                 },
             )
@@ -473,85 +456,62 @@ pub(super) fn reliable_stream_path_candidates(
                     has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
                         observation,
                     ),
-                    has_configured_performance_hint: path_has_configured_performance_hint(path),
                     snapshot,
                 },
             )
         }))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        candidates = tcp_scores
-            .iter()
-            .filter_map(|(index, eta_ms)| {
-                let path = tcp_paths.get(*index)?;
-                let observation = tcp_observations.get(*index).copied().unwrap_or_default();
-                let snapshot = path_snapshot(path, *index, observation);
-                path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
-                    BulkPathCandidate {
-                        key: RelayPathKey {
-                            underlay: UnderlayProtocol::Tcp,
-                            index: *index,
+        candidates =
+            tcp_scores
+                .iter()
+                .filter_map(|(index, eta_ms)| {
+                    let path = tcp_paths.get(*index)?;
+                    let observation = tcp_observations.get(*index).copied().unwrap_or_default();
+                    let snapshot = path_snapshot(path, *index, observation);
+                    path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
+                        BulkPathCandidate {
+                            key: RelayPathKey {
+                                underlay: UnderlayProtocol::Tcp,
+                                index: *index,
+                            },
+                            eta_ms: *eta_ms
+                                + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
+                            has_evidence: bulk_candidate_has_evidence(path, observation),
+                            has_sender_delivery_evidence:
+                                bulk_candidate_has_sender_delivery_evidence(observation),
+                            snapshot,
                         },
-                        eta_ms: *eta_ms
-                            + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
-                        has_evidence: bulk_candidate_has_evidence(path, observation),
-                        has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
-                            observation,
-                        ),
-                        has_configured_performance_hint: path_has_configured_performance_hint(path),
-                        snapshot,
-                    },
-                )
-            })
-            .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
-                let path = udp_paths.get(*index)?;
-                let observation = udp_observations.get(*index).copied().unwrap_or_default();
-                let snapshot = path_snapshot(path, *index, observation);
-                let eta_ms = *eta_ms
-                    + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
-                        udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
-                    } else {
-                        0.0
-                    }
-                    + reliable_stream_initial_lane_protection_penalty(snapshot, lane);
-                path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
-                    BulkPathCandidate {
-                        key: RelayPathKey {
-                            underlay: UnderlayProtocol::Udp,
-                            index: *index,
+                    )
+                })
+                .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
+                    let path = udp_paths.get(*index)?;
+                    let observation = udp_observations.get(*index).copied().unwrap_or_default();
+                    let snapshot = path_snapshot(path, *index, observation);
+                    let eta_ms = *eta_ms
+                        + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
+                            udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
+                        } else {
+                            0.0
+                        }
+                        + reliable_stream_initial_lane_protection_penalty(snapshot, lane);
+                    path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
+                        BulkPathCandidate {
+                            key: RelayPathKey {
+                                underlay: UnderlayProtocol::Udp,
+                                index: *index,
+                            },
+                            eta_ms,
+                            has_evidence: bulk_candidate_has_evidence(path, observation),
+                            has_sender_delivery_evidence:
+                                bulk_candidate_has_sender_delivery_evidence(observation),
+                            snapshot,
                         },
-                        eta_ms,
-                        has_evidence: bulk_candidate_has_evidence(path, observation),
-                        has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
-                            observation,
-                        ),
-                        has_configured_performance_hint: path_has_configured_performance_hint(path),
-                        snapshot,
-                    },
-                )
-            }))
-            .collect();
+                    )
+                }))
+                .collect();
     }
-    retain_safe_mixed_latency_startup_candidates(&mut candidates, lane);
     candidates
-}
-
-pub(super) fn reliable_stream_initial_underlay_order(
-    lane: FlowLane,
-    underlay: UnderlayProtocol,
-) -> u8 {
-    match (lane, underlay) {
-        (
-            FlowLane::Throughput | FlowLane::Background | FlowLane::RealtimeDatagram,
-            UnderlayProtocol::Udp,
-        ) => 0,
-        (
-            FlowLane::Throughput | FlowLane::Background | FlowLane::RealtimeDatagram,
-            UnderlayProtocol::Tcp,
-        ) => 1,
-        (_, UnderlayProtocol::Tcp) => 0,
-        (_, UnderlayProtocol::Udp) => 1,
-    }
 }
 
 fn reliable_stream_initial_lane_protection_penalty(snapshot: PathSnapshot, lane: FlowLane) -> f64 {
@@ -725,14 +685,14 @@ pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
         observation
             .delivery_samples
             .saturating_add(observation.carrier_delivery_samples),
-    ) / QUIC_INITIAL_WINDOW_PACKETS as f64)
+    ) / RELIABLE_INITIAL_WINDOW_PACKETS as f64)
         .clamp(0.0, 1.0);
     let rtt_confidence = if observation
         .carrier_srtt_ms
         .or(observation.measured_srtt_ms)
         .is_some()
     {
-        1.0 / QUIC_INITIAL_WINDOW_PACKETS as f64
+        1.0 / RELIABLE_INITIAL_WINDOW_PACKETS as f64
     } else {
         0.0
     };
@@ -833,6 +793,13 @@ pub(super) fn bulk_candidate_has_delivery_evidence(
         || path.metadata.initial_rate != RateHint::Unknown
 }
 
+pub(super) fn bulk_candidate_has_unique_data_evidence(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+) -> bool {
+    bulk_candidate_has_delivery_evidence(path, observation)
+}
+
 pub(super) fn bulk_candidate_has_sender_delivery_evidence(
     observation: ClientPathObservation,
 ) -> bool {
@@ -856,46 +823,32 @@ pub(super) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -
         .any(|candidate| candidate.key.underlay != first.key.underlay)
 }
 
-fn retain_safe_mixed_latency_startup_candidates(
-    candidates: &mut Vec<BulkPathCandidate>,
-    lane: FlowLane,
-) {
-    if matches!(lane, FlowLane::Throughput | FlowLane::Background)
-        || !bulk_candidates_span_underlays(candidates)
-    {
-        return;
-    }
-    if candidates
-        .iter()
-        .any(|candidate| candidate.has_sender_delivery_evidence)
-        || candidates
-            .iter()
-            .any(|candidate| candidate.has_configured_performance_hint)
-    {
-        return;
-    }
-    if candidates
-        .iter()
-        .any(|candidate| candidate.key.underlay == UnderlayProtocol::Tcp)
-    {
-        candidates.retain(|candidate| candidate.key.underlay == UnderlayProtocol::Tcp);
-    }
-}
-
 pub(super) fn carrier_diverse_bulk_validation_order(
     candidates: Vec<BulkPathCandidate>,
 ) -> Vec<BulkPathCandidate> {
     if !bulk_candidates_span_underlays(&candidates) {
         return candidates;
     }
-    let mut remaining = candidates;
-    let mut ordered = Vec::with_capacity(remaining.len());
-    for underlay in [UnderlayProtocol::Udp, UnderlayProtocol::Tcp] {
-        if let Some(position) = remaining
-            .iter()
-            .position(|candidate| candidate.key.underlay == underlay)
-        {
-            ordered.push(remaining.remove(position));
+    let mut ordered = Vec::with_capacity(candidates.len());
+    let mut remaining = Vec::new();
+    let mut saw_tcp = false;
+    let mut saw_udp = false;
+    for candidate in candidates {
+        let first_for_underlay = match candidate.key.underlay {
+            UnderlayProtocol::Tcp if !saw_tcp => {
+                saw_tcp = true;
+                true
+            }
+            UnderlayProtocol::Udp if !saw_udp => {
+                saw_udp = true;
+                true
+            }
+            _ => false,
+        };
+        if first_for_underlay {
+            ordered.push(candidate);
+        } else {
+            remaining.push(candidate);
         }
     }
     ordered.extend(remaining);
@@ -922,10 +875,10 @@ pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
 
 pub(super) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
     let _ = underlay;
-    QUIC_INITIAL_RTT.as_secs_f64() * 1000.0
+    RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0
 }
 
 pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
     let _ = underlay;
-    PATH_OPEN_SCORE_BYTES as f64 * 8.0 / QUIC_INITIAL_RTT.as_secs_f64()
+    PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
 }

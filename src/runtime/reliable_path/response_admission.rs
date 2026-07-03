@@ -8,7 +8,7 @@ use super::*;
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
-    pub(super) commands: TcpPathSessionCommandSender,
+    pub(super) commands: ReliablePathCommandSender,
     pub(super) bytes_in_flight: u64,
     pub(super) product_queue_bytes: u64,
     pub(super) product_progress_rate_bps: Option<f64>,
@@ -17,6 +17,7 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) path_metrics: Option<ServerPathMetricsEntry>,
+    pub(super) bulk_discovery_sent_bytes: u64,
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
@@ -26,11 +27,13 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) key: CarrierPathKey,
-    pub(in crate::runtime) commands: TcpPathSessionCommandSender,
+    pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
+    pub(in crate::runtime) has_bulk_rate_evidence: bool,
+    pub(in crate::runtime) bulk_discovery_sent_bytes: u64,
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -270,14 +273,21 @@ pub(super) fn server_bulk_output_snapshot(
         })
         .clamp(0.0, 1.0);
     let model_rate_bps = bulk_rate_metrics.map(server_path_metrics_rate_bps);
-    let local_sender_rate_bps = bulk_rate_metrics
-        .map(server_path_metrics_rate_bps)
-        .or(entry.delivery_rate_bps);
     let prior_rate_bps =
         model_rate_bps.unwrap_or_else(|| default_path_rate_bps(entry.key.underlay));
-    let rate_bps = match entry.key.underlay {
-        UnderlayProtocol::Udp => local_sender_rate_bps,
-        UnderlayProtocol::Tcp => local_sender_rate_bps.map(|rate| rate.max(prior_rate_bps)),
+    let rate_bps = match (
+        entry.key.underlay,
+        bulk_rate_metrics,
+        entry.delivery_rate_bps,
+    ) {
+        (_, Some(path_metrics), _) => Some(server_path_metrics_rate_bps(path_metrics)),
+        (UnderlayProtocol::Tcp, None, Some(rate))
+            if !super::tcp_delivery_samples_override_startup_prior(entry.delivery_samples) =>
+        {
+            Some(rate.max(prior_rate_bps))
+        }
+        (_, None, Some(rate)) => Some(rate),
+        (_, None, None) => None,
     }
     .unwrap_or(prior_rate_bps)
     .max(1.0);
@@ -394,7 +404,7 @@ fn response_loss_penalty_ms(snapshot: PathSnapshot) -> f64 {
 }
 
 fn confidence_sample_denominator() -> f64 {
-    f64::from(QUIC_INITIAL_WINDOW_PACKETS as u32)
+    f64::from(RELIABLE_INITIAL_WINDOW_PACKETS as u32)
 }
 
 fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) -> f64 {
@@ -404,13 +414,17 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::LocalSender,
             metrics,
-        }) if metrics.has_ack_derived_data_sample => {
+        }) if metrics.has_ack_derived_data_sample || metrics.confidence_ppm > 0 => {
             let source_confidence =
                 f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
             let sample_confidence = (f64::from(metrics.data_sample_count)
                 / confidence_sample_denominator())
             .clamp(0.0, 1.0);
-            source_confidence * sample_confidence
+            if metrics.has_ack_derived_data_sample {
+                source_confidence * sample_confidence
+            } else {
+                source_confidence
+            }
         }
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::PeerHint,
@@ -432,6 +446,12 @@ fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEnt
         && !path_metrics.metrics.app_limited
 }
 
+fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
+    path_metrics.source == ServerPathMetricsSource::LocalSender
+        && (server_path_metrics_has_bulk_rate_evidence(path_metrics)
+            || path_metrics.metrics.confidence_ppm > 0)
+}
+
 pub(in crate::runtime) fn server_output_has_sender_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
@@ -439,8 +459,25 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         || entry.delivery_rate_bps.is_some()
         || matches!(
             entry.path_metrics,
-            Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
+            Some(path_metrics) if server_path_metrics_has_sender_evidence(path_metrics)
         )
+}
+
+pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
+    let has_local_carrier_bulk = matches!(
+        entry.path_metrics,
+        Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
+    );
+    match entry.key.underlay {
+        UnderlayProtocol::Udp => has_local_carrier_bulk,
+        UnderlayProtocol::Tcp => {
+            entry.delivery_samples > 0
+                || entry.delivery_rate_bps.is_some()
+                || has_local_carrier_bulk
+        }
+    }
 }
 
 pub(in crate::runtime) fn record_server_sender_decision(
@@ -484,5 +521,74 @@ pub(super) fn sender_service_frame_kind(frame: &Frame) -> &'static str {
         Frame::DatagramFeedback { .. } => "datagram_feedback",
         Frame::DatagramClose { .. } => "datagram_close",
         _ => "control",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_bulk_rate_evidence_requires_local_quic_ack_sample() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let entry = ResponseStreamOutputEntry {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            },
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: Some(500_000_000.0),
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 1,
+            last_delivery_at: Some(Instant::now()),
+            path_metrics: None,
+            bulk_discovery_sent_bytes: 0,
+        };
+
+        assert!(
+            server_output_has_sender_evidence(&entry),
+            "product ACK samples still prove end-to-end sender progress"
+        );
+        assert!(
+            !server_output_has_bulk_rate_evidence(&entry),
+            "UDP ordinary bulk-rate evidence must be local QUIC ACK-derived carrier data, not product STREAM_ACK alone"
+        );
+    }
+
+    #[test]
+    fn tcp_response_snapshot_persistent_delivery_samples_override_default_prior() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let prior_rate = default_path_rate_bps(UnderlayProtocol::Tcp);
+        let entry = ResponseStreamOutputEntry {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            },
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: Some(prior_rate / 10.0),
+            delivery_rate_bps: Some(prior_rate / 10.0),
+            srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
+            delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            last_delivery_at: Some(Instant::now()),
+            path_metrics: None,
+            bulk_discovery_sent_bytes: 0,
+        };
+
+        let lane_tracker = ServerPathLaneTracker::default();
+        let snapshot = server_bulk_output_snapshot(
+            &entry,
+            SessionId(77),
+            FlowLane::Throughput,
+            &lane_tracker,
+            MuxLimits::default(),
+            Instant::now(),
+        );
+
+        assert_eq!(snapshot.delivery_rate_bps, prior_rate / 10.0);
     }
 }

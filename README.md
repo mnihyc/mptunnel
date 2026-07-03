@@ -44,7 +44,7 @@ Docker-only heterogeneous network lab:
 lab/run-heterogeneous-ablation.sh
 ```
 
-The lab emulates low-latency, balanced, cross-continent high-bandwidth, harsh poor-Internet, saturated-link, flapping-link, ideal 0%-loss, controlled 2^3 bandwidth/latency/loss matrix, UDP, and failover scenarios, then records direct, single-path, multipath, and mixed-workload comparison results under `lab/results/`. It mutates Docker network namespaces only.
+The lab emulates low-latency, balanced, a 0.1%-loss half-bandwidth/double-latency balanced companion, cross-continent high-bandwidth, harsh poor-Internet, saturated-link, flapping-link, ideal 0%-loss, controlled 2^3 bandwidth/latency/loss matrix, UDP, and failover scenarios, then records direct, single-path, multipath, mixed-workload, and approximate traffic-overhead comparison results under `lab/results/`. It mutates Docker network namespaces only.
 
 ## Config File
 

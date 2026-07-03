@@ -7,17 +7,10 @@ use std::collections::HashMap;
 // shutdown. Product reliable stream identity, response path-flight ownership,
 // and cross-carrier scheduling live in `reliable_path`.
 
-const TCP_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
-    FlowLane::Control,
-    FlowLane::Latency,
-    FlowLane::RealtimeDatagram,
-    FlowLane::Background,
-];
-
 pub(super) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
-    commands: Arc<Mutex<Option<TcpPathSessionCommandSender>>>,
-    latency_commands: Arc<Mutex<Option<TcpPathSessionCommandSender>>>,
+    commands: Arc<Mutex<Option<ReliablePathCommandSender>>>,
+    latency_commands: Arc<Mutex<Option<ReliablePathCommandSender>>>,
 }
 
 impl std::fmt::Debug for ClientTcpPathSessionHandle {
@@ -62,7 +55,7 @@ impl ClientTcpPathSessionHandle {
         let commands = self.ensure_session(lane);
         let (response_tx, response_rx) = oneshot::channel();
         commands
-            .send_control(TcpPathSessionCommand::OpenStream {
+            .send_control(ReliablePathCommand::OpenStream {
                 stream_id,
                 target,
                 ingress,
@@ -72,10 +65,10 @@ impl ClientTcpPathSessionHandle {
                 response: response_tx,
             })
             .await
-            .map_err(|_| RuntimeError::TcpPathSessionClosed)?;
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
         response_rx
             .await
-            .map_err(|_| RuntimeError::TcpPathSessionClosed)?
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?
     }
 
     pub(super) async fn cancel_stream_open(&self, lane: FlowLane, stream_id: StreamId) {
@@ -94,20 +87,19 @@ impl ClientTcpPathSessionHandle {
             && !commands.is_closed()
         {
             let _ = commands
-                .send_control(TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
+                .send_control(ReliablePathCommand::SendFrame(Frame::StreamDetach {
                     stream_id,
                 }))
                 .await;
             let _ = commands
-                .send_control(TcpPathSessionCommand::CloseStream(stream_id))
+                .send_control(ReliablePathCommand::CloseStream(stream_id))
                 .await;
         }
     }
 
-    pub(super) fn ensure_session(&self, lane: FlowLane) -> TcpPathSessionCommandSender {
+    pub(super) fn ensure_session(&self, lane: FlowLane) -> ReliablePathCommandSender {
         if tcp_path_lane_uses_dedicated_session(lane) && !self.runtime.reuse_latency_session {
-            let (commands, receivers) =
-                tcp_path_session_command_channels(self.runtime.command_queue);
+            let (commands, receivers) = reliable_path_command_channels(self.runtime.command_queue);
             tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receivers));
             return commands;
         }
@@ -124,7 +116,7 @@ impl ClientTcpPathSessionHandle {
             return commands.clone();
         }
 
-        let (commands, receivers) = tcp_path_session_command_channels(self.runtime.command_queue);
+        let (commands, receivers) = reliable_path_command_channels(self.runtime.command_queue);
         tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receivers));
         *current = Some(commands.clone());
         commands
@@ -146,6 +138,7 @@ pub(super) struct ClientTcpPathConnection {
     pub(super) heartbeat_interval: Duration,
     pub(super) next_heartbeat_at: tokio::time::Instant,
     pub(super) pending_heartbeat: Option<(u64, tokio::time::Instant)>,
+    pub(super) path_proofs: PathProofTracker,
 }
 
 pub(super) type EncryptedTcpReader = EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
@@ -160,7 +153,7 @@ pub(super) struct ClientTcpPathStreamState {
 pub(super) struct ClientTcpPendingOpen {
     response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
-    session_commands: TcpPathSessionCommandSender,
+    session_commands: ReliablePathCommandSender,
     lane: FlowLane,
 }
 
@@ -177,6 +170,7 @@ pub(super) struct ClientTcpPathSessionRuntime {
     pub(super) closed_stream_cache_capacity: usize,
     pub(super) reuse_latency_session: bool,
     pub(super) connect_timeout: Duration,
+    pub(super) health: Arc<Mutex<ClientPathHealth>>,
 }
 
 struct ClientTcpPathSessionState {
@@ -191,13 +185,13 @@ struct ClientTcpOpenStreamRequest {
     ingress: IngressKind,
     lane: FlowLane,
     role: StreamOpenRole,
-    session_commands: TcpPathSessionCommandSender,
+    session_commands: ReliablePathCommandSender,
     response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
 }
 
 async fn run_client_tcp_path_session(
     runtime: ClientTcpPathSessionRuntime,
-    mut commands: TcpPathSessionCommandReceivers,
+    mut commands: ReliablePathCommandReceivers,
 ) {
     let mut state = ClientTcpPathSessionState {
         connection: None,
@@ -208,9 +202,9 @@ async fn run_client_tcp_path_session(
 
     loop {
         if state.connection.is_none() {
-            match recv_tcp_path_command(&mut commands).await {
+            match recv_reliable_path_command(&mut commands).await {
                 Some(command) => {
-                    let pending_bytes = tcp_path_command_pending_bytes(&command);
+                    let pending_bytes = reliable_path_command_pending_bytes(&command);
                     handle_disconnected_client_tcp_command(command, &runtime, &mut state).await;
                     commands.release_pending_command_bytes(pending_bytes);
                 }
@@ -233,7 +227,7 @@ async fn run_client_tcp_path_session(
         let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
         tokio::pin!(heartbeat_timer);
 
-        let command_may_recv = !tcp_path_receivers_closed(&commands);
+        let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
             if let Some(connection_ref) = state.connection.as_mut() {
                 let _ = close_client_tcp_path(
@@ -257,7 +251,7 @@ async fn run_client_tcp_path_session(
                             state.connection.as_mut().expect("checked connected TCP path session"),
                             &mut state.streams,
                             &mut state.closed_streams,
-                            runtime.mux_limits,
+                            &runtime,
                         )
                         .await
                         {
@@ -265,7 +259,7 @@ async fn run_client_tcp_path_session(
                             eprintln!("warning: TCP path session frame handling failed: {err}");
                             drop_connection = true;
                         } else if command_may_recv
-                            && let Some(command) = try_recv_tcp_path_command(&mut commands)
+                            && let Some(command) = try_recv_reliable_path_command(&mut commands)
                         {
                             let result = handle_connected_client_tcp_command_run(
                                 command,
@@ -295,13 +289,13 @@ async fn run_client_tcp_path_session(
                         drop_connection = true;
                     }
                     None => {
-                        let err = RuntimeError::TcpPathSessionClosed;
+                        let err = RuntimeError::ReliablePathSessionClosed;
                         fail_client_tcp_streams(&mut state.streams, &err);
                         drop_connection = true;
                     }
                 }
             }
-            command = recv_tcp_path_command(&mut commands), if command_may_recv => {
+            command = recv_reliable_path_command(&mut commands), if command_may_recv => {
                 match command {
                     Some(command) => {
                         let result = handle_connected_client_tcp_command_run(
@@ -322,7 +316,7 @@ async fn run_client_tcp_path_session(
                         }
                     }
                     None => {
-                        if tcp_path_receivers_closed(&commands) {
+                        if reliable_path_receivers_closed(&commands) {
                             if let Some(connection_ref) = state.connection.as_mut() {
                                 let _ = close_client_tcp_path(
                                     connection_ref,
@@ -358,8 +352,8 @@ async fn run_client_tcp_path_session(
 }
 
 async fn handle_connected_client_tcp_command_run(
-    first_command: TcpPathSessionCommand,
-    commands: &mut TcpPathSessionCommandReceivers,
+    first_command: ReliablePathCommand,
+    commands: &mut ReliablePathCommandReceivers,
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
@@ -369,8 +363,8 @@ async fn handle_connected_client_tcp_command_run(
 ) -> Result<(), RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
-    let byte_budget = tcp_path_command_writer_run_budget_bytes(mux_limits);
-    let item_budget = tcp_path_command_writer_run_budget_items(mux_limits);
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
     let mut next_command = Some(first_command);
     pending_frames.clear();
     let mut sent_bytes = 0usize;
@@ -380,13 +374,25 @@ async fn handle_connected_client_tcp_command_run(
     loop {
         let Some(command) = next_command
             .take()
-            .or_else(|| try_recv_tcp_path_command(commands))
+            .or_else(|| try_recv_reliable_path_command(commands))
         else {
+            if try_coalesce_reliable_path_writer_run(
+                commands,
+                &mut next_command,
+                sent_items,
+                sent_bytes,
+                byte_budget,
+                item_budget,
+            )
+            .await
+            {
+                continue;
+            }
             break;
         };
-        let pending_bytes = tcp_path_command_pending_bytes(&command);
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
         match command {
-            TcpPathSessionCommand::SendFrame(frame) => {
+            ReliablePathCommand::SendFrame(frame) => {
                 let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
@@ -451,18 +457,21 @@ async fn flush_client_tcp_frame_batch(
         return Ok(());
     }
     connection.writer.write_frames(frames).await?;
+    for frame in frames.iter() {
+        connection.path_proofs.record_sent_frame(frame);
+    }
     frames.clear();
     record_client_tcp_path_outbound_activity(connection, mux_limits);
     Ok(())
 }
 
 async fn handle_disconnected_client_tcp_command(
-    command: TcpPathSessionCommand,
+    command: ReliablePathCommand,
     runtime: &ClientTcpPathSessionRuntime,
     state: &mut ClientTcpPathSessionState,
 ) {
     match command {
-        TcpPathSessionCommand::OpenStream {
+        ReliablePathCommand::OpenStream {
             stream_id,
             target,
             ingress,
@@ -509,12 +518,12 @@ async fn handle_disconnected_client_tcp_command(
                 let _ = response.send(Err(err));
             }
         },
-        TcpPathSessionCommand::SendFrame(_) | TcpPathSessionCommand::CloseStream(_) => {}
+        ReliablePathCommand::SendFrame(_) | ReliablePathCommand::CloseStream(_) => {}
     }
 }
 
 async fn handle_connected_client_tcp_command(
-    command: TcpPathSessionCommand,
+    command: ReliablePathCommand,
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
@@ -523,7 +532,7 @@ async fn handle_connected_client_tcp_command(
     flush_after_frame: bool,
 ) -> Result<(), RuntimeError> {
     match command {
-        TcpPathSessionCommand::OpenStream {
+        ReliablePathCommand::OpenStream {
             stream_id,
             target,
             ingress,
@@ -546,15 +555,16 @@ async fn handle_connected_client_tcp_command(
             record_client_tcp_path_outbound_activity(connection, mux_limits);
             Ok(())
         }
-        TcpPathSessionCommand::SendFrame(frame) => {
+        ReliablePathCommand::SendFrame(frame) => {
             connection.writer.write_frame(&frame).await?;
+            connection.path_proofs.record_sent_frame(&frame);
             if flush_after_frame {
                 connection.writer.flush().await?;
             }
             record_client_tcp_path_outbound_activity(connection, mux_limits);
             Ok(())
         }
-        TcpPathSessionCommand::CloseStream(stream_id) => {
+        ReliablePathCommand::CloseStream(stream_id) => {
             streams.remove(&stream_id);
             closed_streams.insert(stream_id);
             Ok(())
@@ -632,10 +642,11 @@ pub(super) async fn connect_client_tcp_path(
         startup_snapshot,
         startup_metrics,
         writer,
-        frames: spawn_encrypted_tcp_reader(reader, tcp_path_session_frame_queue(mux_limits)),
+        frames: spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(mux_limits)),
         heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
         next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
         pending_heartbeat: None,
+        path_proofs: PathProofTracker::default(),
     })
 }
 
@@ -687,9 +698,10 @@ async fn handle_client_tcp_path_frame(
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
-    mux_limits: MuxLimits,
+    runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
-    refresh_client_tcp_path_liveness(connection, mux_limits);
+    refresh_client_tcp_path_liveness(connection, runtime.mux_limits);
+    let path_id = PathId(runtime.path_index as u16);
     match frame {
         Frame::StreamMaxData {
             stream_id,
@@ -711,11 +723,11 @@ async fn handle_client_tcp_path_frame(
                         max_offset,
                         lane: pending.lane,
                         underlay: UnderlayProtocol::Tcp,
-                        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+                        max_frame_payload_bytes: reliable_relay_buffer_len(runtime.mux_limits),
                         output: ReliablePathStreamOutput::fixed_with_snapshot(
                             connection.startup_snapshot,
                             pending.session_commands,
-                            mux_limits,
+                            runtime.mux_limits,
                         ),
                         frames,
                     };
@@ -826,6 +838,38 @@ async fn handle_client_tcp_path_frame(
             connection.writer.flush().await?;
             Ok(())
         }
+        Frame::PathProofData {
+            path_id: proof_path_id,
+            proof_id,
+            payload,
+        } if proof_path_id == path_id => {
+            connection
+                .writer
+                .write_frame(&path_proof_ack_frame(path_id, proof_id, payload.len()))
+                .await?;
+            connection.writer.flush().await?;
+            Ok(())
+        }
+        Frame::PathProofAck {
+            path_id: proof_path_id,
+            proof_id,
+            payload_bytes,
+        } if proof_path_id == path_id => {
+            if let Some(observation) =
+                connection
+                    .path_proofs
+                    .acknowledge(path_id, proof_id, payload_bytes)
+                && let Some(record) = runtime
+                    .health
+                    .lock()
+                    .expect("client path health lock")
+                    .tcp
+                    .get_mut(runtime.path_index)
+            {
+                record.mark_path_proof_success(observation.elapsed);
+            }
+            Ok(())
+        }
         Frame::Pong { nonce } => {
             let Some((pending_nonce, _)) = connection.pending_heartbeat.as_ref() else {
                 return Err(RuntimeError::Protocol(
@@ -845,11 +889,11 @@ async fn handle_client_tcp_path_frame(
         Frame::PathStatus {
             status: crate::protocol::PathStatus::Draining | crate::protocol::PathStatus::Failed,
             ..
-        } => Err(RuntimeError::TcpPathSessionClosed),
+        } => Err(RuntimeError::ReliablePathSessionClosed),
         Frame::PathStatus { .. } => Ok(()),
         Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
         Frame::PathDrain { .. } | Frame::PathClose { .. } => {
-            Err(RuntimeError::TcpPathSessionClosed)
+            Err(RuntimeError::ReliablePathSessionClosed)
         }
         _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
     }
@@ -996,11 +1040,11 @@ fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
     match reason {
         RuntimeError::PathHeartbeatTimeout => RuntimeError::PathHeartbeatTimeout,
         RuntimeError::PathOpenTimedOut => RuntimeError::PathOpenTimedOut,
-        RuntimeError::TcpPathSessionClosed => RuntimeError::TcpPathSessionClosed,
+        RuntimeError::ReliablePathSessionClosed => RuntimeError::ReliablePathSessionClosed,
         RuntimeError::RemoteReset(reason) => RuntimeError::RemoteReset(*reason),
         RuntimeError::RemoteClosed(reason) => RuntimeError::RemoteClosed(*reason),
         RuntimeError::Protocol(message) => RuntimeError::Protocol(message),
-        _ => RuntimeError::TcpPathSessionClosed,
+        _ => RuntimeError::ReliablePathSessionClosed,
     }
 }
 
@@ -1029,79 +1073,7 @@ pub(super) fn spawn_encrypted_tcp_reader(
 }
 
 pub(super) fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
-    tcp_path_command_queue(resources.into())
-}
-
-pub(super) fn tcp_path_command_queue(mux_limits: MuxLimits) -> usize {
-    let frame_payload = tcp_path_reliable_stream_queue_payload(mux_limits);
-    tcp_path_command_queue_for_payload(mux_limits, frame_payload)
-}
-
-pub(super) fn tcp_path_command_queue_for_payload(
-    mux_limits: MuxLimits,
-    frame_payload_bytes: usize,
-) -> usize {
-    let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
-    let priority_headroom = tcp_path_priority_headroom_frames();
-    let inflight_frames = mux_limits
-        .max_path_flight_bytes
-        .saturating_add(frame_payload - 1)
-        / frame_payload;
-    inflight_frames
-        .saturating_add(priority_headroom)
-        .max(priority_headroom)
-        .min(tcp_path_session_frame_queue_for_payload(
-            mux_limits,
-            frame_payload,
-        ))
-}
-
-pub(super) fn tcp_path_session_frame_queue(mux_limits: MuxLimits) -> usize {
-    let frame_payload = tcp_path_reliable_stream_queue_payload(mux_limits);
-    tcp_path_session_frame_queue_for_payload(mux_limits, frame_payload)
-}
-
-fn tcp_path_reliable_stream_queue_payload(mux_limits: MuxLimits) -> usize {
-    reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
-        .min(mux_limits.max_reliable_relay_chunk_bytes)
-        .min(mux_limits.max_payload_bytes)
-        .max(1)
-}
-
-pub(super) fn tcp_path_session_frame_queue_for_payload(
-    mux_limits: MuxLimits,
-    frame_payload_bytes: usize,
-) -> usize {
-    reliable_stream_frame_queue_for_payload(mux_limits, frame_payload_bytes)
-        .saturating_mul(tcp_path_writer_lane_count())
-        .max(tcp_path_writer_lane_count())
-}
-
-pub(super) fn reliable_stream_frame_queue(mux_limits: MuxLimits) -> usize {
-    let frame_payload = mux_limits
-        .max_reliable_relay_chunk_bytes
-        .min(mux_limits.max_payload_bytes)
-        .max(1);
-    reliable_stream_frame_queue_for_payload(mux_limits, frame_payload)
-}
-
-pub(super) fn reliable_stream_frame_queue_for_payload(
-    mux_limits: MuxLimits,
-    frame_payload_bytes: usize,
-) -> usize {
-    let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
-    let priority_headroom = tcp_path_priority_headroom_frames();
-    (mux_limits.max_reorder_bytes / frame_payload)
-        .saturating_add(priority_headroom)
-        .max(priority_headroom)
-}
-
-pub(super) fn tcp_path_priority_headroom_frames() -> usize {
-    TCP_PATH_PRIORITY_HEADROOM_LANES.len()
-}
-
-fn tcp_path_writer_lane_count() -> usize {
-    TCP_PATH_PRIORITY_HEADROOM_LANES.len().saturating_add(1)
+    reliable_path_command_queue(resources.into())
 }
 
 #[cfg(test)]
@@ -1162,9 +1134,9 @@ mod tests {
         ];
 
         for (frame, expected_lane) in priority_frames {
-            let effective_lane = tcp_path_effective_frame_lane(&frame, FlowLane::Throughput);
+            let effective_lane = reliable_path_effective_frame_lane(&frame, FlowLane::Throughput);
             assert_eq!(effective_lane, expected_lane);
-            assert!(tcp_path_frame_uses_priority_queue(effective_lane));
+            assert!(reliable_path_frame_uses_priority_queue(effective_lane));
         }
     }
 }

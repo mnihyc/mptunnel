@@ -43,7 +43,7 @@ impl ReliableRelayFlowDemandTracker {
             started_at: now,
             last_refresh_at: now,
             next_rebalance_at: now,
-            last_rebalance_interval: tcp_auto_rebalance_interval(None),
+            last_rebalance_interval: reliable_flow_rebalance_interval(None),
             last_observed_bytes: 0,
             send_rate_bps: 0.0,
         }
@@ -73,19 +73,23 @@ impl ReliableRelayFlowDemandTracker {
         self.last_refresh_at = now;
         self.last_observed_bytes = observed_bytes;
         let previous = self.current;
-        let rebalance_interval = tcp_auto_rebalance_interval(path);
+        let rebalance_interval = reliable_flow_rebalance_interval(path);
         self.last_rebalance_interval = rebalance_interval;
-        let threshold = tcp_auto_bulk_threshold_bytes(path, mux_limits);
+        let threshold = reliable_flow_bulk_threshold_bytes(path, mux_limits);
         let demand =
             FlowDemand::reliable_stream(observed_bytes, signals.repair_bytes as u64, threshold);
         let mut demand = demand;
         let flow_age = now.duration_since(self.started_at);
-        let idle_gap = delta_bytes == 0 && elapsed >= tcp_auto_interactive_idle_gap(path);
-        let rate_threshold = tcp_auto_bulk_rate_threshold_bps(path, mux_limits);
+        let idle_gap = delta_bytes == 0 && elapsed >= reliable_flow_interactive_idle_gap(path);
+        let rate_threshold = reliable_flow_bulk_rate_threshold_bps(path, mux_limits);
         let rate_proven_bulk = self.send_rate_bps >= rate_threshold;
-        let rate_evidence_bytes = tcp_auto_rate_bulk_evidence_bytes(path, mux_limits, threshold);
+        let rate_evidence_bytes =
+            reliable_flow_rate_bulk_evidence_bytes(path, mux_limits, threshold);
+        let prevalidate_bulk = self.current != FlowLane::Throughput
+            && observed_bytes
+                >= reliable_relay_bulk_prevalidation_threshold_bytes(path, mux_limits);
         let byte_proven_bulk = observed_bytes >= threshold
-            && (rate_proven_bulk || flow_age >= tcp_auto_bulk_sustained_age(path));
+            && (rate_proven_bulk || flow_age >= reliable_flow_bulk_sustained_age(path));
         let rate_proven_sustained_bulk = rate_proven_bulk && observed_bytes >= rate_evidence_bytes;
         let sustained_bulk = byte_proven_bulk || rate_proven_sustained_bulk;
         if self.current == FlowLane::Throughput && !idle_gap {
@@ -122,6 +126,7 @@ impl ReliableRelayFlowDemandTracker {
             previous_lane: previous,
             promoted_to_throughput,
             rebalance_due,
+            prevalidate_bulk,
             #[cfg(feature = "lab-diagnostics")]
             observed_bytes,
             #[cfg(feature = "lab-diagnostics")]
@@ -140,7 +145,7 @@ impl ReliableRelayFlowDemandTracker {
     }
 }
 
-fn tcp_auto_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxLimits) -> f64 {
+fn reliable_flow_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxLimits) -> f64 {
     let service_quantum =
         reliable_relay_scheduler_quantum_cap(path, FlowLane::Throughput, mux_limits).max(1);
     service_quantum as f64 * 8.0
@@ -149,7 +154,7 @@ fn tcp_auto_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits: MuxL
             .max(QUIC_TIMER_GRANULARITY.as_secs_f64())
 }
 
-fn tcp_auto_rate_bulk_evidence_bytes(
+fn reliable_flow_rate_bulk_evidence_bytes(
     path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
     full_threshold: u64,
@@ -160,16 +165,16 @@ fn tcp_auto_rate_bulk_evidence_bytes(
     floor.min(full_threshold.max(1))
 }
 
-fn tcp_auto_interactive_idle_gap(path: Option<PathSnapshot>) -> Duration {
+fn reliable_flow_interactive_idle_gap(path: Option<PathSnapshot>) -> Duration {
     transport_pto_from_snapshot(path)
 }
 
-fn tcp_auto_bulk_sustained_age(path: Option<PathSnapshot>) -> Duration {
-    tcp_auto_interactive_idle_gap(path).mul_f64(BBR_DEFAULT_CWND_GAIN)
+fn reliable_flow_bulk_sustained_age(path: Option<PathSnapshot>) -> Duration {
+    reliable_flow_interactive_idle_gap(path).mul_f64(BBR_DEFAULT_CWND_GAIN)
 }
 
-fn tcp_auto_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
-    tcp_auto_interactive_idle_gap(path).div_f64(2.0)
+fn reliable_flow_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
+    reliable_flow_interactive_idle_gap(path).div_f64(2.0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +183,7 @@ pub(super) struct ReliableRelayFlowDecision {
     pub(super) previous_lane: FlowLane,
     pub(super) promoted_to_throughput: bool,
     pub(super) rebalance_due: bool,
+    pub(super) prevalidate_bulk: bool,
     #[cfg(feature = "lab-diagnostics")]
     pub(super) observed_bytes: u64,
     #[cfg(feature = "lab-diagnostics")]
@@ -186,7 +192,7 @@ pub(super) struct ReliableRelayFlowDecision {
     pub(super) rebalance_interval: Duration,
 }
 
-pub(super) fn tcp_auto_bulk_threshold_bytes(
+pub(super) fn reliable_flow_bulk_threshold_bytes(
     path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -201,6 +207,14 @@ pub(super) fn tcp_auto_bulk_threshold_bytes(
         .max(service_quantum)
         .max(PATH_OPEN_SCORE_BYTES as u64)
         .min(window)
+}
+
+pub(super) fn reliable_relay_bulk_prevalidation_threshold_bytes(
+    path: Option<PathSnapshot>,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let _ = (path, mux_limits);
+    PATH_OPEN_SCORE_BYTES as u64
 }
 
 #[cfg(test)]
@@ -243,7 +257,7 @@ mod tests {
     fn rate_evidence_does_not_promote_before_service_quantum_floor() {
         let mut tracker = ReliableRelayFlowDemandTracker::new();
         let limits = MuxLimits::default();
-        let floor = tcp_auto_rate_bulk_evidence_bytes(None, limits, u64::MAX);
+        let floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
         let below_floor = floor.saturating_sub(1).max(1);
 
         let decision = tracker.refresh(
@@ -257,10 +271,31 @@ mod tests {
     }
 
     #[test]
+    fn initial_window_response_triggers_prevalidation_before_throughput_promotion() {
+        let mut tracker = ReliableRelayFlowDemandTracker::new();
+        let limits = MuxLimits::default();
+        let threshold = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
+        assert!(threshold > PATH_OPEN_SCORE_BYTES as u64);
+
+        let decision = tracker.refresh(
+            ReliableRelayFlowSignals::new(PATH_OPEN_SCORE_BYTES as u64, 0, 0),
+            None,
+            limits,
+        );
+
+        assert_eq!(decision.demand.lane, FlowLane::Latency);
+        assert!(!decision.promoted_to_throughput);
+        assert!(
+            decision.prevalidate_bulk,
+            "one QUIC/MPTCP-style initial window is enough to start path proof, not enough to promote data bulk"
+        );
+    }
+
+    #[test]
     fn rate_evidence_promotes_after_service_quantum_floor() {
         let mut tracker = ReliableRelayFlowDemandTracker::new();
         let limits = MuxLimits::default();
-        let floor = tcp_auto_rate_bulk_evidence_bytes(None, limits, u64::MAX);
+        let floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
 
         let decision = tracker.refresh(ReliableRelayFlowSignals::new(floor, 0, 0), None, limits);
 

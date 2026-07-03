@@ -334,6 +334,16 @@ pub enum Frame {
         probe_id: u64,
         payload_bytes: u32,
     },
+    PathProofData {
+        path_id: PathId,
+        proof_id: u64,
+        payload: Bytes,
+    },
+    PathProofAck {
+        path_id: PathId,
+        proof_id: u64,
+        payload_bytes: u32,
+    },
     OpenStream {
         stream_id: StreamId,
         target: TargetAddr,

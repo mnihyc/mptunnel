@@ -89,6 +89,33 @@ flap_modes="${MPTUNNEL_LAB_FLAP_MODES:-apply-lowlat,apply-balanced,apply-fat,app
 flapper_pid=""
 flapper_stop_file=""
 
+scale_lab_netem_value() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+factor = float(sys.argv[2])
+match = re.match(r"^([0-9]+(?:\.[0-9]+)?)(.*)$", value)
+if not match:
+    print(value)
+    raise SystemExit(0)
+scaled = float(match.group(1)) * factor
+if scaled.is_integer():
+    number = str(int(scaled))
+else:
+    number = f"{scaled:.6f}".rstrip("0").rstrip(".")
+print(f"{number}{match.group(2)}")
+PY
+}
+
+balanced_rate_for_mildloss="${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}"
+balanced_delay_for_mildloss="${MPTUNNEL_LAB_BALANCED_DELAY:-80ms}"
+balanced_jitter_for_mildloss="${MPTUNNEL_LAB_BALANCED_JITTER:-10ms}"
+mildloss_rate_for_netem="${MPTUNNEL_LAB_MILDLOSS_RATE:-$(scale_lab_netem_value "$balanced_rate_for_mildloss" 0.5)}"
+mildloss_delay_for_netem="${MPTUNNEL_LAB_MILDLOSS_DELAY:-$(scale_lab_netem_value "$balanced_delay_for_mildloss" 2)}"
+mildloss_jitter_for_netem="${MPTUNNEL_LAB_MILDLOSS_JITTER:-$balanced_jitter_for_mildloss}"
+
 compose() {
   docker compose -f "$compose_file" "$@"
 }
@@ -111,6 +138,10 @@ exec_netem() {
     -e MPTUNNEL_LAB_BALANCED_DELAY="${MPTUNNEL_LAB_BALANCED_DELAY:-80ms}" \
     -e MPTUNNEL_LAB_BALANCED_JITTER="${MPTUNNEL_LAB_BALANCED_JITTER:-10ms}" \
     -e MPTUNNEL_LAB_BALANCED_LOSS="${MPTUNNEL_LAB_BALANCED_LOSS:-1.00%}" \
+    -e MPTUNNEL_LAB_MILDLOSS_RATE="$mildloss_rate_for_netem" \
+    -e MPTUNNEL_LAB_MILDLOSS_DELAY="$mildloss_delay_for_netem" \
+    -e MPTUNNEL_LAB_MILDLOSS_JITTER="$mildloss_jitter_for_netem" \
+    -e MPTUNNEL_LAB_MILDLOSS_LOSS="${MPTUNNEL_LAB_MILDLOSS_LOSS:-0.10%}" \
     -e MPTUNNEL_LAB_FAT_RATE="${MPTUNNEL_LAB_FAT_RATE:-500mbit}" \
     -e MPTUNNEL_LAB_FAT_DELAY="${MPTUNNEL_LAB_FAT_DELAY:-180ms}" \
     -e MPTUNNEL_LAB_FAT_JITTER="${MPTUNNEL_LAB_FAT_JITTER:-20ms}" \
@@ -283,10 +314,12 @@ server_config_toml() {
   endpoints="$(toml_array_from_args \
     "tcp://172.31.10.20:${server_port}" \
     "tcp://172.31.15.20:${server_port}" \
+    "tcp://172.31.16.20:${server_port}" \
     "tcp://172.31.20.20:${server_port}" \
     "tcp://172.31.30.20:${server_port}" \
     "udp://172.31.10.20:${server_port}" \
     "udp://172.31.15.20:${server_port}" \
+    "udp://172.31.16.20:${server_port}" \
     "udp://172.31.20.20:${server_port}" \
     "udp://172.31.30.20:${server_port}")"
   resources="$(resource_config_toml)"
@@ -390,6 +423,12 @@ telemetry_file_for_case() {
   printf '%s/container-stats-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
 }
 
+netdev_snapshot_file_for_case() {
+  local case_name="$1"
+  local phase="$2"
+  printf '%s/netdev-%s-%s.json' "$result_dir" "$(case_artifact_name "$case_name")" "$phase"
+}
+
 telemetry_stop_file_for_case() {
   local case_name="$1"
   printf '%s/container-stats-%s.stop' "$result_dir" "$(case_artifact_name "$case_name")"
@@ -415,10 +454,15 @@ start_case_telemetry() {
     echo ""
     return 0
   fi
-  local telemetry_file stop_file
+  local telemetry_file stop_file before_file after_file
   telemetry_file="$(telemetry_file_for_case "$case_name")"
   stop_file="$(telemetry_stop_file_for_case "$case_name")"
-  rm -f "$telemetry_file" "$stop_file"
+  before_file="$(netdev_snapshot_file_for_case "$case_name" before)"
+  after_file="$(netdev_snapshot_file_for_case "$case_name" after)"
+  rm -f "$telemetry_file" "$stop_file" "$before_file" "$after_file"
+  python3 "$script_dir/container_stats.py" snapshot \
+    --compose-file "$compose_file" \
+    > "$before_file" 2>/dev/null || true
   python3 "$script_dir/container_stats.py" sample \
     --compose-file "$compose_file" \
     --case "$case_name" \
@@ -439,6 +483,9 @@ stop_case_telemetry() {
   if [[ -n "$sampler_pid" ]]; then
     wait "$sampler_pid" >/dev/null 2>&1 || true
   fi
+  python3 "$script_dir/container_stats.py" snapshot \
+    --compose-file "$compose_file" \
+    > "$(netdev_snapshot_file_for_case "$case_name" after)" 2>/dev/null || true
 }
 
 case_telemetry_summary() {
@@ -447,9 +494,15 @@ case_telemetry_summary() {
     printf '{}'
     return 0
   fi
-  local telemetry_file
+  local telemetry_file before_file after_file
   telemetry_file="$(telemetry_file_for_case "$case_name")"
-  python3 "$script_dir/container_stats.py" summarize --input "$telemetry_file" 2>/dev/null || printf '{}'
+  before_file="$(netdev_snapshot_file_for_case "$case_name" before)"
+  after_file="$(netdev_snapshot_file_for_case "$case_name" after)"
+  python3 "$script_dir/container_stats.py" summarize \
+    --input "$telemetry_file" \
+    --netdev-before "$before_file" \
+    --netdev-after "$after_file" \
+    2>/dev/null || printf '{}'
 }
 
 case_log_artifacts_summary() {
@@ -521,6 +574,12 @@ except json.JSONDecodeError:
     telemetry = {}
 if telemetry:
     row["container_telemetry"] = telemetry
+try:
+    sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+    from result_enrichment import enrich_traffic_overhead
+    enrich_traffic_overhead(row, telemetry)
+except Exception as exc:
+    row["traffic_overhead_error"] = str(exc)
 try:
     log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
 except json.JSONDecodeError:
@@ -628,6 +687,12 @@ except json.JSONDecodeError:
     telemetry = {}
 if telemetry:
     row["container_telemetry"] = telemetry
+try:
+    sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+    from result_enrichment import enrich_traffic_overhead
+    enrich_traffic_overhead(row, telemetry)
+except Exception as exc:
+    row["traffic_overhead_error"] = str(exc)
 try:
     log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
 except json.JSONDecodeError:
@@ -754,6 +819,12 @@ except json.JSONDecodeError:
     telemetry = {}
 if telemetry:
     row["container_telemetry"] = telemetry
+try:
+    sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+    from result_enrichment import enrich_traffic_overhead
+    enrich_traffic_overhead(row, telemetry)
+except Exception as exc:
+    row["traffic_overhead_error"] = str(exc)
 try:
     log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
 except json.JSONDecodeError:
@@ -1292,7 +1363,7 @@ run_hysteria2_baseline_upload_case() {
 configure_mptcp_endpoints() {
   local service="$1"
   shift
-  exec_in "$service" "ip mptcp limits set subflows 4 add_addr_accepted 4 && { ip mptcp endpoint flush || true; }"
+  exec_in "$service" "ip mptcp limits set subflows 5 add_addr_accepted 5 && { ip mptcp endpoint flush || true; }"
   local id=1
   local addr dev
   for addr in "$@"; do
@@ -1314,8 +1385,8 @@ run_mptcp_baseline_case() {
     append_skipped_result "$case_name" "mptcp" "kernel MPTCP sockets unavailable"
     return 0
   fi
-  if ! configure_mptcp_endpoints client 172.31.10.10 172.31.15.10 172.31.20.10 172.31.30.10 || \
-     ! configure_mptcp_endpoints target 172.31.10.30 172.31.15.30 172.31.20.30 172.31.30.30; then
+  if ! configure_mptcp_endpoints client 172.31.10.10 172.31.15.10 172.31.16.10 172.31.20.10 172.31.30.10 || \
+     ! configure_mptcp_endpoints target 172.31.10.30 172.31.15.30 172.31.16.30 172.31.20.30 172.31.30.30; then
     append_skipped_result "$case_name" "mptcp" "kernel MPTCP endpoint configuration unavailable"
     return 0
   fi
@@ -1412,6 +1483,12 @@ except json.JSONDecodeError:
     telemetry = {}
 if telemetry:
     row["container_telemetry"] = telemetry
+try:
+    sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+    from result_enrichment import enrich_traffic_overhead
+    enrich_traffic_overhead(row, telemetry)
+except Exception as exc:
+    row["traffic_overhead_error"] = str(exc)
 try:
     log_artifacts = json.loads(os.environ.get("LOG_ARTIFACTS", "{}"))
 except json.JSONDecodeError:
@@ -1778,37 +1855,43 @@ start_server
 
 tcp_endpoint_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
 tcp_endpoint_balanced="--path 'tcp://172.31.15.20:${server_port}'"
+tcp_endpoint_mildloss="--path 'tcp://172.31.16.20:${server_port}'"
 tcp_endpoint_fat="--path 'tcp://172.31.20.20:${server_port}'"
 tcp_endpoint_poor="--path 'tcp://172.31.30.20:${server_port}'"
 udp_endpoint_lowlat="--path 'udp://172.31.10.20:${server_port}'"
 udp_endpoint_balanced="--path 'udp://172.31.15.20:${server_port}'"
+udp_endpoint_mildloss="--path 'udp://172.31.16.20:${server_port}'"
 udp_endpoint_fat="--path 'udp://172.31.20.20:${server_port}'"
 udp_endpoint_poor="--path 'udp://172.31.30.20:${server_port}'"
 
 if [[ "${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" == "1" ]]; then
   tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80&low-latency=true'"
   tcp_balanced="--path 'tcp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
+  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100'"
   tcp_fat="--path 'tcp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
   tcp_poor="--path 'tcp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
   udp_lowlat="--path 'udp://172.31.10.20:${server_port}?srtt-ms=20&rate-mbps=80&low-latency=true'"
   udp_balanced="--path 'udp://172.31.15.20:${server_port}?srtt-ms=80&rate-mbps=200'"
+  udp_mildloss="--path 'udp://172.31.16.20:${server_port}?srtt-ms=160&rate-mbps=100'"
   udp_fat="--path 'udp://172.31.20.20:${server_port}?srtt-ms=180&rate-mbps=500'"
   udp_poor="--path 'udp://172.31.30.20:${server_port}?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true'"
 else
   tcp_lowlat="--path 'tcp://172.31.10.20:${server_port}'"
   tcp_balanced="--path 'tcp://172.31.15.20:${server_port}'"
+  tcp_mildloss="--path 'tcp://172.31.16.20:${server_port}'"
   tcp_fat="--path 'tcp://172.31.20.20:${server_port}'"
   tcp_poor="--path 'tcp://172.31.30.20:${server_port}'"
   udp_lowlat="--path 'udp://172.31.10.20:${server_port}'"
   udp_balanced="--path 'udp://172.31.15.20:${server_port}'"
+  udp_mildloss="--path 'udp://172.31.16.20:${server_port}'"
   udp_fat="--path 'udp://172.31.20.20:${server_port}'"
   udp_poor="--path 'udp://172.31.30.20:${server_port}'"
 fi
-tcp_all="${tcp_lowlat} ${tcp_balanced} ${tcp_fat} ${tcp_poor}"
-udp_all="${udp_lowlat} ${udp_balanced} ${udp_fat} ${udp_poor}"
-tcp_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_fat} ${tcp_endpoint_poor}"
-udp_equal_all="${udp_endpoint_lowlat} ${udp_endpoint_balanced} ${udp_endpoint_fat} ${udp_endpoint_poor}"
-mixed_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${udp_endpoint_fat} ${udp_endpoint_poor}"
+tcp_all="${tcp_lowlat} ${tcp_balanced} ${tcp_mildloss} ${tcp_fat} ${tcp_poor}"
+udp_all="${udp_lowlat} ${udp_balanced} ${udp_mildloss} ${udp_fat} ${udp_poor}"
+tcp_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${tcp_endpoint_mildloss} ${tcp_endpoint_fat} ${tcp_endpoint_poor}"
+udp_equal_all="${udp_endpoint_lowlat} ${udp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
+mixed_equal_all="${tcp_endpoint_lowlat} ${tcp_endpoint_balanced} ${udp_endpoint_mildloss} ${udp_endpoint_fat} ${udp_endpoint_poor}"
 
 if should_run_case "direct_low_latency"; then
   run_unproxied_download_probe_case "direct_low_latency" "tcp" "172.31.10.30:8080"

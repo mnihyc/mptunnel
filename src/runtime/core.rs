@@ -3,7 +3,10 @@ use super::datagram::*;
 use super::error::RuntimeError;
 use super::ingress_runtime::*;
 use super::management::*;
+use super::path_commands::*;
 use super::path_model::*;
+#[cfg(test)]
+use super::path_proof::PathProofObservation;
 use super::prelude::*;
 use super::relay_control::*;
 use super::relay_io::*;
@@ -19,11 +22,14 @@ use crate::lab_diagnostics::lab_diagnostic;
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 // RFC 9002's recommended QUIC initial congestion window is based on ten max
-// datagrams. mptunnel uses the same packet-count shape as the minimum useful
-// path-open/rate sample instead of an arbitrary byte constant.
+// datagrams. mptunnel uses the same packet-count shape as the carrier-neutral
+// reliable-stream startup sample instead of an arbitrary byte constant. The
+// QUIC alias below is for code that specifically consumes QUIC carrier metrics.
 pub(super) const TRANSPORT_MSS_BYTES: usize = 1460;
-pub(super) const QUIC_INITIAL_WINDOW_PACKETS: usize = 10;
-pub(super) const PATH_OPEN_SCORE_BYTES: usize = QUIC_INITIAL_WINDOW_PACKETS * TRANSPORT_MSS_BYTES;
+pub(super) const RELIABLE_INITIAL_WINDOW_PACKETS: usize = 10;
+pub(super) const QUIC_INITIAL_WINDOW_PACKETS: usize = RELIABLE_INITIAL_WINDOW_PACKETS;
+pub(super) const PATH_OPEN_SCORE_BYTES: usize =
+    RELIABLE_INITIAL_WINDOW_PACKETS * TRANSPORT_MSS_BYTES;
 // BBR's model explicitly separates send quantum from inflight volume. These
 // values are protocol-shape constants, not mptunnel tuning knobs: send quantum
 // is pacing_rate*1ms, capped at 64 KiB and floored at 2*MSS; MinPipeCwnd is
@@ -34,7 +40,10 @@ pub(super) const BBR_MIN_SEND_QUANTUM_PACKETS: usize = 2;
 pub(super) const BBR_MIN_PIPE_CWND_PACKETS: usize = 4;
 pub(super) const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
 pub(super) const QUIC_TIMER_GRANULARITY: Duration = Duration::from_millis(1);
-pub(super) const QUIC_INITIAL_RTT: Duration = Duration::from_millis(333);
+// Generic reliable-stream startup prior. The value follows QUIC's conservative
+// initial RTT recommendation, but product/scheduler code intentionally names it
+// without tying it to UDP or QUIC.
+pub(super) const RELIABLE_INITIAL_RTT: Duration = Duration::from_millis(333);
 pub(super) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 pub(super) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 pub(super) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -287,6 +296,8 @@ pub struct ClientPathContext {
     // to the MPP session's carrier path registry, not to individual streams.
     pub(super) tcp_paths: Arc<Vec<PathSpec>>,
     pub(super) udp_paths: Arc<Vec<PathSpec>>,
+    pub(super) tcp_path_ordinals: Arc<Vec<usize>>,
+    pub(super) udp_path_ordinals: Arc<Vec<usize>>,
     pub(super) tcp_security: Arc<Vec<SecurityConfig>>,
     pub(super) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
@@ -334,6 +345,7 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) carrier_delivery_samples: u32,
     pub(super) carrier_last_delivery_at: Option<Instant>,
     pub(super) carrier_app_limited: bool,
+    pub(super) path_proof_success: bool,
 }
 
 impl Default for ClientPathHealthRecord {
@@ -363,6 +375,7 @@ impl Default for ClientPathHealthRecord {
             carrier_delivery_samples: 0,
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
+            path_proof_success: false,
         }
     }
 }
@@ -492,6 +505,11 @@ impl ClientPathHealthRecord {
             Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
             None => sample_ms,
         });
+    }
+
+    pub(super) fn mark_path_proof_success(&mut self, elapsed: Duration) {
+        self.mark_success(elapsed);
+        self.path_proof_success = true;
     }
 
     pub(super) fn mark_liveness_success(&mut self) {
@@ -814,27 +832,41 @@ impl ClientPathContext {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
-        let tcp_paths = paths
+        let tcp_entries = paths
             .iter()
-            .filter(|path| path.spec.underlay == UnderlayProtocol::Tcp)
-            .map(|path| path.spec.clone())
+            .enumerate()
+            .filter(|(_, path)| path.spec.underlay == UnderlayProtocol::Tcp)
+            .map(|(ordinal, path)| (ordinal, path.spec.clone(), path.security.clone()))
             .collect::<Vec<_>>();
-        let tcp_security = paths
+        let tcp_path_ordinals = tcp_entries
             .iter()
-            .filter(|path| path.spec.underlay == UnderlayProtocol::Tcp)
-            .map(|path| path.security.clone())
+            .map(|(ordinal, _, _)| *ordinal)
             .collect::<Vec<_>>();
-        let udp_paths = paths
+        let tcp_paths = tcp_entries
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let tcp_security = tcp_entries
             .into_iter()
-            .filter(|path| path.spec.underlay == UnderlayProtocol::Udp)
+            .map(|(_, _, security)| security)
             .collect::<Vec<_>>();
-        let udp_security = udp_paths
-            .iter()
-            .map(|path| path.security.clone())
-            .collect::<Vec<_>>();
-        let udp_paths = udp_paths
+        let udp_entries = paths
             .into_iter()
-            .map(|path| path.spec)
+            .enumerate()
+            .filter(|(_, path)| path.spec.underlay == UnderlayProtocol::Udp)
+            .map(|(ordinal, path)| (ordinal, path.spec, path.security))
+            .collect::<Vec<_>>();
+        let udp_path_ordinals = udp_entries
+            .iter()
+            .map(|(ordinal, _, _)| *ordinal)
+            .collect::<Vec<_>>();
+        let udp_paths = udp_entries
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let udp_security = udp_entries
+            .into_iter()
+            .map(|(_, _, security)| security)
             .collect::<Vec<_>>();
         let health = Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default(); tcp_paths.len()],
@@ -863,6 +895,7 @@ impl ClientPathContext {
                     ),
                     reuse_latency_session: reuse_tcp_latency_sessions,
                     connect_timeout: path_connect_timeout,
+                    health: health.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -890,6 +923,8 @@ impl ClientPathContext {
             ingresses: Arc::new(ingresses),
             tcp_paths: Arc::new(tcp_paths),
             udp_paths: Arc::new(udp_paths),
+            tcp_path_ordinals: Arc::new(tcp_path_ordinals),
+            udp_path_ordinals: Arc::new(udp_path_ordinals),
             tcp_security: Arc::new(tcp_security),
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
@@ -912,7 +947,26 @@ impl ClientPathContext {
             .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
-    pub(super) fn allocate_tcp_stream_id(&self) -> Result<StreamId, RuntimeError> {
+    pub(super) fn relay_path_config_ordinal(&self, key: RelayPathKey) -> usize {
+        match key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_path_ordinals.get(key.index).copied(),
+            UnderlayProtocol::Udp => self.udp_path_ordinals.get(key.index).copied(),
+        }
+        .unwrap_or(usize::MAX)
+    }
+
+    pub(super) fn relay_path_key_order(
+        &self,
+        left: RelayPathKey,
+        right: RelayPathKey,
+    ) -> std::cmp::Ordering {
+        self.relay_path_config_ordinal(left)
+            .cmp(&self.relay_path_config_ordinal(right))
+            .then_with(|| left.index.cmp(&right.index))
+            .then_with(|| relay_underlay_identity_order(left.underlay, right.underlay))
+    }
+
+    pub(super) fn allocate_reliable_stream_id(&self) -> Result<StreamId, RuntimeError> {
         let mut next = self
             .next_reliable_stream_id
             .lock()
@@ -930,7 +984,7 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> Vec<usize> {
         let observations = self.tcp_health_observations_for_lane(lane);
-        if reliable_stream_latency_startup_should_use_configured_order(
+        if endpoint_only_reliable_startup_should_preserve_configured_order(
             &self.tcp_paths,
             &observations,
             lane,
@@ -977,8 +1031,9 @@ impl ClientPathContext {
     ) -> Option<RelayPathKey> {
         let mut health = self.health.lock().expect("client path health lock");
         let mut tcp_observations = health_observations(&mut health.tcp);
-        apply_tcp_bulk_isolation(&mut tcp_observations, lane, self.mux_limits);
-        let udp_observations = health_observations(&mut health.udp);
+        apply_bulk_latency_isolation(&mut tcp_observations, lane, self.mux_limits);
+        let mut udp_observations = health_observations(&mut health.udp);
+        apply_bulk_latency_isolation(&mut udp_observations, lane, self.mux_limits);
         let mut candidates = reliable_stream_path_candidates(
             &self.tcp_paths,
             &tcp_observations,
@@ -991,12 +1046,7 @@ impl ClientPathContext {
         candidates.sort_by(|left, right| {
             left.eta_ms
                 .total_cmp(&right.eta_ms)
-                .then_with(|| {
-                    reliable_stream_initial_underlay_order(lane, left.key.underlay).cmp(
-                        &reliable_stream_initial_underlay_order(lane, right.key.underlay),
-                    )
-                })
-                .then_with(|| left.key.index.cmp(&right.key.index))
+                .then_with(|| self.relay_path_key_order(left.key, right.key))
         });
         let selected = candidates.first()?.key;
         match selected.underlay {
@@ -1016,6 +1066,35 @@ impl ClientPathContext {
             ),
         );
         Some(selected)
+    }
+
+    pub(super) fn ordered_reliable_path_keys(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Vec<RelayPathKey> {
+        let mut health = self.health.lock().expect("client path health lock");
+        let mut tcp_observations = health_observations(&mut health.tcp);
+        apply_bulk_latency_isolation(&mut tcp_observations, lane, self.mux_limits);
+        let mut udp_observations = health_observations(&mut health.udp);
+        apply_bulk_latency_isolation(&mut udp_observations, lane, self.mux_limits);
+        let mut candidates = reliable_stream_path_candidates(
+            &self.tcp_paths,
+            &tcp_observations,
+            &self.udp_paths,
+            &udp_observations,
+            lane,
+            payload_bytes,
+        );
+        candidates.sort_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| self.relay_path_key_order(left.key, right.key))
+        });
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect()
     }
 
     pub(super) fn ordered_tcp_repair_path_indices(
@@ -1061,9 +1140,10 @@ impl ClientPathContext {
         payload_bytes: usize,
         require_delivery_evidence: bool,
     ) -> Vec<usize> {
-        let observations =
+        let mut observations =
             health_observations(&mut self.health.lock().expect("client path health lock").udp);
-        let scores = if reliable_stream_latency_startup_should_use_configured_order(
+        apply_bulk_latency_isolation(&mut observations, lane, self.mux_limits);
+        let scores = if endpoint_only_reliable_startup_should_preserve_configured_order(
             &self.udp_paths,
             &observations,
             lane,
@@ -1103,6 +1183,49 @@ impl ClientPathContext {
             .collect()
     }
 
+    pub(super) fn ordered_reliable_repair_path_keys(
+        &self,
+        current_tcp_path_index: Option<usize>,
+        current_udp_path_index: Option<usize>,
+        lane: FlowLane,
+        payload_bytes: usize,
+        require_udp_delivery_evidence: bool,
+    ) -> Vec<RelayPathKey> {
+        let mut candidates = self
+            .ordered_tcp_repair_path_indices(current_tcp_path_index, lane, payload_bytes)
+            .into_iter()
+            .map(|index| RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index,
+            })
+            .chain(
+                self.ordered_udp_stream_repair_path_indices(
+                    current_udp_path_index,
+                    lane,
+                    payload_bytes,
+                    require_udp_delivery_evidence,
+                )
+                .into_iter()
+                .map(|index| RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index,
+                }),
+            )
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            let left_eta = self
+                .reliable_relay_path_eta_ms(*left, lane, payload_bytes)
+                .unwrap_or(f64::INFINITY);
+            let right_eta = self
+                .reliable_relay_path_eta_ms(*right, lane, payload_bytes)
+                .unwrap_or(f64::INFINITY);
+            left_eta
+                .total_cmp(&right_eta)
+                .then_with(|| self.relay_path_key_order(*left, *right))
+        });
+        candidates
+    }
+
     pub(super) fn ordered_reliable_bulk_striping_path_keys(
         &self,
         payload_bytes: usize,
@@ -1124,7 +1247,7 @@ impl ClientPathContext {
         candidates.sort_by(|left, right| {
             left.eta_ms
                 .total_cmp(&right.eta_ms)
-                .then_with(|| relay_path_key_order(left.key, right.key))
+                .then_with(|| self.relay_path_key_order(left.key, right.key))
         });
         if !has_evidence && !has_active_bulk_work {
             candidates.truncate(1);
@@ -1149,7 +1272,7 @@ impl ClientPathContext {
         candidates.sort_by(|left, right| {
             left.eta_ms
                 .total_cmp(&right.eta_ms)
-                .then_with(|| relay_path_key_order(left.key, right.key))
+                .then_with(|| self.relay_path_key_order(left.key, right.key))
         });
         let admitted = candidates
             .into_iter()
@@ -1191,7 +1314,6 @@ impl ClientPathContext {
                 has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
                     observation,
                 ),
-                has_configured_performance_hint: path_has_configured_performance_hint(path),
                 snapshot,
             })
         })
@@ -1218,7 +1340,6 @@ impl ClientPathContext {
                     has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
                         observation,
                     ),
-                    has_configured_performance_hint: path_has_configured_performance_hint(path),
                     snapshot,
                 })
             }),
@@ -1232,7 +1353,7 @@ impl ClientPathContext {
     ) -> Vec<ClientPathObservation> {
         let mut observations =
             health_observations(&mut self.health.lock().expect("client path health lock").tcp);
-        apply_tcp_bulk_isolation(&mut observations, lane, self.mux_limits);
+        apply_bulk_latency_isolation(&mut observations, lane, self.mux_limits);
         observations
     }
 
@@ -1258,6 +1379,25 @@ impl ClientPathContext {
             .get_mut(index)?
             .observe(Instant::now());
         Some(path_snapshot(path, index, observation))
+    }
+
+    pub(super) fn reliable_path_snapshot(&self, key: RelayPathKey) -> Option<PathSnapshot> {
+        match key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_path_snapshot(key.index),
+            UnderlayProtocol::Udp => self.udp_path_snapshot(key.index),
+        }
+    }
+
+    pub(super) fn reliable_relay_path_eta_ms(
+        &self,
+        key: RelayPathKey,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Option<f64> {
+        self.reliable_path_snapshot(key).and_then(|snapshot| {
+            scheduler::score_path(snapshot, lane, payload_bytes, SchedulerPolicy::default())
+                .map(|score| score.eta_ms)
+        })
     }
 
     pub(super) fn relay_path_metrics(
@@ -1585,7 +1725,10 @@ impl ClientPathContext {
                     .tcp
                     .get_mut(index)
                     .map(|record| {
-                        bulk_candidate_has_delivery_evidence(path, record.observe(Instant::now()))
+                        bulk_candidate_has_unique_data_evidence(
+                            path,
+                            record.observe(Instant::now()),
+                        )
                     })
                     .unwrap_or(false)
             }
@@ -1597,7 +1740,10 @@ impl ClientPathContext {
                     .udp
                     .get_mut(index)
                     .map(|record| {
-                        bulk_candidate_has_delivery_evidence(path, record.observe(Instant::now()))
+                        bulk_candidate_has_unique_data_evidence(
+                            path,
+                            record.observe(Instant::now()),
+                        )
                     })
                     .unwrap_or(false)
             }
@@ -1673,6 +1819,23 @@ impl ClientPathContext {
         };
         if let Some(current) = records.get_mut(index) {
             current.mark_delivery(sample);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_relay_path_proof_observation(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        observation: PathProofObservation,
+    ) {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(current) = records.get_mut(index) {
+            current.mark_path_proof_success(observation.elapsed);
         }
     }
 

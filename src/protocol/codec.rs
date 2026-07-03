@@ -110,7 +110,9 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::StreamData { payload, .. } | Frame::DatagramData { payload, .. } => {
             payload.len().saturating_add(32)
         }
-        Frame::PathMtuProbe { payload, .. } => payload.len().saturating_add(16),
+        Frame::PathMtuProbe { payload, .. } | Frame::PathProofData { payload, .. } => {
+            payload.len().saturating_add(16)
+        }
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::OpenStream { .. } => 128,
         _ => 64,
@@ -306,6 +308,28 @@ fn encode_payload(
             put_u64(out, *probe_id);
             put_u32(out, *payload_bytes);
             Ok(FrameKind::PathMtuAck)
+        }
+        Frame::PathProofData {
+            path_id,
+            proof_id,
+            payload,
+        } => {
+            encode_payload_bytes_len(payload.len(), limits)?;
+            put_u16(out, path_id.0);
+            put_u64(out, *proof_id);
+            put_u32(out, payload.len() as u32);
+            out.extend_from_slice(payload);
+            Ok(FrameKind::PathProofData)
+        }
+        Frame::PathProofAck {
+            path_id,
+            proof_id,
+            payload_bytes,
+        } => {
+            put_u16(out, path_id.0);
+            put_u64(out, *proof_id);
+            put_u32(out, *payload_bytes);
+            Ok(FrameKind::PathProofAck)
         }
         Frame::OpenStream {
             stream_id,
@@ -513,6 +537,21 @@ fn decode_payload(
         FrameKind::PathMtuAck => Ok(Frame::PathMtuAck {
             path_id: PathId(reader.get_u16()?),
             probe_id: reader.get_u64()?,
+            payload_bytes: reader.get_u32()?,
+        }),
+        FrameKind::PathProofData => {
+            let path_id = PathId(reader.get_u16()?);
+            let proof_id = reader.get_u64()?;
+            let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
+            Ok(Frame::PathProofData {
+                path_id,
+                proof_id,
+                payload,
+            })
+        }
+        FrameKind::PathProofAck => Ok(Frame::PathProofAck {
+            path_id: PathId(reader.get_u16()?),
+            proof_id: reader.get_u64()?,
             payload_bytes: reader.get_u32()?,
         }),
         FrameKind::OpenStream => Ok(Frame::OpenStream {
@@ -1124,6 +1163,8 @@ enum FrameKind {
     PathMtuProbe = 28,
     PathMtuAck = 29,
     StreamDetach = 30,
+    PathProofData = 31,
+    PathProofAck = 32,
 }
 
 impl FrameKind {
@@ -1158,6 +1199,8 @@ impl FrameKind {
             28 => Ok(Self::PathMtuProbe),
             29 => Ok(Self::PathMtuAck),
             30 => Ok(Self::StreamDetach),
+            31 => Ok(Self::PathProofData),
+            32 => Ok(Self::PathProofAck),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1531,6 +1574,16 @@ mod tests {
             path_id: PathId(3),
             probe_id: 99,
             payload_bytes: 9,
+        });
+        round_trip(Frame::PathProofData {
+            path_id: PathId(3),
+            proof_id: 100,
+            payload: Bytes::from_static(b"path-proof"),
+        });
+        round_trip(Frame::PathProofAck {
+            path_id: PathId(3),
+            proof_id: 100,
+            payload_bytes: 10,
         });
         round_trip(Frame::DatagramFeedback {
             flow_id: DatagramFlowId(10),

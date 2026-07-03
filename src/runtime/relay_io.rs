@@ -35,7 +35,7 @@ pub(super) fn reliable_relay_error_is_migratable(err: &RuntimeError) -> bool {
         err,
         RuntimeError::PathHeartbeatTimeout
             | RuntimeError::PathOpenTimedOut
-            | RuntimeError::TcpPathSessionClosed
+            | RuntimeError::ReliablePathSessionClosed
             | RuntimeError::Tcp(_)
             | RuntimeError::Encrypted(_)
             | RuntimeError::RemoteClosed(_)
@@ -343,7 +343,11 @@ pub(super) fn reliable_stream_ack_update_bytes(
         .min(reliable_relay_buffer_len(mux_limits))
         .max(PATH_OPEN_SCORE_BYTES) as u64;
     let measured_step = path
-        .map(|path| (tcp_path_product_bdp_bytes(path) / 2.0).ceil().max(1.0) as u64)
+        .map(|path| {
+            (reliable_path_product_bdp_bytes(path) / 2.0)
+                .ceil()
+                .max(1.0) as u64
+        })
         .unwrap_or(service_floor);
     measured_step
         .clamp(service_floor.min(resource_ceiling), resource_ceiling)
@@ -514,6 +518,14 @@ pub(super) fn receive_stream_fin(
     Ok(final_offset == recv_stream.next_offset())
 }
 
+pub(super) fn stream_data_range_already_delivered(
+    recv_stream: &ReliableRecvStream,
+    offset: u64,
+    payload_len: usize,
+) -> bool {
+    offset.saturating_add(payload_len as u64) <= recv_stream.next_offset()
+}
+
 pub(super) fn pending_stream_fin_ready(
     recv_stream: &ReliableRecvStream,
     pending_final_offset: Option<u64>,
@@ -541,7 +553,8 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
     };
 
     let quantum = bbr_send_quantum_bytes(path, mux_limits);
-    let condition = tcp_path_quantum_condition_factor(path, tcp_path_product_bdp_bytes(path));
+    let condition =
+        reliable_path_quantum_condition_factor(path, reliable_path_product_bdp_bytes(path));
     let target = match lane {
         FlowLane::Control | FlowLane::RealtimeDatagram => {
             bbr_min_send_quantum_bytes(mux_limits).min(quantum)
@@ -565,11 +578,10 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
     target.clamp(floor, cap)
 }
 
-pub(super) fn adaptive_relay_chunk_bytes_for_underlay(
+pub(super) fn adaptive_reliable_relay_chunk_bytes_with_frame_limit(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
-    _underlay: UnderlayProtocol,
     max_frame_payload_bytes: usize,
 ) -> usize {
     adaptive_reliable_relay_chunk_bytes(path, lane, mux_limits)
@@ -583,35 +595,48 @@ pub(super) fn adaptive_reliable_relay_inflight_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
-    let floor = tcp_lane_min_inflight_bytes(lane, mux_limits)
+    let floor = reliable_lane_min_inflight_bytes(lane, mux_limits)
         .min(cap)
         .max(1);
     let Some(path) = path else {
-        return tcp_lane_startup_inflight_bytes(lane, mux_limits)
+        return reliable_lane_startup_inflight_bytes(lane, mux_limits)
             .min(cap)
             .max(floor);
     };
 
-    let bdp_bytes = tcp_path_product_bdp_bytes(path);
+    let bdp_bytes = reliable_path_product_bdp_bytes(path);
     let target = bbr_inflight_target_bytes(path, lane, mux_limits)
-        * tcp_path_stability_factor(path)
-        * tcp_path_backlog_factor(path, bdp_bytes);
+        * reliable_path_stability_factor(path)
+        * reliable_path_backlog_factor(path, bdp_bytes);
     (target.ceil() as usize).clamp(floor, cap)
 }
 
 pub(super) fn reliable_relay_sender_dispatch_budget(
-    _mux_limits: MuxLimits,
+    mux_limits: MuxLimits,
     lane: FlowLane,
     adaptive_chunk: usize,
-    _inflight_limit: usize,
-    _queue_limit: usize,
+    inflight_limit: usize,
+    queue_limit: usize,
 ) -> (usize, usize) {
     let quantum = adaptive_chunk.max(1);
+    if !relay_lane_is_bulk(lane) {
+        return (quantum, 1);
+    }
+
     // The sender service is the scheduling boundary; path queues are only
-    // writer pipes. A dispatch pass therefore emits one preemptible service
-    // quantum instead of filling the whole path inflight envelope.
-    let _ = lane;
-    (quantum, 1)
+    // writer pipes. Bulk may drain one sender/read envelope per service pass,
+    // but each emitted STREAM_DATA frame remains one adaptive quantum and the
+    // pass stays below the path-flight envelope.
+    let service_window = reliable_relay_buffer_len(mux_limits)
+        .min(queue_limit.max(1))
+        .min(inflight_limit.max(1))
+        .max(quantum);
+    let items = service_window.div_ceil(quantum).max(1);
+    let bytes = quantum
+        .saturating_mul(items)
+        .min(service_window)
+        .max(quantum);
+    (bytes, items)
 }
 
 pub(super) fn adaptive_reliable_relay_repair_bytes(
@@ -626,7 +651,7 @@ pub(super) fn adaptive_reliable_relay_repair_bytes(
     adaptive_reliable_relay_chunk_bytes(path, repair_lane, mux_limits).max(1)
 }
 
-pub(super) fn tcp_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
+pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
     let rate_bps = path.delivery_rate_bps.max(
         path.product_progress_rate_bps
             .unwrap_or(path.delivery_rate_bps),
@@ -689,16 +714,10 @@ pub(super) fn relay_lane_min_chunk_bytes(
 pub(super) fn relay_lane_startup_chunk_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let cap = reliable_relay_scheduler_quantum_cap(None, lane, mux_limits);
     let floor = relay_lane_min_chunk_bytes(None, lane, mux_limits);
-    let startup = PathSnapshot::new(
-        PathId(0),
-        UnderlayProtocol::Tcp,
-        default_path_srtt_ms(UnderlayProtocol::Tcp),
-        default_path_rate_bps(UnderlayProtocol::Tcp),
-    );
     let target = match lane {
         FlowLane::Control | FlowLane::RealtimeDatagram => bbr_min_send_quantum_bytes(mux_limits),
         FlowLane::Latency => PATH_OPEN_SCORE_BYTES,
-        FlowLane::Throughput | FlowLane::Background => bbr_send_quantum_bytes(startup, mux_limits),
+        FlowLane::Throughput | FlowLane::Background => reliable_startup_send_quantum_bytes(),
     };
     target.clamp(floor.min(cap).max(1), cap)
 }
@@ -715,8 +734,8 @@ pub(super) fn reliable_relay_scheduler_quantum_cap(
     if lane != FlowLane::Throughput {
         return read_ceiling;
     }
-    let bdp = tcp_path_product_bdp_bytes(path);
-    let condition_factor = tcp_path_quantum_condition_factor(path, bdp);
+    let bdp = reliable_path_product_bdp_bytes(path);
+    let condition_factor = reliable_path_quantum_condition_factor(path, bdp);
     (((read_ceiling as f64) * condition_factor)
         .ceil()
         .max(bbr_min_send_quantum_bytes(mux_limits) as f64) as usize)
@@ -724,7 +743,7 @@ pub(super) fn reliable_relay_scheduler_quantum_cap(
         .max(1)
 }
 
-pub(super) fn tcp_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
+pub(super) fn reliable_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
     let min_pipe = bbr_min_pipe_cwnd_bytes(mux_limits);
     let initial_window = PATH_OPEN_SCORE_BYTES.min(cap).max(min_pipe);
@@ -738,16 +757,15 @@ pub(super) fn tcp_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits)
     }
 }
 
-pub(super) fn tcp_lane_startup_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
+pub(super) fn reliable_lane_startup_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
-    let floor = tcp_lane_min_inflight_bytes(lane, mux_limits);
-    let startup = PathSnapshot::new(
-        PathId(0),
-        UnderlayProtocol::Tcp,
-        default_path_srtt_ms(UnderlayProtocol::Tcp),
-        default_path_rate_bps(UnderlayProtocol::Tcp),
+    let floor = reliable_lane_min_inflight_bytes(lane, mux_limits);
+    let target = bbr_inflight_target_bytes_for_model(
+        reliable_startup_bdp_bytes(),
+        reliable_startup_send_quantum_bytes() as f64,
+        bbr_min_pipe_cwnd_bytes(mux_limits) as f64,
+        lane,
     );
-    let target = bbr_inflight_target_bytes(startup, lane, mux_limits);
     (target.ceil() as usize).clamp(floor.min(cap).max(1), cap)
 }
 
@@ -756,9 +774,18 @@ pub(super) fn bbr_inflight_target_bytes(
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> f64 {
-    let bdp = tcp_path_product_bdp_bytes(path);
+    let bdp = reliable_path_product_bdp_bytes(path);
     let send_quantum = bbr_send_quantum_bytes(path, mux_limits) as f64;
     let min_pipe = bbr_min_pipe_cwnd_bytes(mux_limits) as f64;
+    bbr_inflight_target_bytes_for_model(bdp, send_quantum, min_pipe, lane)
+}
+
+fn bbr_inflight_target_bytes_for_model(
+    bdp: f64,
+    send_quantum: f64,
+    min_pipe: f64,
+    lane: FlowLane,
+) -> f64 {
     let bbr_window = (bdp * BBR_DEFAULT_CWND_GAIN)
         .max(send_quantum)
         .max(min_pipe);
@@ -770,8 +797,24 @@ pub(super) fn bbr_inflight_target_bytes(
     }
 }
 
-pub(super) fn tcp_path_stability_factor(path: PathSnapshot) -> f64 {
-    let bdp_bytes = tcp_path_product_bdp_bytes(path);
+fn reliable_startup_srtt_ms() -> f64 {
+    RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0
+}
+
+fn reliable_startup_rate_bps() -> f64 {
+    PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
+}
+
+pub(super) fn reliable_startup_bdp_bytes() -> f64 {
+    reliable_startup_rate_bps() / 8.0 * (reliable_startup_srtt_ms() / 1000.0)
+}
+
+pub(super) fn reliable_startup_send_quantum_bytes() -> usize {
+    bbr_send_quantum_bytes_for_rate(reliable_startup_rate_bps())
+}
+
+pub(super) fn reliable_path_stability_factor(path: PathSnapshot) -> f64 {
+    let bdp_bytes = reliable_path_product_bdp_bytes(path);
     let min_pipe = (BBR_MIN_PIPE_CWND_PACKETS * TRANSPORT_MSS_BYTES) as f64;
     let floor = adaptive_transport_floor_factor(min_pipe, bdp_bytes);
     let loss_factor = (1.0 - path.loss_rate.clamp(0.0, 1.0)).max(floor);
@@ -780,7 +823,7 @@ pub(super) fn tcp_path_stability_factor(path: PathSnapshot) -> f64 {
     loss_factor * jitter_factor
 }
 
-pub(super) fn tcp_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
+pub(super) fn reliable_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     let queued = path.queue_bytes.saturating_add(path.bytes_in_flight) as f64;
     let floor = adaptive_transport_floor_factor(
         (BBR_MIN_PIPE_CWND_PACKETS * TRANSPORT_MSS_BYTES) as f64,
@@ -789,7 +832,7 @@ pub(super) fn tcp_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     (bdp_bytes / (bdp_bytes + queued.max(0.0))).max(floor)
 }
 
-pub(super) fn tcp_path_backlog_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
+pub(super) fn reliable_path_backlog_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     let queued = path.queue_bytes as f64;
     let floor = adaptive_transport_floor_factor(
         bbr_send_quantum_bytes_for_rate(
@@ -802,9 +845,9 @@ pub(super) fn tcp_path_backlog_factor(path: PathSnapshot, bdp_bytes: f64) -> f64
     (bdp_bytes / (bdp_bytes + queued.max(0.0))).max(floor)
 }
 
-pub(super) fn tcp_path_quantum_condition_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
-    let stability = tcp_path_stability_factor(path);
-    let queue = tcp_path_queue_factor(path, bdp_bytes);
+pub(super) fn reliable_path_quantum_condition_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
+    let stability = reliable_path_stability_factor(path);
+    let queue = reliable_path_queue_factor(path, bdp_bytes);
     let floor = adaptive_transport_floor_factor(
         bbr_send_quantum_bytes_for_rate(
             path.pacing_rate_bps
@@ -828,7 +871,7 @@ fn adaptive_transport_floor_factor(minimum_bytes: f64, bdp_bytes: f64) -> f64 {
     (minimum_bytes.max(1.0) / denominator).min(1.0)
 }
 
-pub(super) fn tcp_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -> FlowLane {
+pub(super) fn reliable_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -> FlowLane {
     if local == FlowLane::Throughput || peer == FlowLane::Throughput {
         FlowLane::Throughput
     } else if local == FlowLane::Background || peer == FlowLane::Background {
@@ -879,17 +922,15 @@ fn enqueue_reliable_tail_repair(
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
-    underlay: UnderlayProtocol,
     max_frame_payload_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     last_send_ack_frontier: u64,
     allow_same_output_frontier_retransmit: bool,
 ) -> usize {
-    let base_repair_limit = adaptive_relay_chunk_bytes_for_underlay(
+    let base_repair_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         send_path_snapshot,
         FlowLane::Throughput,
         mux_limits,
-        underlay,
         max_frame_payload_bytes,
     )
     .max(adaptive_reliable_relay_repair_bytes(
@@ -1019,11 +1060,10 @@ where
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(path_stream.max_offset);
     let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
-    let chunk_size = adaptive_relay_chunk_bytes_for_underlay(
+    let chunk_size = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         None,
         FlowLane::Latency,
         mux_limits,
-        path_stream.underlay,
         path_stream.max_frame_payload_bytes,
     );
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
@@ -1078,7 +1118,7 @@ where
             mux_limits,
         );
         let relay_demand = demand_update.demand;
-        let relay_lane = tcp_sender_effective_relay_lane(relay_demand.lane, peer_lane);
+        let relay_lane = reliable_sender_effective_relay_lane(relay_demand.lane, peer_lane);
         if relay_lane != peer_lane {
             path_stream.set_lane(relay_lane);
             #[cfg(feature = "lab-diagnostics")]
@@ -1118,11 +1158,10 @@ where
             send_path_snapshot,
             relay_lane,
         );
-        let adaptive_chunk = adaptive_relay_chunk_bytes_for_underlay(
+        let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
             send_path_snapshot,
             relay_lane,
             mux_limits,
-            path_stream.underlay,
             path_stream.max_frame_payload_bytes,
         );
         let inflight_limit =
@@ -1230,7 +1269,6 @@ where
                     relay_lane,
                     mux_limits,
                     performance,
-                    path_stream.underlay,
                     path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
                     true,
@@ -1520,6 +1558,27 @@ where
                         stream_id: reset_stream_id,
                         reason,
                     } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+                    Frame::StreamData {
+                        stream_id: received_stream_id,
+                        offset,
+                        payload,
+                        ..
+                    } if received_stream_id == stream_id
+                        && stream_data_range_already_delivered(&recv_stream, offset, payload.len()) =>
+                    {
+                        if enqueue_tcp_recv_progress(
+                            &mut response_sender,
+                            &recv_stream,
+                            &mut recv_progress,
+                            None,
+                            relay_lane,
+                            mux_limits,
+                            true,
+                        ) {
+                            response_sender_retry_at = None;
+                            last_recv_progress_sent_at = Instant::now();
+                        }
+                    }
                     unexpected => {
                         log_unexpected_stream_relay_frame("single", stream_id, &unexpected);
                         return Err(RuntimeError::Protocol("unexpected stream relay frame"));
@@ -1550,7 +1609,7 @@ where
                     Some(updates) => updates
                         .changed()
                         .await
-                        .map_err(|_| RuntimeError::TcpPathSessionClosed),
+                        .map_err(|_| RuntimeError::ReliablePathSessionClosed),
                     None => std::future::pending::<Result<(), RuntimeError>>().await,
                 }
             }, if output_updates.is_some() => {
@@ -1596,7 +1655,6 @@ where
                         relay_lane,
                         mux_limits,
                         performance,
-                        path_stream.underlay,
                         path_stream.max_frame_payload_bytes,
                         last_send_ack_frontier,
                         false,
@@ -1731,9 +1789,9 @@ where
                 } else {
                     let payload = payload.expect("positive read returns payload");
                     #[cfg(feature = "lab-diagnostics")]
-                    let enqueue_id = response_sender.enqueue_data(payload);
+                    let enqueue_id = response_sender.enqueue_data_for_lane(payload, relay_lane);
                     #[cfg(not(feature = "lab-diagnostics"))]
-                    response_sender.enqueue_data(payload);
+                    response_sender.enqueue_data_for_lane(payload, relay_lane);
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "server_sender_enqueue",
@@ -1784,9 +1842,9 @@ where
                         }
                         let payload = payload.expect("positive read returns payload");
                         #[cfg(feature = "lab-diagnostics")]
-                        let enqueue_id = response_sender.enqueue_data(payload);
+                        let enqueue_id = response_sender.enqueue_data_for_lane(payload, relay_lane);
                         #[cfg(not(feature = "lab-diagnostics"))]
-                        response_sender.enqueue_data(payload);
+                        response_sender.enqueue_data_for_lane(payload, relay_lane);
                         opportunistic_reads = opportunistic_reads.saturating_add(1);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
@@ -1918,6 +1976,18 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_stream_data_below_final_frontier_is_already_delivered() {
+        let mut recv_stream = ReliableRecvStream::new(StreamId(1), MuxLimits::default());
+        recv_stream
+            .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+            .expect("receive data");
+
+        assert!(stream_data_range_already_delivered(&recv_stream, 0, 5));
+        assert!(!stream_data_range_already_delivered(&recv_stream, 0, 6));
+        assert!(!stream_data_range_already_delivered(&recv_stream, 5, 1));
+    }
+
+    #[test]
     fn reliable_relay_sender_queue_budget_respects_stream_flow_control_credit() {
         let limits = MuxLimits {
             max_stream_window_bytes: 4,
@@ -1959,19 +2029,19 @@ mod tests {
     #[test]
     fn sender_effective_lane_promotes_from_local_or_peer_bulk_evidence() {
         assert_eq!(
-            tcp_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Latency),
+            reliable_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Latency),
             FlowLane::Latency
         );
         assert_eq!(
-            tcp_sender_effective_relay_lane(FlowLane::Throughput, FlowLane::Latency),
+            reliable_sender_effective_relay_lane(FlowLane::Throughput, FlowLane::Latency),
             FlowLane::Throughput
         );
         assert_eq!(
-            tcp_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Throughput),
+            reliable_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Throughput),
             FlowLane::Throughput
         );
         assert_eq!(
-            tcp_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Background),
+            reliable_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Background),
             FlowLane::Background
         );
     }

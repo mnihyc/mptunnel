@@ -58,7 +58,7 @@ pub(super) struct RelaySenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     stream_id: StreamId,
     flights: RelayPathFlightLedger,
-    ordinary_lead: Option<RelayPathKey>,
+    ordered_data_owner: Option<RelayPathKey>,
     next_send_index: usize,
 }
 
@@ -104,6 +104,7 @@ pub(super) enum ReliableRelayQueuedWorkLane {
 pub(super) struct ReliableRelayQueuedWork {
     pub(super) kind: ReliableRelayQueuedWorkKind,
     pub(super) payload_bytes: usize,
+    pub(super) data_lane: Option<FlowLane>,
     pub(super) stream_ordered_carrier_emit: bool,
     #[cfg(feature = "lab-diagnostics")]
     pub(super) enqueue_id: u64,
@@ -148,6 +149,7 @@ impl ReliableRelaySenderQueue {
         self.push_work(
             ReliableRelayQueuedWorkLane::Control,
             ReliableRelayQueuedWorkKind::Control(frame),
+            None,
             false,
             payload_bytes,
         )
@@ -158,16 +160,22 @@ impl ReliableRelaySenderQueue {
         self.push_work(
             ReliableRelayQueuedWorkLane::Control,
             ReliableRelayQueuedWorkKind::Control(frame),
+            None,
             true,
             payload_bytes,
         )
     }
 
     pub(super) fn push_data(&mut self, payload: Bytes) -> u64 {
+        self.push_data_for_lane(payload, FlowLane::Throughput)
+    }
+
+    pub(super) fn push_data_for_lane(&mut self, payload: Bytes, lane: FlowLane) -> u64 {
         let payload_bytes = payload.len();
         self.push_work(
             ReliableRelayQueuedWorkLane::Data,
             ReliableRelayQueuedWorkKind::Data(payload),
+            Some(lane),
             false,
             payload_bytes,
         )
@@ -183,6 +191,7 @@ impl ReliableRelaySenderQueue {
         self.push_work(
             ReliableRelayQueuedWorkLane::Repair,
             ReliableRelayQueuedWorkKind::Repair { frame, cause },
+            None,
             false,
             payload_bytes,
         )
@@ -192,6 +201,7 @@ impl ReliableRelaySenderQueue {
         &mut self,
         lane: ReliableRelayQueuedWorkLane,
         kind: ReliableRelayQueuedWorkKind,
+        data_lane: Option<FlowLane>,
         final_control: bool,
         payload_bytes: usize,
     ) -> u64 {
@@ -210,6 +220,7 @@ impl ReliableRelaySenderQueue {
         let work = ReliableRelayQueuedWork {
             kind,
             payload_bytes,
+            data_lane,
             stream_ordered_carrier_emit: final_control,
             #[cfg(feature = "lab-diagnostics")]
             enqueue_id,
@@ -291,6 +302,7 @@ impl ReliableRelaySenderQueue {
         Some(ReliableRelayQueuedWork {
             kind: ReliableRelayQueuedWorkKind::Data(prefix),
             payload_bytes: prefix_len,
+            data_lane: work.data_lane,
             stream_ordered_carrier_emit: work.stream_ordered_carrier_emit,
             #[cfg(feature = "lab-diagnostics")]
             enqueue_id: work.enqueue_id,
@@ -397,9 +409,7 @@ pub(super) struct ServerResponseDispatch {
 }
 
 fn carrier_path_key_order(left: CarrierPathKey, right: CarrierPathKey) -> std::cmp::Ordering {
-    relay_underlay_order(left.underlay)
-        .cmp(&relay_underlay_order(right.underlay))
-        .then_with(|| left.path_id.0.cmp(&right.path_id.0))
+    left.path_id.0.cmp(&right.path_id.0)
 }
 
 fn response_ordering_debt_bytes(
@@ -434,7 +444,7 @@ enum ResponseCarrierEmitMode {
 impl ResponseCarrierEmitMode {
     fn effective_lane(self, frame: &Frame, lane: FlowLane) -> FlowLane {
         match self {
-            Self::Classified => tcp_path_effective_frame_lane(frame, lane),
+            Self::Classified => reliable_path_effective_frame_lane(frame, lane),
             Self::StreamOrdered => lane,
         }
     }
@@ -446,7 +456,24 @@ enum ResponseDataDispatchTarget {
     Switchable {
         binding: Arc<ResponseStreamBinding>,
         target: ResponseSenderPathTarget,
+        bulk_discovery: bool,
     },
+}
+
+#[derive(Clone)]
+struct ResponseDataDispatchPlan {
+    primary: ResponseDataDispatchTarget,
+    duplicate_discovery: smallvec::SmallVec<[ResponseSenderPathTarget; 2]>,
+}
+
+impl ResponseDataDispatchPlan {
+    #[cfg(test)]
+    fn primary_key(&self) -> Option<CarrierPathKey> {
+        match &self.primary {
+            ResponseDataDispatchTarget::Fixed(fixed) => Some(fixed.key()),
+            ResponseDataDispatchTarget::Switchable { target, .. } => Some(target.key),
+        }
+    }
 }
 
 fn response_bulk_admission_role(
@@ -466,17 +493,31 @@ fn response_bulk_admission_role(
 
 fn response_unique_quic_data_would_expand_ordering_debt(
     lower_owner: Option<CarrierPathKey>,
-    candidate: CarrierPathKey,
+    target: &ResponseSenderPathTarget,
     ordering_debt: u64,
 ) -> bool {
     matches!(
         lower_owner,
         Some(owner)
-            if owner != candidate
+            if owner != target.key
                 && owner.underlay == UnderlayProtocol::Udp
-                && candidate.underlay == UnderlayProtocol::Udp
+                && target.key.underlay == UnderlayProtocol::Udp
                 && ordering_debt > 0
+                && !target.has_bulk_rate_evidence
     )
+}
+
+fn response_target_can_own_unique_bulk_data(
+    target: &ResponseSenderPathTarget,
+    candidates: &[&ResponseSenderPathTarget],
+) -> bool {
+    if target.has_bulk_rate_evidence {
+        return true;
+    }
+    target.is_active
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence)
 }
 
 fn response_active_lead_suppression(
@@ -528,7 +569,8 @@ fn choose_response_admissible_lead(
         .iter()
         .copied()
         .filter(|target| {
-            response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
+            response_target_can_own_unique_bulk_data(target, candidate_targets)
+                && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
         })
         .min_by(|left, right| {
             left.eta_ms
@@ -558,6 +600,25 @@ fn choose_lowest_eta_response_target(
         .cloned()
 }
 
+fn response_target_has_repair_evidence(target: &ResponseSenderPathTarget) -> bool {
+    target.is_active || target.has_bulk_rate_evidence
+}
+
+fn choose_response_repair_target(
+    targets: &[ResponseSenderPathTarget],
+    avoid_keys: &[CarrierPathKey],
+) -> Option<ResponseSenderPathTarget> {
+    let proven_targets = targets
+        .iter()
+        .filter(|target| response_target_has_repair_evidence(target))
+        .cloned()
+        .collect::<Vec<_>>();
+    choose_lowest_eta_response_target(&proven_targets, avoid_keys, true)
+        .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, true))
+        .or_else(|| choose_lowest_eta_response_target(&proven_targets, avoid_keys, false))
+        .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false))
+}
+
 fn choose_response_sender_target(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
@@ -572,6 +633,23 @@ fn choose_response_sender_target(
         return None;
     }
     let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+    if !repair
+        && emit_mode == ResponseCarrierEmitMode::StreamOrdered
+        && !relay_frame_is_bulk_stream_data(frame, lane)
+        && let Some(active) = targets
+            .iter()
+            .find(|target| target.is_active && !avoid_keys.contains(&target.key))
+    {
+        let effective_lane = emit_mode.effective_lane(frame, lane);
+        return (response_target_can_enqueue_frame_now(active, frame, lane, emit_mode)
+            && response_target_has_emission_credit(
+                active,
+                effective_lane,
+                payload_bytes,
+                mux_limits,
+            ))
+        .then_some(active.clone());
+    }
     let capacity_targets = targets
         .iter()
         .filter(|target| {
@@ -590,7 +668,10 @@ fn choose_response_sender_target(
         return None;
     }
     let targets = capacity_targets.as_slice();
-    if repair || !relay_frame_is_bulk_stream_data(frame, lane) {
+    if repair {
+        return choose_response_repair_target(targets, avoid_keys);
+    }
+    if !relay_frame_is_bulk_stream_data(frame, lane) {
         return choose_lowest_eta_response_target(targets, avoid_keys, true)
             .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false));
     }
@@ -615,11 +696,13 @@ fn choose_response_sender_target(
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if response_unique_quic_data_would_expand_ordering_debt(
-                lower_owner,
-                target.key,
-                ordering_debt,
-            ) {
+            if !response_target_can_own_unique_bulk_data(target, &candidate_targets)
+                || response_unique_quic_data_would_expand_ordering_debt(
+                    lower_owner,
+                    target,
+                    ordering_debt,
+                )
+            {
                 return false;
             }
             let role =
@@ -665,7 +748,7 @@ fn choose_response_sender_data_target(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     lower_flights: &[CarrierPathFlightDebt],
-    ordinary_lead: Option<CarrierPathKey>,
+    ordered_data_owner: Option<CarrierPathKey>,
 ) -> Option<ResponseSenderPathTarget> {
     if targets.is_empty() {
         return None;
@@ -680,13 +763,6 @@ fn choose_response_sender_data_target(
         .collect::<Vec<_>>();
     if capacity_targets.is_empty() {
         return None;
-    }
-    if targets.len() == 1
-        && lower_flights
-            .iter()
-            .all(|flight| Some(flight.key) == targets.first().map(|target| target.key))
-    {
-        return capacity_targets.into_iter().next();
     }
     if !relay_lane_is_bulk(lane) {
         return capacity_targets.into_iter().min_by(|left, right| {
@@ -717,11 +793,13 @@ fn choose_response_sender_data_target(
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if response_unique_quic_data_would_expand_ordering_debt(
-                lower_owner,
-                target.key,
-                ordering_debt,
-            ) {
+            if !response_target_can_own_unique_bulk_data(target, &candidate_targets)
+                || response_unique_quic_data_would_expand_ordering_debt(
+                    lower_owner,
+                    target,
+                    ordering_debt,
+                )
+            {
                 return false;
             }
             let role =
@@ -739,13 +817,33 @@ fn choose_response_sender_data_target(
             .is_none()
         })
         .collect::<Vec<_>>();
+    if lower_owner.is_none()
+        && let Some(discovery) = admitted
+            .iter()
+            .copied()
+            .filter(|target| {
+                response_target_needs_same_underlay_bulk_discovery(
+                    target,
+                    lead.key,
+                    payload_bytes,
+                    mux_limits,
+                )
+            })
+            .min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+    {
+        return Some(discovery.clone());
+    }
     let best = admitted.iter().copied().min_by(|left, right| {
         left.eta_ms
             .total_cmp(&right.eta_ms)
             .then_with(|| carrier_path_key_order(left.key, right.key))
     })?;
     if lower_owner.is_none()
-        && let Some(lead_key) = ordinary_lead
+        && let Some(lead_key) = ordered_data_owner
         && let Some(lead_target) = admitted
             .iter()
             .copied()
@@ -755,6 +853,100 @@ fn choose_response_sender_data_target(
         return Some(lead_target.clone());
     }
     Some(best.clone())
+}
+
+fn response_target_needs_same_underlay_bulk_discovery(
+    target: &ResponseSenderPathTarget,
+    lead_key: CarrierPathKey,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> bool {
+    if target.is_active
+        || !target.has_sender_evidence
+        || target.has_bulk_rate_evidence
+        || target.key.underlay == UnderlayProtocol::Udp
+        || target.key.underlay != lead_key.underlay
+        || target.key == lead_key
+    {
+        return false;
+    }
+    response_target_has_discovery_credit(target, payload_bytes, mux_limits)
+}
+
+fn response_target_needs_quic_duplicate_bulk_discovery(
+    target: &ResponseSenderPathTarget,
+    primary_key: CarrierPathKey,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> bool {
+    target.key.underlay == UnderlayProtocol::Udp
+        && target.key != primary_key
+        && !target.is_active
+        && target.has_sender_evidence
+        && !target.has_bulk_rate_evidence
+        && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
+        && response_target_has_emission_credit(
+            target,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        )
+        && response_target_has_discovery_credit(target, payload_bytes, mux_limits)
+}
+
+fn choose_quic_duplicate_discovery_targets(
+    targets: &[ResponseSenderPathTarget],
+    primary_key: CarrierPathKey,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> smallvec::SmallVec<[ResponseSenderPathTarget; 2]> {
+    let mut selected = targets
+        .iter()
+        .filter(|target| {
+            response_target_needs_quic_duplicate_bulk_discovery(
+                target,
+                primary_key,
+                payload_bytes,
+                mux_limits,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        left.eta_ms
+            .total_cmp(&right.eta_ms)
+            .then_with(|| carrier_path_key_order(left.key, right.key))
+    });
+    selected
+        .into_iter()
+        .take(2)
+        .collect::<smallvec::SmallVec<[_; 2]>>()
+}
+
+fn response_target_has_discovery_credit(
+    target: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> bool {
+    let discovery_credit = response_bulk_discovery_credit_bytes(payload_bytes, mux_limits) as u64;
+    target.bulk_discovery_sent_bytes < discovery_credit
+        && response_target_discovery_debt_bytes(target) < discovery_credit
+}
+
+fn response_bulk_discovery_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> usize {
+    reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
+        .max(payload_bytes)
+        .max(1)
+}
+
+fn response_target_discovery_debt_bytes(target: &ResponseSenderPathTarget) -> u64 {
+    target
+        .snapshot
+        .product_bytes_in_flight
+        .saturating_add(target.snapshot.bytes_in_flight)
+        .saturating_add(target.snapshot.queue_bytes)
+        .saturating_add(target.snapshot.product_queue_bytes)
+        .saturating_add(target.commands.pending_bytes())
 }
 
 fn response_target_within_adaptive_lead_hysteresis(
@@ -840,13 +1032,16 @@ fn plan_response_data_dispatch(
     relay_lane: FlowLane,
     next_offset: u64,
     payload_bytes: usize,
-) -> Result<ResponseDataDispatchTarget, RuntimeError> {
+) -> Result<ResponseDataDispatchPlan, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             let lane =
                 reliable_work_lane_to_carrier_lane(ReliableRelayQueuedWorkLane::Data, relay_lane);
             if fixed.commands().can_enqueue_lane_now(lane) {
-                Ok(ResponseDataDispatchTarget::Fixed(fixed.clone()))
+                Ok(ResponseDataDispatchPlan {
+                    primary: ResponseDataDispatchTarget::Fixed(fixed.clone()),
+                    duplicate_discovery: smallvec::SmallVec::new(),
+                })
             } else {
                 Err(RuntimeError::SenderServiceBlocked)
             }
@@ -854,19 +1049,38 @@ fn plan_response_data_dispatch(
         ReliablePathStreamOutput::Switchable(binding) => {
             let lower_flights = binding.lower_flights_before_offset(next_offset);
             let targets = binding.sender_path_targets(relay_lane, payload_bytes);
+            let ordered_data_owner = binding.ordered_data_owner();
             let Some(target) = choose_response_sender_data_target(
                 &targets,
                 relay_lane,
                 payload_bytes,
                 binding.mux_limits(),
                 &lower_flights,
-                binding.ordinary_lead(),
+                ordered_data_owner,
             ) else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
-            Ok(ResponseDataDispatchTarget::Switchable {
-                binding: binding.clone(),
-                target,
+            let bulk_discovery = ordered_data_owner.is_some_and(|lead_key| {
+                response_target_needs_same_underlay_bulk_discovery(
+                    &target,
+                    lead_key,
+                    payload_bytes,
+                    binding.mux_limits(),
+                )
+            });
+            let duplicate_discovery = choose_quic_duplicate_discovery_targets(
+                &targets,
+                target.key,
+                payload_bytes,
+                binding.mux_limits(),
+            );
+            Ok(ResponseDataDispatchPlan {
+                primary: ResponseDataDispatchTarget::Switchable {
+                    binding: binding.clone(),
+                    target,
+                    bulk_discovery,
+                },
+                duplicate_discovery,
             })
         }
     }
@@ -879,11 +1093,10 @@ fn response_dispatch_payload_bytes(
     queued_payload_bytes: usize,
 ) -> usize {
     let snapshot = path_stream.send_path_snapshot(relay_lane, queued_payload_bytes);
-    adaptive_relay_chunk_bytes_for_underlay(
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         snapshot,
         relay_lane,
         mux_limits,
-        path_stream.underlay,
         path_stream.max_frame_payload_bytes,
     )
     .min(queued_payload_bytes)
@@ -936,11 +1149,15 @@ fn response_frame_has_carrier_credit(
 
 async fn emit_planned_response_data_frame(
     stream: &ReliablePathStream,
-    planned: ResponseDataDispatchTarget,
+    planned: ResponseDataDispatchPlan,
     frame: Frame,
     lane: FlowLane,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-    match planned {
+    let ResponseDataDispatchPlan {
+        primary,
+        duplicate_discovery,
+    } = planned;
+    match primary {
         ResponseDataDispatchTarget::Fixed(fixed) => {
             send_sender_service_frame_to_carrier(
                 fixed.commands(),
@@ -952,7 +1169,11 @@ async fn emit_planned_response_data_frame(
             fixed.record_flight(&frame, true);
             Ok(Some(fixed.key()))
         }
-        ResponseDataDispatchTarget::Switchable { binding, target } => {
+        ResponseDataDispatchTarget::Switchable {
+            binding,
+            target,
+            bulk_discovery,
+        } => {
             match send_sender_service_frame_to_carrier(
                 &target.commands,
                 frame.clone(),
@@ -971,7 +1192,13 @@ async fn emit_planned_response_data_frame(
                 }
             }
             binding.record_flight(target.key, &frame, true);
-            binding.set_ordinary_lead(target.key);
+            if bulk_discovery {
+                binding.record_bulk_discovery_bytes(
+                    target.key,
+                    reliable_stream_frame_payload_bytes(&frame),
+                );
+            }
+            binding.set_ordered_data_owner(target.key);
             record_server_sender_decision(
                 binding.session_id(),
                 stream.stream_id,
@@ -980,6 +1207,41 @@ async fn emit_planned_response_data_frame(
                 lane,
                 "data",
             );
+            for duplicate in duplicate_discovery {
+                match send_sender_service_frame_to_carrier(
+                    &duplicate.commands,
+                    frame.clone(),
+                    lane,
+                    ResponseCarrierEmitMode::Classified,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        binding.record_flight_with_ordering_owner(
+                            duplicate.key,
+                            &frame,
+                            false,
+                            false,
+                        );
+                        binding.record_bulk_discovery_bytes(
+                            duplicate.key,
+                            reliable_stream_frame_payload_bytes(&frame),
+                        );
+                        record_server_sender_decision(
+                            binding.session_id(),
+                            stream.stream_id,
+                            duplicate.key,
+                            &frame,
+                            lane,
+                            "duplicate_discovery",
+                        );
+                    }
+                    Err(RuntimeError::SenderServiceBlocked) => {}
+                    Err(_) => {
+                        binding.detach(duplicate.key, &duplicate.commands);
+                    }
+                }
+            }
             Ok(Some(target.key))
         }
     }
@@ -1045,7 +1307,7 @@ async fn emit_response_frame_from_sender_service(
                         if matches!(frame, Frame::StreamData { .. }) {
                             binding.record_flight(target.key, &frame, !repair);
                             if !repair {
-                                binding.set_ordinary_lead(target.key);
+                                binding.set_ordered_data_owner(target.key);
                             }
                         }
                         record_server_sender_decision(
@@ -1072,7 +1334,7 @@ async fn emit_response_frame_from_sender_service(
 }
 
 async fn send_sender_service_frame_to_carrier(
-    commands: &TcpPathSessionCommandSender,
+    commands: &ReliablePathCommandSender,
     frame: Frame,
     lane: FlowLane,
     emit_mode: ResponseCarrierEmitMode,
@@ -1112,15 +1374,18 @@ async fn emit_relay_path_frame(
     frame: Frame,
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
+    emit_relay_path_frame_with_mode(stream, frame, lane, ResponseCarrierEmitMode::Classified).await
+}
+
+async fn emit_relay_path_frame_with_mode(
+    stream: &ReliablePathStreamHandle,
+    frame: Frame,
+    lane: FlowLane,
+    emit_mode: ResponseCarrierEmitMode,
+) -> Result<(), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            send_sender_service_frame_to_carrier(
-                fixed.commands(),
-                frame,
-                lane,
-                ResponseCarrierEmitMode::Classified,
-            )
-            .await
+            send_sender_service_frame_to_carrier(fixed.commands(), frame, lane, emit_mode).await
         }
         ReliablePathStreamOutput::Switchable(_) => {
             Err(RuntimeError::Protocol("request relay path is not fixed"))
@@ -1192,9 +1457,14 @@ impl ServerResponseSenderService {
             }
             ReliableRelayQueuedWorkKind::Data(payload) => plan_response_data_dispatch(
                 path_stream,
-                relay_lane,
+                queued.data_lane.unwrap_or(relay_lane),
                 send_stream.next_offset(),
-                response_dispatch_payload_bytes(path_stream, relay_lane, mux_limits, payload.len()),
+                response_dispatch_payload_bytes(
+                    path_stream,
+                    queued.data_lane.unwrap_or(relay_lane),
+                    mux_limits,
+                    payload.len(),
+                ),
             )
             .is_ok(),
             ReliableRelayQueuedWorkKind::Repair { frame, .. } => response_frame_has_carrier_credit(
@@ -1241,8 +1511,8 @@ impl ServerResponseSenderService {
         )
     }
 
-    pub(super) fn enqueue_data(&mut self, payload: Bytes) -> u64 {
-        self.queue.push_data(payload)
+    pub(super) fn enqueue_data_for_lane(&mut self, payload: Bytes, lane: FlowLane) -> u64 {
+        self.queue.push_data_for_lane(payload, lane)
     }
 
     pub(super) fn enqueue_control_frame(&mut self, frame: Frame) -> u64 {
@@ -1291,16 +1561,17 @@ impl ServerResponseSenderService {
         let (frame, dispatch_lane_name) = match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => (frame.clone(), "control"),
             ReliableRelayQueuedWorkKind::Data(payload) => {
+                let data_lane = queued.data_lane.unwrap_or(relay_lane);
                 let dispatch_payload_bytes = response_dispatch_payload_bytes(
                     path_stream,
-                    relay_lane,
+                    data_lane,
                     mux_limits,
                     payload.len(),
                 );
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 let planned = plan_response_data_dispatch(
                     path_stream,
-                    relay_lane,
+                    data_lane,
                     send_stream.next_offset(),
                     dispatch_payload.len(),
                 )?;
@@ -1317,7 +1588,7 @@ impl ServerResponseSenderService {
                     path_stream,
                     planned,
                     frame.clone(),
-                    tcp_path_effective_frame_lane(&frame, relay_lane),
+                    reliable_path_effective_frame_lane(&frame, data_lane),
                 )
                 .await
                 {
@@ -1366,7 +1637,7 @@ impl ServerResponseSenderService {
             ReliableRelayQueuedWorkLane::Data => match emit_response_frame_from_sender_service(
                 path_stream,
                 frame.clone(),
-                tcp_path_effective_frame_lane(&frame, relay_lane),
+                reliable_path_effective_frame_lane(&frame, relay_lane),
                 ResponseCarrierEmitMode::Classified,
                 "data",
                 false,
@@ -1425,7 +1696,10 @@ impl ServerResponseSenderService {
         let send_lane = match queued_lane {
             ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
             ReliableRelayQueuedWorkLane::Repair => FlowLane::Latency,
-            ReliableRelayQueuedWorkLane::Data => tcp_path_effective_frame_lane(&frame, relay_lane),
+            ReliableRelayQueuedWorkLane::Data => reliable_path_effective_frame_lane(
+                &frame,
+                committed.data_lane.unwrap_or(relay_lane),
+            ),
         };
         #[cfg(feature = "lab-diagnostics")]
         let pacing_bytes = frame_pacing_bytes(&frame);
@@ -1504,7 +1778,7 @@ impl RelaySenderService {
         Self {
             stream_id,
             flights: RelayPathFlightLedger::default(),
-            ordinary_lead: None,
+            ordered_data_owner: None,
             next_send_index: 0,
         }
     }
@@ -1816,8 +2090,24 @@ impl RelaySenderService {
                 Err(err) => return Err(last_error.unwrap_or(err)),
             };
             let instance = remotes.paths[position].instance();
-            let lane = tcp_path_effective_frame_lane(&frame, remotes.paths[position].stream.lane);
-            match emit_relay_path_frame(&remotes.paths[position].stream, frame.clone(), lane).await
+            let (lane, emit_mode) = if matches!(cause, RelaySendCause::StreamFin) {
+                (
+                    remotes.paths[position].stream.lane,
+                    ResponseCarrierEmitMode::StreamOrdered,
+                )
+            } else {
+                (
+                    reliable_path_effective_frame_lane(&frame, remotes.paths[position].stream.lane),
+                    ResponseCarrierEmitMode::Classified,
+                )
+            };
+            match emit_relay_path_frame_with_mode(
+                &remotes.paths[position].stream,
+                frame.clone(),
+                lane,
+                emit_mode,
+            )
+            .await
             {
                 Ok(()) => {
                     if matches!(frame, Frame::StreamData { .. }) {
@@ -1827,8 +2117,8 @@ impl RelaySenderService {
                             instance.key.index,
                             sent_bytes,
                         );
-                        if !cause.is_repair() && self.ordinary_lead.is_none() {
-                            self.ordinary_lead = Some(instance.key);
+                        if !cause.is_repair() && self.ordered_data_owner.is_none() {
+                            self.ordered_data_owner = Some(instance.key);
                         }
                     }
                     self.next_send_index = if remotes.paths.is_empty() {
@@ -1843,8 +2133,8 @@ impl RelaySenderService {
                 }
                 Err(err) => {
                     last_error = Some(err);
-                    if self.ordinary_lead == Some(instance.key) {
-                        self.ordinary_lead = None;
+                    if self.ordered_data_owner == Some(instance.key) {
+                        self.ordered_data_owner = None;
                     }
                     remotes.fail_path_instance(context, instance).await;
                     if !remotes.paths.is_empty() {
@@ -1855,7 +2145,7 @@ impl RelaySenderService {
                 }
             }
         }
-        Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed))
+        Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed))
     }
 
     fn choose_relay_path_position(
@@ -1868,14 +2158,14 @@ impl RelaySenderService {
         avoid_keys: &[RelayPathKey],
     ) -> Result<usize, RuntimeError> {
         if remotes.paths.is_empty() {
-            return Err(RuntimeError::TcpPathSessionClosed);
+            return Err(RuntimeError::ReliablePathSessionClosed);
         }
         self.next_send_index %= remotes.paths.len();
         if self
-            .ordinary_lead
+            .ordered_data_owner
             .is_some_and(|lead| !remotes.contains_path_key(lead))
         {
-            self.ordinary_lead = None;
+            self.ordered_data_owner = None;
         }
         if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
             match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
@@ -1887,7 +2177,7 @@ impl RelaySenderService {
                 cursor: self.next_send_index,
                 avoid_keys,
                 path_flights: Some(&self.flights),
-                ordinary_lead: self.ordinary_lead,
+                ordered_data_owner: self.ordered_data_owner,
             }) {
                 BulkRelayPathChoice::Selected(position) => return Ok(position),
                 BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
@@ -1902,7 +2192,7 @@ impl RelaySenderService {
             avoid_keys,
             matches!(frame, Frame::StreamData { .. }) && !cause.is_repair(),
         )
-        .ok_or(RuntimeError::TcpPathSessionClosed)
+        .ok_or(RuntimeError::ReliablePathSessionClosed)
     }
 
     fn choose_lowest_eta_relay_path(
@@ -1932,7 +2222,7 @@ impl RelaySenderService {
                 })
                 .filter_map(|(position, path)| {
                     let key = path.key();
-                    let snapshot = relay_path_snapshot(context, key)?;
+                    let snapshot = context.reliable_path_snapshot(key)?;
                     let score = scheduler::score_path(
                         snapshot,
                         lane,
@@ -2018,7 +2308,7 @@ impl RelaySenderService {
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
         let Some(position) = remotes.paths.len().checked_sub(1) else {
-            return Err(RuntimeError::TcpPathSessionClosed);
+            return Err(RuntimeError::ReliablePathSessionClosed);
         };
         let instance = remotes.paths[position].instance();
         remotes.paths[position].stream.lane = lane;
@@ -2057,13 +2347,14 @@ impl RelaySenderService {
         if !resend_fin {
             return Ok(false);
         }
-        emit_relay_path_frame(
+        emit_relay_path_frame_with_mode(
             &remotes.paths[position].stream,
             Frame::StreamFin {
                 stream_id: remotes.stream_id(),
                 final_offset: send_stream.next_offset(),
             },
-            FlowLane::Control,
+            remotes.paths[position].stream.lane,
+            ResponseCarrierEmitMode::StreamOrdered,
         )
         .await?;
         Ok(true)
@@ -2122,7 +2413,7 @@ impl RelaySenderService {
         }
         let repair_path = remotes
             .primary_path_key()
-            .and_then(|key| relay_path_snapshot(context, key));
+            .and_then(|key| context.reliable_path_snapshot(key));
         let repair_limit =
             adaptive_reliable_relay_repair_bytes(repair_path, lane, context.mux_limits);
         let repair_frames = send_stream.retransmission_frames_for_ranges(&ranges, repair_limit);
@@ -2246,7 +2537,7 @@ mod tests {
         inflight_limit_bytes: u64,
         is_active: bool,
     ) -> ResponseSenderPathTarget {
-        let (commands, _receivers) = tcp_path_session_command_channels(8);
+        let (commands, _receivers) = reliable_path_command_channels(8);
         let mut snapshot =
             PathSnapshot::new(PathId(path_id), underlay, eta_ms.max(1.0), 500_000_000.0);
         snapshot.bytes_in_flight = bytes_in_flight;
@@ -2263,6 +2554,8 @@ mod tests {
             eta_ms,
             is_active,
             has_sender_evidence: true,
+            has_bulk_rate_evidence: true,
+            bulk_discovery_sent_bytes: 0,
         }
     }
 
@@ -2293,10 +2586,98 @@ mod tests {
     }
 
     #[test]
+    fn response_stream_ordered_final_control_stays_on_active_lead() {
+        let active_data_owner =
+            response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 512 * 1024, true);
+        let validation_lower_eta =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 512 * 1024, false);
+
+        let selected = choose_response_sender_target(
+            &[active_data_owner.clone(), validation_lower_eta],
+            FlowLane::Throughput,
+            &Frame::StreamFin {
+                stream_id: StreamId(7),
+                final_offset: 2 * 1024 * 1024,
+            },
+            ResponseCarrierEmitMode::StreamOrdered,
+            MuxLimits::default(),
+            &[],
+            &[],
+            false,
+        )
+        .expect("stream-ordered final control should remain dispatchable");
+
+        assert_eq!(
+            selected.key, active_data_owner.key,
+            "FIN/final-offset must not move to a validation path and overtake older data"
+        );
+    }
+
+    #[test]
+    fn response_stream_ordered_final_control_waits_for_backpressured_active_lead() {
+        let (active_commands, _active_receivers) = reliable_path_command_channels(1);
+        active_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(7),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("fill active data queue");
+        let mut active_data_owner =
+            response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 512 * 1024, true);
+        active_data_owner.commands = active_commands;
+        let validation_lower_eta =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 512 * 1024, false);
+
+        let selected = choose_response_sender_target(
+            &[active_data_owner, validation_lower_eta],
+            FlowLane::Throughput,
+            &Frame::StreamFin {
+                stream_id: StreamId(7),
+                final_offset: 2 * 1024 * 1024,
+            },
+            ResponseCarrierEmitMode::StreamOrdered,
+            MuxLimits::default(),
+            &[],
+            &[],
+            false,
+        );
+
+        assert!(
+            selected.is_none(),
+            "stream-ordered FIN must wait behind older active-owner data instead of escaping to validation output"
+        );
+    }
+
+    #[test]
+    fn single_active_response_target_still_obeys_bulk_admission() {
+        let saturated =
+            response_target(0, UnderlayProtocol::Udp, 1.0, 512 * 1024, 512 * 1024, true);
+
+        let selected = choose_response_sender_data_target(
+            &[saturated],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            None,
+        );
+
+        assert!(
+            selected.is_none(),
+            "a temporarily single attached output must not bypass product/carrier flight admission"
+        );
+    }
+
+    #[test]
     fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = 8 * 1024;
-        let (commands, _receivers) = tcp_path_session_command_channels(2048);
+        let (commands, _receivers) = reliable_path_command_channels(2048);
         let mut snapshot = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 1.0, 8_000_000.0);
         snapshot.confidence = 1.0;
         let saturated = ResponseSenderPathTarget {
@@ -2309,6 +2690,8 @@ mod tests {
             eta_ms: 1.0,
             is_active: true,
             has_sender_evidence: true,
+            has_bulk_rate_evidence: true,
+            bulk_discovery_sent_bytes: 0,
         };
         let credit = response_target_emission_credit_bytes(
             &saturated,
@@ -2399,6 +2782,651 @@ mod tests {
     }
 
     #[test]
+    fn quic_proof_success_path_does_not_become_unique_discovery_owner() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let active = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            1.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let mut proof_success = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
+        proof_success.snapshot.delivery_rate_bps = default_path_rate_bps(UnderlayProtocol::Udp);
+        proof_success.snapshot.pacing_rate_bps = proof_success.snapshot.delivery_rate_bps;
+        proof_success.snapshot.app_limited = true;
+        proof_success.snapshot.confidence = 1.0;
+        proof_success.has_bulk_rate_evidence = false;
+
+        let selected = choose_response_sender_data_target(
+            &[active.clone(), proof_success.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(active.key),
+        )
+        .expect("active path should remain the unique owner");
+
+        assert_eq!(
+            selected.key, active.key,
+            "proof-success QUIC validation paths must use duplicate/non-owner discovery, not unique owner data"
+        );
+
+        let mut discovery_in_flight = proof_success;
+        discovery_in_flight.snapshot.product_bytes_in_flight = payload_bytes as u64;
+        let selected_after_credit = choose_response_sender_data_target(
+            &[active.clone(), discovery_in_flight.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(active.key),
+        )
+        .expect("active path remains available while discovery flight is outstanding");
+
+        assert_eq!(
+            selected_after_credit.key, active.key,
+            "proof-only discovery is one bounded quantum until ACK-derived data evidence arrives"
+        );
+    }
+
+    #[test]
+    fn quic_proof_success_path_gets_duplicate_non_owner_discovery() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let active = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            1.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let mut proof_success = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
+        proof_success.has_bulk_rate_evidence = false;
+
+        let duplicates = choose_quic_duplicate_discovery_targets(
+            &[active.clone(), proof_success.clone()],
+            active.key,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].key, proof_success.key);
+    }
+
+    #[test]
+    fn tcp_primary_can_duplicate_discover_proof_success_udp_path() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let primary = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            50.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let mut proof_success = response_target(1, UnderlayProtocol::Udp, 10.0, 0, 0, false);
+        proof_success.has_bulk_rate_evidence = false;
+
+        let duplicates = choose_quic_duplicate_discovery_targets(
+            &[primary.clone(), proof_success.clone()],
+            primary.key,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(
+            duplicates[0].key, proof_success.key,
+            "a TCP primary must be allowed to send bounded duplicate STREAM_DATA on proof-success UDP paths so mixed mode can obtain QUIC bulk-rate evidence without moving ownership"
+        );
+    }
+
+    #[test]
+    fn measured_udp_bulk_path_beats_poor_tcp_active_path() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let active_tcp = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            150.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let measured_udp = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            10.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+
+        let selected = choose_response_sender_data_target(
+            &[active_tcp, measured_udp.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            }),
+        )
+        .expect("measured UDP path should be eligible for ordinary bulk");
+
+        assert_eq!(
+            selected.key, measured_udp.key,
+            "carrier family must not override link metrics once UDP has bulk-rate evidence"
+        );
+    }
+
+    #[test]
+    fn measured_udp_bulk_path_beats_unproven_active_udp_path() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut active_unproven_udp = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        active_unproven_udp.has_bulk_rate_evidence = false;
+        let measured_udp = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            10.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+
+        let selected = choose_response_sender_data_target(
+            &[active_unproven_udp, measured_udp.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            }),
+        )
+        .expect("measured UDP path should be eligible for ordinary bulk");
+
+        assert_eq!(
+            selected.key, measured_udp.key,
+            "active UDP bootstrap must yield to a bulk-rate-proven UDP path"
+        );
+    }
+
+    #[test]
+    fn repair_prefers_bulk_proven_path_over_proof_only_low_eta_path() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let original_owner = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            20.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let proven_alternate = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            50.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        let mut proof_only_udp = response_target(
+            2,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        proof_only_udp.has_bulk_rate_evidence = false;
+
+        let selected = choose_response_sender_target(
+            &[
+                original_owner.clone(),
+                proven_alternate.clone(),
+                proof_only_udp,
+            ],
+            FlowLane::Latency,
+            &Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![0; payload_bytes]),
+            },
+            ResponseCarrierEmitMode::Classified,
+            mux_limits,
+            &[],
+            &[original_owner.key],
+            true,
+        )
+        .expect("repair should remain dispatchable on the proven alternate");
+
+        assert_eq!(
+            selected.key, proven_alternate.key,
+            "repair must not treat proof-only validation as bulk-capable just because it has lower ETA"
+        );
+    }
+
+    #[test]
+    fn repair_can_use_proof_only_path_when_no_proven_repair_path_exists() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let original_owner = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            20.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let mut proof_only_udp = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        proof_only_udp.has_bulk_rate_evidence = false;
+
+        let selected = choose_response_sender_target(
+            &[original_owner.clone(), proof_only_udp.clone()],
+            FlowLane::Latency,
+            &Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![0; payload_bytes]),
+            },
+            ResponseCarrierEmitMode::Classified,
+            mux_limits,
+            &[],
+            &[original_owner.key],
+            true,
+        )
+        .expect("repair may fall back to the only non-owner path");
+
+        assert_eq!(
+            selected.key, proof_only_udp.key,
+            "proof-only validation remains a bounded fallback when no proven repair path exists"
+        );
+    }
+
+    #[test]
+    fn quic_duplicate_discovery_uses_total_credit_not_only_outstanding_debt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let active = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            1.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let mut spent = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
+        spent.has_bulk_rate_evidence = false;
+        spent.bulk_discovery_sent_bytes = payload_bytes as u64;
+
+        let duplicates = choose_quic_duplicate_discovery_targets(
+            &[active.clone(), spent],
+            active.key,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert!(
+            duplicates.is_empty(),
+            "a proof-success QUIC path gets one bounded duplicate-discovery credit until real bulk evidence arrives"
+        );
+    }
+
+    #[test]
+    fn response_dispatch_plan_carries_quic_duplicate_discovery_without_changing_primary() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let (active_commands, _active_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(77),
+            UnderlayProtocol::Udp,
+            PathId(0),
+            active_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (validation_commands, _validation_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Udp,
+                PathId(1),
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.update_path_metrics(
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(1),
+            },
+            PathMetrics {
+                path_id: PathId(1),
+                underlay: UnderlayProtocol::Udp,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 1_000_000,
+                pacing_rate_bps: 1_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: payload_bytes as u64,
+                inflight_hi_bytes: payload_bytes as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frames_rx,
+        };
+
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+            .expect("active path should remain dispatchable");
+
+        assert_eq!(
+            plan.primary_key(),
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            })
+        );
+        assert_eq!(plan.duplicate_discovery.len(), 1);
+        assert_eq!(
+            plan.duplicate_discovery[0].key,
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(1),
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_dispatch_plan_carries_udp_duplicate_discovery_when_primary_is_tcp() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let (active_commands, _active_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(79),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            active_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        binding.update_path_metrics(
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            },
+            PathMetrics {
+                path_id: PathId(0),
+                underlay: UnderlayProtocol::Tcp,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 50_000,
+                srtt_us: 50_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 200_000_000,
+                pacing_rate_bps: 200_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: payload_bytes as u64,
+                inflight_hi_bytes: payload_bytes as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 4,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (validation_commands, _validation_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Udp,
+                PathId(1),
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.update_path_metrics(
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(1),
+            },
+            PathMetrics {
+                path_id: PathId(1),
+                underlay: UnderlayProtocol::Udp,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 1_000_000,
+                pacing_rate_bps: 1_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: payload_bytes as u64,
+                inflight_hi_bytes: payload_bytes as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frames_rx,
+        };
+
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+            .expect("TCP primary remains dispatchable");
+
+        assert_eq!(
+            plan.primary_key(),
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            })
+        );
+        assert_eq!(plan.duplicate_discovery.len(), 1);
+        assert_eq!(
+            plan.duplicate_discovery[0].key,
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(1),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn quic_duplicate_discovery_emits_non_owner_copy_without_migrating_lead() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let (active_commands, mut active_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(78),
+            UnderlayProtocol::Udp,
+            PathId(0),
+            active_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (validation_commands, mut validation_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Udp,
+                PathId(1),
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.update_path_metrics(
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(1),
+            },
+            PathMetrics {
+                path_id: PathId(1),
+                underlay: UnderlayProtocol::Udp,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 1_000_000,
+                pacing_rate_bps: 1_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: payload_bytes as u64,
+                inflight_hi_bytes: payload_bytes as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+            .expect("active path should remain dispatchable");
+        let frame = Frame::StreamData {
+            stream_id: StreamId(7),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![7_u8; payload_bytes]),
+        };
+
+        let selected =
+            emit_planned_response_data_frame(&stream, plan, frame.clone(), FlowLane::Throughput)
+                .await
+                .expect("primary data and duplicate discovery should emit");
+
+        assert_eq!(
+            selected,
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            })
+        );
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            })
+        );
+        assert!(matches!(
+            recv_reliable_path_command(&mut active_rx).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert!(matches!(
+            recv_reliable_path_command(&mut validation_rx).await,
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+        assert!(matches!(
+            recv_reliable_path_command(&mut validation_rx).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        let lower = binding.lower_flights_before_offset(payload_bytes as u64);
+        assert_eq!(lower.len(), 1);
+        assert_eq!(
+            lower[0].key,
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            }
+        );
+    }
+
+    #[test]
     fn single_response_carrier_uses_sliding_window_not_multipath_ordering_debt() {
         let target = response_target(
             0,
@@ -2427,7 +3455,7 @@ mod tests {
     }
 
     #[test]
-    fn response_lower_owner_uses_sliding_window_with_other_carriers_attached() {
+    fn proven_udp_candidate_can_overtake_large_lower_owner_when_completion_model_allows() {
         let owner = response_target(
             0,
             UnderlayProtocol::Udp,
@@ -2443,20 +3471,20 @@ mod tests {
         }];
 
         let selected = choose_response_sender_data_target(
-            &[owner.clone(), alternate],
+            &[owner.clone(), alternate.clone()],
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
             &lower_flights,
             Some(owner.key),
         )
-        .expect("same-carrier lower flight remains admissible with other carriers attached");
+        .expect("bulk-rate-proven same-underlay candidate should remain eligible under ECF/BLEST");
 
-        assert_eq!(selected.key, owner.key);
+        assert_eq!(selected.key, alternate.key);
     }
 
     #[test]
-    fn response_quic_same_stream_unique_data_stays_on_lower_owner_until_debt_clears() {
+    fn proven_udp_candidate_is_not_blocked_by_lower_udp_owner_when_within_reorder_budget() {
         let owner = response_target(
             0,
             UnderlayProtocol::Udp,
@@ -2480,9 +3508,62 @@ mod tests {
             &lower_flights,
             Some(owner.key),
         )
-        .expect("lower-frontier QUIC owner should remain selected");
+        .expect("bulk-rate-proven QUIC candidate should be admitted by completion/reorder math");
+
+        assert_eq!(selected.key.path_id, PathId(1));
+    }
+
+    #[test]
+    fn proof_only_udp_candidate_is_blocked_from_unique_data_with_lower_udp_owner() {
+        let owner = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            80.0,
+            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+            true,
+        );
+        let mut proof_only =
+            response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
+        proof_only.has_bulk_rate_evidence = false;
+        let lower_flights = vec![CarrierPathFlightDebt {
+            key: owner.key,
+            bytes: 64 * 1024,
+        }];
+
+        let selected = choose_response_sender_data_target(
+            &[owner.clone(), proof_only],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &lower_flights,
+            Some(owner.key),
+        )
+        .expect("proof-only path should not own unique later bytes");
 
         assert_eq!(selected.key, owner.key);
+    }
+
+    #[test]
+    fn proof_only_tcp_candidate_does_not_displace_bulk_rate_proven_udp() {
+        let bulk_proven_udp =
+            response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut proof_only_tcp =
+            response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        proof_only_tcp.has_sender_evidence = true;
+        proof_only_tcp.has_bulk_rate_evidence = false;
+
+        let selected = choose_response_sender_data_target(
+            &[bulk_proven_udp.clone(), proof_only_tcp],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(bulk_proven_udp.key),
+        )
+        .expect("bulk-rate-proven path should remain unique ordered owner");
+
+        assert_eq!(selected.key, bulk_proven_udp.key);
     }
 
     #[test]

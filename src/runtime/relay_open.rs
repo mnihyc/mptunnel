@@ -102,7 +102,7 @@ impl ReliableRelayRemoteSet {
             .map(|path| path.path_index)
     }
 
-    pub(super) fn active_carrier_underlay(&self) -> Option<UnderlayProtocol> {
+    pub(super) fn active_path_underlay(&self) -> Option<UnderlayProtocol> {
         self.active_path_position()
             .and_then(|position| self.paths.get(position))
             .map(|path| path.stream.underlay)
@@ -205,7 +205,7 @@ impl ReliableRelayRemoteSet {
             let _ = frames_tx
                 .send(ReliableRelayRemoteFrame {
                     instance,
-                    frame: Err(RuntimeError::TcpPathSessionClosed),
+                    frame: Err(RuntimeError::ReliablePathSessionClosed),
                 })
                 .await;
         });
@@ -215,6 +215,9 @@ impl ReliableRelayRemoteSet {
             placement,
             stream,
         };
+        if placement == RelayPathPlacement::Validation {
+            let _ = path.stream.enqueue_path_proof();
+        }
         let insert_at = match placement {
             RelayPathPlacement::Active => self.paths.len(),
             RelayPathPlacement::Repair | RelayPathPlacement::Validation
@@ -231,7 +234,7 @@ impl ReliableRelayRemoteSet {
         self.frames_rx
             .recv()
             .await
-            .ok_or(RuntimeError::TcpPathSessionClosed)
+            .ok_or(RuntimeError::ReliablePathSessionClosed)
     }
 
     pub(super) fn has_buffered_frame(&self) -> bool {
@@ -352,7 +355,7 @@ pub(super) async fn open_remote_stream(
     ingress: IngressKind,
     lane: FlowLane,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    let stream_id = context.allocate_tcp_stream_id()?;
+    let stream_id = context.allocate_reliable_stream_id()?;
     open_remote_stream_with_id(context, stream_id, target, ingress, lane).await
 }
 
@@ -477,7 +480,7 @@ pub(super) fn reliable_relay_attach_open_timeout(
     key: RelayPathKey,
     lane: FlowLane,
 ) -> Duration {
-    reliable_relay_stall_timeout(relay_path_snapshot(context, key), lane)
+    reliable_relay_stall_timeout(context.reliable_path_snapshot(key), lane)
 }
 
 pub(super) async fn open_remote_stream_on_reserved_path(
@@ -681,7 +684,7 @@ pub(super) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::Encrypted(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
-            | RuntimeError::TcpPathSessionClosed
+            | RuntimeError::ReliablePathSessionClosed
             | RuntimeError::PathHeartbeatTimeout
             | RuntimeError::PathOpenTimedOut
             | RuntimeError::Protocol(_)
@@ -705,7 +708,7 @@ pub(super) fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError
         result,
         Err(RuntimeError::PathHeartbeatTimeout)
             | Err(RuntimeError::PathOpenTimedOut)
-            | Err(RuntimeError::TcpPathSessionClosed)
+            | Err(RuntimeError::ReliablePathSessionClosed)
             | Err(RuntimeError::Tcp(_))
             | Err(RuntimeError::Encrypted(_))
             | Err(RuntimeError::RemoteClosed(_))

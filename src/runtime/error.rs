@@ -41,7 +41,7 @@ pub enum RuntimeError {
     PathHeartbeatTimeout,
     DatagramResponseTimedOut,
     SenderServiceBlocked,
-    TcpPathSessionClosed,
+    ReliablePathSessionClosed,
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
     Protocol(&'static str),
@@ -178,7 +178,7 @@ impl std::fmt::Display for RuntimeError {
             Self::SenderServiceBlocked => {
                 write!(f, "sender service has no currently admissible path")
             }
-            Self::TcpPathSessionClosed => write!(f, "TCP path session closed"),
+            Self::ReliablePathSessionClosed => write!(f, "reliable path session closed"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
@@ -216,7 +216,7 @@ impl std::error::Error for RuntimeError {
             | Self::PathHeartbeatTimeout
             | Self::DatagramResponseTimedOut
             | Self::SenderServiceBlocked
-            | Self::TcpPathSessionClosed
+            | Self::ReliablePathSessionClosed
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)
             | Self::Protocol(_) => None,

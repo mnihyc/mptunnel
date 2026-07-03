@@ -9,8 +9,8 @@ pub(super) struct BulkPathCandidate {
     pub(super) key: RelayPathKey,
     pub(super) eta_ms: f64,
     pub(super) has_evidence: bool,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) has_sender_delivery_evidence: bool,
-    pub(super) has_configured_performance_hint: bool,
     pub(super) snapshot: PathSnapshot,
 }
 
@@ -586,7 +586,6 @@ mod tests {
             eta_ms,
             has_evidence: true,
             has_sender_delivery_evidence: true,
-            has_configured_performance_hint: false,
             snapshot: PathSnapshot::new(
                 PathId(index as u16),
                 UnderlayProtocol::Udp,
@@ -712,6 +711,33 @@ mod tests {
                 BulkAdmissionRole::ActiveDataPath,
             ),
             Some("inflight_limit")
+        );
+    }
+
+    #[test]
+    fn active_udp_clear_frontier_does_not_use_configured_window_as_credit() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 60.0, mbps(200.0));
+        candidate.inflight_limit_bytes = 512 * 1024;
+        candidate.product_bytes_in_flight = 512 * 1024;
+        candidate.queue_bytes = 0;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                candidate,
+                10.0,
+                candidate,
+                10.0,
+                64 * 1024,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "active lead status must not expand product flight to the configured stream/reorder window"
         );
     }
 

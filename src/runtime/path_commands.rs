@@ -2,28 +2,35 @@ use super::reliable_path::ReliablePathStream;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
+    FlowLane::Control,
+    FlowLane::Latency,
+    FlowLane::RealtimeDatagram,
+    FlowLane::Background,
+];
+
 #[derive(Clone)]
-pub(super) struct TcpPathSessionCommandSender {
-    control: mpsc::Sender<TcpPathSessionCommand>,
-    priority: mpsc::Sender<TcpPathSessionCommand>,
-    data: mpsc::Sender<TcpPathSessionCommand>,
-    metrics: Arc<TcpPathSessionCommandQueueMetrics>,
+pub(super) struct ReliablePathCommandSender {
+    control: mpsc::Sender<ReliablePathCommand>,
+    priority: mpsc::Sender<ReliablePathCommand>,
+    data: mpsc::Sender<ReliablePathCommand>,
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
 }
 
-pub(super) struct TcpPathSessionCommandReceivers {
-    control: mpsc::Receiver<TcpPathSessionCommand>,
-    priority: mpsc::Receiver<TcpPathSessionCommand>,
-    data: mpsc::Receiver<TcpPathSessionCommand>,
-    metrics: Arc<TcpPathSessionCommandQueueMetrics>,
+pub(super) struct ReliablePathCommandReceivers {
+    control: mpsc::Receiver<ReliablePathCommand>,
+    priority: mpsc::Receiver<ReliablePathCommand>,
+    data: mpsc::Receiver<ReliablePathCommand>,
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
 }
 
 #[derive(Default)]
-struct TcpPathSessionCommandQueueMetrics {
+struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     capacity_released: Arc<Notify>,
 }
 
-impl TcpPathSessionCommandQueueMetrics {
+impl ReliablePathCommandQueueMetrics {
     fn add_pending_bytes(&self, bytes: usize) {
         self.pending_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -45,7 +52,7 @@ impl TcpPathSessionCommandQueueMetrics {
     }
 }
 
-impl TcpPathSessionCommandReceivers {
+impl ReliablePathCommandReceivers {
     pub(super) fn release_pending_command_bytes(&self, bytes: usize) {
         self.metrics.release_pending_bytes(bytes);
     }
@@ -56,15 +63,15 @@ impl TcpPathSessionCommandReceivers {
     }
 }
 
-impl TcpPathSessionCommandSender {
+impl ReliablePathCommandSender {
     pub(super) async fn send_control(
         &self,
-        command: TcpPathSessionCommand,
-    ) -> Result<(), mpsc::error::SendError<TcpPathSessionCommand>> {
+        command: ReliablePathCommand,
+    ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         #[cfg(feature = "lab-diagnostics")]
-        let command_kind = tcp_path_command_kind(&command);
+        let command_kind = reliable_path_command_kind(&command);
         #[cfg(feature = "lab-diagnostics")]
-        let stream_id = tcp_path_command_stream_id(&command);
+        let stream_id = reliable_path_command_stream_id(&command);
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
         let result = self.control.send(command).await;
@@ -90,9 +97,9 @@ impl TcpPathSessionCommandSender {
         &self,
         stream_id: StreamId,
         lane: FlowLane,
-    ) -> Result<(), mpsc::error::SendError<TcpPathSessionCommand>> {
-        let command = TcpPathSessionCommand::CloseStream(stream_id);
-        let queue = if tcp_path_frame_uses_priority_queue(lane) {
+    ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
+        let command = ReliablePathCommand::CloseStream(stream_id);
+        let queue = if reliable_path_frame_uses_priority_queue(lane) {
             &self.priority
         } else {
             &self.data
@@ -103,7 +110,7 @@ impl TcpPathSessionCommandSender {
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
-            let queue_name = if tcp_path_frame_uses_priority_queue(lane) {
+            let queue_name = if reliable_path_frame_uses_priority_queue(lane) {
                 "priority"
             } else {
                 "data"
@@ -146,13 +153,13 @@ impl TcpPathSessionCommandSender {
         effective_lane_override: Option<FlowLane>,
     ) -> Result<(), RuntimeError> {
         let bytes = frame_pacing_bytes(&frame);
-        let effective_lane =
-            effective_lane_override.unwrap_or_else(|| tcp_path_effective_frame_lane(&frame, lane));
+        let effective_lane = effective_lane_override
+            .unwrap_or_else(|| reliable_path_effective_frame_lane(&frame, lane));
         #[cfg(feature = "lab-diagnostics")]
-        let frame_kind = tcp_path_frame_kind(&frame);
+        let frame_kind = reliable_path_frame_kind(&frame);
         #[cfg(feature = "lab-diagnostics")]
-        let stream_id = tcp_path_frame_stream_id(&frame);
-        let queue = if tcp_path_frame_uses_priority_queue(effective_lane) {
+        let stream_id = reliable_path_frame_stream_id(&frame);
+        let queue = if reliable_path_frame_uses_priority_queue(effective_lane) {
             &self.priority
         } else {
             &self.data
@@ -160,19 +167,19 @@ impl TcpPathSessionCommandSender {
         let result = match queue.try_reserve() {
             Ok(permit) => {
                 self.metrics.add_pending_bytes(bytes);
-                permit.send(TcpPathSessionCommand::SendFrame(frame));
+                permit.send(ReliablePathCommand::SendFrame(frame));
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 Err(RuntimeError::SenderServiceBlocked)
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                Err(RuntimeError::TcpPathSessionClosed)
+                Err(RuntimeError::ReliablePathSessionClosed)
             }
         };
         #[cfg(feature = "lab-diagnostics")]
         {
-            let queue_name = if tcp_path_frame_uses_priority_queue(effective_lane) {
+            let queue_name = if reliable_path_frame_uses_priority_queue(effective_lane) {
                 "priority"
             } else {
                 "data"
@@ -199,7 +206,7 @@ impl TcpPathSessionCommandSender {
     }
 
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
-        let effective_lane = tcp_path_effective_frame_lane(frame, lane);
+        let effective_lane = reliable_path_effective_frame_lane(frame, lane);
         self.can_enqueue_lane_now(effective_lane)
     }
 
@@ -208,7 +215,7 @@ impl TcpPathSessionCommandSender {
     }
 
     pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
-        if tcp_path_frame_uses_priority_queue(lane) {
+        if reliable_path_frame_uses_priority_queue(lane) {
             self.priority.capacity() > 0
         } else {
             self.data.capacity() > 0
@@ -235,14 +242,14 @@ impl TcpPathSessionCommandSender {
     }
 }
 
-pub(super) fn tcp_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
+pub(super) fn reliable_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
     matches!(
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
-pub(super) fn tcp_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane) -> FlowLane {
+pub(super) fn reliable_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane) -> FlowLane {
     match frame {
         Frame::StreamData { .. } => stream_lane,
         Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } => FlowLane::RealtimeDatagram,
@@ -250,22 +257,22 @@ pub(super) fn tcp_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane
     }
 }
 
-pub(super) fn tcp_path_session_command_channels(
+pub(super) fn reliable_path_command_channels(
     queue: usize,
-) -> (TcpPathSessionCommandSender, TcpPathSessionCommandReceivers) {
+) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
     let queue = queue.max(1);
     let (control_tx, control_rx) = mpsc::channel(queue);
     let (priority_tx, priority_rx) = mpsc::channel(queue);
     let (data_tx, data_rx) = mpsc::channel(queue);
-    let metrics = Arc::new(TcpPathSessionCommandQueueMetrics::default());
+    let metrics = Arc::new(ReliablePathCommandQueueMetrics::default());
     (
-        TcpPathSessionCommandSender {
+        ReliablePathCommandSender {
             control: control_tx,
             priority: priority_tx,
             data: data_tx,
             metrics: metrics.clone(),
         },
-        TcpPathSessionCommandReceivers {
+        ReliablePathCommandReceivers {
             control: control_rx,
             priority: priority_rx,
             data: data_rx,
@@ -274,25 +281,25 @@ pub(super) fn tcp_path_session_command_channels(
     )
 }
 
-fn tcp_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
+fn path_command_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
     !receiver.is_closed() || !receiver.is_empty()
 }
 
-pub(super) fn tcp_path_receivers_closed(receivers: &TcpPathSessionCommandReceivers) -> bool {
-    !tcp_receiver_may_recv(&receivers.control)
-        && !tcp_receiver_may_recv(&receivers.priority)
-        && !tcp_receiver_may_recv(&receivers.data)
+pub(super) fn reliable_path_receivers_closed(receivers: &ReliablePathCommandReceivers) -> bool {
+    !path_command_receiver_may_recv(&receivers.control)
+        && !path_command_receiver_may_recv(&receivers.priority)
+        && !path_command_receiver_may_recv(&receivers.data)
 }
 
-pub(super) async fn recv_tcp_path_command(
-    receivers: &mut TcpPathSessionCommandReceivers,
-) -> Option<TcpPathSessionCommand> {
+pub(super) async fn recv_reliable_path_command(
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
     if let Some(command) = recv_ready_priority_command(receivers) {
         return Some(command);
     }
-    let control_may_recv = tcp_receiver_may_recv(&receivers.control);
-    let priority_may_recv = tcp_receiver_may_recv(&receivers.priority);
-    let data_may_recv = tcp_receiver_may_recv(&receivers.data);
+    let control_may_recv = path_command_receiver_may_recv(&receivers.control);
+    let priority_may_recv = path_command_receiver_may_recv(&receivers.priority);
+    let data_may_recv = path_command_receiver_may_recv(&receivers.data);
     match (control_may_recv, priority_may_recv, data_may_recv) {
         (true, true, true) => {
             tokio::select! {
@@ -330,19 +337,52 @@ pub(super) async fn recv_tcp_path_command(
     }
 }
 
-pub(super) fn try_recv_tcp_path_command(
-    receivers: &mut TcpPathSessionCommandReceivers,
-) -> Option<TcpPathSessionCommand> {
+pub(super) fn try_recv_reliable_path_command(
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
     recv_ready_priority_command(receivers).or_else(|| receivers.data.try_recv().ok())
 }
 
-pub(super) fn try_recv_tcp_path_priority_command(
-    receivers: &mut TcpPathSessionCommandReceivers,
-) -> Option<TcpPathSessionCommand> {
+pub(super) fn try_recv_reliable_path_priority_command(
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
     recv_ready_priority_command(receivers)
 }
 
-pub(super) fn tcp_path_command_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
+pub(super) fn reliable_path_writer_should_coalesce_partial_bulk_run(
+    sent_items: usize,
+    sent_bytes: usize,
+    byte_budget: usize,
+    item_budget: usize,
+) -> bool {
+    sent_items > 0 && sent_bytes > 0 && sent_bytes < byte_budget && sent_items < item_budget
+}
+
+pub(super) async fn try_coalesce_reliable_path_writer_run(
+    receivers: &mut ReliablePathCommandReceivers,
+    next_command: &mut Option<ReliablePathCommand>,
+    sent_items: usize,
+    sent_bytes: usize,
+    byte_budget: usize,
+    item_budget: usize,
+) -> bool {
+    if !reliable_path_writer_should_coalesce_partial_bulk_run(
+        sent_items,
+        sent_bytes,
+        byte_budget,
+        item_budget,
+    ) {
+        return false;
+    }
+    tokio::task::yield_now().await;
+    if let Some(command) = try_recv_reliable_path_command(receivers) {
+        *next_command = Some(command);
+        return true;
+    }
+    false
+}
+
+pub(super) fn reliable_path_command_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
     let frame_payload =
         reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
             .min(mux_limits.max_reliable_relay_chunk_bytes)
@@ -367,37 +407,111 @@ pub(super) fn tcp_path_command_writer_run_budget_bytes(mux_limits: MuxLimits) ->
         .max(1)
 }
 
-pub(super) fn tcp_path_command_writer_run_budget_items(mux_limits: MuxLimits) -> usize {
-    tcp_path_command_queue(mux_limits).max(1)
+pub(super) fn reliable_path_command_writer_run_budget_items(mux_limits: MuxLimits) -> usize {
+    reliable_path_command_queue(mux_limits).max(1)
+}
+
+pub(super) fn reliable_path_command_queue(mux_limits: MuxLimits) -> usize {
+    let frame_payload = reliable_path_command_queue_payload(mux_limits);
+    reliable_path_command_queue_for_payload(mux_limits, frame_payload)
+}
+
+pub(super) fn reliable_path_command_queue_for_payload(
+    mux_limits: MuxLimits,
+    frame_payload_bytes: usize,
+) -> usize {
+    let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
+    let priority_headroom = reliable_path_priority_headroom_frames();
+    let inflight_frames = mux_limits
+        .max_path_flight_bytes
+        .saturating_add(frame_payload - 1)
+        / frame_payload;
+    inflight_frames
+        .saturating_add(priority_headroom)
+        .max(priority_headroom)
+        .min(reliable_path_writer_frame_queue_for_payload(
+            mux_limits,
+            frame_payload,
+        ))
+}
+
+pub(super) fn reliable_path_writer_frame_queue(mux_limits: MuxLimits) -> usize {
+    let frame_payload = reliable_path_command_queue_payload(mux_limits);
+    reliable_path_writer_frame_queue_for_payload(mux_limits, frame_payload)
+}
+
+fn reliable_path_command_queue_payload(mux_limits: MuxLimits) -> usize {
+    reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+        .min(mux_limits.max_reliable_relay_chunk_bytes)
+        .min(mux_limits.max_payload_bytes)
+        .max(1)
+}
+
+pub(super) fn reliable_path_writer_frame_queue_for_payload(
+    mux_limits: MuxLimits,
+    frame_payload_bytes: usize,
+) -> usize {
+    reliable_stream_frame_queue_for_payload(mux_limits, frame_payload_bytes)
+        .saturating_mul(reliable_path_writer_lane_count())
+        .max(reliable_path_writer_lane_count())
+}
+
+pub(super) fn reliable_stream_frame_queue(mux_limits: MuxLimits) -> usize {
+    let frame_payload = mux_limits
+        .max_reliable_relay_chunk_bytes
+        .min(mux_limits.max_payload_bytes)
+        .max(1);
+    reliable_stream_frame_queue_for_payload(mux_limits, frame_payload)
+}
+
+pub(super) fn reliable_stream_frame_queue_for_payload(
+    mux_limits: MuxLimits,
+    frame_payload_bytes: usize,
+) -> usize {
+    let frame_payload = frame_payload_bytes.min(mux_limits.max_payload_bytes).max(1);
+    let priority_headroom = reliable_path_priority_headroom_frames();
+    (mux_limits.max_reorder_bytes / frame_payload)
+        .saturating_add(priority_headroom)
+        .max(priority_headroom)
+}
+
+pub(super) fn reliable_path_priority_headroom_frames() -> usize {
+    RELIABLE_PATH_PRIORITY_HEADROOM_LANES.len()
+}
+
+fn reliable_path_writer_lane_count() -> usize {
+    RELIABLE_PATH_PRIORITY_HEADROOM_LANES
+        .len()
+        .saturating_add(1)
 }
 
 fn recv_ready_priority_command(
-    receivers: &mut TcpPathSessionCommandReceivers,
-) -> Option<TcpPathSessionCommand> {
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
     if let Ok(command) = receivers.control.try_recv() {
         return Some(command);
     }
     receivers.priority.try_recv().ok()
 }
 
-pub(super) fn tcp_path_command_pending_bytes(command: &TcpPathSessionCommand) -> usize {
+pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand) -> usize {
     match command {
-        TcpPathSessionCommand::SendFrame(frame) => frame_pacing_bytes(frame),
-        TcpPathSessionCommand::OpenStream { .. } | TcpPathSessionCommand::CloseStream(_) => 0,
+        ReliablePathCommand::SendFrame(frame) => frame_pacing_bytes(frame),
+        ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 0,
     }
 }
 
 #[cfg(feature = "lab-diagnostics")]
-fn tcp_path_command_stream_id(command: &TcpPathSessionCommand) -> StreamId {
+fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> StreamId {
     match command {
-        TcpPathSessionCommand::SendFrame(frame) => tcp_path_frame_stream_id(frame),
-        TcpPathSessionCommand::OpenStream { stream_id, .. }
-        | TcpPathSessionCommand::CloseStream(stream_id) => *stream_id,
+        ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
+        ReliablePathCommand::OpenStream { stream_id, .. }
+        | ReliablePathCommand::CloseStream(stream_id) => *stream_id,
     }
 }
 
 #[cfg(feature = "lab-diagnostics")]
-fn tcp_path_frame_stream_id(frame: &Frame) -> StreamId {
+fn reliable_path_frame_stream_id(frame: &Frame) -> StreamId {
     match frame {
         Frame::OpenStream { stream_id, .. }
         | Frame::StreamData { stream_id, .. }
@@ -410,14 +524,14 @@ fn tcp_path_frame_stream_id(frame: &Frame) -> StreamId {
     }
 }
 
-pub(super) enum TcpPathSessionCommand {
+pub(super) enum ReliablePathCommand {
     OpenStream {
         stream_id: StreamId,
         target: TargetAddr,
         ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
-        session_commands: TcpPathSessionCommandSender,
+        session_commands: ReliablePathCommandSender,
         response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
     },
     SendFrame(Frame),
@@ -425,16 +539,16 @@ pub(super) enum TcpPathSessionCommand {
 }
 
 #[cfg(feature = "lab-diagnostics")]
-fn tcp_path_command_kind(command: &TcpPathSessionCommand) -> &'static str {
+fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
     match command {
-        TcpPathSessionCommand::OpenStream { .. } => "open_stream",
-        TcpPathSessionCommand::SendFrame(frame) => tcp_path_frame_kind(frame),
-        TcpPathSessionCommand::CloseStream(_) => "close_stream",
+        ReliablePathCommand::OpenStream { .. } => "open_stream",
+        ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
+        ReliablePathCommand::CloseStream(_) => "close_stream",
     }
 }
 
 #[cfg(feature = "lab-diagnostics")]
-fn tcp_path_frame_kind(frame: &Frame) -> &'static str {
+fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
     match frame {
         Frame::SessionHello { .. } => "session_hello",
         Frame::SessionAuth { .. } => "session_auth",
@@ -449,6 +563,8 @@ fn tcp_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::PathClose { .. } => "path_close",
         Frame::PathMtuProbe { .. } => "path_mtu_probe",
         Frame::PathMtuAck { .. } => "path_mtu_ack",
+        Frame::PathProofData { .. } => "path_proof_data",
+        Frame::PathProofAck { .. } => "path_proof_ack",
         Frame::OpenStream { .. } => "open_stream",
         Frame::StreamData { .. } => "stream_data",
         Frame::StreamAck { .. } => "stream_ack",

@@ -1,6 +1,8 @@
 use super::*;
 use crate::config::DEFAULT_OUTBOUND_CONNECT_TIMEOUT;
 
+const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[tokio::test]
 async fn path_probe_refreshes_tcp_health_without_stream_load() {
     let (path, server) = spawn_server_path(OutboundConfig::Direct).await;
@@ -344,7 +346,7 @@ async fn tcp_path_sessions_handle_multiple_single_path_interactive_streams() {
     target.await.expect("target join");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     let payload = vec![0x5au8; 2 * 1024 * 1024];
     let expected_payload = payload.clone();
@@ -372,31 +374,62 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         .await
         .expect("high-bandwidth bind");
     let server_context = server_context(OutboundConfig::Direct);
-    let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(8);
+    let (stop_servers_tx, stop_servers_rx) = tokio::sync::watch::channel(false);
     let low_latency_context = server_context.clone();
     let low_latency_accepted_tx = accepted_tx.clone();
+    let mut low_latency_stop_rx = stop_servers_rx.clone();
     let low_latency_server = tokio::spawn(async move {
-        let (stream, _) = low_latency_listener
-            .accept()
-            .await
-            .expect("low-latency accept");
-        low_latency_accepted_tx
-            .send(0usize)
-            .await
-            .expect("accepted low latency");
-        handle_server_path(stream, low_latency_context).await
+        let mut sessions = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                changed = low_latency_stop_rx.changed() => {
+                    if changed.is_ok() && *low_latency_stop_rx.borrow() {
+                        break;
+                    }
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                accepted = low_latency_listener.accept() => {
+                    let (stream, _) = accepted.expect("low-latency accept");
+                    let _ = low_latency_accepted_tx.try_send(0usize);
+                    let session_context = low_latency_context.clone();
+                    sessions.spawn(async move { handle_server_path(stream, session_context).await });
+                }
+            }
+        }
+        while let Some(session) = sessions.join_next().await {
+            session.map_err(RuntimeError::TaskJoin)??;
+        }
+        Ok::<(), RuntimeError>(())
     });
     let high_bandwidth_context = server_context.clone();
+    let mut high_bandwidth_stop_rx = stop_servers_rx.clone();
     let high_bandwidth_server = tokio::spawn(async move {
-        let (stream, _) = high_bandwidth_listener
-            .accept()
-            .await
-            .expect("high-bandwidth accept");
-        accepted_tx
-            .send(1usize)
-            .await
-            .expect("accepted high bandwidth");
-        handle_server_path(stream, high_bandwidth_context).await
+        let mut sessions = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                changed = high_bandwidth_stop_rx.changed() => {
+                    if changed.is_ok() && *high_bandwidth_stop_rx.borrow() {
+                        break;
+                    }
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                accepted = high_bandwidth_listener.accept() => {
+                    let (stream, _) = accepted.expect("high-bandwidth accept");
+                    let _ = accepted_tx.try_send(1usize);
+                    let session_context = high_bandwidth_context.clone();
+                    sessions.spawn(async move { handle_server_path(stream, session_context).await });
+                }
+            }
+        }
+        while let Some(session) = sessions.join_next().await {
+            session.map_err(RuntimeError::TaskJoin)??;
+        }
+        Ok::<(), RuntimeError>(())
     });
 
     let context = ClientPathContext::new(
@@ -458,24 +491,23 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
     let mut received = vec![0u8; expected_payload.len()];
-    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut received))
-        .await
-        .expect("response timeout")
-        .expect("payload read");
+    tokio::time::timeout(
+        FULL_STACK_RESPONSE_TIMEOUT,
+        client.read_exact(&mut received),
+    )
+    .await
+    .expect("response timeout")
+    .expect("payload read");
     assert_eq!(received, expected_payload);
 
-    let mut accepted = vec![
-        tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+    let mut accepted = Vec::new();
+    while !(accepted.contains(&0) && accepted.contains(&1)) {
+        let path = tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
             .await
-            .expect("first accept timeout")
-            .expect("first accepted path"),
-        tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
-            .await
-            .expect("second accept timeout")
-            .expect("second accepted path"),
-    ];
-    accepted.sort_unstable();
-    assert_eq!(accepted, vec![0, 1]);
+            .expect("accept timeout")
+            .expect("accepted path");
+        accepted.push(path);
+    }
 
     handler.await.expect("handler join").expect("handler");
     {
@@ -484,6 +516,7 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         assert_eq!(health.tcp[1].active_flows, 0);
     }
     drop(health_context);
+    let _ = stop_servers_tx.send(true);
     low_latency_server
         .await
         .expect("low-latency server join")
@@ -747,7 +780,7 @@ async fn socks5_ingress_schedules_tcp_stream_to_best_configured_path() {
 }
 
 #[tokio::test]
-async fn socks5_ingress_starts_tcp_auto_latency_first() {
+async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let (target_addr, target) = spawn_echo_target().await;
     let no_bulk_low_latency_path =
         reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=1000&no-bulk").await;

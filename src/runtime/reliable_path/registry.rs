@@ -28,7 +28,7 @@ struct ServerReliableStreamEntry {
 pub(in crate::runtime) struct ServerReliablePathAttachment {
     pub(in crate::runtime) path_id: PathId,
     pub(in crate::runtime) underlay: UnderlayProtocol,
-    pub(in crate::runtime) commands: TcpPathSessionCommandSender,
+    pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
     pub(in crate::runtime) role: StreamOpenRole,
     pub(in crate::runtime) initial_metrics: Option<PathMetrics>,
@@ -366,7 +366,7 @@ impl ServerReliableStreamRegistry {
         stream_id: StreamId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        commands: &TcpPathSessionCommandSender,
+        commands: &ReliablePathCommandSender,
     ) {
         if let Some(binding) = self
             .streams
@@ -414,7 +414,7 @@ impl ServerReliableStreamRegistry {
         let result = stream
             .send(Ok(frame))
             .await
-            .map_err(|_| RuntimeError::TcpPathSessionClosed);
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed);
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record(
             "runtime.server_stream.route_frame",

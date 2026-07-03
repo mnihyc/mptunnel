@@ -45,7 +45,7 @@ fn server_udp_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
 pub(super) fn spawn_server_udp_datagram_flow_worker(
     flow_id: DatagramFlowId,
     mut outbound_socket: outbound::OutboundUdpSocket,
-    commands: TcpPathSessionCommandSender,
+    commands: ReliablePathCommandSender,
     mux_limits: MuxLimits,
 ) -> mpsc::Sender<ServerUdpDatagramRequest> {
     let (requests_tx, mut requests_rx) = mpsc::channel::<ServerUdpDatagramRequest>(
@@ -134,7 +134,7 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
 }
 
 pub(super) fn try_send_server_datagram_realtime_frame(
-    commands: &TcpPathSessionCommandSender,
+    commands: &ReliablePathCommandSender,
     frame: Frame,
 ) -> Result<(), RuntimeError> {
     debug_assert!(matches!(
@@ -178,6 +178,8 @@ pub(super) fn frame_kind_name(frame: &Frame) -> &'static str {
         Frame::PathClose { .. } => "PATH_CLOSE",
         Frame::PathMtuProbe { .. } => "PATH_MTU_PROBE",
         Frame::PathMtuAck { .. } => "PATH_MTU_ACK",
+        Frame::PathProofData { .. } => "PATH_PROOF_DATA",
+        Frame::PathProofAck { .. } => "PATH_PROOF_ACK",
         Frame::OpenStream { .. } => "OPEN_STREAM",
         Frame::StreamData { .. } => "STREAM_DATA",
         Frame::StreamAck { .. } => "STREAM_ACK",
@@ -218,6 +220,8 @@ fn frame_subject(frame: &Frame) -> String {
         | Frame::PathDrain { path_id }
         | Frame::PathMtuProbe { path_id, .. }
         | Frame::PathMtuAck { path_id, .. }
+        | Frame::PathProofData { path_id, .. }
+        | Frame::PathProofAck { path_id, .. }
         | Frame::RxRateHint { path_id, .. } => format!("path_id={}", path_id.0),
         Frame::PathStatus {
             path_id, status, ..
@@ -297,28 +301,28 @@ pub(super) fn log_unexpected_stream_relay_frame(
 
 pub(super) enum ServerTcpPathEvent {
     Frame(Frame),
-    Command(TcpPathSessionCommand),
+    Command(ReliablePathCommand),
 }
 
 pub(super) async fn recv_server_tcp_path_event(
     path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
-    commands_rx: &mut TcpPathSessionCommandReceivers,
+    commands_rx: &mut ReliablePathCommandReceivers,
 ) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
     loop {
-        let command_may_recv = !tcp_path_receivers_closed(commands_rx);
+        let command_may_recv = !reliable_path_receivers_closed(commands_rx);
         tokio::select! {
             biased;
             frame = path_frames.recv() => {
                 return match frame {
                     Some(Ok(frame)) => Ok(Some(ServerTcpPathEvent::Frame(frame))),
                     Some(Err(err)) => Err(RuntimeError::Encrypted(err)),
-                    None => Err(RuntimeError::TcpPathSessionClosed),
+                    None => Err(RuntimeError::ReliablePathSessionClosed),
                 };
             }
-            command = recv_tcp_path_command(commands_rx), if command_may_recv => {
+            command = recv_reliable_path_command(commands_rx), if command_may_recv => {
                 match command {
                     Some(command) => return Ok(Some(ServerTcpPathEvent::Command(command))),
-                    None if tcp_path_receivers_closed(commands_rx) => return Ok(None),
+                    None if reliable_path_receivers_closed(commands_rx) => return Ok(None),
                     None => continue,
                 }
             }

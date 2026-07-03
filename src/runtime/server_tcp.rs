@@ -82,13 +82,14 @@ pub(super) async fn handle_server_path(
 
     let (reader, mut writer) = framed.split();
     let mut path_frames =
-        spawn_encrypted_tcp_reader(reader, tcp_path_session_frame_queue(context.mux_limits));
+        spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(context.mux_limits));
     let (commands_tx, mut commands_rx) =
-        tcp_path_session_command_channels(tcp_server_session_command_queue(&context));
+        reliable_path_command_channels(tcp_server_session_command_queue(&context));
     let mut attached_streams = HashSet::new();
     let mut datagram_flows = Vec::<ServerUdpDatagramFlow>::new();
     let mut draining = false;
     let mut pending_frames = Vec::<Frame>::new();
+    let mut path_proofs = PathProofTracker::default();
 
     loop {
         let Some(event) = recv_server_tcp_path_event(&mut path_frames, &mut commands_rx).await?
@@ -112,6 +113,7 @@ pub(super) async fn handle_server_path(
                         active_datagram_flows: 0,
                     },
                     &mut pending_frames,
+                    &mut path_proofs,
                 )
                 .await?;
                 if !keep_running {
@@ -464,6 +466,42 @@ pub(super) async fn handle_server_path(
                             return Ok(());
                         }
                     }
+                    Frame::PathProofData {
+                        path_id: proof_path_id,
+                        proof_id,
+                        payload,
+                    } if proof_path_id == path_id => {
+                        if !server_write_tcp_path_frame(
+                            &mut writer,
+                            &path_proof_ack_frame(path_id, proof_id, payload.len()),
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Frame::PathProofAck {
+                        path_id: proof_path_id,
+                        proof_id,
+                        payload_bytes,
+                    } if proof_path_id == path_id => {
+                        if let Some(observation) =
+                            path_proofs.acknowledge(path_id, proof_id, payload_bytes)
+                            && let Some(metrics) = path_proof_metrics(
+                                path_id,
+                                UnderlayProtocol::Tcp,
+                                PathMetricDirection::ServerToClient,
+                                observation,
+                            )
+                        {
+                            context.reliable_streams.record_local_path_metrics(
+                                session_id,
+                                UnderlayProtocol::Tcp,
+                                path_id,
+                                metrics,
+                            );
+                        }
+                    }
                     Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
                         context.reliable_streams.record_path_metrics(
                             session_id,
@@ -499,7 +537,7 @@ pub(super) async fn handle_server_path(
                     Frame::SessionClose { .. } => return Ok(()),
                     _ => return Err(RuntimeError::Protocol("unexpected TCP path session frame")),
                 }
-                if let Some(command) = try_recv_tcp_path_command(&mut commands_rx) {
+                if let Some(command) = try_recv_reliable_path_command(&mut commands_rx) {
                     let keep_running = drain_server_tcp_path_commands(
                         command,
                         &mut commands_rx,
@@ -515,6 +553,7 @@ pub(super) async fn handle_server_path(
                             active_datagram_flows: 0,
                         },
                         &mut pending_frames,
+                        &mut path_proofs,
                     )
                     .await?;
                     if !keep_running {
@@ -529,25 +568,26 @@ pub(super) async fn handle_server_path(
 pub(super) struct ServerTcpPathCommandContext<'a> {
     session_id: SessionId,
     path_id: PathId,
-    commands_tx: &'a TcpPathSessionCommandSender,
+    commands_tx: &'a ReliablePathCommandSender,
     draining: bool,
     active_datagram_flows: usize,
 }
 
 async fn drain_server_tcp_path_commands(
-    first_command: TcpPathSessionCommand,
-    commands_rx: &mut TcpPathSessionCommandReceivers,
+    first_command: ReliablePathCommand,
+    commands_rx: &mut ReliablePathCommandReceivers,
     writer: &mut EncryptedTcpWriter,
     context: &ServerPathContext,
     attached_streams: &mut HashSet<StreamId>,
     datagram_flows: &mut Vec<ServerUdpDatagramFlow>,
     command_context: ServerTcpPathCommandContext<'_>,
     pending_frames: &mut Vec<Frame>,
+    path_proofs: &mut PathProofTracker,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
-    let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
-    let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(context.mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
     pending_frames.clear();
     let mut sent_bytes = 0usize;
@@ -557,16 +597,28 @@ async fn drain_server_tcp_path_commands(
     loop {
         let Some(command) = next_command
             .take()
-            .or_else(|| try_recv_tcp_path_command(commands_rx))
+            .or_else(|| try_recv_reliable_path_command(commands_rx))
         else {
+            if try_coalesce_reliable_path_writer_run(
+                commands_rx,
+                &mut next_command,
+                sent_items,
+                sent_bytes,
+                byte_budget,
+                item_budget,
+            )
+            .await
+            {
+                continue;
+            }
             break;
         };
-        let pending_bytes = tcp_path_command_pending_bytes(&command);
-        if let TcpPathSessionCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
+        if let ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
             datagram_flows.retain(|flow| flow.flow_id != *flow_id);
         }
         match command {
-            TcpPathSessionCommand::SendFrame(frame) => {
+            ReliablePathCommand::SendFrame(frame) => {
                 let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                 pending_frames.push(frame);
                 commands_rx.release_pending_command_bytes(pending_bytes);
@@ -579,7 +631,7 @@ async fn drain_server_tcp_path_commands(
                 continue;
             }
             command => {
-                if !server_write_tcp_path_frame_batch(writer, pending_frames).await? {
+                if !server_write_tcp_path_frame_batch(writer, pending_frames, path_proofs).await? {
                     return Ok(false);
                 }
                 let keep_running = handle_server_tcp_path_command(
@@ -606,7 +658,7 @@ async fn drain_server_tcp_path_commands(
         }
     }
 
-    if !server_write_tcp_path_frame_batch(writer, pending_frames).await? {
+    if !server_write_tcp_path_frame_batch(writer, pending_frames, path_proofs).await? {
         return Ok(false);
     }
 
@@ -635,12 +687,16 @@ async fn drain_server_tcp_path_commands(
 async fn server_write_tcp_path_frame_batch(
     framed: &mut EncryptedTcpWriter,
     frames: &mut Vec<Frame>,
+    path_proofs: &mut PathProofTracker,
 ) -> Result<bool, RuntimeError> {
     if frames.is_empty() {
         return Ok(true);
     }
     match framed.write_frames(frames).await {
         Ok(()) => {
+            for frame in frames.iter() {
+                path_proofs.record_sent_frame(frame);
+            }
             frames.clear();
             Ok(true)
         }
@@ -656,7 +712,7 @@ async fn server_write_tcp_path_frame_batch(
 }
 
 pub(super) async fn handle_server_tcp_path_command(
-    command: TcpPathSessionCommand,
+    command: ReliablePathCommand,
     writer: &mut EncryptedTcpWriter,
     context: &ServerPathContext,
     attached_streams: &mut HashSet<StreamId>,
@@ -664,10 +720,10 @@ pub(super) async fn handle_server_tcp_path_command(
     flush_after_frame: bool,
 ) -> Result<bool, RuntimeError> {
     match command {
-        TcpPathSessionCommand::SendFrame(frame) => {
+        ReliablePathCommand::SendFrame(frame) => {
             server_write_tcp_path_frame_maybe_flush(writer, &frame, flush_after_frame).await
         }
-        TcpPathSessionCommand::CloseStream(stream_id) => {
+        ReliablePathCommand::CloseStream(stream_id) => {
             attached_streams.remove(&stream_id);
             context.reliable_streams.detach_path(
                 command_context.session_id,
@@ -692,7 +748,7 @@ pub(super) async fn handle_server_tcp_path_command(
             }
             Ok(true)
         }
-        TcpPathSessionCommand::OpenStream { .. } => Err(RuntimeError::Protocol(
+        ReliablePathCommand::OpenStream { .. } => Err(RuntimeError::Protocol(
             "server TCP path received client open command",
         )),
     }
@@ -799,5 +855,5 @@ pub(super) async fn run_server_tcp_stream(
 }
 
 pub(super) fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
-    tcp_path_command_queue(context.mux_limits)
+    reliable_path_command_queue(context.mux_limits)
 }

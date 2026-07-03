@@ -39,11 +39,11 @@ fn reliable_bulk_striping_path_keys(
 }
 
 async fn recv_emitted_tcp_path_command(
-    receivers: &mut TcpPathSessionCommandReceivers,
-) -> Option<TcpPathSessionCommand> {
-    let command = recv_tcp_path_command(receivers).await;
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
+    let command = recv_reliable_path_command(receivers).await;
     if let Some(command) = &command {
-        receivers.release_pending_command_bytes(tcp_path_command_pending_bytes(command));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(command));
     }
     command
 }
@@ -130,23 +130,55 @@ fn tun_udp_dns_target_uses_configured_matching_resolver() {
 }
 
 async fn reserve_tcp_path() -> PathSpec {
-    let probe = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve port");
-    let port = probe.local_addr().expect("reserved addr").port();
-    drop(probe);
+    let port = reserve_process_unique_tcp_port().await;
     format!("tcp://127.0.0.1:{port}").parse().expect("path")
 }
 
 async fn reserve_tcp_path_with_query(query: &str) -> PathSpec {
-    let probe = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve port");
-    let port = probe.local_addr().expect("reserved addr").port();
-    drop(probe);
+    let port = reserve_process_unique_tcp_port().await;
     format!("tcp://127.0.0.1:{port}?{query}")
         .parse()
         .expect("path")
+}
+
+async fn reserve_process_unique_tcp_port() -> u16 {
+    loop {
+        let probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve tcp port");
+        let port = probe.local_addr().expect("reserved tcp addr").port();
+        let inserted = reserved_test_ports()
+            .lock()
+            .expect("reserved test ports lock")
+            .insert(port);
+        drop(probe);
+        if inserted {
+            return port;
+        }
+    }
+}
+
+async fn reserve_process_unique_udp_port() -> u16 {
+    loop {
+        let probe = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("reserve udp port");
+        let port = probe.local_addr().expect("reserved udp addr").port();
+        let inserted = reserved_test_ports()
+            .lock()
+            .expect("reserved test ports lock")
+            .insert(port);
+        drop(probe);
+        if inserted {
+            return port;
+        }
+    }
+}
+
+fn reserved_test_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> {
+    static PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    PORTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
 async fn spawn_echo_target() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -450,9 +482,7 @@ async fn spawn_notified_server_path(
 }
 
 async fn reserve_udp_path() -> PathSpec {
-    let probe = UdpSocket::bind("127.0.0.1:0").await.expect("reserve port");
-    let port = probe.local_addr().expect("reserved addr").port();
-    drop(probe);
+    let port = reserve_process_unique_udp_port().await;
     format!("udp://127.0.0.1:{port}").parse().expect("path")
 }
 
@@ -692,7 +722,7 @@ fn reliable_relay_sender_queue_prioritizes_repair_lane() {
 #[tokio::test]
 async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes() {
     let stream_id = StreamId(42);
-    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -711,7 +741,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(7), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"response"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), FlowLane::Throughput);
 
     assert!(sender.queued_send_ready());
     let dispatch = sender
@@ -736,7 +766,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
     assert_eq!(send_stream.next_offset(), b"response".len() as u64);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             stream_id: id,
             offset: 0,
             payload,
@@ -749,7 +779,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
 async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
     let stream_id = StreamId(52);
     let mux_limits = MuxLimits::default();
-    let (commands, mut receivers) = tcp_path_session_command_channels(64);
+    let (commands, mut receivers) = reliable_path_command_channels(64);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -771,7 +801,10 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     let mut sender = ServerResponseSenderService::new(SessionId(52), stream_id);
-    sender.enqueue_data(Bytes::from(vec![0x5a; PATH_OPEN_SCORE_BYTES * 4]));
+    sender.enqueue_data_for_lane(
+        Bytes::from(vec![0x5a; PATH_OPEN_SCORE_BYTES * 4]),
+        FlowLane::Throughput,
+    );
 
     let mut ack_end = 0_u64;
     while ack_end < PATH_OPEN_SCORE_BYTES as u64 {
@@ -805,7 +838,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
 #[test]
 fn fixed_response_output_inherits_path_startup_evidence() {
     let mux_limits = MuxLimits::default();
-    let (commands, _receivers) = tcp_path_session_command_channels(64);
+    let (commands, _receivers) = reliable_path_command_channels(64);
     let mut startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
     startup.pacing_rate_bps = 500_000_000.0;
     startup.inflight_limit_bytes =
@@ -837,7 +870,7 @@ fn fixed_response_output_inherits_path_startup_evidence() {
 #[test]
 fn fixed_response_output_keeps_product_flight_out_of_carrier_flight() {
     let mux_limits = MuxLimits::default();
-    let (commands, _receivers) = tcp_path_session_command_channels(64);
+    let (commands, _receivers) = reliable_path_command_channels(64);
     let mut startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
     startup.pacing_rate_bps = 500_000_000.0;
     startup.inflight_limit_bytes =
@@ -875,7 +908,7 @@ fn fixed_response_output_keeps_product_flight_out_of_carrier_flight() {
 async fn server_response_sender_slices_large_reads_to_service_quantum() {
     let stream_id = StreamId(42);
     let mux_limits = MuxLimits::default();
-    let (commands, mut receivers) = tcp_path_session_command_channels(16);
+    let (commands, mut receivers) = reliable_path_command_channels(16);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -900,7 +933,7 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     let mut sender = ServerResponseSenderService::new(SessionId(17), stream_id);
     let queued_bytes = mux_limits.max_reliable_relay_chunk_bytes;
-    sender.enqueue_data(Bytes::from(vec![0x5a; queued_bytes]));
+    sender.enqueue_data_for_lane(Bytes::from(vec![0x5a; queued_bytes]), FlowLane::Throughput);
 
     let dispatch = sender
         .dispatch_next(
@@ -918,7 +951,7 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
     assert_eq!(send_stream.next_offset(), quantum as u64);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             stream_id: id,
             offset: 0,
             payload,
@@ -928,9 +961,84 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
 }
 
 #[tokio::test]
+async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_promotion() {
+    let stream_id = StreamId(142);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(16);
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: mux_limits.max_stream_window_bytes,
+        lane: FlowLane::Latency,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            mux_limits,
+        ),
+        frames: frame_rx,
+    };
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    let mut sender = ServerResponseSenderService::new(SessionId(142), stream_id);
+    let latency_quantum = adaptive_reliable_relay_chunk_bytes(
+        path_stream.send_path_snapshot(FlowLane::Latency, 1),
+        FlowLane::Latency,
+        mux_limits,
+    );
+    sender.enqueue_data_for_lane(
+        Bytes::from(vec![0x5a; latency_quantum * 3]),
+        FlowLane::Latency,
+    );
+
+    let first = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Latency,
+            mux_limits,
+        )
+        .await
+        .expect("dispatch first latency slice");
+    assert_eq!(first.payload_bytes, latency_quantum);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload.len() == latency_quantum
+    ));
+
+    let second = sender
+        .dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            mux_limits,
+        )
+        .await
+        .expect("remaining bytes keep enqueue-time latency lane");
+    assert_eq!(second.payload_bytes, latency_quantum);
+    assert!(
+        matches!(
+            try_recv_reliable_path_priority_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset,
+                payload,
+                ..
+            })) if offset == latency_quantum as u64 && payload.len() == latency_quantum
+        ),
+        "already-queued latency data must not be reclassified into the throughput data queue"
+    );
+}
+
+#[tokio::test]
 async fn server_response_sender_dispatches_control_before_repair_and_data() {
     let stream_id = StreamId(47);
-    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -949,7 +1057,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(47), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"ordinary"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
     sender.enqueue_repair_frame(Frame::StreamData {
         stream_id,
         offset: 64,
@@ -975,7 +1083,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     assert_eq!(send_stream.next_offset(), 0);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamAck {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
             stream_id: id,
             complete: false,
             ..
@@ -997,7 +1105,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
 #[tokio::test]
 async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     let stream_id = StreamId(49);
-    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -1016,7 +1124,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(49), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"ordinary"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
     sender.enqueue_final_control_frame(Frame::StreamFin {
         stream_id,
         final_offset: b"ordinary".len() as u64,
@@ -1045,7 +1153,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     assert_eq!(fin_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             stream_id: id,
             offset: 0,
             payload,
@@ -1054,7 +1162,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     ));
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamFin {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamFin {
             stream_id: id,
             final_offset,
         })) if id == stream_id && final_offset == b"ordinary".len() as u64
@@ -1064,7 +1172,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
 #[tokio::test]
 async fn server_response_control_queue_full_is_sender_backpressure() {
     let stream_id = StreamId(48);
-    let (commands, mut receivers) = tcp_path_session_command_channels(1);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
     commands
         .try_enqueue_admitted_frame(
             Frame::StreamAck {
@@ -1112,14 +1220,14 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
     assert_eq!(sender.bytes(), 1);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamAck { .. }))
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
 }
 
 #[tokio::test]
 async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     let stream_id = StreamId(44);
-    let (commands, receivers) = tcp_path_session_command_channels(1);
+    let (commands, receivers) = reliable_path_command_channels(1);
     drop(receivers);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -1139,7 +1247,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(9), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"response"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), FlowLane::Throughput);
 
     assert_eq!(sender.bytes(), b"response".len());
     assert!(
@@ -1163,7 +1271,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
 async fn server_response_sender_blocks_when_switchable_outputs_detach() {
     let stream_id = StreamId(45);
     let session_id = SessionId(10);
-    let (commands, _receivers) = tcp_path_session_command_channels(4);
+    let (commands, _receivers) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         session_id,
         UnderlayProtocol::Udp,
@@ -1191,7 +1299,7 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(session_id, stream_id);
-    sender.enqueue_data(Bytes::from_static(b"response"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), FlowLane::Throughput);
 
     let err = sender
         .dispatch_next(
@@ -1213,7 +1321,7 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
 #[tokio::test]
 async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
     let stream_id = StreamId(46);
-    let (commands, mut receivers) = tcp_path_session_command_channels(1);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
     commands
         .try_enqueue_admitted_frame(
             Frame::StreamData {
@@ -1243,7 +1351,7 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(11), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"later"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), FlowLane::Throughput);
 
     let err = sender
         .dispatch_next(
@@ -1261,7 +1369,7 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
     assert_eq!(send_stream.next_offset(), 0);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             payload,
             ..
         })) if payload == Bytes::from_static(b"already queued")
@@ -1281,7 +1389,7 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
 async fn response_binding_duplicate_live_path_keeps_existing_output() {
     let stream_id = StreamId(47);
     let session_id = SessionId(12);
-    let (first_commands, mut first_receivers) = tcp_path_session_command_channels(4);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         session_id,
         UnderlayProtocol::Udp,
@@ -1289,7 +1397,7 @@ async fn response_binding_duplicate_live_path_keeps_existing_output() {
         first_commands,
         FlowLane::Throughput,
     );
-    let (second_commands, mut second_receivers) = tcp_path_session_command_channels(4);
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
     assert_eq!(
         binding.attach(
             UnderlayProtocol::Udp,
@@ -1315,7 +1423,7 @@ async fn response_binding_duplicate_live_path_keeps_existing_output() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(session_id, stream_id);
-    sender.enqueue_data(Bytes::from_static(b"same-path-live"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"same-path-live"), FlowLane::Throughput);
 
     sender
         .dispatch_next(
@@ -1329,7 +1437,7 @@ async fn response_binding_duplicate_live_path_keeps_existing_output() {
 
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut first_receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             payload,
             ..
         })) if payload == Bytes::from_static(b"same-path-live")
@@ -1349,7 +1457,7 @@ async fn response_binding_duplicate_live_path_keeps_existing_output() {
 async fn response_binding_duplicate_closed_path_replaces_output() {
     let stream_id = StreamId(48);
     let session_id = SessionId(13);
-    let (first_commands, first_receivers) = tcp_path_session_command_channels(4);
+    let (first_commands, first_receivers) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         session_id,
         UnderlayProtocol::Udp,
@@ -1359,7 +1467,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
     );
     drop(first_receivers);
 
-    let (second_commands, mut second_receivers) = tcp_path_session_command_channels(4);
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
     assert_eq!(
         binding.attach(
             UnderlayProtocol::Udp,
@@ -1385,7 +1493,10 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(session_id, stream_id);
-    sender.enqueue_data(Bytes::from_static(b"same-path-closed"));
+    sender.enqueue_data_for_lane(
+        Bytes::from_static(b"same-path-closed"),
+        FlowLane::Throughput,
+    );
 
     sender
         .dispatch_next(
@@ -1399,7 +1510,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
 
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut second_receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             payload,
             ..
         })) if payload == Bytes::from_static(b"same-path-closed")
@@ -1409,7 +1520,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
 #[tokio::test]
 async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_target() {
     let stream_id = StreamId(45);
-    let (tcp_commands, _tcp_receivers) = tcp_path_session_command_channels(4);
+    let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(4);
     let tcp_commands_for_detach = tcp_commands.clone();
     let binding = ResponseStreamBinding::new(
         SessionId(10),
@@ -1418,7 +1529,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
         tcp_commands,
         FlowLane::Throughput,
     );
-    let (udp_commands, mut udp_receivers) = tcp_path_session_command_channels(4);
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(4);
     binding.attach(
         UnderlayProtocol::Udp,
         PathId(1),
@@ -1459,7 +1570,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
         .send_data(Bytes::from_static(b"x"), StreamFlags::NONE)
         .expect("advance response sender past the lower-frontier byte");
     let mut sender = ServerResponseSenderService::new(SessionId(10), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"later"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), FlowLane::Throughput);
 
     let err = sender
         .dispatch_next(
@@ -1489,7 +1600,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
 #[tokio::test]
 async fn server_response_sender_dispatches_repair_before_data() {
     let stream_id = StreamId(43);
-    let (commands, mut receivers) = tcp_path_session_command_channels(4);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -1508,7 +1619,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
-    sender.enqueue_data(Bytes::from_static(b"ordinary"));
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
     sender.enqueue_repair_frame(Frame::StreamData {
         stream_id,
         offset: 64,
@@ -1529,7 +1640,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
     assert_eq!(send_stream.next_offset(), 0);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             offset: 64,
             payload,
             ..
@@ -1549,7 +1660,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
     assert_eq!(send_stream.next_offset(), b"ordinary".len() as u64);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             offset: 0,
             payload,
             ..
@@ -1577,7 +1688,7 @@ fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
     assert_eq!(
         reliable_stream_frame_queue(mux_limits),
         (mux_limits.max_reorder_bytes / mux_limits.max_reliable_relay_chunk_bytes)
-            + tcp_path_priority_headroom_frames()
+            + reliable_path_priority_headroom_frames()
     );
 }
 
@@ -1598,19 +1709,19 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
     };
 
-    let tcp_sized_queue = reliable_stream_frame_queue(mux_limits);
-    let udp_sized_queue = reliable_stream_frame_queue_for_payload(mux_limits, 1200);
+    let stream_payload_queue = reliable_stream_frame_queue(mux_limits);
+    let packet_payload_queue = reliable_stream_frame_queue_for_payload(mux_limits, 1200);
 
-    assert_eq!(tcp_sized_queue, 68);
+    assert_eq!(stream_payload_queue, 68);
     assert_eq!(
-        udp_sized_queue,
-        mux_limits.max_reorder_bytes / 1200 + tcp_path_priority_headroom_frames()
+        packet_payload_queue,
+        mux_limits.max_reorder_bytes / 1200 + reliable_path_priority_headroom_frames()
     );
-    assert!(udp_sized_queue > tcp_sized_queue);
+    assert!(packet_payload_queue > stream_payload_queue);
 }
 
 #[test]
-fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
+fn reliable_path_command_queue_tracks_inflight_budget_not_stream_limit() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
@@ -1631,12 +1742,12 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
             .min(mux_limits.max_payload_bytes)
             .max(1);
     let expected_queue = (mux_limits.max_path_flight_bytes.div_ceil(frame_payload)
-        + tcp_path_priority_headroom_frames())
-    .min(tcp_path_session_frame_queue_for_payload(
+        + reliable_path_priority_headroom_frames())
+    .min(reliable_path_writer_frame_queue_for_payload(
         mux_limits,
         frame_payload,
     ));
-    assert_eq!(tcp_path_command_queue(mux_limits), expected_queue);
+    assert_eq!(reliable_path_command_queue(mux_limits), expected_queue);
 
     let resources = ResourceLimits {
         max_streams: 65_536,
@@ -1649,7 +1760,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
 }
 
 #[test]
-fn tcp_path_command_queue_tracks_actual_payload_quantum() {
+fn reliable_path_command_queue_tracks_actual_payload_quantum() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
@@ -1665,8 +1776,8 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
     };
 
-    let tcp_sized_queue = tcp_path_command_queue(mux_limits);
-    let udp_sized_queue = tcp_path_command_queue_for_payload(mux_limits, 1200);
+    let stream_payload_queue = reliable_path_command_queue(mux_limits);
+    let packet_payload_queue = reliable_path_command_queue_for_payload(mux_limits, 1200);
 
     let tcp_frame_payload =
         reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
@@ -1674,29 +1785,32 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
             .min(mux_limits.max_payload_bytes)
             .max(1);
     assert_eq!(
-        tcp_sized_queue,
+        stream_payload_queue,
         (mux_limits.max_path_flight_bytes.div_ceil(tcp_frame_payload)
-            + tcp_path_priority_headroom_frames())
-        .min(tcp_path_session_frame_queue_for_payload(
+            + reliable_path_priority_headroom_frames())
+        .min(reliable_path_writer_frame_queue_for_payload(
             mux_limits,
             tcp_frame_payload,
         ))
     );
     assert_eq!(
-        udp_sized_queue,
-        (mux_limits.max_path_flight_bytes.div_ceil(1200) + tcp_path_priority_headroom_frames())
-            .min(tcp_path_session_frame_queue_for_payload(mux_limits, 1200,))
+        packet_payload_queue,
+        (mux_limits.max_path_flight_bytes.div_ceil(1200)
+            + reliable_path_priority_headroom_frames())
+        .min(reliable_path_writer_frame_queue_for_payload(
+            mux_limits, 1200,
+        ))
     );
-    assert!(udp_sized_queue > tcp_sized_queue);
+    assert!(packet_payload_queue > stream_payload_queue);
 }
 
 #[test]
-fn auto_tcp_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
+fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     let mux_limits = MuxLimits::default();
     let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
-    let threshold = tcp_auto_bulk_threshold_bytes(Some(path), mux_limits);
+    let threshold = reliable_flow_bulk_threshold_bytes(Some(path), mux_limits);
     let high_bdp_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 300_000_000.0);
-    let high_bdp_threshold = tcp_auto_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
+    let high_bdp_threshold = reliable_flow_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
     let high_bdp =
         ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0)).ceil() as u64;
     let mut state = ReliableRelayFlowDemandTracker::new();
@@ -1833,14 +1947,10 @@ fn reliable_bulk_quantum_keeps_tcp_and_quic_streams_fed_without_rate_prior() {
 fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
     let mux_limits = MuxLimits::default();
     let startup = adaptive_reliable_relay_inflight_bytes(None, FlowLane::Throughput, mux_limits);
-    let startup_path = PathSnapshot::new(
-        PathId(0),
-        UnderlayProtocol::Tcp,
-        default_path_srtt_ms(UnderlayProtocol::Tcp),
-        default_path_rate_bps(UnderlayProtocol::Tcp),
-    );
-    let default_bbr_target =
-        bbr_inflight_target_bytes(startup_path, FlowLane::Throughput, mux_limits).ceil() as usize;
+    let default_bbr_target = (reliable_startup_bdp_bytes() * BBR_DEFAULT_CWND_GAIN)
+        .max(reliable_startup_send_quantum_bytes() as f64)
+        .max(bbr_min_pipe_cwnd_bytes(mux_limits) as f64)
+        .ceil() as usize;
 
     assert_eq!(
         startup,
@@ -1902,7 +2012,7 @@ fn udp_source_read_startup_can_fill_reliable_carrier_without_double_cwnd() {
 }
 
 #[test]
-fn sender_dispatch_budget_is_one_preemptible_service_quantum() {
+fn sender_dispatch_budget_batches_bulk_with_preemptible_quanta() {
     let mux_limits = MuxLimits::default();
     let adaptive_chunk = 64 * 1024;
     let inflight_limit = 8 * reliable_relay_buffer_len(mux_limits);
@@ -1925,16 +2035,58 @@ fn sender_dispatch_budget_is_one_preemptible_service_quantum() {
         inflight_limit,
         queue_limit,
     );
-    assert_eq!(bulk_bytes, adaptive_chunk);
-    assert_eq!(bulk_items, 1);
+    assert_eq!(bulk_bytes, reliable_relay_buffer_len(mux_limits));
+    assert_eq!(
+        bulk_items,
+        reliable_relay_buffer_len(mux_limits) / adaptive_chunk
+    );
     assert!(
         bulk_bytes < inflight_limit,
-        "bulk sender service must stay preemptible instead of dumping a full path flight into writer queues"
+        "bulk sender service may batch one read envelope, but must not dump a full path flight into writer queues"
     );
 }
 
 #[test]
-fn udp_relay_chunking_uses_quic_product_payload_envelope() {
+fn path_writer_coalesces_partial_bulk_run_without_delaying_full_or_empty_runs() {
+    let mux_limits = MuxLimits::default();
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
+
+    assert!(
+        reliable_path_writer_should_coalesce_partial_bulk_run(
+            1,
+            64 * 1024,
+            byte_budget,
+            item_budget
+        ),
+        "a single queued bulk frame should yield once so the producer can enqueue the rest of its service burst"
+    );
+    assert!(
+        !reliable_path_writer_should_coalesce_partial_bulk_run(0, 0, byte_budget, item_budget),
+        "an empty writer run must not spin"
+    );
+    assert!(
+        !reliable_path_writer_should_coalesce_partial_bulk_run(
+            item_budget,
+            64 * 1024,
+            byte_budget,
+            item_budget
+        ),
+        "a full item-budget writer run should flush immediately"
+    );
+    assert!(
+        !reliable_path_writer_should_coalesce_partial_bulk_run(
+            1,
+            byte_budget,
+            byte_budget,
+            item_budget
+        ),
+        "a full byte-budget writer run should flush immediately"
+    );
+}
+
+#[test]
+fn reliable_relay_chunking_uses_product_payload_envelope() {
     let mux_limits = MuxLimits {
         max_reliable_relay_chunk_bytes: 64 * 1024,
         max_ack_ranges: 16,
@@ -1944,26 +2096,23 @@ fn udp_relay_chunking_uses_quic_product_payload_envelope() {
         .min(mux_limits.max_reliable_relay_chunk_bytes)
         .max(1);
 
-    let latency_chunk = adaptive_relay_chunk_bytes_for_underlay(
+    let latency_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         None,
         FlowLane::Latency,
         mux_limits,
-        UnderlayProtocol::Udp,
         max_frame_payload,
     );
-    let bulk_chunk = adaptive_relay_chunk_bytes_for_underlay(
+    let bulk_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         None,
         FlowLane::Throughput,
         mux_limits,
-        UnderlayProtocol::Udp,
         max_frame_payload,
     );
     let fast = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 50.0, 2_000_000_000.0);
-    let fast_bulk_chunk = adaptive_relay_chunk_bytes_for_underlay(
+    let fast_bulk_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         Some(fast),
         FlowLane::Throughput,
         mux_limits,
-        UnderlayProtocol::Udp,
         max_frame_payload,
     );
 
@@ -2513,7 +2662,7 @@ fn tail_stall_repair_uses_frontier_tail_when_ack_has_no_authoritative_gap() {
 #[test]
 fn tail_stall_repair_retransmits_same_frontier_only_after_stall_evidence() {
     let stream_id = StreamId(34);
-    let (commands, _receivers) = tcp_path_session_command_channels(4);
+    let (commands, _receivers) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         SessionId(34),
         UnderlayProtocol::Tcp,
@@ -2739,7 +2888,7 @@ fn tcp_path_sessions_are_dedicated_for_latency_sensitive_lanes() {
 fn switchable_stream_demand_updates_from_local_sender_metrics() {
     let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let (commands, _rx) = reliable_path_command_channels(4);
     let mut stream = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -2786,7 +2935,7 @@ fn server_registry_accepts_active_duplicate_same_path_input_without_output_repla
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let session_id = SessionId(1);
     let stream_id = StreamId(17);
-    let (first_commands, _first_rx) = tcp_path_session_command_channels(4);
+    let (first_commands, _first_rx) = reliable_path_command_channels(4);
     let opened = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -2809,7 +2958,7 @@ fn server_registry_accepts_active_duplicate_same_path_input_without_output_repla
         .expect("open stream");
     assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
 
-    let (duplicate_commands, _duplicate_rx) = tcp_path_session_command_channels(4);
+    let (duplicate_commands, _duplicate_rx) = reliable_path_command_channels(4);
     let duplicate = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -2839,7 +2988,7 @@ fn server_registry_accepts_active_duplicate_same_path_input_without_output_repla
 fn server_response_output_inherits_open_path_startup_metrics() {
     let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let (commands, _rx) = reliable_path_command_channels(4);
     let path = "tcp://127.0.0.1:10000?srtt-ms=20&rate-mbps=500"
         .parse::<PathSpec>()
         .expect("path spec");
@@ -2928,7 +3077,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
 fn server_reliable_registry_rejects_attach_only_unknown_stream() {
     let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let (commands, _rx) = reliable_path_command_channels(4);
     let opened = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -2957,7 +3106,7 @@ fn server_reliable_registry_rejects_attach_only_unknown_stream() {
 fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
     let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let (commands, _rx) = reliable_path_command_channels(4);
     let session_id = SessionId(1);
     let stream_id = StreamId(100);
     let opened = registry
@@ -2983,7 +3132,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
     assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
     registry.close(session_id, stream_id);
 
-    let (commands, _rx) = tcp_path_session_command_channels(4);
+    let (commands, _rx) = reliable_path_command_channels(4);
     let reopened = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -3010,7 +3159,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
 
 #[tokio::test]
 async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
-    let (tcp_tx, mut tcp_rx) = tcp_path_session_command_channels(4);
+    let (tcp_tx, mut tcp_rx) = reliable_path_command_channels(4);
     let binding = ResponseStreamBinding::new(
         SessionId(1),
         UnderlayProtocol::Tcp,
@@ -3018,7 +3167,7 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
         tcp_tx,
         FlowLane::Latency,
     );
-    let (udp_tx, mut udp_rx) = tcp_path_session_command_channels(4);
+    let (udp_tx, mut udp_rx) = reliable_path_command_channels(4);
     binding.attach(
         UnderlayProtocol::Udp,
         PathId(0),
@@ -3030,18 +3179,18 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
 
     binding.close_stream(StreamId(7)).await;
 
-    match recv_tcp_path_command(&mut tcp_rx)
+    match recv_reliable_path_command(&mut tcp_rx)
         .await
         .expect("tcp close command")
     {
-        TcpPathSessionCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
+        ReliablePathCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
         _ => panic!("expected TCP close stream command"),
     }
-    match recv_tcp_path_command(&mut udp_rx)
+    match recv_reliable_path_command(&mut udp_rx)
         .await
         .expect("udp close command")
     {
-        TcpPathSessionCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
+        ReliablePathCommand::CloseStream(stream_id) => assert_eq!(stream_id, StreamId(7)),
         _ => panic!("expected UDP close stream command"),
     }
 }

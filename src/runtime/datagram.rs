@@ -387,7 +387,7 @@ impl TcpDatagramClientSession {
             {
                 Ok(Some(Ok(frame))) => frame,
                 Ok(Some(Err(err))) => return Err(RuntimeError::Encrypted(err)),
-                Ok(None) => return Err(RuntimeError::TcpPathSessionClosed),
+                Ok(None) => return Err(RuntimeError::ReliablePathSessionClosed),
                 Err(_) => {
                     self.sent_datagrams.remove(&request_key);
                     #[cfg(feature = "lab-diagnostics")]
@@ -470,7 +470,7 @@ impl TcpDatagramClientSession {
                     }
                 }
                 Frame::PathStatus { .. } | Frame::SessionReady => {}
-                Frame::PathClose { .. } => return Err(RuntimeError::TcpPathSessionClosed),
+                Frame::PathClose { .. } => return Err(RuntimeError::ReliablePathSessionClosed),
                 Frame::SessionClose { reason } => {
                     return Err(RuntimeError::RemoteClosed(reason));
                 }
@@ -673,7 +673,7 @@ fn tcp_datagram_error_is_path_retryable(err: &RuntimeError) -> bool {
             | RuntimeError::RemoteClosed(_)
             | RuntimeError::Protocol(_)
             | RuntimeError::PathHeartbeatTimeout
-            | RuntimeError::TcpPathSessionClosed
+            | RuntimeError::ReliablePathSessionClosed
     )
 }
 
@@ -1502,7 +1502,7 @@ impl UdpDatagramClientSession {
                     Ok(Some(Err(err))) => return Err(UdpPathSendError::Runtime(err)),
                     Ok(None) => {
                         return Err(UdpPathSendError::Runtime(
-                            RuntimeError::TcpPathSessionClosed,
+                            RuntimeError::ReliablePathSessionClosed,
                         ));
                     }
                     Err(_)
@@ -1701,7 +1701,7 @@ impl UdpDatagramClientSession {
         match tokio::time::timeout(probe_timeout, self.stream.frames.recv())
             .await
             .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))?
-            .ok_or(RuntimeError::TcpPathSessionClosed)??
+            .ok_or(RuntimeError::ReliablePathSessionClosed)??
         {
             Frame::Pong {
                 nonce: received_nonce,

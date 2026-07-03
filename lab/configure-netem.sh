@@ -3,6 +3,26 @@ set -euo pipefail
 
 mode="${1:-apply}"
 
+scale_netem_value() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+factor = float(sys.argv[2])
+match = re.match(r"^([0-9]+(?:\.[0-9]+)?)(.*)$", value)
+if not match:
+    print(value)
+    raise SystemExit(0)
+scaled = float(match.group(1)) * factor
+if scaled.is_integer():
+    number = str(int(scaled))
+else:
+    number = f"{scaled:.6f}".rstrip("0").rstrip(".")
+print(f"{number}{match.group(2)}")
+PY
+}
+
 lowlat_rate="${MPTUNNEL_LAB_LOWLAT_RATE:-80mbit}"
 lowlat_delay="${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms}"
 lowlat_jitter="${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms}"
@@ -12,6 +32,10 @@ balanced_rate="${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}"
 balanced_delay="${MPTUNNEL_LAB_BALANCED_DELAY:-80ms}"
 balanced_jitter="${MPTUNNEL_LAB_BALANCED_JITTER:-10ms}"
 balanced_loss="${MPTUNNEL_LAB_BALANCED_LOSS:-1.00%}"
+mildloss_rate="${MPTUNNEL_LAB_MILDLOSS_RATE:-$(scale_netem_value "$balanced_rate" 0.5)}"
+mildloss_delay="${MPTUNNEL_LAB_MILDLOSS_DELAY:-$(scale_netem_value "$balanced_delay" 2)}"
+mildloss_jitter="${MPTUNNEL_LAB_MILDLOSS_JITTER:-$balanced_jitter}"
+mildloss_loss="${MPTUNNEL_LAB_MILDLOSS_LOSS:-0.10%}"
 
 fat_rate="${MPTUNNEL_LAB_FAT_RATE:-500mbit}"
 fat_delay="${MPTUNNEL_LAB_FAT_DELAY:-180ms}"
@@ -83,6 +107,7 @@ apply_profile_all() {
 
   apply_profile "172.31.10" "$rate" "$delay" "$jitter" "$loss"
   apply_profile "172.31.15" "$rate" "$delay" "$jitter" "$loss"
+  apply_profile "172.31.16" "$rate" "$delay" "$jitter" "$loss"
   apply_profile "172.31.20" "$rate" "$delay" "$jitter" "$loss"
   apply_profile "172.31.30" "$rate" "$delay" "$jitter" "$loss"
 }
@@ -114,7 +139,7 @@ clear_profile() {
 show_profile() {
   ip -o -4 addr show scope global | while read -r _ iface _ addr _; do
     case "$addr" in
-      172.31.10.*|172.31.15.*|172.31.20.*|172.31.30.*)
+      172.31.10.*|172.31.15.*|172.31.16.*|172.31.20.*|172.31.30.*)
         echo "$iface $addr"
         tc qdisc show dev "$iface"
         ;;
@@ -128,6 +153,9 @@ case "$mode" in
     apply_profile "172.31.10" "$lowlat_rate" "$lowlat_delay" "$lowlat_jitter" "$lowlat_loss"
     # Balanced daily-use path: moderate RTT and useful bandwidth.
     apply_profile "172.31.15" "$balanced_rate" "$balanced_delay" "$balanced_jitter" "$balanced_loss"
+    # Lower-loss companion to the balanced link: half bandwidth, double base
+    # latency, and the same jitter unless explicitly overridden.
+    apply_profile "172.31.16" "$mildloss_rate" "$mildloss_delay" "$mildloss_jitter" "$mildloss_loss"
     # Cross-continent fiber: high RTT, high throughput, small random loss.
     apply_profile "172.31.20" "$fat_rate" "$fat_delay" "$fat_jitter" "$fat_loss"
     # Poor Internet: very high RTT, low throughput, heavy jitter/loss.
@@ -138,6 +166,9 @@ case "$mode" in
     ;;
   apply-balanced)
     apply_profile "172.31.15" "$balanced_rate" "$balanced_delay" "$balanced_jitter" "$balanced_loss"
+    ;;
+  apply-mildloss)
+    apply_profile "172.31.16" "$mildloss_rate" "$mildloss_delay" "$mildloss_jitter" "$mildloss_loss"
     ;;
   apply-fat)
     apply_profile "172.31.20" "$fat_rate" "$fat_delay" "$fat_jitter" "$fat_loss"
@@ -150,6 +181,9 @@ case "$mode" in
     ;;
   ideal-balanced)
     apply_profile "172.31.15" "$balanced_rate" "$balanced_delay" "$balanced_jitter" "$ideal_loss"
+    ;;
+  ideal-mildloss)
+    apply_profile "172.31.16" "$mildloss_rate" "$mildloss_delay" "$mildloss_jitter" "$ideal_loss"
     ;;
   ideal-fat)
     apply_profile "172.31.20" "$fat_rate" "$fat_delay" "$fat_jitter" "$ideal_loss"
@@ -224,6 +258,7 @@ case "$mode" in
   unconstrained|unconstrained-all|clear)
     clear_profile "172.31.10"
     clear_profile "172.31.15"
+    clear_profile "172.31.16"
     clear_profile "172.31.20"
     clear_profile "172.31.30"
     ;;
@@ -231,7 +266,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

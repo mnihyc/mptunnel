@@ -143,6 +143,56 @@ def read_netdev(container_id: str) -> dict[str, int] | None:
     return totals
 
 
+def snapshot_netdev(
+    compose_file: str,
+    services: list[str],
+) -> dict[str, object]:
+    ids = compose_container_ids(compose_file, services)
+    service_rows = {}
+    for service, container_id in sorted(ids.items()):
+        net = read_netdev(container_id)
+        if net is None:
+            continue
+        service_rows[service] = {
+            "container_id": container_id[:12],
+            **net,
+        }
+    return {"services": service_rows, "ts": utc_now()}
+
+
+def load_snapshot(path_text: str | None) -> dict[str, object]:
+    if not path_text:
+        return {}
+    path = Path(path_text)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def apply_snapshot_deltas(
+    services: dict[str, dict[str, object]],
+    before: dict[str, object],
+    after: dict[str, object],
+) -> None:
+    before_services = before.get("services")
+    after_services = after.get("services")
+    if not isinstance(before_services, dict) or not isinstance(after_services, dict):
+        return
+    for service, after_row in after_services.items():
+        before_row = before_services.get(service)
+        if not isinstance(before_row, dict) or not isinstance(after_row, dict):
+            continue
+        service_summary = services.setdefault(service, {})
+        for field in ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets"):
+            before_value = int(before_row.get(field, 0) or 0)
+            after_value = int(after_row.get(field, 0) or 0)
+            service_summary[f"delta_{field}"] = max(after_value - before_value, 0)
+        service_summary["netdev_delta_source"] = "case_before_after_snapshot"
+
+
 def rate_fields(
     current: dict[str, int],
     previous: tuple[float, dict[str, int]] | None,
@@ -271,12 +321,29 @@ def summarize(args: argparse.Namespace) -> int:
             "delta_tx_packets": int(last.get("tx_packets", 0)) - int(first.get("tx_packets", 0)),
         }
 
+    apply_snapshot_deltas(
+        services,
+        load_snapshot(args.netdev_before),
+        load_snapshot(args.netdev_after),
+    )
+
     summary = {
         "file": str(path),
         "samples": len(rows),
         "services": services,
     }
     print(json.dumps(summary, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+def snapshot(args: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            snapshot_netdev(args.compose_file, args.services),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -295,7 +362,14 @@ def main() -> int:
 
     summarize_parser = subparsers.add_parser("summarize")
     summarize_parser.add_argument("--input", required=True)
+    summarize_parser.add_argument("--netdev-before")
+    summarize_parser.add_argument("--netdev-after")
     summarize_parser.set_defaults(func=summarize)
+
+    snapshot_parser = subparsers.add_parser("snapshot")
+    snapshot_parser.add_argument("--compose-file", required=True)
+    snapshot_parser.add_argument("--services", nargs="+", default=["client", "server", "target"])
+    snapshot_parser.set_defaults(func=snapshot)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):

@@ -15,6 +15,8 @@ services:
         ipv4_address: 172.31.10.10
       path_balanced:
         ipv4_address: 172.31.15.10
+      path_mildloss:
+        ipv4_address: 172.31.16.10
       path_fat:
         ipv4_address: 172.31.20.10
       path_poor:
@@ -36,6 +38,8 @@ services:
         ipv4_address: 172.31.10.20
       path_balanced:
         ipv4_address: 172.31.15.20
+      path_mildloss:
+        ipv4_address: 172.31.16.20
       path_fat:
         ipv4_address: 172.31.20.20
       path_poor:
@@ -59,6 +63,8 @@ services:
         ipv4_address: 172.31.10.30
       path_balanced:
         ipv4_address: 172.31.15.30
+      path_mildloss:
+        ipv4_address: 172.31.16.30
       path_fat:
         ipv4_address: 172.31.20.30
       path_poor:
@@ -75,6 +81,10 @@ networks:
     ipam:
       config:
         - subnet: 172.31.15.0/24
+  path_mildloss:
+    ipam:
+      config:
+        - subnet: 172.31.16.0/24
   path_fat:
     ipam:
       config:

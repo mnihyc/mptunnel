@@ -227,7 +227,7 @@ pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) cursor: usize,
     pub(super) avoid_keys: &'a [RelayPathKey],
     pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
-    pub(super) ordinary_lead: Option<RelayPathKey>,
+    pub(super) ordered_data_owner: Option<RelayPathKey>,
 }
 
 pub(super) struct BulkRelayFrameRequest<'a> {
@@ -239,7 +239,7 @@ pub(super) struct BulkRelayFrameRequest<'a> {
     pub(super) cursor: usize,
     pub(super) avoid_keys: &'a [RelayPathKey],
     pub(super) path_flights: Option<&'a RelayPathFlightLedger>,
-    pub(super) ordinary_lead: Option<RelayPathKey>,
+    pub(super) ordered_data_owner: Option<RelayPathKey>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,7 +387,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         cursor,
         avoid_keys,
         path_flights,
-        ordinary_lead,
+        ordered_data_owner,
     } = request;
     let Some((offset, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return BulkRelayPathChoice::NotApplicable;
@@ -403,7 +403,7 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         cursor,
         avoid_keys,
         path_flights,
-        ordinary_lead,
+        ordered_data_owner,
     })
 }
 
@@ -421,7 +421,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         cursor,
         avoid_keys,
         path_flights,
-        ordinary_lead,
+        ordered_data_owner,
     } = request;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
@@ -707,7 +707,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 continue;
             }
         }
-        if normal_bulk_send && lower_flight_owner.is_none() && Some(key) == ordinary_lead {
+        if normal_bulk_send && lower_flight_owner.is_none() && Some(key) == ordered_data_owner {
             old_lead_candidate = Some((position, score.eta_ms, snapshot));
         }
         let cursor_distance = path_cursor_distance(position, cursor, paths.len());
@@ -884,18 +884,8 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         .min_by(|left, right| {
             left.eta_ms
                 .total_cmp(&right.eta_ms)
-                .then_with(|| path_key_order(left.key).cmp(&path_key_order(right.key)))
+                .then_with(|| context.relay_path_key_order(left.key, right.key))
         })
-}
-
-fn path_key_order(key: RelayPathKey) -> (u8, usize) {
-    (
-        match key.underlay {
-            UnderlayProtocol::Tcp => 0,
-            UnderlayProtocol::Udp => 1,
-        },
-        key.index,
-    )
 }
 
 fn scored_relay_path_snapshot_for_bulk_choice(
@@ -921,7 +911,7 @@ fn relay_path_snapshot_for_bulk_choice(
     key: RelayPathKey,
     active_key: Option<RelayPathKey>,
 ) -> Option<PathSnapshot> {
-    let mut snapshot = relay_path_snapshot(context, key)?;
+    let mut snapshot = context.reliable_path_snapshot(key)?;
     if Some(key) != active_key {
         snapshot.active_flows = snapshot.active_flows.saturating_add(1);
     }
@@ -972,7 +962,7 @@ mod tests {
         index: usize,
         placement: RelayPathPlacement,
     ) -> ReliableRelayRemotePath {
-        let (commands, _receivers) = tcp_path_session_command_channels(8);
+        let (commands, _receivers) = reliable_path_command_channels(8);
         ReliableRelayRemotePath {
             path_index: index,
             instance_id: index as u64 + 1,
@@ -1083,7 +1073,7 @@ mod tests {
                 cursor: 0,
                 avoid_keys: &[],
                 path_flights: Some(&ledger),
-                ordinary_lead: None,
+                ordered_data_owner: None,
             }),
             BulkRelayPathChoice::Blocked
         );
@@ -1118,7 +1108,7 @@ mod tests {
                 cursor: 0,
                 avoid_keys: &[],
                 path_flights: Some(&ledger),
-                ordinary_lead: None,
+                ordered_data_owner: None,
             }),
             BulkRelayPathChoice::Selected(0)
         );
@@ -1239,7 +1229,7 @@ mod tests {
                 cursor: 1,
                 avoid_keys: &[],
                 path_flights: Some(&RelayPathFlightLedger::default()),
-                ordinary_lead: Some(lead_key),
+                ordered_data_owner: Some(lead_key),
             }),
             BulkRelayPathChoice::Selected(1)
         );

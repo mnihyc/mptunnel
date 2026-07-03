@@ -1234,7 +1234,7 @@ where
                         let ack = send_stream.apply_normalized_ack(&normalized_ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        sender.release_acked_ranges(context, &normalized_ranges);
+                        sender.release_normalized_acked_ranges(context, &normalized_ranges);
                         let repair_limit = adaptive_reliable_relay_repair_bytes(
                             path_snapshot,
                             relay_lane,

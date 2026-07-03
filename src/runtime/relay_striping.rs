@@ -47,14 +47,16 @@ impl RelayPathFlightLedger {
         bytes
     }
 
-    pub(super) fn release_acked_ranges(&mut self, ranges: &[OffsetRange]) -> Vec<RelayPathRelease> {
+    pub(super) fn release_normalized_acked_ranges(
+        &mut self,
+        ranges: &[OffsetRange],
+    ) -> Vec<RelayPathRelease> {
         if ranges.is_empty() || self.flights.is_empty() {
             return Vec::new();
         }
-        let ranges = normalized_offset_ranges(ranges);
         let mut released = Vec::new();
         let mut acked_offsets = Vec::new();
-        for range in &ranges {
+        for range in ranges {
             for (offset, flights) in self.flights.range(range.start..) {
                 if *offset >= range.end {
                     break;
@@ -1043,7 +1045,7 @@ mod tests {
             4096
         );
 
-        let released = ledger.release_acked_ranges(&[OffsetRange {
+        let released = ledger.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: 4096,
         }]);

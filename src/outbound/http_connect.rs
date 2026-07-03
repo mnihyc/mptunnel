@@ -143,14 +143,64 @@ where
         if context_id.into_inner() != UDP_CONTEXT_ID {
             continue;
         }
-        let udp_payload = payload[consumed..].to_vec();
-        if udp_payload.len() > MAX_CONNECT_UDP_PAYLOAD_BYTES {
+        let udp_payload_len = payload.len().saturating_sub(consumed);
+        if udp_payload_len > MAX_CONNECT_UDP_PAYLOAD_BYTES {
             return Err(HttpConnectClientError::DatagramPayloadTooLarge {
-                actual: udp_payload.len(),
+                actual: udp_payload_len,
                 limit: MAX_CONNECT_UDP_PAYLOAD_BYTES,
             });
         }
-        return Ok(udp_payload);
+        payload.copy_within(consumed.., 0);
+        payload.truncate(udp_payload_len);
+        return Ok(payload);
+    }
+}
+
+pub async fn read_datagram_capsule_into<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> Result<usize, HttpConnectClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let capsule_type = read_capsule_varint(reader).await?.into_inner();
+        let capsule_len = read_capsule_varint(reader).await?.into_inner();
+        if capsule_len > MAX_CONNECT_UDP_CAPSULE_PAYLOAD_BYTES as u64 {
+            return Err(HttpConnectClientError::CapsuleTooLarge {
+                actual: capsule_len,
+                limit: MAX_CONNECT_UDP_CAPSULE_PAYLOAD_BYTES,
+            });
+        }
+        let capsule_len = capsule_len as usize;
+        if capsule_type != DATAGRAM_CAPSULE_TYPE {
+            discard_exact(reader, capsule_len).await?;
+            continue;
+        }
+
+        let (context_id, consumed) =
+            read_capsule_payload_varint_with_len(reader, capsule_len).await?;
+        let payload_len = capsule_len - consumed;
+        if context_id.into_inner() != UDP_CONTEXT_ID {
+            discard_exact(reader, payload_len).await?;
+            continue;
+        }
+        if payload_len > MAX_CONNECT_UDP_PAYLOAD_BYTES {
+            discard_exact(reader, payload_len).await?;
+            return Err(HttpConnectClientError::DatagramPayloadTooLarge {
+                actual: payload_len,
+                limit: MAX_CONNECT_UDP_PAYLOAD_BYTES,
+            });
+        }
+        if payload_len > buffer.len() {
+            discard_exact(reader, payload_len).await?;
+            return Err(HttpConnectClientError::DatagramPayloadTooLarge {
+                actual: payload_len,
+                limit: buffer.len(),
+            });
+        }
+        reader.read_exact(&mut buffer[..payload_len]).await?;
+        return Ok(payload_len);
     }
 }
 
@@ -244,7 +294,20 @@ fn decode_capsule_varint(input: &[u8]) -> Result<(VarInt, usize), HttpConnectCli
     Ok((value, original_len - cursor.len()))
 }
 
+fn capsule_varint_len(first: u8) -> usize {
+    1usize << (usize::from(first >> 6))
+}
+
 async fn read_capsule_varint<R>(reader: &mut R) -> Result<VarInt, HttpConnectClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    Ok(read_capsule_varint_with_len(reader).await?.0)
+}
+
+async fn read_capsule_varint_with_len<R>(
+    reader: &mut R,
+) -> Result<(VarInt, usize), HttpConnectClientError>
 where
     R: AsyncRead + Unpin,
 {
@@ -256,7 +319,30 @@ where
     if len > 1 {
         reader.read_exact(&mut buf[1..len]).await?;
     }
-    Ok(decode_capsule_varint(&buf[..len])?.0)
+    Ok((decode_capsule_varint(&buf[..len])?.0, len))
+}
+
+async fn read_capsule_payload_varint_with_len<R>(
+    reader: &mut R,
+    payload_len: usize,
+) -> Result<(VarInt, usize), HttpConnectClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    if payload_len == 0 {
+        return Err(HttpConnectClientError::InvalidVarint);
+    }
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf[..1]).await?;
+    let len = capsule_varint_len(buf[0]);
+    if len > payload_len {
+        discard_exact(reader, payload_len.saturating_sub(1)).await?;
+        return Err(HttpConnectClientError::InvalidVarint);
+    }
+    if len > 1 {
+        reader.read_exact(&mut buf[1..len]).await?;
+    }
+    Ok((decode_capsule_varint(&buf[..len])?.0, len))
 }
 
 async fn discard_exact<R>(reader: &mut R, mut len: usize) -> Result<(), HttpConnectClientError>
@@ -406,5 +492,35 @@ mod tests {
         let payload = read_datagram_capsule(&mut client).await.expect("read");
 
         assert_eq!(payload, b"ping");
+    }
+
+    #[tokio::test]
+    async fn datagram_capsule_reads_udp_payload_directly_into_caller_buffer() {
+        let (mut client, mut server) = duplex(128);
+        let capsule = datagram_capsule(b"pong").expect("capsule");
+        server.write_all(&capsule).await.expect("write");
+
+        let mut payload = [0u8; 16];
+        let len = read_datagram_capsule_into(&mut client, &mut payload)
+            .await
+            .expect("read");
+
+        assert_eq!(&payload[..len], b"pong");
+    }
+
+    #[tokio::test]
+    async fn datagram_capsule_into_rejects_truncated_context_without_reading_past_capsule() {
+        let (mut client, mut server) = duplex(128);
+        server
+            .write_all(&[0x00, 0x01, 0x40])
+            .await
+            .expect("write truncated datagram capsule");
+
+        let mut payload = [0u8; 16];
+        let err = read_datagram_capsule_into(&mut client, &mut payload)
+            .await
+            .expect_err("truncated context should fail");
+
+        assert!(matches!(err, HttpConnectClientError::InvalidVarint));
     }
 }

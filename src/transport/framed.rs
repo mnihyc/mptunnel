@@ -1,19 +1,25 @@
 use crate::protocol::Frame;
 use crate::protocol::codec::{
-    CodecError, CodecLimits, FRAME_HEADER_LEN, decode_frame, decode_payload_len_from_header,
-    encode_frame,
+    CodecError, CodecLimits, FRAME_HEADER_LEN, decode_frame_bytes, decode_payload_len_from_header,
+    encode_frame_into,
 };
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug)]
 pub struct FramedStream<S> {
     stream: S,
     limits: CodecLimits,
+    encode_buffer: Vec<u8>,
 }
 
 impl<S> FramedStream<S> {
     pub fn new(stream: S, limits: CodecLimits) -> Self {
-        Self { stream, limits }
+        Self {
+            stream,
+            limits,
+            encode_buffer: Vec::new(),
+        }
     }
 
     pub fn limits(&self) -> CodecLimits {
@@ -33,18 +39,19 @@ where
         let mut header = [0u8; FRAME_HEADER_LEN];
         self.stream.read_exact(&mut header).await?;
         let payload_len = decode_payload_len_from_header(&header, self.limits)?;
-        let mut encoded = Vec::with_capacity(FRAME_HEADER_LEN + payload_len);
+        let mut encoded = BytesMut::with_capacity(FRAME_HEADER_LEN + payload_len);
         encoded.extend_from_slice(&header);
         encoded.resize(FRAME_HEADER_LEN + payload_len, 0);
         self.stream
             .read_exact(&mut encoded[FRAME_HEADER_LEN..])
             .await?;
-        Ok(decode_frame(&encoded, self.limits)?)
+        Ok(decode_frame_bytes(encoded.freeze(), self.limits)?)
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<(), FramedTransportError> {
-        let encoded = encode_frame(frame, self.limits)?;
-        self.stream.write_all(&encoded).await?;
+        self.encode_buffer.clear();
+        encode_frame_into(frame, self.limits, &mut self.encode_buffer)?;
+        self.stream.write_all(&self.encode_buffer).await?;
         Ok(())
     }
 

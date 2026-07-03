@@ -209,6 +209,24 @@ pub fn connect_reply(reply: Socks5Reply, bind: SocketAddr) -> Vec<u8> {
 }
 
 pub fn parse_udp_datagram(input: &[u8]) -> Result<(UdpDatagram, usize), Socks5Error> {
+    let parts = parse_udp_datagram_parts(input)?;
+    Ok((
+        UdpDatagram {
+            target: parts.target,
+            payload: Bytes::copy_from_slice(&input[parts.payload_offset..parts.consumed]),
+        },
+        parts.consumed,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpDatagramParts {
+    pub target: TargetAddr,
+    pub payload_offset: usize,
+    pub consumed: usize,
+}
+
+pub fn parse_udp_datagram_parts(input: &[u8]) -> Result<UdpDatagramParts, Socks5Error> {
     if input.len() < 4 {
         return Err(Socks5Error::Incomplete);
     }
@@ -222,13 +240,11 @@ pub fn parse_udp_datagram(input: &[u8]) -> Result<(UdpDatagram, usize), Socks5Er
     let payload_offset = 3usize
         .checked_add(consumed)
         .ok_or(Socks5Error::MessageTooLong)?;
-    Ok((
-        UdpDatagram {
-            target,
-            payload: Bytes::copy_from_slice(&input[payload_offset..]),
-        },
-        input.len(),
-    ))
+    Ok(UdpDatagramParts {
+        target,
+        payload_offset,
+        consumed: input.len(),
+    })
 }
 
 pub fn udp_datagram(target: &TargetAddr, payload: &[u8]) -> Result<Vec<u8>, Socks5Error> {

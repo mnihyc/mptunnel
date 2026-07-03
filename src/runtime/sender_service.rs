@@ -1974,12 +1974,12 @@ impl RelaySenderService {
         })
     }
 
-    pub(super) fn release_acked_ranges(
+    pub(super) fn release_normalized_acked_ranges(
         &mut self,
         context: &ClientPathContext,
         ranges: &[OffsetRange],
     ) {
-        for release in self.flights.release_acked_ranges(ranges) {
+        for release in self.flights.release_normalized_acked_ranges(ranges) {
             context.release_relay_path_inflight(
                 release.key.underlay,
                 release.key.index,
@@ -2228,7 +2228,7 @@ mod tests {
 
         let before = context.tcp_path_snapshot(0).expect("before snapshot");
         assert_eq!(before.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
-        sender.release_acked_ranges(
+        sender.release_normalized_acked_ranges(
             &context,
             &[OffsetRange::new(0, PATH_OPEN_SCORE_BYTES as u64).expect("ack range")],
         );

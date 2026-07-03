@@ -296,15 +296,16 @@ impl HttpConnectUdpAssociation {
     }
 
     async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, OutboundConnectError> {
-        let payload = http_connect::read_datagram_capsule(&mut self.stream).await?;
-        if payload.len() > buffer.len() {
-            return Err(OutboundConnectError::UdpReceiveBufferTooSmall {
-                actual: payload.len(),
-                limit: buffer.len(),
-            });
+        match http_connect::read_datagram_capsule_into(&mut self.stream, buffer).await {
+            Ok(len) => Ok(len),
+            Err(http_connect::HttpConnectClientError::DatagramPayloadTooLarge {
+                actual,
+                limit,
+            }) if limit == buffer.len() => {
+                Err(OutboundConnectError::UdpReceiveBufferTooSmall { actual, limit })
+            }
+            Err(err) => Err(err.into()),
         }
-        buffer[..payload.len()].copy_from_slice(&payload);
-        Ok(payload.len())
     }
 }
 
@@ -318,9 +319,9 @@ impl Socks5UdpAssociation {
 
     async fn recv(&mut self, buffer: &mut [u8]) -> Result<usize, OutboundConnectError> {
         let len = self.relay.recv(&mut self.recv_buffer).await?;
-        let (datagram, consumed) = socks5_udp::parse_udp_datagram(&self.recv_buffer[..len])
+        let datagram = socks5_udp::parse_udp_datagram_parts(&self.recv_buffer[..len])
             .map_err(OutboundConnectError::Socks5UdpPacket)?;
-        if consumed != len {
+        if datagram.consumed != len {
             return Err(OutboundConnectError::InvalidProxyResponse);
         }
         if !socks5_udp_response_target_allowed(&self.target, &datagram.target) {
@@ -329,14 +330,15 @@ impl Socks5UdpAssociation {
                 actual: datagram.target,
             });
         }
-        if datagram.payload.len() > buffer.len() {
+        let payload = &self.recv_buffer[datagram.payload_offset..len];
+        if payload.len() > buffer.len() {
             return Err(OutboundConnectError::UdpReceiveBufferTooSmall {
-                actual: datagram.payload.len(),
+                actual: payload.len(),
                 limit: buffer.len(),
             });
         }
-        buffer[..datagram.payload.len()].copy_from_slice(&datagram.payload);
-        Ok(datagram.payload.len())
+        buffer[..payload.len()].copy_from_slice(payload);
+        Ok(payload.len())
     }
 }
 

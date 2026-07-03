@@ -1790,7 +1790,7 @@ fn mixed_bulk_striping_suppresses_catastrophically_worse_udp_candidate() {
 }
 
 #[test]
-fn mixed_bulk_striping_penalizes_lossy_high_rtt_udp_carrier() {
+fn mixed_bulk_striping_penalizes_lossy_high_rtt_quic_udp_path() {
     let tcp_path = "tcp://127.0.0.1:10142?srtt-ms=250&rate-mbps=25"
         .parse::<PathSpec>()
         .expect("tcp path");

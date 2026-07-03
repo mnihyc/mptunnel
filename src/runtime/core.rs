@@ -291,7 +291,7 @@ pub struct ClientPathContext {
     pub(super) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
     pub(super) path_connect_timeout: Duration,
-    // Product ownership: reliable stream IDs live above TCP and UDP carriers.
+    // Product ownership: reliable stream IDs live above TCP and QUIC UDP paths.
     pub(super) next_reliable_stream_id: Arc<Mutex<u64>>,
     // Path-model ownership: health records are evidence snapshots consumed by
     // schedulers; they must not own product bytes or carrier queues.
@@ -582,7 +582,7 @@ impl ClientPathHealthRecord {
         self.measured_mtu_payload_bytes = Some(payload_bytes);
     }
 
-    pub(super) fn mark_udp_carrier_metrics(&mut self, metrics: UdpPathMetrics) {
+    pub(super) fn mark_quic_path_metrics(&mut self, metrics: UdpPathMetrics) {
         if self.manual_disabled {
             return;
         }
@@ -747,8 +747,8 @@ where
 pub(super) fn reliable_closed_stream_cache_capacity(max_streams: usize) -> usize {
     // Closed-stream rejection state scales with the configured stream registry.
     // The cache is lazily allocated by RecentIdCache, so small deployments stay
-    // cheap and high-fanout deployments are not silently capped by a stale
-    // fixed slot count.
+    // cheap and high-fanout deployments are not silently capped by one fixed
+    // slot count.
     max_streams.max(1).saturating_mul(2)
 }
 
@@ -1854,7 +1854,7 @@ pub struct ServerPathContext {
     pub(super) mux_limits: MuxLimits,
     pub(super) security: SecurityConfig,
     // Product ownership: server-side reliable streams are registered once per
-    // session/stream ID and can attach TCP or UDP carrier paths.
+    // session/stream ID and can attach TCP or QUIC UDP paths.
     pub(super) reliable_streams: Arc<ServerReliableStreamRegistry>,
     pub(super) path_join_replay: Arc<Mutex<RecentIdCache<PathJoinReplayKey>>>,
     pub(super) max_reliable_streams: usize,

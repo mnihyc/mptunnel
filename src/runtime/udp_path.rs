@@ -49,7 +49,7 @@ impl ClientUdpPathSessionHandle {
         .await
         {
             Ok(stream) => Ok(stream),
-            Err(err) if udp_carrier_open_error_is_path_retryable(&err) => {
+            Err(err) if quic_path_open_error_is_retryable(&err) => {
                 self.drop_connection().await;
                 let connection = self.ensure_connection().await?;
                 open_client_udp_stream_on_connection(
@@ -73,7 +73,7 @@ impl ClientUdpPathSessionHandle {
         let connection = self.ensure_connection().await?;
         match open_client_udp_datagram_stream(connection, self.runtime.clone()).await {
             Ok(stream) => Ok(stream),
-            Err(err) if udp_carrier_open_error_is_path_retryable(&err) => {
+            Err(err) if quic_path_open_error_is_retryable(&err) => {
                 self.drop_connection().await;
                 let connection = self.ensure_connection().await?;
                 open_client_udp_datagram_stream(connection, self.runtime.clone()).await
@@ -436,18 +436,18 @@ fn spawn_client_udp_path_metrics(
             if let Some(record) = runtime
                 .health
                 .lock()
-                .expect("client UDP carrier health lock")
+                .expect("client QUIC UDP path health lock")
                 .udp
                 .get_mut(runtime.path_index)
             {
-                record.mark_udp_carrier_metrics(metrics);
+                record.mark_quic_path_metrics(metrics);
             }
-            tokio::time::sleep(udp_carrier_metrics_poll_interval(metrics)).await;
+            tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
     });
 }
 
-fn udp_carrier_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
+fn quic_path_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
     if metrics.app_limited {
         transport_pto_from_ms(
             metrics.srtt.as_secs_f64() * 1000.0,
@@ -478,12 +478,12 @@ pub(super) async fn run_server_udp_listener(
 ) -> Result<(), RuntimeError> {
     loop {
         let Some(connection) = endpoint.accept().await else {
-            return Err(RuntimeError::Protocol("UDP carrier endpoint closed"));
+            return Err(RuntimeError::Protocol("QUIC UDP path endpoint closed"));
         };
         let context = context.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_server_udp_connection(connection, context).await {
-                warn_unexpected_udp_runtime_error("server UDP carrier connection failed", &err);
+                warn_unexpected_udp_runtime_error("server QUIC UDP path connection failed", &err);
             }
         });
     }
@@ -587,7 +587,7 @@ async fn open_client_udp_stream_on_connection(
             Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
             _ => {
                 return Err(RuntimeError::Protocol(
-                    "unexpected UDP carrier stream open frame",
+                    "unexpected QUIC UDP path stream open frame",
                 ));
             }
         }
@@ -630,7 +630,7 @@ async fn open_client_udp_datagram_stream(
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<ClientUdpDatagramStream, RuntimeError> {
     let (send, recv) = connection.open_bi().await?;
-    let frames = spawn_udp_carrier_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
+    let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
     Ok(ClientUdpDatagramStream {
         send,
         frames,
@@ -639,7 +639,7 @@ async fn open_client_udp_datagram_stream(
     })
 }
 
-fn spawn_udp_carrier_reader(
+fn spawn_quic_path_reader(
     mut recv: UdpPathRecvStream,
     codec_limits: CodecLimits,
     queue_size: usize,
@@ -673,7 +673,7 @@ async fn run_client_udp_stream(
     mut commands: TcpPathSessionCommandReceivers,
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
-    let mut carrier_frames = spawn_udp_carrier_reader(recv, codec_limits, reader_queue_size);
+    let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
     loop {
         let command_may_recv = !tcp_path_receivers_closed(&commands);
@@ -734,7 +734,7 @@ async fn run_client_udp_stream(
                     }
                     Some(Ok(_)) => {
                         let _ = frames
-                            .send(Err(RuntimeError::Protocol("unexpected UDP carrier reliable stream frame")))
+                            .send(Err(RuntimeError::Protocol("unexpected QUIC UDP path reliable stream frame")))
                             .await;
                         return;
                     }
@@ -878,7 +878,7 @@ async fn drain_client_udp_stream_commands(
             }
             TcpPathSessionCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
-                    "client UDP carrier stream received open command",
+                    "client QUIC UDP path stream received open command",
                 ));
             }
         };
@@ -932,7 +932,7 @@ async fn handle_server_udp_connection(
 ) -> Result<(), RuntimeError> {
     let (session_id, path_id, capabilities) =
         accept_server_udp_path_handshake(&connection, &context).await?;
-    spawn_server_udp_carrier_metrics(context.clone(), session_id, path_id, connection.clone());
+    spawn_server_quic_path_metrics(context.clone(), session_id, path_id, connection.clone());
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
@@ -950,13 +950,13 @@ async fn handle_server_udp_connection(
             )
             .await
             {
-                warn_unexpected_udp_runtime_error("server UDP carrier stream failed", &err);
+                warn_unexpected_udp_runtime_error("server QUIC UDP path stream failed", &err);
             }
         });
     }
 }
 
-fn spawn_server_udp_carrier_metrics(
+fn spawn_server_quic_path_metrics(
     context: ServerPathContext,
     session_id: SessionId,
     path_id: PathId,
@@ -977,15 +977,15 @@ fn spawn_server_udp_carrier_metrics(
                     session_id,
                     UnderlayProtocol::Udp,
                     path_id,
-                    path_metrics_from_udp_carrier(path_id, metrics),
+                    path_metrics_from_quic_path(path_id, metrics),
                 );
             }
-            tokio::time::sleep(udp_carrier_metrics_poll_interval(metrics)).await;
+            tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
     });
 }
 
-fn path_metrics_from_udp_carrier(path_id: PathId, metrics: UdpPathMetrics) -> PathMetrics {
+fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> PathMetrics {
     PathMetrics {
         path_id,
         underlay: UnderlayProtocol::Udp,
@@ -1039,7 +1039,11 @@ async fn accept_server_udp_path_handshake(
     let (mut send, mut recv) = connection.accept_bi().await?;
     let session_id = match udp_path_read_frame(&mut recv, context.codec_limits).await? {
         Frame::SessionHello { session_id } => session_id,
-        _ => return Err(RuntimeError::Protocol("expected UDP carrier SESSION_HELLO")),
+        _ => {
+            return Err(RuntimeError::Protocol(
+                "expected QUIC UDP path SESSION_HELLO",
+            ));
+        }
     };
     let authenticator = SessionAuthenticator::new(context.security.secret.as_bytes())?;
     let now_unix_secs = current_unix_secs()?;
@@ -1059,7 +1063,7 @@ async fn accept_server_udp_path_handshake(
                 now_unix_secs,
                 freshness_window_secs: auth_freshness_window_secs,
             }) => {}
-        _ => return Err(RuntimeError::Protocol("invalid UDP carrier SESSION_AUTH")),
+        _ => return Err(RuntimeError::Protocol("invalid QUIC UDP path SESSION_AUTH")),
     }
     let (path_id, capabilities) = match udp_path_read_frame(&mut recv, context.codec_limits).await?
     {
@@ -1088,7 +1092,7 @@ async fn accept_server_udp_path_handshake(
         {
             (path_id, capabilities)
         }
-        _ => return Err(RuntimeError::Protocol("invalid UDP carrier PATH_JOIN")),
+        _ => return Err(RuntimeError::Protocol("invalid QUIC UDP path PATH_JOIN")),
     };
 
     udp_path_write_frame(&mut send, &Frame::SessionReady, context.codec_limits).await?;
@@ -1160,7 +1164,7 @@ async fn handle_server_udp_bidi_stream(
             Ok(())
         }
         _ => Err(RuntimeError::Protocol(
-            "unexpected first UDP carrier stream frame",
+            "unexpected first QUIC UDP path stream frame",
         )),
     }
 }
@@ -1318,7 +1322,7 @@ async fn run_server_udp_reliable_stream_loop(
         commands_tx,
         mut commands_rx,
     } = stream_context;
-    let mut carrier_frames = spawn_udp_carrier_reader(
+    let mut carrier_frames = spawn_quic_path_reader(
         recv,
         context.codec_limits,
         reliable_stream_frame_queue(context.mux_limits),
@@ -1435,7 +1439,7 @@ async fn run_server_udp_reliable_stream_loop(
                             }
                             ServerReliableStreamOpen::New(_) => {
                                 return Err(RuntimeError::Protocol(
-                                    "UDP carrier reannouncement opened duplicate stream",
+                                    "QUIC UDP path reannouncement opened duplicate stream",
                                 ));
                             }
                             ServerReliableStreamOpen::DuplicateLiveIgnored => {
@@ -1462,11 +1466,11 @@ async fn run_server_udp_reliable_stream_loop(
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
                         log_unexpected_stream_relay_frame(
-                            "server UDP carrier reliable",
+                            "server QUIC UDP path reliable",
                             stream_id,
                             &frame,
                         );
-                        return Err(RuntimeError::Protocol("unexpected server UDP carrier reliable stream frame"));
+                        return Err(RuntimeError::Protocol("unexpected server QUIC UDP path reliable stream frame"));
                     }
                     Some(Err(RuntimeError::TcpPathSessionClosed)) | None => {
                         context.reliable_streams.detach_path(
@@ -1616,7 +1620,7 @@ async fn drain_server_udp_reliable_commands(
             }
             TcpPathSessionCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
-                    "server UDP carrier stream received client open command",
+                    "server QUIC UDP path stream received client open command",
                 ));
             }
         };
@@ -1683,7 +1687,7 @@ async fn handle_server_udp_datagram_stream(
         context.codec_limits,
     ));
     let mut send = send;
-    let mut carrier_frames = spawn_udp_carrier_reader(
+    let mut carrier_frames = spawn_quic_path_reader(
         recv,
         context.codec_limits,
         udp_path_command_queue(context.mux_limits, context.codec_limits),
@@ -1719,15 +1723,15 @@ async fn handle_server_udp_datagram_stream(
                     }
                     Some(Ok(Frame::DatagramData { flow_id, datagram_id, ttl_ms, payload })) => {
                         if ttl_ms == 0 {
-                            return Err(RuntimeError::Protocol("expired UDP carrier datagram received"));
+                            return Err(RuntimeError::Protocol("expired QUIC UDP path datagram received"));
                         }
                         let flow_index = flows
                             .iter()
                             .position(|flow| flow.flow_id == flow_id)
-                            .ok_or(RuntimeError::Protocol("unknown UDP carrier datagram flow"))?;
+                            .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
                         let requests = flows
                             .get(flow_index)
-                            .ok_or(RuntimeError::Protocol("unknown UDP carrier datagram flow"))?
+                            .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?
                             .requests
                             .clone();
                         match requests.try_send(ServerUdpDatagramRequest { datagram_id, ttl_ms, payload }) {
@@ -1742,7 +1746,7 @@ async fn handle_server_udp_datagram_stream(
                                 ).await?;
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                eprintln!("warning: UDP carrier datagram worker queue full; dropping request");
+                                eprintln!("warning: QUIC UDP path datagram worker queue full; dropping request");
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 flows.retain(|flow| flow.flow_id != flow_id);
@@ -1762,7 +1766,7 @@ async fn handle_server_udp_datagram_stream(
                         udp_path_write_frame(&mut send, &Frame::Pong { nonce }, context.codec_limits).await?;
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
-                    Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server UDP carrier datagram stream frame")),
+                    Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server QUIC UDP path datagram stream frame")),
                     Some(Err(RuntimeError::TcpPathSessionClosed)) | None => return Ok(()),
                     Some(Err(err)) => return Err(err),
                 }
@@ -1881,7 +1885,7 @@ async fn drain_server_udp_datagram_commands(
             }
             TcpPathSessionCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
-                    "server UDP carrier datagram stream received open command",
+                    "server QUIC UDP path datagram stream received open command",
                 ));
             }
         };
@@ -1938,7 +1942,7 @@ async fn open_server_udp_datagram_flow(
 ) -> Result<(), RuntimeError> {
     if flows.iter().any(|flow| flow.flow_id == flow_id) {
         return Err(RuntimeError::Protocol(
-            "duplicate UDP carrier datagram flow",
+            "duplicate QUIC UDP path datagram flow",
         ));
     }
     if flows.len() >= context.max_udp_flows_per_session {
@@ -2004,7 +2008,7 @@ fn warn_unexpected_udp_runtime_error(message: &str, err: &RuntimeError) {
     }
 }
 
-fn udp_carrier_open_error_is_path_retryable(err: &RuntimeError) -> bool {
+fn quic_path_open_error_is_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,
         RuntimeError::Io(_)
@@ -2026,7 +2030,7 @@ fn udp_path_command_queue(mux_limits: MuxLimits, codec_limits: CodecLimits) -> u
 async fn resolve_first_socket_addr(path: &PathSpec) -> Result<SocketAddr, RuntimeError> {
     let mut addrs = lookup_host((path.endpoint.host.as_str(), path.endpoint.port)).await?;
     addrs.next().ok_or(RuntimeError::Protocol(
-        "UDP carrier endpoint resolved no socket addresses",
+        "QUIC UDP path endpoint resolved no socket addresses",
     ))
 }
 
@@ -2149,7 +2153,7 @@ mod tests {
             last_delivery_sample_at: None,
         };
 
-        let path_metrics = path_metrics_from_udp_carrier(PathId(7), metrics);
+        let path_metrics = path_metrics_from_quic_path(PathId(7), metrics);
 
         assert_eq!(path_metrics.loss_ppm, 0);
         assert!(!path_metrics.loss_observed);

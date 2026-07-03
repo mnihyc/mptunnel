@@ -385,17 +385,17 @@ mod tests {
         );
         assert!("udp://example.com:443?mtu=100".parse::<PathSpec>().is_err());
         assert!(
-            "tcp://example.com:443?engine=quic"
+            "tcp://example.com:443?unsupported=true"
                 .parse::<PathSpec>()
                 .is_err()
         );
         assert!(
-            "udp://example.com:443?engine=quic"
+            "udp://example.com:443?unsupported=true"
                 .parse::<PathSpec>()
                 .is_err()
         );
         assert!(
-            "udp://example.com:443?engine=custom-lab"
+            "udp://example.com:443?profile=experimental"
                 .parse::<PathSpec>()
                 .is_err()
         );

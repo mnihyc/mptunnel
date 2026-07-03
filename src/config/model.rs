@@ -757,7 +757,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn udp_paths_use_quic_without_engine_selector() {
+    fn udp_paths_reject_unknown_query_parameters() {
         let default_path = "udp://127.0.0.1:443"
             .parse::<PathSpec>()
             .expect("default udp path parses");
@@ -767,12 +767,12 @@ mod tests {
             crate::protocol::UnderlayProtocol::Udp
         );
         assert!(
-            "udp://127.0.0.1:443?engine=quic"
+            "udp://127.0.0.1:443?unsupported=true"
                 .parse::<PathSpec>()
                 .is_err()
         );
         assert!(
-            "udp://127.0.0.1:443?engine=custom-lab"
+            "udp://127.0.0.1:443?profile=experimental"
                 .parse::<PathSpec>()
                 .is_err()
         );

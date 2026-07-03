@@ -70,14 +70,14 @@ fn measured_udp_delivery_rate_updates_next_datagram_order() {
 
 #[test]
 fn udp_datagram_feedback_updates_scheduler_health() {
-    let stale_path = "udp://127.0.0.1:10021?srtt-ms=250&rate-mbps=1"
+    let lagging_path = "udp://127.0.0.1:10021?srtt-ms=250&rate-mbps=1"
         .parse::<PathSpec>()
-        .expect("stale path");
+        .expect("lagging path");
     let observed_path = "udp://127.0.0.1:10022?srtt-ms=250&rate-mbps=1"
         .parse::<PathSpec>()
         .expect("observed path");
     let context = ClientPathContext::new(
-        vec![stale_path, observed_path],
+        vec![lagging_path, observed_path],
         security(),
         ResourceLimits::default(),
     )
@@ -939,7 +939,7 @@ fn hinted_tcp_startup_uses_configured_metrics_before_order() {
 }
 
 #[test]
-fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
+fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     let path = "udp://127.0.0.1:10129"
         .parse::<PathSpec>()
         .expect("udp path");
@@ -949,7 +949,7 @@ fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
 
     {
         let mut health = context.health.lock().expect("health lock");
-        health.udp[0].mark_udp_carrier_metrics(UdpPathMetrics {
+        health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(42),
             rttvar: Duration::from_millis(7),
@@ -981,7 +981,7 @@ fn udp_carrier_metrics_feed_path_model_without_fake_bulk_evidence() {
 
     {
         let mut health = context.health.lock().expect("health lock");
-        health.udp[0].mark_udp_carrier_metrics(UdpPathMetrics {
+        health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(42),
             rttvar: Duration::from_millis(7),

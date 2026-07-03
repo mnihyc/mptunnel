@@ -833,20 +833,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_active_path_must_not_expand_cross_path_stream_hole() {
+    fn lagging_active_path_must_not_expand_cross_path_stream_hole() {
         let best = candidate(1, 100.0, 170.0, 180.0);
-        let mut stale_active = candidate(0, 1900.0, 1800.0, 1.0);
-        stale_active.snapshot.underlay = UnderlayProtocol::Tcp;
-        stale_active.snapshot.confidence = 1.0;
-        stale_active.snapshot.inflight_limit_bytes =
+        let mut lagging_active = candidate(0, 1900.0, 1800.0, 1.0);
+        lagging_active.snapshot.underlay = UnderlayProtocol::Tcp;
+        lagging_active.snapshot.confidence = 1.0;
+        lagging_active.snapshot.inflight_limit_bytes =
             MuxLimits::default().max_path_flight_bytes as u64;
 
         assert_eq!(
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
                 best_snapshot: best.snapshot,
                 best_eta_ms: best.eta_ms,
-                candidate_snapshot: stale_active.snapshot,
-                candidate_eta_ms: stale_active.eta_ms,
+                candidate_snapshot: lagging_active.snapshot,
+                candidate_eta_ms: lagging_active.eta_ms,
                 payload_bytes: 16 * 1024,
                 mux_limits: MuxLimits::default(),
                 role: BulkAdmissionRole::ActiveDataPath,

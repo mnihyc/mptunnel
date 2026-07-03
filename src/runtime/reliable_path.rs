@@ -282,7 +282,7 @@ impl FixedReliablePathOutput {
             });
     }
 
-    fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+    fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         if ranges.is_empty() {
             return;
         }
@@ -475,7 +475,7 @@ impl ReliablePathStreamOutput {
 
     pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         match self {
-            Self::Fixed(fixed) => fixed.release_acked_ranges(ranges),
+            Self::Fixed(fixed) => fixed.release_normalized_acked_ranges(ranges),
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
         }
     }

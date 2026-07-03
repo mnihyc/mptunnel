@@ -1405,7 +1405,9 @@ impl UdpDatagramClientSession {
     ) -> Result<Self, RuntimeError> {
         let stream = tokio::time::timeout(handshake_timeout, path_session.open_datagram_stream())
             .await
-            .map_err(|_| RuntimeError::Protocol("UDP carrier datagram stream open timed out"))??;
+            .map_err(|_| {
+                RuntimeError::Protocol("QUIC UDP path datagram stream open timed out")
+            })??;
         let path_id = stream.path_id;
         Ok(Self {
             _path_session: path_session,

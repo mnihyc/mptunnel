@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn datagram_queue_drops_expired_items_before_send() {
         let mut flow = DatagramFlow::new(DatagramFlowId(3), limits());
-        flow.enqueue(0, 10, Bytes::from_static(b"stale"))
+        flow.enqueue(0, 10, Bytes::from_static(b"expired"))
             .expect("enqueue");
 
         assert_eq!(flow.pop_frame(10), None);

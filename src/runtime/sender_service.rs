@@ -2350,23 +2350,23 @@ mod tests {
     }
 
     #[test]
-    fn response_quic_feed_credit_uses_live_carrier_debt_not_stale_bdp() {
+    fn response_quic_feed_credit_uses_live_carrier_debt_not_outdated_bdp() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = 64 * 1024;
-        let mut stale_quic = response_target(0, UnderlayProtocol::Udp, 250.0, 0, 64 * 1024, true);
-        stale_quic.snapshot.delivery_rate_bps = 351_000.0;
-        stale_quic.snapshot.pacing_rate_bps = 351_000.0;
-        stale_quic.snapshot.bytes_in_flight = 8 * 1024 * 1024;
-        stale_quic.snapshot.queue_bytes = 1024 * 1024;
+        let mut loaded_quic = response_target(0, UnderlayProtocol::Udp, 250.0, 0, 64 * 1024, true);
+        loaded_quic.snapshot.delivery_rate_bps = 351_000.0;
+        loaded_quic.snapshot.pacing_rate_bps = 351_000.0;
+        loaded_quic.snapshot.bytes_in_flight = 8 * 1024 * 1024;
+        loaded_quic.snapshot.queue_bytes = 1024 * 1024;
 
         let quic_credit = response_target_emission_credit_bytes(
-            &stale_quic,
+            &loaded_quic,
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
         );
-        let stale_bdp_credit = adaptive_reliable_relay_inflight_bytes(
-            Some(stale_quic.snapshot),
+        let outdated_bdp_credit = adaptive_reliable_relay_inflight_bytes(
+            Some(loaded_quic.snapshot),
             FlowLane::Throughput,
             mux_limits,
         );
@@ -2376,24 +2376,24 @@ mod tests {
             "QUIC feed credit must follow live carrier debt so the product sender keeps QUIC fed"
         );
         assert!(
-            quic_credit > stale_bdp_credit,
-            "stale app-limited BDP must not be the only QUIC writer-feed ceiling"
+            quic_credit > outdated_bdp_credit,
+            "app-limited BDP must not be the only QUIC writer-feed ceiling"
         );
 
-        let mut stale_tcp = response_target(1, UnderlayProtocol::Tcp, 250.0, 0, 64 * 1024, true);
-        stale_tcp.snapshot.delivery_rate_bps = 351_000.0;
-        stale_tcp.snapshot.pacing_rate_bps = 351_000.0;
-        stale_tcp.snapshot.bytes_in_flight = 8 * 1024 * 1024;
-        stale_tcp.snapshot.queue_bytes = 1024 * 1024;
+        let mut loaded_tcp = response_target(1, UnderlayProtocol::Tcp, 250.0, 0, 64 * 1024, true);
+        loaded_tcp.snapshot.delivery_rate_bps = 351_000.0;
+        loaded_tcp.snapshot.pacing_rate_bps = 351_000.0;
+        loaded_tcp.snapshot.bytes_in_flight = 8 * 1024 * 1024;
+        loaded_tcp.snapshot.queue_bytes = 1024 * 1024;
         let tcp_credit = response_target_emission_credit_bytes(
-            &stale_tcp,
+            &loaded_tcp,
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
         );
 
         assert_eq!(
-            tcp_credit, stale_bdp_credit,
+            tcp_credit, outdated_bdp_credit,
             "TCP product credit remains model-gated; only QUIC delegates packet pacing to QUIC"
         );
     }

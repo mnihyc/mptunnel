@@ -150,7 +150,7 @@ impl ReliableAckGapRepairProgress {
     pub(super) fn repair_ready(
         &mut self,
         complete: bool,
-        ranges: &[OffsetRange],
+        normalized_ranges: &[OffsetRange],
         active_underlay: Option<UnderlayProtocol>,
         has_multipath_repair_alternative: bool,
         path: Option<PathSnapshot>,
@@ -158,7 +158,7 @@ impl ReliableAckGapRepairProgress {
     ) -> bool {
         self.repair_ready_at(
             complete,
-            ranges,
+            normalized_ranges,
             active_underlay,
             has_multipath_repair_alternative,
             reliable_stream_recv_progress_interval(path, lane),
@@ -169,7 +169,7 @@ impl ReliableAckGapRepairProgress {
     fn repair_ready_at(
         &mut self,
         complete: bool,
-        ranges: &[OffsetRange],
+        normalized_ranges: &[OffsetRange],
         active_underlay: Option<UnderlayProtocol>,
         has_multipath_repair_alternative: bool,
         progress_interval: Duration,
@@ -181,13 +181,13 @@ impl ReliableAckGapRepairProgress {
         }
         if active_underlay != Some(UnderlayProtocol::Udp) {
             self.clear();
-            return stream_ack_first_gap(ranges).is_some();
+            return normalized_stream_ack_first_gap(normalized_ranges).is_some();
         }
         if !has_multipath_repair_alternative {
             self.clear();
             return false;
         }
-        let Some(first_gap) = stream_ack_first_gap(ranges) else {
+        let Some(first_gap) = normalized_stream_ack_first_gap(normalized_ranges) else {
             self.clear();
             return false;
         };
@@ -218,18 +218,17 @@ impl ReliableAckGapRepairProgress {
     }
 }
 
-fn stream_ack_first_gap(ranges: &[OffsetRange]) -> Option<(u64, u64)> {
-    if ranges.is_empty() {
+fn normalized_stream_ack_first_gap(normalized_ranges: &[OffsetRange]) -> Option<(u64, u64)> {
+    debug_assert!(
+        normalized_ranges
+            .windows(2)
+            .all(|ranges| ranges[0].end < ranges[1].start)
+    );
+    if normalized_ranges.is_empty() {
         return None;
     }
-    let mut ranges = ranges.to_vec();
-    ranges.sort_by(|left, right| {
-        left.start
-            .cmp(&right.start)
-            .then_with(|| left.end.cmp(&right.end))
-    });
     let mut cursor = 0_u64;
-    for range in ranges {
+    for range in normalized_ranges {
         if range.end <= cursor {
             continue;
         }

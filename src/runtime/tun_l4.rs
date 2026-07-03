@@ -113,7 +113,7 @@ pub(super) struct TunUdpFlowKey {
 }
 
 pub(super) struct TunUdpResponse {
-    payload: Vec<u8>,
+    payload: Bytes,
     source: SocketAddr,
     destination: SocketAddr,
 }
@@ -405,7 +405,11 @@ pub(super) async fn run_tun_udp_socket(
                     return Ok(());
                 };
                 write_half
-                    .send((response.payload, response.source, response.destination))
+                    .send((
+                        response.payload.to_vec(),
+                        response.source,
+                        response.destination,
+                    ))
                     .await?;
             }
             done = done_rx.recv() => {
@@ -463,7 +467,7 @@ pub(super) async fn handle_tun_udp_flow(
                     Ok(response) => {
                         responses
                             .send(TunUdpResponse {
-                                payload: response.to_vec(),
+                                payload: response,
                                 source: completion.metadata.remote,
                                 destination: completion.metadata.local,
                             })

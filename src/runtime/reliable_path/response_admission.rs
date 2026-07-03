@@ -282,7 +282,7 @@ pub(super) fn server_bulk_output_snapshot(
     ) {
         (_, Some(path_metrics), _) => Some(server_path_metrics_rate_bps(path_metrics)),
         (UnderlayProtocol::Tcp, None, Some(rate))
-            if !super::tcp_delivery_samples_override_startup_prior(entry.delivery_samples) =>
+            if !super::product_delivery_samples_override_startup_prior(entry.delivery_samples) =>
         {
             Some(rate.max(prior_rate_bps))
         }
@@ -472,6 +472,10 @@ pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
     );
     match entry.key.underlay {
         UnderlayProtocol::Udp => has_local_carrier_bulk,
+        // TCP response output is one encrypted carrier stream, so product
+        // STREAM_ACK samples are path-scoped sender evidence. QUIC/UDP exposes
+        // carrier ACK-derived samples separately and must use those for
+        // ordinary bulk-rate proof.
         UnderlayProtocol::Tcp => {
             entry.delivery_samples > 0
                 || entry.delivery_rate_bps.is_some()

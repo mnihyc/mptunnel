@@ -2400,6 +2400,9 @@ pub(super) fn relay_underlay_identity_order(
     left: UnderlayProtocol,
     right: UnderlayProtocol,
 ) -> std::cmp::Ordering {
+    // Stable identity tie-breaker only. Real scheduling order is decided before
+    // this by path metrics and original config ordinal; this must not become a
+    // TCP-vs-UDP preference.
     (left as u8).cmp(&(right as u8))
 }
 

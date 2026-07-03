@@ -181,7 +181,7 @@ struct FixedReliablePathModel {
     flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
 }
 
-pub(in crate::runtime) fn tcp_delivery_samples_override_startup_prior(
+pub(in crate::runtime) fn product_delivery_samples_override_startup_prior(
     delivery_samples: u32,
 ) -> bool {
     delivery_samples >= RELIABLE_INITIAL_WINDOW_PACKETS as u32
@@ -238,7 +238,7 @@ impl FixedReliablePathOutput {
         let prior_rate_bps = self.startup.delivery_rate_bps.max(1.0);
         let delivery_rate_bps = match (self.key.underlay, model.delivery_rate_bps) {
             (UnderlayProtocol::Tcp, Some(rate))
-                if !tcp_delivery_samples_override_startup_prior(model.delivery_samples) =>
+                if !product_delivery_samples_override_startup_prior(model.delivery_samples) =>
             {
                 rate.max(prior_rate_bps)
             }

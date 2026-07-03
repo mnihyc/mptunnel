@@ -653,6 +653,26 @@ fn udp_edge_lane_startup_ramps_after_success_feedback() {
 }
 
 #[test]
+fn udp_edge_lane_startup_uses_tcp_datagram_carriers_too() {
+    let paths = vec![
+        "tcp://127.0.0.1:10186?srtt-ms=20&jitter-ms=0&rate-mbps=30"
+            .parse()
+            .expect("first tcp path"),
+        "tcp://127.0.0.1:10187?srtt-ms=25&jitter-ms=0&rate-mbps=30"
+            .parse()
+            .expect("second tcp path"),
+    ];
+    let context =
+        ClientPathContext::new(paths, security(), ResourceLimits::default()).expect("context");
+
+    assert!(udp_edge_lane_limit(&context) > 1);
+    assert_eq!(udp_edge_startup_lane_limit(&context), 2);
+    assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
+    assert!(udp_edge_lane_spawn_allowed(1, 0, &context));
+    assert!(!udp_edge_lane_spawn_allowed(2, 0, &context));
+}
+
+#[test]
 fn udp_edge_lane_startup_respects_queue_capacity() {
     let path = "udp://127.0.0.1:10183".parse().expect("path");
     let resources = ResourceLimits {

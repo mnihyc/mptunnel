@@ -31,7 +31,6 @@ pub enum RuntimeError {
     TunDevice(std::io::Error),
     TaskJoin(tokio::task::JoinError),
     NoTcpPath,
-    NoUdpPath,
     NoDatagramPath,
     NoSchedulableReliablePath,
     NoSchedulableTcpPath,
@@ -149,7 +148,6 @@ impl std::fmt::Display for RuntimeError {
             ),
             Self::TaskJoin(err) => write!(f, "runtime task failed: {err}"),
             Self::NoTcpPath => write!(f, "runtime operation requires at least one TCP path"),
-            Self::NoUdpPath => write!(f, "runtime operation requires at least one UDP path"),
             Self::NoDatagramPath => {
                 write!(
                     f,
@@ -206,7 +204,6 @@ impl std::error::Error for RuntimeError {
             Self::TunDevice(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
             Self::NoTcpPath
-            | Self::NoUdpPath
             | Self::NoDatagramPath
             | Self::NoSchedulableReliablePath
             | Self::NoSchedulableTcpPath

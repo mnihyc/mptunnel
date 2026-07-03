@@ -154,12 +154,6 @@ impl ReliableRelayRemoteSet {
             .max(1)
     }
 
-    pub(super) fn fin_requires_repair_drain(&self) -> bool {
-        self.paths
-            .iter()
-            .any(|path| path.stream.underlay == UnderlayProtocol::Udp)
-    }
-
     pub(super) fn attach(&mut self, opened: OpenedRemoteStream) {
         self.attach_with_placement(opened, RelayPathPlacement::Active);
     }

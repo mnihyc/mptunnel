@@ -294,9 +294,8 @@ where
         };
         let can_read_local =
             can_read_by_flow && prospective_read_budget > 0 && !inbound_frame_ready;
-        let can_send_pending_fin = pending_local_fin
-            && sender_queue.is_empty()
-            && (!remotes.fin_requires_repair_drain() || send_stream.repair_bytes() == 0);
+        let can_send_pending_fin =
+            reliable_relay_can_send_pending_fin(pending_local_fin, sender_queue.is_empty());
         #[cfg(feature = "lab-diagnostics")]
         {
             if local_open && !can_read_local {
@@ -1335,10 +1334,10 @@ where
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
                         last_stream_progress_at = Instant::now();
-                        if pending_local_fin
-                            && sender_queue.is_empty()
-                            && send_stream.repair_bytes() == 0
-                        {
+                        if reliable_relay_can_send_pending_fin(
+                            pending_local_fin,
+                            sender_queue.is_empty(),
+                        ) {
                             match sender
                                 .send_control_frame(
                                     context,
@@ -1635,6 +1634,10 @@ fn reliable_relay_can_finish_after_path_loss(
         && send_stream.repair_bytes() == 0
         && recv_stream.reorder_bytes() == 0
         && stats.payload_bytes > 0
+}
+
+fn reliable_relay_can_send_pending_fin(pending_local_fin: bool, sender_queue_empty: bool) -> bool {
+    pending_local_fin && sender_queue_empty
 }
 
 fn reliable_relay_should_wait_for_pending_path_recovery(
@@ -2467,6 +2470,13 @@ mod tests {
             UnderlayProtocol::Tcp
         )));
         assert!(!reliable_relay_product_stall_keeps_sole_carrier(None));
+    }
+
+    #[test]
+    fn pending_fin_policy_is_ordered_queue_state_not_carrier_family() {
+        assert!(reliable_relay_can_send_pending_fin(true, true));
+        assert!(!reliable_relay_can_send_pending_fin(true, false));
+        assert!(!reliable_relay_can_send_pending_fin(false, true));
     }
 
     #[tokio::test]

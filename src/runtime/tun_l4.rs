@@ -145,7 +145,7 @@ pub(super) fn udp_edge_queue_slots(context: &ClientPathContext) -> usize {
     (context.mux_limits.max_datagram_queue_bytes / payload).max(1)
 }
 
-pub(super) fn udp_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usize {
+pub(super) fn datagram_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usize {
     if snapshot.state == SchedulerPathState::Failed {
         return 0;
     }
@@ -169,16 +169,21 @@ pub(super) fn udp_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usize {
 }
 
 pub(super) fn udp_edge_lane_limit(context: &ClientPathContext) -> usize {
-    let path_parallelism = (0..context.udp_paths.len())
-        .filter_map(|index| context.udp_path_snapshot(index))
-        .map(udp_edge_path_lane_parallelism)
+    let tcp_parallelism = (0..context.tcp_paths.len())
+        .filter_map(|index| context.tcp_path_snapshot(index))
+        .map(datagram_edge_path_lane_parallelism)
         .sum::<usize>();
-    udp_edge_queue_slots(context).min(path_parallelism.max(1))
+    let udp_parallelism = (0..context.udp_paths.len())
+        .filter_map(|index| context.udp_path_snapshot(index))
+        .map(datagram_edge_path_lane_parallelism)
+        .sum::<usize>();
+    udp_edge_queue_slots(context).min(tcp_parallelism.saturating_add(udp_parallelism).max(1))
 }
 
 pub(super) fn udp_edge_startup_lane_limit(context: &ClientPathContext) -> usize {
     let queue_slots = udp_edge_queue_slots(context);
-    let hedge_lane = usize::from(queue_slots > 1 && !context.udp_paths.is_empty());
+    let has_datagram_carrier = !context.tcp_paths.is_empty() || !context.udp_paths.is_empty();
+    let hedge_lane = usize::from(queue_slots > 1 && has_datagram_carrier);
     udp_edge_lane_limit(context)
         .min(queue_slots)
         .min(1usize.saturating_add(hedge_lane))

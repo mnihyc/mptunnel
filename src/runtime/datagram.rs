@@ -251,7 +251,6 @@ fn datagram_underlay_error_is_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,
         RuntimeError::NoTcpPath
-            | RuntimeError::NoUdpPath
             | RuntimeError::NoSchedulableTcpPath
             | RuntimeError::NoSchedulableUdpPath
             | RuntimeError::Io(_)

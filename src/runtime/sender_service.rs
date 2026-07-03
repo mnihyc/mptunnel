@@ -920,9 +920,7 @@ fn response_target_needs_quic_unique_bulk_trial(
     if discovery_credit == 0 {
         return false;
     }
-    let trial_credit = discovery_credit.saturating_mul(2);
     target.bulk_discovery_sent_bytes >= discovery_credit
-        && target.bulk_discovery_sent_bytes < trial_credit
         && response_target_discovery_debt_bytes(target) < discovery_credit
 }
 
@@ -1276,20 +1274,27 @@ async fn emit_planned_response_data_frame(
                 }
             }
             binding.record_flight(target.key, &frame, true);
-            if bulk_discovery || bulk_unique_trial {
+            if bulk_discovery {
                 binding.record_bulk_discovery_bytes(
                     target.key,
                     reliable_stream_frame_payload_bytes(&frame),
                 );
             }
             binding.set_ordered_data_owner(target.key);
+            let decision_reason = if bulk_discovery {
+                "bulk_discovery"
+            } else if bulk_unique_trial {
+                "unique_trial"
+            } else {
+                "data"
+            };
             record_server_sender_decision(
                 binding.session_id(),
                 stream.stream_id,
                 target.key,
                 &frame,
                 lane,
-                "data",
+                decision_reason,
             );
             for duplicate in duplicate_discovery {
                 match send_sender_service_frame_to_carrier(
@@ -3405,6 +3410,49 @@ mod tests {
             "ACK-derived carrier data makes a QUIC validation path eligible for one bounded unique trial, but not bulk-rate proven"
         );
         assert!(plan.duplicate_discovery.is_empty());
+    }
+
+    #[test]
+    fn quic_ack_data_seen_unique_trial_does_not_consume_duplicate_discovery_credit() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut active = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            50.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        active.has_bulk_rate_evidence = true;
+        let mut trial = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
+        trial.has_ack_data_evidence = true;
+        trial.has_bulk_rate_evidence = false;
+        trial.bulk_discovery_sent_bytes = response_bulk_discovery_credit_bytes(
+            payload_bytes,
+            mux_limits,
+            MppPerformanceConfig::default(),
+        ) as u64
+            + payload_bytes as u64;
+
+        let selected = choose_response_sender_data_target(
+            &[active, trial.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            MppPerformanceConfig::default(),
+            &[],
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            }),
+        )
+        .expect("ACK-data-seen QUIC path remains eligible for owner trials");
+
+        assert_eq!(
+            selected.key, trial.key,
+            "ordinary unique trial bytes are app payload, not duplicate/probe overhead; they must not exhaust duplicate-discovery credit"
+        );
     }
 
     #[test]

@@ -2667,11 +2667,18 @@ ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
 duplicate-discovery copy that is acknowledged by the local QUIC carrier may set
 ACK-derived data seen for that carrier path, which proves the path can carry
 data and may make it eligible for a bounded trial when the ordered frontier is
-safe. That trial is ordinary product data, but it is still part of validation
-state: the sender debits it against the same discovery ledger used for duplicate
-discovery and MUST stop trials once the bounded discovery allowance is spent
-unless the carrier produces non-application-limited bulk-rate evidence. ACK-data
+safe. That trial is ordinary product data, not duplicate/probe overhead: it owns
+the stream range, enters product/path flight, and is governed by normal
+ECF/BLEST admission, stream-ordering-debt checks, service quantum preemption, and
+carrier credit. It MUST NOT debit the duplicate/proof discovery ledger. The
+duplicate/proof ledger still bounds non-owner extra traffic; unique trial traffic
+is bounded by the no-worse admission model and by carrier/path feedback. ACK-data
 seen does not set bulk-rate evidence and does not overwrite the delivery rate.
+ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
+after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
+MUST NOT require product TX and QUIC ACK to happen in the same sampling interval,
+and it MUST NOT be inferred from path proof, stream ACK, MAX_DATA, or other
+control-only frames.
 Until a non-application-limited data sample exists, and until the local QUIC
 stack exposes usable pacing or congestion-window capacity, ACK progress MUST
 NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not bulk

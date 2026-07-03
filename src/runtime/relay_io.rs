@@ -1013,17 +1013,23 @@ async fn drain_server_response_sender_ready(
         dispatched_items = dispatched_items.saturating_add(1);
         if dispatch.lane == ReliableRelayQueuedWorkLane::Repair {
             #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "repair_frame_dispatched",
-                format_args!(
-                    "session_id={} stream_id={} path_underlay={:?} path_id={} payload_bytes={}",
-                    session_id.0,
-                    path_stream.stream_id.0,
-                    dispatch.selected_path.underlay,
-                    dispatch.selected_path.path_id.0,
-                    dispatch.payload_bytes,
-                ),
-            );
+            {
+                let (selected_underlay, selected_path_id) = dispatch
+                    .selected_path
+                    .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
+                    .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
+                lab_diagnostic(
+                    "repair_frame_dispatched",
+                    format_args!(
+                        "session_id={} stream_id={} path_underlay={} path_id={} payload_bytes={}",
+                        session_id.0,
+                        path_stream.stream_id.0,
+                        selected_underlay,
+                        selected_path_id,
+                        dispatch.payload_bytes,
+                    ),
+                );
+            }
         } else {
             dispatched_payload_bytes =
                 dispatched_payload_bytes.saturating_add(dispatch.payload_bytes);

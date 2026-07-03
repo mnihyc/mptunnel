@@ -32,6 +32,7 @@ pub struct Endpoint {
 pub struct Connection {
     connection: quinn::Connection,
     write_backlog: Arc<AtomicU64>,
+    product_data_written: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +44,7 @@ pub struct CongestionMetrics {
     pub loss_ppm: Option<u32>,
     pub ecn_ppm: Option<u32>,
     pub newly_acked_bytes: Option<u64>,
+    pub product_data_written_bytes: u64,
     pub delivery_sample_count: u64,
     pub app_limited: bool,
 }
@@ -51,6 +53,7 @@ pub struct CongestionMetrics {
 pub struct SendStream {
     stream: quinn::SendStream,
     write_backlog: Arc<AtomicU64>,
+    product_data_written: Arc<AtomicU64>,
     encode_buffer: Vec<u8>,
 }
 
@@ -260,6 +263,7 @@ impl Endpoint {
         Ok(Connection {
             connection: connecting.await?,
             write_backlog: Arc::new(AtomicU64::new(0)),
+            product_data_written: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -271,6 +275,7 @@ impl Endpoint {
                     return Some(Connection {
                         connection,
                         write_backlog: Arc::new(AtomicU64::new(0)),
+                        product_data_written: Arc::new(AtomicU64::new(0)),
                     });
                 }
                 Err(err) => {
@@ -293,6 +298,7 @@ impl Connection {
             SendStream {
                 stream: send,
                 write_backlog: self.write_backlog.clone(),
+                product_data_written: self.product_data_written.clone(),
                 encode_buffer: Vec::new(),
             },
             RecvStream { stream: recv },
@@ -305,6 +311,7 @@ impl Connection {
             SendStream {
                 stream: send,
                 write_backlog: self.write_backlog.clone(),
+                product_data_written: self.product_data_written.clone(),
                 encode_buffer: Vec::new(),
             },
             RecvStream { stream: recv },
@@ -349,6 +356,7 @@ impl Connection {
             loss_ppm,
             ecn_ppm: None,
             newly_acked_bytes,
+            product_data_written_bytes: self.product_data_written.load(Ordering::Relaxed),
             delivery_sample_count,
             app_limited,
         }
@@ -373,6 +381,9 @@ pub async fn write_frames(
     }
     #[cfg(feature = "lab-diagnostics")]
     let encode_started = std::time::Instant::now();
+    let product_data_bytes = frames.iter().fold(0u64, |total, frame| {
+        total.saturating_add(frame_product_data_bytes(frame) as u64)
+    });
     let packet_len = {
         let packet = &mut send.encode_buffer;
         packet.clear();
@@ -403,6 +414,10 @@ pub async fn write_frames(
             Some(current.saturating_sub(packet_len))
         });
     write_result?;
+    if product_data_bytes > 0 {
+        send.product_data_written
+            .fetch_add(product_data_bytes, Ordering::Relaxed);
+    }
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.write_frames_wait",
@@ -410,6 +425,13 @@ pub async fn write_frames(
         packet_len as usize,
     );
     Ok(())
+}
+
+fn frame_product_data_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::StreamData { payload, .. } | Frame::DatagramData { payload, .. } => payload.len(),
+        _ => 0,
+    }
 }
 
 fn encode_length_prefixed_frame(

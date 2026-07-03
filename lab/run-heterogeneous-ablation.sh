@@ -67,7 +67,8 @@ case "$lab_perf" in
     ;;
 esac
 case_filter="${CASE_FILTER:-}"
-client_settle_seconds="${CLIENT_SETTLE_SECONDS:-2}"
+client_start_settle_seconds="${CLIENT_START_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
+client_stop_settle_seconds="${CLIENT_STOP_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
 isolate_cases="${ISOLATE_CASES:-1}"
 isolate_containers="${ISOLATE_CONTAINERS_PER_CASE:-1}"
 if [[ -n "${MPTUNNEL_LAB_SECRET:-}" ]]; then
@@ -897,7 +898,7 @@ stop_baselines() {
 
 stop_client() {
   stop_process client /tmp/mptunnel-client.pid
-  sleep "$client_settle_seconds"
+  sleep "$client_stop_settle_seconds"
 }
 
 stop_server() {
@@ -1122,7 +1123,7 @@ start_client_with_netem() {
     $(mptunnel_lab_env_prefix client) \
     /workspace/target/release/mptunnel --config '${config_path}' \
       >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
-  sleep 1
+  sleep "$client_start_settle_seconds"
   exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"
 }
 
@@ -1156,7 +1157,7 @@ start_tun_client() {
     $(mptunnel_lab_env_prefix client) \
     /workspace/target/release/mptunnel --config '${config_path}' \
       >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
-  sleep 1
+  sleep "$client_start_settle_seconds"
   exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"
   exec_in client "deadline=\$((SECONDS + 10)); while ! ip link show mptun0 >/dev/null 2>&1 && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; ip link show mptun0 >/dev/null"
   exec_in client "ip route replace 172.31.40.30/32 dev mptun0"

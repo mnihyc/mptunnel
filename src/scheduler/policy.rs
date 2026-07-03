@@ -436,9 +436,6 @@ pub fn score_path(
     if path.flags.expensive {
         eta_ms += adaptive_expensive_path_penalty_ms(path, payload_bytes);
     }
-    if path.underlay == UnderlayProtocol::Tcp && prefers_low_reorder(lane) {
-        eta_ms += adaptive_tcp_reorder_penalty_ms(path, payload_bytes);
-    }
     Some(PathScore {
         path_id: path.id,
         eta_ms,
@@ -606,12 +603,6 @@ fn adaptive_expensive_path_penalty_ms(path: PathSnapshot, payload_bytes: usize) 
     path_pto_ms(path).max(payload_tx_ms(path, payload_bytes))
 }
 
-fn adaptive_tcp_reorder_penalty_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
-    (path.srtt_ms.max(1.0) / 2.0)
-        .max(path.jitter_ms.max(0.0))
-        .max(payload_tx_ms(path, payload_bytes))
-}
-
 fn adaptive_tail_avoidance_threshold_bytes(
     paths: &[PathSnapshot],
     packet: EnqueueRequest,
@@ -684,6 +675,27 @@ mod tests {
         );
 
         assert_eq!(choice.map(|score| score.path_id), Some(PathId(0)));
+    }
+
+    #[test]
+    fn latency_scoring_uses_metrics_not_tcp_udp_family_penalty() {
+        let lower_latency_tcp =
+            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 10.0, mbps(100.0));
+        let higher_latency_udp =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 18.0, mbps(100.0));
+
+        let choice = choose_path(
+            &[lower_latency_tcp, higher_latency_udp],
+            FlowLane::RealtimeDatagram,
+            512,
+            SchedulerPolicy::default(),
+        );
+
+        assert_eq!(
+            choice.map(|score| score.path_id),
+            Some(PathId(0)),
+            "realtime/latency carrier choice must follow link metrics, not a hardcoded TCP penalty"
+        );
     }
 
     #[test]

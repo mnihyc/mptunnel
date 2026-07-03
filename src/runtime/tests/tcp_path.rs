@@ -224,7 +224,7 @@ fn mixed_reliable_initial_open_uses_best_carrier_not_tcp_first() {
 }
 
 #[test]
-fn mixed_reliable_latency_startup_uses_udp_probe_metric_when_it_beats_tcp_unknown() {
+fn mixed_reliable_latency_startup_ignores_probe_noise_without_product_evidence() {
     let context = ClientPathContext::new(
         vec![
             "tcp://127.0.0.1:11086".parse().expect("tcp path"),
@@ -240,7 +240,7 @@ fn mixed_reliable_latency_startup_uses_udp_probe_metric_when_it_beats_tcp_unknow
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Udp);
+    assert_eq!(selected.underlay, UnderlayProtocol::Tcp);
     assert_eq!(selected.index, 0);
 }
 
@@ -1869,6 +1869,33 @@ fn mixed_endpoint_only_bulk_striping_keeps_udp_eligible_under_tcp_pressure() {
             underlay: UnderlayProtocol::Udp,
             index: 0,
         })
+    );
+}
+
+#[test]
+fn mixed_latency_startup_uses_metrics_not_udp_family_penalty() {
+    let tcp_path = "tcp://127.0.0.1:10190?srtt-ms=12&rate-mbps=1000"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let udp_path = "udp://127.0.0.1:10191?srtt-ms=8&rate-mbps=1000"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context = ClientPathContext::new(
+        vec![tcp_path, udp_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
+
+    assert_eq!(
+        context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        }),
+        "latency startup must follow measured link status instead of penalizing the UDP family"
     );
 }
 

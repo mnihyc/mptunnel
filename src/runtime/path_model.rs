@@ -424,8 +424,7 @@ pub(super) fn reliable_stream_path_candidates(
                         underlay: UnderlayProtocol::Tcp,
                         index: *index,
                     },
-                    eta_ms: *eta_ms
-                        + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
+                    eta_ms: *eta_ms,
                     has_evidence: bulk_candidate_has_evidence(path, observation),
                     has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
                         observation,
@@ -443,8 +442,7 @@ pub(super) fn reliable_stream_path_candidates(
                     udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
                 } else {
                     0.0
-                }
-                + reliable_stream_initial_lane_protection_penalty(snapshot, lane);
+                };
             path_can_be_auto_discovered_for_lane(path, observation, lane).then_some(
                 BulkPathCandidate {
                     key: RelayPathKey {
@@ -475,8 +473,7 @@ pub(super) fn reliable_stream_path_candidates(
                                 underlay: UnderlayProtocol::Tcp,
                                 index: *index,
                             },
-                            eta_ms: *eta_ms
-                                + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
+                            eta_ms: *eta_ms,
                             has_evidence: bulk_candidate_has_evidence(path, observation),
                             has_sender_delivery_evidence:
                                 bulk_candidate_has_sender_delivery_evidence(observation),
@@ -493,8 +490,7 @@ pub(super) fn reliable_stream_path_candidates(
                             udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
                         } else {
                             0.0
-                        }
-                        + reliable_stream_initial_lane_protection_penalty(snapshot, lane);
+                        };
                     path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
                         BulkPathCandidate {
                             key: RelayPathKey {
@@ -512,17 +508,6 @@ pub(super) fn reliable_stream_path_candidates(
                 .collect();
     }
     candidates
-}
-
-fn reliable_stream_initial_lane_protection_penalty(snapshot: PathSnapshot, lane: FlowLane) -> f64 {
-    if snapshot.underlay == UnderlayProtocol::Udp
-        && matches!(lane, FlowLane::Control | FlowLane::Latency)
-        && snapshot.active_latency_sensitive_flows > 0
-    {
-        snapshot.srtt_ms.max(1.0)
-    } else {
-        0.0
-    }
 }
 
 pub(super) fn path_snapshot(

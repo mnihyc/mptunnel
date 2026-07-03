@@ -2075,8 +2075,9 @@ final-offset ordering guarantee.
 TCP and UDP underlays are optimized separately and may also be used together.
 Mixed-carrier reliable streams MUST avoid blind TCP+UDP striping without
 evidence. Auto MAY move a stream between carriers or attach repair paths when
-live measurements show benefit. UDP datagrams prefer UDP underlay, with TCP
-underlay fallback only as best-effort datagram relay.
+live measurements show benefit. Datagram flows use the same evidence-driven
+carrier rule: TCP or QUIC UDP may carry a product datagram when its measured
+latency, loss, queue/flight state, TTL fit, and demand model is best.
 
 TCP and UDP can coexist, but they report very different signals. UDP exposes
 packet-level recovery, ACK-derived delivery samples, pacing, and congestion
@@ -2318,13 +2319,13 @@ TCP-only deployments are degenerate candidate sets of this rule.
 Endpoint-only startup uses cautious evidence handling before cross-carrier
 sorting. Probe-only RTT or rate samples MUST NOT by themselves make a path
 steal the first reliable stream when no product delivery evidence exists, and
-a UDP path already serving realtime or latency-sensitive work receives an
-additional lane-protection cost before it is chosen for a reliable latency
-stream. This is not a manual mode or fixed traffic class: it is a path-model
-penalty that can be overcome by a materially better UDP path. The intent is to
-preserve QUIC/BBR-style lane isolation while still allowing a low-RTT/high-rate
-QUIC UDP carrier to become the initial lead when it is genuinely the best
-completion candidate.
+a path already serving realtime or latency-sensitive work is scored by the same
+active-flow, queue, RTT, loss, and delivery-rate model regardless of whether
+the carrier is TCP or QUIC UDP. This is not a manual mode or fixed traffic
+class: fresh opens are latency-first, sustained demand may move toward larger
+measured bandwidth, and the sender can shrink back to latency/realtime behavior
+when that demand disappears. The intent is to preserve lane isolation without
+hardcoded TCP-vs-UDP preference.
 
 The DRR service quantum for throughput data is the actual preemptible
 sender-service packet quantum selected from live BDP, stability, queue pressure,

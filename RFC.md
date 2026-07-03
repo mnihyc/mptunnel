@@ -2327,6 +2327,12 @@ measured bandwidth, and the sender can shrink back to latency/realtime behavior
 when that demand disappears. The intent is to preserve lane isolation without
 hardcoded TCP-vs-UDP preference.
 
+When a path has path-scoped product delivery evidence or carrier delivery
+evidence, those observations remain valid startup inputs even after the path has
+gone idle. The endpoint-only startup filter only suppresses probe-only liveness
+noise; it MUST NOT discard delivery-backed RTT, rate, loss, or queue evidence
+and fall back to configured order.
+
 The DRR service quantum for throughput data is the actual preemptible
 sender-service packet quantum selected from live BDP, stability, queue pressure,
 and the configured read/payload envelope. It is independent from the 512 KiB

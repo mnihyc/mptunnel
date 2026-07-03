@@ -295,23 +295,32 @@ pub(super) fn endpoint_only_reliable_startup_path_scores(
     let observations = observations
         .iter()
         .copied()
-        .map(|observation| ClientPathObservation {
-            measured_srtt_ms: None,
-            measured_jitter_ms: None,
-            measured_rate_bps: None,
-            measured_loss_rate: None,
-            measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
-            delivery_samples: 0,
-            last_delivery_at: None,
-            carrier_srtt_ms: None,
-            carrier_rttvar_ms: None,
-            carrier_delivery_rate_bps: None,
-            carrier_delivery_samples: 0,
-            carrier_last_delivery_at: None,
-            ..observation
-        })
+        .map(endpoint_only_startup_observation_for_scoring)
         .collect::<Vec<_>>();
     ordered_path_scores(paths, &observations, lane, payload_bytes)
+}
+
+fn endpoint_only_startup_observation_for_scoring(
+    observation: ClientPathObservation,
+) -> ClientPathObservation {
+    if bulk_candidate_has_sender_delivery_evidence(observation) {
+        return observation;
+    }
+    ClientPathObservation {
+        measured_srtt_ms: None,
+        measured_jitter_ms: None,
+        measured_rate_bps: None,
+        measured_loss_rate: None,
+        measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
+        delivery_samples: 0,
+        last_delivery_at: None,
+        carrier_srtt_ms: None,
+        carrier_rttvar_ms: None,
+        carrier_delivery_rate_bps: None,
+        carrier_delivery_samples: 0,
+        carrier_last_delivery_at: None,
+        ..observation
+    }
 }
 
 pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {

@@ -245,6 +245,35 @@ fn mixed_reliable_latency_startup_ignores_probe_noise_without_product_evidence()
 }
 
 #[test]
+fn mixed_reliable_latency_startup_uses_delivery_backed_metrics_after_idle() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11092".parse().expect("tcp path"),
+            "udp://127.0.0.1:11093".parse().expect("udp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_udp_path_probe_success(0, Duration::from_millis(1));
+    context.mark_udp_path_delivery(
+        0,
+        PathDeliveryStats {
+            payload_bytes: 1024 * 1024,
+            first_payload_at: Some(Instant::now() - Duration::from_millis(10)),
+            last_payload_at: Some(Instant::now()),
+        },
+    );
+
+    let selected = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("selected path");
+
+    assert_eq!(selected.underlay, UnderlayProtocol::Udp);
+    assert_eq!(selected.index, 0);
+}
+
+#[test]
 fn mixed_reliable_latency_startup_preserves_global_order_without_family_preference() {
     let context = ClientPathContext::new(
         vec![

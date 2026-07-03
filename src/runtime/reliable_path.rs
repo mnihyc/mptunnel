@@ -91,8 +91,8 @@ impl ReliablePathStream {
         self.output.set_lane(lane);
     }
 
-    pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
-        self.output.release_acked_ranges(ranges);
+    pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
+        self.output.release_normalized_acked_ranges(ranges);
     }
 
     pub(super) fn has_multipath_repair_alternative(&self) -> bool {
@@ -473,10 +473,10 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+    pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         match self {
             Self::Fixed(fixed) => fixed.release_acked_ranges(ranges),
-            Self::Switchable(binding) => binding.release_acked_ranges(ranges),
+            Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
         }
     }
 
@@ -892,7 +892,7 @@ impl ResponseStreamBinding {
         !was_active
     }
 
-    pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+    pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         if ranges.is_empty() {
             return;
         }
@@ -918,7 +918,7 @@ impl ResponseStreamBinding {
                 .ack_ordering
                 .lock()
                 .expect("server response ACK ordering lock")
-                .apply_ack(ranges, &[]);
+                .apply_normalized_ack(ranges, &[]);
             if ordering_update.changed {
                 self.notify_update();
             }
@@ -937,7 +937,7 @@ impl ResponseStreamBinding {
                 .ack_ordering
                 .lock()
                 .expect("server response ACK ordering lock");
-            ordering.apply_ack(ranges, &released)
+            ordering.apply_normalized_ack(ranges, &released)
         };
         #[cfg(feature = "lab-diagnostics")]
         if ordering_update.acked_hole_bytes > 0 {
@@ -1573,7 +1573,7 @@ mod tests {
 
         binding.record_flight(key, &frame, true);
         std::thread::sleep(Duration::from_millis(1));
-        binding.release_acked_ranges(&[OffsetRange {
+        binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: reliable_stream_frame_payload_bytes(&frame) as u64,
         }]);
@@ -1593,7 +1593,7 @@ mod tests {
 
         binding.record_flight(key, &frame, true);
         std::thread::sleep(Duration::from_millis(1));
-        binding.release_acked_ranges(&[OffsetRange {
+        binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: reliable_stream_frame_payload_bytes(&frame) as u64,
         }]);
@@ -1631,7 +1631,7 @@ mod tests {
         assert_eq!(lower[0].key, owner);
         assert_eq!(lower[0].bytes, 4096);
 
-        binding.release_acked_ranges(&[OffsetRange {
+        binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: 4096,
         }]);
@@ -1677,7 +1677,7 @@ mod tests {
         binding.record_flight(owner, &later, true);
         binding.record_flight_with_ordering_owner(duplicate, &later, false, false);
 
-        binding.release_acked_ranges(&[OffsetRange {
+        binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 1024,
             end: 5120,
         }]);
@@ -1779,7 +1779,7 @@ mod tests {
         let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
         binding.record_flight(key, &frame, true);
         std::thread::sleep(Duration::from_millis(20));
-        binding.release_acked_ranges(&[OffsetRange {
+        binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: reliable_stream_frame_payload_bytes(&frame) as u64,
         }]);

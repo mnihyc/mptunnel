@@ -1344,7 +1344,7 @@ where
                         let ack = send_stream.apply_normalized_ack(&normalized_ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        path_stream.release_acked_ranges(&normalized_ranges);
+                        path_stream.release_normalized_acked_ranges(&normalized_ranges);
                         let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
                         let ack_made_progress =
                             ack.released_bytes > 0 || largest_ack_end > last_send_ack_frontier;

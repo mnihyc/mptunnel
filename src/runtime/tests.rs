@@ -787,7 +787,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
         ack_end = ack_end.saturating_add(dispatch.payload_bytes as u64);
         let _ = recv_emitted_tcp_path_command(&mut receivers).await;
     }
-    path_stream.release_acked_ranges(&[OffsetRange {
+    path_stream.release_normalized_acked_ranges(&[OffsetRange {
         start: 0,
         end: ack_end,
     }]);

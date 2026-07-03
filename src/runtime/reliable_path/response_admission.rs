@@ -77,7 +77,7 @@ pub(in crate::runtime) struct ResponseAckOrderingUpdate {
 }
 
 impl ResponseAckOrderingState {
-    pub(super) fn apply_ack(
+    pub(super) fn apply_normalized_ack(
         &mut self,
         ranges: &[OffsetRange],
         released: &[(u64, CarrierPathFlight)],
@@ -127,10 +127,9 @@ impl ResponseAckOrderingState {
     }
 
     fn advance_contiguous_frontier(&mut self, ranges: &[OffsetRange]) {
-        let ranges = normalized_offset_ranges(ranges);
         loop {
             let mut next_frontier = self.contiguous_frontier;
-            for range in &ranges {
+            for range in ranges {
                 if range.start > next_frontier {
                     break;
                 }

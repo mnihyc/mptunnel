@@ -442,7 +442,7 @@ impl ResponseCarrierEmitMode {
 
 #[derive(Clone)]
 enum ResponseDataDispatchTarget {
-    Fixed(TcpPathSessionCommandSender),
+    Fixed(Arc<FixedReliablePathOutput>),
     Switchable {
         binding: Arc<ResponseStreamBinding>,
         target: ResponseSenderPathTarget,
@@ -769,11 +769,11 @@ fn plan_response_data_dispatch(
     payload_bytes: usize,
 ) -> Result<ResponseDataDispatchTarget, RuntimeError> {
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(commands) => {
+        ReliablePathStreamOutput::Fixed(fixed) => {
             let lane =
                 reliable_work_lane_to_carrier_lane(ReliableRelayQueuedWorkLane::Data, relay_lane);
-            if commands.can_enqueue_lane_now(lane) {
-                Ok(ResponseDataDispatchTarget::Fixed(commands.clone()))
+            if fixed.commands().can_enqueue_lane_now(lane) {
+                Ok(ResponseDataDispatchTarget::Fixed(fixed.clone()))
             } else {
                 Err(RuntimeError::SenderServiceBlocked)
             }
@@ -825,10 +825,12 @@ fn response_frame_has_carrier_credit(
     repair: bool,
 ) -> bool {
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(commands) => match emit_mode {
-            ResponseCarrierEmitMode::Classified => commands.can_enqueue_frame_now(frame, lane),
+        ReliablePathStreamOutput::Fixed(fixed) => match emit_mode {
+            ResponseCarrierEmitMode::Classified => {
+                fixed.commands().can_enqueue_frame_now(frame, lane)
+            }
             ResponseCarrierEmitMode::StreamOrdered => {
-                commands.can_enqueue_stream_ordered_frame_now(lane)
+                fixed.commands().can_enqueue_stream_ordered_frame_now(lane)
             }
         },
         ReliablePathStreamOutput::Switchable(binding) => {
@@ -866,24 +868,35 @@ async fn emit_planned_response_data_frame(
     lane: FlowLane,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
     match planned {
-        ResponseDataDispatchTarget::Fixed(commands) => {
+        ResponseDataDispatchTarget::Fixed(fixed) => {
             send_sender_service_frame_to_carrier(
-                &commands,
-                frame,
-                lane,
-                ResponseCarrierEmitMode::Classified,
-            )
-            .await?;
-            Ok(None)
-        }
-        ResponseDataDispatchTarget::Switchable { binding, target } => {
-            send_sender_service_frame_to_carrier(
-                &target.commands,
+                fixed.commands(),
                 frame.clone(),
                 lane,
                 ResponseCarrierEmitMode::Classified,
             )
             .await?;
+            fixed.record_flight(&frame, true);
+            Ok(Some(fixed.key()))
+        }
+        ResponseDataDispatchTarget::Switchable { binding, target } => {
+            match send_sender_service_frame_to_carrier(
+                &target.commands,
+                frame.clone(),
+                lane,
+                ResponseCarrierEmitMode::Classified,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(RuntimeError::SenderServiceBlocked) => {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+                Err(_) => {
+                    binding.detach(target.key, &target.commands);
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+            }
             binding.record_flight(target.key, &frame, true);
             if binding.ordinary_lead().is_none() {
                 binding.set_ordinary_lead(target.key);
@@ -910,9 +923,13 @@ async fn emit_response_frame_from_sender_service(
     repair: bool,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(commands) => {
-            send_sender_service_frame_to_carrier(commands, frame, lane, emit_mode).await?;
-            Ok(None)
+        ReliablePathStreamOutput::Fixed(fixed) => {
+            send_sender_service_frame_to_carrier(fixed.commands(), frame.clone(), lane, emit_mode)
+                .await?;
+            if matches!(frame, Frame::StreamData { .. }) {
+                fixed.record_flight(&frame, !repair);
+            }
+            Ok(Some(fixed.key()))
         }
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
@@ -930,7 +947,8 @@ async fn emit_response_frame_from_sender_service(
             loop {
                 let targets = binding.sender_path_targets(lane, payload_bytes);
                 if targets.is_empty() {
-                    return Err(last_error.unwrap_or(RuntimeError::TcpPathSessionClosed));
+                    let _ = last_error;
+                    return Err(RuntimeError::SenderServiceBlocked);
                 }
                 let Some(target) = choose_response_sender_target(
                     &targets,
@@ -1021,9 +1039,9 @@ async fn emit_relay_path_frame(
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(commands) => {
+        ReliablePathStreamOutput::Fixed(fixed) => {
             send_sender_service_frame_to_carrier(
-                commands,
+                fixed.commands(),
                 frame,
                 lane,
                 ResponseCarrierEmitMode::Classified,
@@ -1458,6 +1476,7 @@ impl RelaySenderService {
         send_stream: &mut ReliableSendStream,
         sender_queue: &mut ReliableRelaySenderQueue,
         local_open: bool,
+        data_quantum_bytes: usize,
     ) -> Result<ClientQueuedDispatch, RuntimeError> {
         let queued_kind = sender_queue
             .front()
@@ -1477,6 +1496,7 @@ impl RelaySenderService {
                     sender_queue,
                     local_open,
                     payload,
+                    data_quantum_bytes,
                 )
                 .await
             }
@@ -1508,15 +1528,18 @@ impl RelaySenderService {
         sender_queue: &mut ReliableRelaySenderQueue,
         local_open: bool,
         payload: Bytes,
+        data_quantum_bytes: usize,
     ) -> Result<ClientQueuedDispatch, RuntimeError> {
+        let dispatch_payload_bytes = data_quantum_bytes.min(payload.len()).max(1);
+        let dispatch_payload = payload.slice(..dispatch_payload_bytes);
         let frame = send_stream
-            .send_data(payload, StreamFlags::NONE)
+            .send_data(dispatch_payload, StreamFlags::NONE)
             .map_err(RuntimeError::Stream)?;
         let retry_frame = frame.clone();
         match self.send_stream_data(context, remotes, frame.clone()).await {
             Ok(outcome) => {
-                let (_, committed) = sender_queue
-                    .commit_front()
+                let committed = sender_queue
+                    .commit_front_data_prefix(dispatch_payload_bytes)
                     .expect("sent queued data must still be at queue front");
                 Ok(ClientQueuedDispatch::Data {
                     path_key: outcome.path_key,
@@ -1546,8 +1569,8 @@ impl RelaySenderService {
                         }
                         match self.send_stream_data(context, remotes, retry_frame).await {
                             Ok(outcome) => {
-                                let (_, committed) = sender_queue
-                                    .commit_front()
+                                let committed = sender_queue
+                                    .commit_front_data_prefix(dispatch_payload_bytes)
                                     .expect("sent queued data must still be at queue front");
                                 Ok(ClientQueuedDispatch::Data {
                                     path_key: outcome.path_key,

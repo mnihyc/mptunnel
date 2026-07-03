@@ -429,18 +429,18 @@ pub(super) fn reliable_stream_path_candidates(
         reliable_stream_mixed_startup_path_scores(udp_paths, udp_observations, lane, payload_bytes);
 
     let mut candidates = tcp_scores
-        .into_iter()
+        .iter()
         .filter_map(|(index, eta_ms)| {
-            let path = tcp_paths.get(index)?;
-            let observation = tcp_observations.get(index).copied().unwrap_or_default();
-            let snapshot = path_snapshot(path, index, observation);
+            let path = tcp_paths.get(*index)?;
+            let observation = tcp_observations.get(*index).copied().unwrap_or_default();
+            let snapshot = path_snapshot(path, *index, observation);
             path_can_be_auto_discovered_for_lane(path, observation, lane).then_some(
                 BulkPathCandidate {
                     key: RelayPathKey {
                         underlay: UnderlayProtocol::Tcp,
-                        index,
+                        index: *index,
                     },
-                    eta_ms: eta_ms
+                    eta_ms: *eta_ms
                         + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
                     has_evidence: bulk_candidate_has_evidence(path, observation),
                     has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
@@ -451,11 +451,11 @@ pub(super) fn reliable_stream_path_candidates(
                 },
             )
         })
-        .chain(udp_scores.into_iter().filter_map(|(index, eta_ms)| {
-            let path = udp_paths.get(index)?;
-            let observation = udp_observations.get(index).copied().unwrap_or_default();
-            let snapshot = path_snapshot(path, index, observation);
-            let eta_ms = eta_ms
+        .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
+            let path = udp_paths.get(*index)?;
+            let observation = udp_observations.get(*index).copied().unwrap_or_default();
+            let snapshot = path_snapshot(path, *index, observation);
+            let eta_ms = *eta_ms
                 + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
                     udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
                 } else {
@@ -466,7 +466,7 @@ pub(super) fn reliable_stream_path_candidates(
                 BulkPathCandidate {
                     key: RelayPathKey {
                         underlay: UnderlayProtocol::Udp,
-                        index,
+                        index: *index,
                     },
                     eta_ms,
                     has_evidence: bulk_candidate_has_evidence(path, observation),
@@ -479,6 +479,59 @@ pub(super) fn reliable_stream_path_candidates(
             )
         }))
         .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = tcp_scores
+            .iter()
+            .filter_map(|(index, eta_ms)| {
+                let path = tcp_paths.get(*index)?;
+                let observation = tcp_observations.get(*index).copied().unwrap_or_default();
+                let snapshot = path_snapshot(path, *index, observation);
+                path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
+                    BulkPathCandidate {
+                        key: RelayPathKey {
+                            underlay: UnderlayProtocol::Tcp,
+                            index: *index,
+                        },
+                        eta_ms: *eta_ms
+                            + reliable_stream_initial_lane_protection_penalty(snapshot, lane),
+                        has_evidence: bulk_candidate_has_evidence(path, observation),
+                        has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+                            observation,
+                        ),
+                        has_configured_performance_hint: path_has_configured_performance_hint(path),
+                        snapshot,
+                    },
+                )
+            })
+            .chain(udp_scores.iter().filter_map(|(index, eta_ms)| {
+                let path = udp_paths.get(*index)?;
+                let observation = udp_observations.get(*index).copied().unwrap_or_default();
+                let snapshot = path_snapshot(path, *index, observation);
+                let eta_ms = *eta_ms
+                    + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
+                        udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
+                    } else {
+                        0.0
+                    }
+                    + reliable_stream_initial_lane_protection_penalty(snapshot, lane);
+                path_can_be_recovery_candidate_for_lane(path, observation, lane).then_some(
+                    BulkPathCandidate {
+                        key: RelayPathKey {
+                            underlay: UnderlayProtocol::Udp,
+                            index: *index,
+                        },
+                        eta_ms,
+                        has_evidence: bulk_candidate_has_evidence(path, observation),
+                        has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
+                            observation,
+                        ),
+                        has_configured_performance_hint: path_has_configured_performance_hint(path),
+                        snapshot,
+                    },
+                )
+            }))
+            .collect();
+    }
     retain_safe_mixed_latency_startup_candidates(&mut candidates, lane);
     candidates
 }
@@ -575,6 +628,35 @@ pub(super) fn path_snapshot(
             && observation.carrier_bytes_in_flight == 0
             && observation.carrier_app_limited,
     }
+}
+
+pub(super) fn path_startup_snapshot(path: &PathSpec, index: usize) -> PathSnapshot {
+    path_snapshot(
+        path,
+        index,
+        ClientPathObservation {
+            state: SchedulerPathState::Active,
+            carrier_app_limited: true,
+            ..ClientPathObservation::default()
+        },
+    )
+}
+
+pub(super) fn path_startup_metrics(
+    path: &PathSpec,
+    index: usize,
+    direction: PathMetricDirection,
+) -> PathMetrics {
+    let observation = ClientPathObservation {
+        state: SchedulerPathState::Active,
+        carrier_app_limited: true,
+        ..ClientPathObservation::default()
+    };
+    path_metrics_from_snapshot(
+        path_snapshot(path, index, observation),
+        observation,
+        direction,
+    )
 }
 
 pub(super) fn path_metrics_from_snapshot(
@@ -699,6 +781,19 @@ fn path_can_be_auto_discovered_for_lane(
         && !path.metadata.capabilities.expensive
         && !path.metadata.capabilities.backup
         && !path.metadata.capabilities.probe_only
+        && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
+            || path.metadata.capabilities.bulk_allowed)
+}
+
+fn path_can_be_recovery_candidate_for_lane(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+    lane: FlowLane,
+) -> bool {
+    !matches!(
+        observation.state,
+        SchedulerPathState::Failed | SchedulerPathState::Draining
+    ) && !path.metadata.capabilities.probe_only
         && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
             || path.metadata.capabilities.bulk_allowed)
 }

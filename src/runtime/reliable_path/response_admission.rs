@@ -233,6 +233,7 @@ pub(super) fn server_bulk_output_snapshot(
         .path_metrics
         .and_then(|path_metrics| (entry.delivery_samples == 0).then_some(path_metrics));
     let model_metrics = local_carrier_metrics.or(validation_hint_metrics);
+    let rate_prior_metrics = local_carrier_metrics.or(entry.path_metrics);
     let srtt_ms = model_metrics.map_or_else(
         || {
             entry
@@ -249,7 +250,7 @@ pub(super) fn server_bulk_output_snapshot(
             f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
         })
         .clamp(0.0, 1.0);
-    let model_rate_bps = model_metrics.map(server_path_metrics_rate_bps);
+    let model_rate_bps = rate_prior_metrics.map(server_path_metrics_rate_bps);
     let local_sender_rate_bps = local_carrier_metrics
         .map(server_path_metrics_rate_bps)
         .or(entry.delivery_rate_bps);
@@ -278,7 +279,12 @@ pub(super) fn server_bulk_output_snapshot(
         UnderlayProtocol::Udp => {
             local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
         }
-        UnderlayProtocol::Tcp => entry.bytes_in_flight,
+        // TCP does not expose packet-level carrier flight to the product layer.
+        // Product stream ranges waiting for STREAM_ACK remain in
+        // product_bytes_in_flight below; treating them as carrier flight makes
+        // the BBR-style send quantum collapse as soon as the product window is
+        // full even when the kernel TCP stream is healthy.
+        UnderlayProtocol::Tcp => 0,
     };
     snapshot.product_bytes_in_flight = entry.bytes_in_flight;
     snapshot.inflight_limit_bytes =

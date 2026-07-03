@@ -139,6 +139,8 @@ pub(super) fn tcp_path_lane_uses_dedicated_session(lane: FlowLane) -> bool {
 }
 
 pub(super) struct ClientTcpPathConnection {
+    pub(super) startup_snapshot: PathSnapshot,
+    pub(super) startup_metrics: PathMetrics,
     pub(super) writer: EncryptedTcpWriter,
     pub(super) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     pub(super) heartbeat_interval: Duration,
@@ -366,6 +368,7 @@ async fn handle_connected_client_tcp_command_run(
     let byte_budget = tcp_path_command_writer_run_budget_bytes(mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(mux_limits);
     let mut next_command = Some(first_command);
+    let mut pending_frames = Vec::<Frame>::new();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut wrote_frame = false;
@@ -378,34 +381,41 @@ async fn handle_connected_client_tcp_command_run(
             break;
         };
         let pending_bytes = tcp_path_command_pending_bytes(&command);
-        let is_frame = matches!(command, TcpPathSessionCommand::SendFrame(_));
-        let is_stream_detach = matches!(
-            &command,
-            TcpPathSessionCommand::SendFrame(Frame::StreamDetach { .. })
-        );
-        handle_connected_client_tcp_command(
-            command,
-            connection,
-            streams,
-            closed_streams,
-            stream_frame_queue,
-            mux_limits,
-            false,
-        )
-        .await?;
-        commands.release_pending_command_bytes(pending_bytes);
-        if is_frame {
-            wrote_frame = true;
-            sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+        match command {
+            TcpPathSessionCommand::SendFrame(frame) => {
+                let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
+                pending_frames.push(frame);
+                commands.release_pending_command_bytes(pending_bytes);
+                wrote_frame = true;
+                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_items = sent_items.saturating_add(1);
+                if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
+                    break;
+                }
+                continue;
+            }
+            command => {
+                flush_client_tcp_frame_batch(connection, &mut pending_frames, mux_limits).await?;
+                handle_connected_client_tcp_command(
+                    command,
+                    connection,
+                    streams,
+                    closed_streams,
+                    stream_frame_queue,
+                    mux_limits,
+                    false,
+                )
+                .await?;
+                commands.release_pending_command_bytes(pending_bytes);
+            }
         }
         sent_items = sent_items.saturating_add(1);
-        if is_stream_detach {
-            break;
-        }
         if sent_bytes >= byte_budget || sent_items >= item_budget {
             break;
         }
     }
+
+    flush_client_tcp_frame_batch(connection, &mut pending_frames, mux_limits).await?;
 
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -425,6 +435,20 @@ async fn handle_connected_client_tcp_command_run(
     if wrote_frame {
         connection.writer.flush().await?;
     }
+    Ok(())
+}
+
+async fn flush_client_tcp_frame_batch(
+    connection: &mut ClientTcpPathConnection,
+    frames: &mut Vec<Frame>,
+    mux_limits: MuxLimits,
+) -> Result<(), RuntimeError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    connection.writer.write_frames(frames).await?;
+    frames.clear();
+    record_client_tcp_path_outbound_activity(connection, mux_limits);
     Ok(())
 }
 
@@ -597,7 +621,12 @@ pub(super) async fn connect_client_tcp_path(
 
     let (reader, writer) = framed.split();
     let now = tokio::time::Instant::now();
+    let startup_snapshot = path_startup_snapshot(path, path_index);
+    let startup_metrics =
+        path_startup_metrics(path, path_index, PathMetricDirection::ClientToServer);
     Ok(ClientTcpPathConnection {
+        startup_snapshot,
+        startup_metrics,
         writer,
         frames: spawn_encrypted_tcp_reader(reader, tcp_path_session_frame_queue(mux_limits)),
         heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
@@ -627,6 +656,12 @@ async fn open_client_tcp_stream_on_connection(
             local_close_pending: false,
         },
     );
+    connection
+        .writer
+        .write_frame(&Frame::PathMetrics {
+            metrics: connection.startup_metrics,
+        })
+        .await?;
     connection
         .writer
         .write_frame(&Frame::OpenStream {
@@ -673,7 +708,11 @@ async fn handle_client_tcp_path_frame(
                         lane: pending.lane,
                         underlay: UnderlayProtocol::Tcp,
                         max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
-                        output: ReliablePathStreamOutput::Fixed(pending.session_commands),
+                        output: ReliablePathStreamOutput::fixed_with_snapshot(
+                            connection.startup_snapshot,
+                            pending.session_commands,
+                            mux_limits,
+                        ),
                         frames,
                     };
                     let _ = pending.response.send(Ok(stream));

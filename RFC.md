@@ -513,15 +513,16 @@ hard-coding lab pass/fail behavior:
   Throughput quanta are nevertheless required to amortize user-space encryption,
   framing, and write wakeups. A sender MUST NOT let a transient low measured
   delivery rate create a self-reinforcing tiny-frame loop for sustained bulk
-  streams. For throughput lanes, the send quantum follows BBR-style send
-  quantum reasoning: it is derived from the current pacing or delivery rate over
-  a short send-quantum interval, bounded below by a small packet multiple and
-  bounded above by the BBR-style 64 KiB quantum before the configured
-  read/payload envelope is applied. Lossy, jittery, or queued paths shrink by
-  measured condition factors; high-rate stable paths grow until that standard
-  quantum or the configured envelope is reached. Inflight limits and carrier
-  pacing control network pressure; the frame quantum controls scheduling
-  preemption and per-byte processing cost.
+  streams. For reliable TCP and QUIC UDP carriers, the product sender feeds the
+  carrier with a bounded BBR-style bulk service quantum: no larger than the
+  BBR-style 64 KiB send quantum and the configured read/payload envelope, and no
+  smaller than that feed quantum while the live condition cap permits it. QUIC
+  or kernel TCP then owns packet pacing and congestion below that product
+  record. Lossy, jittery, or queued paths can still shrink the upper condition
+  cap; high-rate stable paths repeatedly dispatch bounded quanta until the
+  carrier remains fed. Inflight limits and carrier pacing control network
+  pressure; the frame quantum controls scheduling preemption and per-byte
+  processing cost.
   Receiver-side stream input queues and path command queues follow the same
   rule. Their depth is sized from the relevant byte window divided by the
   actual maximum product-frame payload used by the attachment plus one
@@ -609,11 +610,11 @@ their origin is explicit and they do not become hidden modes.
 | Tail and duplication admission | Tail threshold derives from latency-path BDP; duplicate slack derives from jitter or one initial-window fraction of PTO; duplication is only control/realtime and must fit transmit cost | MPTCP/MPQUIC reinjection with QUIC/BBR timing evidence | Blind duplication wastes capacity; no duplication hurts recovery | Keep adaptive and gated by evidence/extra-traffic hint; tail avoidance MUST NOT bypass path capability flags such as no-bulk |
 | Lane priority order | control, realtime datagram, latency, throughput, background | ACK/control protection is common in QUIC-style schedulers; taxonomy is mptunnel product policy | Wrong implementation can starve bulk or control | Keep as fixed priority invariant with dynamic queues |
 | DRR lane/flow quanta | Deficit charge equals actual sender-service packet quantum | DRR/fair queuing is common | Fixed byte quanta previously underfed high-rate carriers | Keep adaptive charge based on actual queued frame size |
-| Service frame quantum | `clamp(rate * 1 ms, 2*MSS, 64 KiB)` before configured read/payload envelope and measured condition factors | BBR send-quantum model | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta |
+| Service frame quantum | Latency/control use small BBR-style quanta; reliable bulk feeds TCP/QUIC with the bounded 64 KiB BBR send quantum under the configured read/payload envelope and live condition cap | BBR send-quantum model applied at the product-record boundary, with TCP/QUIC packet pacing below | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta while control/repair/latency remain preemptive |
 | Inflight target | BDP * BBR cwnd gain, send quantum, and MinPipeCwnd under configured flight envelope; latency/realtime lanes use the smaller preemptive target | BBR inflight model and product lane priority | Too low underfeeds; too high queues | Keep adaptive from live BDP/queue/loss/carrier evidence |
 | Stability/backlog factors | Shrink by loss/jitter/queue/backlog relative to BDP with floor derived from MinPipeCwnd or send quantum divided by BDP | Congestion-sensitive adaptation; floor is no longer a fixed fraction | Over-shrinking can create low-rate loops | Keep adaptive; diagnostics must show shrink reason |
 | Auto bulk classification | EWMA/rate/byte/idle-gap evidence promotes/demotes demand using service quantum, BDP, and PTO | Product-specific but measurement-based | Late/early promotion affects latency/throughput | Keep adaptive; no user-visible mode tag or port rule |
-| ACK progress cadence | ACK step blends window, repair pressure, max ACK range capacity, BDP, and immediate non-bulk ACKs | SACK/QUIC ACK-range practice | Sparse ACKs delay repair; chatty ACKs waste reverse bandwidth | Keep dynamic from receive progress |
+| ACK progress cadence | Product `STREAM_ACK` uses BDP/2 when measured, otherwise the bounded bulk service quantum, under the repair/flow-control resource ceiling; `STREAM_MAX_DATA` uses larger flow-control hysteresis | SACK/QUIC ACK-range practice with MPTCP-style product repair ownership release | Sparse ACKs fill repair cache and stall senders; chatty ACKs waste reverse bandwidth | Keep dynamic from receive progress and separate from MAX_DATA cadence |
 | MAX_DATA cadence | Credit update after a window/chunk-derived threshold | QUIC flow-control update logic | Coarse credit can stall high-BDP streams | Keep adaptive from window/chunk |
 | Active stall and retry timing | Derived from QUIC PTO, observed RTT/rttvar, lane state, TTL, and persistent congestion threshold | QUIC PTO/recovery model | Fixed sleeps underfeed high-rate carriers or delay failover | Fixed retry/stall constants are removed from data-plane policy |
 | Path failure cooldown | Derived from PTO and consecutive failures, capped by QUIC persistent congestion threshold | QUIC persistent-congestion backoff applied to path reuse | Fixed cooldown can hide recovered paths | Fixed 5s cooldown is removed |
@@ -1403,11 +1404,54 @@ validation and reannouncement from replaying user connections during races
 around stream teardown.
 
 The server maps a repeated stream ID to the same outbound TCP connection when
-reattaching after path migration or repair.
+reattaching after path migration or repair. For a given product stream and
+carrier path key, there MUST be at most one live response-output attachment.
+A repeated `OPEN_STREAM` for the same stream ID on the same live carrier path
+is an idempotent reannouncement: it may refresh lane metadata, demand hints,
+credit, and path status, but it MUST NOT replace the live writer/output channel
+or create another ordinary output for unique later offsets. Same-key replacement
+is allowed only after the previous output has been closed, detached, or otherwise
+made unusable by carrier teardown. If an `OPEN_STREAM` arrives on a different
+live carrier channel for a stream/path key that already has a live output, the
+receiver MUST NOT replace the live response-output channel. An Active duplicate
+carrier channel MAY be accepted as an overlapping input replacement when the
+sender has already abandoned or is replacing the previous carrier instance; in
+that case valid product frames are still routed by stream offset, and ordering
+debt remains a product-ledger concern. Non-active duplicate proof channels
+SHOULD be ignored or closed when an equivalent live output already exists. Any
+duplicate-carrier close MUST NOT be encoded as a product `STREAM_RESET`, because
+the original product stream remains alive. This rule preserves carrier ordering
+scope: QUIC and TCP guarantee order inside one carrier stream, not across
+accidental parallel carrier streams carrying the same product offset space; when
+active replacement overlap is unavoidable, the sender service must repair or
+avoid the resulting product ordering debt.
+
+Product-level stall evidence alone MUST NOT create a replacement carrier stream
+for the same product stream on the same sole QUIC UDP path. On a single live
+QUIC carrier, QUIC owns packet loss recovery, stream ordering, PTO, congestion
+control, and NAT rebinding. A product sender may reannounce stream metadata on
+the existing carrier stream, but it MUST keep queued bytes and repair ownership
+on that carrier until QUIC reports carrier close/error or a distinct survivor
+path is available. Opening a fresh QUIC stream for later unique product offsets
+while the previous QUIC stream may still deliver lower offsets defeats QUIC's
+per-stream ordering guarantee and recreates above-QUIC head-of-line debt. Real
+carrier teardown remains a carrier event and may attach a replacement path; a
+product repair-cache stall is not by itself proof of carrier teardown.
 
 Stream IDs are stable logical identifiers, not carrier connection identifiers.
 Reattaching the same stream ID is what lets mptunnel repair over a survivor path
 without forcing the application to reconnect.
+
+Product frames that arrive for an unknown stream ID are not carrier-liveness
+evidence and are not terminal product-stream evidence. A receiver MAY drop such
+frames when no bounded orphan/reorder buffer is available, but it MUST NOT add
+that stream ID to the recent closed-stream cache merely because an unknown
+`STREAM_DATA`, `STREAM_ACK`, `STREAM_FIN`, or `STREAM_RESET` was observed.
+Only a real product terminal transition, such as accepted FIN/RESET handling or
+local registry teardown after the stream has completed, may create recent-closed
+state. This preserves the layering rule from QUIC and MPTCP: packet/path arrival
+order and product stream creation order are independent, and a reordered data
+frame must not make a later valid `OPEN_STREAM` impossible.
 
 ### 13.2 Stream Data
 
@@ -1985,6 +2029,28 @@ mark the carrier failed, and MUST continue polling ACK, credit, control,
 repair, and path-update feedback. A full carrier queue is backpressure, not a
 liveness failure. Control and ACK lanes may use their higher-priority emission
 path, but they MUST NOT sit behind a bulk data queue.
+
+After a sender service emits one bounded data quantum, it MUST give carrier
+feedback tasks an opportunity to run before continuing an unlimited bulk drain.
+An implementation may do this by polling buffered inbound frames first or by a
+cooperative scheduler yield at the sender-service quantum boundary. This is not
+a throughput throttle: it is the ownership boundary that lets `STREAM_ACK`,
+`STREAM_MAX_DATA`, detach, reset, and carrier credit feedback release product
+flight and repair state before the next bulk continuation. A diagnostic build
+MUST NOT be faster merely because logging accidentally creates this yield.
+
+The same nonterminal rule applies when a switchable stream has no currently
+usable carrier output. A closed TCP writer queue or closed QUIC stream output is
+a path-output event. It MUST detach that carrier attachment and wake the sender
+service, but it MUST NOT by itself close the product stream, advance the product
+offset, release repair ownership, drop the queued byte range, or insert the
+stream ID into the recent closed-stream cache. If no remaining output can accept
+the next quantum, the sender service remains blocked and waits for carrier
+capacity, path-output updates, stream ACK/credit feedback, or a new path
+attachment. This rule is necessary because a path failure and a product stream
+FIN/RESET are different ledgers; treating the former as the latter creates false
+remote resets, unknown-frame drops, and lost high-rate transfers during QUIC/TCP
+reattachment races.
 
 The size of a carrier command queue is derived from the sender-service quantum
 that will actually be emitted on that carrier, bounded by the carrier's legal

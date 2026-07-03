@@ -1001,7 +1001,12 @@ mod tests {
                 lane: FlowLane::Throughput,
                 underlay,
                 max_frame_payload_bytes: 64 * 1024,
-                output: ReliablePathStreamOutput::Fixed(commands),
+                output: ReliablePathStreamOutput::fixed(
+                    underlay,
+                    PathId(index as u16),
+                    commands,
+                    MuxLimits::default(),
+                ),
             },
         }
     }

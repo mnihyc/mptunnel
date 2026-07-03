@@ -31,6 +31,7 @@ pub(in crate::runtime) struct ServerReliablePathAttachment {
     pub(in crate::runtime) commands: TcpPathSessionCommandSender,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
     pub(in crate::runtime) role: StreamOpenRole,
+    pub(in crate::runtime) initial_metrics: Option<PathMetrics>,
 }
 
 /// Request to open or attach a carrier path to a product reliable stream.
@@ -48,6 +49,7 @@ pub(in crate::runtime) struct ServerReliableStreamOpenRequest<'a> {
 pub(in crate::runtime) enum ServerReliableStreamOpen {
     New(ReliablePathStream),
     Existing,
+    DuplicateLiveIgnored,
     Rejected,
 }
 
@@ -121,7 +123,13 @@ impl ServerReliableStreamRegistry {
         let underlay = attachment.underlay;
         let path_id = attachment.path_id;
         let role = attachment.role;
-        let initial_metrics = self.stored_path_metrics(session_id, underlay, path_id);
+        let initial_metrics = attachment
+            .initial_metrics
+            .map(|metrics| ServerPathMetricsEntry {
+                metrics,
+                source: ServerPathMetricsSource::LocalSender,
+            })
+            .or_else(|| self.stored_path_metrics(session_id, underlay, path_id));
         let mut streams = self
             .streams
             .lock()
@@ -133,7 +141,7 @@ impl ServerReliableStreamRegistry {
                 ));
             }
             entry.lane = lane;
-            entry.binding.attach(
+            let attach_outcome = entry.binding.attach(
                 underlay,
                 path_id,
                 attachment.commands,
@@ -141,6 +149,20 @@ impl ServerReliableStreamRegistry {
                 role,
                 max_frame_payload_bytes,
             );
+            if matches!(
+                attach_outcome,
+                ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
+            ) {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_stream_open",
+                    format_args!(
+                        "session_id={} stream_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=rejected_duplicate_live_output",
+                        session_id.0, stream_id.0, underlay, path_id.0, role, lane,
+                    ),
+                );
+                return Ok(ServerReliableStreamOpen::DuplicateLiveIgnored);
+            }
             if let Some(metrics) = initial_metrics {
                 entry.binding.update_path_metrics(
                     CarrierPathKey { underlay, path_id },
@@ -288,6 +310,25 @@ impl ServerReliableStreamRegistry {
             .lock()
             .expect("server path metrics lock")
             .insert((session_id, underlay, path_id), entry);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "server_path_metrics_recorded",
+            format_args!(
+                "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={}",
+                session_id.0,
+                underlay,
+                path_id.0,
+                source,
+                metrics.direction,
+                metrics.delivery_rate_bps as f64 / 1_000_000.0,
+                metrics.pacing_rate_bps as f64 / 1_000_000.0,
+                metrics.srtt_us as f64 / 1000.0,
+                metrics.confidence_ppm,
+                metrics.app_limited,
+                metrics.has_ack_derived_data_sample,
+                metrics.data_sample_count,
+            ),
+        );
         let bindings = {
             let streams = self
                 .streams
@@ -356,11 +397,6 @@ impl ServerReliableStreamRegistry {
                 .map(|entry| entry.frames.clone())
         };
         let Some(stream) = stream else {
-            let closed_key = (session_id, stream_id);
-            self.closed_streams
-                .lock()
-                .expect("server reliable stream closed cache lock")
-                .insert(closed_key);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_stream_unknown_frame_drop",

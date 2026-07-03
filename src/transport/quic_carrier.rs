@@ -1,6 +1,8 @@
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_perf_record;
 use crate::mux::MuxLimits;
 use crate::protocol::Frame;
-use crate::protocol::codec::{CodecLimits, decode_frame, encode_frame};
+use crate::protocol::codec::{CodecLimits, decode_frame, encode_frame_into};
 use quinn::{
     ClientConfig, ConnectionError, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt,
 };
@@ -126,12 +128,53 @@ pub async fn write_frame(
     frame: &Frame,
     limits: CodecLimits,
 ) -> Result<(), QuicCarrierError> {
-    let encoded = encode_frame(frame, limits)?;
-    let len = u32::try_from(encoded.len()).map_err(|_| QuicCarrierError::FrameTooLarge)?;
-    let mut packet = Vec::with_capacity(FRAME_LEN_BYTES + encoded.len());
-    packet.extend_from_slice(&len.to_be_bytes());
-    packet.extend_from_slice(&encoded);
+    write_frames(send, std::slice::from_ref(frame), limits).await
+}
+
+pub async fn write_frames(
+    send: &mut SendStream,
+    frames: &[Frame],
+    limits: CodecLimits,
+) -> Result<(), QuicCarrierError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    let encode_started = std::time::Instant::now();
+    let mut packet = Vec::new();
+    for frame in frames {
+        encode_length_prefixed_frame(frame, limits, &mut packet)?;
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.quic.encode_frames",
+        encode_started.elapsed(),
+        packet.len(),
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    let write_started = std::time::Instant::now();
     send.stream.write_all(&packet).await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.quic.write_frames_wait",
+        write_started.elapsed(),
+        packet.len(),
+    );
+    Ok(())
+}
+
+fn encode_length_prefixed_frame(
+    frame: &Frame,
+    limits: CodecLimits,
+    packet: &mut Vec<u8>,
+) -> Result<(), QuicCarrierError> {
+    let len_offset = packet.len();
+    packet.extend_from_slice(&[0u8; FRAME_LEN_BYTES]);
+    let frame_start = packet.len();
+    encode_frame_into(frame, limits, packet)?;
+    let frame_len = packet.len().saturating_sub(frame_start);
+    let frame_len = u32::try_from(frame_len).map_err(|_| QuicCarrierError::FrameTooLarge)?;
+    packet[len_offset..len_offset + FRAME_LEN_BYTES].copy_from_slice(&frame_len.to_be_bytes());
     Ok(())
 }
 
@@ -450,6 +493,55 @@ mod tests {
         let _ = client_done_tx.send(());
 
         server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn quic_carrier_batches_multiple_product_frames_per_write() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let limits = CodecLimits::default();
+        let mux_limits = MuxLimits::default();
+        let server = Endpoint::bind_server(
+            "127.0.0.1:0".parse().expect("server addr"),
+            secret,
+            mux_limits,
+        )
+        .await
+        .expect("server endpoint");
+        let server_addr = server.local_addr().expect("server local addr");
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.expect("accepted connection");
+            let (_send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+            assert_eq!(
+                read_frame(&mut recv, limits).await.expect("read first"),
+                Frame::Ping { nonce: 1 }
+            );
+            assert_eq!(
+                read_frame(&mut recv, limits).await.expect("read second"),
+                Frame::Pong { nonce: 2 }
+            );
+        });
+
+        let client = Endpoint::bind_client(
+            "127.0.0.1:0".parse().expect("client addr"),
+            secret,
+            mux_limits,
+        )
+        .await
+        .expect("client endpoint");
+        let connection = client.connect(server_addr).await.expect("client connect");
+        let (mut send, _recv) = connection.open_bi().await.expect("client stream");
+        write_frames(
+            &mut send,
+            &[Frame::Ping { nonce: 1 }, Frame::Pong { nonce: 2 }],
+            limits,
+        )
+        .await
+        .expect("client write batch");
+        finish_stream(&mut send).expect("client finish stream");
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task");
     }
 
     #[tokio::test]

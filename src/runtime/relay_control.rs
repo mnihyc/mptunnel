@@ -51,7 +51,20 @@ where
             .saturating_add(context.udp_paths.len())
             .max(1),
     );
-    let mut pending_validation_opens = HashSet::<RelayPathKey>::new();
+    let mut pending_validation_opens = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
+    if reliable_relay_has_evidenced_bulk_alternative(context, &remotes, &send_stream)
+        && spawn_reliable_relay_validation_opens(
+            context,
+            &spec,
+            FlowLane::Throughput,
+            &remotes,
+            &send_stream,
+            &mut pending_validation_opens,
+            &validation_open_tx,
+        )
+    {
+        last_stream_progress_at = Instant::now();
+    }
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -159,11 +172,15 @@ where
                 .unwrap_or(UnderlayProtocol::Tcp),
             remotes.max_frame_payload_bytes(context.mux_limits),
         );
-        resize_reliable_relay_buffer(&mut buf, adaptive_chunk);
         let adaptive_inflight =
             adaptive_reliable_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
         let sender_queue_limit =
             reliable_relay_sender_queue_limit(context.mux_limits, adaptive_inflight);
+        let source_read_ceiling = reliable_relay_buffer_len(context.mux_limits)
+            .min(remotes.max_frame_payload_bytes(context.mux_limits))
+            .min(sender_queue_limit)
+            .max(1);
+        resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
         let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
             reliable_relay_sender_dispatch_budget(
                 context.mux_limits,
@@ -254,7 +271,7 @@ where
                 &sender_queue,
                 context.mux_limits,
                 sender_queue_limit,
-                adaptive_chunk.min(buf.len()),
+                source_read_ceiling,
             )
         } else {
             0
@@ -396,6 +413,24 @@ where
                         }
                     } else {
                         response_stall_reannounce_attempts = 0;
+                    }
+                    if reliable_relay_product_stall_keeps_sole_carrier(
+                        remotes.active_carrier_underlay(),
+                    ) {
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "client_product_stall_keeps_sole_carrier",
+                            format_args!(
+                                "stream_id={} active_underlay={:?} repair_bytes={} sent_offset={} cause=avoid_same_path_reopen",
+                                stream_id.0,
+                                remotes.active_carrier_underlay(),
+                                send_stream.repair_bytes(),
+                                send_stream.next_offset(),
+                            ),
+                        );
+                        last_response_stall_repair_at = Instant::now();
+                        last_stream_progress_at = Instant::now();
+                        continue;
                     }
                 }
                 let failed_key = remotes.active_path_instance().map(|instance| instance.key);
@@ -583,6 +618,7 @@ where
                             &mut send_stream,
                             &mut sender_queue,
                             local_open,
+                            sender_dispatch_byte_budget.saturating_sub(dispatched_payload_bytes),
                         )
                         .await
                     {
@@ -642,6 +678,9 @@ where
                 if let Some(err) = dispatch_error {
                     break Err(err);
                 }
+                if dispatched_items > 0 && (remote_open || send_stream.repair_bytes() > 0) {
+                    tokio::task::yield_now().await;
+                }
             }
             _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
                 sender_retry_at = None;
@@ -653,61 +692,26 @@ where
             }
             validation_open = validation_open_rx.recv(), if !pending_validation_opens.is_empty() => {
                 let Some(validation_open) = validation_open else {
-                    pending_validation_opens.clear();
+                    cancel_pending_validation_opens(
+                        context,
+                        stream_id,
+                        &mut pending_validation_opens,
+                    );
                     continue;
                 };
                 pending_validation_opens.remove(&validation_open.key);
-                match validation_open.result {
-                    Ok(opened) => {
-                        if !remotes.contains_path_key(validation_open.key) {
-                            remotes.attach_for_validation(opened);
-                            send_stream.update_max_offset(remotes.max_offset());
-                            last_stream_progress_at = Instant::now();
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "relay_validation_open_attached",
-                                format_args!(
-                                    "stream_id={} path_underlay={:?} path_index={} pending={}",
-                                    stream_id.0,
-                                    validation_open.key.underlay,
-                                    validation_open.key.index,
-                                    pending_validation_opens.len(),
-                                ),
-                            );
-                        }
-                    }
-                    Err(err) if relay_path_open_error_is_retryable(validation_open.key.underlay, &err) => {
-                        context.mark_relay_path_failure(
-                            validation_open.key.underlay,
-                            validation_open.key.index,
-                        );
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "relay_validation_open_failed",
-                            format_args!(
-                                "stream_id={} path_underlay={:?} path_index={} retryable=true error={}",
-                                stream_id.0,
-                                validation_open.key.underlay,
-                                validation_open.key.index,
-                                err,
-                            ),
-                        );
-                    }
-                    Err(err) => {
-                        #[cfg(not(feature = "lab-diagnostics"))]
-                        let _ = &err;
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "relay_validation_open_failed",
-                            format_args!(
-                                "stream_id={} path_underlay={:?} path_index={} retryable=false error={}",
-                                stream_id.0,
-                                validation_open.key.underlay,
-                                validation_open.key.index,
-                                err,
-                            ),
-                        );
-                    }
+                if handle_validation_open_result(
+                    context,
+                    stream_id,
+                    &mut remotes,
+                    &mut send_stream,
+                    validation_open,
+                    pending_validation_opens.len(),
+                    &mut last_stream_progress_at,
+                )
+                .await
+                {
+                    sender_retry_at = None;
                 }
             }
             read = async {
@@ -769,7 +773,7 @@ where
                             &sender_queue,
                             context.mux_limits,
                             sender_queue_limit,
-                            adaptive_chunk.min(buf.len()),
+                            source_read_ceiling,
                         );
                         if next_read_budget == 0 {
                             break;
@@ -1438,6 +1442,18 @@ where
         }
     };
 
+    let _ = drain_completed_validation_opens(
+        context,
+        stream_id,
+        &mut remotes,
+        &mut send_stream,
+        &mut pending_validation_opens,
+        &mut validation_open_rx,
+        &mut last_stream_progress_at,
+    )
+    .await;
+    cancel_pending_validation_opens(context, stream_id, &mut pending_validation_opens);
+
     let remaining_paths = remotes
         .paths
         .iter()
@@ -1560,9 +1576,158 @@ fn reliable_relay_can_finish_after_path_loss(
 
 fn reliable_relay_should_wait_for_pending_path_recovery(
     remote_open: bool,
-    pending_validation_opens: &HashSet<RelayPathKey>,
+    pending_validation_opens: &HashMap<RelayPathKey, RelayValidationOpenTask>,
 ) -> bool {
     remote_open && !pending_validation_opens.is_empty()
+}
+
+fn reliable_relay_has_evidenced_bulk_alternative(
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+) -> bool {
+    let payload_bytes =
+        reliable_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
+    context
+        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
+        .into_iter()
+        .any(|key| {
+            !remotes.contains_path_key(key)
+                && context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
+        })
+}
+
+async fn handle_validation_open_result(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &mut ReliableSendStream,
+    validation_open: RelayValidationOpenResult,
+    pending_count: usize,
+    last_stream_progress_at: &mut Instant,
+) -> bool {
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = (stream_id, pending_count);
+    match validation_open.result {
+        Ok(opened) => {
+            if !remotes.contains_path_key(validation_open.key) {
+                remotes.attach_for_validation(opened);
+                send_stream.update_max_offset(remotes.max_offset());
+                *last_stream_progress_at = Instant::now();
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "relay_validation_open_attached",
+                    format_args!(
+                        "stream_id={} path_underlay={:?} path_index={} pending={}",
+                        stream_id.0,
+                        validation_open.key.underlay,
+                        validation_open.key.index,
+                        pending_count,
+                    ),
+                );
+                true
+            } else {
+                let lane = opened.stream.lane;
+                context.release_relay_path_load(
+                    validation_open.key.underlay,
+                    validation_open.key.index,
+                    lane,
+                );
+                opened.stream.close().await;
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "relay_validation_open_duplicate_closed",
+                    format_args!(
+                        "stream_id={} path_underlay={:?} path_index={} lane={:?} pending={}",
+                        stream_id.0,
+                        validation_open.key.underlay,
+                        validation_open.key.index,
+                        lane,
+                        pending_count,
+                    ),
+                );
+                false
+            }
+        }
+        Err(err) if relay_path_open_error_is_retryable(validation_open.key.underlay, &err) => {
+            context
+                .mark_relay_path_failure(validation_open.key.underlay, validation_open.key.index);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "relay_validation_open_failed",
+                format_args!(
+                    "stream_id={} path_underlay={:?} path_index={} retryable=true error={}",
+                    stream_id.0, validation_open.key.underlay, validation_open.key.index, err,
+                ),
+            );
+            false
+        }
+        Err(err) => {
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = &err;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "relay_validation_open_failed",
+                format_args!(
+                    "stream_id={} path_underlay={:?} path_index={} retryable=false error={}",
+                    stream_id.0, validation_open.key.underlay, validation_open.key.index, err,
+                ),
+            );
+            false
+        }
+    }
+}
+
+async fn drain_completed_validation_opens(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &mut ReliableSendStream,
+    pending: &mut HashMap<RelayPathKey, RelayValidationOpenTask>,
+    validation_open_rx: &mut mpsc::Receiver<RelayValidationOpenResult>,
+    last_stream_progress_at: &mut Instant,
+) -> bool {
+    let mut attached = false;
+    while let Ok(validation_open) = validation_open_rx.try_recv() {
+        if pending.remove(&validation_open.key).is_none() {
+            if let Ok(opened) = validation_open.result {
+                opened.stream.close().await;
+            }
+            continue;
+        }
+        attached |= handle_validation_open_result(
+            context,
+            stream_id,
+            remotes,
+            send_stream,
+            validation_open,
+            pending.len(),
+            last_stream_progress_at,
+        )
+        .await;
+    }
+    attached
+}
+
+fn cancel_pending_validation_opens(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    pending: &mut HashMap<RelayPathKey, RelayValidationOpenTask>,
+) {
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = stream_id;
+    for (key, task) in pending.drain() {
+        task.handle.abort();
+        context.release_relay_path_load(key.underlay, key.index, task.lane);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "relay_validation_open_cancelled",
+            format_args!(
+                "stream_id={} path_underlay={:?} path_index={} lane={:?}",
+                stream_id.0, key.underlay, key.index, task.lane,
+            ),
+        );
+    }
 }
 
 fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
@@ -1574,13 +1739,18 @@ struct RelayValidationOpenResult {
     result: Result<OpenedRemoteStream, RuntimeError>,
 }
 
+struct RelayValidationOpenTask {
+    lane: FlowLane,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 fn spawn_reliable_relay_validation_opens(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lane: FlowLane,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
-    pending: &mut HashSet<RelayPathKey>,
+    pending: &mut HashMap<RelayPathKey, RelayValidationOpenTask>,
     result_tx: &mpsc::Sender<RelayValidationOpenResult>,
 ) -> bool {
     if !relay_lane_is_bulk(lane) {
@@ -1603,33 +1773,78 @@ fn spawn_reliable_relay_validation_opens(
     let candidates = candidates
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
-        .filter(|key| !pending.contains(key))
+        .filter(|key| !pending.contains_key(key))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return false;
     }
     let mut spawned = false;
     for key in candidates {
-        pending.insert(key);
+        match key.underlay {
+            UnderlayProtocol::Tcp if context.tcp_paths.get(key.index).is_some() => {
+                context.reserve_tcp_path_load(key.index, lane);
+            }
+            UnderlayProtocol::Udp if context.udp_paths.get(key.index).is_some() => {
+                context.reserve_udp_stream_path_load(key.index, lane);
+            }
+            _ => continue,
+        }
         let context = context.clone();
         let target = spec.target.clone();
         let ingress = spec.ingress;
         let result_tx = result_tx.clone();
-        tokio::spawn(async move {
-            let result = open_remote_stream_for_relay_path(
-                &context,
-                stream_id,
-                target,
-                ingress,
-                lane,
-                key,
-                StreamOpenRole::Validation,
-            )
-            .await;
-            let _ = result_tx
-                .send(RelayValidationOpenResult { key, result })
-                .await;
+        let handle = tokio::spawn(async move {
+            let result = match key.underlay {
+                UnderlayProtocol::Tcp => {
+                    open_remote_stream_on_reserved_path(
+                        &context,
+                        stream_id,
+                        target,
+                        ingress,
+                        lane,
+                        key.index,
+                        StreamOpenRole::Validation,
+                    )
+                    .await
+                }
+                UnderlayProtocol::Udp => {
+                    open_remote_stream_on_reserved_udp_path(
+                        &context,
+                        stream_id,
+                        target,
+                        ingress,
+                        lane,
+                        key.index,
+                        UdpStreamOpenOptions {
+                            wait_for_accept: false,
+                            role: StreamOpenRole::Validation,
+                        },
+                    )
+                    .await
+                }
+            };
+            if result.is_err() {
+                context.release_relay_path_load(key.underlay, key.index, lane);
+            }
+            let message = RelayValidationOpenResult { key, result };
+            if let Err(err) = result_tx.send(message).await {
+                let RelayValidationOpenResult { key, result } = err.0;
+                if let Ok(opened) = result {
+                    let lane = opened.stream.lane;
+                    context.release_relay_path_load(key.underlay, key.index, lane);
+                    opened.stream.close().await;
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "relay_validation_open_orphan_closed",
+                        format_args!(
+                            "stream_id={} path_underlay={:?} path_index={} lane={:?}",
+                            stream_id.0, key.underlay, key.index, lane,
+                        ),
+                    );
+                }
+            }
         });
+        pending.insert(key, RelayValidationOpenTask { lane, handle });
         spawned = true;
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
@@ -2162,6 +2377,12 @@ pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Du
     QUIC_PERSISTENT_CONGESTION_THRESHOLD
 }
 
+pub(super) fn reliable_relay_product_stall_keeps_sole_carrier(
+    active_underlay: Option<UnderlayProtocol>,
+) -> bool {
+    active_underlay == Some(UnderlayProtocol::Udp)
+}
+
 pub(super) fn reliable_relay_refresh_path_tracking(
     path_last_delivery_at: &mut HashMap<RelayPathKey, Instant>,
     path_keys: &[RelayPathKey],
@@ -2304,4 +2525,20 @@ pub(super) fn reliable_relay_stall_deadline(
 pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
     let _ = lane;
     transport_pto_from_snapshot(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn product_stall_keeps_sole_quic_carrier_instead_of_reopening_same_path() {
+        assert!(reliable_relay_product_stall_keeps_sole_carrier(Some(
+            UnderlayProtocol::Udp
+        )));
+        assert!(!reliable_relay_product_stall_keeps_sole_carrier(Some(
+            UnderlayProtocol::Tcp
+        )));
+        assert!(!reliable_relay_product_stall_keeps_sole_carrier(None));
+    }
 }

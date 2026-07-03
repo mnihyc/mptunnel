@@ -464,18 +464,18 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         .expect("payload read");
     assert_eq!(received, expected_payload);
 
-    assert_eq!(
+    let mut accepted = vec![
         tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
             .await
-            .expect("first accept timeout"),
-        Some(0)
-    );
-    assert_eq!(
+            .expect("first accept timeout")
+            .expect("first accepted path"),
         tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
             .await
-            .expect("second accept timeout"),
-        Some(1)
-    );
+            .expect("second accept timeout")
+            .expect("second accepted path"),
+    ];
+    accepted.sort_unstable();
+    assert_eq!(accepted, vec![0, 1]);
 
     handler.await.expect("handler join").expect("handler");
     {

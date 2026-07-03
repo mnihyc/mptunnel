@@ -343,7 +343,28 @@ pub(super) fn try_recv_tcp_path_priority_command(
 }
 
 pub(super) fn tcp_path_command_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
-    reliable_relay_buffer_len(mux_limits).max(1)
+    let frame_payload =
+        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+            .min(mux_limits.max_reliable_relay_chunk_bytes)
+            .min(mux_limits.max_payload_bytes)
+            .max(1);
+    let stream_data_frame_overhead = crate::protocol::codec::FRAME_HEADER_LEN
+        .saturating_add(8) // stream_id
+        .saturating_add(8) // offset
+        .saturating_add(1) // stream flags
+        .saturating_add(4); // payload length
+    let encoded_frame_bytes = frame_payload
+        .saturating_add(stream_data_frame_overhead)
+        .max(1);
+    let frames_per_record = mux_limits
+        .max_payload_bytes
+        .checked_div(encoded_frame_bytes)
+        .unwrap_or(0)
+        .max(1);
+    frame_payload
+        .saturating_mul(frames_per_record)
+        .max(reliable_relay_buffer_len(mux_limits))
+        .max(1)
 }
 
 pub(super) fn tcp_path_command_writer_run_budget_items(mux_limits: MuxLimits) -> usize {

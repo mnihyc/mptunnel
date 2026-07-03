@@ -1862,6 +1862,17 @@ pub struct ServerPathContext {
 }
 
 impl ServerPathContext {
+    pub(super) fn local_path_startup_metrics(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+    ) -> Option<PathMetrics> {
+        let index = usize::from(path_id.0);
+        let path = self.server_paths.get(index)?;
+        (path.underlay == underlay)
+            .then(|| path_startup_metrics(path, index, PathMetricDirection::ServerToClient))
+    }
+
     pub(super) fn accept_path_join_nonce(
         &self,
         session_id: SessionId,

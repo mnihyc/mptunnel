@@ -140,6 +140,8 @@ pub(super) async fn handle_server_path(
                                         context.mux_limits,
                                     ),
                                     role,
+                                    initial_metrics: context
+                                        .local_path_startup_metrics(UnderlayProtocol::Tcp, path_id),
                                 },
                             },
                             context.mux_limits,
@@ -189,6 +191,7 @@ pub(super) async fn handle_server_path(
                                     return Ok(());
                                 }
                             }
+                            ServerReliableStreamOpen::DuplicateLiveIgnored => {}
                             ServerReliableStreamOpen::Rejected => {
                                 if !server_write_tcp_path_frame(
                                     &mut writer,
@@ -540,6 +543,7 @@ async fn drain_server_tcp_path_commands(
     let byte_budget = tcp_path_command_writer_run_budget_bytes(context.mux_limits);
     let item_budget = tcp_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
+    let mut pending_frames = Vec::<Frame>::new();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut wrote_frame = false;
@@ -555,38 +559,49 @@ async fn drain_server_tcp_path_commands(
         if let TcpPathSessionCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
             datagram_flows.retain(|flow| flow.flow_id != *flow_id);
         }
-        let is_frame = matches!(command, TcpPathSessionCommand::SendFrame(_));
-        let is_stream_detach = matches!(
-            &command,
-            TcpPathSessionCommand::SendFrame(Frame::StreamDetach { .. })
-        );
-        let keep_running = handle_server_tcp_path_command(
-            command,
-            writer,
-            context,
-            attached_streams,
-            ServerTcpPathCommandContext {
-                active_datagram_flows: datagram_flows.len(),
-                ..command_context
-            },
-            false,
-        )
-        .await?;
-        commands_rx.release_pending_command_bytes(pending_bytes);
-        if !keep_running {
-            return Ok(false);
-        }
-        if is_frame {
-            wrote_frame = true;
-            sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
-        }
-        sent_items = sent_items.saturating_add(1);
-        if is_stream_detach {
-            break;
+        match command {
+            TcpPathSessionCommand::SendFrame(frame) => {
+                let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
+                pending_frames.push(frame);
+                commands_rx.release_pending_command_bytes(pending_bytes);
+                wrote_frame = true;
+                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_items = sent_items.saturating_add(1);
+                if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
+                    break;
+                }
+                continue;
+            }
+            command => {
+                if !server_write_tcp_path_frame_batch(writer, &mut pending_frames).await? {
+                    return Ok(false);
+                }
+                let keep_running = handle_server_tcp_path_command(
+                    command,
+                    writer,
+                    context,
+                    attached_streams,
+                    ServerTcpPathCommandContext {
+                        active_datagram_flows: datagram_flows.len(),
+                        ..command_context
+                    },
+                    false,
+                )
+                .await?;
+                commands_rx.release_pending_command_bytes(pending_bytes);
+                if !keep_running {
+                    return Ok(false);
+                }
+                sent_items = sent_items.saturating_add(1);
+            }
         }
         if sent_bytes >= byte_budget || sent_items >= item_budget {
             break;
         }
+    }
+
+    if !server_write_tcp_path_frame_batch(writer, &mut pending_frames).await? {
+        return Ok(false);
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -609,6 +624,29 @@ async fn drain_server_tcp_path_commands(
         return Ok(false);
     }
     Ok(true)
+}
+
+async fn server_write_tcp_path_frame_batch(
+    framed: &mut EncryptedTcpWriter,
+    frames: &mut Vec<Frame>,
+) -> Result<bool, RuntimeError> {
+    if frames.is_empty() {
+        return Ok(true);
+    }
+    match framed.write_frames(frames).await {
+        Ok(()) => {
+            frames.clear();
+            Ok(true)
+        }
+        Err(err) if encrypted_framed_peer_closed(&err) => {
+            frames.clear();
+            Ok(false)
+        }
+        Err(err) => {
+            frames.clear();
+            Err(RuntimeError::Encrypted(err))
+        }
+    }
 }
 
 pub(super) async fn handle_server_tcp_path_command(

@@ -38,6 +38,138 @@ async fn tcp_path_latency_lane_reuse_depends_on_topology() {
     assert!(!first_latency.same_channel(&bulk));
 }
 
+#[tokio::test]
+async fn tcp_client_sends_path_metrics_before_open_stream() {
+    let path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=500").await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let security = security();
+        let mut framed = EncryptedFramedStream::with_cipher_suite(
+            stream,
+            security.secret.as_bytes(),
+            PeerRole::Server,
+            CodecLimits::default(),
+            security.cipher,
+        );
+        let session_id = match framed.read_frame().await? {
+            Frame::SessionHello { session_id } => session_id,
+            _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
+        };
+        let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
+        match framed.read_frame().await? {
+            Frame::SessionAuth {
+                session_id: auth_session_id,
+                nonce,
+                issued_at_unix_secs,
+                auth_tag,
+            } if auth_session_id == session_id
+                && authenticator.verify_session_auth(SessionAuthCheck {
+                    session_id,
+                    nonce,
+                    issued_at_unix_secs,
+                    tag: auth_tag,
+                    now_unix_secs: current_unix_secs()?,
+                    freshness_window_secs: security.auth_freshness_window.as_secs(),
+                }) => {}
+            _ => return Err(RuntimeError::Protocol("invalid SESSION_AUTH")),
+        }
+        let (path_id, capabilities) = match framed.read_frame().await? {
+            Frame::PathJoin {
+                session_id: join_session_id,
+                path_id,
+                underlay,
+                nonce,
+                issued_at_unix_secs,
+                capabilities,
+                auth_tag,
+            } if join_session_id == session_id
+                && underlay == UnderlayProtocol::Tcp
+                && authenticator.verify_path_join(PathJoinAuthCheck {
+                    session_id,
+                    path_id,
+                    underlay,
+                    nonce,
+                    issued_at_unix_secs,
+                    capabilities,
+                    tag: auth_tag,
+                    now_unix_secs: current_unix_secs()?,
+                    freshness_window_secs: security.auth_freshness_window.as_secs(),
+                }) =>
+            {
+                (path_id, capabilities)
+            }
+            _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
+        };
+        framed.write_frame(&Frame::SessionReady).await?;
+        framed
+            .write_frame(&Frame::PathStatus {
+                path_id,
+                status: crate::protocol::PathStatus::Active,
+                capabilities,
+            })
+            .await?;
+        framed.flush().await?;
+
+        match framed.read_frame().await? {
+            Frame::PathMetrics { metrics } => {
+                assert_eq!(metrics.path_id, path_id);
+                assert_eq!(metrics.underlay, UnderlayProtocol::Tcp);
+                assert_eq!(metrics.direction, PathMetricDirection::ClientToServer);
+                assert!(
+                    metrics.delivery_rate_bps >= 500_000_000,
+                    "startup metrics must carry configured path evidence before OPEN_STREAM"
+                );
+            }
+            other => panic!("expected PATH_METRICS before OPEN_STREAM, got {other:?}"),
+        }
+
+        match framed.read_frame().await? {
+            Frame::OpenStream { stream_id, .. } => {
+                framed
+                    .write_frame(&Frame::StreamMaxData {
+                        stream_id,
+                        max_offset: ResourceLimits::default().max_stream_window_bytes,
+                    })
+                    .await?;
+                framed.flush().await?;
+            }
+            other => panic!("expected OPEN_STREAM after PATH_METRICS, got {other:?}"),
+        }
+
+        let _ = server_path;
+        Ok::<(), RuntimeError>(())
+    });
+
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(44),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        reuse_latency_session: true,
+        connect_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
+    });
+    let stream = handle
+        .open_stream(
+            StreamId(99),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            IngressKind::HttpConnect,
+            FlowLane::Throughput,
+            StreamOpenRole::Active,
+        )
+        .await
+        .expect("open stream");
+    drop(stream);
+
+    server.await.expect("server task").expect("server path");
+}
+
 #[test]
 fn mixed_reliable_underlays_share_one_logical_session() {
     let context = ClientPathContext::new(
@@ -225,7 +357,12 @@ async fn fixed_reliable_path_close_is_carrier_local_without_hidden_detach() {
         lane: FlowLane::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: 64 * 1024,
-        output: ReliablePathStreamOutput::Fixed(commands),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
     };
 
     stream.close().await;
@@ -257,7 +394,12 @@ async fn fixed_reliable_path_detach_is_explicit_product_control() {
         lane: FlowLane::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: 64 * 1024,
-        output: ReliablePathStreamOutput::Fixed(commands),
+        output: ReliablePathStreamOutput::fixed(
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            MuxLimits::default(),
+        ),
     };
 
     stream.send_detach().await;
@@ -603,6 +745,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
+                    initial_metrics: None,
                 },
             },
             MuxLimits::default(),
@@ -636,6 +779,32 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
         )
         .await
         .expect("unknown server product stream frame should be dropped");
+
+    let (commands, _receivers) = tcp_path_session_command_channels(4);
+    let opened = registry
+        .open_or_attach(
+            ServerReliableStreamOpenRequest {
+                session_id,
+                stream_id: unknown,
+                target: &target,
+                lane: FlowLane::Latency,
+                attachment: ServerReliablePathAttachment {
+                    path_id: PathId(1),
+                    underlay: UnderlayProtocol::Tcp,
+                    commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Active,
+                    initial_metrics: None,
+                },
+            },
+            MuxLimits::default(),
+            8,
+        )
+        .expect("unknown-frame drop must not poison active open");
+    assert!(
+        matches!(opened, ServerReliableStreamOpen::New(_)),
+        "unknown stream data is a product reordering/drop event, not terminal close state"
+    );
 }
 
 #[tokio::test]
@@ -653,7 +822,12 @@ async fn server_reliable_relay_does_not_replay_whole_repair_cache_on_path_reatta
             lane: FlowLane::Latency,
             underlay: UnderlayProtocol::Tcp,
             max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
-            output: ReliablePathStreamOutput::Fixed(commands_tx),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands_tx,
+                mux_limits,
+            ),
             frames: frames_rx,
         },
         mux_limits,
@@ -983,6 +1157,26 @@ fn data_plane_failure_cools_path_for_active_reopen() {
     assert_eq!(
         context.ordered_tcp_path_indices(FlowLane::Throughput, 64 * 1024),
         vec![1]
+    );
+}
+
+#[test]
+fn sole_suspect_path_remains_reopenable_when_no_survivor_exists() {
+    let path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("single path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+
+    context.mark_relay_path_data_plane_failure(UnderlayProtocol::Tcp, 0);
+
+    assert_eq!(
+        context.reserve_reliable_stream_path(FlowLane::Throughput, 64 * 1024, &[]),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        }),
+        "a sole suspect path is a recovery candidate; only Failed/Draining paths are hard excluded"
     );
 }
 
@@ -1708,7 +1902,12 @@ fn opened_relay_stream_for_test(
                 lane: FlowLane::Throughput,
                 underlay,
                 max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
-                output: ReliablePathStreamOutput::Fixed(commands),
+                output: ReliablePathStreamOutput::fixed(
+                    underlay,
+                    PathId(path_index as u16),
+                    commands,
+                    mux_limits,
+                ),
                 frames: frames_rx,
             },
         },
@@ -1756,7 +1955,12 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
             lane: FlowLane::Throughput,
             underlay: UnderlayProtocol::Tcp,
             max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
-            output: ReliablePathStreamOutput::Fixed(commands),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                mux_limits,
+            ),
             frames: frames_rx,
         },
     };
@@ -1798,6 +2002,72 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
         .is_err(),
         "blocked relay dispatch must not enqueue another STREAM_DATA frame"
     );
+}
+
+#[tokio::test]
+async fn client_sender_slices_large_upload_reads_to_service_quantum() {
+    let path = "udp://127.0.0.1:10273?srtt-ms=20&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let stream_id = StreamId(80);
+    let mux_limits = MuxLimits::default();
+    let (opened, mut command_rx, _frames_tx) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
+    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    let queued_bytes = mux_limits.max_reliable_relay_chunk_bytes;
+    let quantum = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(mux_limits));
+    sender_queue.push_data(Bytes::from(vec![0x5a; queued_bytes]));
+
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            &ReliableRelayOpenSpec {
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                ingress: IngressKind::Socks5,
+            },
+            FlowLane::Throughput,
+            &mut remotes,
+            &mut send_stream,
+            &mut sender_queue,
+            true,
+            quantum,
+        )
+        .await
+        .expect("dispatch upload service quantum");
+
+    match dispatch {
+        ClientQueuedDispatch::Data {
+            path_key,
+            payload_bytes,
+        } => {
+            assert_eq!(
+                path_key,
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index: 0,
+                }
+            );
+            assert_eq!(payload_bytes, quantum);
+        }
+        ClientQueuedDispatch::Repair { .. } => panic!("expected upload data dispatch"),
+    }
+    assert_eq!(sender_queue.data_bytes(), queued_bytes - quantum);
+    assert_eq!(send_stream.next_offset(), quantum as u64);
+    assert!(matches!(
+        recv_tcp_path_command(&mut command_rx).await,
+        Some(TcpPathSessionCommand::SendFrame(Frame::StreamData {
+            stream_id: id,
+            offset: 0,
+            payload,
+            ..
+        })) if id == stream_id && payload.len() == quantum
+    ));
 }
 
 #[tokio::test]
@@ -2483,7 +2753,12 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
             lane: FlowLane::Throughput,
             underlay: UnderlayProtocol::Udp,
             max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
-            output: ReliablePathStreamOutput::Fixed(commands),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Udp,
+                PathId(1),
+                commands,
+                mux_limits,
+            ),
             frames: frames_rx,
         },
     };

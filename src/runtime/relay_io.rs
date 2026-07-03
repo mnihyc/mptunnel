@@ -52,10 +52,13 @@ pub(super) fn stream_ack_gap_repair_allowed(
     if !complete {
         return false;
     }
+    if !has_multipath_repair_alternative {
+        return false;
+    }
     if active_underlay != Some(UnderlayProtocol::Udp) {
         return true;
     }
-    has_multipath_repair_alternative && udp_gap_repair_ready
+    udp_gap_repair_ready
 }
 
 pub(super) fn stream_ack_gap_repair_frames(
@@ -307,23 +310,23 @@ pub(super) fn reliable_stream_ack_update_bytes(
     if !relay_lane_is_bulk(lane) {
         return 1;
     }
-    let ack_capacity = mux_limits.max_ack_ranges.max(1) as u64;
-    let window_step = mux_limits.max_stream_window_bytes / ack_capacity;
-    let repair_step = mux_limits.max_repair_bytes as u64 / ack_capacity;
-    let configured_step = window_step.min(repair_step).max(1);
+    let resource_ceiling = reliable_stream_max_data_update_bytes(mux_limits)
+        .min(
+            (mux_limits.max_repair_bytes as u64)
+                .saturating_div(4)
+                .max(1),
+        )
+        .max(PATH_OPEN_SCORE_BYTES as u64);
+    let service_floor = BBR_MAX_SEND_QUANTUM_BYTES
+        .min(reliable_relay_buffer_len(mux_limits))
+        .max(PATH_OPEN_SCORE_BYTES) as u64;
     let measured_step = path
-        .map(|path| {
-            ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0))
-                .ceil()
-                .max(1.0) as u64
-                / ack_capacity
-        })
-        .unwrap_or(configured_step)
-        .max(1);
-    let blended = ((configured_step as f64) * (measured_step as f64))
-        .sqrt()
-        .ceil() as u64;
-    blended.max(PATH_OPEN_SCORE_BYTES as u64)
+        .map(|path| (tcp_path_product_bdp_bytes(path) / 2.0).ceil().max(1.0) as u64)
+        .unwrap_or(service_floor);
+    measured_step
+        .clamp(service_floor.min(resource_ceiling), resource_ceiling)
+        .min(mux_limits.max_repair_bytes as u64)
+        .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
 pub(super) fn enqueue_tcp_recv_progress(
@@ -437,9 +440,13 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
         .min(cap)
         .max(1);
     let Some(path) = path else {
-        return relay_lane_startup_chunk_bytes(lane, mux_limits)
-            .min(cap)
-            .max(floor);
+        let startup = relay_lane_startup_chunk_bytes(lane, mux_limits);
+        let startup = if relay_lane_is_bulk(lane) {
+            startup.max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+        } else {
+            startup
+        };
+        return startup.min(cap).max(floor);
     };
 
     let quantum = bbr_send_quantum_bytes(path, mux_limits);
@@ -452,6 +459,17 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
         FlowLane::Throughput | FlowLane::Background => {
             ((quantum as f64) * condition).ceil() as usize
         }
+    };
+    let target = if relay_lane_is_bulk(lane) {
+        // TCP and QUIC UDP already own packet pacing and congestion below
+        // mptunnel. Once a reliable stream is classified as throughput demand,
+        // the product sender must not keep the carrier app-limited with a
+        // 2*MSS application-record loop. Feed the carrier with BBR's bounded
+        // maximum send quantum while retaining the configured frame/read
+        // envelope and live condition cap as the hard upper bounds.
+        target.max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+    } else {
+        target
     };
     target.clamp(floor, cap)
 }
@@ -531,6 +549,13 @@ pub(super) fn bbr_min_send_quantum_bytes(mux_limits: MuxLimits) -> usize {
     (BBR_MIN_SEND_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES)
         .min(cap)
         .max(1)
+}
+
+fn reliable_bulk_carrier_feed_quantum_bytes(mux_limits: MuxLimits) -> usize {
+    let cap = reliable_relay_buffer_len(mux_limits).max(1);
+    BBR_MAX_SEND_QUANTUM_BYTES
+        .min(cap)
+        .max(bbr_min_send_quantum_bytes(mux_limits))
 }
 
 pub(super) fn bbr_min_pipe_cwnd_bytes(mux_limits: MuxLimits) -> usize {
@@ -1009,10 +1034,14 @@ where
             path_stream.underlay,
             path_stream.max_frame_payload_bytes,
         );
-        resize_reliable_relay_buffer(&mut buf, adaptive_chunk);
         let inflight_limit =
             adaptive_reliable_relay_inflight_bytes(send_path_snapshot, relay_lane, mux_limits);
         let sender_queue_limit = reliable_relay_sender_queue_limit(mux_limits, inflight_limit);
+        let source_read_ceiling = reliable_relay_buffer_len(mux_limits)
+            .min(path_stream.max_frame_payload_bytes)
+            .min(sender_queue_limit)
+            .max(1);
+        resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
         let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
             reliable_relay_sender_dispatch_budget(
                 mux_limits,
@@ -1026,16 +1055,30 @@ where
         last_sender_dispatch_item_budget = sender_dispatch_item_budget;
         #[cfg(feature = "lab-diagnostics")]
         if last_reported_budget != Some((relay_lane, adaptive_chunk, inflight_limit)) {
+            let snapshot = send_path_snapshot;
             lab_diagnostic(
                 "server_relay_budget",
                 format_args!(
-                    "stream_id={} underlay={:?} lane={:?} chunk_bytes={} inflight_bytes={} max_frame_payload_bytes={}",
+                    "stream_id={} underlay={:?} lane={:?} chunk_bytes={} inflight_bytes={} max_frame_payload_bytes={} snapshot={} rate_mbps={:.3} pacing_mbps={:.3} product_progress_mbps={:.3} queue_bytes={} product_queue_bytes={} carrier_flight_bytes={} product_flight_bytes={} confidence_ppm={}",
                     stream_id.0,
                     path_stream.underlay,
                     relay_lane,
                     adaptive_chunk,
                     inflight_limit,
                     path_stream.max_frame_payload_bytes,
+                    snapshot.is_some(),
+                    snapshot.map_or(0.0, |path| path.delivery_rate_bps / 1_000_000.0),
+                    snapshot.map_or(0.0, |path| path.pacing_rate_bps / 1_000_000.0),
+                    snapshot
+                        .and_then(|path| path.product_progress_rate_bps)
+                        .unwrap_or(0.0)
+                        / 1_000_000.0,
+                    snapshot.map_or(0, |path| path.queue_bytes),
+                    snapshot.map_or(0, |path| path.product_queue_bytes),
+                    snapshot.map_or(0, |path| path.bytes_in_flight),
+                    snapshot.map_or(0, |path| path.product_bytes_in_flight),
+                    snapshot.map_or(0, |path| (path.confidence.clamp(0.0, 1.0) * 1_000_000.0)
+                        .round() as u32),
                 ),
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
@@ -1061,6 +1104,7 @@ where
         } else {
             Vec::new()
         };
+        let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
         let can_read_by_flow = response_sender.can_read_product_source(
             local_open,
             queued_send_blocked,
@@ -1257,7 +1301,7 @@ where
                                         &ranges,
                                         repair_limit,
                                         close_sent || pending_local_fin,
-                                        true,
+                                        has_multipath_repair_alternative,
                                     ),
                                     false,
                                 );
@@ -1480,7 +1524,7 @@ where
                 }
                 continue;
             }
-            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked => {
+            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked && has_carrier_capacity_notify => {
                 response_sender_retry_at = None;
                 continue;
             }
@@ -1858,10 +1902,16 @@ mod tests {
             true,
             true,
         ));
-        assert!(stream_ack_gap_repair_allowed(
+        assert!(!stream_ack_gap_repair_allowed(
             true,
             Some(UnderlayProtocol::Tcp),
             false,
+            false,
+        ));
+        assert!(stream_ack_gap_repair_allowed(
+            true,
+            Some(UnderlayProtocol::Tcp),
+            true,
             false,
         ));
         assert!(!stream_ack_gap_repair_allowed(

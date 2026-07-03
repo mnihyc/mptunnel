@@ -152,37 +152,246 @@ impl ReliablePathStreamHandle {
 pub(super) enum ReliablePathStreamOutput {
     /// A fixed carrier command pipe, used by client-side paths where the stream
     /// is bound to the currently opened carrier association.
-    Fixed(TcpPathSessionCommandSender),
+    Fixed(Arc<FixedReliablePathOutput>),
     /// A switchable response binding, used by server-side streams that may send
     /// later response bytes or repair ranges over another joined carrier path.
     Switchable(Arc<ResponseStreamBinding>),
 }
 
+pub(super) struct FixedReliablePathOutput {
+    key: CarrierPathKey,
+    startup: PathSnapshot,
+    commands: TcpPathSessionCommandSender,
+    mux_limits: MuxLimits,
+    model: Mutex<FixedReliablePathModel>,
+}
+
+#[derive(Default)]
+struct FixedReliablePathModel {
+    bytes_in_flight: u64,
+    product_queue_bytes: u64,
+    product_progress_rate_bps: Option<f64>,
+    delivery_rate_bps: Option<f64>,
+    srtt_ms: Option<f64>,
+    delivery_samples: u32,
+    flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
+}
+
+impl FixedReliablePathOutput {
+    #[cfg(test)]
+    pub(super) fn new(
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        commands: TcpPathSessionCommandSender,
+        mux_limits: MuxLimits,
+    ) -> Arc<Self> {
+        let startup = PathSnapshot::new(
+            path_id,
+            underlay,
+            default_path_srtt_ms(underlay),
+            default_path_rate_bps(underlay),
+        );
+        Self::new_with_snapshot(startup, commands, mux_limits)
+    }
+
+    pub(super) fn new_with_snapshot(
+        startup: PathSnapshot,
+        commands: TcpPathSessionCommandSender,
+        mux_limits: MuxLimits,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            key: CarrierPathKey {
+                underlay: startup.underlay,
+                path_id: startup.id,
+            },
+            startup,
+            commands,
+            mux_limits,
+            model: Mutex::new(FixedReliablePathModel::default()),
+        })
+    }
+
+    pub(super) fn key(&self) -> CarrierPathKey {
+        self.key
+    }
+
+    pub(super) fn commands(&self) -> &TcpPathSessionCommandSender {
+        &self.commands
+    }
+
+    fn send_path_snapshot(&self) -> PathSnapshot {
+        let model = self.model.lock().expect("fixed reliable path model lock");
+        let prior_rate_bps = self.startup.delivery_rate_bps.max(1.0);
+        let delivery_rate_bps = match self.key.underlay {
+            UnderlayProtocol::Tcp => model
+                .delivery_rate_bps
+                .map(|rate| rate.max(prior_rate_bps))
+                .unwrap_or(prior_rate_bps),
+            UnderlayProtocol::Udp => model.delivery_rate_bps.unwrap_or(prior_rate_bps),
+        }
+        .max(1.0);
+        let srtt_ms = model.srtt_ms.unwrap_or(self.startup.srtt_ms);
+        let mut snapshot = self.startup;
+        snapshot.srtt_ms = srtt_ms;
+        snapshot.delivery_rate_bps = delivery_rate_bps;
+        snapshot.product_progress_rate_bps = model.product_progress_rate_bps;
+        snapshot.pacing_rate_bps = delivery_rate_bps
+            .max(model.product_progress_rate_bps.unwrap_or(0.0))
+            .max(1.0);
+        snapshot.queue_bytes = self.commands.pending_bytes();
+        snapshot.product_queue_bytes = model.product_queue_bytes;
+        snapshot.bytes_in_flight = 0;
+        snapshot.product_bytes_in_flight = model.bytes_in_flight;
+        snapshot.inflight_limit_bytes = snapshot.inflight_limit_bytes.max(
+            bbr_inflight_target_bytes(snapshot, FlowLane::Throughput, self.mux_limits)
+                .ceil()
+                .max(PATH_OPEN_SCORE_BYTES as f64) as u64,
+        );
+        let learned_confidence = (f64::from(model.delivery_samples)
+            / f64::from(QUIC_INITIAL_WINDOW_PACKETS as u32))
+        .clamp(0.0, 1.0);
+        snapshot.confidence = snapshot.confidence.max(learned_confidence);
+        snapshot.app_limited = model.bytes_in_flight == 0
+            && model.product_queue_bytes == 0
+            && self.commands.pending_bytes() == 0;
+        snapshot
+    }
+
+    fn set_sender_queue_bytes(&self, bytes: usize) {
+        let mut model = self.model.lock().expect("fixed reliable path model lock");
+        model.product_queue_bytes = bytes as u64;
+    }
+
+    pub(super) fn record_flight(&self, frame: &Frame, stream_ack_proves_path: bool) {
+        let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
+            return;
+        };
+        let mut model = self.model.lock().expect("fixed reliable path model lock");
+        model.bytes_in_flight = model.bytes_in_flight.saturating_add(bytes as u64);
+        model
+            .flights
+            .entry(offset)
+            .or_default()
+            .push(CarrierPathFlight {
+                key: self.key,
+                end,
+                bytes,
+                sent_at: Instant::now(),
+                stream_ack_proves_path,
+            });
+    }
+
+    fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
+        if ranges.is_empty() {
+            return;
+        }
+        let mut model = self.model.lock().expect("fixed reliable path model lock");
+        let acked_offsets = model
+            .flights
+            .iter()
+            .filter_map(|(offset, path_flights)| {
+                path_flights
+                    .iter()
+                    .any(|flight| {
+                        ranges
+                            .iter()
+                            .any(|range| range.start <= *offset && range.end >= flight.end)
+                    })
+                    .then_some(*offset)
+            })
+            .collect::<Vec<_>>();
+        if acked_offsets.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut sample_bytes = 0_u64;
+        let mut sample_start = now;
+        let mut released_proven_flights = 0_u32;
+        for offset in acked_offsets {
+            if let Some(path_flights) = model.flights.remove(&offset) {
+                for flight in path_flights {
+                    model.bytes_in_flight =
+                        model.bytes_in_flight.saturating_sub(flight.bytes as u64);
+                    if flight.stream_ack_proves_path {
+                        sample_bytes = sample_bytes.saturating_add(flight.bytes as u64);
+                        sample_start = sample_start.min(flight.sent_at);
+                        released_proven_flights = released_proven_flights.saturating_add(1);
+                    }
+                }
+            }
+        }
+        if let Some(sample) =
+            PathRateSample::new(sample_bytes, now.saturating_duration_since(sample_start))
+        {
+            let sample_bps = sample.rate_bps();
+            model.product_progress_rate_bps = Some(match model.product_progress_rate_bps {
+                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                None => sample_bps,
+            });
+            model.delivery_rate_bps = Some(match model.delivery_rate_bps {
+                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                None => sample_bps,
+            });
+            let sample_rtt_ms = now.saturating_duration_since(sample_start).as_secs_f64() * 1000.0;
+            model.srtt_ms = Some(match model.srtt_ms {
+                Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
+                None => sample_rtt_ms,
+            });
+        }
+        model.delivery_samples = model
+            .delivery_samples
+            .saturating_add(released_proven_flights);
+    }
+}
+
 impl ReliablePathStreamOutput {
+    #[cfg(test)]
+    pub(super) fn fixed(
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        commands: TcpPathSessionCommandSender,
+        mux_limits: MuxLimits,
+    ) -> Self {
+        Self::Fixed(FixedReliablePathOutput::new(
+            underlay, path_id, commands, mux_limits,
+        ))
+    }
+
+    pub(super) fn fixed_with_snapshot(
+        startup: PathSnapshot,
+        commands: TcpPathSessionCommandSender,
+        mux_limits: MuxLimits,
+    ) -> Self {
+        Self::Fixed(FixedReliablePathOutput::new_with_snapshot(
+            startup, commands, mux_limits,
+        ))
+    }
+
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         match self {
-            Self::Fixed(commands) => commands.can_enqueue_frame_now(frame, lane),
+            Self::Fixed(fixed) => fixed.commands().can_enqueue_frame_now(frame, lane),
             Self::Switchable(_) => true,
         }
     }
 
     pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
         match self {
-            Self::Fixed(commands) => commands.can_enqueue_lane_now(lane),
+            Self::Fixed(fixed) => fixed.commands().can_enqueue_lane_now(lane),
             Self::Switchable(_) => false,
         }
     }
 
     pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         match self {
-            Self::Fixed(commands) => vec![commands.capacity_notify()],
+            Self::Fixed(fixed) => vec![fixed.commands().capacity_notify()],
             Self::Switchable(binding) => binding.capacity_notifies(),
         }
     }
 
     pub(super) async fn send_stream_detach(&self, stream_id: StreamId) {
-        if let Self::Fixed(commands) = self {
-            let _ = commands
+        if let Self::Fixed(fixed) = self {
+            let _ = fixed
+                .commands()
                 .send_control(TcpPathSessionCommand::SendFrame(Frame::StreamDetach {
                     stream_id,
                 }))
@@ -192,8 +401,9 @@ impl ReliablePathStreamOutput {
 
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
         match self {
-            Self::Fixed(commands) => {
-                let _ = commands
+            Self::Fixed(fixed) => {
+                let _ = fixed
+                    .commands()
                     .send_control(TcpPathSessionCommand::CloseStream(stream_id))
                     .await;
             }
@@ -203,8 +413,11 @@ impl ReliablePathStreamOutput {
 
     pub(super) async fn close_stream_ordered(&self, stream_id: StreamId, lane: FlowLane) {
         match self {
-            Self::Fixed(commands) => {
-                let _ = commands.send_stream_ordered_close(stream_id, lane).await;
+            Self::Fixed(fixed) => {
+                let _ = fixed
+                    .commands()
+                    .send_stream_ordered_close(stream_id, lane)
+                    .await;
             }
             Self::Switchable(binding) => binding.close_stream_ordered(stream_id, lane).await,
         }
@@ -230,14 +443,19 @@ impl ReliablePathStreamOutput {
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
         match self {
-            Self::Fixed(_) => None,
+            Self::Fixed(fixed) => {
+                let _ = lane;
+                let _ = payload_bytes;
+                Some(fixed.send_path_snapshot())
+            }
             Self::Switchable(binding) => binding.send_path_snapshot(lane, payload_bytes),
         }
     }
 
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
-        if let Self::Switchable(binding) = self {
-            binding.set_sender_queue_bytes(bytes);
+        match self {
+            Self::Fixed(fixed) => fixed.set_sender_queue_bytes(bytes),
+            Self::Switchable(binding) => binding.set_sender_queue_bytes(bytes),
         }
     }
 
@@ -255,8 +473,9 @@ impl ReliablePathStreamOutput {
     }
 
     pub(super) fn release_acked_ranges(&self, ranges: &[OffsetRange]) {
-        if let Self::Switchable(binding) = self {
-            binding.release_acked_ranges(ranges);
+        match self {
+            Self::Fixed(fixed) => fixed.release_acked_ranges(ranges),
+            Self::Switchable(binding) => binding.release_acked_ranges(ranges),
         }
     }
 
@@ -314,6 +533,12 @@ pub(super) struct ResponseStreamBinding {
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
     version: watch::Sender<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponseStreamAttachOutcome {
+    Attached,
+    RejectedDuplicateLiveOutput,
 }
 
 impl ResponseStreamBinding {
@@ -401,13 +626,8 @@ impl ResponseStreamBinding {
         lane: FlowLane,
         role: StreamOpenRole,
         _max_frame_payload_bytes: usize,
-    ) {
-        let previous_lane = {
-            let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-            let previous = *current_lane;
-            *current_lane = lane;
-            previous
-        };
+    ) -> ResponseStreamAttachOutcome {
+        let previous_lane = *self.lane.lock().expect("server reliable stream lane lock");
         let mut outputs = self
             .outputs
             .lock()
@@ -420,6 +640,10 @@ impl ResponseStreamBinding {
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>();
             drop(outputs);
+            {
+                let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
+                *current_lane = lane;
+            }
             if previous_lane != lane {
                 self.lane_tracker.change_lanes(
                     self.session_id,
@@ -429,31 +653,70 @@ impl ResponseStreamBinding {
                 );
             }
             self.notify_update();
-            return;
+            return ResponseStreamAttachOutcome::Attached;
         }
         let mut was_active = false;
         let mut already_attached = false;
-        let entry =
-            if let Some(position) = outputs.entries.iter().position(|entry| entry.key == key) {
-                was_active = position + 1 == outputs.entries.len();
-                already_attached = true;
-                let mut entry = outputs.entries.remove(position);
+        let existing_position = outputs.entries.iter().position(|entry| entry.key == key);
+        if let Some(position) = existing_position {
+            let entry = &outputs.entries[position];
+            if !entry.commands.is_closed()
+                && !entry.commands.same_channel(&commands)
+                && role != StreamOpenRole::Active
+            {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_stream_output_attach",
+                    format_args!(
+                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=reject_duplicate_live same_channel=false",
+                        self.session_id.0, underlay, path_id.0, role, lane,
+                    ),
+                );
+                return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
+            }
+        }
+        let entry = if let Some(position) = existing_position {
+            was_active = position + 1 == outputs.entries.len();
+            already_attached = true;
+            let mut entry = outputs.entries.remove(position);
+            if entry.commands.is_closed() {
                 entry.commands = commands;
-                entry
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_stream_output_attach",
+                    format_args!(
+                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=replace_closed",
+                        self.session_id.0, underlay, path_id.0, role, lane,
+                    ),
+                );
             } else {
-                ResponseStreamOutputEntry {
-                    key,
-                    commands,
-                    bytes_in_flight: 0,
-                    product_queue_bytes: 0,
-                    product_progress_rate_bps: None,
-                    delivery_rate_bps: None,
-                    srtt_ms: None,
-                    delivery_samples: 0,
-                    last_delivery_at: None,
-                    path_metrics: None,
+                #[cfg(feature = "lab-diagnostics")]
+                {
+                    let same_channel = entry.commands.same_channel(&commands);
+                    lab_diagnostic(
+                        "server_stream_output_attach",
+                        format_args!(
+                            "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=duplicate_live same_channel={}",
+                            self.session_id.0, underlay, path_id.0, role, lane, same_channel,
+                        ),
+                    );
                 }
-            };
+            }
+            entry
+        } else {
+            ResponseStreamOutputEntry {
+                key,
+                commands,
+                bytes_in_flight: 0,
+                product_queue_bytes: 0,
+                product_progress_rate_bps: None,
+                delivery_rate_bps: None,
+                srtt_ms: None,
+                delivery_samples: 0,
+                last_delivery_at: None,
+                path_metrics: None,
+            }
+        };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
             || was_active
             || outputs.entries.is_empty();
@@ -469,6 +732,10 @@ impl ResponseStreamBinding {
             .map(|entry| entry.key)
             .collect::<Vec<_>>();
         drop(outputs);
+        {
+            let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
+            *current_lane = lane;
+        }
         if previous_lane != lane {
             self.lane_tracker
                 .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
@@ -480,6 +747,7 @@ impl ResponseStreamBinding {
             self.set_ordinary_lead(key);
         }
         self.notify_update();
+        ResponseStreamAttachOutcome::Attached
     }
 
     pub(super) fn lane(&self) -> FlowLane {
@@ -689,6 +957,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         let now = Instant::now();
         let mut changed = false;
+        let mut path_samples = HashMap::<CarrierPathKey, (u64, Instant)>::new();
         for (_, flight) in released {
             if let Some(entry) = outputs
                 .entries
@@ -697,28 +966,37 @@ impl ResponseStreamBinding {
             {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
                 if flight.stream_ack_proves_path {
-                    let elapsed = now.saturating_duration_since(flight.sent_at);
-                    if let Some(sample) = PathRateSample::new(flight.bytes as u64, elapsed) {
-                        let sample_bps = sample.rate_bps();
-                        entry.product_progress_rate_bps =
-                            Some(match entry.product_progress_rate_bps {
-                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-                                None => sample_bps,
-                            });
-                        if entry.key.underlay == UnderlayProtocol::Tcp {
-                            entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
-                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-                                None => sample_bps,
-                            });
-                            let sample_rtt_ms = elapsed.as_secs_f64() * 1000.0;
-                            entry.srtt_ms = Some(match entry.srtt_ms {
-                                Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
-                                None => sample_rtt_ms,
-                            });
-                        }
-                    }
+                    let sample = path_samples
+                        .entry(flight.key)
+                        .or_insert((0_u64, flight.sent_at));
+                    sample.0 = sample.0.saturating_add(flight.bytes as u64);
+                    sample.1 = sample.1.min(flight.sent_at);
                 }
                 changed = true;
+            }
+        }
+        for (key, (bytes, first_sent_at)) in path_samples {
+            if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key)
+                && let Some(sample) =
+                    PathRateSample::new(bytes, now.saturating_duration_since(first_sent_at))
+            {
+                let sample_bps = sample.rate_bps();
+                entry.product_progress_rate_bps = Some(match entry.product_progress_rate_bps {
+                    Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                    None => sample_bps,
+                });
+                if entry.key.underlay == UnderlayProtocol::Tcp {
+                    entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
+                        Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                        None => sample_bps,
+                    });
+                    let sample_rtt_ms =
+                        now.saturating_duration_since(first_sent_at).as_secs_f64() * 1000.0;
+                    entry.srtt_ms = Some(match entry.srtt_ms {
+                        Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
+                        None => sample_rtt_ms,
+                    });
+                }
             }
         }
         for hole in ordering_update.newly_contiguous {
@@ -996,6 +1274,25 @@ impl ResponseStreamBinding {
         }
         drop(outputs);
         if changed {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "server_response_path_metrics_attached",
+                format_args!(
+                    "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={}",
+                    self.session_id.0,
+                    key.underlay,
+                    key.path_id.0,
+                    source,
+                    metrics.direction,
+                    metrics.delivery_rate_bps as f64 / 1_000_000.0,
+                    metrics.pacing_rate_bps as f64 / 1_000_000.0,
+                    metrics.srtt_us as f64 / 1000.0,
+                    metrics.confidence_ppm,
+                    metrics.app_limited,
+                    metrics.has_ack_derived_data_sample,
+                    metrics.data_sample_count,
+                ),
+            );
             self.notify_update();
         }
     }
@@ -1203,5 +1500,64 @@ mod tests {
         assert_eq!(entry.delivery_samples, 1);
         assert!(entry.delivery_rate_bps.is_some());
         assert!(entry.srtt_ms.is_some());
+    }
+
+    #[test]
+    fn tcp_peer_metrics_remain_send_quantum_prior_after_low_product_sample() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let mux_limits = binding.mux_limits();
+        let metrics = PathMetrics {
+            path_id: key.path_id,
+            underlay: key.underlay,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 20_000,
+            srtt_us: 20_000,
+            rttvar_us: 1_000,
+            jitter_us: 1_000,
+            delivery_rate_bps: 500_000_000,
+            pacing_rate_bps: 500_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 0,
+            inflight_hi_bytes: 0,
+            confidence_ppm: 0,
+            app_limited: true,
+            has_ack_derived_data_sample: false,
+            data_sample_count: 0,
+        };
+        binding.update_path_metrics(key, metrics, ServerPathMetricsSource::PeerHint);
+
+        let before_ack = binding
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("path metrics seed response path snapshot");
+        assert_eq!(before_ack.delivery_rate_bps, 500_000_000.0);
+
+        let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
+        binding.record_flight(key, &frame, true);
+        std::thread::sleep(Duration::from_millis(20));
+        binding.release_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: reliable_stream_frame_payload_bytes(&frame) as u64,
+        }]);
+
+        let entry = first_output_entry(&binding);
+        assert_eq!(entry.delivery_samples, 1);
+        assert!(
+            entry.delivery_rate_bps.unwrap_or(f64::INFINITY) < 500_000_000.0,
+            "the test must create a low product progress sample"
+        );
+        let after_ack = binding
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("peer rate prior remains available after product ACK sample");
+        assert_eq!(after_ack.delivery_rate_bps, 500_000_000.0);
+        assert!(
+            adaptive_reliable_relay_chunk_bytes(Some(after_ack), FlowLane::Throughput, mux_limits)
+                > bbr_min_send_quantum_bytes(mux_limits),
+            "a low product ACK sample must not collapse TCP send quantum below the path-rate prior"
+        );
     }
 }

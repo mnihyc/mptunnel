@@ -2,9 +2,13 @@ use crate::config::CipherSuite;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::Frame;
-use crate::protocol::codec::{CodecError, CodecLimits, decode_frame, encode_frame};
+use crate::protocol::codec::{
+    CodecError, CodecLimits, decode_frames_bytes, encode_frame_into, encode_frames_into,
+};
 use crate::transport::aead::{AEAD_TAG_LEN, TransportAead};
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::io::{self, IoSlice};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 const MAGIC: &[u8; 4] = b"MPTE";
@@ -52,6 +56,7 @@ pub struct EncryptedFramedReader<R> {
     limits: CodecLimits,
     recv_direction: u8,
     recv_counter: u64,
+    pending_frames: std::collections::VecDeque<Frame>,
 }
 
 pub struct EncryptedFramedWriter<W> {
@@ -60,6 +65,7 @@ pub struct EncryptedFramedWriter<W> {
     limits: CodecLimits,
     send_direction: u8,
     send_counter: u64,
+    encode_buffer: Vec<u8>,
 }
 
 impl<S: std::fmt::Debug> std::fmt::Debug for EncryptedFramedStream<S> {
@@ -133,6 +139,7 @@ impl<S> EncryptedFramedStream<S> {
                 limits,
                 recv_direction,
                 recv_counter,
+                pending_frames: std::collections::VecDeque::new(),
             },
             EncryptedFramedWriter {
                 stream: write_half,
@@ -140,6 +147,7 @@ impl<S> EncryptedFramedStream<S> {
                 limits,
                 send_direction,
                 send_counter,
+                encode_buffer: Vec::new(),
             },
         )
     }
@@ -171,6 +179,7 @@ where
             self.send_direction,
             &mut self.send_counter,
             frame,
+            &mut Vec::new(),
         )
         .await
     }
@@ -190,7 +199,33 @@ where
     R: AsyncRead + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
-        read_frame_from(
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Ok(frame);
+        }
+        let mut frames = read_frames_from(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.recv_direction,
+            &mut self.recv_counter,
+        )
+        .await?;
+        if frames.is_empty() {
+            return Err(EncryptedFramedTransportError::Codec(
+                CodecError::UnexpectedEof,
+            ));
+        }
+        for frame in frames.drain(1..) {
+            self.pending_frames.push_back(frame);
+        }
+        Ok(frames.remove(0))
+    }
+
+    pub async fn read_frames(&mut self) -> Result<Vec<Frame>, EncryptedFramedTransportError> {
+        if !self.pending_frames.is_empty() {
+            return Ok(self.pending_frames.drain(..).collect());
+        }
+        read_frames_from(
             &mut self.stream,
             &self.cipher,
             self.limits,
@@ -216,6 +251,23 @@ where
             self.send_direction,
             &mut self.send_counter,
             frame,
+            &mut self.encode_buffer,
+        )
+        .await
+    }
+
+    pub async fn write_frames(
+        &mut self,
+        frames: &[Frame],
+    ) -> Result<(), EncryptedFramedTransportError> {
+        write_frames_to(
+            &mut self.stream,
+            &self.cipher,
+            self.limits,
+            self.send_direction,
+            &mut self.send_counter,
+            frames,
+            &mut self.encode_buffer,
         )
         .await
     }
@@ -237,6 +289,25 @@ async fn read_frame_from<R>(
     recv_direction: u8,
     recv_counter: &mut u64,
 ) -> Result<Frame, EncryptedFramedTransportError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut frames = read_frames_from(stream, cipher, limits, recv_direction, recv_counter).await?;
+    if frames.len() != 1 {
+        return Err(EncryptedFramedTransportError::Codec(
+            CodecError::TrailingBytes,
+        ));
+    }
+    Ok(frames.remove(0))
+}
+
+async fn read_frames_from<R>(
+    stream: &mut R,
+    cipher: &TransportAead,
+    limits: CodecLimits,
+    recv_direction: u8,
+    recv_counter: &mut u64,
+) -> Result<Vec<Frame>, EncryptedFramedTransportError>
 where
     R: AsyncRead + Unpin,
 {
@@ -300,12 +371,14 @@ where
     );
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
-    let frame = decode_frame(&encrypted, limits)?;
+    #[cfg(feature = "lab-diagnostics")]
+    let decrypted_len = encrypted.len();
+    let frames = decode_frames_bytes(Bytes::from(encrypted), limits)?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.tcp.decode_frame",
         stage_started.elapsed(),
-        encrypted.len(),
+        decrypted_len,
     );
     *recv_counter = recv_counter
         .checked_add(1)
@@ -316,7 +389,7 @@ where
         total_started.elapsed(),
         HEADER_LEN + ciphertext_len,
     );
-    Ok(frame)
+    Ok(frames)
 }
 
 async fn write_frame_to<W>(
@@ -326,6 +399,7 @@ async fn write_frame_to<W>(
     send_direction: u8,
     send_counter: &mut u64,
     frame: &Frame,
+    payload: &mut Vec<u8>,
 ) -> Result<(), EncryptedFramedTransportError>
 where
     W: AsyncWrite + Unpin,
@@ -334,7 +408,8 @@ where
     let total_started = std::time::Instant::now();
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
-    let mut payload = encode_frame(frame, limits)?;
+    payload.clear();
+    encode_frame_into(frame, limits, payload)?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.tcp.encode_frame",
@@ -351,7 +426,7 @@ where
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
     let tag = cipher
-        .encrypt_in_place_detached(&nonce, &header, &mut payload)
+        .encrypt_in_place_detached(&nonce, &header, payload)
         .map_err(|_| EncryptedFramedTransportError::Crypto)?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
@@ -363,11 +438,7 @@ where
     let written_bytes = HEADER_LEN + payload.len() + tag.len();
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
-    let mut encrypted_frame = Vec::with_capacity(HEADER_LEN + payload.len() + tag.len());
-    encrypted_frame.extend_from_slice(&header);
-    encrypted_frame.extend_from_slice(&payload);
-    encrypted_frame.extend_from_slice(&tag);
-    stream.write_all(&encrypted_frame).await?;
+    write_all_vectored_parts(stream, [&header, payload.as_slice(), tag.as_slice()]).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.tcp.write_socket_wait",
@@ -383,6 +454,127 @@ where
         total_started.elapsed(),
         written_bytes,
     );
+    Ok(())
+}
+
+async fn write_frames_to<W>(
+    stream: &mut W,
+    cipher: &TransportAead,
+    limits: CodecLimits,
+    send_direction: u8,
+    send_counter: &mut u64,
+    frames: &[Frame],
+    payload: &mut Vec<u8>,
+) -> Result<(), EncryptedFramedTransportError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if frames.is_empty() {
+        return Ok(());
+    }
+    if frames.len() == 1 {
+        return write_frame_to(
+            stream,
+            cipher,
+            limits,
+            send_direction,
+            send_counter,
+            &frames[0],
+            payload,
+        )
+        .await;
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    let total_started = std::time::Instant::now();
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
+    encode_frames_into(frames, limits, payload)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.encode_frame",
+        stage_started.elapsed(),
+        payload.len(),
+    );
+    let ciphertext_len = payload
+        .len()
+        .checked_add(TAG_LEN)
+        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
+    validate_encrypted_len(ciphertext_len, limits)?;
+    let header = encode_header(send_direction, *send_counter, ciphertext_len)?;
+    let nonce = build_nonce(send_direction, *send_counter);
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
+    let tag = cipher
+        .encrypt_in_place_detached(&nonce, &header, payload)
+        .map_err(|_| EncryptedFramedTransportError::Crypto)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.encrypt",
+        stage_started.elapsed(),
+        payload.len(),
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    let written_bytes = HEADER_LEN + payload.len() + tag.len();
+    #[cfg(feature = "lab-diagnostics")]
+    let stage_started = std::time::Instant::now();
+    write_all_vectored_parts(stream, [&header, payload.as_slice(), tag.as_slice()]).await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.write_socket_wait",
+        stage_started.elapsed(),
+        written_bytes,
+    );
+    *send_counter = send_counter
+        .checked_add(1)
+        .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.write_frame_total",
+        total_started.elapsed(),
+        written_bytes,
+    );
+    Ok(())
+}
+
+async fn write_all_vectored_parts<W>(stream: &mut W, parts: [&[u8]; 3]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut part_index = 0usize;
+    let mut part_offset = 0usize;
+    while part_index < parts.len() {
+        while part_index < parts.len() && part_offset == parts[part_index].len() {
+            part_index += 1;
+            part_offset = 0;
+        }
+        if part_index >= parts.len() {
+            return Ok(());
+        }
+
+        let first = &parts[part_index][part_offset..];
+        let second = parts.get(part_index + 1).copied().unwrap_or(&[]);
+        let third = parts.get(part_index + 2).copied().unwrap_or(&[]);
+        let bufs = [
+            IoSlice::new(first),
+            IoSlice::new(second),
+            IoSlice::new(third),
+        ];
+        let mut written = stream.write_vectored(&bufs).await?;
+        if written == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        while written > 0 && part_index < parts.len() {
+            let available = parts[part_index].len().saturating_sub(part_offset);
+            if written < available {
+                part_offset += written;
+                written = 0;
+            } else {
+                written -= available;
+                part_index += 1;
+                part_offset = 0;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -563,6 +755,35 @@ mod tests {
         client.flush().await.expect("flush");
 
         assert_eq!(server.read_frame().await.expect("read"), frame);
+    }
+
+    #[tokio::test]
+    async fn encrypted_writer_batches_multiple_protocol_frames_per_record() {
+        let (client, server) = duplex(4096);
+        let limits = CodecLimits::default();
+        let client =
+            EncryptedFramedStream::new(client, b"0123456789abcdef", PeerRole::Client, limits);
+        let server =
+            EncryptedFramedStream::new(server, b"0123456789abcdef", PeerRole::Server, limits);
+        let (_client_reader, mut client_writer) = client.split();
+        let (mut server_reader, _server_writer) = server.split();
+        let frames = vec![
+            Frame::SessionHello {
+                session_id: SessionId(42),
+            },
+            Frame::Ping { nonce: 7 },
+            Frame::Pong { nonce: 7 },
+        ];
+
+        client_writer
+            .write_frames(&frames)
+            .await
+            .expect("write batch");
+        client_writer.flush().await.expect("flush");
+
+        assert_eq!(server_reader.read_frame().await.expect("read 1"), frames[0]);
+        assert_eq!(server_reader.read_frame().await.expect("read 2"), frames[1]);
+        assert_eq!(server_reader.read_frame().await.expect("read 3"), frames[2]);
     }
 
     #[tokio::test]

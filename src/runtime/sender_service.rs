@@ -459,6 +459,7 @@ enum ResponseDataDispatchTarget {
         binding: Arc<ResponseStreamBinding>,
         target: ResponseSenderPathTarget,
         bulk_discovery: bool,
+        bulk_unique_trial: bool,
     },
 }
 
@@ -512,8 +513,15 @@ fn response_unique_quic_data_would_expand_ordering_debt(
 fn response_target_can_own_unique_bulk_data(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
 ) -> bool {
     if target.has_bulk_rate_evidence {
+        return true;
+    }
+    if response_target_needs_quic_unique_bulk_trial(target, payload_bytes, mux_limits, performance)
+    {
         return true;
     }
     target.is_active
@@ -545,6 +553,7 @@ fn choose_response_admissible_lead(
     mux_limits: MuxLimits,
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
+    performance: MppPerformanceConfig,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if let Some(owner) = lower_owner {
@@ -571,8 +580,13 @@ fn choose_response_admissible_lead(
         .iter()
         .copied()
         .filter(|target| {
-            response_target_can_own_unique_bulk_data(target, candidate_targets)
-                && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
+            response_target_can_own_unique_bulk_data(
+                target,
+                candidate_targets,
+                payload_bytes,
+                mux_limits,
+                performance,
+            ) && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
         })
         .min_by(|left, right| {
             left.eta_ms
@@ -692,19 +706,24 @@ fn choose_response_sender_target(
         mux_limits,
         payload_bytes,
         lower_flights,
+        MppPerformanceConfig::default(),
     )?;
     let selected = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if !response_target_can_own_unique_bulk_data(target, &candidate_targets)
-                || response_unique_quic_data_would_expand_ordering_debt(
-                    lower_owner,
-                    target,
-                    ordering_debt,
-                )
-            {
+            if !response_target_can_own_unique_bulk_data(
+                target,
+                &candidate_targets,
+                payload_bytes,
+                mux_limits,
+                MppPerformanceConfig::default(),
+            ) || response_unique_quic_data_would_expand_ordering_debt(
+                lower_owner,
+                target,
+                ordering_debt,
+            ) {
                 return false;
             }
             let role =
@@ -790,19 +809,24 @@ fn choose_response_sender_data_target(
         mux_limits,
         payload_bytes,
         lower_flights,
+        performance,
     )?;
     let admitted = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if !response_target_can_own_unique_bulk_data(target, &candidate_targets)
-                || response_unique_quic_data_would_expand_ordering_debt(
-                    lower_owner,
-                    target,
-                    ordering_debt,
-                )
-            {
+            if !response_target_can_own_unique_bulk_data(
+                target,
+                &candidate_targets,
+                payload_bytes,
+                mux_limits,
+                performance,
+            ) || response_unique_quic_data_would_expand_ordering_debt(
+                lower_owner,
+                target,
+                ordering_debt,
+            ) {
                 return false;
             }
             let role =
@@ -876,6 +900,30 @@ fn response_target_needs_same_underlay_bulk_discovery(
         return false;
     }
     response_target_has_discovery_credit(target, payload_bytes, mux_limits, performance)
+}
+
+fn response_target_needs_quic_unique_bulk_trial(
+    target: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
+) -> bool {
+    if target.key.underlay != UnderlayProtocol::Udp
+        || target.is_active
+        || !target.has_ack_data_evidence
+        || target.has_bulk_rate_evidence
+    {
+        return false;
+    }
+    let discovery_credit =
+        response_bulk_discovery_credit_bytes(payload_bytes, mux_limits, performance) as u64;
+    if discovery_credit == 0 {
+        return false;
+    }
+    let trial_credit = discovery_credit.saturating_mul(2);
+    target.bulk_discovery_sent_bytes >= discovery_credit
+        && target.bulk_discovery_sent_bytes < trial_credit
+        && response_target_discovery_debt_bytes(target) < discovery_credit
 }
 
 fn response_target_needs_quic_duplicate_bulk_discovery(
@@ -1102,11 +1150,18 @@ fn plan_response_data_dispatch(
                 binding.mux_limits(),
                 performance,
             );
+            let bulk_unique_trial = response_target_needs_quic_unique_bulk_trial(
+                &target,
+                payload_bytes,
+                binding.mux_limits(),
+                performance,
+            );
             Ok(ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding: binding.clone(),
                     target,
                     bulk_discovery,
+                    bulk_unique_trial,
                 },
                 duplicate_discovery,
             })
@@ -1201,6 +1256,7 @@ async fn emit_planned_response_data_frame(
             binding,
             target,
             bulk_discovery,
+            bulk_unique_trial,
         } => {
             match send_sender_service_frame_to_carrier(
                 &target.commands,
@@ -1220,7 +1276,7 @@ async fn emit_planned_response_data_frame(
                 }
             }
             binding.record_flight(target.key, &frame, true);
-            if bulk_discovery {
+            if bulk_discovery || bulk_unique_trial {
                 binding.record_bulk_discovery_bytes(
                     target.key,
                     reliable_stream_frame_payload_bytes(&frame),
@@ -2596,6 +2652,7 @@ mod tests {
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
             bulk_discovery_sent_bytes: 0,
+            has_ack_data_evidence: true,
         }
     }
 
@@ -2731,6 +2788,7 @@ mod tests {
             eta_ms: 1.0,
             is_active: true,
             has_sender_evidence: true,
+            has_ack_data_evidence: true,
             has_bulk_rate_evidence: true,
             bulk_discovery_sent_bytes: 0,
         };
@@ -3260,6 +3318,93 @@ mod tests {
                 path_id: PathId(1),
             }
         );
+    }
+
+    #[test]
+    fn quic_ack_data_seen_path_gets_bounded_unique_trial_when_frontier_clear() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let (active_commands, _active_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(81),
+            UnderlayProtocol::Udp,
+            PathId(0),
+            active_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let validation_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (validation_commands, _validation_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                validation_key.underlay,
+                validation_key.path_id,
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.record_bulk_discovery_bytes(validation_key, payload_bytes);
+        binding.update_path_metrics(
+            validation_key,
+            PathMetrics {
+                path_id: validation_key.path_id,
+                underlay: validation_key.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 5_000,
+                srtt_us: 5_000,
+                rttvar_us: 500,
+                jitter_us: 500,
+                delivery_rate_bps: 1_000_000,
+                pacing_rate_bps: 1_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: payload_bytes as u64,
+                inflight_hi_bytes: payload_bytes as u64,
+                confidence_ppm: 0,
+                app_limited: true,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 0,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frames_rx,
+        };
+
+        let plan = plan_response_data_dispatch(
+            &stream,
+            FlowLane::Throughput,
+            0,
+            payload_bytes,
+            MppPerformanceConfig::default(),
+        )
+        .expect("ACK-data-seen path should be trial eligible when frontier is clear");
+
+        assert_eq!(
+            plan.primary_key(),
+            Some(validation_key),
+            "ACK-derived carrier data makes a QUIC validation path eligible for one bounded unique trial, but not bulk-rate proven"
+        );
+        assert!(plan.duplicate_discovery.is_empty());
     }
 
     #[test]

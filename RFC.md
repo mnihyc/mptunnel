@@ -2667,15 +2667,18 @@ ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
 duplicate-discovery copy that is acknowledged by the local QUIC carrier may set
 ACK-derived data seen for that carrier path, which proves the path can carry
 data and may make it eligible for a bounded trial when the ordered frontier is
-safe. It does not set bulk-rate evidence and does not overwrite the delivery
-rate. Until a non-application-limited data sample exists, and until the local
-QUIC stack exposes usable pacing or congestion-window capacity, ACK progress
-MUST NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not
-bulk capacity evidence, and MUST NOT by itself initialize the QUIC/UDP
-delivery-rate model. The scheduler MAY use the QUIC pacing/cwnd rate or the
-normal UDP startup model for bounded admission, but it MUST keep the
-app-limited or capacity-unknown provenance visible to diagnostics and
-admission.
+safe. That trial is ordinary product data, but it is still part of validation
+state: the sender debits it against the same discovery ledger used for duplicate
+discovery and MUST stop trials once the bounded discovery allowance is spent
+unless the carrier produces non-application-limited bulk-rate evidence. ACK-data
+seen does not set bulk-rate evidence and does not overwrite the delivery rate.
+Until a non-application-limited data sample exists, and until the local QUIC
+stack exposes usable pacing or congestion-window capacity, ACK progress MUST
+NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not bulk
+capacity evidence, and MUST NOT by itself initialize the QUIC/UDP delivery-rate
+model. The scheduler MAY use the QUIC pacing/cwnd rate or the normal UDP
+startup model for bounded admission, but it MUST keep the app-limited or
+capacity-unknown provenance visible to diagnostics and admission.
 Before a non-application-limited ACK-derived data sample exists, a QUIC
 pacing/cwnd value that is below the normal UDP startup model is carrier-local
 startup state, not product-scheduler bulk capacity proof. The product scheduler

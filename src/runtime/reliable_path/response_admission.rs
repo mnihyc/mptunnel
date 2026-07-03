@@ -32,6 +32,7 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
+    pub(in crate::runtime) has_ack_data_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
     pub(in crate::runtime) bulk_discovery_sent_bytes: u64,
 }
@@ -446,9 +447,15 @@ fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEnt
         && !path_metrics.metrics.app_limited
 }
 
+fn server_path_metrics_has_ack_data_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
+    path_metrics.source == ServerPathMetricsSource::LocalSender
+        && path_metrics.metrics.has_ack_derived_data_sample
+}
+
 fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
     path_metrics.source == ServerPathMetricsSource::LocalSender
         && (server_path_metrics_has_bulk_rate_evidence(path_metrics)
+            || server_path_metrics_has_ack_data_evidence(path_metrics)
             || path_metrics.metrics.confidence_ppm > 0)
 }
 
@@ -480,6 +487,23 @@ pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
             entry.delivery_samples > 0
                 || entry.delivery_rate_bps.is_some()
                 || has_local_carrier_bulk
+        }
+    }
+}
+
+pub(in crate::runtime) fn server_output_has_ack_data_evidence(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
+    let has_local_carrier_ack_data = matches!(
+        entry.path_metrics,
+        Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
+    );
+    match entry.key.underlay {
+        UnderlayProtocol::Udp => has_local_carrier_ack_data,
+        UnderlayProtocol::Tcp => {
+            entry.delivery_samples > 0
+                || entry.delivery_rate_bps.is_some()
+                || has_local_carrier_ack_data
         }
     }
 }

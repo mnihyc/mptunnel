@@ -1881,6 +1881,32 @@ fn relay_candidate_filter_preserves_current_carrier_cohort() {
     );
 }
 
+#[test]
+fn relay_bulk_attach_plan_opens_same_carrier_cohort_together() {
+    let tcp = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let udp0 = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let udp1 = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 1,
+    };
+
+    let plan = relay_bulk_attach_plan(vec![tcp, udp0, udp1], Some(UnderlayProtocol::Udp));
+    assert_eq!(plan.candidates, vec![udp0, udp1]);
+    assert!(!plan.allow_mixed_carrier);
+    assert!(plan.attach_all_candidates);
+
+    let mixed_probe = relay_bulk_attach_plan(vec![tcp], Some(UnderlayProtocol::Udp));
+    assert_eq!(mixed_probe.candidates, vec![tcp]);
+    assert!(mixed_probe.allow_mixed_carrier);
+    assert!(!mixed_probe.attach_all_candidates);
+}
+
 fn opened_relay_stream_for_test(
     stream_id: StreamId,
     underlay: UnderlayProtocol,
@@ -2452,16 +2478,14 @@ async fn request_sender_blocked_bulk_admission_does_not_fallback_to_eta_path() {
         _ => panic!("expected first bulk chunk on initial owner path"),
     }
 
+    let initial_instance = remotes
+        .path_instance_for_key(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        })
+        .expect("initial lower-frontier owner should still be attached");
     assert!(
-        remotes
-            .fail_path_key(
-                &context,
-                RelayPathKey {
-                    underlay: UnderlayProtocol::Tcp,
-                    index: 0,
-                },
-            )
-            .await,
+        remotes.fail_path_instance(&context, initial_instance).await,
         "initial lower-frontier owner should be removable"
     );
     match recv_tcp_path_command(&mut initial_commands)

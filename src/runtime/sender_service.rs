@@ -464,6 +464,21 @@ fn response_bulk_admission_role(
     }
 }
 
+fn response_unique_quic_data_would_expand_ordering_debt(
+    lower_owner: Option<CarrierPathKey>,
+    candidate: CarrierPathKey,
+    ordering_debt: u64,
+) -> bool {
+    matches!(
+        lower_owner,
+        Some(owner)
+            if owner != candidate
+                && owner.underlay == UnderlayProtocol::Udp
+                && candidate.underlay == UnderlayProtocol::Udp
+                && ordering_debt > 0
+    )
+}
+
 fn response_active_lead_suppression(
     target: &ResponseSenderPathTarget,
     mux_limits: MuxLimits,
@@ -600,6 +615,13 @@ fn choose_response_sender_target(
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
+            if response_unique_quic_data_would_expand_ordering_debt(
+                lower_owner,
+                target.key,
+                ordering_debt,
+            ) {
+                return false;
+            }
             let role =
                 response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -695,6 +717,13 @@ fn choose_response_sender_data_target(
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
+            if response_unique_quic_data_would_expand_ordering_debt(
+                lower_owner,
+                target.key,
+                ordering_debt,
+            ) {
+                return false;
+            }
             let role =
                 response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -765,6 +794,9 @@ fn response_target_emission_credit_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
+    if relay_lane_is_bulk(lane) && target.key.underlay == UnderlayProtocol::Udp {
+        return response_quic_carrier_feed_credit_bytes(target, payload_bytes, mux_limits);
+    }
     adaptive_reliable_relay_inflight_bytes(Some(target.snapshot), lane, mux_limits)
         .max(reliable_relay_scheduler_quantum_cap(
             Some(target.snapshot),
@@ -773,6 +805,34 @@ fn response_target_emission_credit_bytes(
         ))
         .max(payload_bytes)
         .max(1)
+}
+
+fn response_quic_carrier_feed_credit_bytes(
+    target: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let product_envelope = mux_limits
+        .max_path_flight_bytes
+        .min(mux_limits.max_repair_bytes)
+        .min(mux_limits.max_reorder_bytes)
+        .min(usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX))
+        .max(payload_bytes)
+        .max(1);
+    let carrier_window = usize::try_from(target.snapshot.inflight_limit_bytes)
+        .unwrap_or(usize::MAX)
+        .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    let live_carrier_debt = usize::try_from(
+        target
+            .snapshot
+            .bytes_in_flight
+            .saturating_add(target.snapshot.queue_bytes),
+    )
+    .unwrap_or(usize::MAX);
+    product_envelope
+        .min(carrier_window.saturating_add(live_carrier_debt))
+        .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+        .max(payload_bytes)
 }
 
 fn plan_response_data_dispatch(
@@ -911,9 +971,7 @@ async fn emit_planned_response_data_frame(
                 }
             }
             binding.record_flight(target.key, &frame, true);
-            if binding.ordinary_lead().is_none() {
-                binding.set_ordinary_lead(target.key);
-            }
+            binding.set_ordinary_lead(target.key);
             record_server_sender_decision(
                 binding.session_id(),
                 stream.stream_id,
@@ -986,6 +1044,9 @@ async fn emit_response_frame_from_sender_service(
                     Ok(()) => {
                         if matches!(frame, Frame::StreamData { .. }) {
                             binding.record_flight(target.key, &frame, !repair);
+                            if !repair {
+                                binding.set_ordinary_lead(target.key);
+                            }
                         }
                         record_server_sender_decision(
                             binding.session_id(),
@@ -2289,6 +2350,55 @@ mod tests {
     }
 
     #[test]
+    fn response_quic_feed_credit_uses_live_carrier_debt_not_stale_bdp() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = 64 * 1024;
+        let mut stale_quic = response_target(0, UnderlayProtocol::Udp, 250.0, 0, 64 * 1024, true);
+        stale_quic.snapshot.delivery_rate_bps = 351_000.0;
+        stale_quic.snapshot.pacing_rate_bps = 351_000.0;
+        stale_quic.snapshot.bytes_in_flight = 8 * 1024 * 1024;
+        stale_quic.snapshot.queue_bytes = 1024 * 1024;
+
+        let quic_credit = response_target_emission_credit_bytes(
+            &stale_quic,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+        let stale_bdp_credit = adaptive_reliable_relay_inflight_bytes(
+            Some(stale_quic.snapshot),
+            FlowLane::Throughput,
+            mux_limits,
+        );
+
+        assert!(
+            quic_credit >= 8 * 1024 * 1024,
+            "QUIC feed credit must follow live carrier debt so the product sender keeps QUIC fed"
+        );
+        assert!(
+            quic_credit > stale_bdp_credit,
+            "stale app-limited BDP must not be the only QUIC writer-feed ceiling"
+        );
+
+        let mut stale_tcp = response_target(1, UnderlayProtocol::Tcp, 250.0, 0, 64 * 1024, true);
+        stale_tcp.snapshot.delivery_rate_bps = 351_000.0;
+        stale_tcp.snapshot.pacing_rate_bps = 351_000.0;
+        stale_tcp.snapshot.bytes_in_flight = 8 * 1024 * 1024;
+        stale_tcp.snapshot.queue_bytes = 1024 * 1024;
+        let tcp_credit = response_target_emission_credit_bytes(
+            &stale_tcp,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert_eq!(
+            tcp_credit, stale_bdp_credit,
+            "TCP product credit remains model-gated; only QUIC delegates packet pacing to QUIC"
+        );
+    }
+
+    #[test]
     fn single_response_carrier_uses_sliding_window_not_multipath_ordering_debt() {
         let target = response_target(
             0,
@@ -2341,6 +2451,36 @@ mod tests {
             Some(owner.key),
         )
         .expect("same-carrier lower flight remains admissible with other carriers attached");
+
+        assert_eq!(selected.key, owner.key);
+    }
+
+    #[test]
+    fn response_quic_same_stream_unique_data_stays_on_lower_owner_until_debt_clears() {
+        let owner = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            80.0,
+            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+            true,
+        );
+        let lower_eta_alternate =
+            response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = vec![CarrierPathFlightDebt {
+            key: owner.key,
+            bytes: 64 * 1024,
+        }];
+
+        let selected = choose_response_sender_data_target(
+            &[owner.clone(), lower_eta_alternate],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &lower_flights,
+            Some(owner.key),
+        )
+        .expect("lower-frontier QUIC owner should remain selected");
 
         assert_eq!(selected.key, owner.key);
     }

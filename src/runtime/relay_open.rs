@@ -119,6 +119,14 @@ impl ReliableRelayRemoteSet {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(super) fn path_instance_for_key(&self, key: RelayPathKey) -> Option<RelayPathInstance> {
+        self.paths
+            .iter()
+            .find(|path| path.key() == key)
+            .map(ReliableRelayRemotePath::instance)
+    }
+
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
         for path in &mut self.paths {
             path.stream.lane = lane;
@@ -265,21 +273,6 @@ impl ReliableRelayRemoteSet {
         true
     }
 
-    pub(super) async fn fail_path_key(
-        &mut self,
-        context: &ClientPathContext,
-        key: RelayPathKey,
-    ) -> bool {
-        let Some(path) = self.remove_path_key(key) else {
-            return false;
-        };
-        context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
-        context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
-        path.stream.send_detach().await;
-        path.stream.close().await;
-        true
-    }
-
     pub(super) fn remove_path_instance(
         &mut self,
         instance: RelayPathInstance,
@@ -288,11 +281,6 @@ impl ReliableRelayRemoteSet {
             .paths
             .iter()
             .position(|path| path.instance() == instance)?;
-        self.remove_path_at(position)
-    }
-
-    pub(super) fn remove_path_key(&mut self, key: RelayPathKey) -> Option<ReliableRelayRemotePath> {
-        let position = self.paths.iter().position(|path| path.key() == key)?;
         self.remove_path_at(position)
     }
 

@@ -634,45 +634,46 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         let key = CarrierPathKey { underlay, path_id };
-        if role == StreamOpenRole::Validation {
-            let attached_keys = outputs
-                .entries
-                .iter()
-                .map(|entry| entry.key)
-                .collect::<Vec<_>>();
-            drop(outputs);
-            {
-                let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-                *current_lane = lane;
-            }
-            if previous_lane != lane {
-                self.lane_tracker.change_lanes(
-                    self.session_id,
-                    &attached_keys,
-                    previous_lane,
-                    lane,
-                );
-            }
-            self.notify_update();
-            return ResponseStreamAttachOutcome::Attached;
-        }
         let mut was_active = false;
         let mut already_attached = false;
         let existing_position = outputs.entries.iter().position(|entry| entry.key == key);
         if let Some(position) = existing_position {
             let entry = &outputs.entries[position];
-            if !entry.commands.is_closed()
-                && !entry.commands.same_channel(&commands)
-                && role != StreamOpenRole::Active
-            {
+            if !entry.commands.is_closed() {
+                let same_channel = entry.commands.same_channel(&commands);
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "server_stream_output_attach",
                     format_args!(
-                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=reject_duplicate_live same_channel=false",
-                        self.session_id.0, underlay, path_id.0, role, lane,
+                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=duplicate_live same_channel={}",
+                        self.session_id.0, underlay, path_id.0, role, lane, same_channel,
                     ),
                 );
+                if role == StreamOpenRole::Active || same_channel {
+                    let attached_keys = outputs
+                        .entries
+                        .iter()
+                        .map(|entry| entry.key)
+                        .collect::<Vec<_>>();
+                    drop(outputs);
+                    let previous_lane =
+                        *self.lane.lock().expect("server reliable stream lane lock");
+                    {
+                        let mut current_lane =
+                            self.lane.lock().expect("server reliable stream lane lock");
+                        *current_lane = lane;
+                    }
+                    if previous_lane != lane {
+                        self.lane_tracker.change_lanes(
+                            self.session_id,
+                            &attached_keys,
+                            previous_lane,
+                            lane,
+                        );
+                    }
+                    self.notify_update();
+                    return ResponseStreamAttachOutcome::Attached;
+                }
                 return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
             }
         }
@@ -1477,6 +1478,92 @@ mod tests {
             .first()
             .expect("test response binding has output")
             .clone()
+    }
+
+    #[test]
+    fn response_validation_attach_adds_output_without_promoting_lead() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Udp);
+        let validation = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (validation_commands, _validation_receivers) = tcp_path_session_command_channels(8);
+
+        assert_eq!(binding.ordinary_lead(), Some(active));
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        assert_eq!(outputs.entries.len(), 2);
+        assert!(outputs.entries.iter().any(|entry| entry.key == validation));
+        drop(outputs);
+        assert_eq!(
+            binding.ordinary_lead(),
+            Some(active),
+            "validation attachment opens a carrier output but is not scheduler ownership"
+        );
+    }
+
+    #[test]
+    fn response_duplicate_active_attach_is_idempotent_for_live_output() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Udp);
+        let validation = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (validation_commands, _validation_receivers) = tcp_path_session_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let before = {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .entries
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>()
+        };
+        let (duplicate_commands, _duplicate_receivers) = tcp_path_session_command_channels(8);
+
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                duplicate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let after = {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .entries
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(after, before);
+        assert_eq!(binding.ordinary_lead(), Some(active));
     }
 
     #[test]

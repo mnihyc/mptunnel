@@ -9,10 +9,6 @@ pub(super) async fn relay_migrating_tcp_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let initial_key = RelayPathKey {
-        underlay: remote.stream.underlay,
-        index: remote.path_index,
-    };
     let mut remotes =
         ReliableRelayRemoteSet::new(remote, reliable_stream_frame_queue(context.mux_limits));
     let stream_id = remotes.stream_id();
@@ -37,7 +33,6 @@ where
     let mut response_stall_reannounce_attempts = 0_u32;
     let mut last_receive_hole_repair_at = Instant::now();
     let mut receive_hole_repair_attempts = 0_u32;
-    let mut path_last_delivery_at = HashMap::from([(initial_key, Instant::now())]);
     let mut interactive_response_pending = false;
     let mut recv_progress = ReliableRecvProgress::default();
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
@@ -328,50 +323,61 @@ where
                         send_stream.update_max_offset(remotes.max_offset());
                         last_receive_hole_repair_at = Instant::now();
                         receive_hole_repair_attempts = 0;
-                        reliable_relay_refresh_path_tracking(
-                            &mut path_last_delivery_at,
-                            &remotes.path_keys(),
-                            Instant::now(),
-                        );
                         continue;
                     }
                     Ok(_) => {
                         receive_hole_repair_attempts =
                             receive_hole_repair_attempts.saturating_add(1);
-                        if receive_hole_repair_attempts >= reliable_relay_receive_hole_failure_attempts(relay_lane) {
-                            let path_keys = remotes.path_keys();
-                            if let Some(path_key) = reliable_relay_receive_hole_victim(
+                        match sender
+                            .send_recv_progress(
+                                &mut remotes,
                                 context,
-                                &path_keys,
-                                relay_lane,
-                                recv_stream.reorder_bytes().max(1),
-                                &path_last_delivery_at,
-                            ) && remotes.fail_path_key(context, path_key).await
-                            {
-                                path_last_delivery_at.remove(&path_key);
-                                if !remotes.is_empty()
-                                    && let Err(err) = sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
-                                        .await
-                                {
-                                    eprintln!(
-                                        "warning: TCP receive-hole survivor reannounce failed: {err}"
-                                    );
+                                &recv_stream,
+                                &mut recv_progress,
+                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                            )
+                            .await
+                        {
+                            Ok(sent) => {
+                                if sent {
+                                    last_recv_progress_sent_at = Instant::now();
+                                    last_stream_progress_at = Instant::now();
                                 }
-                                send_stream.update_max_offset(remotes.max_offset());
-                                last_stream_progress_at = Instant::now();
-                                last_receive_hole_repair_at = Instant::now();
-                                receive_hole_repair_attempts = 0;
-                                continue;
                             }
-                            if !remotes.is_empty()
-                                && let Err(err) = sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
-                                    .await
-                            {
-                                eprintln!(
-                                    "warning: TCP receive-hole sole-survivor reannounce failed: {err}"
-                                );
+                            Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                match attach_reliable_relay_paths(
+                                    context,
+                                    &spec,
+                                    relay_lane,
+                                    &mut remotes,
+                                    &send_stream,
+                                    !local_open,
+                                    ReliableRelayAttachMode::Any,
+                                )
+                                .await
+                                {
+                                    Ok(attached) if attached > 0 => {
+                                        sender_retry_at = None;
+                                        send_stream.update_max_offset(remotes.max_offset());
+                                        last_stream_progress_at = Instant::now();
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => break Err(err),
+                                }
                             }
+                            Err(err) => break Err(err),
                         }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "receive_hole_repair_signal",
+                            format_args!(
+                                "stream_id={} lane={:?} reorder_bytes={} attempts={} action=ack_progress_only",
+                                stream_id.0,
+                                relay_lane,
+                                recv_stream.reorder_bytes(),
+                                receive_hole_repair_attempts,
+                            ),
+                        );
                         last_receive_hole_repair_at = Instant::now();
                     }
                     Err(err) if remotes.is_empty() => break Err(err),
@@ -382,38 +388,46 @@ where
                 }
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
-                if remotes.path_keys().len() <= 1 {
-                    let reannounce_budget = reliable_relay_sole_survivor_reannounce_attempts(
-                        reliable_relay_stall_timeout(path_snapshot, relay_lane),
-                    );
-                    if response_stall_reannounce_attempts
-                        < reannounce_budget
+                if reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+                    &remotes,
+                    relay_lane,
+                ) {
+                    match sender.send_recv_progress(
+                        &mut remotes,
+                        context,
+                        &recv_stream,
+                        &mut recv_progress,
+                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    )
+                    .await
                     {
-                        response_stall_reannounce_attempts =
-                            response_stall_reannounce_attempts.saturating_add(1);
-                        match sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
-                            .await
-                        {
-                            Ok(()) => {
-                                send_stream.update_max_offset(remotes.max_offset());
-                                last_stream_progress_at = Instant::now();
-                                last_response_stall_repair_at = Instant::now();
-                                reliable_relay_refresh_path_tracking(
-                                    &mut path_last_delivery_at,
-                                    &remotes.path_keys(),
-                                    Instant::now(),
-                                );
-                                continue;
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "warning: TCP stall sole-survivor reannounce failed: {err}"
-                                );
+                        Ok(sent) => {
+                            if sent {
+                                last_recv_progress_sent_at = Instant::now();
                             }
                         }
-                    } else {
-                        response_stall_reannounce_attempts = 0;
+                        Err(err) if reliable_relay_error_is_migratable(&err) => {
+                            sender_retry_at = None;
+                        }
+                        Err(err) => break Err(err),
                     }
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "client_product_stall_keeps_same_underlay_cohort",
+                        format_args!(
+                            "stream_id={} active_underlay={:?} attached_paths={} repair_bytes={} recv_reorder_bytes={} sent_offset={} cause=stable_membership",
+                            stream_id.0,
+                            remotes.active_carrier_underlay(),
+                            remotes.path_keys().len(),
+                            send_stream.repair_bytes(),
+                            recv_stream.reorder_bytes(),
+                            send_stream.next_offset(),
+                        ),
+                    );
+                    last_response_stall_repair_at = Instant::now();
+                    continue;
+                }
+                if remotes.path_keys().len() <= 1 {
                     if reliable_relay_product_stall_keeps_sole_carrier(
                         remotes.active_carrier_underlay(),
                     ) {
@@ -432,6 +446,31 @@ where
                         last_stream_progress_at = Instant::now();
                         continue;
                     }
+                    let reannounce_budget = reliable_relay_sole_survivor_reannounce_attempts(
+                        reliable_relay_stall_timeout(path_snapshot, relay_lane),
+                    );
+                    if response_stall_reannounce_attempts < reannounce_budget {
+                        response_stall_reannounce_attempts =
+                            response_stall_reannounce_attempts.saturating_add(1);
+                        match sender
+                            .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
+                            .await
+                        {
+                            Ok(()) => {
+                                send_stream.update_max_offset(remotes.max_offset());
+                                last_stream_progress_at = Instant::now();
+                                last_response_stall_repair_at = Instant::now();
+                                continue;
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: TCP stall sole-survivor reannounce failed: {err}"
+                                );
+                            }
+                        }
+                    } else {
+                        response_stall_reannounce_attempts = 0;
+                    }
                 }
                 let failed_key = remotes.active_path_instance().map(|instance| instance.key);
                 if let Some(instance) = remotes.active_path_instance() {
@@ -445,11 +484,6 @@ where
                             send_stream.update_max_offset(remotes.max_offset());
                             last_stream_progress_at = Instant::now();
                             last_response_stall_repair_at = Instant::now();
-                            reliable_relay_refresh_path_tracking(
-                                &mut path_last_delivery_at,
-                                &remotes.path_keys(),
-                                Instant::now(),
-                            );
                             if let Some(failed_key) = failed_key
                                 && sender.enqueue_failed_path_gap_repairs(
                                     &mut sender_queue,
@@ -485,11 +519,6 @@ where
                         send_stream.update_max_offset(remotes.max_offset());
                         last_stream_progress_at = Instant::now();
                         last_response_stall_repair_at = Instant::now();
-                        reliable_relay_refresh_path_tracking(
-                            &mut path_last_delivery_at,
-                            &remotes.path_keys(),
-                            Instant::now(),
-                        );
                         if let Some(failed_key) = failed_key
                             && sender.enqueue_failed_path_gap_repairs(
                                 &mut sender_queue,
@@ -902,11 +931,6 @@ where
                             send_stream.update_max_offset(remotes.max_offset());
                             last_stream_progress_at = Instant::now();
                             last_response_stall_repair_at = Instant::now();
-                            reliable_relay_refresh_path_tracking(
-                                &mut path_last_delivery_at,
-                                &remotes.path_keys(),
-                                Instant::now(),
-                            );
                             if sender.enqueue_failed_path_gap_repairs(
                                 &mut sender_queue,
                                 context,
@@ -934,11 +958,6 @@ where
                                     sender_retry_at = None;
                                     send_stream.update_max_offset(remotes.max_offset());
                                     last_stream_progress_at = Instant::now();
-                                    reliable_relay_refresh_path_tracking(
-                                        &mut path_last_delivery_at,
-                                        &remotes.path_keys(),
-                                        Instant::now(),
-                                    );
                                     if sender.enqueue_failed_path_gap_repairs(
                                         &mut sender_queue,
                                         context,
@@ -967,7 +986,6 @@ where
                                                 pending_validation_opens.len(),
                                             ),
                                         );
-                                        path_last_delivery_at.remove(&path_key);
                                         continue;
                                     }
                                     if reliable_relay_can_finish_after_path_loss(
@@ -999,7 +1017,6 @@ where
                                                 pending_validation_opens.len(),
                                             ),
                                         );
-                                        path_last_delivery_at.remove(&path_key);
                                         continue;
                                     }
                                     if reliable_relay_can_finish_after_path_loss(
@@ -1017,7 +1034,6 @@ where
                                 }
                             }
                         }
-                        path_last_delivery_at.remove(&path_key);
                         continue;
                     }
                     Err(err) => break Err(err),
@@ -1078,7 +1094,6 @@ where
                             last_delivery_progress_at = Instant::now();
                             receive_hole_repair_attempts = 0;
                             response_stall_reannounce_attempts = 0;
-                            path_last_delivery_at.insert(path_key, Instant::now());
                         }
                         let mut write_error = None;
                         let mut delivered_payload_bytes = 0usize;
@@ -2024,7 +2039,10 @@ pub(super) async fn attach_reliable_relay_paths(
         }
     };
     if matches!(mode, ReliableRelayAttachMode::BulkStriping) {
-        let candidates = context.ordered_reliable_bulk_striping_path_keys(payload_bytes);
+        let attach_plan = relay_bulk_attach_plan(
+            context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
+            remotes.active_carrier_underlay(),
+        );
         let result = attach_relay_path_candidates(
             context,
             remotes,
@@ -2033,11 +2051,11 @@ pub(super) async fn attach_reliable_relay_paths(
                 lane,
                 send_stream,
                 resend_fin,
-                candidates,
+                candidates: attach_plan.candidates,
                 role: StreamOpenRole::Validation,
-                allow_mixed_carrier: true,
+                allow_mixed_carrier: attach_plan.allow_mixed_carrier,
                 send_attach_control: false,
-                attach_all_candidates: false,
+                attach_all_candidates: attach_plan.attach_all_candidates,
             },
         )
         .await;
@@ -2161,6 +2179,7 @@ pub(super) async fn attach_udp_relay_paths(
     };
     let mut last_retryable_error = None;
     let mut attached = 0usize;
+    let attach_all_candidates = matches!(mode, ReliableRelayAttachMode::BulkStriping);
 
     for path_index in candidates {
         let key = RelayPathKey {
@@ -2199,9 +2218,7 @@ pub(super) async fn attach_udp_relay_paths(
                             StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        if role == StreamOpenRole::Active
-                            || matches!(mode, ReliableRelayAttachMode::BulkStriping)
-                        {
+                        if role == StreamOpenRole::Active || !attach_all_candidates {
                             return Ok(attached);
                         }
                     }
@@ -2229,6 +2246,43 @@ pub(super) async fn attach_udp_relay_paths(
         Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath))
     } else {
         Ok(0)
+    }
+}
+
+pub(super) struct RelayBulkAttachPlan {
+    pub(super) candidates: Vec<RelayPathKey>,
+    pub(super) allow_mixed_carrier: bool,
+    pub(super) attach_all_candidates: bool,
+}
+
+pub(super) fn relay_bulk_attach_plan(
+    candidates: Vec<RelayPathKey>,
+    active_underlay: Option<UnderlayProtocol>,
+) -> RelayBulkAttachPlan {
+    let Some(active_underlay) = active_underlay else {
+        return RelayBulkAttachPlan {
+            candidates,
+            allow_mixed_carrier: true,
+            attach_all_candidates: false,
+        };
+    };
+    let same_carrier = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.underlay == active_underlay)
+        .collect::<Vec<_>>();
+    if same_carrier.is_empty() {
+        RelayBulkAttachPlan {
+            candidates,
+            allow_mixed_carrier: true,
+            attach_all_candidates: false,
+        }
+    } else {
+        RelayBulkAttachPlan {
+            attach_all_candidates: same_carrier.len() > 1,
+            candidates: same_carrier,
+            allow_mixed_carrier: false,
+        }
     }
 }
 
@@ -2368,10 +2422,6 @@ pub(super) fn reliable_relay_receive_hole_repair_deadline(
     tokio::time::Instant::from_std(anchor + reliable_relay_stall_timeout(path, lane))
 }
 
-pub(super) fn reliable_relay_receive_hole_failure_attempts(_lane: FlowLane) -> u32 {
-    1
-}
-
 pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Duration) -> u32 {
     let _ = stall_timeout;
     QUIC_PERSISTENT_CONGESTION_THRESHOLD
@@ -2386,46 +2436,20 @@ pub(super) fn reliable_relay_product_stall_keeps_sole_carrier(
     )
 }
 
-pub(super) fn reliable_relay_refresh_path_tracking(
-    path_last_delivery_at: &mut HashMap<RelayPathKey, Instant>,
-    path_keys: &[RelayPathKey],
-    now: Instant,
-) {
-    let live_paths = path_keys.iter().copied().collect::<HashSet<_>>();
-    path_last_delivery_at.retain(|path_key, _| live_paths.contains(path_key));
-    for path_key in path_keys {
-        path_last_delivery_at.entry(*path_key).or_insert(now);
-    }
-}
-
-pub(super) fn reliable_relay_receive_hole_victim(
-    context: &ClientPathContext,
-    path_keys: &[RelayPathKey],
+pub(super) fn reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+    remotes: &ReliableRelayRemoteSet,
     lane: FlowLane,
-    payload_bytes: usize,
-    path_last_delivery_at: &HashMap<RelayPathKey, Instant>,
-) -> Option<RelayPathKey> {
-    if path_keys.len() <= 1 {
-        return None;
+) -> bool {
+    if !relay_lane_is_bulk(lane) || remotes.paths.len() <= 1 {
+        return false;
     }
-    path_keys.iter().copied().max_by(|left, right| {
-        let left_score =
-            reliable_relay_receive_hole_victim_score(context, *left, lane, payload_bytes);
-        let right_score =
-            reliable_relay_receive_hole_victim_score(context, *right, lane, payload_bytes);
-        left_score
-            .total_cmp(&right_score)
-            .then_with(|| reliable_relay_stale_delivery_order(*left, *right, path_last_delivery_at))
-    })
-}
-
-pub(super) fn reliable_relay_receive_hole_victim_score(
-    context: &ClientPathContext,
-    key: RelayPathKey,
-    lane: FlowLane,
-    payload_bytes: usize,
-) -> f64 {
-    reliable_relay_path_eta_ms(context, key, lane, payload_bytes).unwrap_or(f64::INFINITY)
+    let Some(first) = remotes.paths.first().map(|path| path.stream.underlay) else {
+        return false;
+    };
+    remotes
+        .paths
+        .iter()
+        .all(|path| path.stream.underlay == first)
 }
 
 pub(super) fn reliable_relay_delivery_path_should_become_active(
@@ -2463,24 +2487,6 @@ pub(super) fn reliable_relay_path_eta_ms(
         scheduler::score_path(snapshot, lane, payload_bytes, SchedulerPolicy::default())
             .map(|score| score.eta_ms)
     })
-}
-
-pub(super) fn reliable_relay_stale_delivery_order(
-    left: RelayPathKey,
-    right: RelayPathKey,
-    path_last_delivery_at: &HashMap<RelayPathKey, Instant>,
-) -> std::cmp::Ordering {
-    match (
-        path_last_delivery_at.get(&left),
-        path_last_delivery_at.get(&right),
-    ) {
-        (Some(left_seen), Some(right_seen)) => right_seen
-            .cmp(left_seen)
-            .then_with(|| relay_path_key_order(right, left)),
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, None) => relay_path_key_order(right, left),
-    }
 }
 
 pub(super) fn relay_path_snapshot(
@@ -2534,6 +2540,30 @@ pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: Flo
 mod tests {
     use super::*;
 
+    fn test_reliable_path_stream(
+        stream_id: StreamId,
+        underlay: UnderlayProtocol,
+        path_index: usize,
+        commands: TcpPathSessionCommandSender,
+        lane: FlowLane,
+    ) -> ReliablePathStream {
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        ReliablePathStream {
+            stream_id,
+            max_offset: MuxLimits::default().max_stream_window_bytes,
+            lane,
+            underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+            output: ReliablePathStreamOutput::fixed(
+                underlay,
+                PathId(path_index as u16),
+                commands,
+                MuxLimits::default(),
+            ),
+            frames: frames_rx,
+        }
+    }
+
     #[test]
     fn product_stall_keeps_sole_reliable_carrier_instead_of_reopening_same_path() {
         assert!(reliable_relay_product_stall_keeps_sole_carrier(Some(
@@ -2543,5 +2573,46 @@ mod tests {
             UnderlayProtocol::Tcp
         )));
         assert!(!reliable_relay_product_stall_keeps_sole_carrier(None));
+    }
+
+    #[tokio::test]
+    async fn product_stall_keeps_same_underlay_bulk_cohort_instead_of_reannouncing() {
+        let (commands_a, _receivers_a) = tcp_path_session_command_channels(1);
+        let (commands_b, _receivers_b) = tcp_path_session_command_channels(1);
+        let first = OpenedRemoteStream {
+            path_index: 0,
+            stream: test_reliable_path_stream(
+                StreamId(1),
+                UnderlayProtocol::Udp,
+                0,
+                commands_a,
+                FlowLane::Throughput,
+            ),
+        };
+        let second = OpenedRemoteStream {
+            path_index: 1,
+            stream: test_reliable_path_stream(
+                StreamId(1),
+                UnderlayProtocol::Udp,
+                1,
+                commands_b,
+                FlowLane::Throughput,
+            ),
+        };
+        let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+        remotes.attach_for_validation(second);
+
+        assert!(
+            reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+                &remotes,
+                FlowLane::Throughput,
+            )
+        );
+        assert!(
+            !reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+                &remotes,
+                FlowLane::Latency,
+            )
+        );
     }
 }

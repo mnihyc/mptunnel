@@ -541,8 +541,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             continue;
         }
         if normal_bulk_send {
+            let owns_lower_frontier = lower_flight_owner == Some(key);
             if restrict_to_admitted {
-                if !admitted_bulk_keys.contains(&key) {
+                if !owns_lower_frontier && !admitted_bulk_keys.contains(&key) {
                     #[cfg(feature = "lab-diagnostics")]
                     log_bulk_relay_candidate_decision(
                         BulkRelayCandidateDiagnostics::skipped(
@@ -557,7 +558,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     );
                     continue;
                 }
-            } else if Some(key) != active_key {
+            } else if !owns_lower_frontier && Some(key) != active_key {
                 #[cfg(feature = "lab-diagnostics")]
                 log_bulk_relay_candidate_decision(
                     BulkRelayCandidateDiagnostics::skipped(
@@ -575,6 +576,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         }
         if normal_bulk_send
             && Some(key) != active_key
+            && lower_flight_owner != Some(key)
             && !context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
         {
             #[cfg(feature = "lab-diagnostics")]
@@ -831,7 +833,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         .filter(|path| {
             let key = path.key();
             if let Some(owner) = lower_flight_owner {
-                return key == owner && path.placement == RelayPathPlacement::Active;
+                return key == owner;
             }
             if restrict_to_admitted {
                 admitted_bulk_keys.contains(&key)
@@ -842,6 +844,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         .filter(|path| {
             let key = path.key();
             Some(key) == active_key
+                || lower_flight_owner == Some(key)
                 || context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
         })
         .filter_map(|path| {
@@ -1085,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_admission_blocks_when_lower_flight_owner_is_not_admitted() {
+    fn relay_lower_frontier_owner_can_lead_from_validation_attachment() {
         let context = context(&[
             "tcp://127.0.0.1:10110?srtt-ms=50&rate-mbps=1",
             "udp://127.0.0.1:10111?srtt-ms=50&rate-mbps=1",
@@ -1115,7 +1118,7 @@ mod tests {
                 path_flights: Some(&ledger),
                 ordinary_lead: None,
             }),
-            BulkRelayPathChoice::Blocked
+            BulkRelayPathChoice::Selected(0)
         );
     }
 

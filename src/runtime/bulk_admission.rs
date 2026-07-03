@@ -60,15 +60,17 @@ pub(super) fn bulk_striping_admitted_cohort(
         } else {
             bulk_additional_admission_role(best.key.underlay, candidate.key.underlay)
         };
-        let suppression = bulk_candidate_admission_suppression(
-            best.snapshot,
-            best.eta_ms,
-            candidate.snapshot,
-            candidate.eta_ms,
-            payload_bytes,
-            mux_limits,
-            role,
-        );
+        let suppression =
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: candidate.snapshot,
+                candidate_eta_ms: candidate.eta_ms,
+                payload_bytes,
+                mux_limits,
+                role,
+                stream_ordering_debt_bytes: 0,
+            });
         if suppression.is_none() {
             selected.push(candidate);
         } else {
@@ -78,7 +80,7 @@ pub(super) fn bulk_striping_admitted_cohort(
             lab_diagnostic(
                 "bulk_striping_candidate_suppressed",
                 format_args!(
-                    "path_underlay={:?} path_index={} role={:?} eta_ms={:.3} best_eta_ms={:.3} horizon_ms={:.3} product_bytes_in_flight={} carrier_bytes_in_flight={} carrier_inflight_limit={} product_inflight_limit={} scheduler_debt={} queue_bytes={} reorder_budget={} reason={}",
+                    "path_underlay={:?} path_index={} role={:?} eta_ms={:.3} best_eta_ms={:.3} horizon_ms={:.3} best_sender_evidence={} candidate_sender_evidence={} best_confidence={:.3} candidate_confidence={:.3} best_app_limited={} candidate_app_limited={} product_bytes_in_flight={} carrier_bytes_in_flight={} carrier_inflight_limit={} product_inflight_limit={} scheduler_debt={} queue_bytes={} reorder_budget={} reason={}",
                     candidate.key.underlay,
                     candidate.key.index,
                     role,
@@ -91,6 +93,12 @@ pub(super) fn bulk_striping_admitted_cohort(
                         payload_bytes,
                         mux_limits,
                     ),
+                    best.has_sender_delivery_evidence,
+                    candidate.has_sender_delivery_evidence,
+                    best.snapshot.confidence,
+                    candidate.snapshot.confidence,
+                    best.snapshot.app_limited,
+                    candidate.snapshot.app_limited,
                     bulk_product_reorder_debt_bytes(candidate.snapshot),
                     candidate.snapshot.bytes_in_flight,
                     bulk_carrier_inflight_limit_bytes(
@@ -135,6 +143,7 @@ pub(super) fn bulk_service_horizon_payload_bytes(
     envelope
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn bulk_candidate_admission_suppression(
     best_snapshot: PathSnapshot,
     best_eta_ms: f64,
@@ -162,12 +171,7 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     if let Some(reason) = bulk_cross_underlay_completion_suppression(check) {
         return Some(reason);
     }
-    if !bulk_candidate_within_inflight_limit(
-        check.candidate_snapshot,
-        check.payload_bytes,
-        check.mux_limits,
-        check.role,
-    ) {
+    if !bulk_candidate_within_inflight_limit(check) {
         return Some("inflight_limit");
     }
     if !bulk_candidate_within_reorder_budget(
@@ -179,8 +183,8 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     ) {
         return Some("reorder_budget");
     }
-    if (check.role != BulkAdmissionRole::ActiveDataPath
-        || check.stream_ordering_debt_bytes > 0 && check.candidate_eta_ms > check.best_eta_ms)
+    if (bulk_completion_horizon_applies(check)
+        || (check.stream_ordering_debt_bytes > 0 && check.candidate_eta_ms > check.best_eta_ms))
         && check.candidate_eta_ms
             > bulk_completion_horizon_ms_with_ordering_debt(
                 check.best_snapshot,
@@ -194,6 +198,19 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
         return Some("completion_horizon");
     }
     None
+}
+
+fn bulk_completion_horizon_applies(check: BulkAdmissionCheck) -> bool {
+    if check.role == BulkAdmissionRole::ActiveDataPath {
+        return false;
+    }
+    if check.stream_ordering_debt_bytes > 0 {
+        return true;
+    }
+    if check.role == BulkAdmissionRole::AdditionalSameUnderlay {
+        return false;
+    }
+    true
 }
 
 fn bulk_cross_underlay_completion_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
@@ -248,17 +265,25 @@ pub(super) fn bulk_completion_horizon_ms_with_ordering_debt(
     best_eta_ms.max(0.0) + best_payload_tx_ms + absorption_ms
 }
 
-fn bulk_candidate_within_inflight_limit(
-    candidate: PathSnapshot,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    role: BulkAdmissionRole,
-) -> bool {
+fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
+    let candidate = check.candidate_snapshot;
+    let payload_bytes = check.payload_bytes;
+    let mux_limits = check.mux_limits;
+    let role = check.role;
     let use_carrier_gate = candidate.underlay == UnderlayProtocol::Udp
         && !bulk_uses_product_only_active_gate(candidate, role);
     let (inflight_limit, committed) = if use_carrier_gate {
         (
             bulk_carrier_inflight_limit_bytes(candidate, payload_bytes, mux_limits, role),
+            bulk_scheduler_inflight_debt_bytes(candidate, role),
+        )
+    } else if bulk_active_lead_has_contiguous_frontier(
+        candidate,
+        role,
+        check.stream_ordering_debt_bytes,
+    ) {
+        (
+            bulk_active_lead_product_envelope_bytes(payload_bytes, mux_limits),
             bulk_scheduler_inflight_debt_bytes(candidate, role),
         )
     } else {
@@ -271,6 +296,25 @@ fn bulk_candidate_within_inflight_limit(
         return false;
     }
     true
+}
+
+fn bulk_active_lead_has_contiguous_frontier(
+    candidate: PathSnapshot,
+    role: BulkAdmissionRole,
+    stream_ordering_debt_bytes: u64,
+) -> bool {
+    role == BulkAdmissionRole::ActiveDataPath
+        && stream_ordering_debt_bytes == 0
+        && bulk_latency_pressure_flows(candidate) == 0
+}
+
+fn bulk_active_lead_product_envelope_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    mux_limits
+        .max_path_flight_bytes
+        .min(stream_window)
+        .min(mux_limits.max_reorder_bytes)
+        .max(payload_bytes) as u64
 }
 
 fn bulk_product_inflight_limit_bytes(
@@ -472,12 +516,28 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
             reorder_budget
         }
         BulkAdmissionRole::AdditionalSameUnderlay => {
-            bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
+            bulk_same_underlay_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
         }
         BulkAdmissionRole::AdditionalCrossUnderlay => {
             bulk_effective_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
         }
     }
+}
+
+fn bulk_same_underlay_reorder_budget_bytes(
+    candidate: PathSnapshot,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let product_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
+    if candidate.underlay != UnderlayProtocol::Udp || candidate.inflight_limit_bytes == 0 {
+        return product_budget;
+    }
+    candidate
+        .inflight_limit_bytes
+        .max(product_budget)
+        .max(payload_bytes as u64)
+        .min(mux_limits.max_reorder_bytes as u64)
 }
 
 fn bulk_effective_reorder_budget_bytes(
@@ -552,12 +612,12 @@ mod tests {
     }
 
     #[test]
-    fn bulk_admission_rejects_candidate_outside_adaptive_eta_cohort() {
+    fn cross_underlay_bulk_admission_rejects_candidate_outside_completion_horizon() {
+        let mut cross_underlay = candidate(1, 5000.0, 260.0, 250.0);
+        cross_underlay.key.underlay = UnderlayProtocol::Tcp;
+        cross_underlay.snapshot.underlay = UnderlayProtocol::Tcp;
         let admitted = bulk_striping_admitted_cohort(
-            vec![
-                candidate(0, 1000.0, 250.0, 300.0),
-                candidate(1, 5000.0, 260.0, 250.0),
-            ],
+            vec![candidate(0, 1000.0, 250.0, 300.0), cross_underlay],
             64 * 1024,
             MuxLimits::default(),
         );
@@ -725,13 +785,14 @@ mod tests {
     }
 
     #[test]
-    fn tcp_active_path_obeys_model_based_product_flight_budget() {
+    fn tcp_active_path_without_ordering_debt_uses_lead_product_envelope() {
         let best = candidate(0, 100.0, 50.0, 500.0);
-        let mut active = candidate(0, 100.0, 50.0, 50.0);
+        let mut active = candidate(0, 100.0, 50.0, 0.35);
         active.snapshot.underlay = UnderlayProtocol::Tcp;
-        active.snapshot.confidence = 1.0;
-        active.snapshot.inflight_limit_bytes = MuxLimits::default().max_path_flight_bytes as u64;
-        active.snapshot.bytes_in_flight = 1024 * 1024;
+        active.snapshot.confidence = 0.1;
+        active.snapshot.app_limited = true;
+        active.snapshot.bytes_in_flight = 8 * 1024 * 1024;
+        active.snapshot.product_bytes_in_flight = 8 * 1024 * 1024;
 
         assert_eq!(
             bulk_candidate_admission_suppression(
@@ -743,6 +804,30 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn tcp_active_path_with_ordering_debt_obeys_model_based_product_flight_budget() {
+        let best = candidate(0, 100.0, 50.0, 500.0);
+        let mut active = candidate(0, 100.0, 50.0, 50.0);
+        active.snapshot.underlay = UnderlayProtocol::Tcp;
+        active.snapshot.confidence = 1.0;
+        active.snapshot.inflight_limit_bytes = MuxLimits::default().max_path_flight_bytes as u64;
+        active.snapshot.bytes_in_flight = 1024 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: active.snapshot,
+                candidate_eta_ms: active.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::ActiveDataPath,
+                stream_ordering_debt_bytes: 1024 * 1024,
+            }),
             Some("inflight_limit")
         );
     }
@@ -1016,6 +1101,90 @@ mod tests {
     }
 
     #[test]
+    fn same_underlay_startup_probe_is_not_rejected_by_app_limited_completion_horizon() {
+        let mut lead = candidate(0, 1_530_000.0, 50.0, 0.35);
+        let mut extra = candidate(1, 3_060_000.0, 50.0, 0.35);
+        lead.snapshot.confidence = 0.1;
+        lead.snapshot.app_limited = true;
+        extra.snapshot.confidence = 0.1;
+        extra.snapshot.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 0,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn same_underlay_low_confidence_sender_samples_remain_startup_admissible() {
+        let mut lead = candidate(0, 98_000.0, 80.0, 1.0);
+        let mut extra = candidate(1, 1_500_000.0, 80.0, 1.0);
+        lead.snapshot.confidence = 0.1;
+        extra.snapshot.confidence = 0.1;
+        extra.snapshot.inflight_limit_bytes = 256 * 1024;
+        extra.snapshot.product_bytes_in_flight = 128 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 0,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn same_underlay_clear_frontier_uses_credit_and_reorder_not_completion_horizon() {
+        let mut lead = candidate(0, 98_000.0, 80.0, 500.0);
+        let mut extra = candidate(1, 1_500_000.0, 80.0, 500.0);
+        lead.snapshot.confidence = 1.0;
+        extra.snapshot.confidence = 1.0;
+        extra.snapshot.inflight_limit_bytes = 16 * 1024 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 0,
+            }),
+            None
+        );
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 512 * 1024,
+            }),
+            Some("completion_horizon")
+        );
+    }
+
+    #[test]
     fn cross_underlay_path_can_join_only_when_it_beats_lead_next_quantum() {
         let best = candidate(0, 500.0, 50.0, 500.0);
         let mut extra = candidate(1, 504.0, 250.0, 500.0);
@@ -1117,10 +1286,12 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_candidate_outside_eta_cohort_is_suppressed() {
+    fn low_confidence_cross_underlay_candidate_outside_eta_cohort_is_suppressed() {
         let mut best = candidate(0, 1000.0, 180.0, 500.0);
         best.snapshot.confidence = 1.0;
         let mut uncertain = candidate(1, 1350.0, 180.0, 500.0);
+        uncertain.key.underlay = UnderlayProtocol::Tcp;
+        uncertain.snapshot.underlay = UnderlayProtocol::Tcp;
         uncertain.snapshot.confidence = 0.1;
 
         let admitted =

@@ -551,7 +551,7 @@ pub(super) fn bbr_min_send_quantum_bytes(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
-fn reliable_bulk_carrier_feed_quantum_bytes(mux_limits: MuxLimits) -> usize {
+pub(super) fn reliable_bulk_carrier_feed_quantum_bytes(mux_limits: MuxLimits) -> usize {
     let cap = reliable_relay_buffer_len(mux_limits).max(1);
     BBR_MAX_SEND_QUANTUM_BYTES
         .min(cap)

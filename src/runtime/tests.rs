@@ -2672,70 +2672,22 @@ fn tcp_receive_hole_repair_tracks_buffered_ordering_gap() {
 }
 
 #[test]
-fn tcp_receive_hole_victim_prefers_worst_score_then_stale_delivery() {
+fn tcp_receive_hole_repair_deadline_is_progress_signal_not_path_victim_policy() {
     let now = Instant::now();
-    let low_latency_path = "tcp://127.0.0.1:10028?srtt-ms=5&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("low latency path");
-    let stale_but_fast_path = "tcp://127.0.0.1:10029?srtt-ms=10&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("stale but fast path");
-    let slow_path = "tcp://127.0.0.1:10030?srtt-ms=300&rate-mbps=5"
-        .parse::<PathSpec>()
-        .expect("slow path");
-    let context = ClientPathContext::new(
-        vec![low_latency_path, stale_but_fast_path, slow_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    let key = |index| RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index,
-    };
-    let mut path_last_delivery_at = HashMap::from([
-        (key(0), now - Duration::from_secs(1)),
-        (key(1), now - Duration::from_secs(3)),
-        (key(2), now - Duration::from_secs(2)),
-    ]);
+    let mut path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 100_000_000.0);
+    path.jitter_ms = 5.0;
+    path.inflight_limit_bytes = 1_000_000;
 
-    assert_eq!(
-        reliable_relay_receive_hole_victim(
-            &context,
-            &[key(0), key(1), key(2)],
-            FlowLane::Throughput,
-            64 * 1024,
-            &path_last_delivery_at
-        ),
-        Some(key(2))
-    );
-
-    reliable_relay_refresh_path_tracking(
-        &mut path_last_delivery_at,
-        &[key(0), key(2), key(3)],
+    let deadline = reliable_relay_receive_hole_repair_deadline(
         now,
+        now - Duration::from_secs(1),
+        Some(path),
+        FlowLane::Throughput,
     );
-    assert!(!path_last_delivery_at.contains_key(&key(1)));
-    assert_eq!(path_last_delivery_at.get(&key(3)), Some(&now));
-    assert_eq!(
-        reliable_relay_receive_hole_victim(
-            &context,
-            &[key(0), key(1)],
-            FlowLane::Throughput,
-            64 * 1024,
-            &path_last_delivery_at
-        ),
-        Some(key(1))
-    );
-    assert_eq!(
-        reliable_relay_receive_hole_victim(
-            &context,
-            &[key(3)],
-            FlowLane::Throughput,
-            64 * 1024,
-            &path_last_delivery_at
-        ),
-        None
+
+    assert!(
+        deadline > tokio::time::Instant::from_std(now),
+        "receive-hole handling schedules ACK/progress repair; path failure is owned by carrier/stall evidence"
     );
 }
 

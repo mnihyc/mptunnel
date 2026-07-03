@@ -681,6 +681,8 @@ pub(super) fn path_metrics_from_snapshot(
         pacing_rate_bps: snapshot.pacing_rate_bps.max(1.0).round() as u64,
         loss_ppm: (snapshot.loss_rate.clamp(0.0, 1.0) * 1_000_000.0).round() as u32,
         ecn_ppm: 0,
+        loss_observed: observation.delivery_samples > 0 || observation.carrier_delivery_samples > 0,
+        ecn_observed: false,
         bytes_in_flight: snapshot.bytes_in_flight,
         queue_bytes: snapshot.queue_bytes,
         inflight_limit_bytes: snapshot.inflight_limit_bytes,

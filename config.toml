@@ -53,6 +53,11 @@
 # streams for proxy/TUN use. Raise only for intentional large fan-out.
 # max_paths = 64
 # max_streams = 65536
+# QUIC transport stream advertisement cap. This is scoped only to MPP over
+# QUIC/UDP and is independent from byte receive windows. By default it follows
+# max_streams so QUIC does not secretly cap proxy/TUN fan-out; lower it only for
+# constrained deployments that intentionally want fewer concurrent QUIC streams.
+# max_quic_concurrent_bidi_streams = 65536
 # Product flow-control window. Recommended: 64 MiB to 256 MiB for high-BDP VPS
 # paths; lower only for memory-constrained clients.
 # max_stream_window_bytes = 67108864

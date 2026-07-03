@@ -870,6 +870,8 @@ fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u64(out, metrics.pacing_rate_bps);
     put_u32(out, metrics.loss_ppm);
     put_u32(out, metrics.ecn_ppm);
+    put_u8(out, u8::from(metrics.loss_observed));
+    put_u8(out, u8::from(metrics.ecn_observed));
     put_u64(out, metrics.bytes_in_flight);
     put_u64(out, metrics.queue_bytes);
     put_u64(out, metrics.inflight_limit_bytes);
@@ -895,6 +897,8 @@ fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecErro
         pacing_rate_bps: reader.get_u64()?,
         loss_ppm: reader.get_u32()?,
         ecn_ppm: reader.get_u32()?,
+        loss_observed: decode_bool(reader.get_u8()?)?,
+        ecn_observed: decode_bool(reader.get_u8()?)?,
         bytes_in_flight: reader.get_u64()?,
         queue_bytes: reader.get_u64()?,
         inflight_limit_bytes: reader.get_u64()?,
@@ -1562,6 +1566,8 @@ mod tests {
                 pacing_rate_bps: 150_000_000,
                 loss_ppm: 1_500,
                 ecn_ppm: 25,
+                loss_observed: true,
+                ecn_observed: true,
                 bytes_in_flight: 64 * 1024,
                 queue_bytes: 16 * 1024,
                 inflight_limit_bytes: 512 * 1024,

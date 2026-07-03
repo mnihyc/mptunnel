@@ -1773,7 +1773,10 @@ impl UdpDatagramClientSession {
         self.last_feedback_observation = Some(UdpDatagramPathObservation {
             rtt: Duration::from_micros(u64::from(metrics.srtt_us)),
             jitter: Duration::from_micros(u64::from(metrics.jitter_us)),
-            loss_rate: (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0),
+            loss_rate: metrics
+                .loss_observed
+                .then(|| (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0),
             rate_sample: PathRateSample::new(
                 metrics.delivery_rate_bps.max(8) / 8,
                 Duration::from_secs(1),

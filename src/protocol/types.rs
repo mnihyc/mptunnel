@@ -236,6 +236,8 @@ pub struct PathMetrics {
     pub pacing_rate_bps: u64,
     pub loss_ppm: u32,
     pub ecn_ppm: u32,
+    pub loss_observed: bool,
+    pub ecn_observed: bool,
     pub bytes_in_flight: u64,
     pub queue_bytes: u64,
     pub inflight_limit_bytes: u64,

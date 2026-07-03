@@ -463,6 +463,7 @@ Default resource parameters are:
 | max ACK ranges | 256 |
 | max paths | 64 |
 | max streams | 65,536 |
+| max QUIC concurrent bidirectional streams | 65,536 |
 | max stream window bytes | 67,108,864 |
 | max repair bytes | 67,108,864 |
 | max reorder bytes | 67,108,864 |
@@ -494,7 +495,10 @@ hard-coding lab pass/fail behavior:
   frames to become a second data stream.
 * 64 paths and 65,536 streams are protocol-scale limits. They are above normal
   deployment needs but low enough to keep registries, arrays, and diagnostics
-  bounded.
+  bounded. QUIC bidirectional stream concurrency is a separate QUIC transport
+  advertisement and defaults to the product stream cap. It MUST NOT be derived
+  from byte receive-window ratios; QUIC stream count and QUIC byte flow control
+  are separate resource mechanisms.
 * 64 MiB stream, repair, and reorder budgets cover roughly one second of data at
   about 500 Mbps, or a smaller time slice near 1 Gbps, which is sufficient for
   high-BDP lab and VPS paths without making web browsing or SSH reserve that
@@ -568,6 +572,7 @@ and production evidence justify them.
 | Product ACK ranges | `max_ack_ranges = 256` | Sparse ACK/SACK/QUIC ACK ranges are common; exact cap is mptunnel policy | Too low can hide holes under severe reorder/loss; too high makes ACKs bulky | Keep as encoding cap; ACK emission cadence remains adaptive |
 | Path count | `max_paths = 64` | Finite path/subflow state is common in MPTCP/MPQUIC; exact cap is mptunnel policy | Can cap unusual path groups, not normal performance | Keep as registry cap; not a target path count |
 | Stream count | `max_streams = 65,536` | QUIC-style stream registries are common; exact cap is mptunnel policy | Can cap very large fan-out; otherwise not hot path | Keep as non-preallocated registry cap |
+| QUIC bidirectional stream count | `max_quic_concurrent_bidi_streams = max_streams` by default | QUIC `MAX_STREAMS` is a stream-count resource separate from byte flow-control windows | A hidden low cap blocks proxy/TUN fan-out even when byte windows are large | Keep as QUIC-scoped configurable cap; never derive it from receive-window ratios |
 | Stream window | `max_stream_window_bytes = 64 MiB` | Flow-control windows are common in QUIC and MPTCP; exact envelope is mptunnel policy | Can limit high-BDP paths if below real BDP | Keep as configurable receive/flow-control envelope; credit release is adaptive |
 | Repair cache | `max_repair_bytes = 64 MiB` | MPTCP-style reinjection requires retained unacked data; exact envelope is mptunnel policy | Can limit repair on lossy/heterogeneous paths | Keep as repair envelope; repair choice and spending are adaptive |
 | Reorder budget | `max_reorder_bytes = 64 MiB` | Multipath byte streams need receive-hole bounds; exact envelope is mptunnel policy | Too low rejects useful paths; too high masks harmful striping | Keep as reorder envelope; admission uses live debt |
@@ -579,7 +584,7 @@ and production evidence justify them.
 | Extra traffic hint | `extra_traffic_hint_percent = 1` default; 100/200 allowed | Reinjection/duplication is common in MPTCP/MPQUIC; numeric hint is mptunnel/operator policy | Bad if treated as hard cap or blind duplication allowance | Keep as adaptive hint; sender spends extra traffic only with evidence |
 | Security freshness | `auth_freshness_window_seconds = 300` | Replay freshness windows are common security controls; exact window is mptunnel policy | Affects clock-skew/replay tolerance, not data-plane rate | Keep as security policy; not data-plane adaptive |
 | Cipher default | AES-256-GCM default; ChaCha20-Poly1305 optional | AEAD is mandatory; AES-GCM default follows modern hardware acceleration practice | CPU can matter on CPUs without AES acceleration | Keep as operator choice; no plaintext unless explicit |
-| QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight/read ceiling | QUIC flow-control/congestion split is common; mapping is mptunnel policy | Can cap QUIC if mapped envelope is too small | Keep resource mapping; QUIC BBR/pacing remains dynamic |
+| QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight/read ceiling; bidirectional stream count = QUIC-scoped stream cap | QUIC flow-control/congestion/MAX_STREAMS split is common; mapping is mptunnel policy | Can cap QUIC if mapped envelope or stream count is too small | Keep resource mapping; QUIC BBR/pacing remains dynamic; stream count is independent from byte windows |
 | QUIC BBR controller | Quinn BBR when available | BBR-style rate/RTT/inflight control is mature practice; implementation is library-owned | Library/platform behavior can still cap performance | Keep as dynamic carrier controller |
 | QUIC datagram MTU model | Startup 1200 byte payload; lower 512 and upper 65,000 path-spec bounds | 1200-byte UDP support is a QUIC requirement; mptunnel sets lower/upper guardrails | Low MTU can increase fragmentation/overhead | Keep startup safety plus path MTU observation/probing |
 | TUN defaults | IPv4 `10.88.0.1/24`, MTU 1500, DNS TTL 5s | Local-interface defaults are common deployment choices; exact values are mptunnel examples | MTU/TTL can affect TUN behavior but not sender scheduling | Keep as operator defaults, scoped to TUN |
@@ -711,12 +716,12 @@ congestion controller and pacing decide packet emission inside that sender
 envelope. This preserves the ownership split used by MPTCP and MPQUIC:
 product scheduling keeps the stream fed, while the carrier owns packet flight
 and pacing. The admitted concurrent QUIC bidirectional stream count is derived
-from the receive byte envelope and the stream window, then bounded by the
-configured stream limit. QUIC unidirectional streams are not used by protocol
-version 1. The production QUIC engine SHOULD use a BBR-style congestion
-controller when the implementation library provides one, because mptunnel's UDP
-goal is Hysteria-like high-BDP delivery with model-based pacing rather than
-loss-only growth.
+from the QUIC-scoped stream cap and bounded by the product stream registry cap;
+it MUST NOT be derived from byte receive-window ratios. QUIC unidirectional
+streams are not used by protocol version 1. The production QUIC engine SHOULD
+use a BBR-style congestion controller when the implementation library provides
+one, because mptunnel's UDP goal is Hysteria-like high-BDP delivery with
+model-based pacing rather than loss-only growth.
 
 Hints seed the path model before measurements exist. They MUST NOT permanently
 override live observations. Auto scheduling MUST correct stale hints from health
@@ -1057,6 +1062,8 @@ delivery_rate_bps:u64
 pacing_rate_bps:u64
 loss_ppm:u32
 ecn_ppm:u32
+loss_observed:u8
+ecn_observed:u8
 bytes_in_flight:u64
 queue_bytes:u64
 inflight_limit_bytes:u64
@@ -1067,7 +1074,10 @@ has_ack_derived_data_sample:u8
 data_sample_count:u32
 ```
 
-Metrics are advisory and MUST NOT bypass local safety checks.
+`loss_observed` and `ecn_observed` distinguish a measured zero from an
+unknown value. A sender MUST NOT publish unknown QUIC carrier loss, ECN, flight,
+or queue state as a measured zero. Metrics are advisory and MUST NOT bypass
+local safety checks.
 
 The fields are the minimum shared model needed for BBR-like and MPTCP-like
 decisions. RTT and jitter describe latency risk. Delivery rate estimates useful
@@ -1256,20 +1266,27 @@ or PTO.
 The local path model consumes QUIC sender telemetry as carrier evidence. At
 minimum, scheduling-visible UDP path snapshots use QUIC RTT, RTT variance,
 minimum RTT, congestion window or inflight-high equivalent, pacing rate when
-available, bytes sent, ACK progress, and application data frame progress.
+available, real carrier bytes in flight when exposed by the QUIC engine, writer
+backlog, byte-counted ACK progress, loss provenance, and application data frame
+progress.
 
 Carrier ACK-only progress may update liveness and RTT. It MUST NOT by itself be
 used as bulk throughput proof. A UDP path becomes ordinary bulk evidence only
-after the sender has observed ACK-derived data delivery samples or an
-unpolluted product delivery sample that the scheduler can attribute to that path
-and direction. Application-limited and pure-control samples MUST NOT reduce the
-bulk delivery-rate estimate. Peer `PATH_METRICS` remain validation hints unless
-freshness, direction, confidence, and provenance make them safe for a specific
-admission decision. A response sender MUST NOT use peer metrics, app-limited
-metrics, or control-only metrics as authority for ordinary bulk delivery rate,
-pacing rate, bytes in flight, inflight limit, or product-flight cap. Those values
-come from local sender evidence for the same direction, or from unpolluted
-product delivery samples where no packet-level carrier metric exists.
+after the sender has observed newly acknowledged carrier bytes from the QUIC
+congestion controller or an unpolluted product delivery sample that the
+scheduler can attribute to that path and direction. A QUIC ACK-frame count, UDP
+datagram transmit byte count, PATH_RESPONSE, or ACK-only/control-only packet
+MUST NOT be converted into a delivery-rate sample. Delivery-rate samples are
+byte-counted: `sample_rate = newly_acked_bytes * 8 / elapsed`. Application-
+limited and pure-control samples MUST NOT reduce the bulk delivery-rate
+estimate. Peer `PATH_METRICS` remain validation hints unless freshness,
+direction, confidence, and provenance make them safe for a specific admission
+decision. A response sender MUST NOT use peer metrics, app-limited metrics,
+control-only metrics, unknown loss reported as zero, or unknown carrier flight
+reported as zero as authority for ordinary bulk delivery rate, pacing rate,
+bytes in flight, inflight limit, or product-flight cap. Those values come from
+local sender evidence for the same direction, or from unpolluted product
+delivery samples where no packet-level carrier metric exists.
 
 STREAM_ACK and QUIC ACKs release different ledgers. QUIC ACKs release carrier
 packet flight and feed the QUIC congestion controller. STREAM_ACK releases
@@ -2539,25 +2556,27 @@ accept the next ordinary quantum. If the oldest lower outstanding range has a
 path owner, that owner is the only ordinary lead candidate until it becomes
 admissible, is repaired, or ACK progress removes the lower-frontier debt.
 
-For each ordered reliable stream, lead choice is flow-level state. The sender
-does not recompute an unrelated min-ETA lead for every quantum. The current
-lead remains the ordinary-data owner while it is still attached, eligible, and
-admissible for the next quantum. Temporary carrier-credit, queue, or active
-data-path backpressure is not by itself a reason to move unique later offsets
-to a different path; the bytes remain queued in the sender service until the
-lead has credit, ACK progress changes the stream frontier, or the lead is
-detached or failed. A new ordinary lead may be elected only when the previous
-lead is no longer attached, no lower-frontier debt would be expanded, or a
-frontier-safe active reattachment explicitly becomes the stream owner. This
-prevents high-rate homogeneous or heterogeneous paths from alternating
-ownership of later offsets faster than the receiver can close lower holes.
+For each ordered reliable stream, lead choice is flow-level state, but it is not
+a sticky override. When a lower-frontier owner exists, that owner is the only
+ordinary lead candidate until it becomes admissible, is repaired, or ACK
+progress removes the ordering debt. When the ordered frontier is clear, the
+sender computes the eligible and admissible ECF/BLEST lead for the next quantum.
+The previous ordinary lead is only a hysteresis hint: it may remain selected
+when it is still admitted and within measured jitter/queue hysteresis of the
+best admissible candidate. It MUST NOT keep ownership over a substantially
+lower-ETA, admissible, sender-evidenced path merely because it was the previous
+path. Temporary carrier-credit or queue backpressure on the old lead is not a
+reason to move unique later offsets to a harmful path, but neither is old-lead
+attachment a reason to ignore a safer faster candidate when no lower-frontier
+debt would expand. This preserves same-stream ordering while allowing
+same-protocol path groups to aggregate instead of being pinned to stale state.
 Successful emission of ordinary data on a non-lead carrier MUST NOT by itself
-migrate the stream lead. Lead migration is a control decision caused by detach,
-failure, or explicit frontier-safe reattachment; it is not a side effect of a
-validation, repair, or opportunistic write succeeding. Independent bulk streams
-SHOULD keep independent leads when the chosen leads remain admissible, so
-same-protocol path groups can share load without creating same-stream ordering
-debt.
+migrate the stream lead. Lead migration is a sender-service decision caused by
+admissibility, frontier state, detach, failure, or explicit frontier-safe
+reattachment; it is not a side effect of a validation, repair, or opportunistic
+write succeeding. Independent bulk streams SHOULD keep independent leads when
+the chosen leads remain admissible, so same-protocol path groups can share load
+without creating same-stream ordering debt.
 For request/upload bulk, reading from the local product source is also
 preemptible. One relay task MUST NOT drain multiple bulk source-read quanta in a
 single cooperative turn while other product flows are runnable. Bulk batching

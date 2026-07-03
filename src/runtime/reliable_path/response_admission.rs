@@ -265,6 +265,7 @@ pub(super) fn server_bulk_output_snapshot(
         f64::from(path_metrics.metrics.jitter_us) / 1000.0
     });
     let loss_rate = model_metrics
+        .filter(|path_metrics| path_metrics.metrics.loss_observed)
         .map_or(0.0, |path_metrics| {
             f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
         })

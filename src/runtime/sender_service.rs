@@ -684,25 +684,13 @@ fn choose_response_sender_data_target(
     } else {
         proven_targets
     };
-    if lower_owner.is_none()
-        && let Some(lead_key) = ordinary_lead
-        && targets.iter().any(|target| target.key == lead_key)
-    {
-        let lead_target = candidate_targets
-            .iter()
-            .copied()
-            .find(|target| target.key == lead_key)?;
-        return response_active_lead_suppression(lead_target, mux_limits, payload_bytes, 0)
-            .is_none()
-            .then_some(lead_target.clone());
-    }
     let lead = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
         payload_bytes,
         lower_flights,
     )?;
-    candidate_targets
+    let admitted = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
@@ -721,12 +709,37 @@ fn choose_response_sender_data_target(
             })
             .is_none()
         })
-        .min_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-        })
-        .cloned()
+        .collect::<Vec<_>>();
+    let best = admitted.iter().copied().min_by(|left, right| {
+        left.eta_ms
+            .total_cmp(&right.eta_ms)
+            .then_with(|| carrier_path_key_order(left.key, right.key))
+    })?;
+    if lower_owner.is_none()
+        && let Some(lead_key) = ordinary_lead
+        && let Some(lead_target) = admitted
+            .iter()
+            .copied()
+            .find(|target| target.key == lead_key)
+        && response_target_within_adaptive_lead_hysteresis(lead_target, best, payload_bytes)
+    {
+        return Some(lead_target.clone());
+    }
+    Some(best.clone())
+}
+
+fn response_target_within_adaptive_lead_hysteresis(
+    old_lead: &ResponseSenderPathTarget,
+    best: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+) -> bool {
+    if old_lead.key == best.key {
+        return true;
+    }
+    let jitter_hysteresis_ms = old_lead.snapshot.jitter_ms.max(best.snapshot.jitter_ms);
+    let queue_hysteresis_bytes = payload_bytes as u64;
+    old_lead.eta_ms <= best.eta_ms + jitter_hysteresis_ms
+        && old_lead.snapshot.queue_bytes <= best.snapshot.queue_bytes + queue_hysteresis_bytes
 }
 
 fn response_target_has_emission_credit(
@@ -2333,10 +2346,31 @@ mod tests {
     }
 
     #[test]
-    fn response_ordinary_bulk_keeps_stream_lead_when_frontier_is_clear() {
+    fn response_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
         let lead = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = choose_response_sender_data_target(
+            &[lead.clone(), lower_eta_alternate.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(lead.key),
+        )
+        .expect("lower ETA path should be selected");
+
+        assert_eq!(selected.key, lower_eta_alternate.key);
+    }
+
+    #[test]
+    fn response_ordinary_bulk_keeps_lead_only_inside_measured_hysteresis() {
+        let mut lead = response_target(0, UnderlayProtocol::Udp, 5.1, 0, 16 * 1024 * 1024, true);
+        let mut lower_eta_alternate =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        lead.snapshot.jitter_ms = 0.2;
+        lower_eta_alternate.snapshot.jitter_ms = 0.1;
 
         let selected = choose_response_sender_data_target(
             &[lead.clone(), lower_eta_alternate],
@@ -2346,7 +2380,7 @@ mod tests {
             &[],
             Some(lead.key),
         )
-        .expect("existing stream lead should remain selected");
+        .expect("near-tie lead should remain selected inside observed jitter");
 
         assert_eq!(selected.key, lead.key);
     }

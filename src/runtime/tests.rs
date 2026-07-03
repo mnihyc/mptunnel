@@ -555,6 +555,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         max_payload_bytes: 64 * 1024,
         max_ack_ranges: 256,
         max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
         max_stream_window_bytes: 1024 * 1024,
         max_repair_bytes: 1024 * 1024,
         max_reorder_bytes: 1024 * 1024,
@@ -1562,6 +1563,7 @@ fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
         max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
@@ -1585,6 +1587,7 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
         max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
@@ -1612,6 +1615,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
         max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
@@ -1636,6 +1640,7 @@ fn tcp_path_command_queue_tracks_inflight_budget_not_stream_limit() {
 
     let resources = ResourceLimits {
         max_streams: 65_536,
+        max_quic_concurrent_bidi_streams: 65_536,
         max_path_flight_bytes: mux_limits.max_path_flight_bytes,
         max_reliable_relay_chunk_bytes: mux_limits.max_reliable_relay_chunk_bytes,
         ..ResourceLimits::default()
@@ -1649,6 +1654,7 @@ fn tcp_path_command_queue_tracks_actual_payload_quantum() {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
         max_streams: 1024,
+        max_quic_concurrent_bidi_streams: 1024,
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,

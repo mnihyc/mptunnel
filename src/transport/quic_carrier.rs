@@ -8,9 +8,12 @@ use quinn::{
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
+use std::any::Any;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 const FRAME_LEN_BYTES: usize = 4;
 const QUIC_CERT_DNS_NAME: &str = "mptunnel.invalid";
@@ -25,22 +28,204 @@ pub struct Endpoint {
 #[derive(Debug, Clone)]
 pub struct Connection {
     connection: quinn::Connection,
+    write_backlog: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CongestionMetrics {
     pub congestion_window: u64,
+    pub bytes_in_flight: Option<u64>,
+    pub pending_bytes: u64,
     pub pacing_rate_bps: Option<u64>,
+    pub loss_ppm: Option<u32>,
+    pub ecn_ppm: Option<u32>,
+    pub newly_acked_bytes: Option<u64>,
+    pub delivery_sample_count: u64,
+    pub app_limited: bool,
 }
 
 #[derive(Debug)]
 pub struct SendStream {
     stream: quinn::SendStream,
+    write_backlog: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
 pub struct RecvStream {
     stream: quinn::RecvStream,
+}
+
+#[derive(Debug, Default)]
+struct InstrumentedBbrConfig;
+
+#[derive(Debug, Default)]
+struct QuicCarrierTelemetry {
+    bytes_in_flight: AtomicU64,
+    newly_acked_bytes: AtomicU64,
+    delivery_sample_count: AtomicU64,
+    sent_bytes: AtomicU64,
+    lost_bytes: AtomicU64,
+    app_limited: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuicCarrierTelemetrySnapshot {
+    bytes_in_flight: u64,
+    newly_acked_bytes: Option<u64>,
+    delivery_sample_count: u64,
+    loss_ppm: Option<u32>,
+    app_limited: bool,
+}
+
+struct InstrumentedController {
+    inner: Box<dyn quinn::congestion::Controller>,
+    telemetry: Arc<QuicCarrierTelemetry>,
+}
+
+impl std::fmt::Debug for InstrumentedController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstrumentedController")
+            .field("telemetry", &self.telemetry)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QuicCarrierTelemetry {
+    fn snapshot(&self) -> QuicCarrierTelemetrySnapshot {
+        let newly_acked_bytes = self.newly_acked_bytes.swap(0, Ordering::Relaxed);
+        let delivery_sample_count = self.delivery_sample_count.swap(0, Ordering::Relaxed);
+        let sent_bytes = self.sent_bytes.load(Ordering::Relaxed);
+        let lost_bytes = self.lost_bytes.load(Ordering::Relaxed);
+        let loss_ppm = (sent_bytes > 0).then(|| {
+            let ratio = (lost_bytes as f64 / sent_bytes as f64).clamp(0.0, 1.0);
+            (ratio * 1_000_000.0).round() as u32
+        });
+        QuicCarrierTelemetrySnapshot {
+            bytes_in_flight: self.bytes_in_flight.load(Ordering::Relaxed),
+            newly_acked_bytes: (newly_acked_bytes > 0).then_some(newly_acked_bytes),
+            delivery_sample_count,
+            loss_ppm,
+            app_limited: self.app_limited.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add_sent(&self, bytes: u64) {
+        self.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.bytes_in_flight.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_acked(&self, bytes: u64, app_limited: bool) {
+        if bytes > 0 {
+            self.newly_acked_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.delivery_sample_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.app_limited.store(app_limited, Ordering::Relaxed);
+        let _ =
+            self.bytes_in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
+    }
+
+    fn finish_ack_batch(&self, in_flight: u64, app_limited: bool) {
+        self.bytes_in_flight.store(in_flight, Ordering::Relaxed);
+        self.app_limited.store(app_limited, Ordering::Relaxed);
+    }
+
+    fn add_lost(&self, lost_bytes: u64) {
+        if lost_bytes > 0 {
+            self.lost_bytes.fetch_add(lost_bytes, Ordering::Relaxed);
+            let _ = self.bytes_in_flight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(lost_bytes)),
+            );
+        }
+    }
+}
+
+impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn quinn::congestion::Controller> {
+        let inner = Arc::new(quinn::congestion::BbrConfig::default()).build(now, current_mtu);
+        Box::new(InstrumentedController {
+            inner,
+            telemetry: Arc::new(QuicCarrierTelemetry::default()),
+        })
+    }
+}
+
+impl quinn::congestion::Controller for InstrumentedController {
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.telemetry.add_sent(bytes);
+        self.inner.on_sent(now, bytes, last_packet_number);
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &quinn_proto::RttEstimator,
+    ) {
+        self.telemetry.add_acked(bytes, app_limited);
+        self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        self.telemetry.finish_ack_batch(in_flight, app_limited);
+        self.inner
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.telemetry.add_lost(lost_bytes);
+        self.inner
+            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.inner.on_mtu_update(new_mtu);
+    }
+
+    fn window(&self) -> u64 {
+        self.inner.window()
+    }
+
+    fn metrics(&self) -> quinn::congestion::ControllerMetrics {
+        self.inner.metrics()
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(Self {
+            inner: self.inner.clone_box(),
+            telemetry: self.telemetry.clone(),
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.inner.initial_window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
 }
 
 impl Endpoint {
@@ -70,6 +255,7 @@ impl Endpoint {
             .map_err(QuicCarrierError::Connect)?;
         Ok(Connection {
             connection: connecting.await?,
+            write_backlog: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -77,7 +263,12 @@ impl Endpoint {
         loop {
             let incoming = self.endpoint.accept().await?;
             match incoming.await {
-                Ok(connection) => return Some(Connection { connection }),
+                Ok(connection) => {
+                    return Some(Connection {
+                        connection,
+                        write_backlog: Arc::new(AtomicU64::new(0)),
+                    });
+                }
                 Err(err) => {
                     eprintln!("warning: QUIC carrier accept failed: {err}");
                     continue;
@@ -94,12 +285,24 @@ impl Endpoint {
 impl Connection {
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
         let (send, recv) = self.connection.open_bi().await?;
-        Ok((SendStream { stream: send }, RecvStream { stream: recv }))
+        Ok((
+            SendStream {
+                stream: send,
+                write_backlog: self.write_backlog.clone(),
+            },
+            RecvStream { stream: recv },
+        ))
     }
 
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
         let (send, recv) = self.connection.accept_bi().await?;
-        Ok((SendStream { stream: send }, RecvStream { stream: recv }))
+        Ok((
+            SendStream {
+                stream: send,
+                write_backlog: self.write_backlog.clone(),
+            },
+            RecvStream { stream: recv },
+        ))
     }
 
     pub fn close(&self) {
@@ -115,10 +318,33 @@ impl Connection {
     }
 
     pub fn congestion_metrics(&self) -> CongestionMetrics {
-        let metrics = self.connection.congestion_state().metrics();
+        let controller = self.connection.congestion_state();
+        let metrics = controller.metrics();
+        let telemetry = controller
+            .into_any()
+            .downcast::<InstrumentedController>()
+            .ok()
+            .map(|controller| controller.telemetry.snapshot());
+        let (bytes_in_flight, loss_ppm, newly_acked_bytes, delivery_sample_count, app_limited) =
+            telemetry.map_or((None, None, None, 0, true), |snapshot| {
+                (
+                    Some(snapshot.bytes_in_flight),
+                    snapshot.loss_ppm,
+                    snapshot.newly_acked_bytes,
+                    snapshot.delivery_sample_count,
+                    snapshot.app_limited,
+                )
+            });
         CongestionMetrics {
             congestion_window: metrics.congestion_window,
+            bytes_in_flight,
+            pending_bytes: self.write_backlog.load(Ordering::Relaxed),
             pacing_rate_bps: metrics.pacing_rate,
+            loss_ppm,
+            ecn_ppm: None,
+            newly_acked_bytes,
+            delivery_sample_count,
+            app_limited,
         }
     }
 }
@@ -153,7 +379,15 @@ pub async fn write_frames(
     );
     #[cfg(feature = "lab-diagnostics")]
     let write_started = std::time::Instant::now();
-    send.stream.write_all(&packet).await?;
+    let packet_len = packet.len() as u64;
+    send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
+    let write_result = send.stream.write_all(&packet).await;
+    let _ = send
+        .write_backlog
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(packet_len))
+        });
+    write_result?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.write_frames_wait",
@@ -238,7 +472,7 @@ fn quic_transport_config(mux_limits: MuxLimits) -> TransportConfig {
     let send_window = (mux_limits.max_path_flight_bytes as u64)
         .max(mux_limits.max_reliable_relay_chunk_bytes as u64)
         .max(1);
-    let concurrent_streams = (connection_receive_window / stream_receive_window)
+    let concurrent_streams = (mux_limits.max_quic_concurrent_bidi_streams as u64)
         .max(1)
         .min(mux_limits.max_streams as u64);
 
@@ -251,7 +485,7 @@ fn quic_transport_config(mux_limits: MuxLimits) -> TransportConfig {
         .max_concurrent_uni_streams(0_u8.into())
         .datagram_receive_buffer_size(Some(mux_limits.max_datagram_queue_bytes))
         .datagram_send_buffer_size(mux_limits.max_datagram_queue_bytes)
-        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        .congestion_controller_factory(Arc::new(InstrumentedBbrConfig));
     transport
 }
 
@@ -608,11 +842,30 @@ mod tests {
             + mux_limits.max_datagram_queue_bytes as u64
             + mux_limits.max_path_flight_bytes as u64;
         let send_window = mux_limits.max_path_flight_bytes as u64;
-        let bidi_streams = receive_window / stream_window;
+        let bidi_streams = mux_limits.max_quic_concurrent_bidi_streams;
         assert!(rendered.contains(&format!("stream_receive_window: {stream_window}")));
         assert!(rendered.contains(&format!("receive_window: {receive_window}")));
         assert!(rendered.contains(&format!("send_window: {send_window}")));
         assert!(rendered.contains(&format!("max_concurrent_bidi_streams: {bidi_streams}")));
         assert!(rendered.contains("max_concurrent_uni_streams: 0"));
+    }
+
+    #[test]
+    fn quic_stream_limit_is_independent_from_receive_window_ratio() {
+        let mux_limits = MuxLimits {
+            max_stream_window_bytes: 64 * 1024 * 1024,
+            max_repair_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            max_datagram_queue_bytes: 16 * 1024 * 1024,
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_streams: 65_536,
+            max_quic_concurrent_bidi_streams: 4096,
+            ..MuxLimits::default()
+        };
+        let transport = quic_transport_config(mux_limits);
+        let rendered = format!("{transport:?}");
+
+        assert!(rendered.contains("max_concurrent_bidi_streams: 4096"));
+        assert!(!rendered.contains("max_concurrent_bidi_streams: 4,"));
     }
 }

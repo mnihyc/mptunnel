@@ -462,76 +462,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         && paths
             .iter()
             .any(|path| admitted_bulk_keys.contains(&path.key()));
-    if normal_bulk_send
-        && lower_flight_owner.is_none()
-        && let Some(lead_key) = ordinary_lead
-        && let Some(position) = paths.iter().position(|path| path.key() == lead_key)
-    {
-        let path = &paths[position];
-        if path.placement == RelayPathPlacement::Repair {
-            return BulkRelayPathChoice::Blocked;
-        }
-        if let Some(frame) = frame
-            && !path.stream.can_enqueue_frame_now(frame, lane)
-        {
-            return BulkRelayPathChoice::Blocked;
-        }
-        if Some(lead_key) != active_key
-            && !context.relay_path_has_bulk_model_evidence(lead_key.underlay, lead_key.index)
-        {
-            return BulkRelayPathChoice::Blocked;
-        }
-        let Some((snapshot, eta_ms)) = scored_relay_path_snapshot_for_bulk_choice(
-            context,
-            lead_key,
-            active_key,
-            lane,
-            payload_bytes,
-            policy,
-        ) else {
-            return BulkRelayPathChoice::Blocked;
-        };
-        let suppression =
-            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-                best_snapshot: snapshot,
-                best_eta_ms: eta_ms,
-                candidate_snapshot: snapshot,
-                candidate_eta_ms: eta_ms,
-                payload_bytes,
-                mux_limits: context.mux_limits,
-                role: BulkAdmissionRole::ActiveDataPath,
-                stream_ordering_debt_bytes: 0,
-            });
-        if suppression.is_none() {
-            #[cfg(feature = "lab-diagnostics")]
-            log_bulk_relay_candidate_decision(
-                BulkRelayCandidateDiagnostics {
-                    stream_id,
-                    lane,
-                    key: lead_key,
-                    lead_key: Some(lead_key),
-                    role: Some(BulkAdmissionRole::ActiveDataPath),
-                    eta_ms: Some(eta_ms),
-                    best_eta_ms: Some(eta_ms),
-                    completion_horizon_ms: Some(bulk_completion_horizon_ms_with_ordering_debt(
-                        snapshot,
-                        eta_ms,
-                        snapshot,
-                        payload_bytes,
-                        context.mux_limits,
-                        0,
-                    )),
-                    stream_ordering_debt_bytes: 0,
-                    payload_bytes,
-                    snapshot: Some(snapshot),
-                },
-                true,
-                "selected_stream_lead",
-            );
-            return BulkRelayPathChoice::Selected(position);
-        }
-        return BulkRelayPathChoice::Blocked;
-    }
     let lead = if normal_bulk_send {
         choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
             context,
@@ -554,7 +484,8 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     }
     let lead_key = lead.map(|lead| lead.key);
     let lead_baseline = lead.map(|lead| (lead.snapshot, lead.eta_ms));
-    let mut best: Option<(usize, f64, usize)> = None;
+    let mut best: Option<(usize, f64, usize, PathSnapshot)> = None;
+    let mut old_lead_candidate: Option<(usize, f64, PathSnapshot)> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut best_diagnostics: Option<BulkRelayCandidateDiagnostics> = None;
     for (position, path) in paths.iter().enumerate() {
@@ -772,10 +703,13 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 continue;
             }
         }
+        if normal_bulk_send && lower_flight_owner.is_none() && Some(key) == ordinary_lead {
+            old_lead_candidate = Some((position, score.eta_ms, snapshot));
+        }
         let cursor_distance = path_cursor_distance(position, cursor, paths.len());
         match best {
             None => {
-                best = Some((position, score.eta_ms, cursor_distance));
+                best = Some((position, score.eta_ms, cursor_distance, snapshot));
                 #[cfg(feature = "lab-diagnostics")]
                 {
                     best_diagnostics =
@@ -794,11 +728,11 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                         }));
                 }
             }
-            Some((_, best_eta, best_distance)) => {
+            Some((_, best_eta, best_distance, _)) => {
                 if score.eta_ms < best_eta
                     || (score.eta_ms == best_eta && cursor_distance < best_distance)
                 {
-                    best = Some((position, score.eta_ms, cursor_distance));
+                    best = Some((position, score.eta_ms, cursor_distance, snapshot));
                     #[cfg(feature = "lab-diagnostics")]
                     {
                         best_diagnostics =
@@ -820,7 +754,19 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             }
         }
     }
-    if let Some((position, _, _)) = best {
+    if let Some((best_position, best_eta_ms, _, best_snapshot)) = best {
+        let position = old_lead_candidate
+            .filter(|(_, old_eta_ms, old_snapshot)| {
+                relay_path_within_adaptive_lead_hysteresis(
+                    *old_eta_ms,
+                    *old_snapshot,
+                    best_eta_ms,
+                    best_snapshot,
+                    payload_bytes,
+                )
+            })
+            .map(|(position, _, _)| position)
+            .unwrap_or(best_position);
         #[cfg(feature = "lab-diagnostics")]
         if let Some(diagnostics) = best_diagnostics {
             log_bulk_relay_candidate_decision(diagnostics, true, "selected");
@@ -831,6 +777,19 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         return BulkRelayPathChoice::NotApplicable;
     }
     BulkRelayPathChoice::Blocked
+}
+
+fn relay_path_within_adaptive_lead_hysteresis(
+    old_eta_ms: f64,
+    old_snapshot: PathSnapshot,
+    best_eta_ms: f64,
+    best_snapshot: PathSnapshot,
+    payload_bytes: usize,
+) -> bool {
+    let jitter_hysteresis_ms = old_snapshot.jitter_ms.max(best_snapshot.jitter_ms);
+    let queue_hysteresis_bytes = payload_bytes as u64;
+    old_eta_ms <= best_eta_ms + jitter_hysteresis_ms
+        && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
 }
 
 struct RelayBulkLeadRequest<'a> {
@@ -1249,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_ordinary_bulk_keeps_stream_lead_when_frontier_is_clear() {
+    fn relay_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
         let context = context(&[
             "udp://127.0.0.1:10140?srtt-ms=50&rate-mbps=500",
             "udp://127.0.0.1:10141?srtt-ms=5&rate-mbps=500",
@@ -1277,7 +1236,31 @@ mod tests {
                 path_flights: Some(&RelayPathFlightLedger::default()),
                 ordinary_lead: Some(lead_key),
             }),
-            BulkRelayPathChoice::Selected(0)
+            BulkRelayPathChoice::Selected(1)
+        );
+    }
+
+    #[test]
+    fn relay_ordinary_bulk_keeps_lead_only_inside_measured_hysteresis() {
+        let mut lead = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 6.0, 500_000_000.0);
+        let mut alternate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 5.0, 500_000_000.0);
+        lead.jitter_ms = 2.0;
+        alternate.jitter_ms = 1.0;
+
+        assert!(relay_path_within_adaptive_lead_hysteresis(
+            6.0,
+            lead,
+            5.0,
+            alternate,
+            64 * 1024
+        ));
+
+        lead.jitter_ms = 0.0;
+        alternate.jitter_ms = 0.0;
+
+        assert!(
+            !relay_path_within_adaptive_lead_hysteresis(6.0, lead, 5.0, alternate, 64 * 1024),
+            "old relay lead must not survive outside measured jitter/queue hysteresis"
         );
     }
 }

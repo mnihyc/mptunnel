@@ -1,6 +1,6 @@
 use crate::config::{
-    DEFAULT_DATAGRAM_QUEUE_BYTES, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
-    DEFAULT_STREAM_WINDOW_BYTES, ResourceLimits,
+    DEFAULT_DATAGRAM_QUEUE_BYTES, DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS, DEFAULT_REORDER_BYTES,
+    DEFAULT_REPAIR_BYTES, DEFAULT_STREAM_WINDOW_BYTES, ResourceLimits,
 };
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ pub struct MuxLimits {
     pub max_payload_bytes: usize,
     pub max_ack_ranges: usize,
     pub max_streams: usize,
+    pub max_quic_concurrent_bidi_streams: usize,
     pub max_stream_window_bytes: u64,
     pub max_repair_bytes: usize,
     pub max_reorder_bytes: usize,
@@ -25,6 +26,7 @@ impl Default for MuxLimits {
             max_payload_bytes: 1_048_512,
             max_ack_ranges: 256,
             max_streams: 65_536,
+            max_quic_concurrent_bidi_streams: DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
             max_stream_window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
             max_repair_bytes: DEFAULT_REPAIR_BYTES,
             max_reorder_bytes: DEFAULT_REORDER_BYTES,
@@ -43,6 +45,7 @@ impl From<ResourceLimits> for MuxLimits {
             max_payload_bytes: value.max_payload_bytes,
             max_ack_ranges: value.max_ack_ranges,
             max_streams: value.max_streams,
+            max_quic_concurrent_bidi_streams: value.max_quic_concurrent_bidi_streams,
             max_stream_window_bytes: value.max_stream_window_bytes,
             max_repair_bytes: value.max_repair_bytes,
             max_reorder_bytes: value.max_reorder_bytes,

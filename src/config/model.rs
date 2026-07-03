@@ -21,6 +21,8 @@ pub const DEFAULT_REORDER_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_DATAGRAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_PATH_FLIGHT_BYTES: usize = DEFAULT_REPAIR_BYTES;
 pub const DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES: usize = 512 * 1024;
+pub const DEFAULT_MAX_STREAMS: usize = 65_536;
+pub const DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS: usize = DEFAULT_MAX_STREAMS;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
@@ -180,6 +182,7 @@ pub struct ResourceLimits {
     pub max_ack_ranges: usize,
     pub max_paths: usize,
     pub max_streams: usize,
+    pub max_quic_concurrent_bidi_streams: usize,
     pub max_stream_window_bytes: u64,
     pub max_repair_bytes: usize,
     pub max_reorder_bytes: usize,
@@ -197,7 +200,8 @@ impl Default for ResourceLimits {
             max_payload_bytes: 1_048_512,
             max_ack_ranges: 256,
             max_paths: 64,
-            max_streams: 65_536,
+            max_streams: DEFAULT_MAX_STREAMS,
+            max_quic_concurrent_bidi_streams: DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
             max_stream_window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
             max_repair_bytes: DEFAULT_REPAIR_BYTES,
             max_reorder_bytes: DEFAULT_REORDER_BYTES,
@@ -229,6 +233,9 @@ impl ResourceLimits {
         }
         if self.max_streams == 0 {
             return Err(ConfigError::StreamLimitZero);
+        }
+        if self.max_quic_concurrent_bidi_streams == 0 {
+            return Err(ConfigError::QuicBidiStreamLimitZero);
         }
         if self.max_stream_window_bytes == 0 {
             return Err(ConfigError::StreamWindowLimitZero);
@@ -563,6 +570,7 @@ pub enum ConfigError {
     PathLimitZero,
     PathLimitTooLarge,
     StreamLimitZero,
+    QuicBidiStreamLimitZero,
     StreamWindowLimitZero,
     RepairLimitTooSmall,
     ReorderLimitTooSmall,
@@ -624,6 +632,12 @@ impl std::fmt::Display for ConfigError {
             Self::PathLimitZero => write!(f, "max paths must be greater than zero"),
             Self::PathLimitTooLarge => write!(f, "max paths must fit in protocol path IDs"),
             Self::StreamLimitZero => write!(f, "max streams must be greater than zero"),
+            Self::QuicBidiStreamLimitZero => {
+                write!(
+                    f,
+                    "max QUIC concurrent bidirectional streams must be greater than zero"
+                )
+            }
             Self::StreamWindowLimitZero => {
                 write!(f, "max stream window bytes must be greater than zero")
             }

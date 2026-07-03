@@ -1,10 +1,11 @@
 use crate::config::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_DATAGRAM_QUEUE_BYTES,
-    DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
-    DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS, DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS,
-    DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES,
-    DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
+    DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
+    DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
+    DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
+    DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
     DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
     LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig,
     ServerConfig, ServiceConfig, SharedSecret,
@@ -227,6 +228,14 @@ pub struct ResourceArgs {
     #[arg(
         long,
         global = true,
+        env = "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS",
+        default_value_t = DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS
+    )]
+    pub max_quic_concurrent_bidi_streams: usize,
+
+    #[arg(
+        long,
+        global = true,
         env = "MPTUNNEL_MAX_STREAM_WINDOW_BYTES",
         default_value_t = DEFAULT_STREAM_WINDOW_BYTES
     )]
@@ -297,6 +306,7 @@ impl ResourceArgs {
             max_ack_ranges: self.max_ack_ranges,
             max_paths: self.max_paths,
             max_streams: self.max_streams,
+            max_quic_concurrent_bidi_streams: self.max_quic_concurrent_bidi_streams,
             max_stream_window_bytes: self.max_stream_window_bytes,
             max_repair_bytes: self.max_repair_bytes,
             max_reorder_bytes: self.max_reorder_bytes,

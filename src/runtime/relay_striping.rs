@@ -13,24 +13,33 @@ pub(super) struct RelayPathRelease {
     pub(super) bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) elapsed: Duration,
+    pub(super) path_proving: bool,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct RelayPathFlightLedger {
+    // Client/request-side product-flight ledger. It intentionally mirrors the
+    // response binding's OwnerData/RepairData ACK rule, but uses RelayPathKey
+    // and updates client path health instead of server response output entries.
     flights: BTreeMap<u64, Vec<RelayPathFlight>>,
 }
 
 impl RelayPathFlightLedger {
-    pub(super) fn record_frame(&mut self, key: RelayPathKey, frame: &Frame) -> usize {
-        self.record_frame_with_ordering_owner(key, frame, true)
+    pub(super) fn record_owner_frame(&mut self, key: RelayPathKey, frame: &Frame) -> usize {
+        self.record_product_frame(key, frame, CarrierWorkKind::OwnerData)
     }
 
-    pub(super) fn record_frame_with_ordering_owner(
+    pub(super) fn record_repair_frame(&mut self, key: RelayPathKey, frame: &Frame) -> usize {
+        self.record_product_frame(key, frame, CarrierWorkKind::RepairData)
+    }
+
+    fn record_product_frame(
         &mut self,
         key: RelayPathKey,
         frame: &Frame,
-        owns_ordering_frontier: bool,
+        kind: CarrierWorkKind,
     ) -> usize {
+        debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return 0;
         };
@@ -42,7 +51,7 @@ impl RelayPathFlightLedger {
                 end,
                 bytes,
                 sent_at: Instant::now(),
-                owns_ordering_frontier,
+                kind,
             });
         bytes
     }
@@ -70,12 +79,14 @@ impl RelayPathFlightLedger {
         acked_offsets.dedup();
         for offset in acked_offsets {
             if let Some(flights) = self.flights.remove(&offset) {
+                let path_proving = relay_path_flights_have_unambiguous_owner_ack(&flights);
                 let now = Instant::now();
                 for flight in flights {
                     released.push(RelayPathRelease {
                         key: flight.key,
                         bytes: flight.bytes,
                         elapsed: now.saturating_duration_since(flight.sent_at),
+                        path_proving: path_proving && flight.kind.is_ordering_owner(),
                     });
                 }
             }
@@ -91,6 +102,7 @@ impl RelayPathFlightLedger {
                     key: flight.key,
                     bytes: flight.bytes,
                     elapsed: Instant::now().saturating_duration_since(flight.sent_at),
+                    path_proving: false,
                 });
             }
         }
@@ -152,7 +164,14 @@ fn latest_ordering_owner(flights: &[RelayPathFlight]) -> Option<&RelayPathFlight
     flights
         .iter()
         .rev()
-        .find(|flight| flight.owns_ordering_frontier)
+        .find(|flight| flight.kind.is_ordering_owner())
+}
+
+fn relay_path_flights_have_unambiguous_owner_ack(flights: &[RelayPathFlight]) -> bool {
+    matches!(
+        flights,
+        [flight] if flight.kind.is_ordering_owner()
+    )
 }
 
 pub(super) fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
@@ -179,7 +198,7 @@ struct RelayPathFlight {
     end: u64,
     bytes: usize,
     sent_at: Instant,
-    owns_ordering_frontier: bool,
+    kind: CarrierWorkKind,
 }
 
 pub(super) fn reliable_stream_frame_extent(frame: &Frame) -> Option<(u64, u64, usize)> {
@@ -247,6 +266,21 @@ struct RelayBulkLead {
     key: RelayPathKey,
     snapshot: PathSnapshot,
     eta_ms: f64,
+}
+
+fn relay_path_runtime_role(
+    key: RelayPathKey,
+    active_key: Option<RelayPathKey>,
+    lower_flight_owner: Option<RelayPathKey>,
+    has_bulk_model_evidence: bool,
+) -> PathRuntimeRole {
+    if Some(key) == active_key || Some(key) == lower_flight_owner {
+        PathRuntimeRole::Service
+    } else if has_bulk_model_evidence {
+        PathRuntimeRole::Cohort
+    } else {
+        PathRuntimeRole::Standby
+    }
 }
 
 #[cfg(feature = "lab-diagnostics")]
@@ -579,7 +613,13 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         if normal_bulk_send
             && Some(key) != active_key
             && lower_flight_owner != Some(key)
-            && !context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
+            && !relay_path_runtime_role(
+                key,
+                active_key,
+                lower_flight_owner,
+                context.relay_path_has_bulk_model_evidence(key.underlay, key.index),
+            )
+            .may_own_unique_data()
         {
             #[cfg(feature = "lab-diagnostics")]
             log_bulk_relay_candidate_decision(
@@ -998,8 +1038,8 @@ mod tests {
             index: 0,
         };
         let mut ledger = RelayPathFlightLedger::default();
-        ledger.record_frame(path0, &data_frame(0, 4096));
-        ledger.record_frame(path1, &data_frame(4096, 4096));
+        ledger.record_owner_frame(path0, &data_frame(0, 4096));
+        ledger.record_owner_frame(path1, &data_frame(4096, 4096));
 
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path0, 8192), 4096);
         assert_eq!(ledger.ordering_debt_bytes_before_offset(path1, 8192), 4096);
@@ -1022,8 +1062,8 @@ mod tests {
         };
         let frame = data_frame(0, 4096);
         let mut ledger = RelayPathFlightLedger::default();
-        ledger.record_frame(owner, &frame);
-        ledger.record_frame_with_ordering_owner(duplicate, &frame, false);
+        ledger.record_owner_frame(owner, &frame);
+        ledger.record_repair_frame(duplicate, &frame);
 
         assert_eq!(
             ledger.oldest_lower_flight_owner_before_offset(4096),
@@ -1042,6 +1082,33 @@ mod tests {
         assert_eq!(released.len(), 2);
         assert!(released.iter().any(|release| release.key == owner));
         assert!(released.iter().any(|release| release.key == duplicate));
+        assert!(
+            released.iter().all(|release| !release.path_proving),
+            "ACK of duplicated request bytes releases inflight state but is not path-scoped proof"
+        );
+    }
+
+    #[test]
+    fn owner_only_ack_release_is_path_proving() {
+        let owner = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let frame = data_frame(0, 4096);
+        let mut ledger = RelayPathFlightLedger::default();
+        ledger.record_owner_frame(owner, &frame);
+
+        let released = ledger.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 4096,
+        }]);
+
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].key, owner);
+        assert!(
+            released[0].path_proving,
+            "a single outstanding owner copy is path-scoped STREAM_ACK evidence"
+        );
     }
 
     #[test]
@@ -1059,7 +1126,7 @@ mod tests {
             index: 1,
         };
         let mut ledger = RelayPathFlightLedger::default();
-        ledger.record_frame(missing_owner, &data_frame(0, 64 * 1024));
+        ledger.record_owner_frame(missing_owner, &data_frame(0, 64 * 1024));
 
         assert_eq!(
             choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
@@ -1094,7 +1161,7 @@ mod tests {
             relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
         ];
         let mut ledger = RelayPathFlightLedger::default();
-        ledger.record_frame(lower_owner, &data_frame(0, 64 * 1024));
+        ledger.record_owner_frame(lower_owner, &data_frame(0, 64 * 1024));
 
         assert_eq!(
             choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {

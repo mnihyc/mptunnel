@@ -1593,7 +1593,7 @@ fn path_proof_observation_does_not_promote_tcp_candidate_without_delivery_eviden
                 underlay: UnderlayProtocol::Tcp,
                 index: 1,
             }),
-        "proof-success path remains eligible for validation/discovery until ACK-data evidence arrives"
+        "proof-success path remains eligible for validation until ACK-data evidence arrives"
     );
     {
         let health = context.health.lock().expect("client path health lock");
@@ -1648,7 +1648,7 @@ fn path_proof_observation_does_not_promote_udp_candidate_without_carrier_sample(
                 underlay: UnderlayProtocol::Udp,
                 index: 1,
             }),
-        "proof-success QUIC UDP path remains eligible for validation/discovery until ACK-data evidence arrives"
+        "proof-success QUIC UDP path remains eligible for validation until ACK-data evidence arrives"
     );
 }
 
@@ -1940,7 +1940,7 @@ fn endpoint_only_udp_bulk_load_spreads_replacement_without_realtime_work() {
 }
 
 #[test]
-fn udp_bulk_repair_requires_delivery_evidence_when_stream_has_active_path() {
+fn udp_bulk_repair_uses_liveness_status_when_stream_has_active_path() {
     let active_path = "udp://127.0.0.1:10140"
         .parse::<PathSpec>()
         .expect("active path");
@@ -1957,29 +1957,43 @@ fn udp_bulk_repair_requires_delivery_evidence_when_stream_has_active_path() {
     context.mark_udp_path_probe_success(0, Duration::from_millis(20));
     context.mark_udp_path_probe_success(1, Duration::from_millis(25));
 
-    assert!(
-        context
-            .ordered_udp_stream_repair_path_indices(Some(0), FlowLane::Throughput, 64 * 1024, true)
-            .is_empty()
+    assert_eq!(
+        context.ordered_udp_stream_repair_path_indices(Some(0), FlowLane::Throughput, 64 * 1024),
+        vec![1]
     );
+}
 
-    context.mark_udp_path_delivery(
-        1,
-        PathDeliveryStats {
-            payload_bytes: 1024 * 1024,
-            first_payload_at: Some(Instant::now() - Duration::from_millis(80)),
-            last_payload_at: Some(Instant::now()),
-        },
-    );
+#[tokio::test]
+async fn udp_bulk_repair_candidate_uses_liveness_status_not_family_penalty() {
+    let active_path = "udp://127.0.0.1:10142?srtt-ms=80&rate-mbps=80"
+        .parse::<PathSpec>()
+        .expect("active path");
+    let repair_path = "udp://127.0.0.1:10143?srtt-ms=20&rate-mbps=200"
+        .parse::<PathSpec>()
+        .expect("repair path");
+    let context = ClientPathContext::new(
+        vec![active_path, repair_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    context.mark_udp_path_probe_success(0, Duration::from_millis(80));
+    context.mark_udp_path_probe_success(1, Duration::from_millis(20));
+    let stream_id = StreamId(149);
+    let (udp_stream, _udp_commands, _udp_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let remotes = ReliableRelayRemoteSet::new(udp_stream, 4);
+
+    let candidates =
+        reliable_relay_repair_path_candidates(&context, &remotes, FlowLane::Throughput, 64 * 1024);
 
     assert_eq!(
-        context.ordered_udp_stream_repair_path_indices(
-            Some(0),
-            FlowLane::Throughput,
-            64 * 1024,
-            true
-        ),
-        vec![1]
+        candidates.first().copied(),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        }),
+        "repair-only admission should be driven by live path status and metrics, not a UDP-specific delivery-evidence penalty"
     );
 }
 
@@ -2097,7 +2111,7 @@ fn mixed_endpoint_only_bulk_striping_keeps_measured_udp_without_unmeasured_tcp()
 }
 
 #[test]
-fn mixed_udp_repair_keeps_healthy_udp_eligible_on_active_tcp_stream() {
+fn mixed_udp_repair_uses_liveness_status_on_active_tcp_stream() {
     let tcp_path = "tcp://127.0.0.1:10157"
         .parse::<PathSpec>()
         .expect("tcp path");
@@ -2115,36 +2129,13 @@ fn mixed_udp_repair_keeps_healthy_udp_eligible_on_active_tcp_stream() {
     .expect("context");
 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
-    assert!(
-        context
-            .ordered_udp_stream_repair_path_indices(
-                None,
-                FlowLane::Throughput,
-                MuxLimits::default().max_reliable_relay_chunk_bytes,
-                true,
-            )
-            .is_empty()
-    );
 
-    let now = Instant::now();
-    context.mark_udp_path_delivery(
-        1,
-        PathDeliveryStats {
-            payload_bytes: 4 * 1024 * 1024,
-            first_payload_at: Some(now),
-            last_payload_at: Some(now + Duration::from_millis(40)),
-        },
+    let candidates = context.ordered_udp_stream_repair_path_indices(
+        None,
+        FlowLane::Throughput,
+        MuxLimits::default().max_reliable_relay_chunk_bytes,
     );
-
-    assert_eq!(
-        context.ordered_udp_stream_repair_path_indices(
-            None,
-            FlowLane::Throughput,
-            MuxLimits::default().max_reliable_relay_chunk_bytes,
-            true,
-        ),
-        vec![1]
-    );
+    assert_eq!(candidates.first().copied(), Some(1));
 }
 
 #[test]
@@ -2163,33 +2154,12 @@ fn udp_repair_keeps_healthy_endpoint_only_path_eligible() {
     .expect("context");
 
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
-    assert!(
-        context
-            .ordered_udp_stream_repair_path_indices(
-                Some(0),
-                FlowLane::Throughput,
-                MuxLimits::default().max_reliable_relay_chunk_bytes,
-                true,
-            )
-            .is_empty()
-    );
-
-    let now = Instant::now();
-    context.mark_udp_path_delivery(
-        1,
-        PathDeliveryStats {
-            payload_bytes: 4 * 1024 * 1024,
-            first_payload_at: Some(now),
-            last_payload_at: Some(now + Duration::from_millis(40)),
-        },
-    );
 
     assert_eq!(
         context.ordered_udp_stream_repair_path_indices(
             Some(0),
             FlowLane::Throughput,
             MuxLimits::default().max_reliable_relay_chunk_bytes,
-            true,
         ),
         vec![1]
     );
@@ -2351,34 +2321,6 @@ async fn relay_active_attach_candidates_are_metric_ordered_across_carriers() {
         }),
         "active UDP must not hide a better measured TCP candidate"
     );
-}
-
-#[test]
-fn relay_bulk_attach_plan_keeps_cross_carrier_validation_candidates() {
-    let tcp = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let udp0 = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let udp1 = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 1,
-    };
-
-    let plan = relay_bulk_attach_plan(vec![tcp, udp0, udp1], true);
-    assert_eq!(plan.candidates, vec![tcp, udp0, udp1]);
-    assert!(plan.attach_all_candidates);
-
-    let mixed_probe = relay_bulk_attach_plan(vec![tcp], true);
-    assert_eq!(mixed_probe.candidates, vec![tcp]);
-    assert!(mixed_probe.attach_all_candidates);
-
-    let startup_probe = relay_bulk_attach_plan(vec![tcp, udp0], false);
-    assert_eq!(startup_probe.candidates, vec![tcp, udp0]);
-    assert!(!startup_probe.attach_all_candidates);
 }
 
 #[tokio::test]
@@ -2589,17 +2531,7 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
         .expect("dispatch upload service quantum");
 
     match dispatch {
-        ClientQueuedDispatch::Data {
-            path_key,
-            payload_bytes,
-        } => {
-            assert_eq!(
-                path_key,
-                RelayPathKey {
-                    underlay: UnderlayProtocol::Udp,
-                    index: 0,
-                }
-            );
+        ClientQueuedDispatch::Data { payload_bytes } => {
             assert_eq!(payload_bytes, quantum);
         }
         ClientQueuedDispatch::Repair { .. } => panic!("expected upload data dispatch"),
@@ -3235,7 +3167,7 @@ async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
 }
 
 #[tokio::test]
-async fn delivered_repair_path_promotes_only_when_scheduler_score_improves() {
+async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
     let stream_id = StreamId(47);
     let context = ClientPathContext::new(
         vec![

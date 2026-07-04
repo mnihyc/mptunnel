@@ -526,7 +526,6 @@ pub(super) fn bulk_path_candidate(
         has_path_proof_evidence: bulk_candidate_has_path_proof_evidence(observation),
         has_ack_data_evidence: bulk_candidate_has_ack_data_evidence(path, observation),
         has_bulk_rate_evidence: bulk_candidate_has_bulk_rate_evidence(path, observation),
-        has_unique_data_evidence: bulk_candidate_has_unique_data_evidence(path, observation),
         has_sender_delivery_evidence: bulk_candidate_has_sender_delivery_evidence(
             path,
             observation,
@@ -817,13 +816,6 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
             && !observation.carrier_app_limited
             && observation.carrier_delivery_sample_bytes
                 >= client_path_observation_bulk_sample_floor_bytes(observation))
-}
-
-pub(super) fn bulk_candidate_has_unique_data_evidence(
-    path: &PathSpec,
-    observation: ClientPathObservation,
-) -> bool {
-    bulk_candidate_has_bulk_rate_evidence(path, observation)
 }
 
 pub(super) fn bulk_candidate_has_sender_delivery_evidence(

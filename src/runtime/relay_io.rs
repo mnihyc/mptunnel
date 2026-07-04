@@ -240,7 +240,7 @@ fn normalized_stream_ack_first_gap(normalized_ranges: &[OffsetRange]) -> Option<
     None
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct ReliableRecvProgress {
     last_max_data_offset: u64,
     last_ack_offset: u64,

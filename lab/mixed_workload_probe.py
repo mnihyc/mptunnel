@@ -8,6 +8,9 @@ import sys
 import threading
 import time
 
+DEFAULT_INTERVAL_SECONDS = 0.2
+INTERVAL_TRIM_DISCARD_EACH_END = 3
+
 
 def parse_host_port(value):
     if value.startswith("["):
@@ -115,14 +118,34 @@ def percentile(values, rank):
     return ordered[index]
 
 
-def interval_rates_mbps(interval_bytes, interval_seconds):
+def interval_metric_fields(interval_bytes, interval_seconds, prefix):
     if interval_seconds <= 0 or not interval_bytes:
-        return []
-    last_index = max(interval_bytes)
-    return [
-        round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
-        for index in range(last_index + 1)
-    ]
+        raw = []
+    else:
+        raw = [
+            round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
+            for index in range(max(interval_bytes) + 1)
+        ]
+    trimmed = (
+        raw[INTERVAL_TRIM_DISCARD_EACH_END:-INTERVAL_TRIM_DISCARD_EACH_END]
+        if len(raw) > INTERVAL_TRIM_DISCARD_EACH_END * 2
+        else []
+    )
+    name = f"{prefix}_interval"
+    fields = {
+        f"{name}_seconds": interval_seconds,
+        f"{name}_trim_discard_each_end": INTERVAL_TRIM_DISCARD_EACH_END,
+        f"{name}_goodput_raw_mbps": raw,
+        f"{name}_goodput_mbps": trimmed,
+        f"{name}_goodput_avg_mbps": None,
+        f"{name}_goodput_max_mbps": None,
+        f"{name}_goodput_min_mbps": None,
+    }
+    if trimmed:
+        fields[f"{name}_goodput_avg_mbps"] = round(sum(trimmed) / len(trimmed), 3)
+        fields[f"{name}_goodput_max_mbps"] = max(trimmed)
+        fields[f"{name}_goodput_min_mbps"] = min(trimmed)
+    return fields
 
 
 def write_started_file(path):
@@ -326,10 +349,6 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 "bulk_goodput_mbps": bytes_read * 8 / elapsed / 1_000_000
                 if elapsed > 0
                 else 0.0,
-                "bulk_interval_seconds": args.interval_seconds,
-                "bulk_interval_goodput_mbps": interval_rates_mbps(
-                    interval_bytes, args.interval_seconds
-                ),
                 "bulk_first_body_s": first_body_s,
                 "bulk_bytes_at_failover": bytes_at_failover,
                 "bulk_max_read_gap_s": max_read_gap_s,
@@ -343,6 +362,13 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 "bulk_recovery_gap_start_bytes": recovery_gap_start_bytes,
                 "bulk_recovery_gap_end_bytes": recovery_gap_end_bytes,
             }
+        )
+        result.update(
+            interval_metric_fields(
+                interval_bytes,
+                args.interval_seconds,
+                prefix="bulk",
+            )
         )
     except Exception as exc:
         result.update({"bulk_status": "fail", "bulk_error": str(exc)})
@@ -792,7 +818,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
-    parser.add_argument("--interval-seconds", type=float, default=1.0)
+    parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--small-interval-ms", type=int, default=100)
     parser.add_argument("--udp-payload-bytes", type=int, default=512)
     parser.add_argument("--udp-timeout-ms", type=int, default=2500)

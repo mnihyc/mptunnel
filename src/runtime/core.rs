@@ -1122,7 +1122,7 @@ impl ClientPathContext {
             lab_diagnostic(
                 "reliable_stream_initial_path_candidate",
                 format_args!(
-                    "lane={:?} payload_bytes={} rank={} path_underlay={:?} path_index={} eta_ms={:.3} state={:?} active_flows={} active_latency_flows={} queue_bytes={} product_queue_bytes={} bytes_in_flight={} inflight_limit={} delivery_rate_bps={:.0} pacing_rate_bps={:.0} app_limited={} liveness_evidence={} path_proof_evidence={} ack_data_evidence={} bulk_rate_evidence={} unique_data_evidence={} sender_delivery_evidence={}",
+                    "lane={:?} payload_bytes={} rank={} path_underlay={:?} path_index={} eta_ms={:.3} state={:?} active_flows={} active_latency_flows={} queue_bytes={} product_queue_bytes={} bytes_in_flight={} inflight_limit={} delivery_rate_bps={:.0} pacing_rate_bps={:.0} app_limited={} liveness_evidence={} path_proof_evidence={} ack_data_evidence={} bulk_rate_evidence={} sender_delivery_evidence={}",
                     lane,
                     payload_bytes,
                     rank,
@@ -1143,7 +1143,6 @@ impl ClientPathContext {
                     candidate.has_path_proof_evidence,
                     candidate.has_ack_data_evidence,
                     candidate.has_bulk_rate_evidence,
-                    candidate.has_unique_data_evidence,
                     candidate.has_sender_delivery_evidence,
                 ),
             );
@@ -1238,7 +1237,6 @@ impl ClientPathContext {
         current_path_index: Option<usize>,
         lane: FlowLane,
         payload_bytes: usize,
-        require_delivery_evidence: bool,
     ) -> Vec<usize> {
         let mut observations =
             health_observations(&mut self.health.lock().expect("client path health lock").udp);
@@ -1268,17 +1266,6 @@ impl ClientPathContext {
                         .get(*index)
                         .is_some_and(|observation| observation.state == SchedulerPathState::Active)
             })
-            .filter(|(index, _)| {
-                if !require_delivery_evidence {
-                    return true;
-                }
-                let Some(path) = self.udp_paths.get(*index) else {
-                    return false;
-                };
-                let observation = observations.get(*index).copied().unwrap_or_default();
-                path_can_be_auto_discovered(path, observation)
-                    && bulk_candidate_has_ack_data_evidence(path, observation)
-            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -1289,7 +1276,6 @@ impl ClientPathContext {
         current_udp_path_index: Option<usize>,
         lane: FlowLane,
         payload_bytes: usize,
-        require_udp_delivery_evidence: bool,
     ) -> Vec<RelayPathKey> {
         let mut candidates = self
             .ordered_tcp_repair_path_indices(current_tcp_path_index, lane, payload_bytes)
@@ -1303,7 +1289,6 @@ impl ClientPathContext {
                     current_udp_path_index,
                     lane,
                     payload_bytes,
-                    require_udp_delivery_evidence,
                 )
                 .into_iter()
                 .map(|index| RelayPathKey {
@@ -1331,12 +1316,12 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
         let mut candidates = self.ordered_reliable_bulk_path_candidates(payload_bytes);
-        let has_unique_data_evidence = candidates
+        let has_bulk_rate_evidence = candidates
             .iter()
-            .any(|candidate| candidate.has_unique_data_evidence);
+            .any(|candidate| candidate.has_bulk_rate_evidence);
         let has_active_bulk_work = candidates.iter().any(bulk_candidate_has_active_bulk_work);
-        if has_unique_data_evidence {
-            candidates.retain(|candidate| candidate.has_unique_data_evidence);
+        if has_bulk_rate_evidence {
+            candidates.retain(|candidate| candidate.has_bulk_rate_evidence);
         } else if has_active_bulk_work {
             candidates.retain(bulk_candidate_has_active_bulk_work);
         } else if !bulk_candidates_span_underlays(&candidates)
@@ -1351,7 +1336,7 @@ impl ClientPathContext {
                 .total_cmp(&right.eta_ms)
                 .then_with(|| self.relay_path_key_order(left.key, right.key))
         });
-        if !has_unique_data_evidence && !has_active_bulk_work {
+        if !has_bulk_rate_evidence && !has_active_bulk_work {
             candidates.truncate(1);
         }
         bulk_striping_admitted_cohort(candidates, payload_bytes, self.mux_limits)
@@ -1379,7 +1364,7 @@ impl ClientPathContext {
         let admitted = candidates
             .into_iter()
             .filter(|candidate| {
-                !candidate.has_unique_data_evidence && candidate.snapshot.active_flows == 0
+                !candidate.has_bulk_rate_evidence && candidate.snapshot.active_flows == 0
             })
             .collect::<Vec<_>>();
         carrier_diverse_bulk_validation_order(admitted)
@@ -1824,10 +1809,7 @@ impl ClientPathContext {
                     .tcp
                     .get_mut(index)
                     .map(|record| {
-                        bulk_candidate_has_unique_data_evidence(
-                            path,
-                            record.observe(Instant::now()),
-                        )
+                        bulk_candidate_has_bulk_rate_evidence(path, record.observe(Instant::now()))
                     })
                     .unwrap_or(false)
             }
@@ -1839,10 +1821,7 @@ impl ClientPathContext {
                     .udp
                     .get_mut(index)
                     .map(|record| {
-                        bulk_candidate_has_unique_data_evidence(
-                            path,
-                            record.observe(Instant::now()),
-                        )
+                        bulk_candidate_has_bulk_rate_evidence(path, record.observe(Instant::now()))
                     })
                     .unwrap_or(false)
             }

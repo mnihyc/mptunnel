@@ -9,6 +9,9 @@ import sys
 import threading
 import time
 
+DEFAULT_INTERVAL_SECONDS = 0.2
+INTERVAL_TRIM_DISCARD_EACH_END = 3
+
 
 def split_host_port(value):
     if value.startswith("["):
@@ -91,14 +94,33 @@ def connect_target(args):
     return sock
 
 
-def interval_rates_mbps(interval_bytes, interval_seconds):
+def interval_metric_fields(interval_bytes, interval_seconds):
     if interval_seconds <= 0 or not interval_bytes:
-        return []
-    last_index = max(interval_bytes)
-    return [
-        round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
-        for index in range(last_index + 1)
-    ]
+        raw = []
+    else:
+        raw = [
+            round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
+            for index in range(max(interval_bytes) + 1)
+        ]
+    trimmed = (
+        raw[INTERVAL_TRIM_DISCARD_EACH_END:-INTERVAL_TRIM_DISCARD_EACH_END]
+        if len(raw) > INTERVAL_TRIM_DISCARD_EACH_END * 2
+        else []
+    )
+    fields = {
+        "interval_seconds": interval_seconds,
+        "interval_trim_discard_each_end": INTERVAL_TRIM_DISCARD_EACH_END,
+        "interval_goodput_raw_mbps": raw,
+        "interval_goodput_mbps": trimmed,
+        "interval_goodput_avg_mbps": None,
+        "interval_goodput_max_mbps": None,
+        "interval_goodput_min_mbps": None,
+    }
+    if trimmed:
+        fields["interval_goodput_avg_mbps"] = round(sum(trimmed) / len(trimmed), 3)
+        fields["interval_goodput_max_mbps"] = max(trimmed)
+        fields["interval_goodput_min_mbps"] = min(trimmed)
+    return fields
 
 
 def record_interval_chunk(started, state, lock, size):
@@ -219,7 +241,7 @@ def interval_upload(args):
         else "fail"
     )
     goodput = bytes_sent * 8 / elapsed / 1_000_000 if elapsed > 0 else 0.0
-    return {
+    result = {
         "case": args.label,
         "protocol": args.protocol,
         "status": status,
@@ -241,11 +263,9 @@ def interval_upload(args):
         "max_write_gap_s": round(state["max_write_gap_s"], 6),
         "recovery_gap_s": round(state["recovery_gap_s"], 6),
         "failover_after_s": args.failover_after,
-        "interval_seconds": args.interval_seconds,
-        "interval_goodput_mbps": interval_rates_mbps(
-            state["interval_bytes"], args.interval_seconds
-        ),
     }
+    result.update(interval_metric_fields(state["interval_bytes"], args.interval_seconds))
+    return result
 
 
 def main():
@@ -259,7 +279,7 @@ def main():
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--parallel-uploads", type=int, default=1)
-    parser.add_argument("--interval-seconds", type=float, default=1.0)
+    parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--started-file")
     args = parser.parse_args()
     try:

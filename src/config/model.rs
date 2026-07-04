@@ -114,17 +114,18 @@ impl ManagementConfig {
     }
 }
 
-pub const DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT: u16 = 1;
+pub const DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MppPerformanceConfig {
     /// Operator hint for adaptive duplicate/probe/repair overhead, in percent.
     ///
-    /// 1 means the sender treats roughly 1% extra transport traffic as
-    /// acceptable when runtime evidence shows that additional repair/probing can
-    /// reduce stalls. 100 permits full duplication in pathological cases, and
-    /// values above 100 bias toward redundant repair under severe instability.
-    /// This is a hint, not a production hard limit.
+    /// 5 means the sender may spend roughly 5% extra transport traffic when
+    /// runtime evidence shows that duplicate, repair, or probe work can reduce
+    /// stalls. The sender enforces this as a hard optional-work budget plus a
+    /// small startup floor; it is not a product-data throttle. 100 permits full
+    /// duplication in pathological cases, and values above 100 bias toward
+    /// redundant repair under severe instability.
     pub extra_traffic_hint_percent: u16,
 }
 
@@ -755,6 +756,14 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_traffic_hint_default_is_optimistic_five_percent() {
+        assert_eq!(
+            MppPerformanceConfig::default().extra_traffic_hint_percent,
+            5
+        );
+    }
 
     #[test]
     fn udp_paths_reject_unknown_query_parameters() {

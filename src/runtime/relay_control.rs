@@ -448,9 +448,7 @@ where
                     continue;
                 }
                 if remotes.path_keys().len() <= 1 {
-                    if reliable_relay_product_stall_keeps_sole_carrier(
-                        remotes.active_path_underlay(),
-                    ) {
+                    if remotes.active_path_underlay().is_some() {
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "client_product_stall_keeps_sole_carrier",
@@ -671,25 +669,15 @@ where
                         )
                         .await
                     {
-                        Ok(ClientQueuedDispatch::Data {
-                            path_key,
-                            payload_bytes,
-                        }) => {
+                        Ok(ClientQueuedDispatch::Data { payload_bytes }) => {
                             dispatched_items = dispatched_items.saturating_add(1);
                             dispatched_payload_bytes =
                                 dispatched_payload_bytes.saturating_add(payload_bytes);
                             last_stream_progress_at = Instant::now();
                             stats.record_payload_bytes(payload_bytes);
-                            path_stats
-                                .entry(path_key)
-                                .or_default()
-                                .record_payload_bytes(payload_bytes);
                         }
-                        Ok(ClientQueuedDispatch::Repair {
-                            path_key,
-                            payload_bytes,
-                        }) => {
-                            let _ = (path_key, payload_bytes);
+                        Ok(ClientQueuedDispatch::Repair { payload_bytes }) => {
+                            let _ = payload_bytes;
                             dispatched_items = dispatched_items.saturating_add(1);
                             last_stream_progress_at = Instant::now();
                         }
@@ -1061,7 +1049,6 @@ where
                         payload,
                     } if received_stream_id == stream_id && remote_open => {
                         let previous_remote_offset = recv_stream.next_offset();
-                        #[cfg(feature = "lab-diagnostics")]
                         let payload_len = payload.len();
                         #[cfg(feature = "lab-diagnostics")]
                         let mux_started = Instant::now();
@@ -1110,20 +1097,19 @@ where
                             response_stall_reannounce_attempts = 0;
                         }
                         let mut write_error = None;
-                        let mut delivered_payload_bytes = 0usize;
                         let delivered = outcome.delivered;
-                        for chunk in delivered.iter() {
-                            stats.record_payload_bytes(chunk.len());
-                            let path_stat = path_stats
-                                .entry(path_key)
-                                .or_default();
-                            path_stat.record_payload_bytes(chunk.len());
-                            delivered_payload_bytes =
-                                delivered_payload_bytes.saturating_add(chunk.len());
+                        let delivered_payload_bytes = record_client_response_delivery_accounting(
+                            &mut stats,
+                            &mut path_stats,
+                            path_key,
+                            delivered.as_slice(),
+                            if delivered_progress { payload_len } else { 0 },
+                        );
+                        if let Some(path_stat) = path_stats.get(&path_key).copied() {
                             maybe_mark_live_relay_path_delivery(
                                 context,
                                 path_key,
-                                *path_stat,
+                                path_stat,
                                 &mut path_next_live_sample_bytes,
                             );
                         }
@@ -1261,7 +1247,8 @@ where
                             path_snapshot,
                             relay_lane,
                             context.mux_limits,
-                        );
+                        )
+                        .min(sender.repair_extra_event_budget_remaining(context.mux_limits));
                         let has_multipath_repair_alternative = remotes.path_keys().len() > 1;
                         let udp_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
@@ -1319,17 +1306,23 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            sender_queue
-                                .push_repair_with_cause(frame, RelaySendCause::AckGapRepair);
+                            let queued = sender.enqueue_repair_frame(
+                                &mut sender_queue,
+                                frame,
+                                RelaySendCause::AckGapRepair,
+                                context.mux_limits,
+                            );
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
                                 "repair",
                                 format_args!(
-                                    "stream_id={} cause={} queued=true",
-                                    stream_id.0, repair_kind,
+                                    "stream_id={} cause={} queued={}",
+                                    stream_id.0, repair_kind, queued,
                                 ),
                             );
-                            sender_retry_at = None;
+                            if queued {
+                                sender_retry_at = None;
+                            }
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
@@ -1618,6 +1611,28 @@ fn maybe_mark_live_relay_path_delivery(
     );
 }
 
+fn record_client_response_delivery_accounting(
+    total_stats: &mut PathDeliveryStats,
+    path_stats: &mut HashMap<RelayPathKey, PathDeliveryStats>,
+    path_key: RelayPathKey,
+    delivered: &[Bytes],
+    path_scoped_received_bytes: usize,
+) -> usize {
+    let mut delivered_payload_bytes = 0usize;
+    for chunk in delivered {
+        total_stats.record_payload_bytes(chunk.len());
+        delivered_payload_bytes = delivered_payload_bytes.saturating_add(chunk.len());
+    }
+    let path_scoped_delivered_bytes = path_scoped_received_bytes.min(delivered_payload_bytes);
+    if path_scoped_delivered_bytes > 0 {
+        path_stats
+            .entry(path_key)
+            .or_default()
+            .record_payload_bytes(path_scoped_delivered_bytes);
+    }
+    delivered_payload_bytes
+}
+
 fn reliable_relay_can_finish_after_path_loss(
     local_open: bool,
     remote_open: bool,
@@ -1822,6 +1837,9 @@ fn spawn_reliable_relay_validation_opens(
     if !relay_lane_is_bulk(lane) {
         return false;
     }
+    if !pending.is_empty() {
+        return false;
+    }
     let stream_id = remotes.stream_id();
     let payload_bytes =
         reliable_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
@@ -1837,11 +1855,12 @@ fn spawn_reliable_relay_validation_opens(
         }
     }
     let candidates = unique_candidates;
-    let candidates = candidates
+    let mut candidates = candidates
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
         .filter(|key| !pending.contains_key(key))
         .collect::<Vec<_>>();
+    candidates.truncate(1);
     if candidates.is_empty() {
         return false;
     }
@@ -1937,7 +1956,6 @@ pub(super) struct RelayPathAttachRequest<'a> {
     candidates: Vec<RelayPathKey>,
     role: StreamOpenRole,
     send_attach_control: bool,
-    attach_all_candidates: bool,
 }
 
 pub(super) async fn attach_relay_path_candidates(
@@ -1984,9 +2002,7 @@ pub(super) async fn attach_relay_path_candidates(
                             StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        if !request.attach_all_candidates {
-                            return Ok(attached);
-                        }
+                        return Ok(attached);
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         context.mark_relay_path_failure(key.underlay, key.index);
@@ -2085,10 +2101,6 @@ pub(super) async fn attach_reliable_relay_paths(
         }
     };
     if matches!(mode, ReliableRelayAttachMode::BulkStriping) {
-        let attach_plan = relay_bulk_attach_plan(
-            context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
-            !remotes.is_empty(),
-        );
         let result = attach_relay_path_candidates(
             context,
             remotes,
@@ -2097,10 +2109,9 @@ pub(super) async fn attach_reliable_relay_paths(
                 lane,
                 send_stream,
                 resend_fin,
-                candidates: attach_plan.candidates,
+                candidates: context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
                 role: StreamOpenRole::Validation,
                 send_attach_control: false,
-                attach_all_candidates: attach_plan.attach_all_candidates,
             },
         )
         .await;
@@ -2138,7 +2149,6 @@ pub(super) async fn attach_reliable_relay_paths(
                 ),
                 role,
                 send_attach_control: true,
-                attach_all_candidates: false,
             },
         )
         .await;
@@ -2159,7 +2169,6 @@ pub(super) async fn attach_reliable_relay_paths(
             ),
             role,
             send_attach_control: true,
-            attach_all_candidates: false,
         },
     )
     .await
@@ -2184,40 +2193,16 @@ pub(super) fn reliable_relay_repair_path_candidates(
     lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<RelayPathKey> {
-    let require_udp_delivery_evidence =
-        matches!(lane, FlowLane::Throughput | FlowLane::Background) && !remotes.is_empty();
     context
         .ordered_reliable_repair_path_keys(
             remotes.active_path_index_for(UnderlayProtocol::Tcp),
             remotes.active_path_index_for(UnderlayProtocol::Udp),
             lane,
             payload_bytes,
-            require_udp_delivery_evidence,
         )
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
         .collect()
-}
-
-pub(super) struct RelayBulkAttachPlan {
-    pub(super) candidates: Vec<RelayPathKey>,
-    pub(super) attach_all_candidates: bool,
-}
-
-pub(super) fn relay_bulk_attach_plan(
-    candidates: Vec<RelayPathKey>,
-    has_attached_output: bool,
-) -> RelayBulkAttachPlan {
-    if !has_attached_output {
-        return RelayBulkAttachPlan {
-            candidates,
-            attach_all_candidates: false,
-        };
-    }
-    RelayBulkAttachPlan {
-        attach_all_candidates: true,
-        candidates,
-    }
 }
 
 pub(super) fn reliable_relay_should_race_repair(
@@ -2349,15 +2334,6 @@ pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Du
     QUIC_PERSISTENT_CONGESTION_THRESHOLD
 }
 
-pub(super) fn reliable_relay_product_stall_keeps_sole_carrier(
-    active_underlay: Option<UnderlayProtocol>,
-) -> bool {
-    matches!(
-        active_underlay,
-        Some(UnderlayProtocol::Tcp | UnderlayProtocol::Udp)
-    )
-}
-
 pub(super) fn reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
     remotes: &ReliableRelayRemoteSet,
     lane: FlowLane,
@@ -2462,21 +2438,40 @@ mod tests {
     }
 
     #[test]
-    fn product_stall_keeps_sole_reliable_carrier_instead_of_reopening_same_path() {
-        assert!(reliable_relay_product_stall_keeps_sole_carrier(Some(
-            UnderlayProtocol::Udp
-        )));
-        assert!(reliable_relay_product_stall_keeps_sole_carrier(Some(
-            UnderlayProtocol::Tcp
-        )));
-        assert!(!reliable_relay_product_stall_keeps_sole_carrier(None));
-    }
-
-    #[test]
     fn pending_fin_policy_is_ordered_queue_state_not_carrier_family() {
         assert!(reliable_relay_can_send_pending_fin(true, true));
         assert!(!reliable_relay_can_send_pending_fin(true, false));
         assert!(!reliable_relay_can_send_pending_fin(false, true));
+    }
+
+    #[test]
+    fn response_delivery_accounting_credits_current_frame_not_released_buffer() {
+        let path_key = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        };
+        let delivered = [
+            Bytes::from_static(&[0; 1024]),
+            Bytes::from_static(&[1; 4096]),
+        ];
+        let mut total = PathDeliveryStats::default();
+        let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
+
+        let delivered_bytes = record_client_response_delivery_accounting(
+            &mut total,
+            &mut path_stats,
+            path_key,
+            &delivered,
+            1024,
+        );
+
+        assert_eq!(delivered_bytes, 5120);
+        assert_eq!(total.payload_bytes, 5120);
+        assert_eq!(
+            path_stats.get(&path_key).expect("path stat").payload_bytes,
+            1024,
+            "hole-closing carrier must not inherit buffered bytes released from other paths"
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,8 @@ import threading
 import time
 
 IPPROTO_MPTCP = getattr(socket, "IPPROTO_MPTCP", 262)
+DEFAULT_INTERVAL_SECONDS = 0.2
+INTERVAL_TRIM_DISCARD_EACH_END = 3
 
 
 def split_host_port(value):
@@ -40,14 +42,33 @@ def parse_headers(buffer):
     return int(parts[1]), content_length, body
 
 
-def interval_rates_mbps(interval_bytes, interval_seconds):
+def interval_metric_fields(interval_bytes, interval_seconds):
     if interval_seconds <= 0 or not interval_bytes:
-        return []
-    last_index = max(interval_bytes)
-    return [
-        round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
-        for index in range(last_index + 1)
-    ]
+        raw = []
+    else:
+        raw = [
+            round(interval_bytes.get(index, 0) * 8 / interval_seconds / 1_000_000, 3)
+            for index in range(max(interval_bytes) + 1)
+        ]
+    trimmed = (
+        raw[INTERVAL_TRIM_DISCARD_EACH_END:-INTERVAL_TRIM_DISCARD_EACH_END]
+        if len(raw) > INTERVAL_TRIM_DISCARD_EACH_END * 2
+        else []
+    )
+    fields = {
+        "interval_seconds": interval_seconds,
+        "interval_trim_discard_each_end": INTERVAL_TRIM_DISCARD_EACH_END,
+        "interval_goodput_raw_mbps": raw,
+        "interval_goodput_mbps": trimmed,
+        "interval_goodput_avg_mbps": None,
+        "interval_goodput_max_mbps": None,
+        "interval_goodput_min_mbps": None,
+    }
+    if trimmed:
+        fields["interval_goodput_avg_mbps"] = round(sum(trimmed) / len(trimmed), 3)
+        fields["interval_goodput_max_mbps"] = max(trimmed)
+        fields["interval_goodput_min_mbps"] = min(trimmed)
+    return fields
 
 
 def serve_client(conn, file_path):
@@ -194,11 +215,8 @@ def download(args):
         "goodput_mbps": state["bytes"] * 8 / elapsed / 1_000_000 if elapsed > 0 else 0.0,
         "first_body_s": state["first_body_s"],
         "max_read_gap_s": state["max_read_gap_s"],
-        "interval_seconds": args.interval_seconds,
-        "interval_goodput_mbps": interval_rates_mbps(
-            state["interval_bytes"], args.interval_seconds
-        ),
     }
+    row.update(interval_metric_fields(state["interval_bytes"], args.interval_seconds))
     if error:
         row["error"] = error
     print(json.dumps(row, separators=(",", ":")))
@@ -218,7 +236,7 @@ def main():
     client.add_argument("--path", default="/large.bin")
     client.add_argument("--timeout", type=float, default=120.0)
     client.add_argument("--load-duration", type=float, default=30.0)
-    client.add_argument("--interval-seconds", type=float, default=1.0)
+    client.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     client.add_argument("--chunk-bytes", type=int, default=256 * 1024)
     args = parser.parse_args()
     if args.command == "check":

@@ -16,7 +16,6 @@ pub(super) struct BulkPathCandidate {
     pub(super) has_ack_data_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) has_bulk_rate_evidence: bool,
-    pub(super) has_unique_data_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) has_sender_delivery_evidence: bool,
     pub(super) snapshot: PathSnapshot,
@@ -310,7 +309,8 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
             .product_bytes_in_flight
             .saturating_add(candidate.product_queue_bytes)
             .saturating_add(candidate.queue_bytes);
-        return committed.saturating_add(payload_bytes as u64) <= inflight_limit;
+        return committed.saturating_add(payload_bytes as u64) <= inflight_limit
+            || committed < inflight_limit;
     }
     let use_carrier_gate = candidate.underlay == UnderlayProtocol::Udp
         && !bulk_uses_product_only_active_gate(candidate, role);
@@ -325,10 +325,26 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
             bulk_scheduler_inflight_debt_bytes(candidate, role),
         )
     };
-    if inflight_limit > 0 && committed.saturating_add(payload_bytes as u64) > inflight_limit {
+    if !bulk_quantum_granular_limit_allows(committed, payload_bytes, inflight_limit, role) {
         return false;
     }
     true
+}
+
+fn bulk_quantum_granular_limit_allows(
+    committed: u64,
+    payload_bytes: usize,
+    limit: u64,
+    role: BulkAdmissionRole,
+) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let payload_bytes = payload_bytes as u64;
+    if committed.saturating_add(payload_bytes) <= limit {
+        return true;
+    }
+    matches!(role, BulkAdmissionRole::AdditionalSameUnderlay) && committed < limit
 }
 
 fn bulk_active_lead_has_contiguous_frontier(
@@ -413,9 +429,12 @@ fn bulk_candidate_within_reorder_budget(
         role,
         stream_ordering_debt_bytes,
     );
-    bulk_total_reorder_debt_bytes(candidate, role, stream_ordering_debt_bytes)
-        .saturating_add(payload_bytes as u64)
-        <= admission_budget
+    bulk_quantum_granular_limit_allows(
+        bulk_total_reorder_debt_bytes(candidate, role, stream_ordering_debt_bytes),
+        payload_bytes,
+        admission_budget,
+        role,
+    )
 }
 
 fn bulk_reorder_absorption_ms(
@@ -631,7 +650,6 @@ mod tests {
             has_path_proof_evidence: false,
             has_ack_data_evidence: true,
             has_bulk_rate_evidence: true,
-            has_unique_data_evidence: true,
             has_sender_delivery_evidence: true,
             snapshot: PathSnapshot::new(
                 PathId(index as u16),
@@ -655,6 +673,31 @@ mod tests {
 
         assert_eq!(admitted.len(), 2);
         assert_eq!(admitted[1].key.index, 1);
+    }
+
+    #[test]
+    fn same_underlay_candidate_with_sub_quantum_debt_still_gets_one_service_quantum() {
+        let payload_bytes = 512 * 1024;
+        let best = candidate(0, 1000.0, 80.0, 200.0);
+        let mut alternate = candidate(1, 1001.0, 80.0, 200.0);
+        alternate.snapshot.inflight_limit_bytes = payload_bytes as u64;
+        alternate.snapshot.bytes_in_flight = 34;
+        alternate.snapshot.product_bytes_in_flight = 34;
+
+        let admitted = bulk_striping_admitted_cohort(
+            vec![best, alternate],
+            payload_bytes,
+            MuxLimits::default(),
+        );
+
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|candidate| candidate.key.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "same-underlay admission is quantum-granular: tiny existing product debt should not suppress one otherwise-admissible service quantum"
+        );
     }
 
     #[test]

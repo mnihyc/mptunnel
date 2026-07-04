@@ -17,7 +17,8 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) path_metrics: Option<ServerPathMetricsEntry>,
-    pub(super) bulk_discovery_sent_bytes: u64,
+    pub(super) trial_owner_sent_bytes: u64,
+    pub(super) duplicate_validation_sent_bytes: u64,
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
@@ -32,8 +33,10 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
+    pub(in crate::runtime) has_ack_data_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
-    pub(in crate::runtime) bulk_discovery_sent_bytes: u64,
+    pub(in crate::runtime) trial_owner_sent_bytes: u64,
+    pub(in crate::runtime) duplicate_validation_sent_bytes: u64,
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -46,8 +49,13 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) end: u64,
     pub(super) bytes: usize,
     pub(super) sent_at: Instant,
-    pub(super) stream_ack_proves_path: bool,
-    pub(super) owns_ordering_frontier: bool,
+    pub(super) kind: CarrierWorkKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct CarrierPathReleasedFlight {
+    pub(super) flight: CarrierPathFlight,
+    pub(super) path_proving: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,8 +69,8 @@ pub(in crate::runtime) struct CarrierPathAckedHole {
     pub(super) key: CarrierPathKey,
     pub(super) end: u64,
     pub(super) bytes: u64,
-    pub(super) stream_ack_proves_path: bool,
-    pub(super) owns_ordering_frontier: bool,
+    pub(super) kind: CarrierWorkKind,
+    pub(super) path_proving: bool,
 }
 
 #[derive(Debug, Default)]
@@ -83,19 +91,20 @@ impl ResponseAckOrderingState {
     pub(super) fn apply_normalized_ack(
         &mut self,
         ranges: &[OffsetRange],
-        released: &[(u64, CarrierPathFlight)],
+        released: &[(u64, CarrierPathReleasedFlight)],
     ) -> ResponseAckOrderingUpdate {
         let previous_frontier = self.contiguous_frontier;
         let previous_hole_bytes = self.acked_hole_bytes();
         let mut newly_contiguous = Vec::new();
 
-        for (offset, flight) in released {
+        for (offset, release) in released {
+            let flight = release.flight;
             let hole = CarrierPathAckedHole {
                 key: flight.key,
                 end: flight.end,
                 bytes: flight.bytes as u64,
-                stream_ack_proves_path: flight.stream_ack_proves_path,
-                owns_ordering_frontier: flight.owns_ordering_frontier,
+                kind: flight.kind,
+                path_proving: release.path_proving,
             };
             if hole.end <= self.contiguous_frontier {
                 newly_contiguous.push(hole);
@@ -172,13 +181,16 @@ pub(in crate::runtime) fn response_latest_ordering_flight(
     flights
         .iter()
         .rev()
-        .find(|flight| flight.owns_ordering_frontier)
+        .find(|flight| flight.kind.is_ordering_owner())
 }
 
 pub(in crate::runtime) fn response_latest_ordering_hole(
     holes: &[CarrierPathAckedHole],
 ) -> Option<&CarrierPathAckedHole> {
-    holes.iter().rev().find(|hole| hole.owns_ordering_frontier)
+    holes
+        .iter()
+        .rev()
+        .find(|hole| hole.kind.is_ordering_owner())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +497,17 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         )
 }
 
+pub(in crate::runtime) fn server_output_has_ack_data_evidence(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
+    entry.delivery_samples > 0
+        || entry.delivery_rate_bps.is_some()
+        || matches!(
+            entry.path_metrics,
+            Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
+        )
+}
+
 pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
@@ -571,7 +594,8 @@ mod tests {
             delivery_samples: 1,
             last_delivery_at: Some(Instant::now()),
             path_metrics: None,
-            bulk_discovery_sent_bytes: 0,
+            trial_owner_sent_bytes: 0,
+            duplicate_validation_sent_bytes: 0,
         };
 
         assert!(
@@ -630,7 +654,8 @@ mod tests {
                     data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
-            bulk_discovery_sent_bytes: 0,
+            trial_owner_sent_bytes: 0,
+            duplicate_validation_sent_bytes: 0,
         };
 
         assert!(
@@ -685,7 +710,8 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
-            bulk_discovery_sent_bytes: 0,
+            trial_owner_sent_bytes: 0,
+            duplicate_validation_sent_bytes: 0,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();
@@ -712,6 +738,64 @@ mod tests {
             !server_output_has_bulk_rate_evidence(&entry),
             "ACK-data seen without non-app-limited samples is not ordinary bulk-rate proof"
         );
+    }
+
+    #[test]
+    fn local_proof_metrics_are_sender_evidence_not_ack_data_evidence() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(10),
+        };
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 40_000,
+                    srtt_us: 40_000,
+                    rttvar_us: 2_000,
+                    jitter_us: 2_000,
+                    delivery_rate_bps: 32_000,
+                    pacing_rate_bps: 32_000,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: 0,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                    inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                    confidence_ppm: 1_000_000,
+                    app_limited: true,
+                    has_ack_derived_data_sample: false,
+                    data_sample_count: 0,
+                    data_sample_bytes: 0,
+                },
+            }),
+            trial_owner_sent_bytes: 0,
+            duplicate_validation_sent_bytes: 0,
+        };
+
+        assert!(server_output_has_sender_evidence(&entry));
+        assert!(
+            !server_output_has_ack_data_evidence(&entry),
+            "PATH_PROOF-style liveness evidence must not become ACK-data evidence for unique Trial ownership"
+        );
+        assert!(!server_output_has_bulk_rate_evidence(&entry));
     }
 
     #[test]
@@ -761,7 +845,8 @@ mod tests {
                     data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
-            bulk_discovery_sent_bytes: 0,
+            trial_owner_sent_bytes: 0,
+            duplicate_validation_sent_bytes: 0,
         };
 
         assert!(matches!(
@@ -805,7 +890,8 @@ mod tests {
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             last_delivery_at: Some(Instant::now()),
             path_metrics: None,
-            bulk_discovery_sent_bytes: 0,
+            trial_owner_sent_bytes: 0,
+            duplicate_validation_sent_bytes: 0,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();

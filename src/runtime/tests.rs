@@ -886,7 +886,7 @@ fn fixed_response_output_keeps_product_flight_out_of_carrier_flight() {
     let ReliablePathStreamOutput::Fixed(fixed) = &output else {
         panic!("expected fixed output");
     };
-    fixed.record_flight(&frame, true);
+    fixed.record_owner_flight(&frame);
 
     let snapshot = output
         .send_path_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
@@ -1549,7 +1549,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(0),
     };
-    binding.record_flight(
+    binding.record_owner_flight(
         lower_owner_key,
         &Frame::StreamData {
             stream_id,
@@ -1557,7 +1557,6 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
             flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"x"),
         },
-        true,
     );
     binding.detach(lower_owner_key, &tcp_commands_for_detach);
 
@@ -2712,13 +2711,12 @@ fn tail_stall_repair_retransmits_same_frontier_only_after_stall_evidence() {
         flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"frontier"),
     };
-    binding.record_flight(
+    binding.record_owner_flight(
         CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(0),
         },
         &frame,
-        true,
     );
     let later_frame = Frame::StreamData {
         stream_id,
@@ -3068,7 +3066,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable output");
     };
-    binding.record_flight(
+    binding.record_owner_flight(
         CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(0),
@@ -3079,7 +3077,6 @@ fn server_response_output_inherits_open_path_startup_metrics() {
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0x22; PATH_OPEN_SCORE_BYTES]),
         },
-        true,
     );
     let with_product_flight = stream
         .send_path_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)

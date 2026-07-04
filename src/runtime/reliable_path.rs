@@ -274,7 +274,16 @@ impl FixedReliablePathOutput {
         model.product_queue_bytes = bytes as u64;
     }
 
-    pub(super) fn record_flight(&self, frame: &Frame, stream_ack_proves_path: bool) {
+    pub(super) fn record_owner_flight(&self, frame: &Frame) {
+        self.record_product_flight(frame, CarrierWorkKind::OwnerData)
+    }
+
+    pub(super) fn record_repair_flight(&self, frame: &Frame) {
+        self.record_product_flight(frame, CarrierWorkKind::RepairData)
+    }
+
+    fn record_product_flight(&self, frame: &Frame, kind: CarrierWorkKind) {
+        debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
@@ -289,8 +298,7 @@ impl FixedReliablePathOutput {
                 end,
                 bytes,
                 sent_at: Instant::now(),
-                stream_ack_proves_path,
-                owns_ordering_frontier: true,
+                kind,
             });
     }
 
@@ -322,10 +330,11 @@ impl FixedReliablePathOutput {
         let mut released_proven_flights = 0_u32;
         for offset in acked_offsets {
             if let Some(path_flights) = model.flights.remove(&offset) {
+                let path_proving = carrier_path_flights_have_unambiguous_owner_ack(&path_flights);
                 for flight in path_flights {
                     model.bytes_in_flight =
                         model.bytes_in_flight.saturating_sub(flight.bytes as u64);
-                    if flight.stream_ack_proves_path {
+                    if path_proving && flight.kind.is_ordering_owner() {
                         sample_bytes = sample_bytes.saturating_add(flight.bytes as u64);
                         sample_start = sample_start.min(flight.sent_at);
                         released_proven_flights = released_proven_flights.saturating_add(1);
@@ -545,6 +554,7 @@ pub(super) struct ResponseStreamBinding {
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
+    cohort_epoch: Mutex<Option<FlowCohortEpoch>>,
     version: watch::Sender<u64>,
 }
 
@@ -622,12 +632,14 @@ impl ResponseStreamBinding {
                     delivery_samples: 0,
                     last_delivery_at: None,
                     path_metrics: None,
-                    bulk_discovery_sent_bytes: 0,
+                    trial_owner_sent_bytes: 0,
+                    duplicate_validation_sent_bytes: 0,
                 }],
             }),
             ordered_data_owner: Mutex::new(Some(key)),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
+            cohort_epoch: Mutex::new(None),
             version,
         })
     }
@@ -731,7 +743,8 @@ impl ResponseStreamBinding {
                 delivery_samples: 0,
                 last_delivery_at: None,
                 path_metrics: None,
-                bulk_discovery_sent_bytes: 0,
+                trial_owner_sent_bytes: 0,
+                duplicate_validation_sent_bytes: 0,
             }
         };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
@@ -917,6 +930,7 @@ impl ResponseStreamBinding {
                 .expect("server response ACK ordering lock")
                 .apply_normalized_ack(ranges, &[]);
             if ordering_update.changed {
+                self.reset_cohort_epoch();
                 self.notify_update();
             }
             return;
@@ -924,7 +938,16 @@ impl ResponseStreamBinding {
         let mut released = Vec::new();
         for offset in acked_offsets {
             if let Some(path_flights) = flights.remove(&offset) {
-                released.extend(path_flights.into_iter().map(|flight| (offset, flight)));
+                let path_proving = carrier_path_flights_have_unambiguous_owner_ack(&path_flights);
+                released.extend(path_flights.into_iter().map(|flight| {
+                    (
+                        offset,
+                        CarrierPathReleasedFlight {
+                            flight,
+                            path_proving: path_proving && flight.kind.is_ordering_owner(),
+                        },
+                    )
+                }));
             }
         }
         drop(flights);
@@ -957,14 +980,15 @@ impl ResponseStreamBinding {
         let now = Instant::now();
         let mut changed = false;
         let mut path_samples = HashMap::<CarrierPathKey, (u64, Instant)>::new();
-        for (_, flight) in released {
+        for (_, release) in released {
+            let flight = release.flight;
             if let Some(entry) = outputs
                 .entries
                 .iter_mut()
                 .find(|entry| entry.key == flight.key)
             {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
-                if flight.stream_ack_proves_path {
+                if release.path_proving {
                     let sample = path_samples
                         .entry(flight.key)
                         .or_insert((0_u64, flight.sent_at));
@@ -999,7 +1023,7 @@ impl ResponseStreamBinding {
             }
         }
         for hole in ordering_update.newly_contiguous {
-            if !hole.stream_ack_proves_path {
+            if !hole.path_proving {
                 continue;
             }
             if let Some(entry) = outputs
@@ -1016,6 +1040,7 @@ impl ResponseStreamBinding {
         }
         drop(outputs);
         if changed || ordering_update.changed {
+            self.reset_cohort_epoch();
             self.notify_update();
         }
     }
@@ -1037,6 +1062,103 @@ impl ResponseStreamBinding {
             drop(lead);
             self.notify_update();
         }
+    }
+
+    fn cohort_epoch_for(
+        current: Option<FlowCohortEpoch>,
+        service: CarrierPathKey,
+        owner_credit_bytes: usize,
+        optional_credit_bytes: usize,
+        optional_overhead_budget_bytes: usize,
+        max_read_gap_budget: Duration,
+    ) -> FlowCohortEpoch {
+        current
+            .filter(|epoch| {
+                epoch.matches_envelope(
+                    service,
+                    owner_credit_bytes,
+                    optional_credit_bytes,
+                    optional_overhead_budget_bytes,
+                    max_read_gap_budget,
+                )
+            })
+            .unwrap_or_else(|| {
+                FlowCohortEpoch::new(
+                    0,
+                    service,
+                    owner_credit_bytes,
+                    optional_credit_bytes,
+                    optional_overhead_budget_bytes,
+                    max_read_gap_budget,
+                )
+            })
+    }
+
+    pub(super) fn cohort_epoch_snapshot(&self) -> Option<FlowCohortEpoch> {
+        self.cohort_epoch
+            .lock()
+            .expect("server reliable stream cohort epoch lock")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn preview_cohort_owner_admission(
+        &self,
+        service: CarrierPathKey,
+        owner_credit_bytes: usize,
+        optional_credit_bytes: usize,
+        optional_overhead_budget_bytes: usize,
+        max_read_gap_budget: Duration,
+        input: OptionalOwnerAdmissionInput,
+    ) -> OptionalPathAdmission {
+        let current = self
+            .cohort_epoch
+            .lock()
+            .expect("server reliable stream cohort epoch lock")
+            .clone();
+        let mut epoch = Self::cohort_epoch_for(
+            current,
+            service,
+            owner_credit_bytes,
+            optional_credit_bytes,
+            optional_overhead_budget_bytes,
+            max_read_gap_budget,
+        );
+        epoch.admit_optional_owner(input)
+    }
+
+    pub(super) fn commit_cohort_owner_admission(
+        &self,
+        service: CarrierPathKey,
+        owner_credit_bytes: usize,
+        optional_credit_bytes: usize,
+        optional_overhead_budget_bytes: usize,
+        max_read_gap_budget: Duration,
+        input: OptionalOwnerAdmissionInput,
+    ) -> OptionalPathAdmission {
+        let mut guard = self
+            .cohort_epoch
+            .lock()
+            .expect("server reliable stream cohort epoch lock");
+        let current = guard.take();
+        let mut epoch = Self::cohort_epoch_for(
+            current,
+            service,
+            owner_credit_bytes,
+            optional_credit_bytes,
+            optional_overhead_budget_bytes,
+            max_read_gap_budget,
+        );
+        let admission = epoch.admit_optional_owner(input);
+        *guard = Some(epoch);
+        admission
+    }
+
+    pub(super) fn reset_cohort_epoch(&self) {
+        *self
+            .cohort_epoch
+            .lock()
+            .expect("server reliable stream cohort epoch lock") = None;
     }
 
     fn clear_ordered_data_owner_if(&self, key: CarrierPathKey) {
@@ -1062,22 +1184,16 @@ impl ResponseStreamBinding {
                 .is_empty()
     }
 
-    pub(super) fn record_flight(
-        &self,
-        key: CarrierPathKey,
-        frame: &Frame,
-        stream_ack_proves_path: bool,
-    ) {
-        self.record_flight_with_ordering_owner(key, frame, stream_ack_proves_path, true)
+    pub(super) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
+        self.record_product_flight(key, frame, CarrierWorkKind::OwnerData)
     }
 
-    pub(super) fn record_flight_with_ordering_owner(
-        &self,
-        key: CarrierPathKey,
-        frame: &Frame,
-        stream_ack_proves_path: bool,
-        owns_ordering_frontier: bool,
-    ) {
+    pub(super) fn record_repair_flight(&self, key: CarrierPathKey, frame: &Frame) {
+        self.record_product_flight(key, frame, CarrierWorkKind::RepairData)
+    }
+
+    fn record_product_flight(&self, key: CarrierPathKey, frame: &Frame, kind: CarrierWorkKind) {
+        debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
@@ -1100,12 +1216,11 @@ impl ResponseStreamBinding {
                 end,
                 bytes,
                 sent_at: Instant::now(),
-                stream_ack_proves_path,
-                owns_ordering_frontier,
+                kind,
             });
     }
 
-    pub(super) fn record_bulk_discovery_bytes(&self, key: CarrierPathKey, bytes: usize) {
+    pub(super) fn record_trial_owner_bytes(&self, key: CarrierPathKey, bytes: usize) {
         if bytes == 0 {
             return;
         }
@@ -1114,8 +1229,23 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.bulk_discovery_sent_bytes =
-                entry.bulk_discovery_sent_bytes.saturating_add(bytes as u64);
+            entry.trial_owner_sent_bytes =
+                entry.trial_owner_sent_bytes.saturating_add(bytes as u64);
+        }
+    }
+
+    pub(super) fn record_duplicate_validation_bytes(&self, key: CarrierPathKey, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.duplicate_validation_sent_bytes = entry
+                .duplicate_validation_sent_bytes
+                .saturating_add(bytes as u64);
         }
     }
 
@@ -1222,8 +1352,10 @@ impl ResponseStreamBinding {
                     ),
                     is_active: Some(entry.key) == active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
+                    has_ack_data_evidence: server_output_has_ack_data_evidence(entry),
                     has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
-                    bulk_discovery_sent_bytes: entry.bulk_discovery_sent_bytes,
+                    trial_owner_sent_bytes: entry.trial_owner_sent_bytes,
+                    duplicate_validation_sent_bytes: entry.duplicate_validation_sent_bytes,
                 }
             })
             .collect()
@@ -1323,6 +1455,13 @@ impl ResponseStreamBinding {
             self.notify_update();
         }
     }
+}
+
+fn carrier_path_flights_have_unambiguous_owner_ack(flights: &[CarrierPathFlight]) -> bool {
+    matches!(
+        flights,
+        [flight] if flight.kind.is_ordering_owner()
+    )
 }
 
 fn server_stream_open_role_promotes_data_path(role: StreamOpenRole) -> bool {
@@ -1650,7 +1789,7 @@ mod tests {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Udp);
         let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
 
-        binding.record_flight(key, &frame, true);
+        binding.record_owner_flight(key, &frame);
         std::thread::sleep(Duration::from_millis(1));
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
@@ -1670,7 +1809,7 @@ mod tests {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
         let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
 
-        binding.record_flight(key, &frame, true);
+        binding.record_owner_flight(key, &frame);
         std::thread::sleep(Duration::from_millis(1));
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
@@ -1702,8 +1841,8 @@ mod tests {
         );
         let frame = stream_data_frame_at(0, 4096);
 
-        binding.record_flight(owner, &frame, true);
-        binding.record_flight_with_ordering_owner(duplicate, &frame, false, false);
+        binding.record_owner_flight(owner, &frame);
+        binding.record_repair_flight(duplicate, &frame);
 
         let lower = binding.lower_flights_before_offset(4096);
         assert_eq!(lower.len(), 1);
@@ -1727,7 +1866,10 @@ mod tests {
             .expect("duplicate output exists");
         assert_eq!(owner_entry.bytes_in_flight, 0);
         assert_eq!(duplicate_entry.bytes_in_flight, 0);
-        assert_eq!(owner_entry.delivery_samples, 1);
+        assert_eq!(
+            owner_entry.delivery_samples, 0,
+            "ACK of a duplicated byte range is not path-scoped proof for the owner path"
+        );
         assert_eq!(
             duplicate_entry.delivery_samples, 0,
             "duplicate validation STREAM_ACK must not become response bulk evidence"
@@ -1761,7 +1903,7 @@ mod tests {
             .map(|entry| entry.key)
             .collect::<Vec<_>>();
 
-        binding.record_flight_with_ordering_owner(repair, &frame, false, false);
+        binding.record_repair_flight(repair, &frame);
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: 4096,
@@ -1792,6 +1934,116 @@ mod tests {
     }
 
     #[test]
+    fn repair_flight_kind_never_owns_ordering_or_delivery_evidence() {
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Udp);
+        let repair = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            repair.underlay,
+            repair.path_id,
+            repair_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Repair,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+
+        let owner_frame = stream_data_frame_at(0, 1024);
+        let repair_frame = stream_data_frame_at(1024, 1024);
+        binding.record_owner_flight(owner, &owner_frame);
+        binding.record_repair_flight(repair, &repair_frame);
+
+        let lower = binding.lower_flights_before_offset(2048);
+        assert_eq!(lower.len(), 1);
+        assert_eq!(lower[0].key, owner);
+        assert_eq!(lower[0].bytes, 1024);
+
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 2048,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let repair_entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == repair)
+            .expect("repair output exists");
+        assert_eq!(repair_entry.bytes_in_flight, 0);
+        assert_eq!(
+            repair_entry.delivery_samples, 0,
+            "RepairData ACKs release product flight but never become path delivery evidence"
+        );
+    }
+
+    #[test]
+    fn response_cohort_epoch_spends_optional_owner_credit_until_reset() {
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
+        let optional = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let input = OptionalOwnerAdmissionInput {
+            key: optional,
+            bulk_rate_proven: true,
+            frontier_clear: true,
+            completion_improves: true,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        let first = binding.preview_cohort_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(first.decision, OptionalPathDecision::AdmitOwner);
+
+        let committed = binding.commit_cohort_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(committed.decision, OptionalPathDecision::AdmitOwner);
+
+        let second = binding.preview_cohort_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(
+            second.decision,
+            OptionalPathDecision::ProbeOnly,
+            "optional owner credit must persist instead of refreshing for every target check"
+        );
+
+        binding.reset_cohort_epoch();
+        let after_reset = binding.preview_cohort_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(after_reset.decision, OptionalPathDecision::AdmitOwner);
+    }
+
+    #[test]
     fn response_acked_hole_debt_counts_unique_ordering_owner_only() {
         let (binding, owner) = binding_for_underlay(UnderlayProtocol::Udp);
         let duplicate = CarrierPathKey {
@@ -1809,9 +2061,9 @@ mod tests {
         );
         let lower_missing = stream_data_frame_at(0, 1024);
         let later = stream_data_frame_at(1024, 4096);
-        binding.record_flight(owner, &lower_missing, true);
-        binding.record_flight(owner, &later, true);
-        binding.record_flight_with_ordering_owner(duplicate, &later, false, false);
+        binding.record_owner_flight(owner, &lower_missing);
+        binding.record_owner_flight(owner, &later);
+        binding.record_repair_flight(duplicate, &later);
 
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 1024,
@@ -1915,7 +2167,7 @@ mod tests {
         assert_eq!(before_ack.delivery_rate_bps, 500_000_000.0);
 
         let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
-        binding.record_flight(key, &frame, true);
+        binding.record_owner_flight(key, &frame);
         std::thread::sleep(Duration::from_millis(20));
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
@@ -1954,7 +2206,7 @@ mod tests {
         for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
             let frame = stream_data_frame_at(offset, MIN_RATE_SAMPLE_BYTES as usize);
             let end = offset + reliable_stream_frame_payload_bytes(&frame) as u64;
-            fixed.record_flight(&frame, true);
+            fixed.record_owner_flight(&frame);
             std::thread::sleep(Duration::from_millis(20));
             fixed.release_normalized_acked_ranges(&[OffsetRange { start: offset, end }]);
             offset = end;

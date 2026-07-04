@@ -180,6 +180,9 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     if let Some(reason) = bulk_cross_underlay_completion_suppression(check) {
         return Some(reason);
     }
+    if let Some(reason) = bulk_same_underlay_completion_suppression(check) {
+        return Some(reason);
+    }
     if !bulk_candidate_within_inflight_limit(check) {
         return Some("inflight_limit");
     }
@@ -207,6 +210,28 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
         return Some("completion_horizon");
     }
     None
+}
+
+fn bulk_same_underlay_completion_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
+    if check.role != BulkAdmissionRole::AdditionalSameUnderlay {
+        return None;
+    }
+    if check.stream_ordering_debt_bytes > 0 {
+        return None;
+    }
+    if !bulk_same_underlay_requires_completion_gain(check.candidate_snapshot) {
+        return None;
+    }
+    let lead_next_quantum_eta_ms =
+        check.best_eta_ms + bulk_payload_tx_ms(check.best_snapshot, check.payload_bytes);
+    if check.candidate_eta_ms > lead_next_quantum_eta_ms {
+        return Some("same_underlay_no_completion_gain");
+    }
+    None
+}
+
+fn bulk_same_underlay_requires_completion_gain(candidate: PathSnapshot) -> bool {
+    !candidate.app_limited && candidate.confidence >= 1.0
 }
 
 fn bulk_completion_horizon_applies(check: BulkAdmissionCheck) -> bool {
@@ -619,11 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn bulk_admission_allows_candidate_inside_adaptive_eta_cohort() {
+    fn bulk_admission_allows_same_underlay_candidate_that_beats_lead_next_quantum() {
         let admitted = bulk_striping_admitted_cohort(
             vec![
                 candidate(0, 1000.0, 250.0, 100.0),
-                candidate(1, 1040.0, 260.0, 100.0),
+                candidate(1, 1004.0, 260.0, 100.0),
             ],
             64 * 1024,
             MuxLimits::default(),
@@ -783,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_admission_allows_heterogeneous_bulk_when_reorder_budget_can_absorb_gap() {
+    fn same_underlay_candidate_must_not_join_only_because_reorder_budget_can_absorb_gap() {
         let admitted = bulk_striping_admitted_cohort(
             vec![
                 candidate(0, 2958.0, 80.0, 180.0),
@@ -793,8 +818,8 @@ mod tests {
             MuxLimits::default(),
         );
 
-        assert_eq!(admitted.len(), 2);
-        assert_eq!(admitted[1].key.index, 1);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].key.index, 0);
     }
 
     #[test]
@@ -1222,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn same_underlay_clear_frontier_uses_credit_and_reorder_not_completion_horizon() {
+    fn same_underlay_clear_frontier_still_requires_completion_gain_after_bulk_proof() {
         let mut lead = candidate(0, 98_000.0, 80.0, 500.0);
         let mut extra = candidate(1, 1_500_000.0, 80.0, 500.0);
         lead.snapshot.confidence = 1.0;
@@ -1240,7 +1265,7 @@ mod tests {
                 role: BulkAdmissionRole::AdditionalSameUnderlay,
                 stream_ordering_debt_bytes: 0,
             }),
-            None
+            Some("same_underlay_no_completion_gain")
         );
         assert_eq!(
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -1254,6 +1279,29 @@ mod tests {
                 stream_ordering_debt_bytes: 512 * 1024,
             }),
             Some("completion_horizon")
+        );
+    }
+
+    #[test]
+    fn bulk_rate_proven_same_underlay_path_must_beat_lead_next_quantum() {
+        let mut lead = candidate(0, 100_000_000.0, 50.0, 100.0);
+        let mut extra = candidate(1, 500_000_000.0, 700.0, 500.0);
+        lead.snapshot.confidence = 1.0;
+        extra.snapshot.confidence = 1.0;
+        extra.snapshot.app_limited = false;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 0,
+            }),
+            Some("same_underlay_no_completion_gain")
         );
     }
 

@@ -2781,6 +2781,17 @@ if path is an additional data path:
     eta_p(chunk) <= completion_horizon(lead_path, path, chunk)
 ```
 
+The additional-data completion rule applies to same-underlay and cross-underlay
+paths. Sharing a carrier family, such as QUIC+QUIC or TCP+TCP, is not proof
+that later offsets will arrive before the lead can send the next quantum. A
+same-underlay path that has only startup, proof, or app-limited evidence may
+receive bounded validation/proof traffic, but once it is considered
+bulk-rate-proven for unique ordered `STREAM_DATA`, it MUST show positive
+incremental completion gain before joining the ordinary bulk cohort. Reorder
+budget is a safety envelope for already-admitted work; it MUST NOT be used as
+extra time slack to put unique ordered bytes onto a high-latency path that loses
+the ECF/BLEST next-quantum comparison.
+
 The lead path is a safe baseline, not merely the lowest raw ETA. A candidate
 whose carrier or product debt already violates the active data-path admission
 gate MUST NOT be used as the baseline that rejects other paths. Otherwise a

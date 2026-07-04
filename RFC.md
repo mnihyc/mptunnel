@@ -2724,12 +2724,34 @@ ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
 duplicate-discovery copy that is acknowledged by the local QUIC carrier may set
 ACK-derived data seen for that carrier path, which proves the path can carry
 data and keeps it visible to validation and duplicate-discovery policy. It does
-not make the path eligible to own future ordered `STREAM_DATA`. Ordinary unique
-bulk ownership requires either that the path is already the active service path
-or that the path has non-application-limited bulk-rate evidence and passes normal
-ECF/BLEST admission, stream-ordering-debt checks, service quantum preemption, and
-carrier credit. ACK-data seen does not set bulk-rate evidence and does not
-overwrite the delivery rate.
+not make the path eligible for ordinary future ordered `STREAM_DATA` ownership.
+It may, however, make the path eligible for bounded unique exploration when the
+validation/discovery traffic ledger still has credit. That exploration is not
+ordinary bulk admission and MUST NOT be selected merely as a sticky lead or a
+carrier-family preference. It is a path-local probe state used when an existing
+lower-frontier owner would otherwise keep the stream on one path forever. The
+exploration quantum owns only the byte range it sends, is accounted in the
+validation/discovery ledger, respects service-quantum preemption and carrier
+credit, and MUST NOT rewrite the ordinary lead. Duplicate discovery remains
+bounded by the duplicate/probe budget because it is extra traffic; unique
+exploration carries real application bytes and therefore uses a trial envelope
+derived from the path-local QUIC inflight limit, capped by the product resource
+envelope and floored by a small minimum pipe. A lower-frontier owner is therefore
+not an absolute ban once the candidate has path-local ACK-data evidence;
+proof-only QUIC paths still MUST NOT own unique future bytes. This lets the QUIC
+carrier produce a non-application-limited delivery sample instead of remaining
+stuck behind one application-limited frame forever. Ordinary unique bulk
+ownership requires either that the path is already the active service path or
+that the path has non-application-limited bulk-rate evidence and passes the
+normal ECF/BLEST admission model. ACK-data seen does not set bulk-rate evidence
+and does not overwrite the delivery rate.
+Because duplicate discovery does not own the ordered frontier, it MAY be sent on
+an attached QUIC validation output before that output has sender evidence, as
+long as the same byte range is also sent on the selected primary owner and the
+duplicate is charged to the validation/discovery ledger. This is the safe
+bootstrap from "attached but unproven" to ACK-data-seen: failure of the duplicate
+path cannot create a receive hole, while success produces path-local QUIC ACKed
+data evidence.
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
 MUST NOT require product TX and QUIC ACK to happen in the same sampling interval,

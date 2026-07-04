@@ -32,6 +32,7 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
+    pub(in crate::runtime) has_ack_data_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
     pub(in crate::runtime) bulk_discovery_sent_bytes: u64,
 }
@@ -318,8 +319,13 @@ pub(super) fn server_bulk_output_snapshot(
         UnderlayProtocol::Tcp => 0,
     };
     snapshot.product_bytes_in_flight = entry.bytes_in_flight;
-    snapshot.inflight_limit_bytes =
-        bulk_rate_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes);
+    snapshot.inflight_limit_bytes = match entry.key.underlay {
+        UnderlayProtocol::Udp => local_carrier_metrics
+            .map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes),
+        UnderlayProtocol::Tcp => {
+            bulk_rate_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes)
+        }
+    };
     snapshot.confidence = server_output_confidence(entry, now);
     let lane_load = lane_tracker.snapshot(session_id, entry.key);
     let session_lane_load = lane_tracker.session_snapshot(session_id);
@@ -466,6 +472,15 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
             entry.path_metrics,
             Some(path_metrics) if server_path_metrics_has_sender_evidence(path_metrics)
         )
+}
+
+pub(in crate::runtime) fn server_output_has_ack_data_evidence(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
+    matches!(
+        entry.path_metrics,
+        Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
+    )
 }
 
 pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
@@ -618,6 +633,80 @@ mod tests {
         assert!(
             server_output_has_bulk_rate_evidence(&entry),
             "a later app-limited metrics poll must not erase existing non-app-limited QUIC bulk evidence"
+        );
+    }
+
+    #[test]
+    fn udp_app_limited_ack_data_snapshot_keeps_carrier_inflight_limit() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(7),
+        };
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 80_000,
+                    srtt_us: 80_000,
+                    rttvar_us: 2_000,
+                    jitter_us: 2_000,
+                    delivery_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
+                    pacing_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: 0,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: 2 * 1024 * 1024,
+                    inflight_hi_bytes: 2 * 1024 * 1024,
+                    confidence_ppm: 0,
+                    app_limited: true,
+                    has_ack_derived_data_sample: true,
+                    data_sample_count: 0,
+                },
+            }),
+            bulk_discovery_sent_bytes: 0,
+        };
+
+        let lane_tracker = ServerPathLaneTracker::default();
+        let snapshot = server_bulk_output_snapshot(
+            &entry,
+            SessionId(77),
+            FlowLane::Throughput,
+            &lane_tracker,
+            MuxLimits::default(),
+            Instant::now(),
+        );
+
+        assert_eq!(
+            snapshot.delivery_rate_bps,
+            default_path_rate_bps(UnderlayProtocol::Udp),
+            "app-limited ACK-data must not create a tiny bulk-rate model"
+        );
+        assert_eq!(
+            snapshot.inflight_limit_bytes,
+            2 * 1024 * 1024,
+            "carrier inflight credit is path-local QUIC state and remains usable for bounded exploration"
+        );
+        assert!(
+            !server_output_has_bulk_rate_evidence(&entry),
+            "ACK-data seen without non-app-limited samples is not ordinary bulk-rate proof"
         );
     }
 

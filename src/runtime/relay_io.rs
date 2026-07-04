@@ -401,6 +401,49 @@ pub(super) fn sender_service_retry_delay(path: Option<PathSnapshot>, lane: FlowL
     QUIC_TIMER_GRANULARITY
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseSenderWaitState {
+    blocked: bool,
+    ready: bool,
+    subscribe_capacity: bool,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+fn response_sender_wait_state(
+    queue_nonempty: bool,
+    queue_ready: bool,
+    front_has_carrier_credit: bool,
+    retry_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    retry_delay: Duration,
+) -> ResponseSenderWaitState {
+    if !queue_nonempty {
+        return ResponseSenderWaitState {
+            blocked: false,
+            ready: false,
+            subscribe_capacity: false,
+            retry_at: None,
+        };
+    }
+    if front_has_carrier_credit {
+        return ResponseSenderWaitState {
+            blocked: false,
+            ready: queue_ready,
+            subscribe_capacity: false,
+            retry_at: None,
+        };
+    }
+    let retry_at = retry_at
+        .filter(|deadline| *deadline > now)
+        .unwrap_or(now + retry_delay);
+    ResponseSenderWaitState {
+        blocked: true,
+        ready: false,
+        subscribe_capacity: true,
+        retry_at: Some(retry_at),
+    }
+}
+
 pub(super) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
     mux_limits
         .max_reliable_relay_chunk_bytes
@@ -1232,8 +1275,8 @@ where
             );
             last_reported_budget = Some((relay_lane, adaptive_chunk, inflight_limit));
         }
-        if response_sender_retry_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
-        {
+        let now = tokio::time::Instant::now();
+        if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
             response_sender_retry_at = None;
         }
         let queued_front_has_carrier_credit = response_sender.front_has_carrier_credit(
@@ -1242,13 +1285,19 @@ where
             relay_lane,
             mux_limits,
         );
-        let queued_send_blocked = !response_sender.is_empty()
-            && response_sender_retry_at.is_some()
-            && !queued_front_has_carrier_credit;
-        let queued_send_ready = response_sender.queued_send_ready() && !queued_send_blocked;
-        let queued_send_retry_deadline =
-            response_sender_retry_at.unwrap_or_else(tokio::time::Instant::now);
-        let carrier_capacity_notifies = if queued_send_blocked {
+        let sender_wait = response_sender_wait_state(
+            !response_sender.is_empty(),
+            response_sender.queued_send_ready(),
+            queued_front_has_carrier_credit,
+            response_sender_retry_at,
+            now,
+            sender_service_retry_delay(send_path_snapshot, relay_lane),
+        );
+        response_sender_retry_at = sender_wait.retry_at;
+        let queued_send_blocked = sender_wait.blocked;
+        let queued_send_ready = sender_wait.ready;
+        let queued_send_retry_deadline = sender_wait.retry_at.unwrap_or(now);
+        let carrier_capacity_notifies = if sender_wait.subscribe_capacity {
             path_stream.capacity_notifies()
         } else {
             Vec::new()
@@ -2042,6 +2091,19 @@ mod tests {
             reliable_sender_effective_relay_lane(FlowLane::Latency, FlowLane::Background),
             FlowLane::Background
         );
+    }
+
+    #[test]
+    fn response_sender_wait_state_blocks_immediately_without_carrier_credit() {
+        let now = tokio::time::Instant::now();
+        let retry_delay = Duration::from_millis(10);
+
+        let state = response_sender_wait_state(true, true, false, None, now, retry_delay);
+
+        assert!(state.blocked);
+        assert!(!state.ready);
+        assert!(state.subscribe_capacity);
+        assert_eq!(state.retry_at, Some(now + retry_delay));
     }
 
     #[test]

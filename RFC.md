@@ -2231,6 +2231,14 @@ be the primary pacing mechanism for a high-rate reliable stream. This rule
 follows the same ownership split as QUIC and MPTCP: product bytes remain in the
 sender queue while the carrier is full, but the byte-producing side is
 credit-clocked by actual carrier progress instead of by an unrelated timer.
+The blocked state is derived from the current front queued item and current
+carrier credit, not from whether an earlier dispatch attempt already failed.
+When the front item has no eligible carrier credit, the sender service is
+blocked immediately, stops reading more product bytes for that flow, subscribes
+to carrier-capacity wakeups, and arms only a short fallback retry. Treating that
+state as runnable until a failed dispatch installs a retry timer is
+non-conformant because it makes throughput depend on event-loop timing or
+diagnostic logging delay rather than on carrier progress.
 Validation, repair, standby, and failover attachments MUST NOT suppress the
 active service path's carrier-credit visibility. A readiness/wakeup predicate
 answers only whether some eligible output could accept the queued lane now; it

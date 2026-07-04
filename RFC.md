@@ -2740,6 +2740,11 @@ zero non-app-limited delivery samples; otherwise a validation path can prove
 real product-byte delivery but remain invisible to the graduation state machine.
 That publication is only path-scoped data evidence: the path remains not
 bulk-rate-proven until non-application-limited ACK-derived data samples exist.
+Once such samples exist, bulk-rate proof is durable path evidence: a later
+idle/application-limited metrics poll MAY mark the current snapshot as
+application-limited for scheduling caution, but it MUST NOT erase the existing
+bulk-rate proof or collapse the carrier feed envelope back to startup-only
+credit.
 Until a non-application-limited data sample exists, and until the local QUIC
 stack exposes usable pacing or congestion-window capacity, ACK progress MUST
 NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not bulk

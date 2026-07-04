@@ -443,7 +443,6 @@ fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEnt
     path_metrics.source == ServerPathMetricsSource::LocalSender
         && path_metrics.metrics.has_ack_derived_data_sample
         && path_metrics.metrics.data_sample_count > 0
-        && !path_metrics.metrics.app_limited
 }
 
 fn server_path_metrics_has_ack_data_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
@@ -565,6 +564,60 @@ mod tests {
         assert!(
             !server_output_has_bulk_rate_evidence(&entry),
             "UDP ordinary bulk-rate evidence must be local QUIC ACK-derived carrier data, not product STREAM_ACK alone"
+        );
+    }
+
+    #[test]
+    fn udp_bulk_rate_evidence_survives_later_app_limited_metric_poll() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: Some(500_000_000.0),
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 20_000,
+                    srtt_us: 20_000,
+                    rttvar_us: 1_000,
+                    jitter_us: 1_000,
+                    delivery_rate_bps: 200_000_000,
+                    pacing_rate_bps: 200_000_000,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+                    inflight_hi_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+                    confidence_ppm: 1_000_000,
+                    app_limited: true,
+                    has_ack_derived_data_sample: true,
+                    data_sample_count: 32,
+                },
+            }),
+            bulk_discovery_sent_bytes: 0,
+        };
+
+        assert!(
+            server_output_has_bulk_rate_evidence(&entry),
+            "a later app-limited metrics poll must not erase existing non-app-limited QUIC bulk evidence"
         );
     }
 

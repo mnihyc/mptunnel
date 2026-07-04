@@ -445,6 +445,32 @@ impl Default for ClientPathObservation {
     }
 }
 
+fn reliable_reservation_should_use_endpoint_only_startup_order(
+    tcp_paths: &[PathSpec],
+    tcp_observations: &[ClientPathObservation],
+    udp_paths: &[PathSpec],
+    udp_observations: &[ClientPathObservation],
+    lane: FlowLane,
+) -> bool {
+    reliable_relay_expects_interactive_response(lane)
+        && (!tcp_paths.is_empty() || !udp_paths.is_empty())
+        && tcp_paths.iter().chain(udp_paths).all(path_is_endpoint_only)
+        && !paths_have_sender_delivery_evidence(tcp_paths, tcp_observations)
+        && !paths_have_sender_delivery_evidence(udp_paths, udp_observations)
+}
+
+fn paths_have_sender_delivery_evidence(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+) -> bool {
+    paths.iter().enumerate().any(|(index, path)| {
+        bulk_candidate_has_sender_delivery_evidence(
+            path,
+            observations.get(index).copied().unwrap_or_default(),
+        )
+    })
+}
+
 impl ClientPathHealthRecord {
     pub(super) fn observe(&mut self, now: Instant) -> ClientPathObservation {
         if self.manual_disabled {
@@ -1063,11 +1089,58 @@ impl ClientPathContext {
             payload_bytes,
         );
         candidates.retain(|candidate| !excluded.contains(&candidate.key));
-        candidates.sort_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| self.relay_path_key_order(left.key, right.key))
-        });
+        if reliable_reservation_should_use_endpoint_only_startup_order(
+            &self.tcp_paths,
+            &tcp_observations,
+            &self.udp_paths,
+            &udp_observations,
+            lane,
+        ) {
+            candidates.sort_by(|left, right| {
+                left.snapshot
+                    .active_latency_sensitive_flows
+                    .cmp(&right.snapshot.active_latency_sensitive_flows)
+                    .then_with(|| left.snapshot.active_flows.cmp(&right.snapshot.active_flows))
+                    .then_with(|| self.relay_path_key_order(left.key, right.key))
+            });
+        } else {
+            candidates.sort_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| self.relay_path_key_order(left.key, right.key))
+            });
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        for (rank, candidate) in candidates.iter().enumerate() {
+            lab_diagnostic(
+                "reliable_stream_initial_path_candidate",
+                format_args!(
+                    "lane={:?} payload_bytes={} rank={} path_underlay={:?} path_index={} eta_ms={:.3} state={:?} active_flows={} active_latency_flows={} queue_bytes={} product_queue_bytes={} bytes_in_flight={} inflight_limit={} delivery_rate_bps={:.0} pacing_rate_bps={:.0} app_limited={} liveness_evidence={} path_proof_evidence={} ack_data_evidence={} bulk_rate_evidence={} unique_data_evidence={} sender_delivery_evidence={}",
+                    lane,
+                    payload_bytes,
+                    rank,
+                    candidate.key.underlay,
+                    candidate.key.index,
+                    candidate.eta_ms,
+                    candidate.snapshot.state,
+                    candidate.snapshot.active_flows,
+                    candidate.snapshot.active_latency_sensitive_flows,
+                    candidate.snapshot.queue_bytes,
+                    candidate.snapshot.product_queue_bytes,
+                    candidate.snapshot.bytes_in_flight,
+                    candidate.snapshot.inflight_limit_bytes,
+                    candidate.snapshot.delivery_rate_bps,
+                    candidate.snapshot.pacing_rate_bps,
+                    candidate.snapshot.app_limited,
+                    candidate.has_liveness_evidence,
+                    candidate.has_path_proof_evidence,
+                    candidate.has_ack_data_evidence,
+                    candidate.has_bulk_rate_evidence,
+                    candidate.has_unique_data_evidence,
+                    candidate.has_sender_delivery_evidence,
+                ),
+            );
+        }
         let selected = candidates.first()?.key;
         match selected.underlay {
             UnderlayProtocol::Tcp => health.tcp.get_mut(selected.index)?.reserve_load(lane),

@@ -665,7 +665,7 @@ their origin is explicit and they do not become hidden modes.
 | UDP target/datagram path model | UDP/QUIC response timeout and retry budget derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. TCP-underlay datagrams send once per datagram ID on the reliable carrier and do not reopen the carrier merely because the UDP target response is absent |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | BBR app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | Product/carrier inflight <= BBR/BDP/resource ceiling; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use carrier credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection |
+| Bulk admission | Product flight/queue <= BBR/BDP/resource envelope for active owners; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not duplicate QUIC cwnd as a hard product gate for the active ordered owner |
 | Validation traffic | Probes, duplicate STREAM_DATA, or repair data; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -2197,15 +2197,16 @@ into a bursty sender. In the single-path/same-underlay case, TCP and QUIC UDP
 therefore use the same product quantum sizing rule, while their carrier engines
 remain responsible for their own packet congestion control and pacing.
 
-A sender-service dispatch pass MUST emit at most one preemptible service
-quantum of ordinary throughput work for a flow before yielding back to the
-feedback loop. The dispatch-pass byte budget is not the path inflight envelope,
-the carrier congestion window, or the full sender queue limit. Those larger
-values describe how much product or carrier flight may exist over time; they do
-not authorize one scheduling pass to move tens of MiB into a writer pipe. This
-keeps product ACKs, carrier ACKs, FIN/RESET/DETACH, repair, and latency work
-observable between bulk quanta while still allowing a high-rate carrier to stay
-fed through repeated nonblocking dispatches.
+A sender-service ordinary throughput frame is one preemptible service quantum.
+A dispatch run MAY emit multiple ordinary throughput quanta for a flow, but only
+up to a bounded feed window, and then MUST yield back to the feedback loop before
+starting another ordinary bulk run. The dispatch-run byte budget is not the path
+inflight envelope, the carrier congestion window, or the full sender queue
+limit. Those larger values describe how much product or carrier flight may exist
+over time; they do not authorize one scheduling pass to move tens of MiB into a
+writer pipe. This keeps product ACKs, carrier ACKs, FIN/RESET/DETACH, repair,
+and latency work observable between bounded bulk runs while still allowing a
+high-rate carrier to stay fed through repeated nonblocking dispatches.
 
 Carrier command-queue credit is event-driven. When a carrier writer consumes or
 discards a queued command and releases queue capacity, that release is a sender
@@ -2223,12 +2224,21 @@ window that starves a healthy QUIC/BBR sender. Control, product ACK,
 FIN/RESET/DETACH, and bounded repair lanes remain priority work and MUST NOT be
 delayed behind bulk writer-pipe debt. If capacity is unavailable, the sender
 SHOULD wait on carrier capacity release or path-output feedback rather than
-sleeping for a coarse fixed retry interval. A fixed retry timer MAY exist only
-as a race fallback; it MUST NOT be the primary pacing mechanism for a high-rate
-reliable stream. This rule follows the same ownership split as QUIC and MPTCP:
-product bytes remain in the sender queue while the carrier is full, but the
-byte-producing side is credit-clocked by actual carrier progress instead of by
-an unrelated timer.
+sleeping for the receive-progress, repair, or path-stall timer. A fixed retry
+timer MAY exist only as a lost-notification race fallback, and it MUST be no
+coarser than the carrier timer granularity used for QUIC recovery; it MUST NOT
+be the primary pacing mechanism for a high-rate reliable stream. This rule
+follows the same ownership split as QUIC and MPTCP: product bytes remain in the
+sender queue while the carrier is full, but the byte-producing side is
+credit-clocked by actual carrier progress instead of by an unrelated timer.
+Validation, repair, standby, and failover attachments MUST NOT suppress the
+active service path's carrier-credit visibility. A readiness/wakeup predicate
+answers only whether some eligible output could accept the queued lane now; it
+does not choose the final path, promote validation, or bypass ECF/BLEST
+admission. Ordinary unique data readiness therefore considers active or
+admission-eligible non-repair outputs, while the dispatch planner remains the
+single owner of lead selection, validation policy, repair policy, and
+stream-ordering-debt checks.
 
 Once a carrier writer is selected by its event loop, it SHOULD drain a bounded
 run of already-admitted commands before yielding back to the event selector.
@@ -2247,6 +2257,18 @@ one frame per select wakeup when a healthy carrier has queued work. A narrower
 writer-feed quantum is valid only when diagnostics show it reduces delay without
 underfeeding the carrier; fixed one-frame writer-feed behavior is not a
 protocol requirement and can underfeed high-rate QUIC UDP.
+
+The sender-service executor follows the same bounded-run rule at the boundary
+above path command queues. After it dispatches a non-empty ordinary bulk run to
+carrier command queues, it MUST yield cooperatively before taking another
+ordinary bulk run. This gives carrier writers, product ACK processing,
+flow-control updates, and path metrics a scheduling opportunity without relying
+on diagnostic logging, stdout/stderr backpressure, or other accidental delays.
+For ordinary `STREAM_DATA`, each emitted frame is one adaptive product quantum.
+A sender-service bulk run MAY contain multiple such quanta up to a bounded feed
+window, then MUST yield before another ordinary bulk run. The 512 KiB
+read-buffer ceiling and path-flight envelope are resource ceilings, not
+per-frame payload sizes.
 
 A carrier event loop MUST NOT let ordinary data commands outrank already
 available inbound feedback. The loop first services ready control and priority
@@ -2323,12 +2345,22 @@ TCP-only deployments are degenerate candidate sets of this rule.
 Endpoint-only startup uses cautious evidence handling before cross-carrier
 sorting. Probe-only RTT or rate samples MUST NOT by themselves make a path
 steal the first reliable stream when no product delivery evidence exists, and
-a path already serving realtime or latency-sensitive work is scored by the same
-active-flow, queue, RTT, loss, and delivery-rate model regardless of whether
-the carrier is TCP or QUIC UDP. This is not a manual mode or fixed traffic
-class: fresh opens are latency-first, sustained demand may move toward larger
-measured bandwidth, and the sender can shrink back to latency/realtime behavior
-when that demand disappears. The intent is to preserve lane isolation without
+tiny carrier/accounting differences such as path-proof bytes, ACK/control
+flights, or command-queue noise MUST NOT reorder an otherwise unknown
+endpoint-only latency startup cohort. In that exact no-load/no-delivery-evidence
+state, configured path order is only a deterministic startup fallback; it is not
+a throughput preference. If fresh latency opens are already active but no
+sender delivery evidence exists, active startup load MAY spread new opens away
+from busy paths, but the remaining tie-breaker is still configured fallback
+order; probe bytes, ACK/control frames, command-queue debt, or zero-byte
+differences MUST NOT make a later unknown endpoint outrank an earlier equally
+eligible endpoint. Delivery-backed evidence discards this fallback. A path
+already serving realtime or latency-sensitive work is then scored by the same
+active-flow, queue, RTT, loss, and delivery-rate model regardless of whether the
+carrier is TCP or QUIC UDP. This is not a manual mode or fixed traffic class:
+fresh opens are latency-first, sustained demand may move toward larger measured
+bandwidth, and the sender can shrink back to latency/realtime behavior when
+that demand disappears. The intent is to preserve lane isolation without
 hardcoded TCP-vs-UDP preference.
 
 When a path has path-scoped product delivery evidence or carrier delivery
@@ -2433,8 +2465,19 @@ Before a product data frame is emitted, all applicable gates must pass:
 * sender queue budget and repair-cache budget allow retained state;
 * the selected path is healthy enough for the lane;
 * the selected path passes ETA/admission checks for the frame;
-* the carrier controller or TCP path write budget allows the packet or frame,
-  except for the explicit ACK-only and PTO exceptions in this specification.
+* the carrier writer has bounded queue capacity for the packet or frame, except
+  for the explicit ACK-only and PTO exceptions in this specification.
+
+For an active reliable QUIC UDP data owner, QUIC carrier congestion state is
+sender evidence and carrier-owned pacing state, not a second hard product
+flight gate. The product scheduler MUST keep product flight, repair cache,
+sender queues, and ordering debt within the mptunnel resource envelope, and it
+MUST use QUIC bytes-in-flight, queue, RTT, pacing, and loss as ETA/admission
+inputs. It MUST NOT stop feeding the active ordered-stream owner solely because
+the QUIC carrier reports bytes in flight at its inflight limit while the carrier
+writer still accepts bounded work. QUIC itself remains responsible for packet
+pacing, congestion-window enforcement, ACK/loss/PTO, and stream-level
+backpressure below the product frame.
 
 For reliable bulk streams, the sender service also performs admission before it
 pulls another source byte range into a `STREAM_DATA` frame when the next offset
@@ -2517,6 +2560,12 @@ Validation admission is evaluated with the bounded proof payload, not with the
 full product path inflight envelope. This keeps discovery aggressive enough to
 learn new paths while preventing validation churn from consuming the same budget
 as established bulk data.
+
+Validation attachment adds a path-manager output; it does not remove or hide the
+active service output. If the active output still has carrier credit for the
+queued lane, the sender service MUST remain wakeable even while validation proof
+traffic is pending on other outputs. This prevents optional discovery from
+turning a usable active path into an apparent sender-service starvation state.
 
 Validation lifecycle is path-manager state, not per-quantum data-scheduler
 state. Once a reliable product stream has an attached carrier output for a path,
@@ -2666,19 +2715,23 @@ bulk delivery-rate model to a tiny value. The sender keeps two separate facts:
 ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
 duplicate-discovery copy that is acknowledged by the local QUIC carrier may set
 ACK-derived data seen for that carrier path, which proves the path can carry
-data and may make it eligible for a bounded trial when the ordered frontier is
-safe. That trial is ordinary product data, not duplicate/probe overhead: it owns
-the stream range, enters product/path flight, and is governed by normal
+data and keeps it visible to validation and duplicate-discovery policy. It does
+not make the path eligible to own future ordered `STREAM_DATA`. Ordinary unique
+bulk ownership requires either that the path is already the active service path
+or that the path has non-application-limited bulk-rate evidence and passes normal
 ECF/BLEST admission, stream-ordering-debt checks, service quantum preemption, and
-carrier credit. It MUST NOT debit the duplicate/proof discovery ledger. The
-duplicate/proof ledger still bounds non-owner extra traffic; unique trial traffic
-is bounded by the no-worse admission model and by carrier/path feedback. ACK-data
-seen does not set bulk-rate evidence and does not overwrite the delivery rate.
+carrier credit. ACK-data seen does not set bulk-rate evidence and does not
+overwrite the delivery rate.
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
 MUST NOT require product TX and QUIC ACK to happen in the same sampling interval,
 and it MUST NOT be inferred from path proof, stream ACK, MAX_DATA, or other
-control-only frames.
+control-only frames. The QUIC path metrics publisher MUST report ACK-data-seen
+to the product scheduler even when the sample is application-limited and has
+zero non-app-limited delivery samples; otherwise a validation path can prove
+real product-byte delivery but remain invisible to the graduation state machine.
+That publication is only path-scoped data evidence: the path remains not
+bulk-rate-proven until non-application-limited ACK-derived data samples exist.
 Until a non-application-limited data sample exists, and until the local QUIC
 stack exposes usable pacing or congestion-window capacity, ACK progress MUST
 NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not bulk
@@ -2928,19 +2981,25 @@ updates, explicit gap repair, duplicate validation, and path events while the
 ordinary byte range waits for ACK progress or a serviceable lower-frontier
 owner. If the blocked frontier later produces data-plane PTO/stall evidence,
 the sender may perform the normal tail/gap repair action described below.
-`extra_traffic_hint_percent` scales the byte budget of that evidence-backed
-repair action: `1` permits roughly one percent more repair/probe traffic, `100`
-roughly doubles that repair budget, and `200` roughly triples it. The value is a
-continuous hint for how aggressively the sender may trade duplicate traffic for
-recovery speed; it is not a fixed rate, not a hard cap, and not permission to
-send speculative unique bytes that deepen ordered receive debt.
+`extra_traffic_hint_percent` feeds a cumulative extra-traffic ledger owned by
+the sender service. Ordinary unique owner bytes earn additional duplicate,
+probe, and repair budget; path proof, duplicate discovery, and repair debit that
+ledger. A small startup floor prevents proof/repair deadlock before enough
+ordinary bytes have been sent, but the floor is spent once and does not refresh
+on every ACK-gap or tail-stall event. After that floor is spent, newly earned
+repair budget accumulates until it can fund at least one useful repair burst;
+sub-MSS or crumb-sized repairs are not emitted merely because a small fractional
+budget was earned. The value is a continuous hint for how aggressively the
+sender may trade duplicate traffic for recovery speed; it is not a fixed rate,
+not a per-event multiplier, and not permission to send speculative unique bytes
+that deepen ordered receive debt.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
 a gap, a path failure or detach event, or data-plane PTO/stall evidence. The
-same `extra_traffic_hint_percent` budget applies to immediate ACK-gap repair
-and later tail/PTO repair, because both cases have concrete gap, failure, or
-stall evidence. The repair extent is the missing or suspect unacknowledged byte
-range indicated by that event, not every cached chunk below the frontier.
+same sender-owned extra-traffic ledger applies to immediate ACK-gap repair and
+later tail/PTO repair, because both cases spend duplicate traffic from the same
+stream-level budget. The repair extent is the missing or suspect unacknowledged
+byte range indicated by that event, not every cached chunk below the frontier.
 Repair target choice is evidence-ordered, not carrier-family ordered. The
 sender first prefers an eligible path that did not carry the last outstanding
 copy of the repaired range and that is active or bulk-rate proven for this
@@ -3694,8 +3753,9 @@ on_stream_ack(stream_id, complete, ranges):
     release_path_inflight_entries_covered_by(ranges)
     do_not_lower_delivery_rate_from_feedback_only_release_timing()
     if ack_frontier_advanced_after_tail_repair:
-        mark_repair_path_as_sender_evidence_for_failover()
-        promote_repair_path_to_active_lifecycle_slot()
+        record_repair_ack_progress_diagnostic_only()
+        do_not_mark_repair_path_as_sender_evidence()
+        do_not_promote_repair_path_to_active_lifecycle_slot()
     if active_path_uses_reliable_udp_carrier:
         if not complete:
             clear_product_gap_repair_tracker()
@@ -3716,14 +3776,14 @@ on_stream_ack(stream_id, complete, ranges):
             else:
                 remember_possible_receive_hole(hole.start)
     else if complete:
-        repair_budget = base_repair_budget * (1 + extra_traffic_hint_percent / 100)
+        repair_budget = min(base_repair_budget, sender_extra_traffic_remaining())
         holes = unacked_chunks_below_largest_acked_not_covered_by(ranges)
         schedule_repair(holes, repair_budget)
     else:
         do_not_infer_holes_from_omitted_ranges()
 
 on_tail_stall_repair(stream_id, last_complete_ack_ranges):
-    repair_budget = base_repair_budget * (1 + extra_traffic_hint_percent / 100)
+    repair_budget = min(base_repair_budget, sender_extra_traffic_remaining())
     holes = unacked_chunks_below_largest_acked_not_covered_by(last_complete_ack_ranges)
     if holes is not empty:
         schedule_prefix_repair(holes, repair_budget)

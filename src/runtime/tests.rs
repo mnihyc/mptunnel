@@ -1058,12 +1058,19 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(47), stream_id);
     sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
-    sender.enqueue_repair_frame(Frame::StreamData {
-        stream_id,
-        offset: 64,
-        flags: StreamFlags::NONE,
-        payload: Bytes::from_static(b"repair"),
-    });
+    assert!(
+        sender
+            .enqueue_repair_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 64,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"repair"),
+                },
+                MuxLimits::default(),
+            )
+            .is_some()
+    );
     sender.enqueue_control_frame(Frame::StreamAck {
         stream_id,
         complete: false,
@@ -1620,12 +1627,19 @@ async fn server_response_sender_dispatches_repair_before_data() {
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
     sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
-    sender.enqueue_repair_frame(Frame::StreamData {
-        stream_id,
-        offset: 64,
-        flags: StreamFlags::NONE,
-        payload: Bytes::from_static(b"repair"),
-    });
+    assert!(
+        sender
+            .enqueue_repair_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 64,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"repair"),
+                },
+                MuxLimits::default(),
+            )
+            .is_some()
+    );
 
     let repair_dispatch = sender
         .dispatch_next(
@@ -2012,7 +2026,7 @@ fn udp_source_read_startup_can_fill_reliable_carrier_without_double_cwnd() {
 }
 
 #[test]
-fn sender_dispatch_budget_batches_bulk_with_preemptible_quanta() {
+fn sender_dispatch_budget_batches_bounded_bulk_quanta() {
     let mux_limits = MuxLimits::default();
     let adaptive_chunk = 64 * 1024;
     let inflight_limit = 8 * reliable_relay_buffer_len(mux_limits);
@@ -2040,10 +2054,7 @@ fn sender_dispatch_budget_batches_bulk_with_preemptible_quanta() {
         bulk_items,
         reliable_relay_buffer_len(mux_limits) / adaptive_chunk
     );
-    assert!(
-        bulk_bytes < inflight_limit,
-        "bulk sender service may batch one read envelope, but must not dump a full path flight into writer queues"
-    );
+    assert!(bulk_bytes < inflight_limit);
 }
 
 #[test]
@@ -2197,6 +2208,21 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
     assert_eq!(
         high_interval,
         (transport_pto_from_snapshot(Some(cross_continent)) / 2).max(QUIC_TIMER_GRANULARITY)
+    );
+}
+
+#[test]
+fn sender_service_retry_delay_is_not_receive_progress_stall_timer() {
+    let cross_continent = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 900.0, 300_000_000.0);
+
+    assert!(
+        reliable_stream_recv_progress_interval(Some(cross_continent), FlowLane::Throughput)
+            > Duration::from_millis(100)
+    );
+    assert_eq!(
+        sender_service_retry_delay(Some(cross_continent), FlowLane::Throughput),
+        QUIC_TIMER_GRANULARITY,
+        "carrier writer backpressure retry must be fast and independent from receive-progress/repair cadence"
     );
 }
 

@@ -397,7 +397,8 @@ pub(super) fn reliable_stream_recv_progress_interval(
 }
 
 pub(super) fn sender_service_retry_delay(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
-    reliable_stream_recv_progress_interval(path, lane)
+    let _ = (path, lane);
+    QUIC_TIMER_GRANULARITY
 }
 
 pub(super) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
@@ -623,9 +624,9 @@ pub(super) fn reliable_relay_sender_dispatch_budget(
     }
 
     // The sender service is the scheduling boundary; path queues are only
-    // writer pipes. Bulk may drain one sender/read envelope per service pass,
+    // writer pipes. Bulk may drain one bounded feed window per service pass,
     // but each emitted STREAM_DATA frame remains one adaptive quantum and the
-    // pass stays below the path-flight envelope.
+    // pass yields before another ordinary bulk run.
     let service_window = reliable_relay_buffer_len(mux_limits)
         .min(queue_limit.max(1))
         .min(inflight_limit.max(1))
@@ -880,14 +881,6 @@ pub(super) fn reliable_sender_effective_relay_lane(local: FlowLane, peer: FlowLa
     }
 }
 
-fn repair_limit_with_extra_traffic_hint(
-    base_limit: usize,
-    performance: MppPerformanceConfig,
-) -> usize {
-    let hint = performance.extra_traffic_hint_percent as usize;
-    base_limit.saturating_add(base_limit.saturating_mul(hint) / 100)
-}
-
 pub(super) fn prefix_repair_frames_with_available_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
@@ -920,6 +913,7 @@ fn enqueue_reliable_tail_repair(
     send_path_snapshot: Option<PathSnapshot>,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     performance: MppPerformanceConfig,
     max_frame_payload_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
@@ -937,7 +931,8 @@ fn enqueue_reliable_tail_repair(
         relay_lane,
         mux_limits,
     ));
-    let repair_limit = repair_limit_with_extra_traffic_hint(base_repair_limit, performance);
+    let repair_limit =
+        base_repair_limit.min(response_sender.repair_extra_event_budget_remaining(mux_limits));
     let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
         send_stream,
         last_send_ack_ranges,
@@ -972,9 +967,14 @@ fn enqueue_reliable_tail_repair(
             repair_kind,
         ),
     );
-    let repair_count = repair_frames.len();
+    let mut repair_count = 0usize;
     for frame in repair_frames {
-        response_sender.enqueue_repair_frame(frame);
+        if response_sender
+            .enqueue_repair_frame(frame, mux_limits)
+            .is_some()
+        {
+            repair_count = repair_count.saturating_add(1);
+        }
     }
     repair_count
 }
@@ -1054,6 +1054,10 @@ async fn drain_server_response_sender_ready(
                 blocked_by_carrier,
             ),
         );
+    }
+
+    if dispatched_payload_bytes > 0 {
+        tokio::task::yield_now().await;
     }
 
     Ok(blocked_by_carrier)
@@ -1409,8 +1413,8 @@ where
                         last_send_ack_complete = complete;
                         let base_repair_limit =
                             adaptive_reliable_relay_repair_bytes(None, relay_lane, mux_limits);
-                        let repair_limit =
-                            repair_limit_with_extra_traffic_hint(base_repair_limit, performance);
+                        let repair_limit = base_repair_limit
+                            .min(response_sender.repair_extra_event_budget_remaining(mux_limits));
                         let has_multipath_repair_alternative =
                             path_stream.has_multipath_repair_alternative();
                         let udp_gap_repair_ready = ack_gap_repair.repair_ready(
@@ -1490,13 +1494,16 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            response_sender.enqueue_repair_frame(frame);
+                            let queued =
+                                response_sender.enqueue_repair_frame(frame, mux_limits).is_some();
+                            #[cfg(not(feature = "lab-diagnostics"))]
+                            let _ = queued;
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
                                 "repair",
                                 format_args!(
-                                    "stream_id={} cause={} queued=true",
-                                    stream_id.0, repair_kind,
+                                    "stream_id={} cause={} queued={}",
+                                    stream_id.0, repair_kind, queued,
                                 ),
                             );
                         }
@@ -2182,27 +2189,5 @@ mod tests {
             interval,
             now + interval + interval,
         ));
-    }
-
-    #[test]
-    fn tail_repair_hint_scales_repair_budget_by_percent() {
-        let base = relay_lane_startup_chunk_bytes(FlowLane::Latency, MuxLimits::default());
-        let low_hint = MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
-        };
-        let high_hint = MppPerformanceConfig {
-            extra_traffic_hint_percent: 100,
-        };
-        let severe_hint = MppPerformanceConfig {
-            extra_traffic_hint_percent: 200,
-        };
-
-        let low_limit = repair_limit_with_extra_traffic_hint(base, low_hint);
-        let high_limit = repair_limit_with_extra_traffic_hint(base, high_hint);
-        let severe_limit = repair_limit_with_extra_traffic_hint(base, severe_hint);
-
-        assert_eq!(low_limit, base + base / 100);
-        assert_eq!(high_limit, base * 2);
-        assert_eq!(severe_limit, base * 3);
     }
 }

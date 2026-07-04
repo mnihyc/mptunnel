@@ -22,6 +22,7 @@ pub(super) struct BulkPathCandidate {
     pub(super) snapshot: PathSnapshot,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BulkAdmissionRole {
     ActiveDataPath,
@@ -285,11 +286,13 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
             bulk_carrier_inflight_limit_bytes(candidate, payload_bytes, mux_limits, role),
             bulk_scheduler_inflight_debt_bytes(candidate, role),
         )
-    } else if bulk_active_lead_has_contiguous_frontier(
-        candidate,
-        role,
-        check.stream_ordering_debt_bytes,
-    ) {
+    } else if candidate.underlay != UnderlayProtocol::Udp
+        && bulk_active_lead_has_contiguous_frontier(
+            candidate,
+            role,
+            check.stream_ordering_debt_bytes,
+        )
+    {
         (
             bulk_active_lead_product_envelope_bytes(payload_bytes, mux_limits),
             bulk_scheduler_inflight_debt_bytes(candidate, role),
@@ -429,7 +432,15 @@ fn bulk_scheduler_inflight_debt_bytes(candidate: PathSnapshot, role: BulkAdmissi
 }
 
 fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
-    role == BulkAdmissionRole::ActiveSingleCarrier && bulk_latency_pressure_flows(candidate) > 0
+    candidate.underlay == UnderlayProtocol::Udp
+        && matches!(
+            role,
+            BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
+        )
+    // Latency pressure still reduces the product envelope in
+    // `bulk_product_inflight_limit_bytes`; it must not move the active owner
+    // back onto the carrier cwnd hard gate. QUIC/TCP carriers own packet
+    // pacing below this layer.
 }
 
 fn bulk_active_role_has_latency_pressure(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
@@ -702,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn active_udp_path_obeys_carrier_credit() {
+    fn active_udp_path_obeys_product_flight_credit() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
@@ -979,7 +990,30 @@ mod tests {
     }
 
     #[test]
-    fn udp_multipath_active_path_obeys_carrier_queue_gate() {
+    fn udp_multipath_active_path_ignores_carrier_flight_as_product_stop() {
+        let best = candidate(0, 100.0, 50.0, 500.0);
+        let mut active = candidate(0, 100.0, 50.0, 500.0);
+        active.snapshot.confidence = 1.0;
+        active.snapshot.inflight_limit_bytes = 512 * 1024;
+        active.snapshot.bytes_in_flight = 512 * 1024;
+        active.snapshot.product_bytes_in_flight = 0;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                best.snapshot,
+                best.eta_ms,
+                active.snapshot,
+                active.eta_ms,
+                64 * 1024,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn udp_active_ordered_owner_uses_product_envelope_not_carrier_cwnd_gate() {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut active = candidate(0, 100.0, 50.0, 500.0);
         active.snapshot.confidence = 1.0;
@@ -996,7 +1030,8 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit")
+            None,
+            "QUIC carrier cwnd/in-flight is carrier-owned pacing evidence; the product active owner must be bounded by product flight and carrier writer backpressure, not a duplicate hard cwnd gate"
         );
     }
 
@@ -1025,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_single_flow_lead_keeps_carrier_queue_gate() {
+    fn udp_single_flow_lead_uses_product_gate_not_carrier_queue_gate() {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut active = candidate(0, 100.0, 50.0, 500.0);
         active.snapshot.confidence = 1.0;
@@ -1044,7 +1079,7 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveSingleCarrier,
             ),
-            Some("inflight_limit")
+            None
         );
     }
 

@@ -1059,7 +1059,7 @@ fn spawn_server_quic_path_metrics(
                 tokio::time::sleep(default_transport_pto()).await;
                 continue;
             };
-            if metrics.delivery_sample_count > 0 {
+            if quic_path_metrics_should_publish_local_sender(metrics) {
                 context.reliable_streams.record_local_path_metrics(
                     session_id,
                     UnderlayProtocol::Udp,
@@ -1070,6 +1070,10 @@ fn spawn_server_quic_path_metrics(
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
     });
+}
+
+fn quic_path_metrics_should_publish_local_sender(metrics: UdpPathMetrics) -> bool {
+    metrics.delivery_sample_count > 0 || metrics.ack_derived_data_seen
 }
 
 fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> PathMetrics {
@@ -2310,10 +2314,11 @@ mod tests {
         let _ = tracker.quic.observe(stats, congestion, 2);
 
         tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
-        let tx_only =
-            tracker
-                .quic
-                .observe(stats, with_product_data_written(congestion, 8 * 1024 * 1024), 2);
+        let tx_only = tracker.quic.observe(
+            stats,
+            with_product_data_written(congestion, 8 * 1024 * 1024),
+            2,
+        );
 
         assert_eq!(tx_only.delivery_sample_count, 0);
         assert!(tx_only.last_delivery_sample_at.is_none());
@@ -2441,7 +2446,11 @@ mod tests {
         stats.frame_rx.acks = 1;
         let app_limited = tracker.quic.observe(
             stats,
-            with_acked_bytes(with_product_data_written(congestion, 32 * 1024), 32 * 1024, 1),
+            with_acked_bytes(
+                with_product_data_written(congestion, 32 * 1024),
+                32 * 1024,
+                1,
+            ),
             2,
         );
 
@@ -2465,7 +2474,11 @@ mod tests {
         stats.frame_rx.acks = 1;
         let app_limited = tracker.quic.observe(
             stats,
-            with_acked_bytes(with_product_data_written(congestion, 32 * 1024), 32 * 1024, 1),
+            with_acked_bytes(
+                with_product_data_written(congestion, 32 * 1024),
+                32 * 1024,
+                1,
+            ),
             2,
         );
         let product_metrics = path_metrics_from_quic_path(PathId(7), app_limited);
@@ -2475,6 +2488,34 @@ mod tests {
         assert!(app_limited.app_limited);
         assert!(product_metrics.has_ack_derived_data_sample);
         assert_eq!(product_metrics.data_sample_count, 0);
+    }
+
+    #[test]
+    fn quic_server_metrics_publish_ack_data_seen_even_when_app_limited() {
+        let metrics = UdpPathMetrics {
+            direction: 2,
+            srtt: Duration::from_millis(50),
+            rttvar: Duration::from_millis(5),
+            min_rtt: Duration::from_millis(45),
+            min_rtt_observed: true,
+            delivery_rate_bps: 500_000_000.0,
+            pacing_rate_bps: 500_000_000.0,
+            inflight_hi: 4 * 1024 * 1024,
+            bytes_in_flight: 0,
+            pending_bytes: 0,
+            loss_ppm: None,
+            ecn_ppm: None,
+            app_limited: true,
+            ack_derived_data_seen: true,
+            delivery_sample_count: 0,
+            last_delivery_sample_at: None,
+        };
+
+        assert!(quic_path_metrics_should_publish_local_sender(metrics));
+        let product_metrics = path_metrics_from_quic_path(PathId(7), metrics);
+        assert!(product_metrics.has_ack_derived_data_sample);
+        assert_eq!(product_metrics.data_sample_count, 0);
+        assert!(product_metrics.app_limited);
     }
 
     #[test]
@@ -2494,14 +2535,15 @@ mod tests {
         assert!(!sent_without_ack.ack_derived_data_seen);
 
         tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
-        let ack_after_send =
-            tracker
-                .quic
-                .observe(
-                    stats,
-                    with_acked_bytes(with_product_data_written(congestion, 32 * 1024), 32 * 1024, 1),
-                    2,
-                );
+        let ack_after_send = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, 32 * 1024),
+                32 * 1024,
+                1,
+            ),
+            2,
+        );
 
         assert!(
             ack_after_send.ack_derived_data_seen,

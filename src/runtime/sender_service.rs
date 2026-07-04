@@ -400,6 +400,8 @@ pub(super) struct ServerResponseSenderService {
     stream_id: StreamId,
     queue: ReliableRelaySenderQueue,
     performance: MppPerformanceConfig,
+    ordinary_data_dispatched_bytes: u64,
+    extra_repair_queued_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -459,7 +461,6 @@ enum ResponseDataDispatchTarget {
         binding: Arc<ResponseStreamBinding>,
         target: ResponseSenderPathTarget,
         bulk_discovery: bool,
-        bulk_unique_trial: bool,
     },
 }
 
@@ -513,15 +514,8 @@ fn response_unique_quic_data_would_expand_ordering_debt(
 fn response_target_can_own_unique_bulk_data(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    performance: MppPerformanceConfig,
 ) -> bool {
     if target.has_bulk_rate_evidence {
-        return true;
-    }
-    if response_target_needs_quic_unique_bulk_trial(target, payload_bytes, mux_limits, performance)
-    {
         return true;
     }
     target.is_active
@@ -553,7 +547,6 @@ fn choose_response_admissible_lead(
     mux_limits: MuxLimits,
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
-    performance: MppPerformanceConfig,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if let Some(owner) = lower_owner {
@@ -580,13 +573,8 @@ fn choose_response_admissible_lead(
         .iter()
         .copied()
         .filter(|target| {
-            response_target_can_own_unique_bulk_data(
-                target,
-                candidate_targets,
-                payload_bytes,
-                mux_limits,
-                performance,
-            ) && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
+            response_target_can_own_unique_bulk_data(target, candidate_targets)
+                && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
         })
         .min_by(|left, right| {
             left.eta_ms
@@ -706,24 +694,19 @@ fn choose_response_sender_target(
         mux_limits,
         payload_bytes,
         lower_flights,
-        MppPerformanceConfig::default(),
     )?;
     let selected = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if !response_target_can_own_unique_bulk_data(
-                target,
-                &candidate_targets,
-                payload_bytes,
-                mux_limits,
-                MppPerformanceConfig::default(),
-            ) || response_unique_quic_data_would_expand_ordering_debt(
-                lower_owner,
-                target,
-                ordering_debt,
-            ) {
+            if !response_target_can_own_unique_bulk_data(target, &candidate_targets)
+                || response_unique_quic_data_would_expand_ordering_debt(
+                    lower_owner,
+                    target,
+                    ordering_debt,
+                )
+            {
                 return false;
             }
             let role =
@@ -809,24 +792,19 @@ fn choose_response_sender_data_target(
         mux_limits,
         payload_bytes,
         lower_flights,
-        performance,
     )?;
     let admitted = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if !response_target_can_own_unique_bulk_data(
-                target,
-                &candidate_targets,
-                payload_bytes,
-                mux_limits,
-                performance,
-            ) || response_unique_quic_data_would_expand_ordering_debt(
-                lower_owner,
-                target,
-                ordering_debt,
-            ) {
+            if !response_target_can_own_unique_bulk_data(target, &candidate_targets)
+                || response_unique_quic_data_would_expand_ordering_debt(
+                    lower_owner,
+                    target,
+                    ordering_debt,
+                )
+            {
                 return false;
             }
             let role =
@@ -900,28 +878,6 @@ fn response_target_needs_same_underlay_bulk_discovery(
         return false;
     }
     response_target_has_discovery_credit(target, payload_bytes, mux_limits, performance)
-}
-
-fn response_target_needs_quic_unique_bulk_trial(
-    target: &ResponseSenderPathTarget,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    performance: MppPerformanceConfig,
-) -> bool {
-    if target.key.underlay != UnderlayProtocol::Udp
-        || target.is_active
-        || !target.has_ack_data_evidence
-        || target.has_bulk_rate_evidence
-    {
-        return false;
-    }
-    let discovery_credit =
-        response_bulk_discovery_credit_bytes(payload_bytes, mux_limits, performance) as u64;
-    if discovery_credit == 0 {
-        return false;
-    }
-    target.bulk_discovery_sent_bytes >= discovery_credit
-        && response_target_discovery_debt_bytes(target) < discovery_credit
 }
 
 fn response_target_needs_quic_duplicate_bulk_discovery(
@@ -1007,6 +963,34 @@ fn response_bulk_discovery_credit_bytes(
         .min(service_quantum)
         .max(1);
     percent_budget.max(startup_floor)
+}
+
+fn response_extra_traffic_startup_floor_bytes(mux_limits: MuxLimits) -> usize {
+    reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
+        .max(PATH_OPEN_SCORE_BYTES)
+        .min(mux_limits.max_repair_bytes)
+        .max(1)
+}
+
+fn response_repair_minimum_useful_burst_bytes(mux_limits: MuxLimits) -> usize {
+    PATH_OPEN_SCORE_BYTES
+        .min(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+        .min(mux_limits.max_repair_bytes)
+        .max(1)
+}
+
+fn response_extra_traffic_budget_bytes(
+    ordinary_data_dispatched_bytes: u64,
+    performance: MppPerformanceConfig,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let hint = performance.extra_traffic_hint_percent as u64;
+    if hint == 0 {
+        return 0;
+    }
+    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits) as u64;
+    let earned = ordinary_data_dispatched_bytes.saturating_mul(hint) / 100;
+    startup_floor.saturating_add(earned)
 }
 
 fn response_target_discovery_debt_bytes(target: &ResponseSenderPathTarget) -> u64 {
@@ -1148,18 +1132,11 @@ fn plan_response_data_dispatch(
                 binding.mux_limits(),
                 performance,
             );
-            let bulk_unique_trial = response_target_needs_quic_unique_bulk_trial(
-                &target,
-                payload_bytes,
-                binding.mux_limits(),
-                performance,
-            );
             Ok(ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding: binding.clone(),
                     target,
                     bulk_discovery,
-                    bulk_unique_trial,
                 },
                 duplicate_discovery,
             })
@@ -1254,7 +1231,6 @@ async fn emit_planned_response_data_frame(
             binding,
             target,
             bulk_discovery,
-            bulk_unique_trial,
         } => {
             match send_sender_service_frame_to_carrier(
                 &target.commands,
@@ -1283,8 +1259,6 @@ async fn emit_planned_response_data_frame(
             binding.set_ordered_data_owner(target.key);
             let decision_reason = if bulk_discovery {
                 "bulk_discovery"
-            } else if bulk_unique_trial {
-                "unique_trial"
             } else {
                 "data"
             };
@@ -1505,6 +1479,8 @@ impl ServerResponseSenderService {
             stream_id,
             queue: ReliableRelaySenderQueue::default(),
             performance,
+            ordinary_data_dispatched_bytes: 0,
+            extra_repair_queued_bytes: 0,
         }
     }
 
@@ -1519,6 +1495,32 @@ impl ServerResponseSenderService {
 
     pub(super) fn data_bytes(&self) -> usize {
         self.queue.data_bytes()
+    }
+
+    pub(super) fn repair_extra_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
+        response_extra_traffic_budget_bytes(
+            self.ordinary_data_dispatched_bytes,
+            self.performance,
+            mux_limits,
+        )
+        .saturating_sub(self.extra_repair_queued_bytes)
+        .min(usize::MAX as u64) as usize
+    }
+
+    pub(super) fn repair_extra_event_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
+        let remaining = self.repair_extra_budget_remaining(mux_limits);
+        if remaining < response_repair_minimum_useful_burst_bytes(mux_limits) {
+            0
+        } else {
+            remaining
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_ordinary_data_dispatched_for_test(&mut self, bytes: usize) {
+        self.ordinary_data_dispatched_bytes = self
+            .ordinary_data_dispatched_bytes
+            .saturating_add(bytes as u64);
     }
 
     pub(super) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
@@ -1623,8 +1625,19 @@ impl ServerResponseSenderService {
         self.queue.push_final_control(frame)
     }
 
-    pub(super) fn enqueue_repair_frame(&mut self, frame: Frame) -> u64 {
-        self.queue.push_repair(frame)
+    pub(super) fn enqueue_repair_frame(
+        &mut self,
+        frame: Frame,
+        mux_limits: MuxLimits,
+    ) -> Option<u64> {
+        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        if payload_bytes > self.repair_extra_budget_remaining(mux_limits) {
+            return None;
+        }
+        self.extra_repair_queued_bytes = self
+            .extra_repair_queued_bytes
+            .saturating_add(payload_bytes as u64);
+        Some(self.queue.push_repair(frame))
     }
 
     pub(super) async fn dispatch_next(
@@ -1793,6 +1806,11 @@ impl ServerResponseSenderService {
         enqueue_id: u64,
         queue_delay_ms: u128,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
+        if queued_lane == ReliableRelayQueuedWorkLane::Data {
+            self.ordinary_data_dispatched_bytes = self
+                .ordinary_data_dispatched_bytes
+                .saturating_add(committed.payload_bytes as u64);
+        }
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = match queued_lane {
             ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
@@ -2657,8 +2675,124 @@ mod tests {
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
             bulk_discovery_sent_bytes: 0,
-            has_ack_data_evidence: true,
         }
+    }
+
+    #[test]
+    fn response_repair_extra_budget_is_cumulative_not_per_event() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(91);
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(91),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+        let repair_payload = Bytes::from(vec![0x55; startup_floor]);
+
+        assert_eq!(
+            sender.repair_extra_budget_remaining(mux_limits),
+            startup_floor
+        );
+        assert!(
+            sender
+                .enqueue_repair_frame(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: 0,
+                        flags: StreamFlags::NONE,
+                        payload: repair_payload.clone(),
+                    },
+                    mux_limits,
+                )
+                .is_some(),
+            "startup repair floor should be spendable once"
+        );
+        assert_eq!(sender.repair_extra_budget_remaining(mux_limits), 0);
+        assert!(
+            sender
+                .enqueue_repair_frame(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: startup_floor as u64,
+                        flags: StreamFlags::NONE,
+                        payload: repair_payload.clone(),
+                    },
+                    mux_limits,
+                )
+                .is_none(),
+            "repair budget must be cumulative, not refreshed for every tail/ACK event"
+        );
+
+        let earned_data_bytes = startup_floor.saturating_mul(100);
+        sender.record_ordinary_data_dispatched_for_test(earned_data_bytes);
+
+        assert!(
+            sender.repair_extra_budget_remaining(mux_limits) >= startup_floor,
+            "ordinary owner bytes earn more bounded extra repair budget"
+        );
+        assert!(
+            sender
+                .enqueue_repair_frame(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: (startup_floor * 2) as u64,
+                        flags: StreamFlags::NONE,
+                        payload: repair_payload,
+                    },
+                    mux_limits,
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn response_repair_extra_budget_accumulates_until_useful_burst() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(92);
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(92),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+        let min_burst = response_repair_minimum_useful_burst_bytes(mux_limits);
+
+        assert!(sender.repair_extra_event_budget_remaining(mux_limits) >= min_burst);
+        assert!(
+            sender
+                .enqueue_repair_frame(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: 0,
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0x44; startup_floor]),
+                    },
+                    mux_limits,
+                )
+                .is_some()
+        );
+
+        sender.record_ordinary_data_dispatched_for_test(startup_floor);
+        assert!(
+            sender.repair_extra_budget_remaining(mux_limits) > 0,
+            "ordinary data earns fractional repair budget"
+        );
+        assert_eq!(
+            sender.repair_extra_event_budget_remaining(mux_limits),
+            0,
+            "tiny earned repair crumbs should accumulate instead of emitting high-overhead repair frames"
+        );
+
+        sender.record_ordinary_data_dispatched_for_test(min_burst.saturating_mul(100));
+        assert!(
+            sender.repair_extra_event_budget_remaining(mux_limits) >= min_burst,
+            "once enough owner bytes are sent, repair can spend a useful burst"
+        );
     }
 
     #[test]
@@ -2793,7 +2927,6 @@ mod tests {
             eta_ms: 1.0,
             is_active: true,
             has_sender_evidence: true,
-            has_ack_data_evidence: true,
             has_bulk_rate_evidence: true,
             bulk_discovery_sent_bytes: 0,
         };
@@ -3326,7 +3459,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_ack_data_seen_path_gets_bounded_unique_trial_when_frontier_clear() {
+    fn quic_ack_data_seen_path_does_not_own_unique_data_without_bulk_rate() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let (active_commands, _active_rx) = reliable_path_command_channels(8);
@@ -3402,18 +3535,21 @@ mod tests {
             payload_bytes,
             MppPerformanceConfig::default(),
         )
-        .expect("ACK-data-seen path should be trial eligible when frontier is clear");
+        .expect("active path should remain eligible when validation path has ACK-data only");
 
         assert_eq!(
             plan.primary_key(),
-            Some(validation_key),
-            "ACK-derived carrier data makes a QUIC validation path eligible for one bounded unique trial, but not bulk-rate proven"
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            }),
+            "ACK-derived carrier data is path-scoped validation evidence, not permission to own future ordered STREAM_DATA"
         );
         assert!(plan.duplicate_discovery.is_empty());
     }
 
     #[test]
-    fn quic_ack_data_seen_unique_trial_does_not_consume_duplicate_discovery_credit() {
+    fn quic_ack_data_seen_path_does_not_displace_bulk_rate_proven_owner() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active = response_target(
@@ -3426,7 +3562,6 @@ mod tests {
         );
         active.has_bulk_rate_evidence = true;
         let mut trial = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-        trial.has_ack_data_evidence = true;
         trial.has_bulk_rate_evidence = false;
         trial.bulk_discovery_sent_bytes = response_bulk_discovery_credit_bytes(
             payload_bytes,
@@ -3436,7 +3571,7 @@ mod tests {
             + payload_bytes as u64;
 
         let selected = choose_response_sender_data_target(
-            &[active, trial.clone()],
+            &[active.clone(), trial.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
@@ -3447,11 +3582,11 @@ mod tests {
                 path_id: PathId(0),
             }),
         )
-        .expect("ACK-data-seen QUIC path remains eligible for owner trials");
+        .expect("bulk-rate-proven active path should remain eligible");
 
         assert_eq!(
-            selected.key, trial.key,
-            "ordinary unique trial bytes are app payload, not duplicate/probe overhead; they must not exhaust duplicate-discovery credit"
+            selected.key, active.key,
+            "ACK-data-seen without non-app-limited bulk-rate evidence must not displace the current ordered owner"
         );
     }
 

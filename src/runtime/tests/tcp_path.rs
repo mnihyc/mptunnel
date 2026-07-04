@@ -294,6 +294,53 @@ fn mixed_reliable_latency_startup_preserves_global_order_without_family_preferen
 }
 
 #[test]
+fn latency_startup_prefers_lowest_latency_path_before_bulk_promotion() {
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:11120?srtt-ms=20&rate-mbps=80&low-latency=true"
+                .parse()
+                .expect("low latency path"),
+            "udp://127.0.0.1:11121?srtt-ms=80&rate-mbps=200"
+                .parse()
+                .expect("balanced path"),
+            "udp://127.0.0.1:11122?srtt-ms=160&rate-mbps=100"
+                .parse()
+                .expect("mild loss path"),
+            "udp://127.0.0.1:11123?srtt-ms=180&rate-mbps=500"
+                .parse()
+                .expect("fat path"),
+            "udp://127.0.0.1:11124?srtt-ms=420&jitter-ms=120&rate-mbps=50&expensive=true"
+                .parse()
+                .expect("poor path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let first = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("first latency path");
+    assert_eq!(
+        first,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        "stream open must start on the lowest-latency admissible path, not the highest-bandwidth path"
+    );
+
+    let second = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("second latency path");
+    assert_eq!(second.underlay, UnderlayProtocol::Udp);
+    assert!(
+        second.index <= 1,
+        "additional latency opens may reuse the best latency path or spread to the next low-latency path, but must not jump to a high-RTT bulk path before demand is proven"
+    );
+}
+
+#[test]
 fn endpoint_only_latency_startup_uses_scored_order_when_bulk_load_exists() {
     let context = ClientPathContext::new(
         vec![
@@ -1768,6 +1815,76 @@ fn endpoint_only_udp_stream_startup_preserves_configured_order_on_probe_noise() 
 }
 
 #[test]
+fn endpoint_only_udp_latency_reservation_preserves_configured_order_on_probe_noise() {
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:10135".parse().expect("first path"),
+            "udp://127.0.0.1:10136".parse().expect("second path"),
+            "udp://127.0.0.1:10137".parse().expect("third path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    context.record_relay_path_send(UnderlayProtocol::Udp, 0, 34);
+    context.record_relay_path_send(UnderlayProtocol::Udp, 1, 34);
+
+    let selected = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("selected path");
+
+    assert_eq!(
+        selected,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        "endpoint-only latency reservation must not turn path-proof/probe noise into a path preference"
+    );
+}
+
+#[test]
+fn endpoint_only_udp_latency_reservation_spreads_by_order_not_probe_noise() {
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:10145".parse().expect("first path"),
+            "udp://127.0.0.1:10146".parse().expect("second path"),
+            "udp://127.0.0.1:10147".parse().expect("third path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let first = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("first latency reservation");
+    assert_eq!(
+        first,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        }
+    );
+
+    context.record_relay_path_send(UnderlayProtocol::Udp, 1, 34);
+
+    let second = context
+        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("second latency reservation");
+
+    assert_eq!(
+        second,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        },
+        "endpoint-only latency spread must use configured fallback order until sender delivery evidence exists"
+    );
+}
+
+#[test]
 fn endpoint_only_udp_stream_bulk_striping_admits_only_best_unmeasured_path() {
     let low_latency_path = "udp://127.0.0.1:10137"
         .parse::<PathSpec>()
@@ -3016,6 +3133,40 @@ async fn bulk_relay_validation_attach_sends_path_proof_not_unique_stream_data() 
         .await
         .is_err(),
         "validation path must not receive unique ordinary data before path-scoped proof graduates"
+    );
+}
+
+#[tokio::test]
+async fn validation_attach_keeps_active_data_lane_credit_visible() {
+    let stream_id = StreamId(146);
+    let (active_stream, _active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
+
+    assert!(
+        remotes.can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, FlowLane::Throughput),
+        "active path credit must be visible before validation attach"
+    );
+
+    let (validation_stream, mut validation_commands, _validation_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
+    remotes.attach_for_validation(validation_stream);
+
+    match tokio::time::timeout(
+        Duration::from_millis(100),
+        recv_reliable_path_command(&mut validation_commands),
+    )
+    .await
+    .expect("validation proof timeout")
+    .expect("validation proof command")
+    {
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {}
+        _ => panic!("validation attach must send carrier proof"),
+    }
+
+    assert!(
+        remotes.can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, FlowLane::Throughput),
+        "validation attachment must not hide active service-path data credit"
     );
 }
 

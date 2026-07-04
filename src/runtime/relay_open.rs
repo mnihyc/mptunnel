@@ -240,11 +240,10 @@ impl ReliableRelayRemoteSet {
         work_lane: ReliableRelayQueuedWorkLane,
         relay_lane: FlowLane,
     ) -> bool {
-        self.paths.len() == 1
-            && self
-                .paths
-                .first()
-                .is_some_and(|path| path.stream.can_enqueue_work_lane_now(work_lane, relay_lane))
+        self.paths.iter().any(|path| {
+            relay_path_placement_may_wake_work_lane(path.placement, work_lane)
+                && path.stream.can_enqueue_work_lane_now(work_lane, relay_lane)
+        })
     }
 
     pub(super) async fn close_all(&mut self) {
@@ -316,6 +315,16 @@ pub(super) enum RelayPathPlacement {
     Active,
     Repair,
     Validation,
+}
+
+fn relay_path_placement_may_wake_work_lane(
+    placement: RelayPathPlacement,
+    work_lane: ReliableRelayQueuedWorkLane,
+) -> bool {
+    match work_lane {
+        ReliableRelayQueuedWorkLane::Data => placement != RelayPathPlacement::Repair,
+        ReliableRelayQueuedWorkLane::Control | ReliableRelayQueuedWorkLane::Repair => true,
+    }
 }
 
 #[derive(Clone)]

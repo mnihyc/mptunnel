@@ -2744,7 +2744,10 @@ Once such samples exist, bulk-rate proof is durable path evidence: a later
 idle/application-limited metrics poll MAY mark the current snapshot as
 application-limited for scheduling caution, but it MUST NOT erase the existing
 bulk-rate proof or collapse the carrier feed envelope back to startup-only
-credit.
+credit. The first accepted non-application-limited QUIC data sample MAY raise
+the sender's path-rate model when it exceeds the current startup/cwnd/pacing
+fallback, but it MUST NOT initialize the model below that fallback; otherwise
+one underfed validation quantum can permanently classify a useful path as slow.
 Until a non-application-limited data sample exists, and until the local QUIC
 stack exposes usable pacing or congestion-window capacity, ACK progress MUST
 NOT become bulk delivery-rate evidence. MTU is packet sizing evidence, not bulk

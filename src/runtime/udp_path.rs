@@ -343,7 +343,7 @@ impl QuicPathMetricTracker {
                         previous.mul_add(0.25, bounded_sample * 0.75)
                     }
                     Some(previous) => previous,
-                    None => bounded_sample,
+                    None => bounded_sample.max(fallback_rate),
                 });
             } else if self.delivery_rate_bps.is_none() {
                 self.delivery_rate_bps = Some(fallback_rate);
@@ -2458,6 +2458,36 @@ mod tests {
         assert!(app_limited.last_delivery_sample_at.is_none());
         assert_eq!(app_limited.delivery_rate_bps.round() as u64, 500_000_000);
         assert!(app_limited.app_limited);
+    }
+
+    #[test]
+    fn quic_initial_full_quantum_sample_does_not_seed_tiny_bulk_rate() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_congestion(PATH_OPEN_SCORE_BYTES as u64, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
+        stats.path.current_mtu = 1400;
+        let startup = tracker.quic.observe(stats, congestion, 2);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
+        stats.frame_rx.acks = 1;
+        let measured = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, PATH_OPEN_SCORE_BYTES as u64),
+                PATH_OPEN_SCORE_BYTES as u64,
+                1,
+            ),
+            2,
+        );
+
+        assert_eq!(measured.delivery_sample_count, 1);
+        assert_eq!(
+            measured.delivery_rate_bps.round() as u64,
+            startup.delivery_rate_bps.round() as u64,
+            "a single underfed validation quantum must not replace the startup/pacing fallback with a tiny rate"
+        );
     }
 
     #[test]

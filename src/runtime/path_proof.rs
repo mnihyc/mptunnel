@@ -125,6 +125,7 @@ pub(super) fn path_proof_metrics(
         app_limited: true,
         has_ack_derived_data_sample: false,
         data_sample_count: 0,
+        data_sample_bytes: 0,
     })
 }
 

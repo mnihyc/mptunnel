@@ -142,6 +142,7 @@ struct QuicPathMetricTracker {
     delivery_rate_bps: Option<f64>,
     ack_derived_data_seen: bool,
     delivery_sample_count: u64,
+    delivery_sample_bytes: u64,
     last_delivery_sample_at: Option<Instant>,
     min_rtt: Option<Duration>,
 }
@@ -311,25 +312,27 @@ impl QuicPathMetricTracker {
         };
 
         let newly_acked_bytes = congestion.newly_acked_bytes.unwrap_or(0);
-        let product_data_ack_context = self.product_data_pending_ack_bytes > 0;
+        let product_data_pending_before_ack = self.product_data_pending_ack_bytes;
+        let product_newly_acked_bytes = newly_acked_bytes.min(product_data_pending_before_ack);
+        let product_data_ack_context = product_newly_acked_bytes > 0;
         let mut app_limited = congestion.app_limited || !product_data_ack_context;
-        if newly_acked_bytes > 0 && product_data_ack_context {
+        if product_newly_acked_bytes > 0 {
             self.ack_derived_data_seen = true;
             self.product_data_pending_ack_bytes = self
                 .product_data_pending_ack_bytes
-                .saturating_sub(newly_acked_bytes);
+                .saturating_sub(product_newly_acked_bytes);
         }
-        if newly_acked_bytes > 0 && !congestion.app_limited {
+        if product_newly_acked_bytes > 0 && !congestion.app_limited {
             let sample_elapsed = elapsed.max(QUIC_TIMER_GRANULARITY);
             let sample_rate =
-                (newly_acked_bytes as f64 * 8.0 / sample_elapsed.as_secs_f64()).max(1.0);
+                (product_newly_acked_bytes as f64 * 8.0 / sample_elapsed.as_secs_f64()).max(1.0);
             let delivery_evidence_floor = if self.delivery_sample_count == 0 {
                 evidence_inflight_hi.max(PATH_OPEN_SCORE_BYTES as u64)
             } else {
                 evidence_inflight_hi
             };
-            let sample_is_app_limited =
-                newly_acked_bytes < delivery_evidence_floor && self.delivery_sample_count == 0;
+            let sample_is_app_limited = product_newly_acked_bytes < delivery_evidence_floor
+                && self.delivery_sample_count == 0;
             app_limited = sample_is_app_limited;
             if !sample_is_app_limited {
                 let current_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
@@ -337,6 +340,9 @@ impl QuicPathMetricTracker {
                 self.delivery_sample_count = self
                     .delivery_sample_count
                     .saturating_add(congestion.delivery_sample_count.max(1));
+                self.delivery_sample_bytes = self
+                    .delivery_sample_bytes
+                    .saturating_add(product_newly_acked_bytes);
                 self.last_delivery_sample_at = Some(now);
                 self.delivery_rate_bps = Some(match self.delivery_rate_bps {
                     Some(previous) if bounded_sample > previous => {
@@ -370,6 +376,7 @@ impl QuicPathMetricTracker {
             app_limited,
             ack_derived_data_seen: self.ack_derived_data_seen,
             delivery_sample_count: self.delivery_sample_count,
+            delivery_sample_bytes: self.delivery_sample_bytes,
             last_delivery_sample_at: self.last_delivery_sample_at,
         }
     }
@@ -1116,6 +1123,7 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
         app_limited: metrics.app_limited,
         has_ack_derived_data_sample: metrics.ack_derived_data_seen,
         data_sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
+        data_sample_bytes: metrics.delivery_sample_bytes,
     }
 }
 
@@ -2343,6 +2351,7 @@ mod tests {
             app_limited: true,
             ack_derived_data_seen: false,
             delivery_sample_count: 0,
+            delivery_sample_bytes: 0,
             last_delivery_sample_at: None,
         };
 
@@ -2538,6 +2547,7 @@ mod tests {
             app_limited: true,
             ack_derived_data_seen: true,
             delivery_sample_count: 0,
+            delivery_sample_bytes: 0,
             last_delivery_sample_at: None,
         };
 
@@ -2623,19 +2633,29 @@ mod tests {
         stats.udp_tx.bytes = 8 * 1024 * 1024;
         stats.frame_tx.stream = 512;
         stats.frame_rx.acks = 16;
-        let raised =
-            tracker
-                .quic
-                .observe(stats, with_acked_bytes(congestion, 8 * 1024 * 1024, 16), 2);
+        let raised = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, 8 * 1024 * 1024),
+                8 * 1024 * 1024,
+                16,
+            ),
+            2,
+        );
 
         tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(500));
         stats.udp_tx.bytes += 512 * 1024;
         stats.frame_tx.stream += 512;
         stats.frame_rx.acks += 16;
-        let after_low =
-            tracker
-                .quic
-                .observe(stats, with_acked_bytes(congestion, 512 * 1024, 16), 2);
+        let after_low = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, 8 * 1024 * 1024 + 512 * 1024),
+                512 * 1024,
+                16,
+            ),
+            2,
+        );
 
         assert_eq!(after_low.delivery_sample_count, 32);
         assert_eq!(after_low.delivery_rate_bps, raised.delivery_rate_bps);

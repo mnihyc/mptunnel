@@ -524,6 +524,7 @@ fn response_target_can_own_unique_bulk_data(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
     lower_owner: Option<CarrierPathKey>,
+    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
@@ -535,6 +536,7 @@ fn response_target_can_own_unique_bulk_data(
         target,
         candidates,
         lower_owner,
+        ordinary_data_dispatched_bytes,
         payload_bytes,
         mux_limits,
         performance,
@@ -551,6 +553,7 @@ fn response_target_can_own_quic_ack_data_trial(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
     _lower_owner: Option<CarrierPathKey>,
+    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
@@ -564,6 +567,7 @@ fn response_target_can_own_quic_ack_data_trial(
             .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence)
         && response_target_has_quic_unique_trial_credit(
             target,
+            ordinary_data_dispatched_bytes,
             payload_bytes,
             mux_limits,
             performance,
@@ -574,6 +578,7 @@ fn response_target_is_quic_ack_data_unique_trial(
     target: &ResponseSenderPathTarget,
     targets: &[ResponseSenderPathTarget],
     lower_owner: Option<CarrierPathKey>,
+    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
@@ -583,6 +588,7 @@ fn response_target_is_quic_ack_data_unique_trial(
         target,
         &candidates,
         lower_owner,
+        ordinary_data_dispatched_bytes,
         payload_bytes,
         mux_limits,
         performance,
@@ -592,6 +598,7 @@ fn response_target_is_quic_ack_data_unique_trial(
 fn response_target_is_quic_ack_data_exploration(
     target: &ResponseSenderPathTarget,
     lower_owner: Option<CarrierPathKey>,
+    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
@@ -604,6 +611,7 @@ fn response_target_is_quic_ack_data_exploration(
         && !target.has_bulk_rate_evidence
         && response_target_has_quic_unique_trial_credit(
             target,
+            ordinary_data_dispatched_bytes,
             payload_bytes,
             mux_limits,
             performance,
@@ -634,6 +642,7 @@ fn choose_response_admissible_lead(
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
     performance: MppPerformanceConfig,
+    ordinary_data_dispatched_bytes: u64,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if let Some(owner) = lower_owner {
@@ -664,6 +673,7 @@ fn choose_response_admissible_lead(
                 target,
                 candidate_targets,
                 lower_owner,
+                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 mux_limits,
                 performance,
@@ -725,6 +735,7 @@ fn choose_response_sender_target(
     performance: MppPerformanceConfig,
     lower_flights: &[CarrierPathFlightDebt],
     avoid_keys: &[CarrierPathKey],
+    ordinary_data_dispatched_bytes: u64,
     repair: bool,
 ) -> Option<ResponseSenderPathTarget> {
     if targets.is_empty() {
@@ -789,6 +800,7 @@ fn choose_response_sender_target(
         payload_bytes,
         lower_flights,
         performance,
+        ordinary_data_dispatched_bytes,
     )?;
     let selected = candidate_targets
         .iter()
@@ -799,6 +811,7 @@ fn choose_response_sender_target(
                 target,
                 &candidate_targets,
                 lower_owner,
+                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 mux_limits,
                 performance,
@@ -852,6 +865,7 @@ fn choose_response_sender_data_target(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
+    ordinary_data_dispatched_bytes: u64,
     lower_flights: &[CarrierPathFlightDebt],
     ordered_data_owner: Option<CarrierPathKey>,
 ) -> Option<ResponseSenderPathTarget> {
@@ -895,6 +909,7 @@ fn choose_response_sender_data_target(
                 response_target_is_quic_ack_data_exploration(
                     target,
                     lower_owner,
+                    ordinary_data_dispatched_bytes,
                     payload_bytes,
                     mux_limits,
                     performance,
@@ -914,6 +929,7 @@ fn choose_response_sender_data_target(
         payload_bytes,
         lower_flights,
         performance,
+        ordinary_data_dispatched_bytes,
     )?;
     let admitted = candidate_targets
         .iter()
@@ -924,6 +940,7 @@ fn choose_response_sender_data_target(
                 target,
                 &candidate_targets,
                 lower_owner,
+                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 mux_limits,
                 performance,
@@ -1073,6 +1090,7 @@ fn response_target_has_discovery_credit(
 
 fn response_target_has_quic_unique_trial_credit(
     target: &ResponseSenderPathTarget,
+    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     performance: MppPerformanceConfig,
@@ -1094,9 +1112,14 @@ fn response_target_has_quic_unique_trial_credit(
         .inflight_limit_bytes
         .min(product_envelope)
         .max(min_pipe_trial_credit);
-    let trial_credit = discovery_credit.saturating_mul(2).max(carrier_trial_credit);
-    target.bulk_discovery_sent_bytes < trial_credit
-        && response_target_discovery_debt_bytes(target) < trial_credit
+    let earned_trial_credit = response_extra_traffic_budget_bytes(
+        ordinary_data_dispatched_bytes,
+        performance,
+        mux_limits,
+    )
+    .max(discovery_credit.saturating_mul(2));
+    target.bulk_discovery_sent_bytes < earned_trial_credit
+        && response_target_discovery_debt_bytes(target) < carrier_trial_credit
 }
 
 fn response_bulk_discovery_credit_bytes(
@@ -1241,6 +1264,7 @@ fn plan_response_data_dispatch(
     next_offset: u64,
     payload_bytes: usize,
     performance: MppPerformanceConfig,
+    ordinary_data_dispatched_bytes: u64,
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
@@ -1265,6 +1289,7 @@ fn plan_response_data_dispatch(
                 payload_bytes,
                 binding.mux_limits(),
                 performance,
+                ordinary_data_dispatched_bytes,
                 &lower_flights,
                 ordered_data_owner,
             ) else {
@@ -1282,12 +1307,14 @@ fn plan_response_data_dispatch(
                 &target,
                 &targets,
                 response_oldest_lower_flight_owner(&lower_flights),
+                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 binding.mux_limits(),
                 performance,
             ) || response_target_is_quic_ack_data_exploration(
                 &target,
                 response_oldest_lower_flight_owner(&lower_flights),
+                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 binding.mux_limits(),
                 performance,
@@ -1367,6 +1394,7 @@ fn response_frame_has_carrier_credit(
                 performance,
                 &lower_flights,
                 &avoid_keys,
+                0,
                 repair,
             )
             .is_some()
@@ -1527,6 +1555,7 @@ async fn emit_response_frame_from_sender_service(
                     performance,
                     &lower_flights,
                     &avoid_keys,
+                    0,
                     repair,
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
@@ -1742,6 +1771,7 @@ impl ServerResponseSenderService {
                     payload.len(),
                 ),
                 self.performance,
+                self.ordinary_data_dispatched_bytes,
             )
             .is_ok(),
             ReliableRelayQueuedWorkKind::Repair { frame, .. } => response_frame_has_carrier_credit(
@@ -1864,6 +1894,7 @@ impl ServerResponseSenderService {
                     send_stream.next_offset(),
                     dispatch_payload.len(),
                     self.performance,
+                    self.ordinary_data_dispatched_bytes,
                 )?;
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
@@ -2995,6 +3026,7 @@ mod tests {
             MppPerformanceConfig::default(),
             &[],
             &[],
+            0,
             false,
         )
         .expect("admissible higher ETA path should lead");
@@ -3021,6 +3053,7 @@ mod tests {
             MppPerformanceConfig::default(),
             &[],
             &[],
+            0,
             false,
         )
         .expect("stream-ordered final control should remain dispatchable");
@@ -3063,6 +3096,7 @@ mod tests {
             MppPerformanceConfig::default(),
             &[],
             &[],
+            0,
             false,
         );
 
@@ -3083,6 +3117,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &[],
             None,
         );
@@ -3142,6 +3177,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             MppPerformanceConfig::default(),
+            0,
             &[],
             None,
         )
@@ -3228,6 +3264,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(active.key),
         )
@@ -3246,6 +3283,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(active.key),
         )
@@ -3374,6 +3412,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Tcp,
@@ -3416,6 +3455,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -3478,6 +3518,7 @@ mod tests {
             MppPerformanceConfig::default(),
             &[],
             &[original_owner.key],
+            0,
             true,
         )
         .expect("repair should remain dispatchable on the proven alternate");
@@ -3524,6 +3565,7 @@ mod tests {
             MppPerformanceConfig::default(),
             &[],
             &[original_owner.key],
+            0,
             true,
         )
         .expect("repair may fall back to the only non-owner path");
@@ -3637,6 +3679,7 @@ mod tests {
                 app_limited: true,
                 has_ack_derived_data_sample: false,
                 data_sample_count: 0,
+                data_sample_bytes: 0,
             },
             ServerPathMetricsSource::LocalSender,
         );
@@ -3657,6 +3700,7 @@ mod tests {
             0,
             payload_bytes,
             MppPerformanceConfig::default(),
+            0,
         )
         .expect("active path should remain dispatchable");
 
@@ -3733,6 +3777,7 @@ mod tests {
                 app_limited: true,
                 has_ack_derived_data_sample: true,
                 data_sample_count: 0,
+                data_sample_bytes: 0,
             },
             ServerPathMetricsSource::LocalSender,
         );
@@ -3753,6 +3798,7 @@ mod tests {
             0,
             payload_bytes,
             MppPerformanceConfig::default(),
+            0,
         )
         .expect("ACK-data-seen validation path should receive a bounded unique trial");
 
@@ -3799,6 +3845,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             performance,
+            0,
             &[CarrierPathFlightDebt {
                 key: active_key,
                 bytes: PATH_OPEN_SCORE_BYTES as u64,
@@ -3844,6 +3891,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             performance,
+            0,
             &[CarrierPathFlightDebt {
                 key: active_key,
                 bytes: PATH_OPEN_SCORE_BYTES as u64,
@@ -3872,25 +3920,40 @@ mod tests {
         trial.bulk_discovery_sent_bytes = one_discovery_credit.saturating_mul(2);
 
         assert!(
-            response_target_has_quic_unique_trial_credit(
+            !response_target_has_quic_unique_trial_credit(
                 &trial,
+                0,
                 payload_bytes,
                 mux_limits,
                 performance
             ),
-            "ACK-data unique trial must not be exhausted after one duplicate plus one owner quantum"
+            "ACK-data unique exploration must not outrun the startup trial share before ordinary owner progress earns more"
         );
 
-        trial.bulk_discovery_sent_bytes = (reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
-            * BBR_MIN_PIPE_CWND_PACKETS) as u64;
+        let ordinary_progress_bytes = one_discovery_credit.saturating_mul(200);
+        assert!(
+            response_target_has_quic_unique_trial_credit(
+                &trial,
+                ordinary_progress_bytes,
+                payload_bytes,
+                mux_limits,
+                performance
+            ),
+            "ordinary app-byte progress refills ACK-data unique exploration instead of permanently exhausting the path"
+        );
+
+        trial.snapshot.product_bytes_in_flight =
+            (reliable_bulk_carrier_feed_quantum_bytes(mux_limits) * BBR_MIN_PIPE_CWND_PACKETS)
+                as u64;
         assert!(
             !response_target_has_quic_unique_trial_credit(
                 &trial,
+                ordinary_progress_bytes,
                 payload_bytes,
                 mux_limits,
                 performance
             ),
-            "ACK-data unique trial remains bounded by a minimum-pipe discovery envelope"
+            "ACK-data unique trial remains bounded by outstanding minimum-pipe debt"
         );
     }
 
@@ -3911,10 +3974,12 @@ mod tests {
         trial.has_ack_data_evidence = true;
         trial.bulk_discovery_sent_bytes = (reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
             * BBR_MIN_PIPE_CWND_PACKETS) as u64;
+        let mut ordinary_progress_bytes = trial.bulk_discovery_sent_bytes.saturating_mul(100);
 
         assert!(
             response_target_has_quic_unique_trial_credit(
                 &trial,
+                ordinary_progress_bytes,
                 payload_bytes,
                 mux_limits,
                 performance
@@ -3923,9 +3988,23 @@ mod tests {
         );
 
         trial.bulk_discovery_sent_bytes = trial.snapshot.inflight_limit_bytes;
+        ordinary_progress_bytes = trial.bulk_discovery_sent_bytes.saturating_mul(100);
+        assert!(
+            response_target_has_quic_unique_trial_credit(
+                &trial,
+                ordinary_progress_bytes,
+                payload_bytes,
+                mux_limits,
+                performance
+            ),
+            "ACKed unique exploration carries app bytes; cumulative sent bytes must not exhaust the path forever"
+        );
+
+        trial.snapshot.product_bytes_in_flight = trial.snapshot.inflight_limit_bytes;
         assert!(
             !response_target_has_quic_unique_trial_credit(
                 &trial,
+                ordinary_progress_bytes,
                 payload_bytes,
                 mux_limits,
                 performance
@@ -3962,6 +4041,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -4018,6 +4098,7 @@ mod tests {
                 app_limited: false,
                 has_ack_derived_data_sample: true,
                 data_sample_count: 4,
+                data_sample_bytes: payload_bytes as u64,
             },
             ServerPathMetricsSource::LocalSender,
         );
@@ -4062,6 +4143,7 @@ mod tests {
                 app_limited: true,
                 has_ack_derived_data_sample: false,
                 data_sample_count: 0,
+                data_sample_bytes: 0,
             },
             ServerPathMetricsSource::LocalSender,
         );
@@ -4082,6 +4164,7 @@ mod tests {
             0,
             payload_bytes,
             MppPerformanceConfig::default(),
+            0,
         )
         .expect("TCP primary remains dispatchable");
 
@@ -4156,6 +4239,7 @@ mod tests {
                 app_limited: true,
                 has_ack_derived_data_sample: false,
                 data_sample_count: 0,
+                data_sample_bytes: 0,
             },
             ServerPathMetricsSource::LocalSender,
         );
@@ -4175,6 +4259,7 @@ mod tests {
             0,
             payload_bytes,
             MppPerformanceConfig::default(),
+            0,
         )
         .expect("active path should remain dispatchable");
         let frame = Frame::StreamData {
@@ -4294,6 +4379,7 @@ mod tests {
                 app_limited: true,
                 has_ack_derived_data_sample: true,
                 data_sample_count: 0,
+                data_sample_bytes: 0,
             },
             ServerPathMetricsSource::LocalSender,
         );
@@ -4313,6 +4399,7 @@ mod tests {
             payload_bytes as u64,
             payload_bytes,
             MppPerformanceConfig::default(),
+            (payload_bytes as u64).saturating_mul(200),
         )
         .expect("ACK-data exploration path should receive bounded unique trial");
         assert_eq!(plan.primary_key(), Some(trial_key));
@@ -4371,6 +4458,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &lower_flights,
             Some(target.key),
         )
@@ -4401,6 +4489,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &lower_flights,
             Some(owner.key),
         )
@@ -4432,6 +4521,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &lower_flights,
             Some(owner.key),
         )
@@ -4465,6 +4555,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &lower_flights,
             Some(owner.key),
         )
@@ -4488,6 +4579,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(bulk_proven_udp.key),
         )
@@ -4508,6 +4600,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(lead.key),
         )
@@ -4530,6 +4623,7 @@ mod tests {
             64 * 1024,
             MuxLimits::default(),
             MppPerformanceConfig::default(),
+            0,
             &[],
             Some(lead.key),
         )

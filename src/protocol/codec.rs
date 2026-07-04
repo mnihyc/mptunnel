@@ -895,6 +895,7 @@ fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u8(out, u8::from(metrics.app_limited));
     put_u8(out, u8::from(metrics.has_ack_derived_data_sample));
     put_u32(out, metrics.data_sample_count);
+    put_u64(out, metrics.data_sample_bytes);
 }
 
 fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecError> {
@@ -922,6 +923,7 @@ fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecErro
         app_limited: decode_bool(reader.get_u8()?)?,
         has_ack_derived_data_sample: decode_bool(reader.get_u8()?)?,
         data_sample_count: reader.get_u32()?,
+        data_sample_bytes: reader.get_u64()?,
     })
 }
 
@@ -1617,6 +1619,7 @@ mod tests {
                 app_limited: false,
                 has_ack_derived_data_sample: true,
                 data_sample_count: 9,
+                data_sample_bytes: 512 * 1024,
             },
         });
         round_trip(Frame::RxRateHint {

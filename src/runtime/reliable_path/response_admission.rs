@@ -423,9 +423,12 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
         }) if metrics.has_ack_derived_data_sample || metrics.confidence_ppm > 0 => {
             let source_confidence =
                 f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
-            let sample_confidence = (f64::from(metrics.data_sample_count)
+            let sample_floor = server_path_metrics_bulk_sample_floor_bytes(metrics).max(1) as f64;
+            let byte_confidence = (metrics.data_sample_bytes as f64 / sample_floor).clamp(0.0, 1.0);
+            let count_confidence = (f64::from(metrics.data_sample_count)
                 / confidence_sample_denominator())
             .clamp(0.0, 1.0);
+            let sample_confidence = byte_confidence.min(count_confidence);
             if metrics.has_ack_derived_data_sample {
                 source_confidence * sample_confidence
             } else {
@@ -445,10 +448,19 @@ fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
     path_metrics.metrics.delivery_rate_bps.max(1) as f64
 }
 
+fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
+    metrics
+        .inflight_hi_bytes
+        .max(metrics.inflight_limit_bytes)
+        .max(PATH_OPEN_SCORE_BYTES as u64)
+}
+
 fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
     path_metrics.source == ServerPathMetricsSource::LocalSender
         && path_metrics.metrics.has_ack_derived_data_sample
         && path_metrics.metrics.data_sample_count > 0
+        && path_metrics.metrics.data_sample_bytes
+            >= server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics)
 }
 
 fn server_path_metrics_has_ack_data_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
@@ -625,6 +637,7 @@ mod tests {
                     app_limited: true,
                     has_ack_derived_data_sample: true,
                     data_sample_count: 32,
+                    data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
             bulk_discovery_sent_bytes: 0,
@@ -679,6 +692,7 @@ mod tests {
                     app_limited: true,
                     has_ack_derived_data_sample: true,
                     data_sample_count: 0,
+                    data_sample_bytes: 0,
                 },
             }),
             bulk_discovery_sent_bytes: 0,
@@ -708,6 +722,76 @@ mod tests {
             !server_output_has_bulk_rate_evidence(&entry),
             "ACK-data seen without non-app-limited samples is not ordinary bulk-rate proof"
         );
+    }
+
+    #[test]
+    fn udp_tiny_non_app_limited_sample_is_ack_data_not_bulk_rate_evidence() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(9),
+        };
+        let sample_floor = 2 * 1024 * 1024;
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 80_000,
+                    srtt_us: 80_000,
+                    rttvar_us: 2_000,
+                    jitter_us: 2_000,
+                    delivery_rate_bps: 12_000_000,
+                    pacing_rate_bps: 12_000_000,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: 0,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: sample_floor,
+                    inflight_hi_bytes: sample_floor,
+                    confidence_ppm: 1_000_000,
+                    app_limited: false,
+                    has_ack_derived_data_sample: true,
+                    data_sample_count: 4,
+                    data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                },
+            }),
+            bulk_discovery_sent_bytes: 0,
+        };
+
+        assert!(server_output_has_ack_data_evidence(&entry));
+        assert!(
+            !server_output_has_bulk_rate_evidence(&entry),
+            "bulk-rate promotion requires enough ACKed byte volume, not just non-app-limited ACK count"
+        );
+        let snapshot = server_bulk_output_snapshot(
+            &entry,
+            SessionId(77),
+            FlowLane::Throughput,
+            &ServerPathLaneTracker::default(),
+            MuxLimits::default(),
+            Instant::now(),
+        );
+        assert_eq!(
+            snapshot.delivery_rate_bps,
+            default_path_rate_bps(UnderlayProtocol::Udp)
+        );
+        assert!(snapshot.confidence < 1.0);
     }
 
     #[test]

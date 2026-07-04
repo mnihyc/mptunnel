@@ -314,7 +314,7 @@ impl ServerReliableStreamRegistry {
         lab_diagnostic(
             "server_path_metrics_recorded",
             format_args!(
-                "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={}",
+                "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={} sample_bytes={}",
                 session_id.0,
                 underlay,
                 path_id.0,
@@ -327,6 +327,7 @@ impl ServerReliableStreamRegistry {
                 metrics.app_limited,
                 metrics.has_ack_derived_data_sample,
                 metrics.data_sample_count,
+                metrics.data_sample_bytes,
             ),
         );
         let bindings = {

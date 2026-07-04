@@ -246,6 +246,7 @@ pub struct PathMetrics {
     pub app_limited: bool,
     pub has_ack_derived_data_sample: bool,
     pub data_sample_count: u32,
+    pub data_sample_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -344,6 +344,7 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) carrier_queue_bytes: u64,
     pub(super) carrier_inflight_limit_bytes: u64,
     pub(super) carrier_delivery_samples: u32,
+    pub(super) carrier_delivery_sample_bytes: u64,
     pub(super) carrier_last_delivery_at: Option<Instant>,
     pub(super) carrier_app_limited: bool,
     pub(super) carrier_ack_derived_data_seen: bool,
@@ -376,6 +377,7 @@ impl Default for ClientPathHealthRecord {
             carrier_queue_bytes: 0,
             carrier_inflight_limit_bytes: 0,
             carrier_delivery_samples: 0,
+            carrier_delivery_sample_bytes: 0,
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
@@ -407,6 +409,7 @@ pub(super) struct ClientPathObservation {
     pub(super) carrier_queue_bytes: u64,
     pub(super) carrier_inflight_limit_bytes: u64,
     pub(super) carrier_delivery_samples: u32,
+    pub(super) carrier_delivery_sample_bytes: u64,
     pub(super) carrier_last_delivery_at: Option<Instant>,
     pub(super) carrier_app_limited: bool,
     pub(super) carrier_ack_derived_data_seen: bool,
@@ -437,6 +440,7 @@ impl Default for ClientPathObservation {
             carrier_queue_bytes: 0,
             carrier_inflight_limit_bytes: 0,
             carrier_delivery_samples: 0,
+            carrier_delivery_sample_bytes: 0,
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
@@ -496,6 +500,7 @@ impl ClientPathHealthRecord {
                 carrier_queue_bytes: self.carrier_queue_bytes,
                 carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
                 carrier_delivery_samples: self.carrier_delivery_samples,
+                carrier_delivery_sample_bytes: self.carrier_delivery_sample_bytes,
                 carrier_last_delivery_at: self.carrier_last_delivery_at,
                 carrier_app_limited: self.carrier_app_limited,
                 carrier_ack_derived_data_seen: self.carrier_ack_derived_data_seen,
@@ -530,6 +535,7 @@ impl ClientPathHealthRecord {
             carrier_queue_bytes: self.carrier_queue_bytes,
             carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
             carrier_delivery_samples: self.carrier_delivery_samples,
+            carrier_delivery_sample_bytes: self.carrier_delivery_sample_bytes,
             carrier_last_delivery_at: self.carrier_last_delivery_at,
             carrier_app_limited: self.carrier_app_limited,
             carrier_ack_derived_data_seen: self.carrier_ack_derived_data_seen,
@@ -658,6 +664,7 @@ impl ClientPathHealthRecord {
             self.carrier_delivery_rate_bps = Some(metrics.delivery_rate_bps.max(1.0));
             self.carrier_delivery_samples =
                 u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX);
+            self.carrier_delivery_sample_bytes = metrics.delivery_sample_bytes;
             self.carrier_last_delivery_at = metrics.last_delivery_sample_at;
         }
         if metrics.ack_derived_data_seen {

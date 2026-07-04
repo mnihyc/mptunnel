@@ -1111,6 +1111,7 @@ confidence_ppm:u32
 app_limited:u8
 has_ack_derived_data_sample:u8
 data_sample_count:u32
+data_sample_bytes:u64
 ```
 
 `loss_observed` and `ecn_observed` distinguish a measured zero from an
@@ -1132,14 +1133,20 @@ service from peer metrics alone; promotion requires local sender evidence or
 stream delivery samples that are not polluted by ordering holes.
 
 When `has_ack_derived_data_sample` is set by the local sender for the current
-direction, `confidence_ppm` and `data_sample_count` are sender-side evidence and
-SHOULD materially raise the path model confidence. A mature sample set with high
-confidence is not merely a liveness hint. Peer-provided metrics, successful
-opens, and control-only traffic remain low-confidence validation hints unless
-local delivery or carrier ACK-derived data samples confirm them. The sender path
-model MUST also add locally queued carrier command bytes to `queue_bytes` for
-all underlays, including TCP, so hidden path queues cannot be ignored by
-ECF/BLEST admission.
+direction, `confidence_ppm`, `data_sample_count`, and `data_sample_bytes` are
+sender-side evidence and SHOULD materially raise the path model confidence. The
+count records independent ACK-derived samples; the byte total records how much
+application DATA was newly acknowledged by the carrier samples used for the
+current delivery model. Bulk-rate promotion MUST require both sample count and
+adequate acknowledged byte volume for the path's current modeled flight
+envelope. A small probe can prove ACK-data visibility, but it MUST NOT seed a
+long-lived bulk-rate model or make the path an ordinary unique-data owner by
+itself. A mature sample set with high confidence is not merely a liveness hint.
+Peer-provided metrics, successful opens, and control-only traffic remain
+low-confidence validation hints unless local delivery or carrier ACK-derived
+data samples confirm them. The sender path model MUST also add locally queued
+carrier command bytes to `queue_bytes` for all underlays, including TCP, so
+hidden path queues cannot be ignored by ECF/BLEST admission.
 
 Each endpoint also keeps local lane occupancy for every session path. This
 state is not trusted from the peer because it reflects local product work
@@ -2726,21 +2733,30 @@ ACK-derived data seen for that carrier path, which proves the path can carry
 data and keeps it visible to validation and duplicate-discovery policy. It does
 not make the path eligible for ordinary future ordered `STREAM_DATA` ownership.
 It may, however, make the path eligible for bounded unique exploration when the
-validation/discovery traffic ledger still has credit. That exploration is not
+validation/discovery traffic ledger still has credit. The resulting ACK-derived
+rate becomes bulk-rate evidence only after the acknowledged DATA byte volume is
+large enough for the path's modeled flight envelope; otherwise the sample
+remains ACK-data evidence for validation/trial state only. That exploration is not
 ordinary bulk admission and MUST NOT be selected merely as a sticky lead or a
 carrier-family preference. It is a path-local probe state used when an existing
 lower-frontier owner would otherwise keep the stream on one path forever. The
-exploration quantum owns only the byte range it sends, is accounted in the
-validation/discovery ledger, respects service-quantum preemption and carrier
-credit, and MUST NOT rewrite the ordinary lead. Duplicate discovery remains
-bounded by the duplicate/probe budget because it is extra traffic; unique
-exploration carries real application bytes and therefore uses a trial envelope
-derived from the path-local QUIC inflight limit, capped by the product resource
-envelope and floored by a small minimum pipe. A lower-frontier owner is therefore
-not an absolute ban once the candidate has path-local ACK-data evidence;
-proof-only QUIC paths still MUST NOT own unique future bytes. This lets the QUIC
-carrier produce a non-application-limited delivery sample instead of remaining
-stuck behind one application-limited frame forever. Ordinary unique bulk
+exploration quantum owns only the byte range it sends, enters the normal
+path-flight and stream-ordering ledgers, respects service-quantum preemption and
+carrier credit, and MUST NOT rewrite the ordinary lead. Duplicate discovery
+remains bounded by the duplicate/probe budget because it is extra traffic;
+unique exploration carries real application bytes and therefore MUST NOT be
+permanently exhausted by cumulative duplicate/probe accounting. Instead, it uses
+two gates. A cumulative exploration-share gate is earned by ordinary
+application-owner bytes already dispatched on the stream, so exploration can
+continue as demand grows but cannot take unlimited turns ahead of the current
+service owner. An outstanding-debt gate is derived from the path-local QUIC
+inflight limit, capped by the product resource envelope and floored by a small
+minimum pipe. A lower-frontier owner is therefore not an absolute ban once the
+candidate has path-local ACK-data evidence; proof-only QUIC paths still MUST NOT
+own unique future bytes. This lets the QUIC carrier produce a
+non-application-limited delivery sample instead of remaining stuck behind one
+application-limited frame forever, while preserving the no-worse rule for the
+existing service owner. Ordinary unique bulk
 ownership requires either that the path is already the active service path or
 that the path has non-application-limited bulk-rate evidence and passes the
 normal ECF/BLEST admission model. ACK-data seen does not set bulk-rate evidence

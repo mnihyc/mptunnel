@@ -1305,7 +1305,7 @@ impl ResponseStreamBinding {
             lab_diagnostic(
                 "server_response_path_metrics_attached",
                 format_args!(
-                    "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={}",
+                    "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={} sample_bytes={}",
                     self.session_id.0,
                     key.underlay,
                     key.path_id.0,
@@ -1318,6 +1318,7 @@ impl ResponseStreamBinding {
                     metrics.app_limited,
                     metrics.has_ack_derived_data_sample,
                     metrics.data_sample_count,
+                    metrics.data_sample_bytes,
                 ),
             );
             self.notify_update();
@@ -1862,6 +1863,7 @@ mod tests {
                 app_limited: true,
                 has_ack_derived_data_sample: true,
                 data_sample_count: 142,
+                data_sample_bytes: 0,
             };
             binding.update_path_metrics(key, metrics, ServerPathMetricsSource::PeerHint);
 
@@ -1904,6 +1906,7 @@ mod tests {
             app_limited: false,
             has_ack_derived_data_sample: true,
             data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            data_sample_bytes: MIN_RATE_SAMPLE_BYTES,
         };
         binding.update_path_metrics(key, metrics, ServerPathMetricsSource::LocalSender);
 

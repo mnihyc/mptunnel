@@ -1067,6 +1067,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             app_limited: true,
             ack_derived_data_seen: false,
             delivery_sample_count: 0,
+            delivery_sample_bytes: 0,
             last_delivery_sample_at: None,
         });
     }
@@ -1100,6 +1101,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             app_limited: false,
             ack_derived_data_seen: true,
             delivery_sample_count: 2,
+            delivery_sample_bytes: 512 * 1024,
             last_delivery_sample_at: Some(now),
         });
     }

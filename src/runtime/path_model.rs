@@ -663,6 +663,7 @@ pub(super) fn path_metrics_from_snapshot(
         app_limited: snapshot.app_limited,
         has_ack_derived_data_sample,
         data_sample_count,
+        data_sample_bytes: observation.carrier_delivery_sample_bytes,
     }
 }
 
@@ -812,7 +813,10 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
         && reliable_product_delivery_samples(path, observation) > 0;
     product_rate
         || path.metadata.initial_rate != RateHint::Unknown
-        || (observation.carrier_delivery_rate_bps.is_some() && !observation.carrier_app_limited)
+        || (observation.carrier_delivery_rate_bps.is_some()
+            && !observation.carrier_app_limited
+            && observation.carrier_delivery_sample_bytes
+                >= client_path_observation_bulk_sample_floor_bytes(observation))
 }
 
 pub(super) fn bulk_candidate_has_unique_data_evidence(
@@ -838,6 +842,12 @@ fn observation_has_sender_delivery_evidence(observation: ClientPathObservation) 
         || observation.carrier_ack_derived_data_seen
         || observation.measured_rate_bps.is_some()
         || (observation.carrier_delivery_rate_bps.is_some() && !observation.carrier_app_limited)
+}
+
+fn client_path_observation_bulk_sample_floor_bytes(observation: ClientPathObservation) -> u64 {
+    observation
+        .carrier_inflight_limit_bytes
+        .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
 fn reliable_product_delivery_samples(path: &PathSpec, observation: ClientPathObservation) -> u32 {

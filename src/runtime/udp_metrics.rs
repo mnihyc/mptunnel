@@ -17,5 +17,6 @@ pub(super) struct UdpPathMetrics {
     pub(super) app_limited: bool,
     pub(super) ack_derived_data_seen: bool,
     pub(super) delivery_sample_count: u64,
+    pub(super) delivery_sample_bytes: u64,
     pub(super) last_delivery_sample_at: Option<Instant>,
 }

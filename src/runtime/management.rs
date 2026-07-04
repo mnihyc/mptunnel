@@ -1049,6 +1049,7 @@ struct ServerMetricStatus {
     app_limited: bool,
     has_ack_derived_data_sample: bool,
     data_sample_count: u32,
+    data_sample_bytes: u64,
 }
 
 fn server_path_metrics(
@@ -1082,6 +1083,7 @@ fn server_path_metrics(
             app_limited: metric.metrics.app_limited,
             has_ack_derived_data_sample: metric.metrics.has_ack_derived_data_sample,
             data_sample_count: metric.metrics.data_sample_count,
+            data_sample_bytes: metric.metrics.data_sample_bytes,
         })
         .collect()
 }

@@ -1222,7 +1222,6 @@ impl ResponseStreamBinding {
                     ),
                     is_active: Some(entry.key) == active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
-                    has_ack_data_evidence: server_output_has_ack_data_evidence(entry),
                     has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
                     bulk_discovery_sent_bytes: entry.bulk_discovery_sent_bytes,
                 }

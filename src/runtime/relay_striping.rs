@@ -1134,7 +1134,7 @@ mod tests {
             PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(80))
                 .expect("sender evidence"),
         );
-        context.record_relay_path_send(saturated.underlay, saturated.index, 32 * 1024 * 1024);
+        context.record_relay_path_send(saturated.underlay, saturated.index, 128 * 1024 * 1024);
         let paths = vec![
             relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
             relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),

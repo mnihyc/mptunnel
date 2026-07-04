@@ -32,7 +32,6 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
-    pub(in crate::runtime) has_ack_data_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
     pub(in crate::runtime) bulk_discovery_sent_bytes: u64,
 }
@@ -486,15 +485,6 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         )
 }
 
-pub(in crate::runtime) fn server_output_has_ack_data_evidence(
-    entry: &ResponseStreamOutputEntry,
-) -> bool {
-    matches!(
-        entry.path_metrics,
-        Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
-    )
-}
-
 pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
@@ -774,7 +764,10 @@ mod tests {
             bulk_discovery_sent_bytes: 0,
         };
 
-        assert!(server_output_has_ack_data_evidence(&entry));
+        assert!(matches!(
+            entry.path_metrics,
+            Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
+        ));
         assert!(
             !server_output_has_bulk_rate_evidence(&entry),
             "bulk-rate promotion requires enough ACKed byte volume, not just non-app-limited ACK count"

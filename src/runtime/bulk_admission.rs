@@ -304,22 +304,19 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
     let payload_bytes = check.payload_bytes;
     let mux_limits = check.mux_limits;
     let role = check.role;
+    if bulk_active_lead_has_contiguous_frontier(candidate, role, check.stream_ordering_debt_bytes) {
+        let inflight_limit = bulk_active_lead_product_envelope_bytes(payload_bytes, mux_limits);
+        let committed = candidate
+            .product_bytes_in_flight
+            .saturating_add(candidate.product_queue_bytes)
+            .saturating_add(candidate.queue_bytes);
+        return committed.saturating_add(payload_bytes as u64) <= inflight_limit;
+    }
     let use_carrier_gate = candidate.underlay == UnderlayProtocol::Udp
         && !bulk_uses_product_only_active_gate(candidate, role);
     let (inflight_limit, committed) = if use_carrier_gate {
         (
             bulk_carrier_inflight_limit_bytes(candidate, payload_bytes, mux_limits, role),
-            bulk_scheduler_inflight_debt_bytes(candidate, role),
-        )
-    } else if candidate.underlay != UnderlayProtocol::Udp
-        && bulk_active_lead_has_contiguous_frontier(
-            candidate,
-            role,
-            check.stream_ordering_debt_bytes,
-        )
-    {
-        (
-            bulk_active_lead_product_envelope_bytes(payload_bytes, mux_limits),
             bulk_scheduler_inflight_debt_bytes(candidate, role),
         )
     } else {
@@ -339,8 +336,10 @@ fn bulk_active_lead_has_contiguous_frontier(
     role: BulkAdmissionRole,
     stream_ordering_debt_bytes: u64,
 ) -> bool {
-    role == BulkAdmissionRole::ActiveDataPath
-        && stream_ordering_debt_bytes == 0
+    matches!(
+        role,
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
+    ) && stream_ordering_debt_bytes == 0
         && bulk_latency_pressure_flows(candidate) == 0
 }
 
@@ -738,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn active_udp_path_obeys_product_flight_credit() {
+    fn active_udp_owner_with_clear_frontier_uses_product_envelope_not_carrier_cwnd() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
@@ -758,12 +757,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit")
+            None,
+            "active QUIC owner must not use current carrier cwnd as a product admission ceiling"
         );
     }
 
     #[test]
-    fn active_udp_clear_frontier_does_not_use_configured_window_as_credit() {
+    fn active_udp_clear_frontier_uses_product_service_envelope() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -784,8 +784,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "active lead status must not expand product flight to the configured stream/reorder window"
+            None,
+            "active service owner should be fed through the product service envelope when the ordered frontier is clear"
         );
     }
 

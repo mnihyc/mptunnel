@@ -1227,10 +1227,12 @@ not match this derived identity. Product `SESSION_AUTH` and `PATH_JOIN` remain
 mandatory after the QUIC handshake, so QUIC authentication and product session
 authentication are separate but bound to the same operator secret.
 
-UDP remains the performance carrier because QUIC owns packet numbers, ACKs,
+UDP-backed reliable paths are QUIC carriers: QUIC owns packet numbers, ACKs,
 loss recovery, PTO, pacing, congestion control, PMTU, connection IDs, and NAT
-rebinding above UDP. mptunnel MUST NOT implement a second packet-level reliable
-transport above QUIC. Above QUIC, mptunnel owns only product semantics:
+rebinding above UDP. They are not preferred merely because their underlay is
+UDP; TCP and QUIC carriers compete by live path metrics, lane demand, ordering
+debt, and no-worse admission. mptunnel MUST NOT implement a second packet-level
+reliable transport above QUIC. Above QUIC, mptunnel owns only product semantics:
 reliable stream offsets, stream ACK ranges, FIN/final offsets, repair byte
 ranges, datagram IDs, flow control, sender-service lanes, path admission, and
 path-model interpretation.
@@ -2732,42 +2734,27 @@ duplicate-discovery copy that is acknowledged by the local QUIC carrier may set
 ACK-derived data seen for that carrier path, which proves the path can carry
 data and keeps it visible to validation and duplicate-discovery policy. It does
 not make the path eligible for ordinary future ordered `STREAM_DATA` ownership.
-It may, however, make the path eligible for bounded unique exploration when the
-validation/discovery traffic ledger still has credit. The resulting ACK-derived
-rate becomes bulk-rate evidence only after the acknowledged DATA byte volume is
-large enough for the path's modeled flight envelope; otherwise the sample
-remains ACK-data evidence for validation/trial state only. That exploration is not
-ordinary bulk admission and MUST NOT be selected merely as a sticky lead or a
-carrier-family preference. It is a path-local probe state used when an existing
-lower-frontier owner would otherwise keep the stream on one path forever. The
-exploration quantum owns only the byte range it sends, enters the normal
-path-flight and stream-ordering ledgers, respects service-quantum preemption and
-carrier credit, and MUST NOT rewrite the ordinary lead. Duplicate discovery
-remains bounded by the duplicate/probe budget because it is extra traffic;
-unique exploration carries real application bytes and therefore MUST NOT be
-permanently exhausted by cumulative duplicate/probe accounting. Instead, it uses
-two gates. A cumulative exploration-share gate is earned by ordinary
-application-owner bytes already dispatched on the stream, so exploration can
-continue as demand grows but cannot take unlimited turns ahead of the current
-service owner. An outstanding-debt gate is derived from the path-local QUIC
-inflight limit, capped by the product resource envelope and floored by a small
-minimum pipe. A lower-frontier owner is therefore not an absolute ban once the
-candidate has path-local ACK-data evidence; proof-only QUIC paths still MUST NOT
-own unique future bytes. This lets the QUIC carrier produce a
-non-application-limited delivery sample instead of remaining stuck behind one
-application-limited frame forever, while preserving the no-worse rule for the
-existing service owner. Ordinary unique bulk
+The resulting ACK-derived rate becomes bulk-rate evidence only after the
+acknowledged DATA byte volume is large enough for the path's modeled flight
+envelope; otherwise the sample remains ACK-data evidence for validation
+visibility only. ACK-data evidence is not an owner state, is not a trial-owner
+state, and MUST NOT bypass lower-frontier ownership. Ordinary unique bulk
 ownership requires either that the path is already the active service path or
 that the path has non-application-limited bulk-rate evidence and passes the
-normal ECF/BLEST admission model. ACK-data seen does not set bulk-rate evidence
-and does not overwrite the delivery rate.
+normal ECF/BLEST admission and no-worse guards. ACK-data seen does not set
+bulk-rate evidence, does not overwrite the delivery rate, does not rewrite the
+ordinary lead, and does not permit the path to own later offsets while another
+path owns unresolved lower bytes.
+
 Because duplicate discovery does not own the ordered frontier, it MAY be sent on
-an attached QUIC validation output before that output has sender evidence, as
-long as the same byte range is also sent on the selected primary owner and the
-duplicate is charged to the validation/discovery ledger. This is the safe
-bootstrap from "attached but unproven" to ACK-data-seen: failure of the duplicate
-path cannot create a receive hole, while success produces path-local QUIC ACKed
-data evidence.
+a QUIC validation output only after the output has path-scoped sender evidence
+and only while the validation/discovery ledger still has credit. The selected
+primary owner MUST send and own the byte range. The duplicate is extra traffic,
+is recorded as non-owner repair/probe work, and cannot create path delivery
+credit from a product `STREAM_ACK`. Failure of the duplicate path cannot create a
+receive hole; success may produce path-local QUIC ACKed data evidence. Attached
+but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic for
+bootstrap rather than duplicate product bytes.
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
 MUST NOT require product TX and QUIC ACK to happen in the same sampling interval,
@@ -2903,22 +2890,21 @@ MPTCP-style sequence repair and receive-window protection reason about product
 byte ownership. `product_queue_debt` is the lead path's bounded,
 preemptible product work already admitted to the transport.
 
-When the UDP production engine is QUIC, the stream currently has only one
-attached response carrier, and that carrier is shared with latency-sensitive or
-realtime product flows, the active lead path MUST NOT be gated by a second
-product-layer copy of the QUIC congestion window. QUIC already owns packet
-pacing, congestion response, stream flow control, and sender backpressure for
-that single shared lead. The product scheduler gates this case with the product
-queue and stream-ordering envelope so the QUIC stream remains fed without
-creating unbounded response backlog. A throughput-only stream, a stream with no
-latency-sensitive sharing on that path, and any stream with multiple attached
-carriers keep carrier debt as an admission gate. Additional UDP paths,
-validation paths, and cross-underlay candidates also use carrier debt as an
-admission gate because they can create new reordering debt or probe traffic
-outside the single shared lead. An implementation MUST NOT use slow product-ACK
-release timing as the UDP carrier congestion window, MUST NOT use carrier ACK
-progress as proof that a stream byte is no longer needed for repair, and MUST
-NOT treat the configured product envelope as a floor above UDP carrier credit.
+When the UDP production engine is QUIC, the active service output with a clear
+ordered frontier MUST NOT be gated by a second product-layer copy of the QUIC
+congestion window. QUIC already owns packet pacing, congestion response, stream
+flow control, and sender backpressure below that active owner. The product
+scheduler gates this case with the product queue and stream-ordering envelope so
+the QUIC stream remains fed without creating unbounded response backlog. This
+applies even when other validation or cohort outputs are attached: optional
+outputs do not reduce the service owner's product feed budget. Additional UDP
+paths, validation paths, and cross-underlay candidates still use carrier debt as
+an admission gate because they can create new reordering debt or probe traffic
+outside the active service owner. An implementation MUST NOT use slow
+product-ACK release timing as the UDP carrier congestion window, MUST NOT use
+carrier ACK progress as proof that a stream byte is no longer needed for repair,
+and MUST NOT treat the configured product envelope as a floor above UDP carrier
+credit for optional paths.
 The product source-read horizon MUST NOT be capped by the carrier congestion
 window, inflight-high, or send-window equivalent. Those values belong to the
 carrier emission gate and to multipath admission, where they describe whether a

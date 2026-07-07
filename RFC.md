@@ -368,17 +368,18 @@ output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
 A frontier-clear same-family path with only liveness, path-proof, or
 configured-hint evidence may become the Service path when the sender-service
-Service selection model chooses it, no lower owner debt exists, and no
-bulk-rate-proven same-family candidate should be preferred. This is a Service
-handoff, not Subflow admission. ACK-data-only evidence from a tiny or
-application-limited probe is not Service-handoff evidence by itself and does not
-grant ordinary owner rights. A same-family Subflow may carry ordinary unique
-bytes only after bulk-rate evidence exists and sender-service admission proves
-that doing so will not expand product receive-hole debt or worsen the completion
-horizon. This rule is path-metric driven inside TCP+TCP and QUIC+QUIC sets; it
-is not a TCP-preferred or UDP-preferred policy. Mixed TCP+QUIC paths are
-deliberately stricter in production v1 because they do not share one
-carrier-family recovery model.
+Service selection model chooses it and no lower owner debt exists. A
+bulk-rate-proven old Service is useful evidence, but it is not a sticky veto
+against a clear-frontier same-family Service handoff; the ETA/no-worse selector
+decides the next Service owner. This is a Service handoff, not Subflow
+admission. ACK-data-only evidence from a tiny or application-limited probe is
+not Service-handoff evidence by itself and does not grant ordinary owner rights.
+A same-family Subflow may carry ordinary unique bytes only after bulk-rate
+evidence exists and sender-service admission proves that doing so will not
+expand product receive-hole debt or worsen the completion horizon. This rule is
+path-metric driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred
+or UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
+production v1 because they do not share one carrier-family recovery model.
 
 A product reliable stream owns only stream semantics: stream ID, target metadata,
 ingress metadata, outbound policy metadata, send offset space, receive offset
@@ -1188,6 +1189,18 @@ low-confidence validation hints unless local delivery or carrier ACK-derived
 data samples confirm them. The sender path model MUST also add locally queued
 carrier command bytes to `queue_bytes` for all underlays, including TCP, so
 hidden path queues cannot be ignored by ECF/BLEST admission.
+
+Implementations MUST keep peer-hint metrics and local-sender metrics in
+separate slots. A local path-proof or control-plane observation may improve
+local liveness, RTT, queue, and service-handoff evidence, but it MUST NOT erase
+the peer's advisory rate/RTT prior before direction-correct bulk-rate evidence
+exists. Conversely, a peer hint MUST NOT overwrite local carrier queue, flight,
+ACK-derived data, or delivery samples. The sender-service ETA model may combine
+local liveness with peer advisory rate for clear-frontier Service selection, but
+Subflow admission still requires local bulk-rate evidence. Once local
+ACK-derived DATA has been seen without enough non-application-limited volume to
+become bulk-rate evidence, the peer hint remains only an advisory rate prior; it
+no longer authorizes Service handoff for that path.
 
 Each endpoint also keeps local lane occupancy for every session path. This
 state is not trusted from the peer because it reflects local product work

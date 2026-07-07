@@ -563,10 +563,7 @@ fn response_target_is_plausible_unique_owner_candidate(
 ) -> bool {
     response_target_is_service_owner_candidate(target, candidates)
         || target.has_bulk_rate_evidence
-        || (target.has_service_handoff_evidence
-            && !candidates
-                .iter()
-                .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence))
+        || target.has_service_handoff_evidence
 }
 
 #[cfg(test)]
@@ -613,7 +610,9 @@ fn response_target_unique_owner_admission_with_epoch(
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     if lower_owner == Some(target.key)
         || response_target_is_service_owner_candidate(target, candidates)
-        || (lower_owner.is_none() && target.key == lead.key && target.has_service_handoff_evidence)
+        || (lower_owner.is_none()
+            && target.key == lead.key
+            && (target.has_service_handoff_evidence || target.has_bulk_rate_evidence))
     {
         return (PathAdmission::service(), None);
     }
@@ -3182,7 +3181,7 @@ mod tests {
             snapshot,
             eta_ms,
             is_active,
-            has_service_handoff_evidence: true,
+            has_service_handoff_evidence: false,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         }
@@ -5378,11 +5377,11 @@ mod tests {
     }
 
     #[test]
-    fn frontier_clear_same_underlay_sender_evidence_can_handoff_service_without_subflow_proof() {
-        let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
-        owner.has_bulk_rate_evidence = false;
+    fn frontier_clear_same_underlay_sender_evidence_can_handoff_service_from_bulk_owner() {
+        let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let mut lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        lower_eta_alternate.has_service_handoff_evidence = true;
         lower_eta_alternate.has_sender_evidence = true;
         lower_eta_alternate.has_bulk_rate_evidence = false;
 

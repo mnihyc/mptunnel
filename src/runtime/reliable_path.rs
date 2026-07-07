@@ -631,7 +631,8 @@ impl ResponseStreamBinding {
                     srtt_ms: None,
                     delivery_samples: 0,
                     last_delivery_at: None,
-                    path_metrics: None,
+                    local_path_metrics: None,
+                    peer_path_metrics: None,
                 }],
             }),
             ordered_data_owner: Mutex::new(Some(key)),
@@ -740,7 +741,8 @@ impl ResponseStreamBinding {
                 srtt_ms: None,
                 delivery_samples: 0,
                 last_delivery_at: None,
-                path_metrics: None,
+                local_path_metrics: None,
+                peer_path_metrics: None,
             }
         };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
@@ -1384,7 +1386,15 @@ impl ResponseStreamBinding {
         let mut changed = false;
         for entry in &mut outputs.entries {
             if entry.key == key {
-                entry.path_metrics = Some(ServerPathMetricsEntry { metrics, source });
+                let path_metrics = Some(ServerPathMetricsEntry { metrics, source });
+                match source {
+                    ServerPathMetricsSource::LocalSender => {
+                        entry.local_path_metrics = path_metrics;
+                    }
+                    ServerPathMetricsSource::PeerHint => {
+                        entry.peer_path_metrics = path_metrics;
+                    }
+                }
                 changed = true;
             }
         }
@@ -2133,6 +2143,71 @@ mod tests {
             assert_eq!(snapshot.bytes_in_flight, 0);
             assert!(snapshot.app_limited);
         }
+    }
+
+    #[test]
+    fn response_peer_hint_rate_survives_local_proof_liveness_metrics() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Udp);
+        let mut peer_hint = PathMetrics {
+            path_id: key.path_id,
+            underlay: key.underlay,
+            direction: PathMetricDirection::ClientToServer,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 200_000,
+            srtt_us: 200_000,
+            rttvar_us: 10_000,
+            jitter_us: 10_000,
+            delivery_rate_bps: 200_000_000,
+            pacing_rate_bps: 200_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 0,
+            inflight_hi_bytes: 0,
+            confidence_ppm: 100_000,
+            app_limited: false,
+            has_ack_derived_data_sample: false,
+            data_sample_count: 0,
+            data_sample_bytes: 0,
+        };
+        binding.update_path_metrics(key, peer_hint, ServerPathMetricsSource::PeerHint);
+
+        let local_proof = PathMetrics {
+            direction: PathMetricDirection::ServerToClient,
+            min_rtt_us: 20_000,
+            srtt_us: 20_000,
+            rttvar_us: 1_000,
+            jitter_us: 1_000,
+            delivery_rate_bps: 500_000,
+            pacing_rate_bps: 500_000,
+            confidence_ppm: 1_000_000,
+            app_limited: true,
+            ..peer_hint
+        };
+        binding.update_path_metrics(key, local_proof, ServerPathMetricsSource::LocalSender);
+
+        let snapshot = binding
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("path remains attached");
+
+        assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
+        assert_eq!(snapshot.srtt_ms, 20.0);
+        assert!(snapshot.app_limited);
+
+        peer_hint.delivery_rate_bps = 300_000_000;
+        binding.update_path_metrics(key, peer_hint, ServerPathMetricsSource::PeerHint);
+        let updated = binding
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("path remains attached");
+        assert_eq!(updated.delivery_rate_bps, 300_000_000.0);
+        assert_eq!(
+            updated.srtt_ms, 20.0,
+            "local liveness RTT must not be erased by peer hint refresh"
+        );
     }
 
     #[test]

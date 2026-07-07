@@ -16,7 +16,8 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) srtt_ms: Option<f64>,
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
-    pub(super) path_metrics: Option<ServerPathMetricsEntry>,
+    pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
+    pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
@@ -254,16 +255,14 @@ pub(super) fn server_bulk_output_snapshot(
     mux_limits: MuxLimits,
     now: Instant,
 ) -> PathSnapshot {
-    let local_carrier_metrics = entry.path_metrics.and_then(|path_metrics| {
-        (path_metrics.source == ServerPathMetricsSource::LocalSender).then_some(path_metrics)
-    });
-    let validation_hint_metrics = entry
-        .path_metrics
-        .and_then(|path_metrics| (entry.delivery_samples == 0).then_some(path_metrics));
-    let model_metrics = local_carrier_metrics.or(validation_hint_metrics);
+    let local_carrier_metrics = entry.local_path_metrics;
+    let peer_hint_metrics = (entry.delivery_samples == 0)
+        .then_some(entry.peer_path_metrics)
+        .flatten();
+    let liveness_metrics = local_carrier_metrics.or(peer_hint_metrics);
     let bulk_rate_metrics = local_carrier_metrics
         .filter(|path_metrics| server_path_metrics_has_bulk_rate_evidence(*path_metrics));
-    let srtt_ms = model_metrics.map_or_else(
+    let srtt_ms = liveness_metrics.map_or_else(
         || {
             entry
                 .srtt_ms
@@ -271,18 +270,22 @@ pub(super) fn server_bulk_output_snapshot(
         },
         |path_metrics| f64::from(path_metrics.metrics.srtt_us.max(1)) / 1000.0,
     );
-    let jitter_ms = model_metrics.map_or(0.0, |path_metrics| {
+    let jitter_ms = liveness_metrics.map_or(0.0, |path_metrics| {
         f64::from(path_metrics.metrics.jitter_us) / 1000.0
     });
-    let loss_rate = model_metrics
+    let loss_rate = liveness_metrics
         .filter(|path_metrics| path_metrics.metrics.loss_observed)
         .map_or(0.0, |path_metrics| {
             f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
         })
         .clamp(0.0, 1.0);
     let model_rate_bps = bulk_rate_metrics.map(server_path_metrics_rate_bps);
-    let prior_rate_bps =
-        model_rate_bps.unwrap_or_else(|| default_path_rate_bps(entry.key.underlay));
+    let peer_hint_rate_bps = peer_hint_metrics
+        .filter(|path_metrics| !path_metrics.metrics.app_limited)
+        .map(server_path_metrics_rate_bps);
+    let prior_rate_bps = model_rate_bps
+        .or(peer_hint_rate_bps)
+        .unwrap_or_else(|| default_path_rate_bps(entry.key.underlay));
     let rate_bps = match (
         entry.key.underlay,
         bulk_rate_metrics,
@@ -300,7 +303,7 @@ pub(super) fn server_bulk_output_snapshot(
     .unwrap_or(prior_rate_bps)
     .max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
-    if let Some(path_metrics) = model_metrics {
+    if let Some(path_metrics) = liveness_metrics {
         snapshot.min_rtt_ms = f64::from(path_metrics.metrics.min_rtt_us.max(1)) / 1000.0;
     }
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
@@ -310,11 +313,11 @@ pub(super) fn server_bulk_output_snapshot(
         snapshot.pacing_rate_bps =
             (path_metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
     }
-    if let Some(path_metrics) = model_metrics {
+    if let Some(path_metrics) = liveness_metrics {
         snapshot.app_limited = path_metrics.metrics.app_limited;
     }
     let metric_queue_bytes =
-        model_metrics.map_or(0, |path_metrics| path_metrics.metrics.queue_bytes);
+        local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.queue_bytes);
     snapshot.queue_bytes = metric_queue_bytes.saturating_add(entry.commands.pending_bytes());
     snapshot.product_queue_bytes = entry.product_queue_bytes;
     snapshot.bytes_in_flight = match entry.key.underlay {
@@ -380,14 +383,7 @@ pub(in crate::runtime) fn server_bulk_output_eta_ms(
     };
     let payload_bits = scoring_payload_bytes as f64 * 8.0;
     let mut eta_ms = snapshot.srtt_ms / 2.0;
-    let effective_rate_bps = if relay_lane_is_bulk(lane) {
-        snapshot
-            .delivery_rate_bps
-            .max(snapshot.pacing_rate_bps)
-            .max(1.0)
-    } else {
-        snapshot.delivery_rate_bps.max(1.0)
-    };
+    let effective_rate_bps = snapshot.delivery_rate_bps.max(1.0);
     eta_ms += (queued_bits + payload_bits) / effective_rate_bps * 1000.0;
     eta_ms += snapshot.jitter_ms;
     eta_ms += response_loss_penalty_ms(snapshot);
@@ -426,7 +422,7 @@ fn confidence_sample_denominator() -> f64 {
 fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) -> f64 {
     let delivery_confidence =
         (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
-    let metric_confidence = match entry.path_metrics {
+    let metric_confidence = match entry.local_path_metrics {
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::LocalSender,
             metrics,
@@ -488,12 +484,22 @@ fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry)
 pub(in crate::runtime) fn server_output_has_service_handoff_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
+    if matches!(
+        entry.local_path_metrics,
+        Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
+    ) {
+        return false;
+    }
+
     matches!(
-        entry.path_metrics,
+        entry.peer_path_metrics,
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::PeerHint,
             ..
-        }) | Some(ServerPathMetricsEntry {
+        })
+    ) || matches!(
+        entry.local_path_metrics,
+        Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::LocalSender,
             metrics: PathMetrics {
                 confidence_ppm: 1..,
@@ -510,7 +516,7 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
     entry.delivery_samples > 0
         || entry.delivery_rate_bps.is_some()
         || matches!(
-            entry.path_metrics,
+            entry.local_path_metrics,
             Some(path_metrics) if server_path_metrics_has_sender_evidence(path_metrics)
         )
 }
@@ -520,7 +526,7 @@ fn server_output_has_ack_data_evidence(entry: &ResponseStreamOutputEntry) -> boo
     entry.delivery_samples > 0
         || entry.delivery_rate_bps.is_some()
         || matches!(
-            entry.path_metrics,
+            entry.local_path_metrics,
             Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
         )
 }
@@ -529,7 +535,7 @@ pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
     let has_local_carrier_bulk = matches!(
-        entry.path_metrics,
+        entry.local_path_metrics,
         Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
     );
     match entry.key.underlay {
@@ -610,7 +616,8 @@ mod tests {
             srtt_ms: None,
             delivery_samples: 1,
             last_delivery_at: Some(Instant::now()),
-            path_metrics: None,
+            local_path_metrics: None,
+            peer_path_metrics: None,
         };
 
         assert!(
@@ -640,7 +647,7 @@ mod tests {
             srtt_ms: None,
             delivery_samples: 0,
             last_delivery_at: None,
-            path_metrics: Some(ServerPathMetricsEntry {
+            local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
                 metrics: PathMetrics {
                     path_id: key.path_id,
@@ -669,6 +676,7 @@ mod tests {
                     data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
+            peer_path_metrics: None,
         };
 
         assert!(
@@ -694,7 +702,7 @@ mod tests {
             srtt_ms: None,
             delivery_samples: 0,
             last_delivery_at: None,
-            path_metrics: Some(ServerPathMetricsEntry {
+            local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
                 metrics: PathMetrics {
                     path_id: key.path_id,
@@ -723,6 +731,7 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
+            peer_path_metrics: None,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();
@@ -768,7 +777,7 @@ mod tests {
             srtt_ms: None,
             delivery_samples: 0,
             last_delivery_at: None,
-            path_metrics: Some(ServerPathMetricsEntry {
+            local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
                 metrics: PathMetrics {
                     path_id: key.path_id,
@@ -797,6 +806,7 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
+            peer_path_metrics: None,
         };
 
         assert!(server_output_has_sender_evidence(&entry));
@@ -825,7 +835,7 @@ mod tests {
             srtt_ms: None,
             delivery_samples: 0,
             last_delivery_at: None,
-            path_metrics: Some(ServerPathMetricsEntry {
+            local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
                 metrics: PathMetrics {
                     path_id: key.path_id,
@@ -854,10 +864,11 @@ mod tests {
                     data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
+            peer_path_metrics: None,
         };
 
         assert!(matches!(
-            entry.path_metrics,
+            entry.local_path_metrics,
             Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
         ));
         assert!(
@@ -896,7 +907,8 @@ mod tests {
             srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             last_delivery_at: Some(Instant::now()),
-            path_metrics: None,
+            local_path_metrics: None,
+            peer_path_metrics: None,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();
@@ -910,5 +922,112 @@ mod tests {
         );
 
         assert_eq!(snapshot.delivery_rate_bps, prior_rate / 10.0);
+    }
+
+    #[test]
+    fn response_eta_uses_delivered_rate_not_inflated_quic_pacing_rate() {
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(2),
+        };
+        let mut baseline = PathSnapshot::new(key.path_id, key.underlay, 100.0, 50_000_000.0);
+        baseline.pacing_rate_bps = 50_000_000.0;
+        baseline.confidence = 1.0;
+
+        let mut inflated_pacing = baseline;
+        inflated_pacing.pacing_rate_bps = 5_000_000_000.0;
+
+        let payload_bytes = 64 * 1024;
+        let baseline_eta = server_bulk_output_eta_ms(
+            key,
+            baseline,
+            Some(key),
+            FlowLane::Throughput,
+            payload_bytes,
+            MuxLimits::default(),
+        );
+        let inflated_eta = server_bulk_output_eta_ms(
+            key,
+            inflated_pacing,
+            Some(key),
+            FlowLane::Throughput,
+            payload_bytes,
+            MuxLimits::default(),
+        );
+
+        assert!(
+            (baseline_eta - inflated_eta).abs() < 0.001,
+            "QUIC pacing is carrier send permission, not delivered product throughput"
+        );
+    }
+
+    #[test]
+    fn ack_data_without_bulk_rate_consumes_peer_hint_service_handoff() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(3),
+        };
+        let peer = ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::PeerHint,
+            metrics: PathMetrics {
+                path_id: key.path_id,
+                underlay: key.underlay,
+                direction: PathMetricDirection::ClientToServer,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 400_000,
+                srtt_us: 400_000,
+                rttvar_us: 10_000,
+                jitter_us: 10_000,
+                delivery_rate_bps: 500_000_000,
+                pacing_rate_bps: 500_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: 0,
+                inflight_hi_bytes: 0,
+                confidence_ppm: 100_000,
+                app_limited: false,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+        };
+        let local_ack_data_only = ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::LocalSender,
+            metrics: PathMetrics {
+                direction: PathMetricDirection::ServerToClient,
+                delivery_rate_bps: 5_000_000,
+                pacing_rate_bps: 50_000_000,
+                confidence_ppm: 0,
+                app_limited: true,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+                ..peer.metrics
+            },
+        };
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            local_path_metrics: Some(local_ack_data_only),
+            peer_path_metrics: Some(peer),
+        };
+
+        assert!(
+            !server_output_has_service_handoff_evidence(&entry),
+            "peer hint handoff is consumed once local ACK-data arrives without bulk-rate proof"
+        );
     }
 }

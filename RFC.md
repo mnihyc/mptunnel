@@ -373,13 +373,15 @@ same-family path may replace the current Service for ordinary owner data only
 after direction-correct bulk-rate evidence exists and the ETA/no-worse selector
 admits that change. ACK-data-only evidence from a tiny or application-limited
 probe is still not bulk-rate evidence and does not grant Service rights. A
-same-family Subflow may carry one bounded startup `OwnerData` sample at a clear
+same-family Subflow may carry a bounded startup `OwnerData` window at a clear
 ordered frontier after the current Service has direction-correct bulk-rate
-evidence and the Subflow has sender evidence. That sample is unique payload
+evidence and the Subflow has sender evidence. That window is unique payload
 data, not duplicate/probe traffic; it does not change the Service owner hint and
 it does not make the Subflow the lower-frontier Service for additional bytes.
-It cannot repeat for that Subflow until direction-correct bulk-rate evidence
-arrives. Steady-state Subflow `OwnerData` requires bulk-rate evidence and
+It is capped by the path-adaptive startup owner credit and is not a steady-state
+role. After that credit is spent, further Subflow `OwnerData` requires
+direction-correct bulk-rate evidence. Steady-state Subflow `OwnerData` requires
+bulk-rate evidence and
 sender-service admission proving that doing so will not expand product
 receive-hole debt or worsen the completion horizon. This rule is path-metric
 driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred or
@@ -2085,11 +2087,11 @@ Once a stream has an ordered-data owner and the scheduler has opened
 same-underlay candidate outputs, app-limited startup samples MUST NOT be treated
 as long-term bandwidth proof for ECF/BLEST completion-horizon rejection. QUIC's
 initial congestion window and early MPTCP subflow growth are probe mechanisms, not
-accurate bulk-rate priors. A same-underlay candidate may receive one
-frontier-clear startup Subflow sample after the current Service has bulk-rate
-evidence and the candidate has sender evidence, but it may be admitted for
-steady-state Subflow ownership only after bulk-rate evidence exists and it still
-fits product inflight, carrier credit, and reorder budgets. This is true
+accurate bulk-rate priors. A same-underlay candidate may receive a bounded
+frontier-clear startup Subflow owner window after the current Service has
+bulk-rate evidence and the candidate has sender evidence, but it may be admitted
+for steady-state Subflow ownership only after bulk-rate evidence exists and it
+still fits product inflight, carrier credit, and reorder budgets. This is true
 even if a candidate's current ETA is
 worse than the lead's ETA, because same-underlay ETA can be an artifact of
 underfeeding and validation; the correct proof is whether the additional path
@@ -3487,13 +3489,14 @@ directly create ordered-stream HOL debt.
 
 For QUIC same-underlay startup, the reorder/feed budget uses live QUIC carrier
 credit when available. If the QUIC implementation reports an inflight or
-congestion-window limit, that carrier limit is the maximum bounded product work
-the sender may place on the candidate during startup, capped by the product
-reorder resource envelope. The sender MUST NOT replace that carrier credit with
-a tiny product-rate BDP derived from the default path-open score or from one
-app-limited sample. This follows MPQUIC's per-path congestion-state model:
-QUIC decides packet pacing and packet flight, while mptunnel only bounds the
-amount of ordered product data it is willing to expose to reordering risk.
+congestion-window limit, that carrier limit shapes ETA and emission credit, but
+the startup owner credit is derived from the existing ACK/update BDP window and
+capped by the UDP startup product window plus the product reorder/resource
+envelope. The sender MUST NOT replace that credit with a tiny product-rate BDP
+derived from the default path-open score or from one app-limited sample. This
+follows MPQUIC's per-path congestion-state model: QUIC decides packet pacing and
+packet flight, while mptunnel bounds the amount of ordered product data it is
+willing to expose to reordering risk.
 
 The same completion-horizon logic applies to the previously attached active path
 when it is no longer the Service path and continuing it would expand an existing

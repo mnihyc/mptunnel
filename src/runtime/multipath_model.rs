@@ -35,8 +35,8 @@ pub(super) enum PathRuntimeRole {
     ///
     /// `Subflow` is intentionally the same term used by MPTCP. In mptunnel it
     /// means an additional same-family path admitted by the no-worse guard. It
-    /// may carry one bounded startup sample with sender evidence, then requires
-    /// bulk-rate evidence for steady-state owner bytes.
+    /// may spend bounded startup owner credit with sender evidence, then
+    /// requires bulk-rate evidence for steady-state owner bytes.
     Subflow,
     /// Path-manager/control-plane probing only. A probe cannot own product
     /// offsets and cannot create product delivery proof.
@@ -394,13 +394,16 @@ impl FlowSubflowSet {
             return true;
         }
 
-        input.sender_evidence
-            && input.key.underlay == self.service.underlay
-            && self
-                .members
-                .iter()
-                .find(|member| member.key == input.key)
-                .is_none_or(|member| member.owner_sent_bytes == 0)
+        if !input.sender_evidence || input.key.underlay != self.service.underlay {
+            return false;
+        }
+
+        let already_sent = self
+            .members
+            .iter()
+            .find(|member| member.key == input.key)
+            .map_or(0, |member| member.owner_sent_bytes);
+        already_sent.saturating_add(input.owner_bytes as u64) <= self.owner_credit_bytes
     }
 
     fn probe_allowed(&self, input: SubflowAdmissionInput) -> bool {
@@ -580,6 +583,41 @@ mod tests {
         });
         assert_eq!(too_much_overhead.decision, PathAdmissionDecision::Standby);
         assert!(epoch.members().is_empty());
+    }
+
+    #[test]
+    fn subflow_set_allows_sender_evidence_startup_until_owner_credit_is_spent() {
+        let payload_bytes = 64 * 1024;
+        let mut epoch =
+            FlowSubflowSet::new(10, key(0), payload_bytes * 3, 0, Duration::from_millis(100));
+        let input = SubflowAdmissionInput {
+            key: key(1),
+            sender_evidence: true,
+            bulk_rate_proven: false,
+            frontier_clear: true,
+            completion_improves: true,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        for _ in 0..3 {
+            let admission = epoch.admit_subflow_owner(input);
+            assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
+            assert_eq!(admission.role, PathRuntimeRole::Subflow);
+        }
+
+        let exhausted = epoch.admit_subflow_owner(input);
+        assert_eq!(
+            exhausted.decision,
+            PathAdmissionDecision::ProbeOnly,
+            "sender-evidence startup Subflow OwnerData is bounded by owner credit, not a new steady-state role"
+        );
+        assert_eq!(
+            epoch.members()[0].owner_sent_bytes,
+            (payload_bytes * 3) as u64
+        );
     }
 
     #[test]

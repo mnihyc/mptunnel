@@ -23,7 +23,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 // RFC 9002's recommended QUIC initial congestion window is based on ten max
 // datagrams. mptunnel uses the same packet-count shape as the carrier-neutral
-// reliable-stream startup sample instead of an arbitrary byte constant. The
+// reliable-stream startup window instead of an arbitrary byte constant. The
 // QUIC alias below is for code that specifically consumes QUIC carrier metrics.
 pub(super) const TRANSPORT_MSS_BYTES: usize = 1460;
 pub(super) const RELIABLE_INITIAL_WINDOW_PACKETS: usize = 10;

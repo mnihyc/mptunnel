@@ -2008,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn response_subflow_set_allows_one_same_family_startup_sample_before_bulk_rate_evidence() {
+    fn response_subflow_set_rejects_unproven_startup_after_credit_is_spent() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -2037,7 +2037,7 @@ mod tests {
         assert_eq!(
             committed.decision,
             PathAdmissionDecision::AdmitSubflow,
-            "same-family startup Subflow samples are unique payload bytes that produce real delivery evidence"
+            "same-family startup Subflow owner windows are unique payload bytes that produce real delivery evidence"
         );
 
         let second = binding.preview_subflow_owner_admission(
@@ -2050,7 +2050,7 @@ mod tests {
         assert_eq!(
             second.decision,
             PathAdmissionDecision::ProbeOnly,
-            "unproven Subflows get one bounded startup sample and then return to Probe until bulk-rate evidence exists"
+            "unproven Subflows return to Probe after bounded startup owner credit is spent"
         );
 
         binding.reset_subflow_set();

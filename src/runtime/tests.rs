@@ -2657,7 +2657,7 @@ fn tail_stall_repair_prefers_authoritative_ack_gap_before_frontier_tail() {
 }
 
 #[test]
-fn tail_stall_repair_does_not_replay_live_tail_without_authoritative_gap() {
+fn tail_stall_repair_reinjects_contiguous_unacked_owner_tail() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(33), mux_limits);
     send_stream
@@ -2674,8 +2674,10 @@ fn tail_stall_repair_does_not_replay_live_tail_without_authoritative_gap() {
     let _ = send_stream.apply_ack(&ranges);
     let (repairs, kind) = stream_tail_stall_repair_frames(&send_stream, &ranges, 6, true);
 
-    assert_eq!(kind, "none");
-    assert!(repairs.is_empty());
+    assert_eq!(kind, "owner_tail");
+    assert_eq!(repairs.len(), 2);
+    assert_eq!(reliable_stream_frame_extent(&repairs[0]), Some((4, 8, 4)));
+    assert_eq!(reliable_stream_frame_extent(&repairs[1]), Some((8, 10, 2)));
 }
 
 #[test]

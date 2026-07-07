@@ -2724,13 +2724,22 @@ the admission envelope is refreshed.
 
 Reliable path membership uses explicit roles. An attached output starts as
 `Standby` or `Probe`, not as a data owner. `Service` is the current best owner
-path and MUST remain fed while it is healthy. `Subflow` is an additional owner
+path and MUST remain fed while it is healthy. A live response stream that has
+any live carrier output MUST expose exactly one live `Service` owner key to
+the sender scheduler. If the current Service output is detached or closed, the
+binding promotes an existing live survivor as the failover Service; this is a
+survivor invariant, not delivery evidence, and it does not credit the survivor
+with bulk-rate samples. A measured Subflow may compete for owner credit, but
+its existence MUST NOT hide or invalidate the current Service as a lead
+candidate; a blocked optional Subflow creates backpressure or Standby/RepairOnly
+state, not a stream with no admissible Service. `Subflow` is an additional owner
 path admitted by the same no-worse completion and ordering-debt model used for
 the Service path. There is one Subflow owner admission mode: direction-correct
 bulk-rate evidence plus no-worse completion, ordering-debt, queue, and overhead
-guards. `RepairOnly`, `Standby`, and `Failed` outputs cannot receive speculative
-owner bytes. Role transitions are monotonic with evidence and carrier state for
-the current decision; they are not implied by attachment order, carrier family,
+guards.
+`RepairOnly`, `Standby`, and `Failed` outputs cannot receive speculative owner
+bytes. Role transitions are monotonic with evidence and carrier state for the
+current decision; they are not implied by attachment order, carrier family,
 configured path order, or temporary queue availability. In particular, `Probe`,
 path-proof-only, and sender-evidence-only paths are not permission to carry an
 unbounded stream of future offsets.
@@ -2743,8 +2752,12 @@ as established bulk data.
 Validation attachment adds a path-manager output; it does not remove or hide the
 active service output. If the active output still has carrier credit for the
 queued lane, the sender service MUST remain wakeable even while validation proof
-traffic is pending on other outputs. This prevents optional validation from
-turning a usable active path into an apparent sender-service starvation state.
+traffic is pending on other outputs or survivor promotion is in progress.
+Product-source backpressure and sender target snapshots MUST use the same live
+Service owner identity as ordinary OwnerData scheduling; using output-list tail
+position as a second active-owner model is stale and invalid. This prevents
+optional validation from turning a usable active path into an apparent
+sender-service starvation state.
 
 Validation lifecycle is path-manager state, not per-quantum data-scheduler
 state. Once a reliable product stream has an attached carrier output for a path,
@@ -3750,15 +3763,27 @@ data-plane stall evidence, or an explicit failover decision. This prevents the
 MPTCP/MPQUIC anti-pattern where normal multipath reordering is mistaken for a
 dead subflow and creates repeated detach/reopen churn.
 
-Owner-gap pressure is also a sender wait state. If the next queued response
-work is `OwnerData` and the authoritative product ACK frontier is blocked
-behind a repairable owner gap, the sender MUST NOT immediately re-poll the
+Owner backpressure is also a product-source and sender wait state. The
+backpressure condition is the union of an explicit authoritative ACK gap and a
+persistent contiguous owner-tail debt that has crossed the same bulk stall
+timeout. While owner backpressure exists, the sender MUST NOT read more local
+bulk bytes into new `OwnerData`, because doing so expands later owner ranges
+while the lower frontier is already known to be blocked. If the next queued
+response work is `OwnerData`, the sender MUST NOT immediately re-poll the
 target-selection/admission machinery just because a carrier queue has byte
 capacity. It must wait for ACK progress, repair/progress timer expiry, local
-source progress, or carrier capacity notification that can make a different
-work item admissible. This keeps product-ordering debt separate from carrier
-pipe availability and prevents CPU spin or repeated non-emitting scheduling
-decisions.
+source progress that can close the stream, or carrier capacity notification that
+can make a different work item admissible. This keeps product-ordering debt
+separate from carrier pipe availability and prevents CPU spin or repeated
+non-emitting scheduling decisions.
+
+Persistent owner-tail stalls are repairable even when the peer's ACK ranges are
+contiguous. If the ACK frontier has stopped below the sender's next product
+offset, the stream has retained unacked `OwnerData`, and an independent survivor
+output exists, the sender may reinject the lowest unacked tail bytes as
+`RepairData` after the persistent-stall timer. This is failover repair, not
+throughput probing: it must not create path delivery evidence, move the Service
+owner, or bypass the extra-traffic budget.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

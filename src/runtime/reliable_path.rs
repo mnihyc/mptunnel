@@ -795,11 +795,14 @@ impl ResponseStreamBinding {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
+        let stored_active_key = self.ordered_data_owner();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
         outputs.read_backpressure_snapshot(
+            active_key,
             self.session_id,
             &self.lane_tracker,
             lane,
@@ -893,9 +896,14 @@ impl ResponseStreamBinding {
             .entries
             .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
         if outputs.entries.len() != before {
+            let live_keys = outputs
+                .entries
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>();
             drop(outputs);
             self.lane_tracker.detach(self.session_id, key, lane);
-            self.clear_ordered_data_owner_if(key);
+            self.repair_ordered_data_owner_after_output_change(&live_keys);
             self.reset_subflow_set();
             self.notify_update();
         }
@@ -1154,13 +1162,14 @@ impl ResponseStreamBinding {
             .expect("server reliable stream subflow set lock") = None;
     }
 
-    fn clear_ordered_data_owner_if(&self, key: CarrierPathKey) {
+    fn repair_ordered_data_owner_after_output_change(&self, live_keys: &[CarrierPathKey]) {
         let mut lead = self
             .ordered_data_owner
             .lock()
             .expect("server reliable stream ordered data owner lock");
-        if *lead == Some(key) {
-            *lead = None;
+        let live_lead = lead.is_some_and(|key| live_keys.contains(&key));
+        if !live_lead {
+            *lead = live_keys.last().copied();
         }
     }
 
@@ -1284,11 +1293,12 @@ impl ResponseStreamBinding {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<ResponseSenderPathTarget> {
-        let active_key = self.ordered_data_owner();
+        let stored_active_key = self.ordered_data_owner();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
         let now = Instant::now();
         outputs
             .entries
@@ -1435,6 +1445,15 @@ fn carrier_path_flights_have_unambiguous_owner_ack(flights: &[CarrierPathFlight]
 
 fn server_stream_open_role_promotes_data_path(role: StreamOpenRole) -> bool {
     role == StreamOpenRole::Active
+}
+
+fn response_live_ordered_data_owner(
+    stored: Option<CarrierPathKey>,
+    entries: &[ResponseStreamOutputEntry],
+) -> Option<CarrierPathKey> {
+    stored
+        .filter(|key| entries.iter().any(|entry| entry.key == *key))
+        .or_else(|| entries.last().map(|entry| entry.key))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1751,6 +1770,53 @@ mod tests {
         };
         assert_eq!(after, before);
         assert_eq!(binding.ordered_data_owner(), Some(active));
+    }
+
+    #[test]
+    fn response_detaching_service_owner_promotes_live_survivor_to_service() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let survivor = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (survivor_commands, _survivor_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                survivor.underlay,
+                survivor.path_id,
+                survivor_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let active_commands = {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == active)
+                .expect("active output exists")
+                .commands
+                .clone()
+        };
+        binding.detach(active, &active_commands);
+
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(survivor),
+            "a live response stream must not be left without a Service owner after failover"
+        );
+        let targets = binding.sender_path_targets(FlowLane::Throughput, 4096);
+        assert!(
+            targets
+                .iter()
+                .find(|target| target.key == survivor)
+                .is_some_and(|target| target.is_active),
+            "the promoted survivor must be exposed as the scheduler Service target"
+        );
     }
 
     #[test]

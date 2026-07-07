@@ -658,12 +658,9 @@ fn response_unique_quic_data_would_expand_ordering_debt(
 
 fn response_target_is_service_owner_candidate(
     target: &ResponseSenderPathTarget,
-    candidates: &[&ResponseSenderPathTarget],
+    _candidates: &[&ResponseSenderPathTarget],
 ) -> bool {
     target.is_active
-        && !candidates
-            .iter()
-            .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence)
 }
 
 fn response_target_is_plausible_unique_owner_candidate(
@@ -4406,7 +4403,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_udp_bulk_path_beats_unproven_active_udp_path() {
+    fn active_udp_service_with_better_eta_beats_slower_measured_udp_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active_unproven_udp = response_target(
@@ -4418,6 +4415,7 @@ mod tests {
             true,
         );
         active_unproven_udp.has_bulk_rate_evidence = false;
+        let active_key = active_unproven_udp.key;
         let measured_udp = response_target(
             1,
             UnderlayProtocol::Udp,
@@ -4438,11 +4436,11 @@ mod tests {
                 path_id: PathId(0),
             }),
         )
-        .expect("measured UDP path should be eligible for ordinary bulk");
+        .expect("active UDP Service should remain eligible for ordinary bulk");
 
         assert_eq!(
-            selected.key, measured_udp.key,
-            "active UDP bootstrap must yield to a bulk-rate-proven UDP path"
+            selected.key, active_key,
+            "bulk-rate evidence must not override a better current Service ETA"
         );
     }
 
@@ -6144,6 +6142,33 @@ mod tests {
         .expect("near-tie lead should remain selected inside observed jitter");
 
         assert_eq!(selected.key, lead.key);
+    }
+
+    #[test]
+    fn active_service_remains_admissible_lead_when_subflow_is_not_admissible() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.has_bulk_rate_evidence = false;
+        let mut subflow = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            mux_limits.max_path_flight_bytes as u64,
+            16 * 1024 * 1024,
+            false,
+        );
+        subflow.has_bulk_rate_evidence = true;
+        let candidates = [&service, &subflow];
+
+        let lead = choose_response_admissible_lead(&candidates, mux_limits, payload_bytes, &[])
+            .expect("active Service must remain a lead candidate when optional Subflow is blocked");
+
+        assert_eq!(
+            lead.key, service.key,
+            "optional bulk-rate evidence must not hide the current Service owner"
+        );
     }
 
     #[test]

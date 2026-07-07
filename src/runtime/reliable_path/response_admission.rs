@@ -31,7 +31,6 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
-    pub(in crate::runtime) has_service_handoff_evidence: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
 }
@@ -479,35 +478,6 @@ fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry)
         && (server_path_metrics_has_bulk_rate_evidence(path_metrics)
             || server_path_metrics_has_ack_data_evidence(path_metrics)
             || path_metrics.metrics.confidence_ppm > 0)
-}
-
-pub(in crate::runtime) fn server_output_has_service_handoff_evidence(
-    entry: &ResponseStreamOutputEntry,
-) -> bool {
-    if matches!(
-        entry.local_path_metrics,
-        Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
-    ) {
-        return false;
-    }
-
-    matches!(
-        entry.peer_path_metrics,
-        Some(ServerPathMetricsEntry {
-            source: ServerPathMetricsSource::PeerHint,
-            ..
-        })
-    ) || matches!(
-        entry.local_path_metrics,
-        Some(ServerPathMetricsEntry {
-            source: ServerPathMetricsSource::LocalSender,
-            metrics: PathMetrics {
-                confidence_ppm: 1..,
-                has_ack_derived_data_sample: false,
-                ..
-            },
-        })
-    )
 }
 
 pub(in crate::runtime) fn server_output_has_sender_evidence(
@@ -958,76 +928,6 @@ mod tests {
         assert!(
             (baseline_eta - inflated_eta).abs() < 0.001,
             "QUIC pacing is carrier send permission, not delivered product throughput"
-        );
-    }
-
-    #[test]
-    fn ack_data_without_bulk_rate_consumes_peer_hint_service_handoff() {
-        let (commands, _receivers) = reliable_path_command_channels(8);
-        let key = CarrierPathKey {
-            underlay: UnderlayProtocol::Udp,
-            path_id: PathId(3),
-        };
-        let peer = ServerPathMetricsEntry {
-            source: ServerPathMetricsSource::PeerHint,
-            metrics: PathMetrics {
-                path_id: key.path_id,
-                underlay: key.underlay,
-                direction: PathMetricDirection::ClientToServer,
-                metric_epoch: metric_epoch_now(),
-                metric_age_us: 0,
-                min_rtt_us: 400_000,
-                srtt_us: 400_000,
-                rttvar_us: 10_000,
-                jitter_us: 10_000,
-                delivery_rate_bps: 500_000_000,
-                pacing_rate_bps: 500_000_000,
-                loss_ppm: 0,
-                ecn_ppm: 0,
-                loss_observed: false,
-                ecn_observed: false,
-                bytes_in_flight: 0,
-                queue_bytes: 0,
-                inflight_limit_bytes: 0,
-                inflight_hi_bytes: 0,
-                confidence_ppm: 100_000,
-                app_limited: false,
-                has_ack_derived_data_sample: false,
-                data_sample_count: 0,
-                data_sample_bytes: 0,
-            },
-        };
-        let local_ack_data_only = ServerPathMetricsEntry {
-            source: ServerPathMetricsSource::LocalSender,
-            metrics: PathMetrics {
-                direction: PathMetricDirection::ServerToClient,
-                delivery_rate_bps: 5_000_000,
-                pacing_rate_bps: 50_000_000,
-                confidence_ppm: 0,
-                app_limited: true,
-                has_ack_derived_data_sample: true,
-                data_sample_count: 0,
-                data_sample_bytes: 0,
-                ..peer.metrics
-            },
-        };
-        let entry = ResponseStreamOutputEntry {
-            key,
-            commands,
-            bytes_in_flight: 0,
-            product_queue_bytes: 0,
-            product_progress_rate_bps: None,
-            delivery_rate_bps: None,
-            srtt_ms: None,
-            delivery_samples: 0,
-            last_delivery_at: None,
-            local_path_metrics: Some(local_ack_data_only),
-            peer_path_metrics: Some(peer),
-        };
-
-        assert!(
-            !server_output_has_service_handoff_evidence(&entry),
-            "peer hint handoff is consumed once local ACK-data arrives without bulk-rate proof"
         );
     }
 }

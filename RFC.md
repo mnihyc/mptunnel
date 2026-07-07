@@ -366,17 +366,13 @@ recovery engines. Therefore, for one ordered reliable stream, a proof-only
 validation output MUST NOT carry later unique `STREAM_DATA` while another
 output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
-A frontier-clear same-family path with only liveness, path-proof, or
-configured-hint evidence may become the Service path when the sender-service
-Service selection model chooses it and no lower owner debt exists. A
-bulk-rate-proven old Service is useful evidence, but it is not a sticky veto
-against a clear-frontier same-family Service handoff; the ETA/no-worse selector
-decides the next Service owner. This is a Service handoff, not Subflow
-admission. ACK-data-only evidence from a tiny or application-limited probe is
-not Service-handoff evidence by itself and does not grant ordinary owner rights.
-Hint-only Service handoff remains bounded by the active Service startup product
-envelope; it MUST NOT emit an unbounded run of ordered bytes before local
-ACK-derived bulk-rate evidence arrives.
+At a clear frontier, liveness, path-proof, configured-hint, or other
+sender-evidence-only inputs MAY rank validation/probe order, but they MUST NOT
+make a non-active path the Service owner for ordered product bytes. A
+same-family path may replace the current Service for ordinary owner data only
+after direction-correct bulk-rate evidence exists and the ETA/no-worse selector
+admits that change. ACK-data-only evidence from a tiny or application-limited
+probe is still not bulk-rate evidence and does not grant ordinary owner rights.
 A same-family Subflow may carry ordinary unique bytes only after bulk-rate
 evidence exists and sender-service admission proves that doing so will not
 expand product receive-hole debt or worsen the completion horizon. This rule is
@@ -1195,18 +1191,19 @@ hidden path queues cannot be ignored by ECF/BLEST admission.
 
 Implementations MUST keep peer-hint metrics and local-sender metrics in
 separate slots. A local path-proof or control-plane observation may improve
-local liveness, RTT, queue, and service-handoff evidence, but it MUST NOT erase
-the peer's advisory rate/RTT prior before direction-correct bulk-rate evidence
-exists. Conversely, a peer hint MUST NOT overwrite local carrier queue, flight,
+local liveness, RTT, and queue evidence, but it MUST NOT erase the peer's
+advisory rate/RTT prior before direction-correct bulk-rate evidence exists.
+Conversely, a peer hint MUST NOT overwrite local carrier queue, flight,
 ACK-derived data, or delivery samples. The sender-service ETA model may combine
-local liveness with peer advisory rate for clear-frontier Service selection, but
-Subflow admission still requires local bulk-rate evidence. Configured startup
-rate hints are advisory priors and MUST be published as non-app-limited metrics.
+local liveness with peer advisory rate for validation/probe ranking, but Service
+ownership and Subflow admission require local bulk-rate evidence except for the
+current active/lower-frontier Service itself. Configured startup rate hints are
+advisory priors and MUST be published as non-app-limited metrics.
 An app-limited peer metric that came from proof/control or a tiny sample MUST NOT
 seed the response rate prior. Once local ACK-derived DATA has been seen without
 enough non-application-limited volume to become bulk-rate evidence, the peer hint
-remains only an advisory rate prior; it no longer authorizes Service handoff for
-that path.
+remains only an advisory rate prior; it does not authorize ordered owner data
+for that path.
 
 Each endpoint also keeps local lane occupancy for every session path. This
 state is not trusted from the peer because it reflects local product work

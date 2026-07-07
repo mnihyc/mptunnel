@@ -561,9 +561,7 @@ fn response_target_is_plausible_unique_owner_candidate(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
 ) -> bool {
-    response_target_is_service_owner_candidate(target, candidates)
-        || target.has_bulk_rate_evidence
-        || target.has_service_handoff_evidence
+    response_target_is_service_owner_candidate(target, candidates) || target.has_bulk_rate_evidence
 }
 
 #[cfg(test)]
@@ -610,9 +608,7 @@ fn response_target_unique_owner_admission_with_epoch(
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     if lower_owner == Some(target.key)
         || response_target_is_service_owner_candidate(target, candidates)
-        || (lower_owner.is_none()
-            && target.key == lead.key
-            && (target.has_service_handoff_evidence || target.has_bulk_rate_evidence))
+        || (lower_owner.is_none() && target.key == lead.key && target.has_bulk_rate_evidence)
     {
         return (PathAdmission::service(), None);
     }
@@ -3181,7 +3177,6 @@ mod tests {
             snapshot,
             eta_ms,
             is_active,
-            has_service_handoff_evidence: false,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         }
@@ -3701,7 +3696,6 @@ mod tests {
             snapshot,
             eta_ms: 1.0,
             is_active: true,
-            has_service_handoff_evidence: true,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         };
@@ -4733,7 +4727,7 @@ mod tests {
     }
 
     #[test]
-    fn response_planning_allows_proof_only_optional_path_as_frontier_clear_service_not_subflow() {
+    fn response_planning_keeps_proof_only_optional_path_as_probe_not_service() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let (active_commands, _active_rx) = reliable_path_command_channels(8);
@@ -4825,12 +4819,12 @@ mod tests {
             frames: frames_rx,
         };
         let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("frontier-clear proof-only same-family path may become Service");
+            .expect("current Service path should remain dispatchable");
 
         assert_eq!(
             plan.primary_key(),
-            Some(optional),
-            "proof-only same-family paths may hand off Service at a clear frontier"
+            Some(service),
+            "proof-only same-family paths remain Probe/Standby and cannot become Service at a clear frontier"
         );
         assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
     }
@@ -5377,11 +5371,10 @@ mod tests {
     }
 
     #[test]
-    fn frontier_clear_same_underlay_sender_evidence_can_handoff_service_from_bulk_owner() {
+    fn frontier_clear_handoff_evidence_does_not_displace_service_without_bulk_rate() {
         let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let mut lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-        lower_eta_alternate.has_service_handoff_evidence = true;
         lower_eta_alternate.has_sender_evidence = true;
         lower_eta_alternate.has_bulk_rate_evidence = false;
 
@@ -5393,9 +5386,12 @@ mod tests {
             &[],
             Some(owner.key),
         )
-        .expect("frontier-clear same-underlay path with sender evidence may become Service");
+        .expect("current Service path should remain dispatchable");
 
-        assert_eq!(selected.key, lower_eta_alternate.key);
+        assert_eq!(
+            selected.key, owner.key,
+            "handoff/proof evidence is not delivery proof and must not displace Service without bulk-rate evidence"
+        );
         assert_eq!(
             response_target_runtime_role(&selected, None),
             PathRuntimeRole::Service

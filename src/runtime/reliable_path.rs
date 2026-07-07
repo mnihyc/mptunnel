@@ -1313,7 +1313,6 @@ impl ResponseStreamBinding {
                         self.mux_limits,
                     ),
                     is_active: Some(entry.key) == active_key,
-                    has_service_handoff_evidence: server_output_has_service_handoff_evidence(entry),
                     has_sender_evidence: server_output_has_sender_evidence(entry),
                     has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
                 }

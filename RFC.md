@@ -1602,10 +1602,13 @@ is an idempotent reannouncement: it may refresh lane metadata, demand hints,
 credit, and path status, but it MUST NOT replace the live writer/output channel
 or create another ordinary output for unique later offsets. It also MUST NOT
 reorder the existing output entry or change ordered-data ownership merely
-because the duplicate open used the Active role. Same-key replacement is allowed
-only after the previous output has been closed, detached, or otherwise made
-unusable by carrier teardown. If an `OPEN_STREAM` arrives on a different live
-carrier channel for a stream/path key that already has a live output, the
+because the duplicate open used the Active role. Senders MUST NOT use repeated
+same-key Active opens as normal validation or throughput discovery; they are
+bounded failover/survivor recovery control after an explicit carrier failure or
+promotion decision. Same-key replacement is allowed only after the previous
+output has been closed, detached, or otherwise made unusable by carrier
+teardown. If an `OPEN_STREAM` arrives on a different live carrier channel for a
+stream/path key that already has a live output, the
 receiver MUST NOT replace the live response-output channel. An Active duplicate
 carrier channel MAY be accepted as an overlapping input/control channel when the
 sender has already abandoned or is replacing the previous carrier instance; in
@@ -2763,6 +2766,15 @@ after the first successful validation attachment. Later passes may attach the
 next metric-ordered candidate after the previous result is known. This preserves
 carrier-diverse validation without turning one bulk stream into a cross-product
 of simultaneous stream opens, proofs, duplicate bytes, and repair obligations.
+For a given product stream and carrier path, validation/probe attachment is a
+one-shot path-manager attempt. A path that has already been attempted for that
+stream MUST NOT be reopened by prevalidation or rebalance simply because the
+previous validation handle closed, failed to graduate, or stopped being attached.
+The next action is a scheduler decision over the current path set: keep the
+path as `Probe`/`Standby`/`RepairOnly`, wait for new evidence, or use another
+candidate. A later product stream may probe the path again, and explicit
+failover recovery may open a survivor when required for correctness, but normal
+bulk validation MUST NOT create repeated same-stream `OPEN_STREAM` churn.
 
 Mixed TCP+UDP validation MUST be carrier-diverse without carrier-family
 prejudice. When an admitted validation subflow set contains both TCP and UDP
@@ -3737,6 +3749,16 @@ carrier failure still requires carrier close/error evidence, persistent
 data-plane stall evidence, or an explicit failover decision. This prevents the
 MPTCP/MPQUIC anti-pattern where normal multipath reordering is mistaken for a
 dead subflow and creates repeated detach/reopen churn.
+
+Owner-gap pressure is also a sender wait state. If the next queued response
+work is `OwnerData` and the authoritative product ACK frontier is blocked
+behind a repairable owner gap, the sender MUST NOT immediately re-poll the
+target-selection/admission machinery just because a carrier queue has byte
+capacity. It must wait for ACK progress, repair/progress timer expiry, local
+source progress, or carrier capacity notification that can make a different
+work item admissible. This keeps product-ordering debt separate from carrier
+pipe availability and prevents CPU spin or repeated non-emitting scheduling
+decisions.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

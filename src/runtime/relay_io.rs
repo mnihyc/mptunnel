@@ -586,6 +586,7 @@ fn response_sender_wait_state(
     queue_nonempty: bool,
     queue_ready: bool,
     front_has_carrier_credit: bool,
+    front_blocked_by_owner_gap: bool,
     retry_at: Option<tokio::time::Instant>,
     now: tokio::time::Instant,
     retry_delay: Duration,
@@ -596,6 +597,17 @@ fn response_sender_wait_state(
             ready: false,
             subscribe_capacity: false,
             retry_at: None,
+        };
+    }
+    if front_blocked_by_owner_gap {
+        let retry_at = retry_at
+            .filter(|deadline| *deadline > now)
+            .unwrap_or(now + retry_delay);
+        return ResponseSenderWaitState {
+            blocked: true,
+            ready: false,
+            subscribe_capacity: false,
+            retry_at: Some(retry_at),
         };
     }
     if front_has_carrier_credit {
@@ -1517,6 +1529,10 @@ where
             !response_sender.is_empty(),
             response_sender.queued_send_ready(),
             queued_front_has_carrier_credit,
+            reliable_relay_queued_lane_blocked_by_owner_gap(
+                response_sender.front_lane(),
+                owner_gap_blocks_product_source,
+            ),
             response_sender_retry_at,
             now,
             sender_service_retry_delay(send_path_snapshot, relay_lane),
@@ -2477,11 +2493,27 @@ mod tests {
         let now = tokio::time::Instant::now();
         let retry_delay = Duration::from_millis(10);
 
-        let state = response_sender_wait_state(true, true, false, None, now, retry_delay);
+        let state = response_sender_wait_state(true, true, false, false, None, now, retry_delay);
 
         assert!(state.blocked);
         assert!(!state.ready);
         assert!(state.subscribe_capacity);
+        assert_eq!(state.retry_at, Some(now + retry_delay));
+    }
+
+    #[test]
+    fn response_sender_wait_state_blocks_owner_gap_without_carrier_capacity_spin() {
+        let now = tokio::time::Instant::now();
+        let retry_delay = Duration::from_millis(10);
+
+        let state = response_sender_wait_state(true, true, true, true, None, now, retry_delay);
+
+        assert!(state.blocked);
+        assert!(!state.ready);
+        assert!(
+            !state.subscribe_capacity,
+            "owner-gap debt is product-ordering pressure, not carrier pipe exhaustion"
+        );
         assert_eq!(state.retry_at, Some(now + retry_delay));
     }
 

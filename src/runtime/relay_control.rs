@@ -48,6 +48,7 @@ where
             .max(1),
     );
     let mut pending_validation_opens = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
+    let mut attempted_validation_paths = std::collections::HashSet::<RelayPathKey>::new();
     if reliable_relay_has_evidenced_bulk_alternative(context, &remotes, &send_stream)
         && spawn_reliable_relay_validation_opens(
             context,
@@ -56,6 +57,7 @@ where
             &remotes,
             &send_stream,
             &mut pending_validation_opens,
+            &mut attempted_validation_paths,
             &validation_open_tx,
         )
     {
@@ -133,6 +135,7 @@ where
                 &remotes,
                 &send_stream,
                 &mut pending_validation_opens,
+                &mut attempted_validation_paths,
                 &validation_open_tx,
             ) {
                 last_stream_progress_at = Instant::now();
@@ -162,6 +165,7 @@ where
                     &remotes,
                     &send_stream,
                     &mut pending_validation_opens,
+                    &mut attempted_validation_paths,
                     &validation_open_tx,
                 ) {
                     last_stream_progress_at = Instant::now();
@@ -496,7 +500,8 @@ where
                     remotes.fail_path_instance(context, instance).await;
                 }
                 if !remotes.is_empty() {
-                    match sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
+                    match sender
+                        .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                         .await
                     {
                         Ok(()) => {
@@ -924,7 +929,8 @@ where
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         remotes.fail_path_instance(context, instance).await;
                         if !remotes.is_empty()
-                            && let Err(err) = sender.reannounce_active_path(context, &mut remotes, &spec, relay_lane)
+                            && let Err(err) = sender
+                                .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
                                 .await
                         {
                             eprintln!(
@@ -1832,6 +1838,7 @@ fn spawn_reliable_relay_validation_opens(
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     pending: &mut HashMap<RelayPathKey, RelayValidationOpenTask>,
+    attempted: &mut std::collections::HashSet<RelayPathKey>,
     result_tx: &mpsc::Sender<RelayValidationOpenResult>,
 ) -> bool {
     if !relay_lane_is_bulk(lane) {
@@ -1855,12 +1862,11 @@ fn spawn_reliable_relay_validation_opens(
         }
     }
     let candidates = unique_candidates;
-    let mut candidates = candidates
+    let candidates = candidates
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
-        .filter(|key| !pending.contains_key(key))
         .collect::<Vec<_>>();
-    candidates.truncate(1);
+    let candidates = reliable_relay_validation_probe_candidates(candidates, pending, attempted);
     if candidates.is_empty() {
         return false;
     }
@@ -1875,6 +1881,7 @@ fn spawn_reliable_relay_validation_opens(
             }
             _ => continue,
         }
+        attempted.insert(key);
         let context = context.clone();
         let target = spec.target.clone();
         let ingress = spec.ingress;
@@ -1946,6 +1953,25 @@ fn spawn_reliable_relay_validation_opens(
         );
     }
     spawned
+}
+
+fn reliable_relay_validation_probe_candidates(
+    candidates: Vec<RelayPathKey>,
+    pending: &HashMap<RelayPathKey, RelayValidationOpenTask>,
+    attempted: &std::collections::HashSet<RelayPathKey>,
+) -> Vec<RelayPathKey> {
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        if pending.contains_key(&candidate)
+            || attempted.contains(&candidate)
+            || selected.contains(&candidate)
+        {
+            continue;
+        }
+        selected.push(candidate);
+        break;
+    }
+    selected
 }
 
 pub(super) struct RelayPathAttachRequest<'a> {
@@ -2412,6 +2438,7 @@ pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: Flo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     fn test_reliable_path_stream(
         stream_id: StreamId,
@@ -2475,7 +2502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_stall_keeps_same_underlay_bulk_subflow_set_instead_of_reannouncing() {
+    async fn product_stall_keeps_stable_same_underlay_bulk_subflow_set() {
         let (commands_a, _receivers_a) = reliable_path_command_channels(1);
         let (commands_b, _receivers_b) = reliable_path_command_channels(1);
         let first = OpenedRemoteStream {
@@ -2512,6 +2539,35 @@ mod tests {
                 &remotes,
                 FlowLane::Latency,
             )
+        );
+    }
+
+    #[test]
+    fn validation_probe_candidates_are_one_shot_per_stream_path() {
+        let tcp0 = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let udp0 = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let candidates = vec![tcp0, udp0, tcp0];
+        let pending = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
+        let mut attempted = HashSet::from([tcp0]);
+        let selected = reliable_relay_validation_probe_candidates(candidates, &pending, &attempted);
+
+        assert_eq!(
+            selected,
+            vec![udp0],
+            "validation/probe attachment is path-scoped and must not reopen a path already attempted for this product stream"
+        );
+
+        attempted.insert(udp0);
+        assert!(
+            reliable_relay_validation_probe_candidates(vec![tcp0, udp0], &pending, &attempted)
+                .is_empty(),
+            "rebalance cannot turn a closed validation handle into repeated OPEN_STREAM churn"
         );
     }
 }

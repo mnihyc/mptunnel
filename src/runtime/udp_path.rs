@@ -275,7 +275,6 @@ impl QuicPathMetricTracker {
         let congestion_window = congestion.congestion_window.max(stats.path.cwnd);
         let carrier_capacity_known = congestion.pacing_rate_bps.is_some() || congestion_window > 0;
         let bytes_in_flight = congestion.bytes_in_flight.unwrap_or(0);
-        let pending_bytes = congestion.pending_bytes.saturating_add(bytes_in_flight);
         let inflight_hi = if carrier_capacity_known {
             congestion_window.max(stats.path.current_mtu as u64) as usize
         } else {
@@ -322,6 +321,17 @@ impl QuicPathMetricTracker {
                 .product_data_pending_ack_bytes
                 .saturating_sub(product_newly_acked_bytes);
         }
+        // `product_data_pending_ack_bytes` is the part of the product stream that
+        // mptunnel has handed to Quinn but has not yet observed as carrier-ACKed.
+        // Quinn's write future completes when bytes are accepted into QUIC's
+        // stream/send buffers, not when they leave the connection. Treat that
+        // backlog as carrier queue debt, otherwise the product scheduler can
+        // overfill QUIC by tens of MiB while believing the path is empty.
+        let carrier_committed_bytes = self
+            .product_data_pending_ack_bytes
+            .saturating_add(congestion.pending_bytes)
+            .max(bytes_in_flight);
+
         if product_newly_acked_bytes > 0 && !congestion.app_limited {
             let sample_elapsed = elapsed.max(QUIC_TIMER_GRANULARITY);
             let sample_rate =
@@ -370,7 +380,7 @@ impl QuicPathMetricTracker {
             pacing_rate_bps,
             inflight_hi,
             bytes_in_flight: usize::try_from(bytes_in_flight).unwrap_or(usize::MAX),
-            pending_bytes: usize::try_from(pending_bytes).unwrap_or(usize::MAX),
+            pending_bytes: usize::try_from(carrier_committed_bytes).unwrap_or(usize::MAX),
             loss_ppm: congestion.loss_ppm,
             ecn_ppm: congestion.ecn_ppm,
             app_limited,
@@ -441,10 +451,22 @@ pub(super) fn udp_path_finish_stream(send: &mut UdpPathSendStream) -> Result<(),
     Ok(quic_carrier::finish_stream(&mut send.stream)?)
 }
 
+// Product-level UDP reliable frame size. This is intentionally the same kind of
+// BDP/service quantum used by TCP. Do not cap this to a QUIC packet train: doing
+// so turns the carrier record size into the application pacing unit and
+// underfeeds QUIC. QUIC-specific recordization is performed inside
+// transport::quic_carrier while preserving this product quantum.
 fn udp_path_max_stream_payload_bytes(codec_limits: CodecLimits, mux_limits: MuxLimits) -> usize {
     quic_carrier::max_stream_payload_bytes(codec_limits)
         .min(mux_limits.max_reliable_relay_chunk_bytes)
         .max(1)
+}
+
+fn udp_reliable_stream_frame_queue(codec_limits: CodecLimits, mux_limits: MuxLimits) -> usize {
+    reliable_stream_frame_queue_for_payload(
+        mux_limits,
+        udp_path_max_stream_payload_bytes(codec_limits, mux_limits),
+    )
 }
 
 fn spawn_client_udp_path_metrics(
@@ -624,7 +646,9 @@ async fn open_client_udp_stream_on_connection(
         runtime.mux_limits,
         runtime.codec_limits,
     ));
-    let (frames_tx, frames_rx) = mpsc::channel(runtime.stream_frame_queue);
+    let stream_frame_queue =
+        udp_reliable_stream_frame_queue(runtime.codec_limits, runtime.mux_limits);
+    let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
     tokio::spawn(run_client_udp_stream(
         send,
         recv,
@@ -632,7 +656,7 @@ async fn open_client_udp_stream_on_connection(
         runtime.path_index,
         runtime.codec_limits,
         runtime.mux_limits,
-        runtime.stream_frame_queue,
+        stream_frame_queue,
         runtime.health.clone(),
         receivers,
         frames_tx,
@@ -1349,7 +1373,11 @@ async fn handle_server_udp_reliable_stream(
                 &mut send,
                 &Frame::StreamMaxData {
                     stream_id,
-                    max_offset: context.mux_limits.max_stream_window_bytes,
+                    max_offset: reliable_stream_initial_advertised_window_bytes(
+                        UnderlayProtocol::Udp,
+                        lane,
+                        context.mux_limits,
+                    ),
                 },
                 context.codec_limits,
             )
@@ -1416,7 +1444,7 @@ async fn run_server_udp_reliable_stream_loop(
         capabilities,
         stream_id,
         target,
-        lane: _lane,
+        lane,
         role: _role,
         commands_tx,
         mut commands_rx,
@@ -1424,7 +1452,7 @@ async fn run_server_udp_reliable_stream_loop(
     let mut carrier_frames = spawn_quic_path_reader(
         recv,
         context.codec_limits,
-        reliable_stream_frame_queue(context.mux_limits),
+        udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits),
     );
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
@@ -1532,7 +1560,11 @@ async fn run_server_udp_reliable_stream_loop(
                                     &mut send,
                                     &Frame::StreamMaxData {
                                         stream_id,
-                                        max_offset: context.mux_limits.max_stream_window_bytes,
+                                        max_offset: reliable_stream_initial_advertised_window_bytes(
+                                            UnderlayProtocol::Udp,
+                                            lane,
+                                            context.mux_limits,
+                                        ),
                                     },
                                     context.codec_limits,
                                 )
@@ -2173,7 +2205,9 @@ async fn open_server_udp_datagram_flow(
 
 fn udp_path_frame_finished(err: &RuntimeError) -> bool {
     match err {
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Read(_)) => true,
         RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::ReadExact(_)) => true,
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::UnexpectedEnd) => true,
         RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Connection(_)) => true,
         _ => false,
     }
@@ -2181,7 +2215,9 @@ fn udp_path_frame_finished(err: &RuntimeError) -> bool {
 
 fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
     match err {
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Read(_)) => true,
         RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::ReadExact(_)) => true,
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::UnexpectedEnd) => true,
         RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Connection(_)) => true,
         RuntimeError::RemoteClosed(CloseReason::Normal) => true,
         _ => false,
@@ -2206,11 +2242,17 @@ fn quic_path_open_error_is_retryable(err: &RuntimeError) -> bool {
     )
 }
 
-fn udp_path_command_queue(mux_limits: MuxLimits, codec_limits: CodecLimits) -> usize {
-    let sender_quantum =
-        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
-    let engine_payload = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
-    reliable_path_command_queue_for_payload(mux_limits, sender_quantum.min(engine_payload).max(1))
+fn udp_path_command_queue(mux_limits: MuxLimits, _codec_limits: CodecLimits) -> usize {
+    // This queue is a sender-service work queue, not a QUIC record-buffer queue.
+    // QUIC reliable streams may split OwnerData into smaller records to reduce
+    // stream head-of-line burst size, but that packetization detail must not
+    // multiply the number of commands admitted above the carrier. Otherwise a
+    // 12--32 KiB QUIC record cap would inflate the queue from the logical
+    // product-flight budget to thousands of commands and recreate the hidden
+    // backlog that caused zero-goodput bursts.  Keep queue capacity tied to the
+    // logical sender quantum; the QUIC writer/flow-control path performs the
+    // lower-level pacing.
+    reliable_path_command_queue(mux_limits)
 }
 
 async fn resolve_first_socket_addr(path: &PathSpec) -> Result<SocketAddr, RuntimeError> {
@@ -2259,6 +2301,31 @@ mod tests {
         metrics.delivery_sample_count = sample_count;
         metrics.app_limited = false;
         metrics
+    }
+
+    #[test]
+    fn quic_product_payload_uses_sender_quantum_not_packet_train_cap() {
+        let mux_limits = MuxLimits::default();
+        let codec_limits = CodecLimits::default();
+        let payload_cap = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
+
+        assert!(
+            payload_cap >= BBR_MAX_SEND_QUANTUM_BYTES,
+            "QUIC product dispatch must stay BDP/service-quantum sized; only carrier serialization may split records"
+        );
+    }
+
+    #[test]
+    fn quic_reliable_stream_reader_queue_stays_logical_product_queue() {
+        let mux_limits = MuxLimits::default();
+        let codec_limits = CodecLimits::default();
+        let queue = udp_reliable_stream_frame_queue(codec_limits, mux_limits);
+
+        assert_eq!(
+            queue,
+            reliable_stream_frame_queue(mux_limits),
+            "carrier recordization must not multiply the product reader queue or hide backlog"
+        );
     }
 
     #[test]
@@ -2331,6 +2398,38 @@ mod tests {
         assert_eq!(tx_only.delivery_sample_count, 0);
         assert!(tx_only.last_delivery_sample_at.is_none());
         assert_eq!(tx_only.delivery_rate_bps.round() as u64, 500_000_000);
+    }
+
+    #[test]
+    fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_congestion(4 * 1024 * 1024, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = 4 * 1024 * 1024;
+        stats.path.current_mtu = 1400;
+        let _ = tracker.quic.observe(stats, congestion, 2);
+
+        let queued = tracker.quic.observe(
+            stats,
+            with_product_data_written(congestion, 8 * 1024 * 1024),
+            2,
+        );
+        assert_eq!(queued.bytes_in_flight, 0);
+        assert_eq!(queued.pending_bytes, 8 * 1024 * 1024);
+        let product_metrics = path_metrics_from_quic_path(PathId(7), queued);
+        assert_eq!(product_metrics.queue_bytes, 8 * 1024 * 1024);
+
+        let partially_acked = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, 8 * 1024 * 1024),
+                2 * 1024 * 1024,
+                1,
+            ),
+            2,
+        );
+        assert_eq!(partially_acked.pending_bytes, 6 * 1024 * 1024);
     }
 
     #[test]
@@ -2424,21 +2523,26 @@ mod tests {
     }
 
     #[test]
-    fn quic_udp_command_queue_tracks_sender_quantum_not_max_frame_size() {
+    fn quic_udp_command_queue_tracks_sender_quantum_not_record_size() {
         let mux_limits = MuxLimits::default();
         let codec_limits = CodecLimits::default();
         let product_queue = reliable_path_command_queue(mux_limits);
         let quic_udp_queue = udp_path_command_queue(mux_limits, codec_limits);
         let sender_quantum =
             reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
-        let engine_payload = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
-        let expected = reliable_path_command_queue_for_payload(
+        let record_sized_queue = reliable_path_command_queue_for_payload(
             mux_limits,
-            sender_quantum.min(engine_payload).max(1),
+            sender_quantum.min(UDP_DEFAULT_MTU_PAYLOAD_BYTES).max(1),
         );
 
-        assert_eq!(quic_udp_queue, product_queue);
-        assert_eq!(quic_udp_queue, expected);
+        assert_eq!(
+            quic_udp_queue, product_queue,
+            "command queue capacity must stay tied to the logical sender quantum"
+        );
+        assert_ne!(
+            quic_udp_queue, record_sized_queue,
+            "carrier packet/record sizing must not inflate the command queue"
+        );
     }
 
     #[test]

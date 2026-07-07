@@ -12,7 +12,8 @@ where
     let mut remotes =
         ReliableRelayRemoteSet::new(remote, reliable_stream_frame_queue(context.mux_limits));
     let stream_id = remotes.stream_id();
-    let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, context.mux_limits, 0);
     send_stream.update_max_offset(remotes.max_offset());
     let mut recv_stream = ReliableRecvStream::new(stream_id, context.mux_limits);
     let chunk_size =
@@ -408,7 +409,7 @@ where
                 }
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
-                if reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+                if reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
                     &remotes,
                     relay_lane,
                 ) {
@@ -433,7 +434,7 @@ where
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
-                        "client_product_stall_keeps_same_underlay_cohort",
+                        "client_product_stall_keeps_same_underlay_subflow_set",
                         format_args!(
                             "stream_id={} active_underlay={:?} attached_paths={} repair_bytes={} recv_reorder_bytes={} sent_offset={} cause=stable_membership",
                             stream_id.0,
@@ -2334,7 +2335,7 @@ pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Du
     QUIC_PERSISTENT_CONGESTION_THRESHOLD
 }
 
-pub(super) fn reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+pub(super) fn reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
     remotes: &ReliableRelayRemoteSet,
     lane: FlowLane,
 ) -> bool {
@@ -2475,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_stall_keeps_same_underlay_bulk_cohort_instead_of_reannouncing() {
+    async fn product_stall_keeps_same_underlay_bulk_subflow_set_instead_of_reannouncing() {
         let (commands_a, _receivers_a) = reliable_path_command_channels(1);
         let (commands_b, _receivers_b) = reliable_path_command_channels(1);
         let first = OpenedRemoteStream {
@@ -2502,13 +2503,13 @@ mod tests {
         remotes.attach_for_validation(second);
 
         assert!(
-            reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+            reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
                 &remotes,
                 FlowLane::Throughput,
             )
         );
         assert!(
-            !reliable_relay_product_stall_keeps_stable_same_underlay_cohort(
+            !reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
                 &remotes,
                 FlowLane::Latency,
             )

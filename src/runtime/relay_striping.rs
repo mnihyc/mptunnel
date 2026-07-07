@@ -277,7 +277,7 @@ fn relay_path_runtime_role(
     if Some(key) == active_key || Some(key) == lower_flight_owner {
         PathRuntimeRole::Service
     } else if has_bulk_model_evidence {
-        PathRuntimeRole::Cohort
+        PathRuntimeRole::Subflow
     } else {
         PathRuntimeRole::Standby
     }
@@ -463,7 +463,23 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         return BulkRelayPathChoice::NotApplicable;
     }
     let policy = SchedulerPolicy::default();
-    let active_key = paths.last().map(|path| path.key());
+    // The request-side primary owner is the existing ordered-data owner when it
+    // is still attached; otherwise it is the first active path opened for the
+    // stream.  Newly attached active paths are candidate subflows, not automatic
+    // service owners.  Using `paths.last()` here made an attached UDP survivor
+    // become the service path before any bytes were sent, which blocked the
+    // initial TCP owner in the lower-frontier regression test and can also
+    // create real upload instability by letting attachment order override
+    // product-byte ownership.
+    let active_key = ordered_data_owner
+        .filter(|owner| paths.iter().any(|path| path.key() == *owner))
+        .or_else(|| {
+            paths
+                .iter()
+                .find(|path| path.placement == RelayPathPlacement::Active)
+                .map(|path| path.key())
+        })
+        .or_else(|| paths.last().map(|path| path.key()));
     let normal_bulk_send = avoid_keys.is_empty();
     if paths.len() <= 1 {
         if normal_bulk_send
@@ -516,6 +532,21 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         None
     };
     if normal_bulk_send && lead.is_none() {
+        if lower_flight_owner.is_none()
+            && let Some(active_key) = active_key
+            && let Some((position, _)) = paths.iter().enumerate().find(|(_, path)| {
+                path.key() == active_key
+                    && path.placement != RelayPathPlacement::Repair
+                    && frame
+                        .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
+                        .unwrap_or(true)
+            })
+        {
+            // First owner bytes establish the lower-frontier owner.  The
+            // no-fallback rule applies after that frontier exists; before then,
+            // blocking the active primary just creates a sender-service stall.
+            return BulkRelayPathChoice::Selected(position);
+        }
         return BulkRelayPathChoice::Blocked;
     }
     let lead_key = lead.map(|lead| lead.key);
@@ -590,7 +621,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                             payload_bytes,
                         ),
                         false,
-                        "not_in_admitted_cohort",
+                        "not_in_admitted_subflow_set",
                     );
                     continue;
                 }
@@ -605,9 +636,33 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                         payload_bytes,
                     ),
                     false,
-                    "no_safe_cohort_non_active_path",
+                    "no_safe_subflow_set_non_active_path",
                 );
                 continue;
+            }
+            if let Some(active) = active_key {
+                // The request/upload side follows the same production rule as
+                // the response scheduler: same-stream reliable OwnerData stays
+                // inside the active carrier family. Different-family paths may
+                // still be used for probes or repair, but they must not create
+                // new ordered-byte ownership that can stall behind an unrelated
+                // TCP/QUIC recovery clock. A path that already owns the lower
+                // frontier remains eligible only to drain existing debt.
+                if key.underlay != active.underlay && !owns_lower_frontier {
+                    #[cfg(feature = "lab-diagnostics")]
+                    log_bulk_relay_candidate_decision(
+                        BulkRelayCandidateDiagnostics::skipped(
+                            stream_id,
+                            lane,
+                            key,
+                            lead_key,
+                            payload_bytes,
+                        ),
+                        false,
+                        "cross_family_owner_disabled",
+                    );
+                    continue;
+                }
             }
         }
         if normal_bulk_send
@@ -1051,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_validation_copy_does_not_become_ordering_owner() {
+    fn repair_copy_does_not_become_ordering_owner() {
         let owner = RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,

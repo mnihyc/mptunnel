@@ -1339,7 +1339,7 @@ impl ClientPathContext {
         if !has_bulk_rate_evidence && !has_active_bulk_work {
             candidates.truncate(1);
         }
-        bulk_striping_admitted_cohort(candidates, payload_bytes, self.mux_limits)
+        bulk_striping_admitted_subflows(candidates, payload_bytes, self.mux_limits)
             .into_iter()
             .map(|candidate| candidate.key)
             .collect()

@@ -189,7 +189,11 @@ pub(super) async fn handle_server_path(
                                     &mut writer,
                                     &Frame::StreamMaxData {
                                         stream_id,
-                                        max_offset: context.mux_limits.max_stream_window_bytes,
+                                        max_offset: reliable_stream_initial_advertised_window_bytes(
+                                            UnderlayProtocol::Tcp,
+                                            lane,
+                                            context.mux_limits,
+                                        ),
                                     },
                                 )
                                 .await?
@@ -835,7 +839,11 @@ pub(super) async fn run_server_tcp_stream(
             &stream,
             Frame::StreamMaxData {
                 stream_id,
-                max_offset: context.mux_limits.max_stream_window_bytes,
+                max_offset: reliable_stream_initial_advertised_window_bytes(
+                    stream.underlay,
+                    stream.lane,
+                    context.mux_limits,
+                ),
             },
         )
         .await?;

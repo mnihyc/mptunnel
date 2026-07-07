@@ -253,9 +253,11 @@ impl ServerReliableStreamRegistry {
                 session_id.0, stream_id.0, underlay, path_id.0, role, lane,
             ),
         );
+        let initial_max_offset =
+            reliable_stream_initial_advertised_window_bytes(underlay, lane, mux_limits);
         Ok(ServerReliableStreamOpen::New(ReliablePathStream {
             stream_id,
-            max_offset: mux_limits.max_stream_window_bytes,
+            max_offset: initial_max_offset,
             lane,
             underlay,
             max_frame_payload_bytes,

@@ -554,7 +554,7 @@ pub(super) struct ResponseStreamBinding {
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
-    cohort_epoch: Mutex<Option<FlowCohortEpoch>>,
+    subflow_set: Mutex<Option<FlowSubflowSet>>,
     version: watch::Sender<u64>,
 }
 
@@ -632,14 +632,13 @@ impl ResponseStreamBinding {
                     delivery_samples: 0,
                     last_delivery_at: None,
                     path_metrics: None,
-                    trial_owner_sent_bytes: 0,
-                    duplicate_validation_sent_bytes: 0,
+                    subflow_startup_sent_bytes: 0,
                 }],
             }),
             ordered_data_owner: Mutex::new(Some(key)),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
-            cohort_epoch: Mutex::new(None),
+            subflow_set: Mutex::new(None),
             version,
         })
     }
@@ -743,8 +742,7 @@ impl ResponseStreamBinding {
                 delivery_samples: 0,
                 last_delivery_at: None,
                 path_metrics: None,
-                trial_owner_sent_bytes: 0,
-                duplicate_validation_sent_bytes: 0,
+                subflow_startup_sent_bytes: 0,
             }
         };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
@@ -930,7 +928,7 @@ impl ResponseStreamBinding {
                 .expect("server response ACK ordering lock")
                 .apply_normalized_ack(ranges, &[]);
             if ordering_update.changed {
-                self.reset_cohort_epoch();
+                self.reset_subflow_set();
                 self.notify_update();
             }
             return;
@@ -1040,7 +1038,7 @@ impl ResponseStreamBinding {
         }
         drop(outputs);
         if changed || ordering_update.changed {
-            self.reset_cohort_epoch();
+            self.reset_subflow_set();
             self.notify_update();
         }
     }
@@ -1064,101 +1062,101 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn cohort_epoch_for(
-        current: Option<FlowCohortEpoch>,
+    fn subflow_set_for(
+        current: Option<FlowSubflowSet>,
         service: CarrierPathKey,
         owner_credit_bytes: usize,
-        optional_credit_bytes: usize,
+        startup_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
-    ) -> FlowCohortEpoch {
+    ) -> FlowSubflowSet {
         current
             .filter(|epoch| {
                 epoch.matches_envelope(
                     service,
                     owner_credit_bytes,
-                    optional_credit_bytes,
+                    startup_credit_bytes,
                     optional_overhead_budget_bytes,
                     max_read_gap_budget,
                 )
             })
             .unwrap_or_else(|| {
-                FlowCohortEpoch::new(
+                FlowSubflowSet::new(
                     0,
                     service,
                     owner_credit_bytes,
-                    optional_credit_bytes,
+                    startup_credit_bytes,
                     optional_overhead_budget_bytes,
                     max_read_gap_budget,
                 )
             })
     }
 
-    pub(super) fn cohort_epoch_snapshot(&self) -> Option<FlowCohortEpoch> {
-        self.cohort_epoch
+    pub(super) fn subflow_set_snapshot(&self) -> Option<FlowSubflowSet> {
+        self.subflow_set
             .lock()
-            .expect("server reliable stream cohort epoch lock")
+            .expect("server reliable stream subflow set lock")
             .clone()
     }
 
     #[cfg(test)]
-    pub(super) fn preview_cohort_owner_admission(
+    pub(super) fn preview_subflow_owner_admission(
         &self,
         service: CarrierPathKey,
         owner_credit_bytes: usize,
-        optional_credit_bytes: usize,
+        startup_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
-        input: OptionalOwnerAdmissionInput,
-    ) -> OptionalPathAdmission {
+        input: SubflowAdmissionInput,
+    ) -> PathAdmission {
         let current = self
-            .cohort_epoch
+            .subflow_set
             .lock()
-            .expect("server reliable stream cohort epoch lock")
+            .expect("server reliable stream subflow set lock")
             .clone();
-        let mut epoch = Self::cohort_epoch_for(
+        let mut epoch = Self::subflow_set_for(
             current,
             service,
             owner_credit_bytes,
-            optional_credit_bytes,
+            startup_credit_bytes,
             optional_overhead_budget_bytes,
             max_read_gap_budget,
         );
-        epoch.admit_optional_owner(input)
+        epoch.admit_subflow_owner(input)
     }
 
-    pub(super) fn commit_cohort_owner_admission(
+    pub(super) fn commit_subflow_owner_admission(
         &self,
         service: CarrierPathKey,
         owner_credit_bytes: usize,
-        optional_credit_bytes: usize,
+        startup_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
-        input: OptionalOwnerAdmissionInput,
-    ) -> OptionalPathAdmission {
+        input: SubflowAdmissionInput,
+    ) -> PathAdmission {
         let mut guard = self
-            .cohort_epoch
+            .subflow_set
             .lock()
-            .expect("server reliable stream cohort epoch lock");
+            .expect("server reliable stream subflow set lock");
         let current = guard.take();
-        let mut epoch = Self::cohort_epoch_for(
+        let mut epoch = Self::subflow_set_for(
             current,
             service,
             owner_credit_bytes,
-            optional_credit_bytes,
+            startup_credit_bytes,
             optional_overhead_budget_bytes,
             max_read_gap_budget,
         );
-        let admission = epoch.admit_optional_owner(input);
+        let admission = epoch.admit_subflow_owner(input);
         *guard = Some(epoch);
         admission
     }
 
-    pub(super) fn reset_cohort_epoch(&self) {
+    pub(super) fn reset_subflow_set(&self) {
         *self
-            .cohort_epoch
+            .subflow_set
             .lock()
-            .expect("server reliable stream cohort epoch lock") = None;
+            .expect("server reliable stream subflow set lock") = None;
     }
 
     fn clear_ordered_data_owner_if(&self, key: CarrierPathKey) {
@@ -1220,7 +1218,7 @@ impl ResponseStreamBinding {
             });
     }
 
-    pub(super) fn record_trial_owner_bytes(&self, key: CarrierPathKey, bytes: usize) {
+    pub(super) fn record_subflow_startup_bytes(&self, key: CarrierPathKey, bytes: usize) {
         if bytes == 0 {
             return;
         }
@@ -1229,22 +1227,8 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.trial_owner_sent_bytes =
-                entry.trial_owner_sent_bytes.saturating_add(bytes as u64);
-        }
-    }
-
-    pub(super) fn record_duplicate_validation_bytes(&self, key: CarrierPathKey, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.duplicate_validation_sent_bytes = entry
-                .duplicate_validation_sent_bytes
+            entry.subflow_startup_sent_bytes = entry
+                .subflow_startup_sent_bytes
                 .saturating_add(bytes as u64);
         }
     }
@@ -1352,10 +1336,8 @@ impl ResponseStreamBinding {
                     ),
                     is_active: Some(entry.key) == active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
-                    has_ack_data_evidence: server_output_has_ack_data_evidence(entry),
                     has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
-                    trial_owner_sent_bytes: entry.trial_owner_sent_bytes,
-                    duplicate_validation_sent_bytes: entry.duplicate_validation_sent_bytes,
+                    subflow_startup_sent_bytes: entry.subflow_startup_sent_bytes,
                 }
             })
             .collect()
@@ -1872,7 +1854,7 @@ mod tests {
         );
         assert_eq!(
             duplicate_entry.delivery_samples, 0,
-            "duplicate validation STREAM_ACK must not become response bulk evidence"
+            "repair duplicate STREAM_ACK must not become response bulk evidence"
         );
     }
 
@@ -1979,14 +1961,14 @@ mod tests {
     }
 
     #[test]
-    fn response_cohort_epoch_spends_optional_owner_credit_until_reset() {
+    fn response_subflow_set_does_not_throttle_measured_subflows_by_startup_credit() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
-        let input = OptionalOwnerAdmissionInput {
+        let input = SubflowAdmissionInput {
             key: optional,
             bulk_rate_proven: true,
             frontier_clear: true,
@@ -1997,7 +1979,7 @@ mod tests {
             optional_overhead_bytes: 0,
         };
 
-        let first = binding.preview_cohort_owner_admission(
+        let first = binding.preview_subflow_owner_admission(
             service,
             payload_bytes,
             payload_bytes,
@@ -2005,9 +1987,9 @@ mod tests {
             Duration::ZERO,
             input,
         );
-        assert_eq!(first.decision, OptionalPathDecision::AdmitOwner);
+        assert_eq!(first.decision, PathAdmissionDecision::AdmitSubflow);
 
-        let committed = binding.commit_cohort_owner_admission(
+        let committed = binding.commit_subflow_owner_admission(
             service,
             payload_bytes,
             payload_bytes,
@@ -2015,9 +1997,9 @@ mod tests {
             Duration::ZERO,
             input,
         );
-        assert_eq!(committed.decision, OptionalPathDecision::AdmitOwner);
+        assert_eq!(committed.decision, PathAdmissionDecision::AdmitSubflow);
 
-        let second = binding.preview_cohort_owner_admission(
+        let second = binding.preview_subflow_owner_admission(
             service,
             payload_bytes,
             payload_bytes,
@@ -2027,12 +2009,12 @@ mod tests {
         );
         assert_eq!(
             second.decision,
-            OptionalPathDecision::ProbeOnly,
-            "optional owner credit must persist instead of refreshing for every target check"
+            PathAdmissionDecision::AdmitSubflow,
+            "measured subflows are paced by inflight/completion/reorder gates, not by one startup-credit quantum"
         );
 
-        binding.reset_cohort_epoch();
-        let after_reset = binding.preview_cohort_owner_admission(
+        binding.reset_subflow_set();
+        let after_reset = binding.preview_subflow_owner_admission(
             service,
             payload_bytes,
             payload_bytes,
@@ -2040,7 +2022,62 @@ mod tests {
             Duration::ZERO,
             input,
         );
-        assert_eq!(after_reset.decision, OptionalPathDecision::AdmitOwner);
+        assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
+    }
+
+    #[test]
+    fn response_subflow_set_persists_unproven_startup_credit_until_reset() {
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
+        let optional = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let input = SubflowAdmissionInput {
+            key: optional,
+            bulk_rate_proven: false,
+            frontier_clear: true,
+            completion_improves: true,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        let committed = binding.commit_subflow_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(committed.decision, PathAdmissionDecision::AdmitSubflow);
+
+        let second = binding.preview_subflow_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(
+            second.decision,
+            PathAdmissionDecision::ProbeOnly,
+            "unproven subflow startup OwnerData is a bounded bootstrap window and must not refresh every dispatch"
+        );
+
+        binding.reset_subflow_set();
+        let after_reset = binding.preview_subflow_owner_admission(
+            service,
+            payload_bytes,
+            payload_bytes,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
     }
 
     #[test]
@@ -2077,7 +2114,7 @@ mod tests {
         assert_eq!(lower[1].key, owner);
         assert_eq!(
             lower[1].bytes, 4096,
-            "acked hole debt must not double-count duplicate validation copies"
+            "acked hole debt must not double-count repair duplicate copies"
         );
         let ordering = binding
             .ack_ordering

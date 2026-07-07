@@ -16,10 +16,27 @@ pub struct ReliableSendStream {
 
 impl ReliableSendStream {
     pub fn new(stream_id: StreamId, limits: MuxLimits) -> Self {
+        Self::new_with_initial_max_offset(stream_id, limits, limits.max_stream_window_bytes)
+    }
+
+    /// Create a send-side product stream with explicit peer flow-control credit.
+    ///
+    /// Runtime relays use `initial_max_offset=0` and then apply the peer's
+    /// `STREAM_MAX_DATA`/open credit before sending. Keeping the public test
+    /// constructor above at the configured window avoids rewriting older unit
+    /// tests, but production paths must not manufacture a 64 MiB credit before
+    /// the receiver advertises it. That uncredited window was the root cause of
+    /// QUIC reliable-stream burst delivery: mptunnel could queue tens of MiB
+    /// above QUIC before the application receiver had created matching credit.
+    pub fn new_with_initial_max_offset(
+        stream_id: StreamId,
+        limits: MuxLimits,
+        initial_max_offset: u64,
+    ) -> Self {
         Self {
             stream_id,
             next_offset: 0,
-            max_offset: limits.max_stream_window_bytes,
+            max_offset: initial_max_offset,
             repair_bytes: 0,
             repair_cache: BTreeMap::new(),
             limits,
@@ -645,15 +662,31 @@ impl ReliableRecvStream {
         self.received_ranges.ranges_limited(limit)
     }
 
+    /// Build a single ACK frame for callers that cannot batch control frames.
+    ///
+    /// A single ACK frame is only a complete description when all received
+    /// ranges fit in `max_ack_ranges`. If the range set has to be truncated we
+    /// must mark the frame `complete=false`; otherwise the sender interprets
+    /// omitted higher ranges as real holes and starts product repair. That was
+    /// catastrophic for multipath/QUIC because ordinary reordering produced
+    /// repair storms, extra traffic, and application stalls.
     pub fn ack_frame(&self) -> Frame {
-        let ranges = self.ack_ranges_limited(self.limits.max_ack_ranges);
+        let all_ranges = self.ack_ranges();
+        let range_limit = self.limits.max_ack_ranges.max(1);
+        let complete = all_ranges.len() <= range_limit;
+        let ranges = all_ranges.into_iter().take(range_limit).collect();
         Frame::StreamAck {
             stream_id: self.stream_id,
-            complete: true,
+            complete,
             ranges,
         }
     }
 
+    /// Build every ACK chunk needed to describe the current receive ranges.
+    ///
+    /// When multiple frames are needed each chunk is explicitly incomplete.
+    /// The sender may use incomplete ACK chunks for flight release, but it must
+    /// not infer stream gaps from omitted chunks.
     pub fn ack_frames(&self) -> Vec<Frame> {
         let ranges = self.ack_ranges();
         let chunk_size = self.limits.max_ack_ranges.max(1);
@@ -676,14 +709,21 @@ impl ReliableRecvStream {
     }
 
     pub fn max_data_offset(&self) -> u64 {
-        self.next_offset
-            .saturating_add(self.limits.max_stream_window_bytes)
+        self.max_data_offset_with_window(self.limits.max_stream_window_bytes)
+    }
+
+    pub fn max_data_offset_with_window(&self, window_bytes: u64) -> u64 {
+        self.next_offset.saturating_add(window_bytes.max(1))
     }
 
     pub fn max_data_frame(&self) -> Frame {
+        self.max_data_frame_with_window(self.limits.max_stream_window_bytes)
+    }
+
+    pub fn max_data_frame_with_window(&self, window_bytes: u64) -> Frame {
         Frame::StreamMaxData {
             stream_id: self.stream_id,
-            max_offset: self.max_data_offset(),
+            max_offset: self.max_data_offset_with_window(window_bytes),
         }
     }
 }
@@ -1051,6 +1091,21 @@ mod tests {
     }
 
     #[test]
+    fn send_stream_with_explicit_zero_credit_waits_for_peer_max_data() {
+        let mut stream = ReliableSendStream::new_with_initial_max_offset(StreamId(11), limits(), 0);
+
+        assert!(matches!(
+            stream.send_data(Bytes::from_static(b"hello"), StreamFlags::NONE),
+            Err(StreamError::FlowControlBlocked { max: 0, .. })
+        ));
+
+        stream.update_max_offset(5);
+        stream
+            .send_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
+            .expect("peer max data creates send credit");
+    }
+
+    #[test]
     fn send_stream_enforces_flow_control_and_repair_limit() {
         let mut limit = limits();
         limit.max_stream_window_bytes = 4;
@@ -1156,7 +1211,7 @@ mod tests {
             stream.ack_frame(),
             Frame::StreamAck {
                 stream_id: StreamId(7),
-                complete: true,
+                complete: false,
                 ranges: vec![
                     OffsetRange::new(0, 1).expect("contiguous range"),
                     OffsetRange::new(10, 11).expect("first repair-adjacent range"),

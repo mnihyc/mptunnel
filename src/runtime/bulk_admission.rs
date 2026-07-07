@@ -53,7 +53,7 @@ pub(super) fn bulk_additional_admission_role(
     }
 }
 
-pub(super) fn bulk_striping_admitted_cohort(
+pub(super) fn bulk_striping_admitted_subflows(
     candidates: Vec<BulkPathCandidate>,
     payload_bytes: usize,
     mux_limits: MuxLimits,
@@ -230,6 +230,13 @@ fn bulk_same_underlay_completion_suppression(check: BulkAdmissionCheck) -> Optio
 }
 
 fn bulk_same_underlay_requires_completion_gain(candidate: PathSnapshot) -> bool {
+    // This gate is for measured Subflow owner admission only.  It MUST NOT be
+    // applied to startup/probe candidates, because those paths do not yet have a
+    // meaningful completion model.  Otherwise the scheduler becomes circular:
+    // the path needs bytes to prove a rate, while the rate proof is required to
+    // receive bytes.  Low-confidence or app-limited same-underlay paths remain
+    // bounded by startup credit, ordering-debt rules, and no-OwnerData-under-debt
+    // guards; they are simply not rejected by measured completion-gain math.
     !candidate.app_limited && candidate.confidence >= 1.0
 }
 
@@ -662,7 +669,7 @@ mod tests {
 
     #[test]
     fn bulk_admission_allows_same_underlay_candidate_that_beats_lead_next_quantum() {
-        let admitted = bulk_striping_admitted_cohort(
+        let admitted = bulk_striping_admitted_subflows(
             vec![
                 candidate(0, 1000.0, 250.0, 100.0),
                 candidate(1, 1004.0, 260.0, 100.0),
@@ -684,7 +691,7 @@ mod tests {
         alternate.snapshot.bytes_in_flight = 34;
         alternate.snapshot.product_bytes_in_flight = 34;
 
-        let admitted = bulk_striping_admitted_cohort(
+        let admitted = bulk_striping_admitted_subflows(
             vec![best, alternate],
             payload_bytes,
             MuxLimits::default(),
@@ -705,7 +712,7 @@ mod tests {
         let mut cross_underlay = candidate(1, 5000.0, 260.0, 250.0);
         cross_underlay.key.underlay = UnderlayProtocol::Tcp;
         cross_underlay.snapshot.underlay = UnderlayProtocol::Tcp;
-        let admitted = bulk_striping_admitted_cohort(
+        let admitted = bulk_striping_admitted_subflows(
             vec![candidate(0, 1000.0, 250.0, 300.0), cross_underlay],
             64 * 1024,
             MuxLimits::default(),
@@ -852,7 +859,7 @@ mod tests {
 
     #[test]
     fn same_underlay_candidate_must_not_join_only_because_reorder_budget_can_absorb_gap() {
-        let admitted = bulk_striping_admitted_cohort(
+        let admitted = bulk_striping_admitted_subflows(
             vec![
                 candidate(0, 2958.0, 80.0, 180.0),
                 candidate(1, 3202.0, 180.0, 220.0),
@@ -873,7 +880,7 @@ mod tests {
         saturated.snapshot.bytes_in_flight = MuxLimits::default().max_path_flight_bytes as u64;
 
         let admitted =
-            bulk_striping_admitted_cohort(vec![best, saturated], 16 * 1024, MuxLimits::default());
+            bulk_striping_admitted_subflows(vec![best, saturated], 16 * 1024, MuxLimits::default());
 
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].key.index, 0);
@@ -1439,7 +1446,7 @@ mod tests {
             MuxLimits::default().max_path_flight_bytes as u64;
         let backup = candidate(1, 130.0, 50.0, 500.0);
 
-        let admitted = bulk_striping_admitted_cohort(
+        let admitted = bulk_striping_admitted_subflows(
             vec![saturated_best, backup],
             16 * 1024,
             MuxLimits::default(),
@@ -1450,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_cross_underlay_candidate_outside_eta_cohort_is_suppressed() {
+    fn low_confidence_cross_underlay_candidate_outside_eta_subflow_set_is_suppressed() {
         let mut best = candidate(0, 1000.0, 180.0, 500.0);
         best.snapshot.confidence = 1.0;
         let mut uncertain = candidate(1, 1350.0, 180.0, 500.0);
@@ -1459,7 +1466,7 @@ mod tests {
         uncertain.snapshot.confidence = 0.1;
 
         let admitted =
-            bulk_striping_admitted_cohort(vec![best, uncertain], 64 * 1024, MuxLimits::default());
+            bulk_striping_admitted_subflows(vec![best, uncertain], 64 * 1024, MuxLimits::default());
 
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].key.index, 0);

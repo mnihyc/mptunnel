@@ -1,10 +1,10 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
 use crate::mux::MuxLimits;
-use crate::protocol::Frame;
 use crate::protocol::codec::{
     CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
 };
+use crate::protocol::{Frame, StreamFlags};
 use bytes::BytesMut;
 use quinn::{
     ClientConfig, ConnectionError, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt,
@@ -19,6 +19,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 const FRAME_LEN_BYTES: usize = 4;
+const QUIC_RECV_CHUNK_BYTES: usize = 64 * 1024;
+// Carrier recordization limit for length-prefixed STREAM_DATA frames written on
+// an ordered QUIC stream. This must not be confused with the product sender
+// quantum: product scheduling still emits the 64 KiB BBR service quantum, while
+// this writer splits only the serialized records so a lost QUIC packet does not
+// withhold an entire product quantum from the peer.
+const QUIC_STREAM_RECORD_PAYLOAD_BYTES: usize = 10 * 1200;
 const QUIC_CERT_DNS_NAME: &str = "mptunnel.invalid";
 const ED25519_PKCS8_PREFIX: &[u8] = &[
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
@@ -60,6 +67,16 @@ pub struct SendStream {
 #[derive(Debug)]
 pub struct RecvStream {
     stream: quinn::RecvStream,
+    // QUIC RecvStream::read_exact is explicitly not cancellation-safe. The
+    // runtime polls path reads inside tokio::select!, where a local read, ACK,
+    // timer, or capacity notification may cancel the pending branch. Keep the
+    // partially-read carrier bytes here and advance the underlying QUIC stream
+    // only through cancel-safe read() calls. Otherwise a cancelled frame read
+    // can silently drop the already-consumed prefix and desynchronize the
+    // length-prefixed mptunnel frame stream, which shows up as random stalls,
+    // repair storms, and bursty zero-throughput intervals on QUIC paths.
+    read_buffer: BytesMut,
+    read_scratch: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +174,12 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
         now: Instant,
         current_mtu: u16,
     ) -> Box<dyn quinn::congestion::Controller> {
+        // Use Quinn BBR for the QUIC carrier. mptunnel does not have an
+        // operator-provided per-path bandwidth contract, so a fixed-rate
+        // Brutal-style controller would either underfill unknown good paths or
+        // overload weaker/shared paths. BBR's delivery-rate/RTT model is the
+        // stable production default for feeding the product multipath scheduler;
+        // QUIC still owns packet pacing, loss recovery, and bytes in flight.
         let inner = Arc::new(quinn::congestion::BbrConfig::default()).build(now, current_mtu);
         Box::new(InstrumentedController {
             inner,
@@ -301,7 +324,7 @@ impl Connection {
                 product_data_written: self.product_data_written.clone(),
                 encode_buffer: Vec::new(),
             },
-            RecvStream { stream: recv },
+            RecvStream::new(recv),
         ))
     }
 
@@ -314,7 +337,7 @@ impl Connection {
                 product_data_written: self.product_data_written.clone(),
                 encode_buffer: Vec::new(),
             },
-            RecvStream { stream: recv },
+            RecvStream::new(recv),
         ))
     }
 
@@ -388,13 +411,11 @@ pub async fn write_frames(
         let packet = &mut send.encode_buffer;
         packet.clear();
         let capacity_hint = frames.iter().fold(0usize, |total, frame| {
-            total
-                .saturating_add(FRAME_LEN_BYTES)
-                .saturating_add(encoded_frame_capacity_hint(frame))
+            total.saturating_add(quic_encoded_frame_capacity_hint(frame))
         });
         packet.reserve(capacity_hint);
         for frame in frames {
-            encode_length_prefixed_frame(frame, limits, packet)?;
+            encode_quic_length_prefixed_frame(frame, limits, packet)?;
         }
         packet.len() as u64
     };
@@ -434,6 +455,57 @@ fn frame_product_data_bytes(frame: &Frame) -> usize {
     }
 }
 
+fn quic_encoded_frame_capacity_hint(frame: &Frame) -> usize {
+    match frame {
+        Frame::StreamData { payload, .. } if payload.len() > QUIC_STREAM_RECORD_PAYLOAD_BYTES => {
+            let chunks = payload.len().div_ceil(QUIC_STREAM_RECORD_PAYLOAD_BYTES);
+            encoded_frame_capacity_hint(frame)
+                .saturating_add(chunks.saturating_mul(FRAME_LEN_BYTES + 32))
+        }
+        _ => FRAME_LEN_BYTES.saturating_add(encoded_frame_capacity_hint(frame)),
+    }
+}
+
+fn encode_quic_length_prefixed_frame(
+    frame: &Frame,
+    limits: CodecLimits,
+    packet: &mut Vec<u8>,
+) -> Result<(), QuicCarrierError> {
+    let Frame::StreamData {
+        stream_id,
+        offset,
+        flags,
+        payload,
+    } = frame
+    else {
+        return encode_length_prefixed_frame(frame, limits, packet);
+    };
+
+    if payload.len() <= QUIC_STREAM_RECORD_PAYLOAD_BYTES {
+        return encode_length_prefixed_frame(frame, limits, packet);
+    }
+
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        let next = cursor
+            .saturating_add(QUIC_STREAM_RECORD_PAYLOAD_BYTES)
+            .min(payload.len());
+        let split_flags = StreamFlags {
+            fin: flags.fin && next == payload.len(),
+            early_data: flags.early_data && cursor == 0,
+        };
+        let split = Frame::StreamData {
+            stream_id: *stream_id,
+            offset: offset.saturating_add(cursor as u64),
+            flags: split_flags,
+            payload: payload.slice(cursor..next),
+        };
+        encode_length_prefixed_frame(&split, limits, packet)?;
+        cursor = next;
+    }
+    Ok(())
+}
+
 fn encode_length_prefixed_frame(
     frame: &Frame,
     limits: CodecLimits,
@@ -449,26 +521,81 @@ fn encode_length_prefixed_frame(
     Ok(())
 }
 
+impl RecvStream {
+    fn new(stream: quinn::RecvStream) -> Self {
+        Self {
+            stream,
+            read_buffer: BytesMut::new(),
+            read_scratch: Vec::new(),
+        }
+    }
+
+    fn buffered_frame_len(&self, limits: CodecLimits) -> Result<Option<usize>, QuicCarrierError> {
+        if self.read_buffer.len() < FRAME_LEN_BYTES {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes([
+            self.read_buffer[0],
+            self.read_buffer[1],
+            self.read_buffer[2],
+            self.read_buffer[3],
+        ]) as usize;
+        if len > limits.max_frame_bytes {
+            return Err(QuicCarrierError::FrameTooLarge);
+        }
+        Ok(Some(len))
+    }
+
+    fn pop_buffered_frame(
+        &mut self,
+        limits: CodecLimits,
+    ) -> Result<Option<Frame>, QuicCarrierError> {
+        let Some(len) = self.buffered_frame_len(limits)? else {
+            return Ok(None);
+        };
+        let frame_end = FRAME_LEN_BYTES.saturating_add(len);
+        if self.read_buffer.len() < frame_end {
+            return Ok(None);
+        }
+        let _ = self.read_buffer.split_to(FRAME_LEN_BYTES);
+        let encoded = self.read_buffer.split_to(len).freeze();
+        Ok(Some(decode_frame_bytes(encoded, limits)?))
+    }
+
+    fn next_read_len(&self, limits: CodecLimits) -> Result<usize, QuicCarrierError> {
+        let wanted = match self.buffered_frame_len(limits)? {
+            Some(len) => FRAME_LEN_BYTES.saturating_add(len),
+            None => FRAME_LEN_BYTES,
+        };
+        Ok(wanted
+            .saturating_sub(self.read_buffer.len())
+            .clamp(1, QUIC_RECV_CHUNK_BYTES))
+    }
+}
+
 pub async fn read_frame(
     recv: &mut RecvStream,
     limits: CodecLimits,
 ) -> Result<Frame, QuicCarrierError> {
-    let mut len = [0u8; FRAME_LEN_BYTES];
-    recv.stream
-        .read_exact(&mut len)
-        .await
-        .map_err(QuicCarrierError::ReadExact)?;
-    let len = u32::from_be_bytes(len) as usize;
-    if len > limits.max_frame_bytes {
-        return Err(QuicCarrierError::FrameTooLarge);
+    loop {
+        if let Some(frame) = recv.pop_buffered_frame(limits)? {
+            return Ok(frame);
+        }
+
+        let read_len = recv.next_read_len(limits)?;
+        recv.read_scratch.resize(read_len, 0);
+        let read = recv
+            .stream
+            .read(&mut recv.read_scratch[..])
+            .await
+            .map_err(QuicCarrierError::Read)?
+            .ok_or(QuicCarrierError::UnexpectedEnd)?;
+        if read == 0 {
+            return Err(QuicCarrierError::UnexpectedEnd);
+        }
+        recv.read_buffer
+            .extend_from_slice(&recv.read_scratch[..read]);
     }
-    let mut encoded = BytesMut::with_capacity(len);
-    encoded.resize(len, 0);
-    recv.stream
-        .read_exact(&mut encoded)
-        .await
-        .map_err(QuicCarrierError::ReadExact)?;
-    Ok(decode_frame_bytes(encoded.freeze(), limits)?)
 }
 
 pub fn finish_stream(send: &mut SendStream) -> Result<(), QuicCarrierError> {
@@ -627,7 +754,9 @@ pub enum QuicCarrierError {
     Connect(quinn::ConnectError),
     Connection(ConnectionError),
     Write(quinn::WriteError),
+    Read(quinn::ReadError),
     ReadExact(quinn::ReadExactError),
+    UnexpectedEnd,
     ClosedStream(quinn::ClosedStream),
     FrameTooLarge,
     Codec(crate::protocol::codec::CodecError),
@@ -644,7 +773,9 @@ impl fmt::Display for QuicCarrierError {
             Self::Connect(err) => write!(f, "QUIC carrier connect failed: {err}"),
             Self::Connection(err) => write!(f, "QUIC carrier connection failed: {err}"),
             Self::Write(err) => write!(f, "QUIC carrier write failed: {err}"),
-            Self::ReadExact(err) => write!(f, "QUIC carrier read failed: {err}"),
+            Self::Read(err) => write!(f, "QUIC carrier read failed: {err}"),
+            Self::ReadExact(err) => write!(f, "QUIC carrier exact read failed: {err}"),
+            Self::UnexpectedEnd => write!(f, "QUIC carrier stream ended mid-frame"),
             Self::ClosedStream(err) => write!(f, "QUIC carrier stream already closed: {err}"),
             Self::FrameTooLarge => write!(f, "QUIC carrier frame exceeds configured limits"),
             Self::Codec(err) => write!(f, "QUIC carrier frame codec failed: {err}"),
@@ -709,8 +840,69 @@ impl From<rcgen::Error> for QuicCarrierError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Frame;
+    use crate::protocol::StreamId;
+    use bytes::Bytes;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn quic_writer_splits_large_stream_data_below_product_scheduler() {
+        let limits = CodecLimits::default();
+        let payload = Bytes::from(vec![7u8; QUIC_STREAM_RECORD_PAYLOAD_BYTES * 2 + 17]);
+        let mut packet = Vec::new();
+        encode_quic_length_prefixed_frame(
+            &Frame::StreamData {
+                stream_id: StreamId(9),
+                offset: 123,
+                flags: StreamFlags {
+                    fin: true,
+                    early_data: true,
+                },
+                payload,
+            },
+            limits,
+            &mut packet,
+        )
+        .expect("encode split stream data");
+
+        let mut cursor = 0usize;
+        let mut decoded = Vec::new();
+        while cursor < packet.len() {
+            let len = u32::from_be_bytes([
+                packet[cursor],
+                packet[cursor + 1],
+                packet[cursor + 2],
+                packet[cursor + 3],
+            ]) as usize;
+            cursor += FRAME_LEN_BYTES;
+            let frame = decode_frame_bytes(
+                Bytes::copy_from_slice(&packet[cursor..cursor + len]),
+                limits,
+            )
+            .expect("decode split carrier record");
+            decoded.push(frame);
+            cursor += len;
+        }
+
+        assert_eq!(decoded.len(), 3);
+        let mut expected_offset = 123u64;
+        for (index, frame) in decoded.iter().enumerate() {
+            let Frame::StreamData {
+                stream_id,
+                offset,
+                flags,
+                payload,
+            } = frame
+            else {
+                panic!("all split records must remain STREAM_DATA");
+            };
+            assert_eq!(*stream_id, StreamId(9));
+            assert_eq!(*offset, expected_offset);
+            expected_offset = expected_offset.saturating_add(payload.len() as u64);
+            assert!(payload.len() <= QUIC_STREAM_RECORD_PAYLOAD_BYTES);
+            assert_eq!(flags.early_data, index == 0);
+            assert_eq!(flags.fin, index == 2);
+        }
+    }
 
     #[tokio::test]
     async fn quic_carrier_round_trips_product_frames() {

@@ -262,10 +262,10 @@ assumptions.
 
 This mirrors the useful separation in mature transports: MPTCP separates the
 logical byte stream from subflow sequence spaces, QUIC separates streams from
-packet recovery, and BBR-style controllers separate delivery-rate models from
-application semantics. mptunnel applies the same separation while preserving
-proxy and TUN compatibility; it does not define a second UDP reliability
-protocol underneath QUIC.
+packet recovery, and carrier congestion controllers separate delivery-rate
+models from application semantics. mptunnel applies the same separation while
+preserving proxy and TUN compatibility; it does not define a second UDP
+reliability protocol underneath QUIC.
 
 ### 4.1 Ownership Model
 
@@ -328,14 +328,14 @@ carrier-local RTT/loss/rate/queue samples, carrier credit, and path-specific
 authentication. A path MUST NOT own product stream offsets or decide that a
 reliable stream should stripe onto it merely because it has capacity.
 
-A path group or carrier cohort is not a product-offset owner. It is a bounded
-scheduler epoch for one flow: one Service path plus optional Trial or Cohort
+A path group or carrier subflow set is not a product-offset owner. It is a bounded
+scheduler epoch for one flow: one Service path plus startup Subflow or bulk-rate-proven Subflow
 members admitted from session paths, path-model evidence, queue state, and
 ECF/BLEST/no-worse admission. The epoch remains valid only while ACK progress,
 read-gap debt, repair pressure, overhead budget, and path metrics remain within
 the admission envelope. It is refreshed or demoted on progress, loss/repair
 escalation, material metric change, or timer expiry. Product byte ownership
-still belongs to the per-range flight ledger, not to the cohort itself. The
+still belongs to the per-range flight ledger, not to the subflow set itself. The
 Service path is the current active or lower-frontier owner; it is not simply the
 lowest-ETA candidate selected for the next quantum.
 
@@ -350,31 +350,33 @@ unique bytes on a different path would expand the ordered receive hole. Converse
 a previously active path MUST NOT keep ordinary ownership merely because it was
 the first or latest active attachment.
 
-Same-underlay carrier cohorts SHOULD be opened together when the sender has
+Same-underlay carrier subflow sets SHOULD be opened together when the sender has
 already admitted multiple paths from the same carrier family for bulk work. This
 keeps TCP+TCP and QUIC+QUIC path groups from being serialized by path-opening
-mechanics after the scheduler has found a safe cohort. Mixed TCP/UDP candidates
-remain stricter: a mixed candidate may be opened for validation, duplicate
-proof, repair, or explicit frontier-safe migration, but a path opener MUST NOT
-turn a mixed ETA list into blind same-stream unique-byte striping.
+mechanics after the scheduler has found a safe subflow set. Mixed TCP/UDP candidates
+remain stricter: a mixed candidate may be opened for validation proof, repair,
+or explicit frontier-safe migration, but a path opener MUST NOT turn a mixed ETA
+list into blind same-stream unique-byte striping.
 
-Opening a same-underlay cohort is not the same as immediately committing
+Opening a same-underlay subflow set is not the same as immediately committing
 unique ordered bytes to every member. MPTCP and MPQUIC can coordinate packet
 or subflow recovery inside one transport-level connection; mptunnel's TCP and
 QUIC carrier outputs sit below the product stream and above separate carrier
 recovery engines. Therefore, for one ordered reliable stream, a proof-only
 validation output MUST NOT carry later unique `STREAM_DATA` while another
 output owns an unresolved lower outstanding range. A validation output may carry
-control, ACK, explicit repair, duplicate validation, or a new independent
-product stream. A frontier-clear Trial may carry a bounded unique owner range
-only after path-scoped sender evidence exists, the Service path is not under
-owner-debt pressure, and the no-worse model predicts useful completion progress;
-that Trial does not become the Service path until delivery evidence justifies it.
-A bulk-rate-proven Cohort output is stronger: it may carry ordinary unique bytes
-when sender-service admission proves that doing so will not expand product
+control, ACK, explicit repair, path proof, or a new independent product stream.
+A frontier-clear same-family Subflow may carry one bounded unique owner
+range only after path-scoped sender evidence exists, the Service path is not
+under owner-debt pressure, and the no-worse model predicts useful completion
+progress; that Subflow does not become the Service path until delivery evidence
+justifies it. A bulk-rate-proven same-family
+Subflow output is stronger: it may carry ordinary unique bytes when
+sender-service admission proves that doing so will not expand product
 receive-hole debt or worsen the completion horizon. This rule is path-metric
-driven and applies to TCP, QUIC UDP, and mixed cohorts; it is not a TCP-preferred
-or UDP-preferred policy.
+driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred or
+UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
+production v1 because they do not share one carrier-family recovery model.
 
 A product reliable stream owns only stream semantics: stream ID, target metadata,
 ingress metadata, outbound policy metadata, send offset space, receive offset
@@ -398,7 +400,7 @@ background lanes are sender-service concerns, not path-queue concerns.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,
-validation state, and carrier credit, then return an admitted path or cohort plus
+validation state, and carrier credit, then return an admitted path or subflow set plus
 an explanation. They MUST NOT mutate repair caches, write to carriers, own
 application buffers, or treat hints as delivery proof.
 
@@ -410,8 +412,8 @@ ownership. `Probe` carries path-scoped validation such as `PATH_PROOF_DATA` and
 does not enter product offset space. `Control` carries ACK, flow-control,
 metrics, reset, detach, FIN, and similar protocol state. Implementations MAY
 encode these meanings with existing frame types, but the ledgers MUST preserve
-the distinction; a `STREAM_DATA` frame used for repair or duplicate validation
-does not become `OwnerData` merely because its wire frame type is `STREAM_DATA`.
+the distinction; a `STREAM_DATA` frame used for repair does not become
+`OwnerData` merely because its wire frame type is `STREAM_DATA`.
 
 The path model owns evidence and provenance. Local sender-side evidence from
 carrier ACKs, QUIC delivery samples, unpolluted ordered stream delivery, and
@@ -424,7 +426,17 @@ Carrier engines own underlay mechanics. TCP owns encrypted framed records,
 writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
 QUIC packets, QUIC TLS, connection IDs, packet recovery, congestion control,
 pacing, ACKs, and roaming. Carrier engines report credit and metrics upward;
-they do not decide product flow fairness or rewrite stream ordering rules.
+they do not decide product flow fairness or rewrite stream ordering rules. QUIC
+stream I/O MUST be polled with cancellation-safe read state: product frame
+framing bytes already consumed from a QUIC stream remain carrier-owned until a
+whole mptunnel frame is decoded. Because mptunnel frames over QUIC are
+length-prefixed records on an ordered QUIC stream, the QUIC carrier MAY split a
+large product `STREAM_DATA` quantum into smaller length-prefixed carrier records
+with consecutive product offsets. This split is a carrier serialization detail:
+it MUST NOT lower the product sender-service quantum, read quantum, flow-control
+window, or admission envelope. QUIC bytes accepted into the carrier writer but
+not yet carrier-ACKed MUST be reported upward as carrier queue/flight debt, not
+as drained product capacity.
 
 Buffers are owned by the layer whose invariant they protect:
 
@@ -500,7 +512,7 @@ SHOULD be rejected before runtime.
 
 MPP inbounds and MPP outbounds MAY carry performance hints scoped to that path
 group. A version 1 implementation defines `extra_traffic_hint_percent` as an
-operator hint for how much optional duplicate-validation and repair overhead is
+operator hint for how much optional repair overhead is
 acceptable when the sender has evidence that additional traffic can reduce
 latency, failover time, or ordering stalls. Path proof/probe traffic is bounded
 by validation fan-out and the path-proof startup payload rather than by
@@ -509,8 +521,8 @@ named mode because performance policy is continuous: `5` means roughly five
 percent extra optional response traffic is acceptable under evidence-backed
 pressure, `100` permits full duplication in pathological moments, and values
 above `100` bias the sender toward redundant repair under severe instability.
-This value is a hard sender-side budget for optional duplicate-validation and
-repair work, with a small startup floor to avoid repair deadlock. It is not a
+This value is a hard sender-side budget for optional repair work, with a small
+startup floor to avoid repair deadlock. It is not a
 fixed rate, not a product-data throttle, and not a condition that can terminate
 production traffic. Auto scheduling remains the default and MUST adapt from
 measurements even when the hint is left unset.
@@ -645,11 +657,11 @@ production evidence justify them.
 | Reliable relay read ceiling | `max_reliable_relay_chunk_bytes = 512 KiB` | Large reads are common user-space amortization; exact ceiling is mptunnel policy | Bad only if treated as indivisible send/AEAD quantum | Keep as read-buffer ceiling; sender service splits into adaptive preemptible quanta |
 | TCP idle heartbeat | 10s interval, 30s timeout | Idle keepalive/liveness is common; exact timers are mptunnel policy | Would violate failover target if used for active data | Keep for idle liveness only; active failover uses data-plane stall/PTO/repair evidence |
 | Path probe timer | 10s interval, 2s timeout | Path validation is common in MPTCP/MPQUIC; exact timers are mptunnel policy | Can delay idle-path discovery; must not gate active recovery | Keep as idle path-manager default; active path recovery is adaptive |
-| Extra traffic hint | `extra_traffic_hint_percent = 5` default; 100/200 allowed | Reinjection/duplication is common in MPTCP/MPQUIC; numeric hint is mptunnel/operator policy | Bad if treated as product-data throttle, per-event refresh, or blind duplication allowance | Keep as hard optional-work budget; response sender spends duplicate-validation/repair traffic only with evidence; path proof remains bounded by validation fan-out |
+| Extra traffic hint | `extra_traffic_hint_percent = 5` default; 100/200 allowed | Reinjection is common in MPTCP/MPQUIC; numeric hint is mptunnel/operator policy | Bad if treated as product-data throttle, per-event refresh, or blind duplication allowance | Keep as hard optional-work budget; response sender spends repair traffic only with evidence; path proof remains bounded by validation fan-out |
 | Security freshness | `auth_freshness_window_seconds = 300` | Replay freshness windows are common security controls; exact window is mptunnel policy | Affects clock-skew/replay tolerance, not data-plane rate | Keep as security policy; not data-plane adaptive |
 | Cipher default | AES-256-GCM default; ChaCha20-Poly1305 optional | AEAD is mandatory; AES-GCM default follows modern hardware acceleration practice | CPU can matter on CPUs without AES acceleration | Keep as operator choice; no plaintext unless explicit |
-| QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight/read ceiling; bidirectional stream count = QUIC-scoped stream cap | QUIC flow-control/congestion/MAX_STREAMS split is common; mapping is mptunnel policy | Can cap QUIC if mapped envelope or stream count is too small | Keep resource mapping; QUIC BBR/pacing remains dynamic; stream count is independent from byte windows |
-| QUIC BBR controller | Quinn BBR when available | BBR-style rate/RTT/inflight control is mature practice; implementation is library-owned | Library/platform behavior can still cap performance | Keep as dynamic carrier controller |
+| QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight/read ceiling; bidirectional stream count = QUIC-scoped stream cap | QUIC flow-control/congestion/MAX_STREAMS split is common; mapping is mptunnel policy | Can cap QUIC if mapped envelope or stream count is too small | Keep resource mapping; QUIC BBR pacing/congestion remains carrier-owned; stream count is independent from byte windows |
+| QUIC congestion controller | Quinn BBR by default | Model-based BBR fits endpoint-only proxy/tunnel operation where no accurate per-direction path rate is configured; fixed-rate Brutal-like sending is only safe with explicit accurate bandwidth configuration | BBR is not a substitute for product no-worse scheduling; fixed-rate modes can overload weak/shared paths if guessed | Keep as carrier-owned congestion control; product scheduling consumes metrics but does not replace it; any Brutal-like configured-rate mode must be explicit |
 | QUIC datagram MTU model | Startup 1200 byte payload; lower 512 and upper 65,000 path-spec bounds | 1200-byte UDP support is a QUIC requirement; mptunnel sets lower/upper guardrails | Low MTU can increase fragmentation/overhead | Keep startup safety plus path MTU observation/probing |
 | TUN defaults | IPv4 `10.88.0.1/24`, MTU 1500, DNS TTL 5s | Local-interface defaults are common deployment choices; exact values are mptunnel examples | MTU/TTL can affect TUN behavior but not sender scheduling | Keep as operator defaults, scoped to TUN |
 | Outbound DNS timeout | 5s default | Resolver timeouts are common control-plane safety; exact value is mptunnel policy | Slow resolvers may fail resolution; not hot path after resolve | Keep per outbound, not global data-plane behavior |
@@ -688,10 +700,10 @@ their origin is explicit and they do not become hidden modes.
 | Active stall and retry timing | Derived from QUIC PTO, observed RTT/rttvar, lane state, TTL, and persistent congestion threshold | QUIC PTO/recovery model | Fixed sleeps underfeed high-rate carriers or delay failover | Fixed retry/stall constants are removed from data-plane policy |
 | Path failure cooldown | Derived from PTO and consecutive failures, capped by QUIC persistent congestion threshold | QUIC persistent-congestion backoff applied to path reuse | Fixed cooldown can hide recovered paths | Fixed 5s cooldown is removed |
 | UDP target/datagram path model | UDP/QUIC response timeout and retry budget derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. TCP-underlay datagrams send once per datagram ID on the reliable carrier and do not reopen the carrier merely because the UDP target response is absent |
-| QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | BBR app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
+| QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | Product flight/queue <= BBR/BDP/resource envelope for active owners; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not duplicate QUIC cwnd as a hard product gate for the active ordered owner |
-| Validation traffic | Probes, duplicate STREAM_DATA, or repair data; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
+| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Validation traffic | Probe/control traffic only; repair data only after explicit gap/failover evidence; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
 
@@ -783,9 +795,11 @@ and pacing. The admitted concurrent QUIC bidirectional stream count is derived
 from the QUIC-scoped stream cap and bounded by the product stream registry cap;
 it MUST NOT be derived from byte receive-window ratios. QUIC unidirectional
 streams are not used by protocol version 1. The production QUIC engine SHOULD
-use a BBR-style congestion controller when the implementation library provides
-one, because mptunnel's UDP goal is Hysteria-like high-BDP delivery with
-model-based pacing rather than loss-only growth.
+use a model-based congestion controller when no explicit per-direction rate is
+configured; this implementation uses Quinn BBR. A fixed-rate Brutal-like mode is
+valid only when the operator supplies an accurate target rate for that direction.
+Product scheduling consumes carrier metrics but must not guess a fixed packet
+send rate.
 
 Hints seed the path model before measurements exist. They MUST NOT permanently
 override live observations. Auto scheduling MUST correct stale hints from health
@@ -1189,7 +1203,7 @@ protection part of admission rather than a late path-writer preference.
 An all-startup state where every stream is still classified as latency MUST NOT
 reserve those startup streams against each other as protected latency work; once
 one flow is classified as throughput/background, separately active latency or
-realtime flows become protected. This prevents frontier-safe Trial owner
+realtime flows become protected. This prevents frontier-safe subflow startup owner
 admission from deadlocking while still protecting browsing, SSH-like,
 ACK/control, repair, and datagram traffic from already-proven bulk.
 
@@ -1277,8 +1291,9 @@ mptunnel resource envelope:
   configured stream count.
 * QUIC datagram buffers, when enabled by the implementation, are bounded by the
   configured datagram queue budget.
-* QUIC congestion control SHOULD use BBR-style control when the library and
-  platform provide it.
+* QUIC congestion control SHOULD use the implementation library's mature
+  production controller by default; experimental controllers are lab-only until
+  repeated shaped and unconstrained rows prove no-worse behavior.
 
 The reason for this profile is the same as Hysteria2 and MPQUIC-style designs:
 packet recovery and congestion control belong in the UDP transport, while proxy
@@ -1322,8 +1337,8 @@ there is already admitted work, but admission and fairness occur above the path
 queue. A path command queue is only an emission pipe for already-admitted work.
 
 For QUIC UDP carriers, the sender-service emission gate MUST NOT become a
-second congestion controller built from stale product delivery rate or
-app-limited startup RTT samples. QUIC owns packet congestion control, pacing,
+second congestion controller built from stale product delivery rate, fixed-rate
+guesses, or app-limited startup RTT samples. QUIC owns packet congestion control, pacing,
 packet flight, loss recovery, and PTO. The product sender instead maintains a
 bounded QUIC writer-feed envelope: it may keep enough already-admitted product
 quanta queued to avoid app-limiting the QUIC controller, and the envelope is
@@ -1553,18 +1568,18 @@ avoid the resulting product ordering debt.
 
 Product-level stall evidence alone MUST NOT create a replacement carrier stream
 for the same product stream on the same sole reliable carrier or inside a stable
-same-underlay carrier cohort. On a live QUIC cohort, QUIC owns packet loss
+same-underlay carrier subflow set. On a live QUIC subflow set, QUIC owns packet loss
 recovery, stream ordering inside each carrier stream, PTO, congestion control,
-and NAT rebinding. On a live TCP cohort, TCP owns byte retransmission, stream
+and NAT rebinding. On a live TCP subflow set, TCP owns byte retransmission, stream
 ordering inside each carrier stream, write pressure, and connection teardown. A
 product sender may send recv-progress, ACK, control, and bounded repair work on
 the existing attached outputs, but it MUST keep queued bytes, path-flight
-ownership, and repair ownership on that carrier or cohort until a carrier
+ownership, and repair ownership on that carrier or subflow set until a carrier
 reports close/error or a distinct survivor path has positively delivered
 replacement data. Opening a fresh reliable carrier stream for later unique
 product offsets while the previous carrier stream may still deliver lower
 offsets defeats the carrier's ordering guarantee and recreates above-carrier
-head-of-line debt. Reshuffling an already-attached same-underlay cohort on
+head-of-line debt. Reshuffling an already-attached same-underlay subflow set on
 product stall is the same class of error: it consumes control capacity and can
 move ordered-data ownership without fixing the missing byte range. Real carrier
 teardown remains a carrier event and may attach a replacement path; a product
@@ -1655,6 +1670,18 @@ is a capacity envelope, not proof that the sender should fill it blindly. The
 sender-service scheduler, repair ledger, path admission, and carrier-credit
 gates decide how aggressively to use the advertised credit from live path
 state.
+
+A sender-side product stream starts with exactly the peer-advertised credit. An
+implementation MUST NOT manufacture the configured stream window as local send
+credit before receiving the peer's open/MAX_DATA credit. For QUIC reliable
+carriers, the advertised product window SHOULD be path-adaptive: the configured
+window is a hard ceiling, while the active advertised window is derived from
+receive progress, measured BDP/carrier credit, and a bounded startup floor. This
+keeps product flow control aligned with QUIC's own congestion/stream backpressure
+and prevents hidden multi-second QUIC stream backlogs from becoming application
+zero-throughput gaps. TCP reliable carriers MAY advertise the full configured
+window because kernel TCP backpressure is the observable carrier queue at this
+layer.
 
 ### 13.5 Stream Close
 
@@ -2017,14 +2044,14 @@ validates idle unknown paths with controlled attachment or repair probes. The
 scheduler MUST NOT abandon an active but unmeasured throughput path for another
 equally unmeasured path just because the other path has a better default ETA.
 Latency-sensitive activity is not throughput evidence. Within a same-underlay
-endpoint-only cohort, the implementation may keep an unmeasured latency-started
+endpoint-only subflow set, the implementation may keep an unmeasured latency-started
 stream on its current path until controlled validation succeeds, avoiding
-needless spraying across equally unknown subflows. In a mixed TCP/UDP cohort,
+needless spraying across equally unknown subflows. In a mixed TCP/UDP subflow set,
 latency-sensitive work on one underlay is pressure that can make another
 suitable underlay preferable for throughput validation. This rule preserves
 startup progress without confusing liveness with throughput confidence.
-When no path in a same-stream bulk cohort has delivery evidence and no path is
-already carrying bulk work for that stream, the ordinary striping cohort is
+When no path in a same-stream bulk subflow set has delivery evidence and no path is
+already carrying bulk work for that stream, the ordinary striping subflow set is
 limited to the single best candidate. Additional unknown candidates belong to
 validation, not to ordinary data striping. This prevents an all-unknown
 endpoint-only startup from becoming fake aggregation before the sender has
@@ -2080,7 +2107,7 @@ Earliest-completion scoring approximates the practical goal of MPTCP ECF-style
 scheduling without exposing subflow details to applications. The service
 horizon prevents a sustained file transfer from being mis-modeled as an
 infinite sequence of tiny latency probes, so a high-RTT/high-bandwidth path can
-lead or join a bulk cohort when its bandwidth and queue state offset its
+lead or join a bulk subflow set when its bandwidth and queue state offset its
 latency. Short flows remain sticky to the path that completes the immediate
 quantum soonest.
 
@@ -2389,7 +2416,7 @@ sorting. Probe-only RTT or rate samples MUST NOT by themselves make a path
 steal the first reliable stream when no product delivery evidence exists, and
 tiny carrier/accounting differences such as path-proof bytes, ACK/control
 flights, or command-queue noise MUST NOT reorder an otherwise unknown
-endpoint-only latency startup cohort. In that exact no-load/no-delivery-evidence
+endpoint-only latency startup subflow set. In that exact no-load/no-delivery-evidence
 state, configured path order is only a deterministic startup fallback; it is not
 a throughput preference. If fresh latency opens are already active but no
 sender delivery evidence exists, active startup load MAY spread new opens away
@@ -2446,16 +2473,15 @@ configured relay envelope, and reduced only when the path model shows actual
 instability or queue pressure. Pacing, inflight, and flow-control gates still
 bound how much data may be outstanding.
 
-Throughput quanta are preemption points. A carrier writer MUST NOT treat one
-large product frame as a non-preemptible unit when that frame expands into many
-carrier packets. After sending one controller-derived packet run, the writer
-MUST give newly queued control, ACK, repair, latency, realtime, and other-stream
-work a chance to run before continuing the remaining fragments of the same bulk
-frame. Requeued fragments for the same stream retain their original frame ID and
-stream order, so later frames from that same stream do not overtake them. This
-keeps the QUIC-style stream scheduler invariant: packet recovery remains
-per-packet, while application stream fairness is decided at packet-run
-boundaries rather than only at whole-frame boundaries.
+Throughput quanta are preemption points. A carrier writer MUST NOT turn the
+carrier record size into the product scheduling quantum. For QUIC reliable
+streams, the writer MAY serialize one product `STREAM_DATA` quantum as several
+length-prefixed carrier records with consecutive offsets so the receiver can
+release earlier product ranges before the tail record is recovered. That split
+MUST preserve product ownership, offset order, FIN placement, and stream fairness;
+it MUST NOT reduce local reads, sender-service dispatch, or flow-control credit
+to the carrier record size. This keeps QUIC packet recovery per-packet while
+application fairness remains at bounded product-quantum boundaries.
 
 At a packet-run boundary, backlog ordering follows the sender lane order rather
 than raw arrival order. Single-packet stream frames, stream ACKs, datagrams,
@@ -2554,10 +2580,10 @@ or replaying repair outside the measured send loop.
 
 ### 18.1 Bulk Assignment and Striping
 
-For bulk reliable streams, the scheduler maintains a small cohort epoch for the
-current flow: one Service owner plus optional Trial or Cohort members admitted
+For bulk reliable streams, the scheduler maintains a small subflow set epoch for the
+current flow: one Service owner plus startup Subflow or bulk-rate-proven Subflow members admitted
 from live ETA, flow sharing, health, and capability state. Individual dispatches
-consume credit from that epoch; they do not recreate optional owner credit from
+consume credit from that set; they do not recreate subflow startup credit from
 scratch. Additional paths attached to the same stream are not automatically
 ordinary data paths. Their role decides what the scheduler may do: Repair paths
 carry gap-targeted repair or failover repair, Validation paths may receive
@@ -2578,29 +2604,38 @@ head-of-line blocking.
 
 Validation is the bridge between conservative startup and useful aggregation.
 An unknown path does not join ordinary same-stream bulk merely because it is
-open, but a Validation attachment can receive a bounded amount of admitted proof
-traffic. Validation attachment is triggered by bulk demand and path admission;
-it MUST NOT depend on the sender having outbound repair bytes. This matters for
-ordinary downloads, where the client may have little or no outbound data after
-the request while the server-to-client stream is clearly bulk. If validation
-traffic yields delivery evidence, the path can compete in the ordinary
-ECF/BLEST cohort. If it does not, the path remains excluded except for failover
-or explicit repair.
+open, but a Validation attachment can receive path-scoped proof traffic.
+Path proof creates liveness/sender evidence only; it is not product delivery
+proof and does not itself make the path a bulk subflow. Same-family paths may
+use one bounded startup `Subflow` OwnerData range once the ordered frontier is
+clear, because product ACK progress is the sender-visible way to obtain real
+delivery evidence for an additional subflow. That startup range is unique owner
+data, not repair or probe traffic, and it is forbidden while another path
+owns unresolved lower bytes. Validation attachment is triggered by bulk demand
+and path admission; it MUST NOT depend on the sender having outbound repair
+bytes.
+This matters for ordinary downloads, where the client may have little or no
+outbound data after the request while the server-to-client stream is clearly
+bulk. If startup OwnerData or QUIC carrier-ACK validation yields
+direction-correct bulk-rate evidence, the path can compete in the ordinary
+ECF/BLEST subflow set. If it does not, the path remains excluded except for
+failover, explicit repair, or another bounded validation event after the
+admission envelope is refreshed.
 
 Reliable path membership uses explicit roles. An attached output starts as
 `Standby` or `Probe`, not as a data owner. `Service` is the current best owner
-path and MUST remain fed while it is healthy. `Trial` is a bounded, frontier-safe
-owner assignment used only when no older owner debt is being expanded, the path
-has path-scoped ACKed data evidence, and the no-worse guard predicts progress.
-`Cohort` is a positive-contribution owner path with direction-correct bulk-rate
-evidence. `RepairOnly`, `Standby`, and `Failed` outputs cannot receive
-speculative owner bytes. Role transitions are monotonic with evidence and
-carrier state for the current decision; they are not implied by attachment
-order, carrier family, configured path order, or temporary queue availability.
-In particular, `Probe`, path-proof-only, and sender-evidence-only paths are not
-permission to carry unique future offsets until ACKed data evidence plus
-ECF/BLEST admission selects the path as `Trial`, or bulk-rate evidence selects
-it as `Cohort`.
+path and MUST remain fed while it is healthy. `Subflow` is an additional owner
+path admitted by the same no-worse completion and ordering-debt model used for
+the Service path. There are two admission modes, not two protocol roles: a
+startup Subflow is a bounded same-family, frontier-clear OwnerData range
+used to gather delivery evidence; a measured Subflow has direction-correct
+bulk-rate evidence and may carry ordinary unique bytes without being throttled
+by startup credit. `RepairOnly`, `Standby`, and `Failed` outputs cannot receive
+speculative owner bytes. Role transitions are monotonic with evidence and carrier state for
+the current decision; they are not implied by attachment order, carrier family,
+configured path order, or temporary queue availability. In particular, `Probe`,
+path-proof-only, and sender-evidence-only paths are not permission to carry an
+unbounded stream of future offsets.
 
 Validation admission is evaluated with the bounded proof payload, not with the
 full product path inflight envelope. This keeps validation aggressive enough to
@@ -2635,7 +2670,7 @@ carrier-diverse validation without turning one bulk stream into a cross-product
 of simultaneous stream opens, proofs, duplicate bytes, and repair obligations.
 
 Mixed TCP+UDP validation MUST be carrier-diverse without carrier-family
-prejudice. When an admitted validation cohort contains both TCP and UDP
+prejudice. When an admitted validation subflow set contains both TCP and UDP
 underlays, the sender SHOULD attempt the best currently admissible candidate
 from each carrier family before spending later validation attempts on additional
 same-family candidates. "Best" is determined by path metrics, capability flags,
@@ -2766,14 +2801,14 @@ ACK-derived delivery rate and QUIC pacing/cwnd-derived pacing rate in its path
 snapshot. Application-limited ACK samples MUST NOT initialize or reduce the
 bulk delivery-rate model to a tiny value. The sender keeps two separate facts:
 ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
-duplicate-validation copy that is acknowledged by the local QUIC carrier may set
+startup Subflow range that is acknowledged by the local QUIC carrier may set
 ACK-derived data seen for that carrier path, which proves the path can carry
-data and keeps it visible to validation and duplicate-validation policy. It does
-not make the path eligible for ordinary future ordered `STREAM_DATA` ownership.
+data and keeps it visible to subflow admission policy. It does not by itself
+make the path eligible for unbounded future ordered `STREAM_DATA` ownership.
 The resulting ACK-derived rate becomes bulk-rate evidence only after the
 acknowledged DATA byte volume is large enough for the path's modeled flight
 envelope; otherwise the sample remains ACK-data evidence for validation
-visibility only. ACK-data evidence is not an owner state, is not a trial-owner
+visibility only. ACK-data evidence is not an owner state, is not a subflow-startup
 state, and MUST NOT bypass lower-frontier ownership. Ordinary unique bulk
 ownership requires either that the path is already the active service path or
 that the path has non-application-limited bulk-rate evidence and passes the
@@ -2782,42 +2817,42 @@ bulk-rate evidence, does not overwrite the delivery rate, does not rewrite the
 ordinary lead, and does not permit the path to own later offsets while another
 path owns unresolved lower bytes.
 
-Because duplicate validation does not own the ordered frontier, it MAY be sent on
-a QUIC validation output only after the output has path-scoped sender evidence
-and only while the sender-service extra product-offset ledger still has credit.
-The selected primary owner MUST send and own the byte range. The duplicate is
-extra traffic, is recorded as non-owner repair work, and cannot create path delivery
-credit from a product `STREAM_ACK`. Failure of the duplicate path cannot create a
-receive hole; success may produce path-local QUIC ACKed data evidence. Attached
-but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic for
-bootstrap rather than duplicate product bytes.
+Validation outputs do not receive product `STREAM_DATA` for
+discovery. Attached but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK`
+and control traffic for bootstrap. A startup Subflow may receive a bounded
+unique owner range only after path-scoped sender evidence exists, the family is
+the same as the Service family, and the ordered frontier is clear.
 
 The production SafeBestPath guard is stricter while a reliable stream has
 owner-debt pressure: unacknowledged owner ranges in its repair cache exceed the
 same path-aware ACK/progress quantum used to decide when product ACK feedback is
 needed. Small normal in-flight debt is not enough to pin the service path; that
 would prevent the latency-first stream from moving to a better bulk path on
-demand. Once owner-debt pressure exists, if the current ordered-data owner is
-still attached and passes ordinary admission, the sender MUST keep unique
-`OwnerData` on that owner and MUST pause duplicate-validation bulk copies until
-the owner debt falls below pressure or explicit loss/failure/stall evidence
-converts the affected range into `RepairData`. This prevents per-quantum ETA
-changes from turning an unhealthy flow into owner migration, receive-hole
-growth, and repeated duplicate traffic. Optional paths may still carry `Probe`,
-`Control`, and gap-targeted `RepairData` that is justified by explicit evidence;
-they MUST NOT receive speculative Trial owner bytes merely because they look
-faster while the product layer is already under ACK/reorder pressure for older
-owner ranges.
+demand. Once owner-debt pressure exists, the sender MUST treat the current
+ordered-data owner as a hard OwnerData gate, not as an ETA preference. If the
+current owner can accept the next OwnerData quantum, the sender MUST keep unique
+`OwnerData` on that owner. If the current owner cannot accept it, the sender MUST
+pause new OwnerData instead of assigning later offsets to another path. Duplicate
+validation bulk copies also remain paused until the owner debt falls below
+pressure or explicit loss/failure/stall evidence converts the affected range
+into `RepairData`. This prevents per-quantum ETA changes from turning an
+unhealthy flow into owner migration, receive-hole growth, and repeated duplicate
+traffic. Optional paths may still carry `Probe`, `Control`, and gap-targeted
+`RepairData` that is justified by explicit evidence; they MUST NOT receive
+speculative Subflow owner bytes merely because they look faster while the product
+layer is already under ACK/reorder pressure for older owner ranges.
 
-For mixed TCP+QUIC reliable streams, cross-underlay `OwnerData` migration has an
-additional health gate. A candidate from a different carrier family may displace
-the current ordered-data owner only when both the current owner family and the
-candidate family have direction-correct non-application-limited bulk-rate
-evidence, or when the current owner is detached/failed and normal failover rules
-apply. This rule is carrier-neutral: it blocks TCP-to-QUIC and QUIC-to-TCP
-speculative owner migration equally. Mixed validation, proof, repair, and
-standby membership remain allowed, but cross-underlay ordinary owner bytes are
-not a path-discovery mechanism.
+For mixed TCP+QUIC reliable streams, production v1 uses a stricter same-family
+`OwnerData` rule. A product stream that already has a Service carrier family
+MUST NOT stripe later ordinary `OwnerData` onto the other carrier family merely
+because both paths have proof or short-term rate samples. MPTCP subflows share
+TCP recovery semantics and MPQUIC paths share QUIC recovery semantics; mptunnel's
+TCP and QUIC reliable-stream carriers have independent ACK clocks, pacing, flow
+control, and loss recovery. Cross-family paths therefore remain `Probe`,
+`RepairOnly`, `Standby`, or explicit failover targets until a future scheduler
+proves a no-worse cross-family mode. This rule is carrier-neutral: it blocks
+TCP-to-QUIC and QUIC-to-TCP speculative owner migration equally, while preserving
+same-family TCP+TCP and QUIC+QUIC aggregation.
 
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
@@ -2855,7 +2890,7 @@ For any same-stream bulk striping, the scheduler chooses eligible paths from
 live ETA. Eligibility requires active or sufficiently confident suspect state,
 no probe-only/backup restriction unless necessary, acceptable inflight/queue
 pressure, and explicit admission against the best next path. A path MUST NOT
-join a bulk striping cohort merely because it has available capacity.
+join a bulk striping subflow set merely because it has available capacity.
 
 A path is admitted for the next bulk chunk only if the implementation estimates:
 
@@ -2878,16 +2913,18 @@ if path is an additional data path:
     eta_p(chunk) <= completion_horizon(lead_path, path, chunk)
 ```
 
-The additional-data completion rule applies to same-underlay and cross-underlay
-paths. Sharing a carrier family, such as QUIC+QUIC or TCP+TCP, is not proof
-that later offsets will arrive before the lead can send the next quantum. A
-same-underlay path that has only startup, proof, or app-limited evidence may
-receive bounded validation/proof traffic, but once it is considered
-bulk-rate-proven for unique ordered `STREAM_DATA`, it MUST show positive
-incremental completion gain before joining the ordinary bulk cohort. Reorder
-budget is a safety envelope for already-admitted work; it MUST NOT be used as
-extra time slack to put unique ordered bytes onto a high-latency path that loses
-the ECF/BLEST next-quantum comparison.
+The additional-data completion rule is a measured-subflow gate, not a startup
+validation gate. Sharing a carrier family, such as QUIC+QUIC or TCP+TCP, is not
+proof that later offsets will arrive before the lead can send the next quantum;
+therefore a bulk-rate-proven same-underlay path that wants ordinary unique
+`OwnerData` MUST show positive incremental completion gain before joining the
+ordinary bulk subflow set. A same-underlay path that has only startup, proof,
+low-confidence sender samples, or app-limited evidence is not rejected by this
+measured completion-gain rule; it remains governed by bounded startup/probe
+credit, owner-debt safety, and no-ordering-debt-expansion rules. Reorder budget
+is a safety envelope for already-admitted work; it MUST NOT be used as extra
+time slack to put unique ordered bytes onto a high-latency path that loses the
+ECF/BLEST next-quantum comparison.
 
 The lead path is a safe baseline, not merely the lowest raw ETA. A candidate
 whose carrier or product debt already violates the active data-path admission
@@ -2961,7 +2998,7 @@ below the active owner; TCP already owns kernel write pressure, congestion
 response, and packet pacing below its writer. The product scheduler gates this
 case with the product queue and stream-ordering envelope so the service owner
 remains fed without creating unbounded response backlog. This applies even when
-other validation or cohort outputs are attached: optional outputs do not reduce
+other validation or subflow set outputs are attached: optional outputs do not reduce
 the service owner's product feed budget. Additional paths, validation paths, and
 cross-underlay candidates still use carrier debt as an admission gate because
 they can create new reordering debt or probe traffic outside the active service
@@ -3069,7 +3106,7 @@ owns the lower offset. It also MUST NOT move those later unique bytes to the
 alternate path while the lower frontier is still unresolved. Instead, it pauses
 ordinary source reads for that stream and continues servicing carrier ACKs,
 product ACKs, control frames, flow-control updates, explicit gap repair,
-duplicate validation, and path events. Ordinary data resumes when ACK progress,
+path proof, and path events. Ordinary data resumes when ACK progress,
 repair delivery, detach/failover, or updated path evidence produces a
 serviceable lower-frontier owner or advances the contiguous frontier. This
 rule closes the MPTCP-style failure mode where a slow or failed subflow owns
@@ -3092,14 +3129,13 @@ QUIC carrier stream or TCP writer is not starved by slow product ACKs. A sender
 MUST NOT treat ordinary queued response bytes blocked by
 unresolved lower-frontier debt as loss evidence by itself. In that condition it
 continues servicing carrier ACKs, product ACKs, control frames, flow-control
-updates, explicit gap repair, duplicate validation, and path events while the
+updates, explicit gap repair, path proof, and path events while the
 ordinary byte range waits for ACK progress or a serviceable lower-frontier
 owner. If the blocked frontier later produces data-plane PTO/stall evidence,
 the sender may perform the normal tail/gap repair action described below.
 `extra_traffic_hint_percent` feeds a cumulative extra-traffic ledger owned by
 the response sender service. Ordinary unique owner bytes earn additional
-duplicate-validation and repair budget; duplicate validation and repair debit
-that ledger. Path proof traffic is bounded by validation attach fan-out and the
+repair budget; repair debits that ledger. Path proof traffic is bounded by validation attach fan-out and the
 path-proof startup payload, not by the response sender's data queue. A small
 startup floor prevents repair deadlock before enough ordinary bytes have been
 sent, but the floor is spent once and does not refresh on every ACK-gap or
@@ -3132,8 +3168,8 @@ merely because a faster active path is available. Speculative reinjection outsid
 the sender-service queue is prohibited because it can occupy path queues before
 the receiver has proven useful repair. A queued sender may spend additional
 repair traffic only after explicit ACK-gap, path failure/detach, or PTO/stall
-evidence, and the numeric traffic hint only scales the sender-service
-duplicate-validation and repair budget.
+evidence, and the numeric traffic hint only scales the sender-service repair
+budget.
 
 Repair `STREAM_DATA` is still stream data for correctness and flow accounting,
 but its service lane is repair/latency, not ordinary bulk. It therefore uses
@@ -3211,8 +3247,24 @@ Conversely, a `STREAM_ACK` for a byte range that had exactly one outstanding
 is a ledger property, not a packet type: the release handler first examines all
 outstanding product-offset copies for the acknowledged range, then marks the
 release as path-proving only when the owner copy was unique. If any `RepairData`
-or duplicate product copy was outstanding for that range, the ACK releases
+copy was outstanding for that range, the ACK releases
 inflight/product state but creates no delivery sample for any carrier path.
+
+ACK completeness is part of that ledger contract. If the receiver has more ACK
+ranges than fit in one `STREAM_ACK`, every emitted ACK chunk for that snapshot
+MUST be marked `complete=false` unless all ranges are present. A sender may use
+incomplete chunks to release owner/repair flight for the included ranges, but it
+MUST NOT infer missing stream holes from ranges omitted by ACK chunking. Treating
+a truncated ACK as complete converts normal multipath reordering into false gap
+repair and is forbidden.
+
+Product repair over reliable TCP/QUIC carriers is reinjection onto an independent
+subflow or failover path. It is not a second retransmission layer queued behind
+the same in-order carrier stream. Same-output tail retransmission cannot overtake
+missing carrier bytes, but it can consume duplicate tunnel traffic and create
+ACK/repair feedback loops. A sender therefore MAY arm tail repair only when an
+independent repair subflow is available, and it SHOULD wait for a persistent
+congestion-scale stall rather than one ordinary PTO before sending tail repair.
 
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,
@@ -3250,10 +3302,10 @@ service quantum. Cross-underlay additional admission MUST remain strict:
 budgets because mixed TCP/QUIC owner bytes can create much larger HOL debt.
 
 Before same-underlay sender evidence exists, the scheduler may spend bounded
-extra traffic on duplicate validation, but it MUST NOT borrow the lead path's
-rate as proof for unique ordinary data on the candidate. The candidate's stored
-path model changes only after local sender evidence or unpolluted product
-delivery evidence exists.
+control-plane probe traffic, but it MUST NOT borrow the lead path's rate as
+proof for unique ordinary data on the candidate. The candidate's stored path
+model changes only after local sender evidence or unpolluted product delivery
+evidence exists.
 
 When no active, evidenced, or validation candidate passes admission, the sender
 keeps the frame queued and wakes the scheduler when stream ACKs release product
@@ -3295,8 +3347,8 @@ This remains true when only one carrier path is currently attached. If the
 oldest lower outstanding range is owned by a detached, failed, or otherwise
 non-serviceable path, the remaining carrier path is not automatically safe for
 later ordinary unique bytes. The remaining path may carry explicit gap repair,
-duplicate validation, control, and ACK traffic, but ordinary later `STREAM_DATA`
-waits until repair or ACK progress resolves the lower frontier.
+control, ACK traffic, and path proof, but ordinary later `STREAM_DATA` waits
+until repair or ACK progress resolves the lower frontier.
 
 If additional same-stream paths are not admitted but the lead data path is
 within its product-flight budget, ordinary bulk remains on the lead path. A
@@ -3313,7 +3365,7 @@ for path queue, inflight, pacing rate, RTT, jitter, loss, and reorder cost. The
 scheduler MUST NOT chase aggregate bandwidth by sending chunks onto a path that
 will arrive too late and create head-of-line stalls.
 
-The version 1 same-stream bulk cohort uses a completion horizon rather than a
+The version 1 same-stream bulk subflow set uses a completion horizon rather than a
 fixed millisecond slack:
 
 ```
@@ -3363,18 +3415,18 @@ if path is the previously attached active path but not the lead path
 ```
 
 Admission gains are internal model-control coefficients, not operator-visible
-traffic modes. They apply only to additional cross-underlay ordinary striping,
-where the scheduler must prove that a path with different transport semantics
-will not increase completion time. Lead and same-underlay product queues use a
-BDP/inflight-derived envelope capped by the configured resource ceiling, while
-carrier controllers still enforce network flight. This follows BBR's separation
-between ready application data and paced network inflight, while preserving the
+traffic modes. In production v1 they apply to additional same-family ordinary
+striping; cross-underlay TCP+QUIC `OwnerData` remains disabled except for
+explicit failover. Lead and same-underlay product queues use a BDP/inflight-
+derived envelope capped by the configured resource ceiling, while carrier
+controllers still enforce network flight. This follows BBR's separation between
+ready application data and paced network inflight, while preserving the
 ECF/BLEST rule that heterogeneous paths must not create avoidable head-of-line
 blocking.
 
 The candidate may pass the ETA gate only when it can arrive before this
 completion horizon. This is deliberately different from both a narrow
-near-best-ETA cohort and an unbounded all-path rule. A narrow ETA cohort blocks
+near-best-ETA subflow set and an unbounded all-path rule. A narrow ETA subflow set blocks
 useful high-bandwidth heterogeneous paths because it ignores how long the best
 path would need to carry the same next chunk. An unbounded all-path rule can
 inflate receiver reorder debt and create long ordered-stream gaps. The
@@ -3472,11 +3524,11 @@ owned elsewhere, or once latency-sensitive traffic needs protection, the normal
 BDP/reorder admission gate applies again.
 
 Per-stream striping admission MUST NOT be confused with independent-flow
-fairness. A path excluded from a stream's striping cohort does not become an ordinary data
+fairness. A path excluded from a stream's striping subflow set does not become an ordinary data
 path simply because it is attached. If the previously attached active path is
 no longer the best admitted path, the sender MAY explicitly move ordinary bulk
 data to the better lead candidate and let delivery evidence decide whether it
-should remain in the cohort. It MUST NOT silently convert a Repair path into an
+should remain in the subflow set. It MUST NOT silently convert a Repair path into an
 ordinary data path. This rule follows the MPTCP lesson that subflow scheduling
 and connection-level sequence correctness are separate decisions: a scheduler
 may use multiple subflows, but it must not move every independent flow to the
@@ -3517,7 +3569,7 @@ stream delivery-rate sample, ACK-derived carrier rate sample, or configured rate
 hint. If the active path has failed and no measured survivor exists, the endpoint
 MAY still use an attached survivor to preserve liveness, but it MUST treat that
 as failover recovery and keep measuring before adding the path to normal bulk
-striping cohorts.
+striping subflow sets.
 
 An ordered receive hole is product-layer ordering debt, not by itself carrier
 failure. A receiver that observes out-of-order reliable stream data MUST send
@@ -3559,8 +3611,8 @@ candidate ordering is carrier-neutral: TCP and QUIC reliable-stream carriers are
 ordered by live status, ETA, queue/flight state, and path policy, not by a
 TCP/UDP family preference and not by a QUIC-only product-delivery prerequisite.
 Repair traffic remains duplicate `RepairData`, consumes the sender-service
-duplicate-validation/repair budget, and never creates ordinary path delivery
-evidence. A Suspect path MAY be used only when no Active survivor can carry the
+repair budget, and never creates ordinary path delivery evidence. A Suspect path
+MAY be used only when no Active survivor can carry the
 work, or as a bounded probe that does not block the active flow.
 
 Failover recovery for browsing, downloads, and SSH-like sessions SHOULD be
@@ -4234,3 +4286,13 @@ This loop is conceptual, not an implementation requirement for a single thread
 or task. A conforming implementation may shard lanes, paths, or flows across
 tasks, but the externally visible behavior must match the same ownership,
 admission, priority, fairness, and diagnostics rules.
+
+For same-stream reliable OwnerData, carrier-family boundaries are part of the
+production scheduler model. TCP+TCP and QUIC+QUIC candidates share a carrier
+family and can compete as same-family subflows once admitted by live metrics,
+ordering-debt, and no-worse checks. TCP+QUIC candidates are different carrier
+families with independent ACK clocks, recovery, pacing, and flow-control
+semantics, so they MUST NOT steal same-stream OwnerData by default. They remain
+valid Probe, Standby, RepairOnly, migration, and failover paths. Cross-family
+OwnerData requires an explicit future scheduler mode with its own proof that it
+does not increase receive-hole debt, repair traffic, or latency.

@@ -61,6 +61,29 @@ pub(super) fn stream_ack_gap_repair_allowed(
     udp_gap_repair_ready
 }
 
+/// Product tail repair is reinjection onto an independent subflow, not a
+/// second retransmission layer behind the same reliable TCP/QUIC stream.
+///
+/// Same-output retransmission cannot overtake the missing carrier bytes on an
+/// in-order reliable carrier, but it does consume tunnel traffic and can create
+/// duplicate ACK/repair feedback loops. This guard keeps repair available for
+/// real multipath failover while preventing single-path QUIC/TCP repair storms.
+pub(super) fn stream_tail_repair_allowed(has_multipath_repair_alternative: bool) -> bool {
+    has_multipath_repair_alternative
+}
+
+pub(super) fn reliable_relay_tail_repair_deadline(
+    last_progress_at: Instant,
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(
+        last_progress_at
+            + reliable_relay_stall_timeout(path, lane)
+                .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+    )
+}
+
 #[cfg(test)]
 pub(super) fn stream_ack_gap_repair_frames(
     send_stream: &ReliableSendStream,
@@ -243,6 +266,7 @@ fn normalized_stream_ack_first_gap(normalized_ranges: &[OffsetRange]) -> Option<
 #[derive(Debug, Clone, Default)]
 pub(super) struct ReliableRecvProgress {
     last_max_data_offset: u64,
+    last_max_data_window_bytes: u64,
     last_ack_offset: u64,
     last_ack_reorder_bytes: usize,
     last_ack_range_count: usize,
@@ -298,16 +322,23 @@ impl ReliableRecvProgress {
     pub(super) fn should_send_max_data(
         &mut self,
         recv_stream: &ReliableRecvStream,
+        path: Option<PathSnapshot>,
+        lane: FlowLane,
         mux_limits: MuxLimits,
         force: bool,
     ) -> bool {
-        let max_offset = recv_stream.max_data_offset();
+        let window_bytes = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+        let max_offset = recv_stream.max_data_offset_with_window(window_bytes);
+        let update_step = reliable_stream_max_data_update_bytes(window_bytes, mux_limits);
+        let window_changed = self.last_max_data_window_bytes != 0
+            && window_bytes.abs_diff(self.last_max_data_window_bytes) >= update_step;
         if force
             || self.last_max_data_offset == 0
-            || max_offset.saturating_sub(self.last_max_data_offset)
-                >= reliable_stream_max_data_update_bytes(mux_limits)
+            || window_changed
+            || max_offset.saturating_sub(self.last_max_data_offset) >= update_step
         {
             self.last_max_data_offset = max_offset;
+            self.last_max_data_window_bytes = window_bytes;
             true
         } else {
             false
@@ -315,12 +346,87 @@ impl ReliableRecvProgress {
     }
 }
 
-pub(super) fn reliable_stream_max_data_update_bytes(mux_limits: MuxLimits) -> u64 {
-    let window_step = mux_limits.max_stream_window_bytes.saturating_div(4).max(1);
+const RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
+const RELIABLE_UDP_BULK_BDP_GAIN: f64 = 4.0;
+
+/// Initial stream-level product receive window advertised to the peer.
+///
+/// TCP keeps the configured application window because kernel TCP backpressure is
+/// the visible carrier queue at this layer. QUIC reliable streams are different:
+/// once Quinn accepts bytes, mptunnel no longer observes those bytes as product
+/// queue, and a 64 MiB product window can turn into seconds of hidden QUIC
+/// stream backlog on shaped links. Start QUIC with a small but BDP-useful window
+/// and let `STREAM_MAX_DATA` grow it from real receive progress.
+pub(super) fn reliable_stream_initial_advertised_window_bytes(
+    underlay: UnderlayProtocol,
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> u64 {
+    reliable_stream_advertised_window_from_underlay(None, underlay, lane, mux_limits)
+}
+
+pub(super) fn reliable_stream_advertised_window_bytes(
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let underlay = path
+        .map(|snapshot| snapshot.underlay)
+        .unwrap_or(UnderlayProtocol::Tcp);
+    reliable_stream_advertised_window_from_underlay(path, underlay, lane, mux_limits)
+}
+
+fn reliable_stream_advertised_window_from_underlay(
+    path: Option<PathSnapshot>,
+    underlay: UnderlayProtocol,
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let configured = mux_limits.max_stream_window_bytes.max(1);
+    if underlay != UnderlayProtocol::Udp {
+        return configured;
+    }
+
+    let relay_chunk = reliable_relay_buffer_len(mux_limits) as u64;
+    let min_window = RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES
+        .max(relay_chunk.saturating_mul(4))
+        .min(configured);
+    let startup_window = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
+        .max(min_window)
+        .min(configured);
+    if !relay_lane_is_bulk(lane) {
+        return startup_window;
+    }
+
+    let Some(path) = path else {
+        return startup_window;
+    };
+
+    let bdp_window = (reliable_path_product_bdp_bytes(path) * RELIABLE_UDP_BULK_BDP_GAIN)
+        .ceil()
+        .max(min_window as f64) as u64;
+    let carrier_window = path
+        .inflight_limit_bytes
+        .saturating_mul(4)
+        .max(path.bytes_in_flight.saturating_mul(2))
+        .max(path.queue_bytes.saturating_mul(2));
+
+    bdp_window
+        .max(carrier_window)
+        .max(startup_window)
+        .min(configured)
+}
+
+pub(super) fn reliable_stream_max_data_update_bytes(
+    advertised_window_bytes: u64,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let window_step = advertised_window_bytes.saturating_div(4).max(1);
     let payload_step = reliable_relay_buffer_len(mux_limits) as u64;
     window_step
         .max(payload_step)
-        .min(mux_limits.max_stream_window_bytes)
+        .min(advertised_window_bytes.max(1))
 }
 
 pub(super) fn reliable_stream_ack_update_bytes(
@@ -331,7 +437,8 @@ pub(super) fn reliable_stream_ack_update_bytes(
     if !relay_lane_is_bulk(lane) {
         return 1;
     }
-    let resource_ceiling = reliable_stream_max_data_update_bytes(mux_limits)
+    let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+    let resource_ceiling = reliable_stream_max_data_update_bytes(advertised_window, mux_limits)
         .min(
             (mux_limits.max_repair_bytes as u64)
                 .saturating_div(4)
@@ -367,14 +474,23 @@ pub(super) fn enqueue_tcp_recv_progress(
     if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_max_data) {
         #[cfg(feature = "lab-diagnostics")]
         let ack_started = Instant::now();
-        let ack_frame = recv_stream.ack_frame();
+        let ack_frames = recv_stream.ack_frames();
         #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record("mux.ack_frames", ack_started.elapsed(), 1);
-        response_sender.enqueue_control_frame(ack_frame);
+        lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
+        // Multipath receive ranges can exceed one ACK frame under normal
+        // reordering. Send every incomplete ACK chunk instead of truncating a
+        // single `complete=true` ACK; otherwise the peer treats omitted ranges
+        // as loss and starts product repair that cannot improve TCP/QUIC
+        // carrier delivery.
+        for ack_frame in ack_frames {
+            response_sender.enqueue_control_frame(ack_frame);
+        }
         sent_any = true;
     }
-    if progress.should_send_max_data(recv_stream, mux_limits, force_max_data) {
-        response_sender.enqueue_control_frame(recv_stream.max_data_frame());
+    if progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data) {
+        let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+        response_sender
+            .enqueue_control_frame(recv_stream.max_data_frame_with_window(advertised_window));
         sent_any = true;
     }
     sent_any
@@ -1119,7 +1235,7 @@ where
     let stream_id = path_stream.stream_id;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = session_id;
-    let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
+    let mut send_stream = ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, 0);
     send_stream.update_max_offset(path_stream.max_offset);
     let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
     let chunk_size = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
@@ -1211,11 +1327,13 @@ where
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(send_path_snapshot, relay_lane),
         );
+        let has_tail_repair_alternative = path_stream.has_multipath_repair_alternative();
         let tail_repair_active = relay_lane_is_bulk(relay_lane)
+            && stream_tail_repair_allowed(has_tail_repair_alternative)
             && send_stream.repair_bytes() > 0
             && !last_send_ack_ranges.is_empty()
             && last_send_ack_frontier < send_stream.next_offset();
-        let tail_repair_deadline = reliable_relay_stall_deadline(
+        let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
             send_path_snapshot,
             relay_lane,
@@ -1339,7 +1457,7 @@ where
                     performance,
                     path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
-                    true,
+                    false,
                 );
                 last_tail_repair_at = Instant::now();
                 if drain_server_response_sender_ready(
@@ -1398,18 +1516,17 @@ where
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = written;
                         if !delivered.is_empty() {
+                            #[cfg(feature = "lab-diagnostics")]
+                            let flush_started = Instant::now();
                             local.flush().await?;
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
                         }
-                        #[cfg(feature = "lab-diagnostics")]
-                        let flush_started = Instant::now();
-                        local.flush().await?;
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
                         if enqueue_tcp_recv_progress(
                             &mut response_sender,
                             &recv_stream,
                             &mut recv_progress,
-                            None,
+                            send_path_snapshot,
                             relay_lane,
                             mux_limits,
                             false,
@@ -1425,7 +1542,7 @@ where
                                 &mut response_sender,
                                 &recv_stream,
                                 &mut recv_progress,
-                                None,
+                                send_path_snapshot,
                                 relay_lane,
                                 mux_limits,
                                 true,
@@ -1595,7 +1712,7 @@ where
                                 &mut response_sender,
                                 &recv_stream,
                                 &mut recv_progress,
-                                None,
+                                send_path_snapshot,
                                 relay_lane,
                                 mux_limits,
                                 true,
@@ -1624,7 +1741,7 @@ where
                             &mut response_sender,
                             &recv_stream,
                             &mut recv_progress,
-                            None,
+                            send_path_snapshot,
                             relay_lane,
                             mux_limits,
                             true,
@@ -1750,7 +1867,7 @@ where
                     &mut response_sender,
                     &recv_stream,
                     &mut recv_progress,
-                    None,
+                    send_path_snapshot,
                     relay_lane,
                     mux_limits,
                     true,
@@ -2144,6 +2261,26 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn tail_repair_requires_independent_repair_subflow() {
+        assert!(!stream_tail_repair_allowed(false));
+        assert!(stream_tail_repair_allowed(true));
+    }
+
+    #[test]
+    fn tail_repair_uses_persistent_congestion_timeout() {
+        let last_progress = Instant::now();
+        let deadline =
+            reliable_relay_tail_repair_deadline(last_progress, None, FlowLane::Throughput);
+        let expected = tokio::time::Instant::from_std(
+            last_progress
+                + reliable_relay_stall_timeout(None, FlowLane::Throughput)
+                    .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+        );
+
+        assert_eq!(deadline, expected);
     }
 
     #[test]

@@ -758,7 +758,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extra_traffic_hint_default_is_optimistic_five_percent() {
+    fn extra_traffic_hint_default_is_five_percent() {
         assert_eq!(
             MppPerformanceConfig::default().extra_traffic_hint_percent,
             5

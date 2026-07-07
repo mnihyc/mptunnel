@@ -2226,6 +2226,32 @@ fn sender_service_retry_delay_is_not_receive_progress_stall_timer() {
 }
 
 #[test]
+fn udp_reliable_stream_uses_adaptive_product_window_below_config_ceiling() {
+    let mux_limits = MuxLimits::default();
+    let tcp_initial = reliable_stream_initial_advertised_window_bytes(
+        UnderlayProtocol::Tcp,
+        FlowLane::Throughput,
+        mux_limits,
+    );
+    let udp_initial = reliable_stream_initial_advertised_window_bytes(
+        UnderlayProtocol::Udp,
+        FlowLane::Throughput,
+        mux_limits,
+    );
+
+    assert_eq!(tcp_initial, mux_limits.max_stream_window_bytes);
+    assert!(udp_initial < mux_limits.max_stream_window_bytes);
+    assert!(udp_initial >= 4 * 1024 * 1024);
+
+    let snapshot = PathSnapshot::new(PathId(7), UnderlayProtocol::Udp, 40.0, 200_000_000.0);
+    let measured_window =
+        reliable_stream_advertised_window_bytes(Some(snapshot), FlowLane::Throughput, mux_limits);
+
+    assert!(measured_window >= udp_initial);
+    assert!(measured_window <= mux_limits.max_stream_window_bytes);
+}
+
+#[test]
 fn reliable_recv_progress_batches_max_data_updates() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024,
@@ -2238,22 +2264,53 @@ fn reliable_recv_progress_batches_max_data_updates() {
     };
     let mut recv_stream = ReliableRecvStream::new(StreamId(22), mux_limits);
     let mut progress = ReliableRecvProgress::default();
-    let step = reliable_stream_max_data_update_bytes(mux_limits);
+    let window = reliable_stream_advertised_window_bytes(None, FlowLane::Throughput, mux_limits);
+    let step = reliable_stream_max_data_update_bytes(window, mux_limits);
 
     assert_eq!(step, 1024);
-    assert!(progress.should_send_max_data(&recv_stream, mux_limits, false));
-    assert!(!progress.should_send_max_data(&recv_stream, mux_limits, false));
+    assert!(progress.should_send_max_data(
+        &recv_stream,
+        None,
+        FlowLane::Throughput,
+        mux_limits,
+        false
+    ));
+    assert!(!progress.should_send_max_data(
+        &recv_stream,
+        None,
+        FlowLane::Throughput,
+        mux_limits,
+        false
+    ));
 
     recv_stream
         .receive_data(0, Bytes::from(vec![0x11; 512]), StreamFlags::NONE)
         .expect("half-step data");
-    assert!(!progress.should_send_max_data(&recv_stream, mux_limits, false));
+    assert!(!progress.should_send_max_data(
+        &recv_stream,
+        None,
+        FlowLane::Throughput,
+        mux_limits,
+        false
+    ));
 
     recv_stream
         .receive_data(512, Bytes::from(vec![0x22; 512]), StreamFlags::NONE)
         .expect("full-step data");
-    assert!(progress.should_send_max_data(&recv_stream, mux_limits, false));
-    assert!(progress.should_send_max_data(&recv_stream, mux_limits, true));
+    assert!(progress.should_send_max_data(
+        &recv_stream,
+        None,
+        FlowLane::Throughput,
+        mux_limits,
+        false
+    ));
+    assert!(progress.should_send_max_data(
+        &recv_stream,
+        None,
+        FlowLane::Throughput,
+        mux_limits,
+        true
+    ));
 }
 
 #[test]
@@ -2371,7 +2428,8 @@ fn reliable_recv_progress_default_bulk_ack_step_tracks_service_quantum() {
     let ack_step = reliable_stream_ack_update_bytes(None, FlowLane::Throughput, mux_limits);
 
     assert_eq!(ack_step, BBR_MAX_SEND_QUANTUM_BYTES as u64);
-    assert!(ack_step < reliable_stream_max_data_update_bytes(mux_limits));
+    let window = reliable_stream_advertised_window_bytes(None, FlowLane::Throughput, mux_limits);
+    assert!(ack_step < reliable_stream_max_data_update_bytes(window, mux_limits));
     assert_eq!(
         reliable_stream_ack_update_bytes(None, FlowLane::Latency, mux_limits),
         1

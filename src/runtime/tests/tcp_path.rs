@@ -1760,7 +1760,7 @@ fn udp_latency_flow_is_protected_from_bulk_like_other_reliable_paths() {
 }
 
 #[test]
-fn endpoint_only_tcp_bulk_striping_keeps_unknown_paths_out_of_measured_bulk_cohort() {
+fn endpoint_only_tcp_bulk_striping_keeps_unknown_paths_out_of_measured_bulk_subflow_set() {
     let low_latency_path = "tcp://127.0.0.1:10146"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -2260,7 +2260,7 @@ fn mixed_bulk_striping_penalizes_lossy_high_rtt_quic_udp_path() {
 }
 
 #[test]
-fn mixed_bulk_striping_can_choose_best_carrier_without_active_cohort() {
+fn mixed_bulk_striping_can_choose_best_carrier_without_active_subflow_set() {
     let tcp_path = "tcp://127.0.0.1:10144?srtt-ms=20&rate-mbps=30"
         .parse::<PathSpec>()
         .expect("tcp path");

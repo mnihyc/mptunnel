@@ -17,8 +17,7 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) path_metrics: Option<ServerPathMetricsEntry>,
-    pub(super) trial_owner_sent_bytes: u64,
-    pub(super) duplicate_validation_sent_bytes: u64,
+    pub(super) subflow_startup_sent_bytes: u64,
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
@@ -33,10 +32,8 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
-    pub(in crate::runtime) has_ack_data_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
-    pub(in crate::runtime) trial_owner_sent_bytes: u64,
-    pub(in crate::runtime) duplicate_validation_sent_bytes: u64,
+    pub(in crate::runtime) subflow_startup_sent_bytes: u64,
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -497,9 +494,8 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         )
 }
 
-pub(in crate::runtime) fn server_output_has_ack_data_evidence(
-    entry: &ResponseStreamOutputEntry,
-) -> bool {
+#[cfg(test)]
+fn server_output_has_ack_data_evidence(entry: &ResponseStreamOutputEntry) -> bool {
     entry.delivery_samples > 0
         || entry.delivery_rate_bps.is_some()
         || matches!(
@@ -594,8 +590,7 @@ mod tests {
             delivery_samples: 1,
             last_delivery_at: Some(Instant::now()),
             path_metrics: None,
-            trial_owner_sent_bytes: 0,
-            duplicate_validation_sent_bytes: 0,
+            subflow_startup_sent_bytes: 0,
         };
 
         assert!(
@@ -654,8 +649,7 @@ mod tests {
                     data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
-            trial_owner_sent_bytes: 0,
-            duplicate_validation_sent_bytes: 0,
+            subflow_startup_sent_bytes: 0,
         };
 
         assert!(
@@ -710,8 +704,7 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
-            trial_owner_sent_bytes: 0,
-            duplicate_validation_sent_bytes: 0,
+            subflow_startup_sent_bytes: 0,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();
@@ -786,14 +779,13 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
-            trial_owner_sent_bytes: 0,
-            duplicate_validation_sent_bytes: 0,
+            subflow_startup_sent_bytes: 0,
         };
 
         assert!(server_output_has_sender_evidence(&entry));
         assert!(
             !server_output_has_ack_data_evidence(&entry),
-            "PATH_PROOF-style liveness evidence must not become ACK-data evidence for unique Trial ownership"
+            "PATH_PROOF-style liveness evidence must not become ACK-data evidence for unique Subflow ownership"
         );
         assert!(!server_output_has_bulk_rate_evidence(&entry));
     }
@@ -845,8 +837,7 @@ mod tests {
                     data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
-            trial_owner_sent_bytes: 0,
-            duplicate_validation_sent_bytes: 0,
+            subflow_startup_sent_bytes: 0,
         };
 
         assert!(matches!(
@@ -890,8 +881,7 @@ mod tests {
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             last_delivery_at: Some(Instant::now()),
             path_metrics: None,
-            trial_owner_sent_bytes: 0,
-            duplicate_validation_sent_bytes: 0,
+            subflow_startup_sent_bytes: 0,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();

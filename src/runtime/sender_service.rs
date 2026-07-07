@@ -824,17 +824,22 @@ fn response_forced_owner_under_product_debt(
     }
 
     // Product owner debt pressure is a hard ordering-safety gate, not an ETA
-    // preference.  If the current owner can accept the next OwnerData quantum,
-    // keep feeding it; if it cannot, pause OwnerData dispatch instead of sending
-    // later offsets to another path.  Optional paths may still receive control,
-    // probe, or explicit repair work elsewhere, but not new ordered owner bytes
-    // while older product debt is above pressure.
-    Some(
-        capacity_targets
-            .iter()
-            .find(|target| target.key == owner_key)
-            .cloned(),
-    )
+    // preference. Optional paths may still receive control, probe, or explicit
+    // repair work elsewhere, but not new ordered owner bytes while older
+    // product debt is above pressure. The current owner also must not bypass
+    // active Service admission here; if its product budget is exhausted, pause
+    // OwnerData so the frontier can drain instead of expanding the old-owner
+    // backlog.
+    let Some(owner) = capacity_targets
+        .iter()
+        .find(|target| target.key == owner_key)
+    else {
+        return Some(None);
+    };
+    if response_active_lead_suppression(owner, mux_limits, payload_bytes, 0).is_some() {
+        return Some(None);
+    }
+    Some(Some(owner.clone()))
 }
 
 fn response_active_lead_suppression(
@@ -5300,6 +5305,41 @@ mod tests {
             )
             .is_none(),
             "OwnerData must pause rather than migrate while the current owner is above debt pressure"
+        );
+    }
+
+    #[test]
+    fn response_owner_debt_pressure_respects_service_inflight_cap() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload_bytes = 64 * 1024;
+        let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        owner.snapshot.product_progress_rate_bps = Some(10_000_000.0);
+        owner.snapshot.product_bytes_in_flight = 8 * 1024 * 1024;
+        owner.snapshot.pacing_rate_bps = 2_000_000_000.0;
+        let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &owner,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert!(
+            choose_response_sender_data_target_with_product_debt(
+                &[owner.clone(), alternate],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                Some(owner.key),
+                owner_debt_pressure.saturating_add(payload_bytes),
+            )
+            .is_none(),
+            "product-owner debt pressure must not bypass active Service inflight admission; pause OwnerData instead of expanding old-owner backlog"
         );
     }
 

@@ -366,16 +366,14 @@ recovery engines. Therefore, for one ordered reliable stream, a proof-only
 validation output MUST NOT carry later unique `STREAM_DATA` while another
 output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
-A frontier-clear same-family Subflow may carry one bounded unique owner
-range only after path-scoped sender evidence exists, the Service path is not
-under owner-debt pressure, and the no-worse model predicts useful completion
-progress; that Subflow does not become the Service path until delivery evidence
-justifies it. A bulk-rate-proven same-family
-Subflow output is stronger: it may carry ordinary unique bytes when
-sender-service admission proves that doing so will not expand product
-receive-hole debt or worsen the completion horizon. This rule is path-metric
-driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred or
-UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
+A frontier-clear same-family path with only liveness, proof, or configured-hint
+evidence may become the Service path when the sender-service Service selection
+model chooses it and no lower owner debt exists, but it is not a Subflow owner.
+A same-family Subflow may carry ordinary unique bytes only after bulk-rate
+evidence exists and sender-service admission proves that doing so will not
+expand product receive-hole debt or worsen the completion horizon. This rule is
+path-metric driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred
+or UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
 production v1 because they do not share one carrier-family recovery model.
 
 A product reliable stream owns only stream semantics: stream ID, target metadata,
@@ -702,7 +700,7 @@ their origin is explicit and they do not become hidden modes.
 | UDP target/datagram path model | UDP/QUIC response timeout and retry budget derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. TCP-underlay datagrams send once per datagram ID on the reliable carrier and do not reopen the carrier merely because the UDP target response is absent |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active UDP Service flight uses the UDP startup product window, not the full resource envelope; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active UDP Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
 | Validation traffic | Probe/control traffic only; repair data only after explicit gap/failover evidence; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -2167,7 +2165,11 @@ server treats the path as low-confidence and MUST NOT prefer it over the
 active/measured path except when the adaptive validation admission rule says the
 proof traffic should not increase completion time. This keeps client and server
 policy aligned without requiring a large control-plane exchange or pretending
-that one endpoint's outbound samples prove the reverse direction.
+that one endpoint's outbound samples prove the reverse direction. Configured
+endpoint hints such as initial RTT, jitter, or rate are also advisory priors:
+they may rank the current Service candidate or validation order, but they are
+not delivery evidence and MUST NOT by themselves make an optional path a
+Subflow owner for same-stream reliable bytes.
 
 ### 17.6 Unified Sender Service
 
@@ -3369,26 +3371,33 @@ The version 1 same-stream bulk subflow set uses a completion horizon rather than
 fixed millisecond slack:
 
 ```
-path_rate = max(path.pacing_rate, path.delivery_rate)
-path_bdp = path_rate * path.srtt
+eta_rate = max(path.pacing_rate, path.delivery_rate)
+eta_bdp = eta_rate * path.srtt
+product_budget_rate = path.product_progress_rate if known else none
+product_budget_bdp = product_budget_rate * path.srtt
 lead_path = min_eta_candidate_that_is_eligible_and_admissible_for_ordinary_bulk()
 if path is the lead path:
-    product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
-                                 2 * path_bdp,
-                                 configured_path_inflight)
+    if product_budget_rate is known:
+        product_inflight_limit = min(2 * product_budget_bdp,
+                                     configured_path_inflight)
+    else if path uses the UDP carrier:
+        product_inflight_limit = min(udp_startup_product_window,
+                                     configured_path_inflight)
+    else:
+        product_inflight_limit = configured_path_inflight
     product_inflight_limit = max(product_inflight_limit, chunk.len)
 else if path uses the same underlay family as the lead path:
     product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
-                                 2 * path_bdp,
+                                 2 * eta_bdp,
                                  configured_path_inflight)
     product_inflight_limit = max(product_inflight_limit, chunk.len)
 else:
     modeled_inflight = max(min(path.carrier_inflight_limit if known else infinity,
-                               2 * path_bdp),
+                               2 * eta_bdp),
                            chunk.len)
     product_inflight_limit = min(modeled_inflight,
                                  max(configured_path_inflight, chunk.len))
-base_reorder_budget = min(max(2 * path_bdp, chunk.len),
+base_reorder_budget = min(max(2 * eta_bdp, chunk.len),
                           configured_receiver_reorder)
 effective_reorder_budget = base_reorder_budget * path.confidence
 if path is the lead path and stream_ordering_debt(path, chunk) == 0:
@@ -3474,6 +3483,11 @@ repair, and latency frames must still interleave with any admitted bulk work.
 The configured ceiling MUST be applied as an upper bound over the adaptive
 product-flight model. It MUST NOT be implemented as a floor that expands a
 smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
+Product owner debt pressure MUST NOT bypass the active Service product-flight
+admission check. If older owner debt is above pressure and the current owner is
+already over its product budget, the sender pauses new OwnerData so the frontier
+can drain; it MUST NOT feed the old owner merely because sending to a Subflow
+would be unsafe.
 When no live path snapshot exists yet, startup product flight is derived from
 the normal startup path model and lane gain, then capped by the same ceiling.
 Unknown-path startup MUST NOT jump directly to the configured maximum merely

@@ -1915,6 +1915,36 @@ fn endpoint_only_udp_stream_bulk_striping_admits_only_best_unmeasured_path() {
 }
 
 #[test]
+fn endpoint_only_udp_rate_hints_rank_service_but_do_not_prove_subflows() {
+    let low_latency_path = "udp://127.0.0.1:10140?srtt-ms=20&rate-mbps=80&low-latency=true"
+        .parse::<PathSpec>()
+        .expect("low latency path");
+    let balanced_path = "udp://127.0.0.1:10141?srtt-ms=80&rate-mbps=200"
+        .parse::<PathSpec>()
+        .expect("balanced path");
+    let fat_path = "udp://127.0.0.1:10142?srtt-ms=180&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("fat path");
+    let context = ClientPathContext::new(
+        vec![low_latency_path, balanced_path, fat_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let candidates = reliable_bulk_striping_path_keys(
+        &context,
+        MuxLimits::default().max_reliable_relay_chunk_bytes,
+    );
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "configured rate hints are priors for Service selection, not bulk delivery evidence for optional Subflow owners"
+    );
+}
+
+#[test]
 fn endpoint_only_udp_bulk_load_spreads_replacement_without_realtime_work() {
     let first_path = "udp://127.0.0.1:10177"
         .parse::<PathSpec>()

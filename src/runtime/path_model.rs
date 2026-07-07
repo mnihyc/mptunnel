@@ -577,6 +577,7 @@ pub(super) fn path_snapshot(
         state: observation.state,
         flags: path.metadata.capabilities.into(),
         srtt_ms,
+        min_rtt_ms: srtt_ms,
         jitter_ms,
         delivery_rate_bps,
         product_progress_rate_bps: None,
@@ -644,7 +645,7 @@ pub(super) fn path_metrics_from_snapshot(
         direction,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: millis_to_micros_u32(snapshot.srtt_ms),
+        min_rtt_us: millis_to_micros_u32(snapshot.min_rtt_ms),
         srtt_us: millis_to_micros_u32(snapshot.srtt_ms),
         rttvar_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
         jitter_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
@@ -811,7 +812,6 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
     let product_rate = observation.measured_rate_bps.is_some()
         && reliable_product_delivery_samples(path, observation) > 0;
     product_rate
-        || path.metadata.initial_rate != RateHint::Unknown
         || (observation.carrier_delivery_rate_bps.is_some()
             && !observation.carrier_app_limited
             && observation.carrier_delivery_sample_bytes

@@ -353,10 +353,6 @@ impl ReliableRecvProgress {
     }
 }
 
-const RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
-const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
-const RELIABLE_UDP_BULK_BDP_GAIN: f64 = 4.0;
-
 /// Initial stream-level product receive window advertised to the peer.
 ///
 /// TCP keeps the configured application window because kernel TCP backpressure is

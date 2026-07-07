@@ -668,6 +668,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         if normal_bulk_send
             && Some(key) != active_key
             && lower_flight_owner != Some(key)
+            && !(lower_flight_owner.is_none()
+                && restrict_to_admitted
+                && admitted_bulk_keys.contains(&key))
             && !relay_path_runtime_role(
                 key,
                 active_key,
@@ -942,6 +945,9 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
             let key = path.key();
             Some(key) == active_key
                 || lower_flight_owner == Some(key)
+                || (lower_flight_owner.is_none()
+                    && restrict_to_admitted
+                    && admitted_bulk_keys.contains(&key))
                 || context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
         })
         .filter_map(|path| {

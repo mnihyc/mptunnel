@@ -299,6 +299,9 @@ pub(super) fn server_bulk_output_snapshot(
     .unwrap_or(prior_rate_bps)
     .max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
+    if let Some(path_metrics) = model_metrics {
+        snapshot.min_rtt_ms = f64::from(path_metrics.metrics.min_rtt_us.max(1)) / 1000.0;
+    }
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;

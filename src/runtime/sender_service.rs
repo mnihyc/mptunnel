@@ -454,6 +454,92 @@ struct ResponseBulkLead {
     eta_ms: f64,
 }
 
+#[cfg(feature = "lab-diagnostics")]
+#[derive(Debug, Clone, Copy)]
+struct ResponseBulkCandidateDiag {
+    lead: Option<ResponseBulkLead>,
+    role: Option<BulkAdmissionRole>,
+    ordering_debt: u64,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn lab_response_bulk_output_candidate(
+    reason: &'static str,
+    target: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    diag: ResponseBulkCandidateDiag,
+) {
+    let (lead_underlay, lead_path_id, lead_eta_ms) = diag
+        .lead
+        .map(|lead| {
+            (
+                format!("{:?}", lead.key.underlay),
+                lead.key.path_id.0.to_string(),
+                lead.eta_ms,
+            )
+        })
+        .unwrap_or_else(|| ("none".to_string(), "none".to_string(), 0.0));
+    lab_diagnostic(
+        "server_bulk_output_candidate",
+        format_args!(
+            "reason={} path_underlay={:?} path_id={} is_active={} sender_evidence={} bulk_rate_evidence={} role={} eta_ms={:.3} lead_underlay={} lead_path_id={} lead_eta_ms={:.3} stream_ordering_debt={} payload_bytes={} command_pending_bytes={} path_queue_bytes={} product_queue_bytes={} carrier_inflight_bytes={} product_inflight_bytes={} carrier_inflight_limit={} delivery_rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence={:.3} app_limited={} mux_max_path_flight={} mux_max_reorder={}",
+            reason,
+            target.key.underlay,
+            target.key.path_id.0,
+            target.is_active,
+            target.has_sender_evidence,
+            target.has_bulk_rate_evidence,
+            diag.role
+                .map(|role| format!("{:?}", role))
+                .unwrap_or_else(|| "none".to_string()),
+            target.eta_ms,
+            lead_underlay,
+            lead_path_id,
+            lead_eta_ms,
+            diag.ordering_debt,
+            payload_bytes,
+            target.commands.pending_bytes(),
+            target.snapshot.queue_bytes,
+            target.snapshot.product_queue_bytes,
+            target.snapshot.bytes_in_flight,
+            target.snapshot.product_bytes_in_flight,
+            target.snapshot.inflight_limit_bytes,
+            target.snapshot.delivery_rate_bps / 1_000_000.0,
+            target.snapshot.pacing_rate_bps / 1_000_000.0,
+            target.snapshot.srtt_ms,
+            target.snapshot.confidence,
+            target.snapshot.app_limited,
+            mux_limits.max_path_flight_bytes,
+            mux_limits.max_reorder_bytes,
+        ),
+    );
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn lab_response_bulk_output_selected(
+    reason: &'static str,
+    selected: &ResponseSelectedDataTarget,
+    payload_bytes: usize,
+) {
+    lab_diagnostic(
+        "server_bulk_output_selected",
+        format_args!(
+            "reason={} path_underlay={:?} path_id={} role={:?} work={:?} payload_bytes={} command_pending_bytes={} eta_ms={:.3} app_limited={} bulk_rate_evidence={}",
+            reason,
+            selected.target.key.underlay,
+            selected.target.key.path_id.0,
+            selected.admission.role,
+            selected.admission.work,
+            payload_bytes,
+            selected.target.commands.pending_bytes(),
+            selected.target.eta_ms,
+            selected.target.snapshot.app_limited,
+            selected.target.has_bulk_rate_evidence,
+        ),
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseCarrierEmitMode {
     Classified,
@@ -524,18 +610,34 @@ struct ResponseSelectedDataTarget {
 }
 
 fn response_bulk_admission_role(
-    lead_key: CarrierPathKey,
+    service_key: CarrierPathKey,
     candidate: CarrierPathKey,
     lower_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
 ) -> BulkAdmissionRole {
-    if lower_owner == Some(candidate) || (candidate == lead_key && ordering_debt == 0) {
+    if lower_owner == Some(candidate) || (candidate == service_key && ordering_debt == 0) {
         BulkAdmissionRole::ActiveDataPath
     } else if let Some(owner) = lower_owner {
         bulk_additional_admission_role(owner.underlay, candidate.underlay)
     } else {
-        bulk_additional_admission_role(lead_key.underlay, candidate.underlay)
+        bulk_additional_admission_role(service_key.underlay, candidate.underlay)
     }
+}
+
+fn response_service_anchor_key(
+    candidates: &[&ResponseSenderPathTarget],
+    lower_owner: Option<CarrierPathKey>,
+    fallback: CarrierPathKey,
+) -> CarrierPathKey {
+    lower_owner
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.is_active)
+                .map(|candidate| candidate.key)
+        })
+        .unwrap_or(fallback)
 }
 
 fn response_unique_quic_data_would_expand_ordering_debt(
@@ -621,9 +723,7 @@ fn response_target_unique_owner_admission_with_epoch(
             (PathAdmission::probe_only(), None)
         };
     }
-    if response_target_is_service_owner_candidate(target, candidates)
-        || (lower_owner.is_none() && target.key == lead.key && target.has_bulk_rate_evidence)
-    {
+    if response_target_is_service_owner_candidate(target, candidates) {
         return (PathAdmission::service(), None);
     }
     if target.is_active {
@@ -634,16 +734,8 @@ fn response_target_unique_owner_admission_with_epoch(
         };
     }
 
-    let service_key = lower_owner
-        .or_else(|| {
-            candidates
-                .iter()
-                .copied()
-                .find(|candidate| candidate.is_active)
-                .map(|candidate| candidate.key)
-        })
-        .unwrap_or(lead.key);
-    let role = response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
+    let service_key = response_service_anchor_key(candidates, lower_owner, lead.key);
+    let role = response_bulk_admission_role(service_key, target.key, lower_owner, ordering_debt);
     let model_allows_owner =
         !response_unique_quic_data_would_expand_ordering_debt(lower_owner, target, ordering_debt)
             && bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -822,15 +914,14 @@ fn response_product_owner_debt_exceeds_pressure(
         > response_product_owner_debt_pressure_bytes(owner, lane, payload_bytes, mux_limits)
 }
 
-fn response_forced_owner_under_product_debt(
+fn response_owner_debt_pressure(
     all_targets: &[ResponseSenderPathTarget],
-    capacity_targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     ordered_data_owner: Option<CarrierPathKey>,
     product_owner_debt_bytes: usize,
-) -> Option<Option<ResponseSenderPathTarget>> {
+) -> Option<CarrierPathKey> {
     if product_owner_debt_bytes == 0 {
         return None;
     }
@@ -851,23 +942,11 @@ fn response_forced_owner_under_product_debt(
         return None;
     }
 
-    // Product owner debt pressure is a hard ordering-safety gate, not an ETA
-    // preference. Optional paths may still receive control, probe, or explicit
-    // repair work elsewhere, but not new ordered owner bytes while older
-    // product debt is above pressure. The current owner also must not bypass
-    // active Service admission here; if its product budget is exhausted, pause
-    // OwnerData so the frontier can drain instead of expanding the old-owner
-    // backlog.
-    let Some(owner) = capacity_targets
-        .iter()
-        .find(|target| target.key == owner_key)
-    else {
-        return Some(None);
-    };
-    if response_active_lead_suppression(owner, mux_limits, payload_bytes, 0).is_some() {
-        return Some(None);
-    }
-    Some(Some(owner.clone()))
+    // Product owner debt pressure is a family/evidence filter, not a Service
+    // priority bypass. The current Service owner and already measured
+    // same-family Subflows compete through the normal no-worse admission checks;
+    // cross-family and proof-only candidates remain Probe/Standby/RepairOnly.
+    Some(owner_key)
 }
 
 fn response_active_lead_suppression(
@@ -1081,6 +1160,7 @@ fn choose_response_sender_target(
         payload_bytes,
         lower_flights,
     )?;
+    let service_key = response_service_anchor_key(&candidate_targets, lower_owner, lead.key);
     let selected = candidate_targets
         .iter()
         .copied()
@@ -1098,7 +1178,7 @@ fn choose_response_sender_target(
                 return false;
             }
             let role =
-                response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
+                response_bulk_admission_role(service_key, target.key, lower_owner, ordering_debt);
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
                 best_snapshot: lead.snapshot,
                 best_eta_ms: lead.eta_ms,
@@ -1213,14 +1293,40 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
     if targets.is_empty() {
         return None;
     }
-    let capacity_targets = targets
-        .iter()
-        .filter(|target| {
-            target.commands.can_enqueue_lane_now(lane)
-                && response_target_has_emission_credit(target, lane, payload_bytes, mux_limits)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut capacity_targets = Vec::new();
+    for target in targets {
+        if !target.commands.can_enqueue_lane_now(lane) {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_response_bulk_output_candidate(
+                "no_lane_capacity",
+                target,
+                payload_bytes,
+                mux_limits,
+                ResponseBulkCandidateDiag {
+                    lead: None,
+                    role: None,
+                    ordering_debt: 0,
+                },
+            );
+            continue;
+        }
+        if !response_target_has_emission_credit(target, lane, payload_bytes, mux_limits) {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_response_bulk_output_candidate(
+                "no_emission_credit",
+                target,
+                payload_bytes,
+                mux_limits,
+                ResponseBulkCandidateDiag {
+                    lead: None,
+                    role: None,
+                    ordering_debt: 0,
+                },
+            );
+            continue;
+        }
+        capacity_targets.push(target.clone());
+    }
     if capacity_targets.is_empty() {
         return None;
     }
@@ -1237,32 +1343,72 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         });
     }
 
-    if let Some(forced_owner) = response_forced_owner_under_product_debt(
+    let debt_pressure = response_owner_debt_pressure(
         targets,
-        &capacity_targets,
         lane,
         payload_bytes,
         mux_limits,
         ordered_data_owner,
         product_owner_debt_bytes,
-    ) {
-        return forced_owner.map(|target| ResponseSelectedDataTarget {
-            target,
-            admission: PathAdmission::service(),
-            subflow_set_commit: None,
-        });
-    }
+    );
+    let debt_pressure_owner = debt_pressure;
 
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    let effective_lower_owner = lower_owner.or(debt_pressure_owner);
     let proven_targets = capacity_targets
         .iter()
         .filter(|target| target.is_active || target.has_sender_evidence)
         .collect::<Vec<_>>();
-    let candidate_targets = if proven_targets.is_empty() {
+    #[cfg(feature = "lab-diagnostics")]
+    if !proven_targets.is_empty() {
+        for target in &capacity_targets {
+            if !target.is_active && !target.has_sender_evidence {
+                lab_response_bulk_output_candidate(
+                    "no_sender_evidence",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: None,
+                        role: None,
+                        ordering_debt: 0,
+                    },
+                );
+            }
+        }
+    }
+    let mut candidate_targets = if proven_targets.is_empty() {
         capacity_targets.iter().collect::<Vec<_>>()
     } else {
         proven_targets
     };
+    if let Some(owner_key) = debt_pressure_owner {
+        #[cfg(feature = "lab-diagnostics")]
+        for target in &candidate_targets {
+            if target.key != owner_key
+                && !(target.key.underlay == owner_key.underlay && target.has_bulk_rate_evidence)
+            {
+                lab_response_bulk_output_candidate(
+                    "debt_pressure_filter",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: None,
+                        role: None,
+                        ordering_debt: product_owner_debt_bytes as u64,
+                    },
+                );
+            }
+        }
+        candidate_targets.retain(|target| {
+            target.key == owner_key
+                || (target.key.underlay == owner_key.underlay && target.has_bulk_rate_evidence)
+        });
+        if candidate_targets.is_empty() {
+            return None;
+        }
+    }
     let mixed_safe_targets = candidate_targets
         .iter()
         .copied()
@@ -1270,27 +1416,71 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
             response_cross_underlay_owner_allowed(target, &candidate_targets, ordered_data_owner)
         })
         .collect::<Vec<_>>();
+    #[cfg(feature = "lab-diagnostics")]
+    if !mixed_safe_targets.is_empty() {
+        for target in &candidate_targets {
+            if !mixed_safe_targets.iter().any(|safe| safe.key == target.key) {
+                lab_response_bulk_output_candidate(
+                    "mixed_family_owner_unhealthy",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: None,
+                        role: None,
+                        ordering_debt: 0,
+                    },
+                );
+            }
+        }
+    }
     let candidate_targets = if mixed_safe_targets.is_empty() {
         candidate_targets
     } else {
         mixed_safe_targets
     };
-    let lead = choose_response_admissible_lead(
+    let Some(lead) = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
         payload_bytes,
         lower_flights,
-    )?;
+    ) else {
+        #[cfg(feature = "lab-diagnostics")]
+        for target in &candidate_targets {
+            lab_response_bulk_output_candidate(
+                "no_admissible_lead",
+                target,
+                payload_bytes,
+                mux_limits,
+                ResponseBulkCandidateDiag {
+                    lead: None,
+                    role: None,
+                    ordering_debt: 0,
+                },
+            );
+        }
+        return None;
+    };
+    let service_key =
+        response_service_anchor_key(&candidate_targets, effective_lower_owner, lead.key);
     let admitted = candidate_targets
         .iter()
         .copied()
         .filter_map(|target| {
-            let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
+            let ordering_debt = if let Some(owner_key) = debt_pressure_owner {
+                if lower_owner.is_none() && target.key != owner_key {
+                    product_owner_debt_bytes as u64
+                } else {
+                    response_ordering_debt_bytes(lower_flights, target.key)
+                }
+            } else {
+                response_ordering_debt_bytes(lower_flights, target.key)
+            };
             let (admission, subflow_set_commit) = response_target_unique_owner_admission_with_epoch(
                 target,
                 &candidate_targets,
                 lead,
-                lower_owner,
+                effective_lower_owner,
                 ordering_debt,
                 payload_bytes,
                 mux_limits,
@@ -1302,43 +1492,73 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
             ) || admission.work != CarrierWorkKind::OwnerData
                 || !admission.role.may_own_unique_data()
             {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_response_bulk_output_candidate(
+                    "not_owner_admission",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: Some(lead),
+                        role: Some(response_bulk_admission_role(
+                            service_key,
+                            target.key,
+                            effective_lower_owner,
+                            ordering_debt,
+                        )),
+                        ordering_debt,
+                    },
+                );
                 return None;
             }
-            let role =
-                response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
-            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-                best_snapshot: lead.snapshot,
-                best_eta_ms: lead.eta_ms,
-                candidate_snapshot: target.snapshot,
-                candidate_eta_ms: target.eta_ms,
-                payload_bytes,
-                mux_limits,
-                role,
-                stream_ordering_debt_bytes: ordering_debt,
-            })
-            .is_none()
-            .then_some(ResponseSelectedDataTarget {
+            let role = response_bulk_admission_role(
+                service_key,
+                target.key,
+                effective_lower_owner,
+                ordering_debt,
+            );
+            let suppression =
+                bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                    best_snapshot: lead.snapshot,
+                    best_eta_ms: lead.eta_ms,
+                    candidate_snapshot: target.snapshot,
+                    candidate_eta_ms: target.eta_ms,
+                    payload_bytes,
+                    mux_limits,
+                    role,
+                    stream_ordering_debt_bytes: ordering_debt,
+                });
+            if let Some(_reason) = suppression {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_response_bulk_output_candidate(
+                    _reason,
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: Some(lead),
+                        role: Some(role),
+                        ordering_debt,
+                    },
+                );
+                return None;
+            }
+            Some(ResponseSelectedDataTarget {
                 target: target.clone(),
                 admission,
                 subflow_set_commit,
             })
         })
         .collect::<Vec<_>>();
-    if product_owner_debt_bytes > 0
-        && lower_owner.is_none()
-        && let Some(owner_key) = ordered_data_owner
-        && let Some(owner_target) = admitted
-            .iter()
-            .find(|selected| selected.target.key == owner_key)
-        && response_product_owner_debt_exceeds_pressure(
-            &owner_target.target,
-            lane,
-            payload_bytes,
-            mux_limits,
-            product_owner_debt_bytes,
-        )
-    {
-        return Some(owner_target.clone());
+    if let Some(retention_target) = response_underfed_same_family_subflow_retention_target(
+        &admitted,
+        ordered_data_owner,
+        payload_bytes,
+        mux_limits,
+    ) {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_response_bulk_output_selected("retention", &retention_target, payload_bytes);
+        return Some(retention_target);
     }
     let best = admitted.iter().min_by(|left, right| {
         left.target
@@ -1357,8 +1577,12 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
             payload_bytes,
         )
     {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_response_bulk_output_selected("hysteresis", lead_target, payload_bytes);
         return Some(lead_target.clone());
     }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_response_bulk_output_selected("best_eta", best, payload_bytes);
     Some(best.clone())
 }
 
@@ -1388,6 +1612,57 @@ fn response_target_within_adaptive_lead_hysteresis(
     let queue_hysteresis_bytes = payload_bytes as u64;
     old_lead.eta_ms <= best.eta_ms + jitter_hysteresis_ms
         && old_lead.snapshot.queue_bytes <= best.snapshot.queue_bytes + queue_hysteresis_bytes
+}
+
+fn response_target_committed_product_bytes(target: &ResponseSenderPathTarget) -> u64 {
+    target
+        .snapshot
+        .product_bytes_in_flight
+        .saturating_add(target.snapshot.product_queue_bytes)
+        .saturating_add(target.snapshot.queue_bytes)
+}
+
+fn response_subflow_retention_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
+    let service_credit = response_active_owner_feed_credit_bytes(payload_bytes, mux_limits) as u64;
+    RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
+        .saturating_div(2)
+        .min(service_credit)
+        .max(payload_bytes as u64)
+}
+
+fn response_underfed_same_family_subflow_retention_target(
+    admitted: &[ResponseSelectedDataTarget],
+    service_key: Option<CarrierPathKey>,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> Option<ResponseSelectedDataTarget> {
+    let service_key = service_key.or_else(|| {
+        admitted
+            .iter()
+            .find(|selected| selected.admission.role == PathRuntimeRole::Service)
+            .map(|selected| selected.target.key)
+    })?;
+    let _service = admitted
+        .iter()
+        .find(|selected| selected.target.key == service_key)?;
+    let retention_credit = response_subflow_retention_credit_bytes(payload_bytes, mux_limits);
+
+    admitted
+        .iter()
+        .filter(|selected| {
+            selected.admission.role == PathRuntimeRole::Subflow
+                && selected.target.key.underlay == service_key.underlay
+                && selected.target.has_bulk_rate_evidence
+                && selected.target.snapshot.app_limited
+                && response_target_committed_product_bytes(&selected.target) < retention_credit
+        })
+        .min_by(|left, right| {
+            response_target_committed_product_bytes(&left.target)
+                .cmp(&response_target_committed_product_bytes(&right.target))
+                .then_with(|| left.target.eta_ms.total_cmp(&right.target.eta_ms))
+                .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
+        })
+        .cloned()
 }
 
 fn response_target_has_emission_credit(
@@ -4839,7 +5114,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_clear_bulk_rate_candidate_is_service_not_subflow() {
+    fn frontier_clear_bulk_rate_candidate_is_subflow_not_service() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active = response_target(0, UnderlayProtocol::Udp, 80.0, 0, 16 * 1024 * 1024, true);
@@ -4861,8 +5136,8 @@ mod tests {
             mux_limits,
         );
 
-        assert_eq!(admission.decision, PathAdmissionDecision::Service);
-        assert_eq!(admission.role, PathRuntimeRole::Service);
+        assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(admission.role, PathRuntimeRole::Subflow);
     }
 
     #[tokio::test]
@@ -5050,7 +5325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_owner_data_stays_on_service_path_while_product_owner_debt_exists() {
+    async fn response_owner_data_can_use_measured_same_family_subflow_under_product_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -5181,17 +5456,17 @@ mod tests {
         let dispatch = sender
             .dispatch_next(&stream, &mut send_stream, FlowLane::Throughput, mux_limits)
             .await
-            .expect("service owner should remain dispatchable while product owner debt exists");
+            .expect("measured same-family subflow should remain dispatchable while product owner debt exists");
 
-        assert_eq!(dispatch.selected_path, Some(active_key));
+        assert_eq!(dispatch.selected_path, Some(alternate_key));
         assert_eq!(binding.ordered_data_owner(), Some(active_key));
         assert!(matches!(
-            recv_reliable_path_command(&mut active_rx).await,
+            recv_reliable_path_command(&mut alternate_rx).await,
             Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
         ));
         assert!(
-            try_recv_reliable_path_command(&mut alternate_rx).is_none(),
-            "non-Service paths must not receive Subflow owner data while product owner debt exists"
+            try_recv_reliable_path_command(&mut active_rx).is_none(),
+            "Subflow owner data must not silently migrate the Service owner"
         );
     }
 
@@ -5473,6 +5748,63 @@ mod tests {
     }
 
     #[test]
+    fn lower_eta_same_family_path_is_subflow_not_service_owner() {
+        let service = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let lower_eta_subflow =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), lower_eta_subflow.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("lower ETA same-family path should be eligible as a Subflow");
+
+        assert_eq!(selected.target.key, lower_eta_subflow.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "non-active same-family OwnerData must not rewrite the Service owner solely because it has the lowest ETA"
+        );
+    }
+
+    #[test]
+    fn lower_eta_same_family_subflow_does_not_borrow_active_service_envelope() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut saturated_subflow =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 512 * 1024, false);
+        saturated_subflow.snapshot.product_bytes_in_flight =
+            RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64);
+        saturated_subflow.snapshot.bytes_in_flight =
+            RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64);
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), saturated_subflow],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("Service should remain eligible when the lower-ETA Subflow is out of credit");
+
+        assert_eq!(
+            selected.target.key, service.key,
+            "non-active Subflow admission must use additional-path gates instead of the active Service envelope"
+        );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
     fn response_ordinary_bulk_keeps_lead_only_inside_measured_hysteresis() {
         let mut lead = response_target(0, UnderlayProtocol::Udp, 5.1, 0, 16 * 1024 * 1024, true);
         let mut lower_eta_alternate =
@@ -5494,7 +5826,82 @@ mod tests {
     }
 
     #[test]
-    fn response_owner_debt_pressure_pauses_ownerdata_when_owner_queue_is_full() {
+    fn underfed_same_family_subflow_gets_retention_feed_when_service_window_is_nearly_full() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            5.0,
+            RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64),
+            16 * 1024 * 1024,
+            true,
+        );
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+        let mut subflow =
+            response_target(1, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, false);
+        subflow.snapshot.delivery_rate_bps = 45_000_000.0;
+        subflow.snapshot.product_progress_rate_bps = Some(45_000_000.0);
+        subflow.snapshot.app_limited = true;
+        subflow.has_sender_evidence = true;
+        subflow.has_bulk_rate_evidence = true;
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("same-family bulk-rate Subflow should remain eligible for retention feed");
+
+        assert_eq!(selected.target.key, subflow.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "retention feed must not migrate the Service owner"
+        );
+    }
+
+    #[test]
+    fn underfed_same_family_subflow_retention_does_not_wait_for_service_saturation() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+        let mut subflow =
+            response_target(1, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, false);
+        subflow.snapshot.delivery_rate_bps = 45_000_000.0;
+        subflow.snapshot.product_progress_rate_bps = Some(45_000_000.0);
+        subflow.snapshot.app_limited = true;
+        subflow.has_sender_evidence = true;
+        subflow.has_bulk_rate_evidence = true;
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("measured app-limited same-family Subflow should receive retention feed");
+
+        assert_eq!(selected.target.key, subflow.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "retention feed keeps a measured Subflow sampled without making it Service"
+        );
+    }
+
+    #[test]
+    fn response_owner_debt_pressure_uses_same_family_subflow_when_owner_queue_is_full() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
@@ -5520,23 +5927,61 @@ mod tests {
             mux_limits,
         );
 
-        assert!(
-            choose_response_sender_data_target_with_product_debt(
-                &[owner.clone(), alternate],
-                FlowLane::Throughput,
-                payload_bytes,
-                mux_limits,
-                &[],
-                Some(owner.key),
-                owner_debt_pressure.saturating_add(payload_bytes),
-            )
-            .is_none(),
-            "OwnerData must pause rather than migrate while the current owner is above debt pressure"
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[owner.clone(), alternate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(owner.key),
+            owner_debt_pressure.saturating_add(payload_bytes),
+            None,
+        )
+        .expect("measured same-family subflow should remain eligible when the owner queue is full");
+
+        assert_eq!(selected.target.key.path_id, PathId(1));
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "debt fallback must not silently migrate Service ownership"
         );
     }
 
     #[test]
-    fn response_owner_debt_pressure_respects_service_inflight_cap() {
+    fn response_owner_debt_pressure_uses_better_same_family_subflow_even_when_owner_has_credit() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let owner = response_target(0, UnderlayProtocol::Udp, 100.0, 0, 16 * 1024 * 1024, true);
+        let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &owner,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[owner.clone(), alternate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(owner.key),
+            owner_debt_pressure.saturating_add(payload_bytes),
+            None,
+        )
+        .expect("measured same-family subflow should compete under owner-debt pressure");
+
+        assert_eq!(selected.target.key.path_id, PathId(1));
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "owner-debt pressure must filter unsafe paths, not force a worse Service owner"
+        );
+    }
+
+    #[test]
+    fn response_owner_debt_pressure_uses_same_family_subflow_when_service_is_over_budget() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -5555,8 +6000,51 @@ mod tests {
             mux_limits,
         );
 
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[owner.clone(), alternate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(owner.key),
+            owner_debt_pressure.saturating_add(payload_bytes),
+            None,
+        )
+        .expect("same-family measured subflow should remain eligible when Service is over budget");
+
+        assert_eq!(selected.target.key.path_id, PathId(1));
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    }
+
+    #[test]
+    fn response_owner_debt_pressure_blocks_cross_underlay_when_owner_queue_is_full() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let alternate = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        let (owner_commands, _owner_rx) = reliable_path_command_channels(1);
+        owner_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(99),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("seed full owner data queue");
+        owner.commands = owner_commands;
+
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &owner,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
         assert!(
-            choose_response_sender_data_target_with_product_debt(
+            select_response_sender_data_target_with_product_debt_and_epoch(
                 &[owner.clone(), alternate],
                 FlowLane::Throughput,
                 payload_bytes,
@@ -5564,9 +6052,56 @@ mod tests {
                 &[],
                 Some(owner.key),
                 owner_debt_pressure.saturating_add(payload_bytes),
+                None,
             )
             .is_none(),
-            "product-owner debt pressure must not bypass active Service inflight admission; pause OwnerData instead of expanding old-owner backlog"
+            "owner-debt fallback must not migrate ordered bytes across TCP/QUIC families"
+        );
+    }
+
+    #[test]
+    fn response_owner_debt_pressure_blocks_proof_only_same_family_subflow() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut alternate =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        alternate.has_sender_evidence = true;
+        alternate.has_bulk_rate_evidence = false;
+        let (owner_commands, _owner_rx) = reliable_path_command_channels(1);
+        owner_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(99),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("seed full owner data queue");
+        owner.commands = owner_commands;
+
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &owner,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert!(
+            select_response_sender_data_target_with_product_debt_and_epoch(
+                &[owner.clone(), alternate],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                Some(owner.key),
+                owner_debt_pressure.saturating_add(payload_bytes),
+                None,
+            )
+            .is_none(),
+            "proof-only paths must stay Probe/Standby while older owner debt is unresolved"
         );
     }
 

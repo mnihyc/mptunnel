@@ -148,7 +148,8 @@ pub(super) fn bulk_service_horizon_payload_bytes(
         .min(stream_window)
         .max(payload_bytes)
         .max(1);
-    envelope
+    let horizon = ((payload_bytes as f64) * (envelope as f64)).sqrt().round() as usize;
+    horizon.clamp(payload_bytes.max(1), envelope)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -800,10 +801,22 @@ mod tests {
 
         assert_eq!(
             limit,
-            bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate))
+            bulk_service_horizon_payload_bytes(payload, mux_limits) as u64
         );
-        assert!(limit <= bulk_service_horizon_payload_bytes(payload, mux_limits) as u64);
-        assert!(limit >= bulk_path_bdp_bytes(candidate));
+        assert!(limit < bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate)));
+        assert!(limit >= payload as u64);
+    }
+
+    #[test]
+    fn bulk_service_horizon_is_geometric_mean_not_full_envelope() {
+        let payload = 64 * 1024;
+        let mux_limits = MuxLimits::default();
+
+        assert_eq!(
+            bulk_service_horizon_payload_bytes(payload, mux_limits),
+            2 * 1024 * 1024,
+            "the service horizon is a preemptible scoring window, not the full product envelope"
+        );
     }
 
     #[test]

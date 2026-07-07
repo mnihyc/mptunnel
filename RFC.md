@@ -2118,6 +2118,15 @@ used only for path scoring; it MUST NOT become an indivisible frame, AEAD
 record, or path write. The sender still emits bounded quanta so control, ACK,
 repair, realtime, and latency work can interleave.
 
+The service horizon applies to initial Service selection and to the current
+Service owner feed. It MUST NOT be reused as the per-candidate payload for an
+already measured Subflow owner decision. A same-family Subflow candidate is
+scored against the next owner range or explicit Subflow credit being assigned to
+that path, then checked against ordering-debt and completion-horizon guards. If
+the implementation scores every 64 KiB Subflow decision as though the Subflow had
+to drain the entire product service horizon, the scheduler serializes the stream
+onto the Service path and prevents useful aggregation.
+
 For throughput and background lanes, delivery rate is first adjusted by the
 number of active bulk flows sharing the path; when a stream considers moving or
 adding work to a non-active path, that stream is counted as joining the path
@@ -2641,8 +2650,12 @@ An unknown path does not join ordinary same-stream bulk merely because it is
 open, but a Validation attachment can receive path-scoped proof traffic.
 Path proof creates liveness/sender evidence only; it is not product delivery
 proof and does not itself make the path a bulk subflow. Same-family proof paths
-MUST NOT receive product `OwnerData` until they have bulk-rate evidence; a path
-that lacks bulk-rate evidence stays `Probe`, `Standby`, or `RepairOnly`.
+MUST NOT receive steady-state product `OwnerData` until they have bulk-rate
+evidence. They MAY receive only the bounded clear-frontier startup Subflow
+`OwnerData` window described above, and only after the current Service has
+direction-correct bulk-rate evidence. A path that lacks bulk-rate evidence and
+has no remaining startup Subflow credit stays `Probe`, `Standby`, or
+`RepairOnly`.
 Validation attachment is triggered by bulk
 demand and path admission; it MUST NOT depend on the sender having outbound
 repair bytes.
@@ -2836,9 +2849,14 @@ visible to admission policy, but it does not by itself make the path eligible
 for ordered `STREAM_DATA` ownership.
 The resulting ACK-derived rate becomes bulk-rate evidence only after the
 acknowledged DATA byte volume is large enough for the path's modeled flight
-envelope; otherwise the sample remains ACK-data evidence for validation
-visibility only. ACK-data evidence is not an owner state and MUST NOT bypass
-lower-frontier ownership. Ordinary unique bulk
+envelope, with two bounds. The floor MUST be at least a small multi-packet
+DATA sample so a tiny ACK burst cannot create a bulk-rate Subflow, and it MUST
+be capped by a bounded startup graduation window so a large transient QUIC
+cwnd/inflight estimate cannot make proof self-defeating by requiring more
+bytes than the product scheduler will feed before graduation. Otherwise the
+sample remains ACK-data evidence for validation visibility only. ACK-data
+evidence is not an owner state and MUST NOT bypass lower-frontier ownership.
+Ordinary unique bulk
 ownership requires either that the path is already the active service path or
 that the path has non-application-limited bulk-rate evidence and passes the
 normal ECF/BLEST admission and no-worse guards. ACK-data seen does not set
@@ -2857,18 +2875,19 @@ same path-aware ACK/progress quantum used to decide when product ACK feedback is
 needed. Small normal in-flight debt is not enough to pin the service path; that
 would prevent the latency-first stream from moving to a better bulk path on
 demand. Once owner-debt pressure exists, the sender MUST treat the current
-ordered-data owner as a hard OwnerData gate, not as an ETA preference. If the
-current owner can accept the next OwnerData quantum, the sender MUST keep unique
-`OwnerData` on that owner. If the current owner cannot accept it, the sender MUST
-pause new OwnerData instead of assigning later offsets to another path. Duplicate
-validation bulk copies also remain paused until the owner debt falls below
-pressure or explicit loss/failure/stall evidence converts the affected range
-into `RepairData`. This prevents per-quantum ETA changes from turning an
-unhealthy flow into owner migration, receive-hole growth, and repeated duplicate
-traffic. Optional paths may still carry `Probe`, `Control`, and gap-targeted
-`RepairData` that is justified by explicit evidence; they MUST NOT receive
-speculative Subflow owner bytes merely because they look faster while the product
-layer is already under ACK/reorder pressure for older owner ranges.
+ordered-data owner as a family/evidence filter, not a priority bypass. The
+current Service owner and already measured same-family Subflows remain eligible
+for `OwnerData`; proof-only, cross-family, and unmeasured candidates remain
+`Probe`, `Standby`, or `RepairOnly` until the debt falls below pressure or
+explicit loss/failure/stall evidence converts the affected range into
+`RepairData`. The surviving OwnerData candidates still pass the normal
+ECF/BLEST-style no-worse checks for ETA, inflight, ordering debt, read-gap,
+queue, overhead, and completion horizon. This prevents per-quantum ETA changes
+from turning an unhealthy flow into cross-family owner migration, receive-hole
+growth, and repeated duplicate traffic without hard-pinning a stalled Service
+owner when a measured same-family Subflow can reduce completion time. Optional
+paths may still carry `Probe`, `Control`, and gap-targeted `RepairData` that is
+justified by explicit evidence.
 
 For mixed TCP+QUIC reliable streams, production v1 uses a stricter same-family
 `OwnerData` rule. A product stream that already has a Service carrier family
@@ -3517,10 +3536,27 @@ The configured ceiling MUST be applied as an upper bound over the adaptive
 product-flight model. It MUST NOT be implemented as a floor that expands a
 smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
 Product owner debt pressure MUST NOT bypass the active Service product-flight
-admission check. If older owner debt is above pressure and the current owner is
-already over its product budget, the sender pauses new OwnerData so the frontier
-can drain; it MUST NOT feed the old owner merely because sending to a Subflow
-would be unsafe.
+admission check. If older owner debt is above pressure, debt pressure acts as a
+family/evidence filter: the current Service owner and already measured
+same-family Subflows remain eligible for OwnerData, while cross-family
+candidates and proof-only candidates remain Probe, Standby, or RepairOnly until
+the debt clears. The surviving OwnerData candidates are then ranked by the
+normal no-worse admission checks: ETA, inflight, ordering debt, read-gap/reorder
+budget, queue, and completion horizon. A sender MUST NOT hard-pin new OwnerData
+to the current owner merely because that owner owns older bytes; doing so turns
+ordering debt into sender starvation instead of an ECF/BLEST-style completion
+decision. A measured same-family Subflow admitted under debt pressure still
+MUST NOT change the Service owner hint merely because it carried the next range.
+When an already bulk-rate-proven same-family Subflow is application-limited with
+little or no product flight, the sender MAY feed that Subflow up to a bounded
+retention window before ordinary ETA tie-breaking. This MUST NOT wait for the
+Service path to become locally saturated: doing so can permanently starve the
+Subflow, then use the underfed rate sample as proof that the path cannot
+contribute. This is not a new proof state and it does not make the Subflow the
+Service owner; it is a stable-subflow scheduling rule.
+The retention feed remains subject to the same OwnerData admission checks and
+MUST NOT apply to proof-only, cross-family, RepairOnly, or Standby paths.
+Its ETA input is the retained Subflow owner range, not the full Service horizon.
 When no live path snapshot exists yet, startup product flight is derived from
 the normal startup path model and lane gain, then capped by the same ceiling.
 Unknown-path startup MUST NOT jump directly to the configured maximum merely

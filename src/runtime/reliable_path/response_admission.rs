@@ -375,11 +375,12 @@ pub(in crate::runtime) fn server_bulk_output_eta_ms(
         .saturating_add(snapshot.product_queue_bytes)
         .saturating_add(snapshot.bytes_in_flight)
         .saturating_mul(8) as f64;
-    let scoring_payload_bytes = if relay_lane_is_bulk(lane) {
-        bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
-    } else {
-        payload_bytes
-    };
+    let scoring_payload_bytes =
+        if relay_lane_is_bulk(lane) && (active_key.is_none() || Some(key) == active_key) {
+            bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+        } else {
+            payload_bytes
+        };
     let payload_bits = scoring_payload_bytes as f64 * 8.0;
     let mut eta_ms = snapshot.srtt_ms / 2.0;
     let effective_rate_bps = snapshot.delivery_rate_bps.max(1.0);
@@ -454,10 +455,22 @@ fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
 }
 
 fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
-    metrics
+    let carrier_floor = metrics
         .inflight_hi_bytes
         .max(metrics.inflight_limit_bytes)
-        .max(PATH_OPEN_SCORE_BYTES as u64)
+        .max(PATH_OPEN_SCORE_BYTES as u64);
+    match metrics.underlay {
+        UnderlayProtocol::Tcp => carrier_floor,
+        UnderlayProtocol::Udp => {
+            let minimum_meaningful_sample = (PATH_OPEN_SCORE_BYTES as u64).saturating_mul(4);
+            let startup_graduation_sample = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
+                .saturating_div(2)
+                .max(minimum_meaningful_sample);
+            carrier_floor
+                .max(minimum_meaningful_sample)
+                .min(startup_graduation_sample)
+        }
+    }
 }
 
 fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
@@ -861,6 +874,62 @@ mod tests {
     }
 
     #[test]
+    fn udp_startup_window_sample_graduates_even_when_inflight_limit_is_larger() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(11),
+        };
+        let sample_bytes = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES / 2;
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            local_path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 160_000,
+                    srtt_us: 160_000,
+                    rttvar_us: 5_000,
+                    jitter_us: 5_000,
+                    delivery_rate_bps: 42_000_000,
+                    pacing_rate_bps: 42_000_000,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: 0,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    inflight_hi_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    confidence_ppm: 1_000_000,
+                    app_limited: false,
+                    has_ack_derived_data_sample: true,
+                    data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                    data_sample_bytes: sample_bytes,
+                },
+            }),
+            peer_path_metrics: None,
+        };
+
+        assert!(
+            server_output_has_bulk_rate_evidence(&entry),
+            "a path with substantial non-app-limited QUIC ACK-derived product data must not be trapped below a transient inflight-limit floor"
+        );
+    }
+
+    #[test]
     fn tcp_response_snapshot_persistent_delivery_samples_override_default_prior() {
         let (commands, _receivers) = reliable_path_command_channels(8);
         let prior_rate = default_path_rate_bps(UnderlayProtocol::Tcp);
@@ -928,6 +997,34 @@ mod tests {
         assert!(
             (baseline_eta - inflated_eta).abs() < 0.001,
             "QUIC pacing is carrier send permission, not delivered product throughput"
+        );
+    }
+
+    #[test]
+    fn response_subflow_eta_uses_owner_quantum_not_service_horizon() {
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let subflow = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let mut snapshot = PathSnapshot::new(subflow.path_id, subflow.underlay, 80.0, 40_000_000.0);
+        snapshot.confidence = 1.0;
+
+        let eta_ms = server_bulk_output_eta_ms(
+            subflow,
+            snapshot,
+            Some(service),
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+        );
+
+        assert!(
+            eta_ms < 100.0,
+            "Subflow ETA must model the next assigned owner range, not a full Service horizon; got {eta_ms:.3}ms"
         );
     }
 }

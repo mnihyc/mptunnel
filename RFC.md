@@ -1825,27 +1825,28 @@ is not repair-authoritative
 (`complete == false`), omitted ranges MUST NOT be interpreted as holes. If the
 ACK is repair-authoritative (`complete == true`),
 the sender may compute holes below the largest end offset carried in that frame
-and schedule only those unacknowledged ranges for repair when the active path
-does not already own reliable packet recovery for that data. For ordinary
-reliable streams over the UDP carrier, an ACK gap by itself MUST NOT trigger
-product-level `STREAM_DATA` reinjection, because QUIC is already recovering
-lost packets with QUIC ACKs, loss detection, congestion control, and PTO.
-Product-level reinjection over UDP is reserved for explicit path failure,
-active stall, migration, or multipath repair where carrier ownership of the
-original flight is no longer sufficient. A fresh ACK gap below the largest
-carried end offset is evidence of a possible receive hole, not by itself proof
-that product-level repair should race the UDP carrier. When a reliable stream
-has more than one attached path and a repair-authoritative `STREAM_ACK` exposes
-the same first missing offset beyond the stream progress interval derived from
-path RTT, jitter, lane, and stall state, that persistent hole is a multipath
-repair signal even if the hole's upper bound grows as later bytes arrive. The
+and schedule only those unacknowledged ranges for repair only after persistent
+gap evidence shows that the carrier recovery that owns the original flight is
+not sufficient. For ordinary reliable streams over TCP or QUIC carriers, an ACK
+gap by itself MUST NOT trigger product-level `STREAM_DATA` reinjection: TCP and
+QUIC already own packet/stream reliability below mptunnel. Product-level
+reinjection is reserved for explicit path failure, active stall, migration, or
+multipath repair where the first missing product offset persists beyond the
+PTO-derived persistent-congestion window for the active reliable carrier. A
+fresh ACK gap below the largest carried end offset is evidence of a possible
+receive hole, not by itself proof that product-level repair should race the
+carrier. When a reliable stream has more than one attached path and a
+repair-authoritative `STREAM_ACK` exposes the same first missing offset beyond
+the persistent repair delay derived from path RTT, jitter, lane, and stall
+state, that persistent hole is a multipath repair signal even if the hole's
+upper bound grows as later bytes arrive. The
 sender SHOULD reinject only the missing cached ranges on an eligible alternative
 path, avoiding the path that last carried the missing range when an alternative
 exists, and MUST rate-limit repeated reinjection of the same first missing
-offset by the same progress interval. This is the product-layer equivalent of
-MPTCP reinjection. It does not weaken UDP carrier recovery; it prevents one slow
-or lossy UDP carrier from holding the only copy of an ordered stream byte while
-other survivor paths are usable. On path failure, the sender repairs only
+offset by the same persistent repair delay. This is the product-layer
+equivalent of MPTCP reinjection. It does not weaken carrier recovery; it
+prevents one slow or lossy carrier from holding the only copy of an ordered
+stream byte while other survivor paths are usable. On path failure, the sender repairs only
 unacknowledged bytes last sent on the failed or suspect path. A sender MUST NOT
 retransmit acknowledged ranges and MUST NOT replay the entire repair cache after
 reattach.
@@ -3247,7 +3248,7 @@ Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
 a gap, a path failure or detach event, or known-final-offset tail recovery.
 Data-plane PTO/stall evidence is a timer input for deciding when to act on those
 facts; it is not by itself permission to duplicate arbitrary live tail bytes.
-The same sender-owned extra-traffic ledger applies to immediate ACK-gap repair
+The same sender-owned extra-traffic ledger applies to persistent ACK-gap repair
 and later final-tail repair, because both cases spend duplicate traffic from the
 same stream-level budget. The repair extent is the missing or suspect
 unacknowledged byte range indicated by that event, not every cached chunk below

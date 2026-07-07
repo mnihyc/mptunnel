@@ -1251,7 +1251,7 @@ where
                         )
                         .min(sender.repair_extra_event_budget_remaining(context.mux_limits));
                         let has_multipath_repair_alternative = remotes.path_keys().len() > 1;
-                        let udp_gap_repair_ready = ack_gap_repair.repair_ready(
+                        let ack_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
                             &normalized_ranges,
                             remotes.active_path_underlay(),
@@ -1264,9 +1264,8 @@ where
                             &normalized_ranges,
                             repair_limit,
                             complete,
-                            remotes.active_path_underlay(),
                             has_multipath_repair_alternative,
-                            udp_gap_repair_ready,
+                            ack_gap_repair_ready,
                         );
                         let repair_kind = if repair_frames.is_empty() {
                             let fin_tail_frames = stream_final_offset_tail_repair_frames(
@@ -1291,7 +1290,7 @@ where
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_before={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={}",
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_before={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} ack_gap_repair_ready={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
@@ -1303,7 +1302,7 @@ where
                                 repair_kind,
                                 remotes.active_path_underlay(),
                                 has_multipath_repair_alternative,
-                                udp_gap_repair_ready,
+                                ack_gap_repair_ready,
                             ),
                         );
                         for frame in repair_frames {

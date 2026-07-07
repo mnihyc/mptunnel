@@ -2572,7 +2572,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
 }
 
 #[test]
-fn stream_ack_gap_repair_is_suppressed_on_udp_reliable_carrier() {
+fn stream_ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(31), mux_limits);
     send_stream
@@ -2590,79 +2590,29 @@ fn stream_ack_gap_repair_is_suppressed_on_udp_reliable_carrier() {
     ];
 
     assert!(
-        stream_ack_gap_repair_frames(
-            &send_stream,
-            &ranges,
-            usize::MAX,
-            true,
-            Some(UnderlayProtocol::Tcp),
-            false,
-            false,
-        )
-        .is_empty(),
-        "a single ordered TCP carrier must not replay product bytes over itself"
-    );
-    let tcp_repairs = stream_ack_gap_repair_frames(
-        &send_stream,
-        &ranges,
-        usize::MAX,
-        true,
-        Some(UnderlayProtocol::Tcp),
-        true,
-        false,
-    );
-    assert_eq!(tcp_repairs.len(), 1);
-    assert!(matches!(
-        &tcp_repairs[0],
-        Frame::StreamData {
-            offset: 4,
-            payload,
-            ..
-        } if payload.as_ref() == b"bbbb"
-    ));
-
-    assert!(
-        stream_ack_gap_repair_frames(
-            &send_stream,
-            &ranges,
-            usize::MAX,
-            true,
-            Some(UnderlayProtocol::Udp),
-            false,
-            true,
-        )
-        .is_empty(),
-        "a single UDP reliable carrier owns ordinary packet-loss recovery"
+        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, false, false,)
+            .is_empty(),
+        "a single reliable carrier must not replay product bytes over itself"
     );
     assert!(
-        stream_ack_gap_repair_frames(
-            &send_stream,
-            &ranges,
-            usize::MAX,
-            true,
-            Some(UnderlayProtocol::Udp),
-            true,
-            false,
-        )
-        .is_empty(),
-        "fresh UDP multipath ACK gaps wait for persistent product-hole evidence"
+        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, false, true,)
+            .is_empty(),
+        "a single reliable carrier owns ordinary packet-loss recovery"
     );
-    let udp_multipath_repairs = stream_ack_gap_repair_frames(
-        &send_stream,
-        &ranges,
-        usize::MAX,
-        true,
-        Some(UnderlayProtocol::Udp),
-        true,
-        true,
+    assert!(
+        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, true, false,)
+            .is_empty(),
+        "fresh multipath ACK gaps wait for persistent product-hole evidence"
     );
+    let persistent_gap_repairs =
+        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, true, true);
     assert_eq!(
-        udp_multipath_repairs.len(),
+        persistent_gap_repairs.len(),
         1,
-        "multipath UDP may reinject authoritative product gaps over another path"
+        "multipath repair may reinject authoritative product gaps over another path"
     );
     assert!(matches!(
-        &udp_multipath_repairs[0],
+        &persistent_gap_repairs[0],
         Frame::StreamData {
             offset: 4,
             payload,
@@ -2670,16 +2620,8 @@ fn stream_ack_gap_repair_is_suppressed_on_udp_reliable_carrier() {
         } if payload.as_ref() == b"bbbb"
     ));
     assert!(
-        stream_ack_gap_repair_frames(
-            &send_stream,
-            &ranges,
-            usize::MAX,
-            false,
-            Some(UnderlayProtocol::Tcp),
-            false,
-            false,
-        )
-        .is_empty(),
+        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, false, false, false,)
+            .is_empty(),
         "non-authoritative ACK snapshots must not infer missing holes"
     );
 }

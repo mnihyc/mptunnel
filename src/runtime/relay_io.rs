@@ -45,9 +45,8 @@ pub(super) fn reliable_relay_error_is_migratable(err: &RuntimeError) -> bool {
 
 pub(super) fn stream_ack_gap_repair_allowed(
     complete: bool,
-    active_underlay: Option<UnderlayProtocol>,
     has_multipath_repair_alternative: bool,
-    udp_gap_repair_ready: bool,
+    ack_gap_repair_ready: bool,
 ) -> bool {
     if !complete {
         return false;
@@ -55,10 +54,7 @@ pub(super) fn stream_ack_gap_repair_allowed(
     if !has_multipath_repair_alternative {
         return false;
     }
-    if active_underlay != Some(UnderlayProtocol::Udp) {
-        return true;
-    }
-    udp_gap_repair_ready
+    ack_gap_repair_ready
 }
 
 /// Product tail repair is reinjection onto an independent subflow, not a
@@ -115,21 +111,26 @@ pub(super) fn reliable_relay_tail_repair_deadline(
     )
 }
 
+pub(super) fn reliable_ack_gap_repair_delay(
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+) -> Duration {
+    reliable_relay_stall_timeout(path, lane).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+}
+
 #[cfg(test)]
 pub(super) fn stream_ack_gap_repair_frames(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
     complete: bool,
-    active_underlay: Option<UnderlayProtocol>,
     has_multipath_repair_alternative: bool,
-    udp_gap_repair_ready: bool,
+    ack_gap_repair_ready: bool,
 ) -> Vec<Frame> {
     if stream_ack_gap_repair_allowed(
         complete,
-        active_underlay,
         has_multipath_repair_alternative,
-        udp_gap_repair_ready,
+        ack_gap_repair_ready,
     ) {
         send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit)
     } else {
@@ -142,15 +143,13 @@ pub(super) fn stream_ack_gap_repair_frames_normalized(
     ranges: &[OffsetRange],
     byte_limit: usize,
     complete: bool,
-    active_underlay: Option<UnderlayProtocol>,
     has_multipath_repair_alternative: bool,
-    udp_gap_repair_ready: bool,
+    ack_gap_repair_ready: bool,
 ) -> Vec<Frame> {
     if stream_ack_gap_repair_allowed(
         complete,
-        active_underlay,
         has_multipath_repair_alternative,
-        udp_gap_repair_ready,
+        ack_gap_repair_ready,
     ) {
         send_stream.retransmission_frames_for_normalized_ack_gaps(ranges, byte_limit)
     } else {
@@ -212,7 +211,7 @@ impl ReliableAckGapRepairProgress {
             normalized_ranges,
             active_underlay,
             has_multipath_repair_alternative,
-            reliable_stream_recv_progress_interval(path, lane),
+            reliable_ack_gap_repair_delay(path, lane),
             Instant::now(),
         )
     }
@@ -230,9 +229,9 @@ impl ReliableAckGapRepairProgress {
             self.clear();
             return false;
         }
-        if active_underlay != Some(UnderlayProtocol::Udp) {
+        if active_underlay.is_none() {
             self.clear();
-            return normalized_stream_ack_first_gap(normalized_ranges).is_some();
+            return false;
         }
         if !has_multipath_repair_alternative {
             self.clear();
@@ -1651,7 +1650,7 @@ where
                             .min(response_sender.repair_extra_event_budget_remaining(mux_limits));
                         let has_multipath_repair_alternative =
                             path_stream.has_multipath_repair_alternative();
-                        let udp_gap_repair_ready = ack_gap_repair.repair_ready(
+                        let ack_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
                             &normalized_ranges,
                             Some(path_stream.underlay),
@@ -1664,9 +1663,8 @@ where
                             &normalized_ranges,
                             repair_limit,
                             complete,
-                            Some(path_stream.underlay),
                             has_multipath_repair_alternative,
-                            udp_gap_repair_ready,
+                            ack_gap_repair_ready,
                         );
                         let repair_kind = if repair_frames.is_empty() {
                             let (fin_tail_frames, blocked_frontier_offset) =
@@ -1708,7 +1706,7 @@ where
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} udp_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
+                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} ack_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
@@ -1721,7 +1719,7 @@ where
                                 repair_kind,
                                 Some(path_stream.underlay),
                                 has_multipath_repair_alternative,
-                                udp_gap_repair_ready,
+                                ack_gap_repair_ready,
                                 base_repair_limit,
                                 repair_limit,
                                 performance.extra_traffic_hint_percent,
@@ -2348,43 +2346,11 @@ mod tests {
     }
 
     #[test]
-    fn udp_ack_gap_repair_requires_multipath_alternative() {
-        assert!(!stream_ack_gap_repair_allowed(
-            true,
-            Some(UnderlayProtocol::Udp),
-            false,
-            true,
-        ));
-        assert!(!stream_ack_gap_repair_allowed(
-            true,
-            Some(UnderlayProtocol::Udp),
-            true,
-            false,
-        ));
-        assert!(stream_ack_gap_repair_allowed(
-            true,
-            Some(UnderlayProtocol::Udp),
-            true,
-            true,
-        ));
-        assert!(!stream_ack_gap_repair_allowed(
-            true,
-            Some(UnderlayProtocol::Tcp),
-            false,
-            false,
-        ));
-        assert!(stream_ack_gap_repair_allowed(
-            true,
-            Some(UnderlayProtocol::Tcp),
-            true,
-            false,
-        ));
-        assert!(!stream_ack_gap_repair_allowed(
-            false,
-            Some(UnderlayProtocol::Udp),
-            true,
-            true,
-        ));
+    fn ack_gap_repair_requires_multipath_alternative_and_persistent_gap() {
+        assert!(!stream_ack_gap_repair_allowed(true, false, true));
+        assert!(!stream_ack_gap_repair_allowed(true, true, false));
+        assert!(stream_ack_gap_repair_allowed(true, true, true));
+        assert!(!stream_ack_gap_repair_allowed(false, true, true));
     }
 
     #[test]
@@ -2603,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_ack_gap_repair_progress_keeps_growing_hole_identity() {
+    fn ack_gap_repair_progress_keeps_growing_hole_identity() {
         let mut progress = ReliableAckGapRepairProgress::default();
         let first = [
             OffsetRange {
@@ -2627,14 +2593,23 @@ mod tests {
         ];
         let now = Instant::now();
         let interval = reliable_stream_recv_progress_interval(None, FlowLane::Throughput);
+        let repair_delay = reliable_ack_gap_repair_delay(None, FlowLane::Throughput);
 
         assert!(!progress.repair_ready_at(
             true,
             &first,
             Some(UnderlayProtocol::Udp),
             true,
-            interval,
+            repair_delay,
             now,
+        ));
+        assert!(!progress.repair_ready_at(
+            true,
+            &grown,
+            Some(UnderlayProtocol::Udp),
+            true,
+            repair_delay,
+            now + interval,
         ));
         assert!(
             progress.repair_ready_at(
@@ -2642,8 +2617,8 @@ mod tests {
                 &grown,
                 Some(UnderlayProtocol::Udp),
                 true,
-                interval,
-                now + interval,
+                repair_delay,
+                now + repair_delay,
             ),
             "a growing ACK horizon with the same missing frontier is one persistent hole"
         );
@@ -2652,13 +2627,13 @@ mod tests {
             &grown,
             Some(UnderlayProtocol::Udp),
             true,
-            interval,
-            now + interval + Duration::from_millis(1),
+            repair_delay,
+            now + repair_delay + Duration::from_millis(1),
         ));
     }
 
     #[test]
-    fn udp_ack_gap_repair_progress_resets_when_frontier_advances() {
+    fn ack_gap_repair_progress_resets_when_frontier_advances() {
         let mut progress = ReliableAckGapRepairProgress::default();
         let first = [
             OffsetRange {
@@ -2681,14 +2656,14 @@ mod tests {
             },
         ];
         let now = Instant::now();
-        let interval = reliable_stream_recv_progress_interval(None, FlowLane::Throughput);
+        let repair_delay = reliable_ack_gap_repair_delay(None, FlowLane::Throughput);
 
         assert!(!progress.repair_ready_at(
             true,
             &first,
             Some(UnderlayProtocol::Udp),
             true,
-            interval,
+            repair_delay,
             now,
         ));
         assert!(!progress.repair_ready_at(
@@ -2696,16 +2671,72 @@ mod tests {
             &advanced,
             Some(UnderlayProtocol::Udp),
             true,
-            interval,
-            now + interval,
+            repair_delay,
+            now + repair_delay,
         ));
         assert!(progress.repair_ready_at(
             true,
             &advanced,
             Some(UnderlayProtocol::Udp),
             true,
-            interval,
-            now + interval + interval,
+            repair_delay,
+            now + repair_delay + repair_delay,
         ));
+    }
+
+    #[test]
+    fn ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
+        let ranges = [
+            OffsetRange {
+                start: 0,
+                end: 64 * 1024,
+            },
+            OffsetRange {
+                start: 128 * 1024,
+                end: 192 * 1024,
+            },
+        ];
+        let now = Instant::now();
+        let repair_delay = reliable_relay_stall_timeout(None, FlowLane::Throughput)
+            .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let mut progress = ReliableAckGapRepairProgress::default();
+            assert!(!progress.repair_ready_at(
+                true,
+                &ranges,
+                Some(underlay),
+                true,
+                repair_delay,
+                now,
+            ));
+            assert!(!progress.repair_ready_at(
+                true,
+                &ranges,
+                Some(underlay),
+                true,
+                repair_delay,
+                now + repair_delay - Duration::from_millis(1),
+            ));
+            assert!(
+                progress.repair_ready_at(
+                    true,
+                    &ranges,
+                    Some(underlay),
+                    true,
+                    repair_delay,
+                    now + repair_delay,
+                ),
+                "{underlay:?} product repair should wait for a persistent ordered-stream gap",
+            );
+            assert!(!progress.repair_ready_at(
+                true,
+                &ranges,
+                Some(underlay),
+                true,
+                repair_delay,
+                now + repair_delay + Duration::from_millis(1),
+            ));
+        }
     }
 }

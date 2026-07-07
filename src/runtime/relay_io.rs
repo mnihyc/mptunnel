@@ -1735,6 +1735,9 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         let mux_started = Instant::now();
                         let ack = send_stream.apply_normalized_ack(&normalized_ranges);
+                        if ack.released_bytes > 0 {
+                            response_sender.record_owner_progress(ack.released_bytes);
+                        }
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         path_stream.release_normalized_acked_ranges(&normalized_ranges);

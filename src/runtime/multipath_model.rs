@@ -114,7 +114,7 @@ pub(super) fn cross_family_reliable_owner_health(
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ExtraTrafficBudget {
-    owner_payload_bytes: u64,
+    owner_progress_bytes: u64,
     optional_spent_bytes: u64,
     startup_floor_bytes: u64,
     percent_budget: u16,
@@ -122,13 +122,13 @@ pub(super) struct ExtraTrafficBudget {
 
 impl ExtraTrafficBudget {
     pub(super) fn new(
-        owner_payload_bytes: u64,
+        owner_progress_bytes: u64,
         optional_spent_bytes: u64,
         startup_floor_bytes: usize,
         performance: MppPerformanceConfig,
     ) -> Self {
         Self {
-            owner_payload_bytes,
+            owner_progress_bytes,
             optional_spent_bytes,
             startup_floor_bytes: startup_floor_bytes as u64,
             percent_budget: performance.extra_traffic_hint_percent,
@@ -137,7 +137,7 @@ impl ExtraTrafficBudget {
 
     pub(super) fn limit_bytes(self) -> u64 {
         self.startup_floor_bytes.saturating_add(
-            self.owner_payload_bytes
+            self.owner_progress_bytes
                 .saturating_mul(self.percent_budget as u64)
                 / 100,
         )
@@ -161,22 +161,22 @@ pub(super) enum ExtraTrafficKind {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ExtraTrafficLedger {
-    owner_payload_bytes: u64,
+    owner_progress_bytes: u64,
     repair_bytes: u64,
 }
 
 impl ExtraTrafficLedger {
     #[cfg(test)]
-    pub(super) fn owner_payload_bytes(self) -> u64 {
-        self.owner_payload_bytes
+    pub(super) fn owner_progress_bytes(self) -> u64 {
+        self.owner_progress_bytes
     }
 
     pub(super) fn optional_spent_bytes(self) -> u64 {
         self.repair_bytes
     }
 
-    pub(super) fn record_owner_payload(&mut self, bytes: usize) {
-        self.owner_payload_bytes = self.owner_payload_bytes.saturating_add(bytes as u64);
+    pub(super) fn record_owner_progress(&mut self, bytes: usize) {
+        self.owner_progress_bytes = self.owner_progress_bytes.saturating_add(bytes as u64);
     }
 
     pub(super) fn record_optional(&mut self, kind: ExtraTrafficKind, bytes: usize) {
@@ -193,7 +193,7 @@ impl ExtraTrafficLedger {
         performance: MppPerformanceConfig,
     ) -> ExtraTrafficBudget {
         ExtraTrafficBudget::new(
-            self.owner_payload_bytes,
+            self.owner_progress_bytes,
             self.optional_spent_bytes(),
             startup_floor_bytes,
             performance,
@@ -458,10 +458,10 @@ mod tests {
     #[test]
     fn extra_traffic_ledger_keeps_owner_and_optional_bytes_separate() {
         let mut ledger = ExtraTrafficLedger::default();
-        ledger.record_owner_payload(1_000_000);
+        ledger.record_owner_progress(1_000_000);
         ledger.record_optional(ExtraTrafficKind::Repair, 300);
 
-        assert_eq!(ledger.owner_payload_bytes(), 1_000_000);
+        assert_eq!(ledger.owner_progress_bytes(), 1_000_000);
         assert_eq!(ledger.optional_spent_bytes(), 300);
         assert_eq!(
             ledger

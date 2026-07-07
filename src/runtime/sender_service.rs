@@ -2256,8 +2256,12 @@ impl ServerResponseSenderService {
     }
 
     #[cfg(test)]
-    pub(super) fn record_ordinary_data_dispatched_for_test(&mut self, bytes: usize) {
-        self.extra_traffic.record_owner_payload(bytes);
+    pub(super) fn record_owner_progress_for_test(&mut self, bytes: usize) {
+        self.record_owner_progress(bytes);
+    }
+
+    pub(super) fn record_owner_progress(&mut self, bytes: usize) {
+        self.extra_traffic.record_owner_progress(bytes);
     }
 
     pub(super) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
@@ -2583,10 +2587,6 @@ impl ServerResponseSenderService {
         enqueue_id: u64,
         queue_delay_ms: u128,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
-        if queued_lane == ReliableRelayQueuedWorkLane::Data {
-            self.extra_traffic
-                .record_owner_payload(committed.payload_bytes);
-        }
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = match queued_lane {
             ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
@@ -2746,8 +2746,12 @@ impl RelaySenderService {
     }
 
     #[cfg(test)]
-    fn record_owner_payload_for_test(&mut self, bytes: usize) {
-        self.extra_traffic.record_owner_payload(bytes);
+    fn record_owner_progress_for_test(&mut self, bytes: usize) {
+        self.record_owner_progress(bytes);
+    }
+
+    pub(super) fn record_owner_progress(&mut self, bytes: usize) {
+        self.extra_traffic.record_owner_progress(bytes);
     }
 
     pub(super) async fn send_stream_data(
@@ -3029,9 +3033,6 @@ impl RelaySenderService {
         } else {
             self.flights.record_owner_frame(path_key, &sent_frame)
         };
-        if !cause.is_repair() {
-            self.extra_traffic.record_owner_payload(payload_bytes);
-        }
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
         Ok(RelaySendOutcome { path_key })
     }
@@ -3988,11 +3989,11 @@ mod tests {
         );
 
         let earned_data_bytes = startup_floor.saturating_mul(100);
-        sender.record_ordinary_data_dispatched_for_test(earned_data_bytes);
+        sender.record_owner_progress_for_test(earned_data_bytes);
 
         assert!(
             sender.repair_extra_budget_remaining(mux_limits) >= startup_floor,
-            "ordinary owner bytes earn more bounded extra repair budget"
+            "ACK-released owner progress earns more bounded extra repair budget"
         );
         assert!(
             sender
@@ -4083,10 +4084,10 @@ mod tests {
                 .is_some()
         );
 
-        sender.record_ordinary_data_dispatched_for_test(startup_floor);
+        sender.record_owner_progress_for_test(startup_floor);
         assert!(
             sender.repair_extra_budget_remaining(mux_limits) > 0,
-            "ordinary data earns fractional repair budget"
+            "ACK-released owner progress earns fractional repair budget"
         );
         assert_eq!(
             sender.repair_extra_event_budget_remaining(mux_limits),
@@ -4094,10 +4095,67 @@ mod tests {
             "tiny earned repair crumbs should accumulate instead of emitting high-overhead repair frames"
         );
 
-        sender.record_ordinary_data_dispatched_for_test(min_burst.saturating_mul(100));
+        sender.record_owner_progress_for_test(min_burst.saturating_mul(100));
         assert!(
             sender.repair_extra_event_budget_remaining(mux_limits) >= min_burst,
-            "once enough owner bytes are sent, repair can spend a useful burst"
+            "once enough owner bytes make ACK progress, repair can spend a useful burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_owner_dispatch_does_not_earn_repair_budget_before_ack_progress() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(96);
+        let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                mux_limits,
+            ),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(96),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+
+        sender
+            .extra_traffic
+            .record_optional(ExtraTrafficKind::Repair, startup_floor);
+        assert_eq!(sender.repair_extra_budget_remaining(mux_limits), 0);
+
+        sender.enqueue_data_for_lane(
+            Bytes::from(vec![0x96; startup_floor.saturating_mul(100)]),
+            FlowLane::Throughput,
+        );
+        sender
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+            )
+            .await
+            .expect("owner dispatch should not be blocked by exhausted repair budget");
+
+        assert_eq!(
+            sender.repair_extra_budget_remaining(mux_limits),
+            0,
+            "emitted OwnerData must not earn optional repair budget until ordered ACK progress releases it"
         );
     }
 
@@ -4181,7 +4239,7 @@ mod tests {
             false,
         ));
 
-        sender.record_owner_payload_for_test(startup_floor.saturating_mul(100));
+        sender.record_owner_progress_for_test(startup_floor.saturating_mul(100));
         assert!(sender.enqueue_repair_frame_with_priority(
             &mut sender_queue,
             Frame::StreamData {

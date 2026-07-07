@@ -3312,12 +3312,13 @@ owner. If the blocked frontier later produces data-plane PTO/stall evidence,
 the sender may act only on the explicit gap or known-final-offset repair
 conditions described below.
 `extra_traffic_hint_percent` feeds a cumulative extra-traffic ledger owned by
-the response sender service. Ordinary unique owner bytes earn additional
-repair budget; repair debits that ledger. Path proof traffic is bounded by validation attach fan-out and the
-path-proof startup payload, not by the response sender's data queue. A small
-startup floor prevents repair deadlock before enough ordinary bytes have been
-sent, but the floor is spent once and does not refresh on every ACK-gap or
-tail-stall event. After that floor is spent, newly earned repair budget
+the sender service. ACK-released ordinary `OwnerData` progress earns additional
+repair budget; emitting bytes into unresolved ordered flight does not. Repair
+debits that ledger. Path proof traffic is bounded by validation attach fan-out
+and the path-proof startup payload, not by the sender's data queue. A small
+startup floor prevents repair deadlock before enough ordinary bytes have made
+ACK progress, but the floor is spent once and does not refresh on every ACK-gap
+or tail-stall event. After that floor is spent, newly earned repair budget
 accumulates until it can fund at least one useful repair burst; sub-MSS or
 crumb-sized repairs are not emitted merely because a small fractional budget was
 earned. The value is a continuous hint for how aggressively the sender may trade

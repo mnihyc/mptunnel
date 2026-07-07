@@ -611,12 +611,16 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
         BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
             if stream_ordering_debt_bytes == 0 =>
         {
-            bulk_product_inflight_limit_bytes(
-                candidate,
-                payload_bytes,
-                mux_limits,
-                BulkAdmissionRole::ActiveDataPath,
-            )
+            if bulk_active_role_has_latency_pressure(candidate, role) {
+                bulk_product_inflight_limit_bytes(
+                    candidate,
+                    payload_bytes,
+                    mux_limits,
+                    BulkAdmissionRole::ActiveDataPath,
+                )
+            } else {
+                bulk_active_lead_product_envelope_bytes(candidate, payload_bytes, mux_limits)
+            }
         }
         BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
             let reorder_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
@@ -847,6 +851,36 @@ mod tests {
                 BulkAdmissionRole::ActiveDataPath,
             ),
             Some("reorder_budget")
+        );
+    }
+
+    #[test]
+    fn active_tcp_service_with_clear_frontier_uses_product_envelope_for_reorder_budget() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.product_progress_rate_bps = Some(mbps(0.351));
+        active.queue_bytes = payload as u64;
+        active.product_bytes_in_flight = 341_200;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                50_018.062,
+                active,
+                50_018.062,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "a clear-frontier Service owner must not lose lead eligibility because the reorder gate reuses a tiny app-limited BDP budget"
         );
     }
 

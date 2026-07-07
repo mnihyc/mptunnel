@@ -442,7 +442,11 @@ may affect sender-service fairness and preemption, but they MUST NOT reduce a
 clear-frontier bulk Service owner to a tiny startup-rate or carrier-cwnd
 product admission ceiling. While bulk demand exists and the ordered frontier is
 clear, the Service owner is fed through the product Service envelope; lower
-carrier congestion and pacing remain the carrier engine's responsibility.
+carrier congestion and pacing remain the carrier engine's responsibility. The
+same envelope applies to clear-frontier Service reorder admission. Reorder
+budgets are for additional paths, cross-path lower-byte debt, and explicit
+owner-debt pressure; they MUST NOT make the active Service owner inadmissible
+because an app-limited BDP estimate is smaller than one queued carrier quantum.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,

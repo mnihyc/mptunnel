@@ -329,8 +329,8 @@ authentication. A path MUST NOT own product stream offsets or decide that a
 reliable stream should stripe onto it merely because it has capacity.
 
 A path group or carrier subflow set is not a product-offset owner. It is a bounded
-scheduler epoch for one flow: one Service path plus bulk-rate-proven Subflow
-members admitted from session paths, path-model evidence, queue state, and
+scheduler epoch for one flow: one Service path plus admitted Subflow members
+selected from session paths, path-model evidence, queue state, and
 ECF/BLEST/no-worse admission. The epoch remains valid only while ACK progress,
 read-gap debt, repair pressure, overhead budget, and path metrics remain within
 the admission envelope. It is refreshed or demoted on progress, loss/repair
@@ -372,12 +372,18 @@ make a non-active path the Service owner for ordered product bytes. A
 same-family path may replace the current Service for ordinary owner data only
 after direction-correct bulk-rate evidence exists and the ETA/no-worse selector
 admits that change. ACK-data-only evidence from a tiny or application-limited
-probe is still not bulk-rate evidence and does not grant ordinary owner rights.
-A same-family Subflow may carry ordinary unique bytes only after bulk-rate
-evidence exists and sender-service admission proves that doing so will not
-expand product receive-hole debt or worsen the completion horizon. This rule is
-path-metric driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred
-or UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
+probe is still not bulk-rate evidence and does not grant Service rights. A
+same-family Subflow may carry one bounded startup `OwnerData` sample at a clear
+ordered frontier after the current Service has direction-correct bulk-rate
+evidence and the Subflow has sender evidence. That sample is unique payload
+data, not duplicate/probe traffic; it does not change the Service owner hint and
+it does not make the Subflow the lower-frontier Service for additional bytes.
+It cannot repeat for that Subflow until direction-correct bulk-rate evidence
+arrives. Steady-state Subflow `OwnerData` requires bulk-rate evidence and
+sender-service admission proving that doing so will not expand product
+receive-hole debt or worsen the completion horizon. This rule is path-metric
+driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred or
+UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
 production v1 because they do not share one carrier-family recovery model.
 
 A product reliable stream owns only stream semantics: stream ID, target metadata,
@@ -2079,9 +2085,11 @@ Once a stream has an ordered-data owner and the scheduler has opened
 same-underlay candidate outputs, app-limited startup samples MUST NOT be treated
 as long-term bandwidth proof for ECF/BLEST completion-horizon rejection. QUIC's
 initial congestion window and early MPTCP subflow growth are probe mechanisms, not
-accurate bulk-rate priors. A same-underlay candidate may be admitted for
-steady-state Subflow ownership only after bulk-rate evidence exists and it
-still fits product inflight, carrier credit, and reorder budgets. This is true
+accurate bulk-rate priors. A same-underlay candidate may receive one
+frontier-clear startup Subflow sample after the current Service has bulk-rate
+evidence and the candidate has sender evidence, but it may be admitted for
+steady-state Subflow ownership only after bulk-rate evidence exists and it still
+fits product inflight, carrier credit, and reorder budgets. This is true
 even if a candidate's current ETA is
 worse than the lead's ETA, because same-underlay ETA can be an artifact of
 underfeeding and validation; the correct proof is whether the additional path
@@ -2603,14 +2611,16 @@ or replaying repair outside the measured send loop.
 ### 18.1 Bulk Assignment and Striping
 
 For bulk reliable streams, the scheduler maintains a small subflow set epoch for the
-current flow: one Service owner plus bulk-rate-proven Subflow members admitted
-from live ETA, flow sharing, health, and capability state. Individual dispatches
-consume credit from that set; they do not recreate validation credit from
-scratch. Additional paths attached to the same stream are not automatically
-ordinary data paths. Their role decides what the scheduler may do: Repair paths
-carry gap-targeted repair or failover repair, Validation paths may receive
-bounded proof traffic, and the Service path may carry ordinary data. A path with
-any role may carry a specific repair frame when it is the best survivor and
+current flow: one Service owner plus Subflow members admitted from live ETA,
+flow sharing, health, and capability state. Startup Subflow samples are bounded
+and require sender evidence; steady-state Subflow owner bytes require
+bulk-rate evidence. Individual dispatches consume credit from that set; they do
+not recreate validation credit from scratch. Additional paths attached to the
+same stream are not automatically ordinary data paths. Their role decides what
+the scheduler may do: Repair paths carry gap-targeted repair or failover repair,
+Validation paths may receive bounded proof traffic, and the Service path may
+carry ordinary data. A path with any role may carry a specific repair frame when
+it is the best survivor and
 avoids the path that likely lost the original bytes.
 
 Same-stream bulk striping is allowed for TCP, UDP, and mixed TCP+UDP reliable

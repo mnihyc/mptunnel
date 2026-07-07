@@ -1955,6 +1955,7 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         let input = SubflowAdmissionInput {
             key: optional,
+            sender_evidence: true,
             bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: true,
@@ -2007,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn response_subflow_set_rejects_unproven_owner_until_bulk_rate_evidence() {
+    fn response_subflow_set_allows_one_same_family_startup_sample_before_bulk_rate_evidence() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -2016,6 +2017,7 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         let input = SubflowAdmissionInput {
             key: optional,
+            sender_evidence: true,
             bulk_rate_proven: false,
             frontier_clear: true,
             completion_improves: true,
@@ -2032,7 +2034,11 @@ mod tests {
             Duration::ZERO,
             input,
         );
-        assert_eq!(committed.decision, PathAdmissionDecision::ProbeOnly);
+        assert_eq!(
+            committed.decision,
+            PathAdmissionDecision::AdmitSubflow,
+            "same-family startup Subflow samples are unique payload bytes that produce real delivery evidence"
+        );
 
         let second = binding.preview_subflow_owner_admission(
             service,
@@ -2044,7 +2050,7 @@ mod tests {
         assert_eq!(
             second.decision,
             PathAdmissionDecision::ProbeOnly,
-            "unproven optional paths remain probes and cannot own product offsets"
+            "unproven Subflows get one bounded startup sample and then return to Probe until bulk-rate evidence exists"
         );
 
         binding.reset_subflow_set();
@@ -2055,7 +2061,7 @@ mod tests {
             Duration::ZERO,
             input,
         );
-        assert_eq!(after_reset.decision, PathAdmissionDecision::ProbeOnly);
+        assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
     }
 
     #[test]

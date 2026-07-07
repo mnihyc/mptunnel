@@ -516,6 +516,13 @@ struct ResponseSubflowAdmissionCommit {
     input: SubflowAdmissionInput,
 }
 
+#[derive(Clone)]
+struct ResponseSelectedDataTarget {
+    target: ResponseSenderPathTarget,
+    admission: PathAdmission,
+    subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
+}
+
 fn response_bulk_admission_role(
     lead_key: CarrierPathKey,
     candidate: CarrierPathKey,
@@ -591,8 +598,8 @@ fn response_target_unique_owner_admission(
 //
 // The important split is:
 // * Service: the current active/lower-frontier owner, kept fed while healthy.
-// * Subflow: bulk-rate-proven additional path, controlled by the
-//   no-worse completion/order-debt model.
+// * Subflow: same-family additional path, admitted for one startup sample with
+//   sender evidence or for steady-state owner bytes with bulk-rate evidence.
 //
 // Path proof, ACK-data visibility, and carrier attachment are intentionally not
 // owner states. They are evidence inputs for this decision.
@@ -606,8 +613,14 @@ fn response_target_unique_owner_admission_with_epoch(
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
-    if lower_owner == Some(target.key)
-        || response_target_is_service_owner_candidate(target, candidates)
+    if lower_owner == Some(target.key) {
+        return if target.is_active || target.has_bulk_rate_evidence {
+            (PathAdmission::service(), None)
+        } else {
+            (PathAdmission::probe_only(), None)
+        };
+    }
+    if response_target_is_service_owner_candidate(target, candidates)
         || (lower_owner.is_none() && target.key == lead.key && target.has_bulk_rate_evidence)
     {
         return (PathAdmission::service(), None);
@@ -620,6 +633,15 @@ fn response_target_unique_owner_admission_with_epoch(
         };
     }
 
+    let service_key = lower_owner
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.is_active)
+                .map(|candidate| candidate.key)
+        })
+        .unwrap_or(lead.key);
     let role = response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
     let model_allows_owner =
         !response_unique_quic_data_would_expand_ordering_debt(lower_owner, target, ordering_debt)
@@ -634,18 +656,21 @@ fn response_target_unique_owner_admission_with_epoch(
                 stream_ordering_debt_bytes: ordering_debt,
             })
             .is_none();
-    let completion_improves = model_allows_owner && target.has_bulk_rate_evidence;
-    let service_key = lower_owner
-        .or_else(|| {
-            candidates
-                .iter()
-                .copied()
-                .find(|candidate| candidate.is_active)
-                .map(|candidate| candidate.key)
-        })
-        .unwrap_or(lead.key);
+    let startup_subflow_sample = lower_owner.is_none()
+        && !target.is_active
+        && target.key.underlay == service_key.underlay
+        && candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.key == service_key)
+            .is_some_and(|candidate| candidate.has_bulk_rate_evidence)
+        && target.has_sender_evidence
+        && !target.has_bulk_rate_evidence;
+    let completion_improves =
+        model_allows_owner && (target.has_bulk_rate_evidence || startup_subflow_sample);
     let input = SubflowAdmissionInput {
         key: target.key,
+        sender_evidence: target.has_sender_evidence,
         bulk_rate_proven: target.has_bulk_rate_evidence,
         frontier_clear: model_allows_owner,
         completion_improves,
@@ -718,17 +743,6 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
     ) && admission.work == CarrierWorkKind::OwnerData
         && admission.role.may_own_unique_data()
-}
-
-fn response_target_runtime_role(
-    target: &ResponseSenderPathTarget,
-    lower_owner: Option<CarrierPathKey>,
-) -> PathRuntimeRole {
-    if lower_owner.is_none() || lower_owner == Some(target.key) || target.is_active {
-        PathRuntimeRole::Service
-    } else {
-        PathRuntimeRole::Subflow
-    }
 }
 
 fn response_cross_underlay_owner_allowed(
@@ -873,19 +887,22 @@ fn choose_response_admissible_lead(
             .iter()
             .copied()
             .find(|target| target.key == owner)?;
-        let owner_cross_path_debt = response_ordering_debt_bytes(lower_flights, owner_target.key);
-        return response_active_lead_suppression(
-            owner_target,
-            mux_limits,
-            payload_bytes,
-            owner_cross_path_debt,
-        )
-        .is_none()
-        .then_some(ResponseBulkLead {
-            key: owner_target.key,
-            snapshot: owner_target.snapshot,
-            eta_ms: owner_target.eta_ms,
-        });
+        if owner_target.is_active || owner_target.has_bulk_rate_evidence {
+            let owner_cross_path_debt =
+                response_ordering_debt_bytes(lower_flights, owner_target.key);
+            return response_active_lead_suppression(
+                owner_target,
+                mux_limits,
+                payload_bytes,
+                owner_cross_path_debt,
+            )
+            .is_none()
+            .then_some(ResponseBulkLead {
+                key: owner_target.key,
+                snapshot: owner_target.snapshot,
+                eta_ms: owner_target.eta_ms,
+            });
+        }
     }
 
     candidate_targets
@@ -1146,6 +1163,7 @@ fn choose_response_sender_data_target_with_product_debt(
     )
 }
 
+#[cfg(test)]
 fn choose_response_sender_data_target_with_product_debt_and_epoch(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
@@ -1156,6 +1174,29 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
     product_owner_debt_bytes: usize,
     subflow_set: Option<&FlowSubflowSet>,
 ) -> Option<ResponseSenderPathTarget> {
+    select_response_sender_data_target_with_product_debt_and_epoch(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        lower_flights,
+        ordered_data_owner,
+        product_owner_debt_bytes,
+        subflow_set,
+    )
+    .map(|selected| selected.target)
+}
+
+fn select_response_sender_data_target_with_product_debt_and_epoch(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    ordered_data_owner: Option<CarrierPathKey>,
+    product_owner_debt_bytes: usize,
+    subflow_set: Option<&FlowSubflowSet>,
+) -> Option<ResponseSelectedDataTarget> {
     if targets.is_empty() {
         return None;
     }
@@ -1175,7 +1216,12 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
             &capacity_targets,
             lower_flights,
             &[],
-        );
+        )
+        .map(|target| ResponseSelectedDataTarget {
+            target,
+            admission: PathAdmission::service(),
+            subflow_set_commit: None,
+        });
     }
 
     if let Some(forced_owner) = response_forced_owner_under_product_debt(
@@ -1187,7 +1233,11 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
         ordered_data_owner,
         product_owner_debt_bytes,
     ) {
-        return forced_owner;
+        return forced_owner.map(|target| ResponseSelectedDataTarget {
+            target,
+            admission: PathAdmission::service(),
+            subflow_set_commit: None,
+        });
     }
 
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
@@ -1221,9 +1271,9 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
     let admitted = candidate_targets
         .iter()
         .copied()
-        .filter(|target| {
+        .filter_map(|target| {
             let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            if !response_target_can_own_unique_bulk_data_with_epoch(
+            let (admission, subflow_set_commit) = response_target_unique_owner_admission_with_epoch(
                 target,
                 &candidate_targets,
                 lead,
@@ -1232,8 +1282,14 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
                 payload_bytes,
                 mux_limits,
                 subflow_set,
-            ) {
-                return false;
+            );
+            if !matches!(
+                admission.decision,
+                PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
+            ) || admission.work != CarrierWorkKind::OwnerData
+                || !admission.role.may_own_unique_data()
+            {
+                return None;
             }
             let role =
                 response_bulk_admission_role(lead.key, target.key, lower_owner, ordering_debt);
@@ -1248,6 +1304,11 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
                 stream_ordering_debt_bytes: ordering_debt,
             })
             .is_none()
+            .then_some(ResponseSelectedDataTarget {
+                target: target.clone(),
+                admission,
+                subflow_set_commit,
+            })
         })
         .collect::<Vec<_>>();
     if product_owner_debt_bytes > 0
@@ -1255,10 +1316,9 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
         && let Some(owner_key) = ordered_data_owner
         && let Some(owner_target) = admitted
             .iter()
-            .copied()
-            .find(|target| target.key == owner_key)
+            .find(|selected| selected.target.key == owner_key)
         && response_product_owner_debt_exceeds_pressure(
-            owner_target,
+            &owner_target.target,
             lane,
             payload_bytes,
             mux_limits,
@@ -1267,18 +1327,22 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
     {
         return Some(owner_target.clone());
     }
-    let best = admitted.iter().copied().min_by(|left, right| {
-        left.eta_ms
-            .total_cmp(&right.eta_ms)
-            .then_with(|| carrier_path_key_order(left.key, right.key))
+    let best = admitted.iter().min_by(|left, right| {
+        left.target
+            .eta_ms
+            .total_cmp(&right.target.eta_ms)
+            .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
     })?;
     if lower_owner.is_none()
         && let Some(lead_key) = ordered_data_owner
         && let Some(lead_target) = admitted
             .iter()
-            .copied()
-            .find(|target| target.key == lead_key)
-        && response_target_within_adaptive_lead_hysteresis(lead_target, best, payload_bytes)
+            .find(|selected| selected.target.key == lead_key)
+        && response_target_within_adaptive_lead_hysteresis(
+            &lead_target.target,
+            &best.target,
+            payload_bytes,
+        )
     {
         return Some(lead_target.clone());
     }
@@ -1427,7 +1491,7 @@ fn plan_response_data_dispatch_with_product_debt(
             let targets = binding.sender_path_targets(relay_lane, payload_bytes);
             let ordered_data_owner = binding.ordered_data_owner();
             let subflow_set = binding.subflow_set_snapshot();
-            let Some(target) = choose_response_sender_data_target_with_product_debt_and_epoch(
+            let Some(selected) = select_response_sender_data_target_with_product_debt_and_epoch(
                 &targets,
                 relay_lane,
                 payload_bytes,
@@ -1439,13 +1503,13 @@ fn plan_response_data_dispatch_with_product_debt(
             ) else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
-            let role = response_target_runtime_role(
-                &target,
-                response_oldest_lower_flight_owner(&lower_flights),
-            );
+            let target = selected.target;
+            let role = selected.admission.role;
             debug_assert!(
-                role != PathRuntimeRole::Subflow || target.has_bulk_rate_evidence,
-                "Subflow OwnerData requires bulk-rate evidence: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
+                role != PathRuntimeRole::Subflow
+                    || target.has_bulk_rate_evidence
+                    || target.has_sender_evidence,
+                "Subflow OwnerData requires sender evidence for startup or bulk-rate evidence for steady state: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
                 target.key,
                 role,
                 ordered_data_owner,
@@ -1454,39 +1518,12 @@ fn plan_response_data_dispatch_with_product_debt(
                 target.has_sender_evidence,
                 target.has_bulk_rate_evidence,
             );
-            let subflow_set_commit = role.is_subflow_owner().then(|| {
-                let service = response_oldest_lower_flight_owner(&lower_flights)
-                    .or(ordered_data_owner)
-                    .or_else(|| {
-                        targets
-                            .iter()
-                            .find(|candidate| candidate.is_active)
-                            .map(|candidate| candidate.key)
-                    })
-                    .unwrap_or(target.key);
-                ResponseSubflowAdmissionCommit {
-                    service,
-                    owner_credit_bytes: payload_bytes,
-                    optional_overhead_budget_bytes: 0,
-                    max_read_gap_budget: Duration::ZERO,
-                    input: SubflowAdmissionInput {
-                        key: target.key,
-                        bulk_rate_proven: target.has_bulk_rate_evidence,
-                        frontier_clear: true,
-                        completion_improves: true,
-                        observed_goodput_non_degrading: true,
-                        read_gap: Duration::ZERO,
-                        owner_bytes: payload_bytes,
-                        optional_overhead_bytes: 0,
-                    },
-                }
-            });
             Ok(ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding: binding.clone(),
                     target,
                     role,
-                    subflow_set_commit,
+                    subflow_set_commit: selected.subflow_set_commit,
                 },
             })
         }
@@ -1608,7 +1645,9 @@ async fn emit_planned_response_data_frame(
                     commit.input,
                 );
             }
-            binding.set_ordered_data_owner(target.key);
+            if role == PathRuntimeRole::Service {
+                binding.set_ordered_data_owner(target.key);
+            }
             let decision_reason = match role {
                 PathRuntimeRole::Service => "data_service",
                 PathRuntimeRole::Subflow => "data_subflow",
@@ -4239,12 +4278,12 @@ mod tests {
                 underlay: UnderlayProtocol::Udp,
                 path_id: PathId(0),
             }),
-            "ACK-data evidence alone is not bulk-rate proof and must not create a unique owner"
+            "ACK-data evidence cannot create a startup Subflow sample before the Service path has bulk-rate evidence"
         );
         assert_eq!(
             plan.primary_role(),
             PathRuntimeRole::Service,
-            "ACK-data-only paths must not become Subflow owners"
+            "ACK-data-only paths must not become Service owners"
         );
     }
 
@@ -4347,7 +4386,7 @@ mod tests {
         ack_data_only.has_bulk_rate_evidence = false;
         ack_data_only.has_sender_evidence = true;
 
-        let selected = choose_response_sender_data_target(
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
             &[active.clone(), ack_data_only.clone()],
             FlowLane::Throughput,
             payload_bytes,
@@ -4357,12 +4396,19 @@ mod tests {
                 underlay: UnderlayProtocol::Udp,
                 path_id: PathId(0),
             }),
+            0,
+            None,
         )
-        .expect("bulk-rate-proven active path should remain eligible");
+        .expect("ACK-data-seen path should receive one same-family startup sample");
 
         assert_eq!(
-            selected.key, active.key,
-            "ACK-data-seen without non-app-limited bulk-rate evidence must not displace the current ordered owner"
+            selected.target.key, ack_data_only.key,
+            "ACK-data-seen path may receive a startup Subflow sample without displacing Service"
+        );
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "ACK-data-seen startup sample must be Subflow, not Service"
         );
     }
 
@@ -4600,10 +4646,6 @@ mod tests {
             selected.key, active.key,
             "path proof/liveness evidence must not assign later unique bytes to an unmeasured Subflow while lower-owner debt exists"
         );
-        assert_eq!(
-            response_target_runtime_role(&selected, Some(active_key)),
-            PathRuntimeRole::Service
-        );
     }
 
     #[test]
@@ -4650,10 +4692,6 @@ mod tests {
             selected.key, active.key,
             "path proof/liveness evidence must not bootstrap same-stream Subflow OwnerData under lower-owner debt"
         );
-        assert_eq!(
-            response_target_runtime_role(&selected, Some(active_key)),
-            PathRuntimeRole::Service
-        );
     }
 
     #[test]
@@ -4695,8 +4733,8 @@ mod tests {
             mux_limits,
         );
 
-        assert_eq!(admission.decision, PathAdmissionDecision::ProbeOnly);
-        assert_eq!(admission.role, PathRuntimeRole::Probe);
+        assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(admission.role, PathRuntimeRole::Subflow);
     }
 
     #[test]
@@ -4726,11 +4764,11 @@ mod tests {
         assert_eq!(admission.role, PathRuntimeRole::Service);
     }
 
-    #[test]
-    fn response_planning_keeps_proof_only_optional_path_as_probe_not_service() {
+    #[tokio::test]
+    async fn response_planning_uses_same_family_startup_sample_as_subflow_not_service() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let (active_commands, _active_rx) = reliable_path_command_channels(8);
+        let (active_commands, mut active_rx) = reliable_path_command_channels(8);
         let binding = ResponseStreamBinding::new_with_limits(
             SessionId(88),
             UnderlayProtocol::Udp,
@@ -4743,6 +4781,36 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(0),
         };
+        binding.update_path_metrics(
+            service,
+            PathMetrics {
+                path_id: service.path_id,
+                underlay: service.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 50_000,
+                srtt_us: 50_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 200_000_000,
+                pacing_rate_bps: 200_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: (payload_bytes * 8) as u64,
+                inflight_hi_bytes: (payload_bytes * 8) as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 4,
+                data_sample_bytes: (payload_bytes * 8) as u64,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
@@ -4789,24 +4857,36 @@ mod tests {
             },
             ServerPathMetricsSource::LocalSender,
         );
-        let input = SubflowAdmissionInput {
-            key: optional,
-            bulk_rate_proven: false,
-            frontier_clear: true,
-            completion_improves: true,
-            observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
-            owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
-        };
-        let committed = binding.commit_subflow_owner_admission(
-            service,
-            payload_bytes,
-            0,
-            Duration::ZERO,
-            input,
+        binding.update_path_metrics(
+            optional,
+            PathMetrics {
+                path_id: optional.path_id,
+                underlay: optional.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 5_000,
+                srtt_us: 5_000,
+                rttvar_us: 500,
+                jitter_us: 500,
+                delivery_rate_bps: 500_000_000,
+                pacing_rate_bps: 500_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: (payload_bytes * 8) as u64,
+                inflight_hi_bytes: (payload_bytes * 8) as u64,
+                confidence_ppm: 0,
+                app_limited: false,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+            ServerPathMetricsSource::PeerHint,
         );
-        assert_eq!(committed.decision, PathAdmissionDecision::ProbeOnly);
 
         let (_frames_tx, frames_rx) = mpsc::channel(1);
         let stream = ReliablePathStream {
@@ -4815,18 +4895,57 @@ mod tests {
             lane: FlowLane::Throughput,
             underlay: UnderlayProtocol::Udp,
             max_frame_payload_bytes: payload_bytes,
-            output: ReliablePathStreamOutput::Switchable(binding),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
             frames: frames_rx,
         };
         let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("current Service path should remain dispatchable");
+            .expect("same-family startup Subflow sample should be dispatchable");
 
         assert_eq!(
             plan.primary_key(),
-            Some(service),
-            "proof-only same-family paths remain Probe/Standby and cannot become Service at a clear frontier"
+            Some(optional),
+            "same-family sender-evidence path should get one bounded startup Subflow sample at a clear frontier"
         );
-        assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
+        assert_eq!(
+            plan.primary_role(),
+            PathRuntimeRole::Subflow,
+            "startup sample must not become Service handoff"
+        );
+
+        let frame = Frame::StreamData {
+            stream_id: StreamId(88),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![9_u8; payload_bytes]),
+        };
+        let outcome = emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput)
+            .await
+            .expect("startup Subflow sample should emit");
+
+        assert_eq!(outcome.selected_path, Some(optional));
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(service),
+            "startup Subflow sample must not rewrite the Service owner hint"
+        );
+        assert!(
+            try_recv_reliable_path_command(&mut active_rx).is_none(),
+            "startup Subflow sample must be emitted only on the admitted Subflow"
+        );
+
+        let followup_plan = plan_response_data_dispatch(
+            &stream,
+            FlowLane::Throughput,
+            payload_bytes as u64,
+            payload_bytes,
+        )
+        .expect("Service should remain dispatchable after a bounded startup Subflow sample");
+        assert_eq!(
+            followup_plan.primary_key(),
+            Some(service),
+            "a startup Subflow sample must not become the lower-frontier Service owner for more data"
+        );
+        assert_eq!(followup_plan.primary_role(), PathRuntimeRole::Service);
     }
 
     #[tokio::test]
@@ -5371,30 +5490,33 @@ mod tests {
     }
 
     #[test]
-    fn frontier_clear_handoff_evidence_does_not_displace_service_without_bulk_rate() {
+    fn frontier_clear_same_family_sender_evidence_is_startup_subflow_not_service() {
         let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let mut lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         lower_eta_alternate.has_sender_evidence = true;
         lower_eta_alternate.has_bulk_rate_evidence = false;
 
-        let selected = choose_response_sender_data_target(
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
             &[owner.clone(), lower_eta_alternate.clone()],
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
             &[],
             Some(owner.key),
+            0,
+            None,
         )
-        .expect("current Service path should remain dispatchable");
+        .expect("same-family sender-evidence path should receive a bounded startup sample");
 
         assert_eq!(
-            selected.key, owner.key,
-            "handoff/proof evidence is not delivery proof and must not displace Service without bulk-rate evidence"
+            selected.target.key, lower_eta_alternate.key,
+            "sender evidence is enough for one startup Subflow sample at a clear same-family frontier"
         );
         assert_eq!(
-            response_target_runtime_role(&selected, None),
-            PathRuntimeRole::Service
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "startup sample must not be classified as Service handoff"
         );
     }
 

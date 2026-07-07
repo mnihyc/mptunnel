@@ -634,7 +634,7 @@ fn response_service_anchor_key(
             candidates
                 .iter()
                 .copied()
-                .find(|candidate| candidate.is_active)
+                .find(|candidate| candidate.is_active && candidate.has_bulk_rate_evidence)
                 .map(|candidate| candidate.key)
         })
         .unwrap_or(fallback)
@@ -658,16 +658,46 @@ fn response_unique_quic_data_would_expand_ordering_debt(
 
 fn response_target_is_service_owner_candidate(
     target: &ResponseSenderPathTarget,
-    _candidates: &[&ResponseSenderPathTarget],
+    candidates: &[&ResponseSenderPathTarget],
+    lead: ResponseBulkLead,
 ) -> bool {
-    target.is_active
+    if target.key != lead.key {
+        return false;
+    }
+    let active_bulk_owner = candidates.iter().copied().any(|candidate| {
+        candidate.key != target.key && candidate.is_active && candidate.has_bulk_rate_evidence
+    });
+    let any_other_bulk_owner = candidates
+        .iter()
+        .copied()
+        .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence);
+
+    if target.is_active {
+        target.has_bulk_rate_evidence || !any_other_bulk_owner
+    } else {
+        target.has_bulk_rate_evidence && !active_bulk_owner
+    }
+}
+
+fn response_target_has_service_anchor_rights(
+    target: &ResponseSenderPathTarget,
+    candidates: &[&ResponseSenderPathTarget],
+) -> bool {
+    if !target.is_active {
+        return false;
+    }
+    target.has_bulk_rate_evidence
+        || !candidates
+            .iter()
+            .copied()
+            .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence)
 }
 
 fn response_target_is_plausible_unique_owner_candidate(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
 ) -> bool {
-    response_target_is_service_owner_candidate(target, candidates) || target.has_bulk_rate_evidence
+    response_target_has_service_anchor_rights(target, candidates) || target.has_bulk_rate_evidence
 }
 
 #[cfg(test)]
@@ -723,7 +753,7 @@ fn response_target_unique_owner_admission_with_epoch(
     if lower_owner.is_some() {
         return (PathAdmission::standby(), None);
     }
-    if response_target_is_service_owner_candidate(target, candidates) {
+    if response_target_is_service_owner_candidate(target, candidates, lead) {
         return (PathAdmission::service(), None);
     }
     if target.is_active {
@@ -999,7 +1029,7 @@ fn choose_response_admissible_lead(
         }
     }
 
-    candidate_targets
+    let admissible = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
@@ -1015,7 +1045,40 @@ fn choose_response_admissible_lead(
             key: target.key,
             snapshot: target.snapshot,
             eta_ms: target.eta_ms,
-        })
+        });
+    if admissible.is_some() {
+        return admissible;
+    }
+
+    if lower_owner.is_none() {
+        if let Some(active) = candidate_targets
+            .iter()
+            .copied()
+            .find(|target| target.is_active)
+        {
+            return Some(ResponseBulkLead {
+                key: active.key,
+                snapshot: active.snapshot,
+                eta_ms: active.eta_ms,
+            });
+        }
+        return candidate_targets
+            .iter()
+            .copied()
+            .filter(|target| target.has_bulk_rate_evidence)
+            .min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+            .map(|target| ResponseBulkLead {
+                key: target.key,
+                snapshot: target.snapshot,
+                eta_ms: target.eta_ms,
+            });
+    }
+
+    None
 }
 
 fn choose_lowest_eta_response_target(
@@ -4403,7 +4466,7 @@ mod tests {
     }
 
     #[test]
-    fn active_udp_service_with_better_eta_beats_slower_measured_udp_subflow() {
+    fn measured_udp_owner_replaces_unmeasured_active_udp_at_clear_frontier() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active_unproven_udp = response_target(
@@ -4415,7 +4478,6 @@ mod tests {
             true,
         );
         active_unproven_udp.has_bulk_rate_evidence = false;
-        let active_key = active_unproven_udp.key;
         let measured_udp = response_target(
             1,
             UnderlayProtocol::Udp,
@@ -4436,11 +4498,11 @@ mod tests {
                 path_id: PathId(0),
             }),
         )
-        .expect("active UDP Service should remain eligible for ordinary bulk");
+        .expect("bulk-rate-proven UDP owner should be eligible at a clear frontier");
 
         assert_eq!(
-            selected.key, active_key,
-            "bulk-rate evidence must not override a better current Service ETA"
+            selected.key, measured_udp.key,
+            "active attachment is only a bootstrap owner when no measured bulk owner exists"
         );
     }
 
@@ -6168,6 +6230,82 @@ mod tests {
         assert_eq!(
             lead.key, service.key,
             "optional bulk-rate evidence must not hide the current Service owner"
+        );
+    }
+
+    #[test]
+    fn active_attachment_without_bulk_evidence_is_not_service_when_measured_lead_exists() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut active_attachment =
+            response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        active_attachment.has_bulk_rate_evidence = false;
+        let measured_lead =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        let candidates = vec![&active_attachment, &measured_lead];
+        let lead = ResponseBulkLead {
+            key: measured_lead.key,
+            snapshot: measured_lead.snapshot,
+            eta_ms: measured_lead.eta_ms,
+        };
+
+        let admission = response_target_unique_owner_admission(
+            &active_attachment,
+            &candidates,
+            lead,
+            None,
+            0,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert_eq!(
+            admission.decision,
+            PathAdmissionDecision::Standby,
+            "an active attachment is not Service ownership once a bulk-rate-proven lead exists"
+        );
+    }
+
+    #[test]
+    fn saturated_service_does_not_block_clear_frontier_startup_subflow() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            25.0,
+            mux_limits.max_path_flight_bytes as u64,
+            16 * 1024 * 1024,
+            true,
+        );
+        service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.has_sender_evidence = true;
+        service.has_bulk_rate_evidence = true;
+        let mut startup_subflow =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        startup_subflow.has_sender_evidence = true;
+        startup_subflow.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), startup_subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("same-family startup Subflow should be admitted at a clear frontier");
+
+        assert_eq!(
+            selected.target.key, startup_subflow.key,
+            "Service feed backpressure must not suppress a bounded same-family startup Subflow sample"
+        );
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "startup sample is Subflow OwnerData, not a Service migration"
         );
     }
 

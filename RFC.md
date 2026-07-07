@@ -339,8 +339,11 @@ and live carrier membership still match the admission envelope. It is recreated
 on material envelope change, detach/failover, or carrier-membership change, not
 on ordinary ACK progress. Product byte ownership still belongs to the per-range
 flight ledger, not to the subflow set itself. The Service path is the current
-active or lower-frontier owner; it is not simply the lowest-ETA candidate
-selected for the next quantum.
+lower-frontier owner, a direction-correct active owner with bulk-rate evidence,
+or the measured bulk-rate owner selected at a clear frontier. An active
+attachment without bulk-rate evidence is only a bootstrap Service when no
+measured owner exists yet; it is not simply the lowest-ETA candidate or the
+first/live attachment selected for the next quantum.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -1870,12 +1873,15 @@ reattach.
 When a tail-stall repair timer fires on a live stream, a sender MUST inspect the
 most recent repair-authoritative `STREAM_ACK`. If that ACK proves an
 unacknowledged gap below its largest end offset, the repair extent is that gap,
-not bytes after the ACK frontier. If no authoritative lower gap is known, the
-live tail is not repair-eligible merely because it is unacknowledged. TCP and
-QUIC already own reliable carrier retransmission for in-flight tail bytes;
-replaying the continuation at the product layer consumes duplicate traffic and
-can create new receive-hole debt. Terminal tail recovery is separate: once a
-final offset is known, a sender may repair unacknowledged bytes below that final
+not bytes after the ACK frontier. If no authoritative lower gap is known, but
+the ACK is complete and the contiguous frontier remains persistently stalled
+below `sent_offset`, the unacknowledged owner tail after that frontier is
+repair-eligible on an eligible survivor path. This is a correctness recovery for
+a blocked product stream, not a throughput striping mechanism: it MUST be
+prefix-preserving, charged to the extra-traffic budget, bounded by outstanding
+repair debt and configured repair/path-flight resources, and repeated only after
+the persistent repair delay. Terminal tail recovery is separate: once a final
+offset is known, a sender may repair unacknowledged bytes below that final
 offset on an eligible survivor path so the DATA_FIN/STREAM_FIN can be
 acknowledged. Repair candidate selection is prefix-preserving: if the lowest
 unresolved repair frame cannot be sent on an alternate eligible output, the
@@ -3647,6 +3653,14 @@ to the current owner merely because that owner owns older bytes; doing so turns
 ordering debt into sender starvation instead of an ECF/BLEST-style completion
 decision. A measured same-family Subflow admitted at a clear frontier still
 MUST NOT change the Service owner hint merely because it carried the next range.
+The current Service may remain the subflow-set anchor even when it is temporarily
+over its local product-feed envelope. That anchor status is not send admission:
+it only supplies the family and measured baseline for evaluating same-family
+Subflow candidates. A clear-frontier same-family Subflow with path-scoped sender
+evidence may spend its bounded startup OwnerData credit while the Service waits
+for ACK or queue progress, provided the Subflow's own no-worse gates pass. If no
+candidate passes those gates, the sender waits; it MUST NOT bypass the Service
+admission check by relabeling another path as Service.
 When an already bulk-rate-proven same-family Subflow is application-limited with
 little or no product flight, the sender MAY feed that Subflow up to a bounded
 retention window before ordinary ETA tie-breaking. This MUST NOT wait for the

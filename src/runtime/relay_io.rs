@@ -967,6 +967,25 @@ pub(super) fn adaptive_reliable_relay_repair_bytes(
     adaptive_reliable_relay_chunk_bytes(path, repair_lane, mux_limits).max(1)
 }
 
+pub(super) fn reliable_tail_stall_repair_limit_bytes(
+    base_repair_limit: usize,
+    repair_debt_bytes: usize,
+    budget_remaining: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if repair_debt_bytes == 0 || budget_remaining == 0 {
+        return 0;
+    }
+    let resource_cap = mux_limits
+        .max_repair_bytes
+        .min(mux_limits.max_path_flight_bytes)
+        .max(1);
+    repair_debt_bytes
+        .max(base_repair_limit.max(1))
+        .min(resource_cap)
+        .min(budget_remaining)
+}
+
 pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
     let rate_bps = path.delivery_rate_bps.max(
         path.product_progress_rate_bps
@@ -1247,8 +1266,12 @@ fn enqueue_reliable_tail_repair(
         relay_lane,
         mux_limits,
     ));
-    let repair_limit =
-        base_repair_limit.min(response_sender.repair_extra_event_budget_remaining(mux_limits));
+    let repair_limit = reliable_tail_stall_repair_limit_bytes(
+        base_repair_limit,
+        send_stream.repair_bytes(),
+        response_sender.repair_extra_event_budget_remaining(mux_limits),
+        mux_limits,
+    );
     let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
         send_stream,
         last_send_ack_ranges,
@@ -2826,6 +2849,30 @@ mod tests {
         assert_eq!(
             reliable_stream_frame_extent(&repair_frames[0]),
             Some((1024, 3072, 2048))
+        );
+    }
+
+    #[test]
+    fn tail_stall_repair_limit_scales_with_owner_tail_debt() {
+        let limits = MuxLimits::default();
+        let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+        let repair_debt = base_limit.saturating_mul(32);
+        let budget_remaining = repair_debt;
+
+        let repair_limit = reliable_tail_stall_repair_limit_bytes(
+            base_limit,
+            repair_debt,
+            budget_remaining,
+            limits,
+        );
+
+        assert!(
+            repair_limit > base_limit,
+            "persistent owner-tail repair must not be capped to a single send quantum"
+        );
+        assert_eq!(
+            repair_limit, repair_debt,
+            "the stall repair burst should cover available owner-tail debt when the earned repair budget allows it"
         );
     }
 

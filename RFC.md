@@ -3472,6 +3472,9 @@ else:
 base_reorder_budget = min(max(2 * eta_bdp, chunk.len),
                           configured_receiver_reorder)
 effective_reorder_budget = base_reorder_budget * path.confidence
+if path does not own the oldest lower outstanding range
+   and stream_ordering_debt(path, chunk) > 0:
+    suppress additional OwnerData for this bulk quantum
 if path is the lead path and stream_ordering_debt(path, chunk) == 0:
     admission_reorder_budget = product_inflight_limit
 else if path is the lead path:
@@ -3523,9 +3526,11 @@ implies a tiny rate. Such a sample proves that the sender was not feeding the
 path enough to measure capacity; it does not prove that the path is slow. While
 there is no lower-frontier owner on another path, same-underlay admission is
 governed by explicit product inflight, live carrier credit, and reorder budgets.
-Once stream-ordering debt exists, or once the candidate crosses underlay
-families, the completion horizon is enforced because later unique bytes can
-directly create ordered-stream HOL debt.
+Once stream-ordering debt exists for a non-owner candidate, additional
+same-stream `OwnerData` is suppressed until the lower frontier clears. The
+completion horizon remains the positive-contribution gate for clear-frontier
+same-family admission and for cross-underlay admission once both carrier
+families are healthy enough to own reliable bytes.
 
 For QUIC same-underlay startup, the reorder/feed budget uses live QUIC carrier
 credit when available. If the QUIC implementation reports an inflight or
@@ -3566,7 +3571,7 @@ normal no-worse admission checks: ETA, inflight, ordering debt, read-gap/reorder
 budget, queue, and completion horizon. A sender MUST NOT hard-pin new OwnerData
 to the current owner merely because that owner owns older bytes; doing so turns
 ordering debt into sender starvation instead of an ECF/BLEST-style completion
-decision. A measured same-family Subflow admitted under debt pressure still
+decision. A measured same-family Subflow admitted at a clear frontier still
 MUST NOT change the Service owner hint merely because it carried the next range.
 When an already bulk-rate-proven same-family Subflow is application-limited with
 little or no product flight, the sender MAY feed that Subflow up to a bounded

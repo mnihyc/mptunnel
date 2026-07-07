@@ -723,6 +723,9 @@ fn response_target_unique_owner_admission_with_epoch(
             (PathAdmission::probe_only(), None)
         };
     }
+    if lower_owner.is_some() {
+        return (PathAdmission::standby(), None);
+    }
     if response_target_is_service_owner_candidate(target, candidates) {
         return (PathAdmission::service(), None);
     }
@@ -5025,6 +5028,40 @@ mod tests {
     }
 
     #[test]
+    fn bulk_rate_same_family_candidate_cannot_own_later_data_under_lower_owner_debt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let owner = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            80.0,
+            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+            true,
+        );
+        let alternate = response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = vec![CarrierPathFlightDebt {
+            key: owner.key,
+            bytes: 2 * 1024 * 1024,
+        }];
+
+        let selected = choose_response_sender_data_target(
+            &[owner.clone(), alternate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower_flights,
+            Some(owner.key),
+        )
+        .expect("lower owner should remain dispatchable");
+
+        assert_eq!(
+            selected.key, owner.key,
+            "bulk-rate evidence proves the alternate path is eligible at a clear frontier, not that it may extend an existing ordered receive hole"
+        );
+    }
+
+    #[test]
     fn proof_only_sender_evidence_is_not_subflow_owner_under_lower_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -5314,18 +5351,15 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes as u64,
             payload_bytes,
-        )
-        .expect("Service should remain dispatchable after a bounded startup Subflow sample");
-        assert_eq!(
-            followup_plan.primary_key(),
-            Some(service),
-            "a startup Subflow sample must not become the lower-frontier Service owner for more data"
         );
-        assert_eq!(followup_plan.primary_role(), PathRuntimeRole::Service);
+        assert!(
+            matches!(followup_plan, Err(RuntimeError::SenderServiceBlocked)),
+            "later OwnerData must wait for the startup Subflow's lower range to clear instead of expanding an ordered receive hole"
+        );
     }
 
     #[tokio::test]
-    async fn response_owner_data_can_use_measured_same_family_subflow_under_product_owner_debt() {
+    async fn response_owner_data_does_not_use_same_family_subflow_under_product_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -5456,17 +5490,17 @@ mod tests {
         let dispatch = sender
             .dispatch_next(&stream, &mut send_stream, FlowLane::Throughput, mux_limits)
             .await
-            .expect("measured same-family subflow should remain dispatchable while product owner debt exists");
+            .expect("lower owner should remain dispatchable while product owner debt exists");
 
-        assert_eq!(dispatch.selected_path, Some(alternate_key));
+        assert_eq!(dispatch.selected_path, Some(active_key));
         assert_eq!(binding.ordered_data_owner(), Some(active_key));
         assert!(matches!(
-            recv_reliable_path_command(&mut alternate_rx).await,
+            recv_reliable_path_command(&mut active_rx).await,
             Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
         ));
         assert!(
-            try_recv_reliable_path_command(&mut active_rx).is_none(),
-            "Subflow owner data must not silently migrate the Service owner"
+            try_recv_reliable_path_command(&mut alternate_rx).is_none(),
+            "product owner debt must not move later OwnerData onto another Subflow"
         );
     }
 
@@ -5617,7 +5651,7 @@ mod tests {
     }
 
     #[test]
-    fn proven_udp_candidate_can_overtake_large_lower_owner_when_completion_model_allows() {
+    fn proven_udp_candidate_cannot_overtake_large_lower_owner() {
         let owner = response_target(
             0,
             UnderlayProtocol::Udp,
@@ -5640,13 +5674,13 @@ mod tests {
             &lower_flights,
             Some(owner.key),
         )
-        .expect("bulk-rate-proven same-underlay candidate should remain eligible under ECF/BLEST");
+        .expect("lower owner should remain eligible while it owns unresolved lower bytes");
 
-        assert_eq!(selected.key, alternate.key);
+        assert_eq!(selected.key, owner.key);
     }
 
     #[test]
-    fn proven_udp_candidate_is_not_blocked_by_lower_udp_owner_when_within_reorder_budget() {
+    fn proven_udp_candidate_waits_even_when_lower_owner_debt_is_within_reorder_budget() {
         let owner = response_target(
             0,
             UnderlayProtocol::Udp,
@@ -5670,9 +5704,9 @@ mod tests {
             &lower_flights,
             Some(owner.key),
         )
-        .expect("bulk-rate-proven QUIC candidate should be admitted by completion/reorder math");
+        .expect("lower owner should remain eligible while the frontier is not clear");
 
-        assert_eq!(selected.key.path_id, PathId(1));
+        assert_eq!(selected.key.path_id, PathId(0));
     }
 
     #[test]
@@ -5901,7 +5935,7 @@ mod tests {
     }
 
     #[test]
-    fn response_owner_debt_pressure_uses_same_family_subflow_when_owner_queue_is_full() {
+    fn response_owner_debt_pressure_waits_when_lower_owner_queue_is_full() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
@@ -5936,19 +5970,15 @@ mod tests {
             Some(owner.key),
             owner_debt_pressure.saturating_add(payload_bytes),
             None,
-        )
-        .expect("measured same-family subflow should remain eligible when the owner queue is full");
-
-        assert_eq!(selected.target.key.path_id, PathId(1));
-        assert_eq!(
-            selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "debt fallback must not silently migrate Service ownership"
+        );
+        assert!(
+            selected.is_none(),
+            "when the lower owner is full, sender must wait instead of expanding the ordered receive hole on a Subflow"
         );
     }
 
     #[test]
-    fn response_owner_debt_pressure_uses_better_same_family_subflow_even_when_owner_has_credit() {
+    fn response_owner_debt_pressure_keeps_lower_owner_when_it_has_credit() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let owner = response_target(0, UnderlayProtocol::Udp, 100.0, 0, 16 * 1024 * 1024, true);
@@ -5970,18 +6000,18 @@ mod tests {
             owner_debt_pressure.saturating_add(payload_bytes),
             None,
         )
-        .expect("measured same-family subflow should compete under owner-debt pressure");
+        .expect("lower owner should remain eligible under owner-debt pressure");
 
-        assert_eq!(selected.target.key.path_id, PathId(1));
+        assert_eq!(selected.target.key.path_id, PathId(0));
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "owner-debt pressure must filter unsafe paths, not force a worse Service owner"
+            PathRuntimeRole::Service,
+            "owner-debt pressure must not reassign later OwnerData to a Subflow"
         );
     }
 
     #[test]
-    fn response_owner_debt_pressure_uses_same_family_subflow_when_service_is_over_budget() {
+    fn response_owner_debt_pressure_waits_when_lower_owner_is_over_budget() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -6009,11 +6039,11 @@ mod tests {
             Some(owner.key),
             owner_debt_pressure.saturating_add(payload_bytes),
             None,
-        )
-        .expect("same-family measured subflow should remain eligible when Service is over budget");
-
-        assert_eq!(selected.target.key.path_id, PathId(1));
-        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        );
+        assert!(
+            selected.is_none(),
+            "an over-budget lower owner should create backpressure, not later-offset Subflow ownership"
+        );
     }
 
     #[test]

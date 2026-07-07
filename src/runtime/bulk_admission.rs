@@ -180,6 +180,9 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     if let Some(reason) = bulk_cross_underlay_completion_suppression(check) {
         return Some(reason);
     }
+    if let Some(reason) = bulk_same_underlay_ordering_debt_suppression(check) {
+        return Some(reason);
+    }
     if let Some(reason) = bulk_same_underlay_completion_suppression(check) {
         return Some(reason);
     }
@@ -212,11 +215,17 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     None
 }
 
+fn bulk_same_underlay_ordering_debt_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
+    if check.role == BulkAdmissionRole::AdditionalSameUnderlay
+        && check.stream_ordering_debt_bytes > 0
+    {
+        return Some("same_underlay_ordering_debt");
+    }
+    None
+}
+
 fn bulk_same_underlay_completion_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
     if check.role != BulkAdmissionRole::AdditionalSameUnderlay {
-        return None;
-    }
-    if check.stream_ordering_debt_bytes > 0 {
         return None;
     }
     if !bulk_same_underlay_requires_completion_gain(check.candidate_snapshot) {
@@ -1494,7 +1503,7 @@ mod tests {
                 role: BulkAdmissionRole::AdditionalSameUnderlay,
                 stream_ordering_debt_bytes: 512 * 1024,
             }),
-            Some("completion_horizon")
+            Some("same_underlay_ordering_debt")
         );
     }
 

@@ -2861,14 +2861,17 @@ carrier ACK-derived data seen, carrier non-application-limited bulk-rate
 evidence, and product-ledger owner progress. Carrier ACK-derived data seen proves
 that the path carried carrier data and keeps it visible to admission policy, but
 it does not by itself make the path eligible for ordered `STREAM_DATA`
-ownership. The carrier ACK-derived rate becomes bulk-rate evidence only after
-the acknowledged DATA byte volume is large enough for the path's modeled flight
-envelope, with two bounds. The floor MUST be at least a small multi-packet DATA
-sample so a tiny ACK burst cannot create a bulk-rate Subflow, and it MUST be
-capped by a bounded startup graduation window so a large transient QUIC
-cwnd/inflight estimate cannot make proof self-defeating by requiring more bytes
-than the product scheduler will feed before graduation. Otherwise the sample
-remains ACK-data evidence for validation visibility only.
+ownership. Local QUIC pacing remains carrier-owned scheduling evidence even when
+the latest ACK-derived data sample is application-limited; app-limited status
+only prevents that sample from becoming a delivery-rate proof. The carrier
+ACK-derived rate becomes bulk-rate evidence only after the acknowledged DATA byte
+volume is large enough for the path's modeled flight envelope, with two bounds.
+The floor MUST be at least a small multi-packet DATA sample so a tiny ACK burst
+cannot create a bulk-rate Subflow, and it MUST be capped by a bounded startup
+graduation window so a large transient QUIC cwnd/inflight estimate cannot make
+proof self-defeating by requiring more bytes than the product scheduler will feed
+before graduation. Otherwise the sample remains ACK-data evidence for validation
+visibility only.
 
 Product-ledger owner progress is also path-scoped bulk-rate evidence when the
 ACKed range had exactly one outstanding `OwnerData` copy and the release handler

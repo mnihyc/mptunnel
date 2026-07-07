@@ -314,7 +314,7 @@ pub(super) fn server_bulk_output_snapshot(
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
-    if let Some(path_metrics) = bulk_rate_metrics {
+    if let Some(path_metrics) = local_carrier_metrics {
         snapshot.pacing_rate_bps =
             (path_metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
     }
@@ -689,6 +689,10 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(snapshot.delivery_rate_bps, product_rate);
+        assert_eq!(
+            snapshot.pacing_rate_bps, 200_000_000.0,
+            "local QUIC pacing remains carrier-owned scheduling evidence even when the carrier ACK sample is app-limited"
+        );
     }
 
     #[test]

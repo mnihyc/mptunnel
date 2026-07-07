@@ -480,8 +480,11 @@ carrier capacity but cannot starve the service path. Only repair explicitly
 classified as critical because it closes an active product hole, terminal tail,
 or failed-owner gap may preempt later `OwnerData`. Critical priority is separate
 from budget bypass: critical repair still consumes the extra-traffic budget
-unless the implementation is using the bounded correctness reserve needed to
-finish or unstuck a stream.
+unless the implementation is repairing a persistent ordered-stream hole that
+would otherwise leave the product stream permanently blocked. That correctness
+repair is still `RepairData`: it does not prove the repair path, does not move
+the Service owner, and is bounded by outstanding repair debt plus configured
+repair/path-flight resource caps.
 
 Carrier engines own underlay mechanics. TCP owns encrypted framed records,
 writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
@@ -583,9 +586,12 @@ percent extra optional response traffic is acceptable under evidence-backed
 pressure, `100` permits full duplication in pathological moments, and values
 above `100` bias the sender toward redundant repair under severe instability.
 This value is a hard sender-side budget for optional repair work, with a small
-startup floor to avoid repair deadlock. It is not a
-fixed rate, not a product-data throttle, and not a condition that can terminate
-production traffic. Auto scheduling remains the default and MUST adapt from
+startup floor to avoid repair deadlock. It is not a fixed rate, not a
+product-data throttle, and not a condition that can terminate production
+traffic or prevent correctness repair for a persistent ordered-stream stall.
+Such repair may exceed the optional hint only when it unblocks already-owned
+product bytes, and remains bounded by repair-cache, path-flight, and sender
+resource limits. Auto scheduling remains the default and MUST adapt from
 measurements even when the hint is left unset.
 
 ### 5.3 Resource Parameters
@@ -1899,18 +1905,18 @@ repair-eligible on an eligible survivor path. This is a correctness recovery for
 a blocked product stream, not a throughput striping mechanism: it MUST be
 prefix-preserving, charged to the extra-traffic budget, bounded by outstanding
 repair debt and configured repair/path-flight resources, and repeated only after
-the persistent repair delay. If the optional repair budget is exhausted while
-only a small persistent owner tail remains, the sender MAY spend a bounded
-critical-closure reserve to unblock the stream. That reserve is not new optional
-probe credit: it MUST be limited by the live repair debt and the configured
-repair/path-flight resources, and it MUST still be counted as repair overhead in
-the extra-traffic ledger. Terminal tail recovery is separate: once a final
-offset is known, a sender may repair unacknowledged bytes below that final
-offset on an eligible survivor path so the DATA_FIN/STREAM_FIN can be
-acknowledged. Repair candidate selection is prefix-preserving: if the lowest
-unresolved repair frame cannot be sent on an alternate eligible output, the
-sender MUST NOT skip it and send a later ordered range instead. This is targeted
-duplicate repair, not whole-cache replay.
+the persistent repair delay. If the optional repair budget is exhausted and the
+retained owner tail is the lowest persistent ordered-stream blocker, the sender
+MAY spend bounded correctness repair to unblock already-owned bytes. That repair
+is not new optional probe credit and not throughput exploration: it MUST be
+limited by live repair debt and configured repair/path-flight resources, and it
+MUST still be counted as repair overhead in the extra-traffic ledger. Terminal
+tail recovery is separate: once a final offset is known, a sender may repair
+unacknowledged bytes below that final offset on an eligible survivor path so the
+DATA_FIN/STREAM_FIN can be acknowledged. Repair candidate selection is
+prefix-preserving: if the lowest unresolved repair frame cannot be sent on an
+alternate eligible output, the sender MUST NOT skip it and send a later ordered
+range instead. This is targeted duplicate repair, not whole-cache replay.
 
 ## 14. Datagram Flow Layer
 
@@ -3313,18 +3319,21 @@ the sender may act only on the explicit gap or known-final-offset repair
 conditions described below.
 `extra_traffic_hint_percent` feeds a cumulative extra-traffic ledger owned by
 the sender service. ACK-released ordinary `OwnerData` progress earns additional
-repair budget; emitting bytes into unresolved ordered flight does not. Repair
-debits that ledger. Path proof traffic is bounded by validation attach fan-out
-and the path-proof startup payload, not by the sender's data queue. A small
-startup floor prevents repair deadlock before enough ordinary bytes have made
-ACK progress, but the floor is spent once and does not refresh on every ACK-gap
-or tail-stall event. After that floor is spent, newly earned repair budget
-accumulates until it can fund at least one useful repair burst; sub-MSS or
-crumb-sized repairs are not emitted merely because a small fractional budget was
-earned. The value is a continuous hint for how aggressively the sender may trade
-duplicate traffic for recovery speed; it is not a fixed rate, not a per-event
-multiplier, and not permission to send speculative unique bytes that deepen
-ordered receive debt.
+repair budget; emitting bytes into unresolved ordered flight does not. Optional
+repair debits that ledger. Path proof traffic is bounded by validation attach
+fan-out and the path-proof startup payload, not by the sender's data queue. A
+small startup floor prevents repair deadlock before enough ordinary bytes have
+made ACK progress, but the floor is spent once and does not refresh on every
+ACK-gap or tail-stall event. After that floor is spent, newly earned repair
+budget accumulates until it can fund at least one useful repair burst; sub-MSS
+or crumb-sized repairs are not emitted merely because a small fractional budget
+was earned. The value is a continuous hint for how aggressively the sender may
+trade duplicate traffic for recovery speed; it is not a fixed rate, not a
+per-event multiplier, not a product-data throttle, and not permission to send
+speculative unique bytes that deepen ordered receive debt. Correctness repair
+for the lowest persistent ordered-stream blocker may exceed the optional hint,
+but only as bounded `RepairData` and only to unblock already-owned product
+bytes.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
 a gap, a path failure or detach event, or known-final-offset tail recovery.
@@ -3844,12 +3853,13 @@ offset, the stream has retained unacked `OwnerData`, and an independent survivor
 output exists, the sender may reinject the lowest unacked tail bytes as
 `RepairData` after the persistent-stall timer. This is failover repair, not
 throughput probing: it must not create path delivery evidence, move the Service
-owner, or bypass the extra-traffic budget. Once the persistent-stall timer has
+owner, or become optional probe credit. Once the persistent-stall timer has
 fired, terminal owner-tail repair may spend the earned repair budget needed to
 close retained owner debt, bounded by repair-cache, path-flight, and sender
-resource limits. It MUST NOT exceed the extra-traffic budget except for the
-small correctness reserve needed to finish a stream whose remaining retained
-tail is below the closure threshold.
+resource limits. It MAY exceed the optional extra-traffic hint only when the
+retained owner tail is the lowest persistent ordered-stream blocker and the
+stream would otherwise remain stuck; the bytes are still counted as repair
+overhead and remain subject to configured repair/path-flight caps.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

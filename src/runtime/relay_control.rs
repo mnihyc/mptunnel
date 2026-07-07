@@ -1278,7 +1278,7 @@ where
                             has_multipath_repair_alternative,
                             ack_gap_repair_ready,
                         );
-                        let mut critical_closure_repair = false;
+                        let mut critical_tail_repair = false;
                         let repair_kind = if repair_frames.is_empty() {
                             let fin_tail_limit = if !local_open {
                                 let limit = reliable_tail_stall_repair_limit_bytes(
@@ -1287,12 +1287,10 @@ where
                                     repair_event_budget,
                                     context.mux_limits,
                                 );
-                                critical_closure_repair = repair_event_budget == 0
-                                    && limit > 0
-                                    && send_stream.repair_bytes()
-                                        <= reliable_tail_stall_critical_closure_bytes(
-                                            context.mux_limits,
-                                        );
+                                critical_tail_repair = reliable_tail_stall_repair_is_critical(
+                                    repair_event_budget,
+                                    limit,
+                                );
                                 limit
                             } else {
                                 repair_limit
@@ -1335,7 +1333,7 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let queued = if critical_closure_repair && repair_kind == "fin_tail" {
+                            let queued = if critical_tail_repair && repair_kind == "fin_tail" {
                                 sender.enqueue_critical_repair_frame(
                                     &mut sender_queue,
                                     frame,

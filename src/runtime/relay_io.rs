@@ -906,31 +906,24 @@ pub(super) fn reliable_tail_stall_repair_limit_bytes(
     if repair_debt_bytes == 0 {
         return 0;
     }
-    if budget_remaining == 0 {
-        let closure_cap = reliable_tail_stall_critical_closure_bytes(mux_limits);
-        return if repair_debt_bytes <= closure_cap {
-            repair_debt_bytes
-        } else {
-            0
-        };
-    }
     let resource_cap = mux_limits
         .max_repair_bytes
         .min(mux_limits.max_path_flight_bytes)
         .max(1);
+    if budget_remaining == 0 {
+        return repair_debt_bytes.min(resource_cap);
+    }
     repair_debt_bytes
         .max(base_repair_limit.max(1))
         .min(resource_cap)
         .min(budget_remaining)
 }
 
-pub(super) fn reliable_tail_stall_critical_closure_bytes(mux_limits: MuxLimits) -> usize {
-    reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
-        .saturating_mul(2)
-        .min(reliable_relay_buffer_len(mux_limits))
-        .min(mux_limits.max_repair_bytes)
-        .min(mux_limits.max_path_flight_bytes)
-        .max(1)
+pub(super) fn reliable_tail_stall_repair_is_critical(
+    budget_remaining: usize,
+    repair_limit: usize,
+) -> bool {
+    budget_remaining == 0 && repair_limit > 0
 }
 
 pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
@@ -1220,9 +1213,8 @@ fn enqueue_reliable_tail_repair(
         budget_remaining,
         mux_limits,
     );
-    let critical_closure_repair = budget_remaining == 0
-        && repair_limit > 0
-        && send_stream.repair_bytes() <= reliable_tail_stall_critical_closure_bytes(mux_limits);
+    let critical_tail_repair =
+        reliable_tail_stall_repair_is_critical(budget_remaining, repair_limit);
     let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
         send_stream,
         last_send_ack_ranges,
@@ -1259,7 +1251,7 @@ fn enqueue_reliable_tail_repair(
     );
     let mut repair_count = 0usize;
     for frame in repair_frames {
-        let queued = if critical_closure_repair {
+        let queued = if critical_tail_repair {
             Some(response_sender.enqueue_critical_repair_frame(frame))
         } else {
             response_sender.enqueue_repair_frame_with_priority(frame, mux_limits, true)
@@ -1774,7 +1766,7 @@ where
                             has_multipath_repair_alternative,
                             ack_gap_repair_ready,
                         );
-                        let mut critical_closure_repair = false;
+                        let mut critical_tail_repair = false;
                         let repair_kind = if repair_frames.is_empty() {
                             let fin_tail_ready = close_sent || pending_local_fin;
                             let fin_tail_limit = if fin_tail_ready {
@@ -1784,10 +1776,10 @@ where
                                     repair_event_budget,
                                     mux_limits,
                                 );
-                                critical_closure_repair = repair_event_budget == 0
-                                    && limit > 0
-                                    && send_stream.repair_bytes()
-                                        <= reliable_tail_stall_critical_closure_bytes(mux_limits);
+                                critical_tail_repair = reliable_tail_stall_repair_is_critical(
+                                    repair_event_budget,
+                                    limit,
+                                );
                                 limit
                             } else {
                                 repair_limit
@@ -1851,7 +1843,7 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let queued = if critical_closure_repair && repair_kind == "fin_tail" {
+                            let queued = if critical_tail_repair && repair_kind == "fin_tail" {
                                 response_sender.enqueue_critical_repair_frame(frame);
                                 true
                             } else {
@@ -2786,11 +2778,11 @@ mod tests {
     }
 
     #[test]
-    fn tail_stall_repair_limit_reserves_small_closure_after_budget_exhaustion() {
+    fn tail_stall_repair_limit_bounds_critical_repair_after_budget_exhaustion() {
         let limits = MuxLimits::default();
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
-        let closure_cap = reliable_tail_stall_critical_closure_bytes(limits);
-        let small_tail = closure_cap.saturating_sub(1024).max(1);
+        let resource_cap = limits.max_repair_bytes.min(limits.max_path_flight_bytes);
+        let small_tail = base_limit.saturating_sub(1024).max(1);
 
         let repair_limit =
             reliable_tail_stall_repair_limit_bytes(base_limit, small_tail, 0, limits);
@@ -2802,12 +2794,119 @@ mod tests {
         assert_eq!(
             reliable_tail_stall_repair_limit_bytes(
                 base_limit,
-                closure_cap.saturating_add(1),
+                resource_cap.saturating_add(base_limit),
                 0,
                 limits
             ),
+            resource_cap,
+            "over-budget correctness repair is bounded by the configured repair resource cap"
+        );
+    }
+
+    #[test]
+    fn tail_stall_critical_repair_limit_repairs_large_owner_tail_after_budget_exhaustion() {
+        let limits = MuxLimits::default();
+        let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+        let repair_debt = base_limit.saturating_mul(8);
+
+        let repair_limit =
+            reliable_tail_stall_repair_limit_bytes(base_limit, repair_debt, 0, limits);
+
+        assert!(
+            repair_limit >= base_limit,
+            "a persistent owner-tail stall is correctness repair; optional budget exhaustion must not leave the product stream permanently blocked"
+        );
+    }
+
+    #[test]
+    fn tail_stall_enqueue_uses_critical_repair_after_budget_exhaustion() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(97);
+        let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+        let repair_debt = base_limit.saturating_mul(8);
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(97),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let initial_budget = response_sender.repair_extra_budget_remaining(limits);
+        assert!(initial_budget > 0);
+        assert!(
+            response_sender
+                .enqueue_repair_frame_with_priority(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: 0,
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0x97; initial_budget]),
+                    },
+                    limits,
+                    false,
+                )
+                .is_some()
+        );
+        assert_eq!(
+            response_sender.repair_extra_event_budget_remaining(limits),
+            0
+        );
+
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                limits,
+            ),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        send_stream
+            .send_data(Bytes::from(vec![0x31; repair_debt]), StreamFlags::NONE)
+            .expect("owner data");
+        let ack_frontier = base_limit as u64;
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &[OffsetRange {
+                start: 0,
+                end: ack_frontier,
+            }],
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+            path_stream.max_frame_payload_bytes,
+            ack_frontier,
+            false,
+        );
+
+        assert!(
+            queued > 0,
+            "budget exhaustion must not prevent correctness-critical owner-tail repair from being queued"
+        );
+        assert!(
+            response_sender.queued_send_ready(),
+            "critical repair should enter the sender queue even when ordinary optional repair budget is exhausted"
+        );
+        assert_eq!(
+            response_sender.repair_extra_event_budget_remaining(limits),
             0,
-            "the closure reserve must not become an unbounded over-budget repair path"
+            "critical repair may exceed the optional hint, but it must not mint fresh optional budget"
         );
     }
 

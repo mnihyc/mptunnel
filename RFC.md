@@ -1808,20 +1808,20 @@ unacknowledged bytes last sent on the failed or suspect path. A sender MUST NOT
 retransmit acknowledged ranges and MUST NOT replay the entire repair cache after
 reattach.
 
-When a tail-stall repair timer fires, a sender MUST first inspect the most
-recent repair-authoritative `STREAM_ACK`. If that ACK proves an unacknowledged
-gap below its largest end offset, the repair extent is that gap, not bytes after
-the ACK frontier. Bytes after the largest ACKed end are eligible for tail repair
-only when no authoritative lower gap is known. This keeps receive-hole repair
-ahead of continuation replay and matches the same ordering principle used by
-QUIC ACK ranges and MPTCP reinjection: recover the earliest missing logical
-offset before spending repair budget on later stream bytes. Repair candidate
-selection is prefix-preserving: if the lowest unresolved repair frame cannot be
-sent on an alternate eligible output, the sender MUST NOT skip it and send a
-later ordered range instead. If a data-plane stall/PTO timer has fired and no
-alternate output can carry the frontier range, the sender MAY retransmit that
-same lowest frontier range on the current survivor output, then stop that repair
-pass. This is targeted duplicate repair, not whole-cache replay.
+When a tail-stall repair timer fires on a live stream, a sender MUST inspect the
+most recent repair-authoritative `STREAM_ACK`. If that ACK proves an
+unacknowledged gap below its largest end offset, the repair extent is that gap,
+not bytes after the ACK frontier. If no authoritative lower gap is known, the
+live tail is not repair-eligible merely because it is unacknowledged. TCP and
+QUIC already own reliable carrier retransmission for in-flight tail bytes;
+replaying the continuation at the product layer consumes duplicate traffic and
+can create new receive-hole debt. Terminal tail recovery is separate: once a
+final offset is known, a sender may repair unacknowledged bytes below that final
+offset on an eligible survivor path so the DATA_FIN/STREAM_FIN can be
+acknowledged. Repair candidate selection is prefix-preserving: if the lowest
+unresolved repair frame cannot be sent on an alternate eligible output, the
+sender MUST NOT skip it and send a later ordered range instead. This is targeted
+duplicate repair, not whole-cache replay.
 
 ## 14. Datagram Flow Layer
 
@@ -3132,7 +3132,8 @@ continues servicing carrier ACKs, product ACKs, control frames, flow-control
 updates, explicit gap repair, path proof, and path events while the
 ordinary byte range waits for ACK progress or a serviceable lower-frontier
 owner. If the blocked frontier later produces data-plane PTO/stall evidence,
-the sender may perform the normal tail/gap repair action described below.
+the sender may act only on the explicit gap or known-final-offset repair
+conditions described below.
 `extra_traffic_hint_percent` feeds a cumulative extra-traffic ledger owned by
 the response sender service. Ordinary unique owner bytes earn additional
 repair budget; repair debits that ledger. Path proof traffic is bounded by validation attach fan-out and the
@@ -3148,11 +3149,14 @@ multiplier, and not permission to send speculative unique bytes that deepen
 ordered receive debt.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
-a gap, a path failure or detach event, or data-plane PTO/stall evidence. The
-same sender-owned extra-traffic ledger applies to immediate ACK-gap repair and
-later tail/PTO repair, because both cases spend duplicate traffic from the same
-stream-level budget. The repair extent is the missing or suspect unacknowledged
-byte range indicated by that event, not every cached chunk below the frontier.
+a gap, a path failure or detach event, or known-final-offset tail recovery.
+Data-plane PTO/stall evidence is a timer input for deciding when to act on those
+facts; it is not by itself permission to duplicate arbitrary live tail bytes.
+The same sender-owned extra-traffic ledger applies to immediate ACK-gap repair
+and later final-tail repair, because both cases spend duplicate traffic from the
+same stream-level budget. The repair extent is the missing or suspect
+unacknowledged byte range indicated by that event, not every cached chunk below
+the frontier.
 Repair target choice is evidence-ordered, not carrier-family ordered. The
 sender first prefers an eligible path that did not carry the last outstanding
 copy of the repaired range and that is active or bulk-rate proven for this
@@ -3160,16 +3164,16 @@ direction. If no such path exists, it may spend bounded repair on another
 non-owner validation/proof path. Only if no useful non-owner path is available
 may it resend the same lowest unresolved repair range on the current survivor
 output. This is the MPTCP reinjection rule applied only after loss, failure, or
-stall evidence exists, with the QUIC-style recovery constraint that a repair
-action is small, ACK-clocked, and never a replay of unrelated cached bytes. A
+explicit repair evidence exists, with the QUIC-style recovery constraint that a
+repair action is small, ACK-clocked, and never a replay of unrelated cached bytes. A
 sender MUST NOT substitute a later range merely because the frontier range is
 already in flight. A sender MUST NOT duplicate every lower outstanding byte
 merely because a faster active path is available. Speculative reinjection outside
 the sender-service queue is prohibited because it can occupy path queues before
 the receiver has proven useful repair. A queued sender may spend additional
-repair traffic only after explicit ACK-gap, path failure/detach, or PTO/stall
-evidence, and the numeric traffic hint only scales the sender-service repair
-budget.
+repair traffic only after explicit ACK-gap, path failure/detach, or
+known-final-offset tail recovery, and the numeric traffic hint only scales the
+sender-service repair budget.
 
 Repair `STREAM_DATA` is still stream data for correctness and flow accounting,
 but its service lane is repair/latency, not ordinary bulk. It therefore uses
@@ -3263,8 +3267,10 @@ subflow or failover path. It is not a second retransmission layer queued behind
 the same in-order carrier stream. Same-output tail retransmission cannot overtake
 missing carrier bytes, but it can consume duplicate tunnel traffic and create
 ACK/repair feedback loops. A sender therefore MAY arm tail repair only when an
-independent repair subflow is available, and it SHOULD wait for a persistent
-congestion-scale stall rather than one ordinary PTO before sending tail repair.
+independent repair subflow is available, and the tail timer may emit repair only
+for an authoritative ACK gap or a known final-offset tail. It SHOULD wait for a
+persistent congestion-scale stall rather than one ordinary PTO before sending
+that repair.
 
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,
@@ -3993,8 +3999,7 @@ on_tail_stall_repair(stream_id, last_complete_ack_ranges):
     if holes is not empty:
         schedule_prefix_repair(holes, repair_budget)
     else:
-        tail = unacked_chunks_after_largest_acked(last_complete_ack_ranges)
-        schedule_prefix_repair(tail, repair_budget)
+        do_not_repair_live_tail_without_authoritative_gap_or_final_offset()
     if lowest_repair_range_is_already_in_flight_on_only_survivor
        and stall_or_PTO_evidence_exists:
         retransmit_same_lowest_range_once()
@@ -4219,8 +4224,10 @@ receive_product_frame_from_quic():
 on_quic_or_product_stall(path, stream):
     if quic_reports_connection_closed_or_path_failed(path):
         mark_path_suspect_for_new_bulk()
-    if product_stream_ack_frontier_stalls_while_survivor_exists(stream):
+    if repair_authoritative_ack_gap_stalls_while_survivor_exists(stream):
         queue_gap_targeted_product_repair_for_unacked_ranges(path, stream)
+    if final_offset_known_and_terminal_tail_stalls(stream):
+        queue_final_tail_repair_for_unacked_ranges(path, stream)
     if active_stall_budget_exceeded(path, stream):
         detach_active_work_to_survivor_path()
         cool_failed_active_path_for_data_scheduling()

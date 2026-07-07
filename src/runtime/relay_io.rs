@@ -72,6 +72,16 @@ pub(super) fn stream_tail_repair_allowed(has_multipath_repair_alternative: bool)
     has_multipath_repair_alternative
 }
 
+pub(super) fn stream_ack_ranges_expose_authoritative_gap(
+    complete: bool,
+    ranges: &[OffsetRange],
+) -> bool {
+    complete
+        && ranges
+            .first()
+            .is_some_and(|first| first.start > 0 || ranges.len() > 1)
+}
+
 pub(super) fn reliable_relay_tail_repair_deadline(
     last_progress_at: Instant,
     path: Option<PathSnapshot>,
@@ -139,10 +149,7 @@ pub(super) fn stream_tail_stall_repair_frames(
             return (gap_frames, "ack_gap");
         }
     }
-    (
-        send_stream.retransmission_frames_after_ack_frontier(ranges, byte_limit),
-        "ack_frontier",
-    )
+    (Vec::new(), "none")
 }
 
 pub(super) fn stream_final_offset_tail_repair_frames(
@@ -1332,6 +1339,10 @@ where
             && stream_tail_repair_allowed(has_tail_repair_alternative)
             && send_stream.repair_bytes() > 0
             && !last_send_ack_ranges.is_empty()
+            && stream_ack_ranges_expose_authoritative_gap(
+                last_send_ack_complete,
+                &last_send_ack_ranges,
+            )
             && last_send_ack_frontier < send_stream.next_offset();
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
@@ -2270,6 +2281,50 @@ mod tests {
     }
 
     #[test]
+    fn tail_repair_timer_requires_repair_authoritative_ack_gap_shape() {
+        assert!(!stream_ack_ranges_expose_authoritative_gap(
+            false,
+            &[
+                OffsetRange {
+                    start: 0,
+                    end: 1024,
+                },
+                OffsetRange {
+                    start: 2048,
+                    end: 4096,
+                },
+            ],
+        ));
+        assert!(!stream_ack_ranges_expose_authoritative_gap(
+            true,
+            &[OffsetRange {
+                start: 0,
+                end: 1024,
+            }],
+        ));
+        assert!(stream_ack_ranges_expose_authoritative_gap(
+            true,
+            &[OffsetRange {
+                start: 1024,
+                end: 4096,
+            }],
+        ));
+        assert!(stream_ack_ranges_expose_authoritative_gap(
+            true,
+            &[
+                OffsetRange {
+                    start: 0,
+                    end: 1024,
+                },
+                OffsetRange {
+                    start: 2048,
+                    end: 4096,
+                },
+            ],
+        ));
+    }
+
+    #[test]
     fn tail_repair_uses_persistent_congestion_timeout() {
         let last_progress = Instant::now();
         let deadline =
@@ -2281,6 +2336,86 @@ mod tests {
         );
 
         assert_eq!(deadline, expected);
+    }
+
+    #[test]
+    fn tail_stall_without_authoritative_ack_gap_does_not_repair_live_tail() {
+        let limits = MuxLimits::default();
+        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
+        send_stream
+            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+            .expect("send stream data");
+
+        let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
+            &send_stream,
+            &[OffsetRange {
+                start: 0,
+                end: 1024,
+            }],
+            4096,
+            false,
+        );
+
+        assert!(repair_frames.is_empty());
+        assert_eq!(repair_kind, "none");
+    }
+
+    #[test]
+    fn tail_stall_repair_still_repairs_authoritative_ack_gap() {
+        let limits = MuxLimits::default();
+        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
+        send_stream
+            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+            .expect("send stream data");
+
+        let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
+            &send_stream,
+            &[
+                OffsetRange {
+                    start: 0,
+                    end: 1024,
+                },
+                OffsetRange {
+                    start: 2048,
+                    end: 4096,
+                },
+            ],
+            4096,
+            true,
+        );
+
+        assert_eq!(repair_kind, "ack_gap");
+        assert_eq!(repair_frames.len(), 1);
+        assert_eq!(
+            reliable_stream_frame_extent(&repair_frames[0]),
+            Some((1024, 2048, 1024))
+        );
+    }
+
+    #[test]
+    fn final_offset_tail_repair_can_recover_unacked_terminal_tail() {
+        let limits = MuxLimits::default();
+        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
+        send_stream
+            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+            .expect("send stream data");
+
+        let repair_frames = stream_final_offset_tail_repair_frames(
+            &send_stream,
+            &[OffsetRange {
+                start: 0,
+                end: 1024,
+            }],
+            4096,
+            true,
+            true,
+        );
+
+        assert_eq!(repair_frames.len(), 1);
+        assert_eq!(
+            reliable_stream_frame_extent(&repair_frames[0]),
+            Some((1024, 4096, 3072))
+        );
     }
 
     #[test]

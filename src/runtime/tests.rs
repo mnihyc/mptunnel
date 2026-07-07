@@ -2705,7 +2705,7 @@ fn tail_stall_repair_prefers_authoritative_ack_gap_before_frontier_tail() {
 }
 
 #[test]
-fn tail_stall_repair_uses_frontier_tail_when_ack_has_no_authoritative_gap() {
+fn tail_stall_repair_does_not_replay_live_tail_without_authoritative_gap() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(33), mux_limits);
     send_stream
@@ -2722,24 +2722,8 @@ fn tail_stall_repair_uses_frontier_tail_when_ack_has_no_authoritative_gap() {
     let _ = send_stream.apply_ack(&ranges);
     let (repairs, kind) = stream_tail_stall_repair_frames(&send_stream, &ranges, 6, true);
 
-    assert_eq!(kind, "ack_frontier");
-    assert_eq!(repairs.len(), 2);
-    assert!(matches!(
-        &repairs[0],
-        Frame::StreamData {
-            offset: 4,
-            payload,
-            ..
-        } if payload.as_ref() == b"bbbb"
-    ));
-    assert!(matches!(
-        &repairs[1],
-        Frame::StreamData {
-            offset: 8,
-            payload,
-            ..
-        } if payload.as_ref() == b"cc"
-    ));
+    assert_eq!(kind, "none");
+    assert!(repairs.is_empty());
 }
 
 #[test]

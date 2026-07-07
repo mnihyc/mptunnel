@@ -561,7 +561,12 @@ fn response_target_is_plausible_unique_owner_candidate(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
 ) -> bool {
-    response_target_is_service_owner_candidate(target, candidates) || target.has_bulk_rate_evidence
+    response_target_is_service_owner_candidate(target, candidates)
+        || target.has_bulk_rate_evidence
+        || (target.has_service_handoff_evidence
+            && !candidates
+                .iter()
+                .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence))
 }
 
 #[cfg(test)]
@@ -608,6 +613,7 @@ fn response_target_unique_owner_admission_with_epoch(
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     if lower_owner == Some(target.key)
         || response_target_is_service_owner_candidate(target, candidates)
+        || (lower_owner.is_none() && target.key == lead.key && target.has_service_handoff_evidence)
     {
         return (PathAdmission::service(), None);
     }
@@ -721,9 +727,9 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
 
 fn response_target_runtime_role(
     target: &ResponseSenderPathTarget,
-    ordered_data_owner: Option<CarrierPathKey>,
+    lower_owner: Option<CarrierPathKey>,
 ) -> PathRuntimeRole {
-    if ordered_data_owner.is_none() || ordered_data_owner == Some(target.key) || target.is_active {
+    if lower_owner.is_none() || lower_owner == Some(target.key) || target.is_active {
         PathRuntimeRole::Service
     } else {
         PathRuntimeRole::Subflow
@@ -1440,7 +1446,7 @@ fn plan_response_data_dispatch_with_product_debt(
             };
             let role = response_target_runtime_role(
                 &target,
-                response_oldest_lower_flight_owner(&lower_flights).or(ordered_data_owner),
+                response_oldest_lower_flight_owner(&lower_flights),
             );
             debug_assert!(
                 role != PathRuntimeRole::Subflow || target.has_bulk_rate_evidence,
@@ -3176,6 +3182,7 @@ mod tests {
             snapshot,
             eta_ms,
             is_active,
+            has_service_handoff_evidence: true,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         }
@@ -3695,6 +3702,7 @@ mod tests {
             snapshot,
             eta_ms: 1.0,
             is_active: true,
+            has_service_handoff_evidence: true,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         };
@@ -4556,7 +4564,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_only_same_family_candidate_cannot_own_startup_data() {
+    fn proof_only_same_family_candidate_cannot_own_data_under_lower_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -4587,14 +4595,17 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            &[],
+            &[CarrierPathFlightDebt {
+                key: active_key,
+                bytes: payload_bytes as u64,
+            }],
             Some(active_key),
         )
         .expect("service path should remain dispatchable");
 
         assert_eq!(
             selected.key, active.key,
-            "path proof/liveness evidence is Probe evidence; it must not assign unique ordered bytes to an unmeasured Subflow"
+            "path proof/liveness evidence must not assign later unique bytes to an unmeasured Subflow while lower-owner debt exists"
         );
         assert_eq!(
             response_target_runtime_role(&selected, Some(active_key)),
@@ -4603,7 +4614,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_only_sender_evidence_is_probe_not_subflow_owner() {
+    fn proof_only_sender_evidence_is_not_subflow_owner_under_lower_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -4634,14 +4645,17 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            &[],
+            &[CarrierPathFlightDebt {
+                key: active_key,
+                bytes: payload_bytes as u64,
+            }],
             Some(active_key),
         )
         .expect("service path should remain dispatchable");
 
         assert_eq!(
             selected.key, active.key,
-            "path proof/liveness evidence must not bootstrap same-stream OwnerData"
+            "path proof/liveness evidence must not bootstrap same-stream Subflow OwnerData under lower-owner debt"
         );
         assert_eq!(
             response_target_runtime_role(&selected, Some(active_key)),
@@ -4693,7 +4707,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_bulk_rate_candidate_is_subflow_set_not_epoch_service() {
+    fn frontier_clear_bulk_rate_candidate_is_service_not_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active = response_target(0, UnderlayProtocol::Udp, 80.0, 0, 16 * 1024 * 1024, true);
@@ -4715,12 +4729,12 @@ mod tests {
             mux_limits,
         );
 
-        assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-        assert_eq!(admission.role, PathRuntimeRole::Subflow);
+        assert_eq!(admission.decision, PathAdmissionDecision::Service);
+        assert_eq!(admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
-    fn response_planning_keeps_proof_only_optional_path_out_of_owner_set() {
+    fn response_planning_allows_proof_only_optional_path_as_frontier_clear_service_not_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let (active_commands, _active_rx) = reliable_path_command_channels(8);
@@ -4812,12 +4826,12 @@ mod tests {
             frames: frames_rx,
         };
         let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("service path remains dispatchable when optional path is proof-only");
+            .expect("frontier-clear proof-only same-family path may become Service");
 
         assert_eq!(
             plan.primary_key(),
-            Some(service),
-            "planning must not create OwnerData for a proof-only optional path"
+            Some(optional),
+            "proof-only same-family paths may hand off Service at a clear frontier"
         );
         assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
     }
@@ -5361,6 +5375,32 @@ mod tests {
         .expect("small normal owner debt should not block better bulk service selection");
 
         assert_eq!(selected.key, lower_eta_alternate.key);
+    }
+
+    #[test]
+    fn frontier_clear_same_underlay_sender_evidence_can_handoff_service_without_subflow_proof() {
+        let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        owner.has_bulk_rate_evidence = false;
+        let mut lower_eta_alternate =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        lower_eta_alternate.has_sender_evidence = true;
+        lower_eta_alternate.has_bulk_rate_evidence = false;
+
+        let selected = choose_response_sender_data_target(
+            &[owner.clone(), lower_eta_alternate.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(owner.key),
+        )
+        .expect("frontier-clear same-underlay path with sender evidence may become Service");
+
+        assert_eq!(selected.key, lower_eta_alternate.key);
+        assert_eq!(
+            response_target_runtime_role(&selected, None),
+            PathRuntimeRole::Service
+        );
     }
 
     #[test]

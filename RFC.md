@@ -366,15 +366,19 @@ recovery engines. Therefore, for one ordered reliable stream, a proof-only
 validation output MUST NOT carry later unique `STREAM_DATA` while another
 output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
-A frontier-clear same-family path with only liveness, proof, or configured-hint
-evidence may become the Service path when the sender-service Service selection
-model chooses it and no lower owner debt exists, but it is not a Subflow owner.
-A same-family Subflow may carry ordinary unique bytes only after bulk-rate
-evidence exists and sender-service admission proves that doing so will not
-expand product receive-hole debt or worsen the completion horizon. This rule is
-path-metric driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred
-or UDP-preferred policy. Mixed TCP+QUIC paths are deliberately stricter in
-production v1 because they do not share one carrier-family recovery model.
+A frontier-clear same-family path with only liveness, path-proof, or
+configured-hint evidence may become the Service path when the sender-service
+Service selection model chooses it, no lower owner debt exists, and no
+bulk-rate-proven same-family candidate should be preferred. This is a Service
+handoff, not Subflow admission. ACK-data-only evidence from a tiny or
+application-limited probe is not Service-handoff evidence by itself and does not
+grant ordinary owner rights. A same-family Subflow may carry ordinary unique
+bytes only after bulk-rate evidence exists and sender-service admission proves
+that doing so will not expand product receive-hole debt or worsen the completion
+horizon. This rule is path-metric driven inside TCP+TCP and QUIC+QUIC sets; it
+is not a TCP-preferred or UDP-preferred policy. Mixed TCP+QUIC paths are
+deliberately stricter in production v1 because they do not share one
+carrier-family recovery model.
 
 A product reliable stream owns only stream semantics: stream ID, target metadata,
 ingress metadata, outbound policy metadata, send offset space, receive offset

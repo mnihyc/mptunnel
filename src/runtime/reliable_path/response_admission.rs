@@ -30,6 +30,7 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
+    pub(in crate::runtime) has_service_handoff_evidence: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
 }
@@ -482,6 +483,25 @@ fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry)
         && (server_path_metrics_has_bulk_rate_evidence(path_metrics)
             || server_path_metrics_has_ack_data_evidence(path_metrics)
             || path_metrics.metrics.confidence_ppm > 0)
+}
+
+pub(in crate::runtime) fn server_output_has_service_handoff_evidence(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
+    matches!(
+        entry.path_metrics,
+        Some(ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::PeerHint,
+            ..
+        }) | Some(ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::LocalSender,
+            metrics: PathMetrics {
+                confidence_ppm: 1..,
+                has_ack_derived_data_sample: false,
+                ..
+            },
+        })
+    )
 }
 
 pub(in crate::runtime) fn server_output_has_sender_evidence(

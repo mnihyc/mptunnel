@@ -135,6 +135,7 @@ pub(super) struct ReliableRelayQueuedWork {
 /// queues must receive only already-admitted frames.
 pub(super) struct ReliableRelaySenderQueue {
     control: VecDeque<ReliableRelayQueuedWork>,
+    critical_repair: VecDeque<ReliableRelayQueuedWork>,
     repair: VecDeque<ReliableRelayQueuedWork>,
     data: VecDeque<ReliableRelayQueuedWork>,
     final_control: VecDeque<ReliableRelayQueuedWork>,
@@ -147,6 +148,7 @@ pub(super) struct ReliableRelaySenderQueue {
 impl ReliableRelaySenderQueue {
     pub(super) fn is_empty(&self) -> bool {
         self.control.is_empty()
+            && self.critical_repair.is_empty()
             && self.repair.is_empty()
             && self.data.is_empty()
             && self.final_control.is_empty()
@@ -202,15 +204,40 @@ impl ReliableRelaySenderQueue {
     }
 
     pub(super) fn push_repair_with_cause(&mut self, frame: Frame, cause: RelaySendCause) -> u64 {
+        self.push_repair_with_priority(frame, cause, false)
+    }
+
+    pub(super) fn push_critical_repair_with_cause(
+        &mut self,
+        frame: Frame,
+        cause: RelaySendCause,
+    ) -> u64 {
+        self.push_repair_with_priority(frame, cause, true)
+    }
+
+    fn push_repair_with_priority(
+        &mut self,
+        frame: Frame,
+        cause: RelaySendCause,
+        critical: bool,
+    ) -> u64 {
         debug_assert!(cause.is_repair());
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
-        self.push_work(
+        let enqueue_id = self.push_work(
             ReliableRelayQueuedWorkLane::Repair,
             ReliableRelayQueuedWorkKind::Repair { frame, cause },
             None,
             false,
             payload_bytes,
-        )
+        );
+        if critical {
+            let work = self
+                .repair
+                .pop_back()
+                .expect("newly pushed repair must exist");
+            self.critical_repair.push_back(work);
+        }
+        enqueue_id
     }
 
     fn push_work(
@@ -257,17 +284,16 @@ impl ReliableRelaySenderQueue {
     pub(super) fn front(&self) -> Option<(ReliableRelayQueuedWorkLane, &ReliableRelayQueuedWork)> {
         if let Some(work) = self.control.front() {
             Some((ReliableRelayQueuedWorkLane::Control, work))
+        } else if let Some(work) = self.critical_repair.front() {
+            Some((ReliableRelayQueuedWorkLane::Repair, work))
+        } else if let Some(work) = self.data.front() {
+            Some((ReliableRelayQueuedWorkLane::Data, work))
         } else if let Some(work) = self.repair.front() {
             Some((ReliableRelayQueuedWorkLane::Repair, work))
         } else {
-            self.data
+            self.final_control
                 .front()
-                .map(|work| (ReliableRelayQueuedWorkLane::Data, work))
-                .or_else(|| {
-                    self.final_control
-                        .front()
-                        .map(|work| (ReliableRelayQueuedWorkLane::Control, work))
-                })
+                .map(|work| (ReliableRelayQueuedWorkLane::Control, work))
         }
     }
 
@@ -280,10 +306,12 @@ impl ReliableRelaySenderQueue {
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
         let (lane, work) = if let Some(work) = self.control.pop_front() {
             (ReliableRelayQueuedWorkLane::Control, work)
-        } else if let Some(work) = self.repair.pop_front() {
+        } else if let Some(work) = self.critical_repair.pop_front() {
             (ReliableRelayQueuedWorkLane::Repair, work)
         } else if let Some(work) = self.data.pop_front() {
             (ReliableRelayQueuedWorkLane::Data, work)
+        } else if let Some(work) = self.repair.pop_front() {
+            (ReliableRelayQueuedWorkLane::Repair, work)
         } else {
             (
                 ReliableRelayQueuedWorkLane::Control,
@@ -351,15 +379,11 @@ pub(super) fn reliable_relay_sender_queue_limit(
 pub(super) fn reliable_relay_can_read_into_sender_queue(
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
-    mux_limits: MuxLimits,
+    _mux_limits: MuxLimits,
     queue_limit: usize,
 ) -> bool {
     sender_queue.bytes() < queue_limit
         && sender_queue.data_bytes() < send_stream.send_credit_bytes()
-        && send_stream
-            .repair_bytes()
-            .saturating_add(sender_queue.data_bytes())
-            < mux_limits.max_repair_bytes
 }
 
 pub(super) fn reliable_relay_can_read_product_source(
@@ -383,18 +407,12 @@ pub(super) fn reliable_relay_can_read_product_source(
 pub(super) fn reliable_relay_sender_queue_read_budget(
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
-    mux_limits: MuxLimits,
+    _mux_limits: MuxLimits,
     queue_limit: usize,
     buffer_len: usize,
 ) -> usize {
     queue_limit
         .saturating_sub(sender_queue.bytes())
-        .min(
-            mux_limits
-                .max_repair_bytes
-                .saturating_sub(send_stream.repair_bytes())
-                .saturating_sub(sender_queue.data_bytes()),
-        )
         .min(
             send_stream
                 .send_credit_bytes()
@@ -691,9 +709,9 @@ fn response_target_unique_owner_admission(
 //
 // The important split is:
 // * Service: the current active/lower-frontier owner, kept fed while healthy.
-// * Subflow: same-family additional path, admitted with bounded startup owner
-//   credit from path-scoped sender evidence or for steady-state owner bytes
-//   with bulk-rate evidence.
+// * Subflow: additional path admitted with bounded startup owner credit when
+//   startup policy permits it, or for steady-state owner bytes with bulk-rate
+//   evidence and candidate-specific ordering safety.
 //
 // Path proof, ACK-data visibility, and carrier attachment are intentionally not
 // owner states. They are evidence inputs for this decision.
@@ -844,13 +862,12 @@ fn response_cross_underlay_owner_allowed(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
     ordered_data_owner: Option<CarrierPathKey>,
-    lower_owner: Option<CarrierPathKey>,
+    lower_flights: &[CarrierPathFlightDebt],
 ) -> bool {
-    // Use the ordered owner when lower product bytes are outstanding; otherwise
-    // use the current Service/active path as the family anchor. Without this, a
-    // freshly cleared frontier could immediately move OwnerData to the other
-    // carrier family, recreating the TCP/QUIC mixed-stream stalls seen in the
-    // shaped all-path rows.
+    // Use the ordered owner as the family anchor, but assess safety from the
+    // candidate's actual ordering debt. A lower-flight record owned by this
+    // candidate is not a reason to block it; it means continuing the candidate
+    // will not expand cross-path lower-byte debt.
     let current_owner = ordered_data_owner.or_else(|| {
         candidates
             .iter()
@@ -866,12 +883,13 @@ fn response_cross_underlay_owner_allowed(
                 .find(|entry| entry.key == owner_key)
         })
         .is_none_or(|owner| owner.has_bulk_rate_evidence);
+    let candidate_ordering_safe = response_ordering_debt_bytes(lower_flights, target.key) == 0;
     cross_family_reliable_owner_health(
         current_owner,
         current_owner_bulk_rate_proven,
         target.key,
         target.has_bulk_rate_evidence,
-        lower_owner.is_none(),
+        candidate_ordering_safe,
     )
     .reliable_owner_allowed()
 }
@@ -934,10 +952,11 @@ fn response_owner_debt_pressure(
         return None;
     }
 
-    // Product owner debt pressure is a family/evidence filter, not a Service
-    // priority bypass. The current Service owner and already measured
-    // same-family Subflows compete through the normal no-worse admission checks;
-    // cross-family and proof-only candidates remain Probe/Standby/RepairOnly.
+    // Product owner debt pressure is an evidence/ordering-safety filter, not a
+    // Service priority bypass. The current Service owner and measured Subflows
+    // that do not expand cross-path ordering debt compete through the normal
+    // no-worse admission checks; proof-only and debt-expanding cross-family
+    // candidates remain Probe/Standby/RepairOnly.
     Some(owner_key)
 }
 
@@ -1413,7 +1432,9 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         #[cfg(feature = "lab-diagnostics")]
         for target in &candidate_targets {
             if target.key != owner_key
-                && !(target.key.underlay == owner_key.underlay && target.has_bulk_rate_evidence)
+                && !(target.has_bulk_rate_evidence
+                    && (target.key.underlay == owner_key.underlay
+                        || response_ordering_debt_bytes(lower_flights, target.key) == 0))
             {
                 lab_response_bulk_output_candidate(
                     "debt_pressure_filter",
@@ -1430,7 +1451,9 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         }
         candidate_targets.retain(|target| {
             target.key == owner_key
-                || (target.key.underlay == owner_key.underlay && target.has_bulk_rate_evidence)
+                || (target.has_bulk_rate_evidence
+                    && (target.key.underlay == owner_key.underlay
+                        || response_ordering_debt_bytes(lower_flights, target.key) == 0))
         });
         if candidate_targets.is_empty() {
             return None;
@@ -1444,7 +1467,7 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
                 target,
                 &candidate_targets,
                 ordered_data_owner,
-                lower_owner,
+                lower_flights,
             )
         })
         .collect::<Vec<_>>();
@@ -2245,10 +2268,6 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
-    pub(super) fn front_lane(&self) -> Option<ReliableRelayQueuedWorkLane> {
-        self.queue.front_lane()
-    }
-
     pub(super) fn front_has_carrier_credit_with_product_owner_debt(
         &self,
         path_stream: &ReliablePathStream,
@@ -2346,10 +2365,11 @@ impl ServerResponseSenderService {
         self.queue.push_final_control(frame)
     }
 
-    pub(super) fn enqueue_repair_frame(
+    pub(super) fn enqueue_repair_frame_with_priority(
         &mut self,
         frame: Frame,
         mux_limits: MuxLimits,
+        critical_priority: bool,
     ) -> Option<u64> {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
@@ -2362,7 +2382,12 @@ impl ServerResponseSenderService {
         }
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
-        Some(self.queue.push_repair(frame))
+        Some(if critical_priority {
+            self.queue
+                .push_critical_repair_with_cause(frame, RelaySendCause::AckGapRepair)
+        } else {
+            self.queue.push_repair(frame)
+        })
     }
 
     pub(super) fn enqueue_critical_repair_frame(&mut self, frame: Frame) -> u64 {
@@ -2370,7 +2395,8 @@ impl ServerResponseSenderService {
         debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
-        self.queue.push_repair(frame)
+        self.queue
+            .push_critical_repair_with_cause(frame, RelaySendCause::AckGapRepair)
     }
 
     pub(super) async fn dispatch_next(
@@ -2679,12 +2705,13 @@ impl RelaySenderService {
         }
     }
 
-    pub(super) fn enqueue_repair_frame(
+    pub(super) fn enqueue_repair_frame_with_priority(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         frame: Frame,
         cause: RelaySendCause,
         mux_limits: MuxLimits,
+        critical_priority: bool,
     ) -> bool {
         debug_assert!(cause.is_repair());
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
@@ -2697,7 +2724,11 @@ impl RelaySenderService {
         }
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
-        sender_queue.push_repair_with_cause(frame, cause);
+        if critical_priority {
+            sender_queue.push_critical_repair_with_cause(frame, cause);
+        } else {
+            sender_queue.push_repair_with_cause(frame, cause);
+        }
         true
     }
 
@@ -2711,7 +2742,7 @@ impl RelaySenderService {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
-        sender_queue.push_repair_with_cause(frame, cause);
+        sender_queue.push_critical_repair_with_cause(frame, cause);
     }
 
     #[cfg(test)]
@@ -3432,11 +3463,12 @@ impl RelaySenderService {
         }
         let mut queued = false;
         for frame in repair_frames {
-            let queued_frame = self.enqueue_repair_frame(
+            let queued_frame = self.enqueue_repair_frame_with_priority(
                 sender_queue,
                 frame,
                 RelaySendCause::PathFailureRepair,
                 context.mux_limits,
+                true,
             );
             queued |= queued_frame;
             #[cfg(feature = "lab-diagnostics")]
@@ -3498,6 +3530,96 @@ fn relay_path_can_enqueue_frame_for_cause_now(
 mod tests {
     use super::*;
     use crate::config::SharedSecret;
+
+    #[test]
+    fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
+        let stream_id = StreamId(77);
+        let mut queue = ReliableRelaySenderQueue::default();
+
+        queue.push_data(Bytes::from_static(b"owner"));
+        queue.push_repair(Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"repair"),
+        });
+
+        let (lane, work) = queue
+            .pop_front()
+            .expect("ordinary owner data should be queued");
+        assert_eq!(
+            lane,
+            ReliableRelayQueuedWorkLane::Data,
+            "ordinary RepairData must not preempt OwnerData; repair only preempts when explicitly critical"
+        );
+        assert_eq!(work.payload_bytes, 5);
+    }
+
+    #[test]
+    fn sender_queue_dispatches_critical_repair_before_owner_data() {
+        let stream_id = StreamId(78);
+        let mut queue = ReliableRelaySenderQueue::default();
+
+        queue.push_data(Bytes::from_static(b"owner"));
+        queue.push_critical_repair_with_cause(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"repair"),
+            },
+            RelaySendCause::AckGapRepair,
+        );
+
+        let (lane, work) = queue.pop_front().expect("critical repair should be queued");
+        assert_eq!(
+            lane,
+            ReliableRelayQueuedWorkLane::Repair,
+            "critical RepairData closes an active product hole and must preempt later OwnerData"
+        );
+        assert_eq!(work.payload_bytes, 6);
+    }
+
+    #[test]
+    fn budgeted_critical_repair_preempts_owner_data_and_debits_budget() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(79);
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(79),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+
+        sender.enqueue_data_for_lane(Bytes::from_static(b"owner"), FlowLane::Throughput);
+        assert!(
+            sender
+                .enqueue_repair_frame_with_priority(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: 0,
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0x7a; startup_floor]),
+                    },
+                    mux_limits,
+                    true,
+                )
+                .is_some(),
+            "startup repair floor should be spendable"
+        );
+
+        assert_eq!(
+            sender.queue.front_lane(),
+            Some(ReliableRelayQueuedWorkLane::Repair)
+        );
+        assert_eq!(
+            sender.repair_extra_budget_remaining(mux_limits),
+            0,
+            "critical priority is not budget bypass"
+        );
+    }
 
     fn security() -> SecurityConfig {
         SecurityConfig::encrypted(
@@ -3835,7 +3957,7 @@ mod tests {
         );
         assert!(
             sender
-                .enqueue_repair_frame(
+                .enqueue_repair_frame_with_priority(
                     Frame::StreamData {
                         stream_id,
                         offset: 0,
@@ -3843,6 +3965,7 @@ mod tests {
                         payload: repair_payload.clone(),
                     },
                     mux_limits,
+                    false,
                 )
                 .is_some(),
             "startup repair floor should be spendable once"
@@ -3850,7 +3973,7 @@ mod tests {
         assert_eq!(sender.repair_extra_budget_remaining(mux_limits), 0);
         assert!(
             sender
-                .enqueue_repair_frame(
+                .enqueue_repair_frame_with_priority(
                     Frame::StreamData {
                         stream_id,
                         offset: startup_floor as u64,
@@ -3858,6 +3981,7 @@ mod tests {
                         payload: repair_payload.clone(),
                     },
                     mux_limits,
+                    false,
                 )
                 .is_none(),
             "repair budget must be cumulative, not refreshed for every tail/ACK event"
@@ -3872,7 +3996,7 @@ mod tests {
         );
         assert!(
             sender
-                .enqueue_repair_frame(
+                .enqueue_repair_frame_with_priority(
                     Frame::StreamData {
                         stream_id,
                         offset: (startup_floor * 2) as u64,
@@ -3880,8 +4004,52 @@ mod tests {
                         payload: repair_payload,
                     },
                     mux_limits,
+                    false,
                 )
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn response_source_read_budget_is_separate_from_repair_cache_retention() {
+        let stream_id = StreamId(93);
+        let mux_limits = MuxLimits {
+            max_repair_bytes: 4096,
+            max_payload_bytes: 4096,
+            max_stream_window_bytes: 64 * 1024,
+            max_path_flight_bytes: 4096,
+            ..MuxLimits::default()
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        send_stream
+            .send_data(
+                Bytes::from(vec![0x5a; mux_limits.max_repair_bytes]),
+                StreamFlags::NONE,
+            )
+            .expect("seed retained unacked OwnerData");
+        assert_eq!(send_stream.repair_bytes(), mux_limits.max_repair_bytes);
+
+        let sender_queue = ReliableRelaySenderQueue::default();
+        assert!(
+            reliable_relay_can_read_into_sender_queue(
+                &send_stream,
+                &sender_queue,
+                mux_limits,
+                mux_limits.max_repair_bytes,
+            ),
+            "repair cache retention is unacked OwnerData memory, not already-queued source bytes"
+        );
+        assert_eq!(
+            reliable_relay_sender_queue_read_budget(
+                &send_stream,
+                &sender_queue,
+                mux_limits,
+                mux_limits.max_repair_bytes,
+                mux_limits.max_repair_bytes,
+            ),
+            mux_limits.max_repair_bytes,
+            "bounded product-source reads may continue while dispatch waits for repair-cache ACK release"
         );
     }
 
@@ -3902,7 +4070,7 @@ mod tests {
         assert!(sender.repair_extra_event_budget_remaining(mux_limits) >= min_burst);
         assert!(
             sender
-                .enqueue_repair_frame(
+                .enqueue_repair_frame_with_priority(
                     Frame::StreamData {
                         stream_id,
                         offset: 0,
@@ -3910,6 +4078,7 @@ mod tests {
                         payload: Bytes::from(vec![0x44; startup_floor]),
                     },
                     mux_limits,
+                    false,
                 )
                 .is_some()
         );
@@ -3950,7 +4119,11 @@ mod tests {
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0x44; startup_floor]),
         };
-        assert!(sender.enqueue_repair_frame(frame, mux_limits).is_some());
+        assert!(
+            sender
+                .enqueue_repair_frame_with_priority(frame, mux_limits, false)
+                .is_some()
+        );
 
         let closure_frame = Frame::StreamData {
             stream_id,
@@ -3960,7 +4133,7 @@ mod tests {
         };
         assert!(
             sender
-                .enqueue_repair_frame(closure_frame.clone(), mux_limits)
+                .enqueue_repair_frame_with_priority(closure_frame.clone(), mux_limits, false)
                 .is_none(),
             "ordinary optional repair budget should be exhausted"
         );
@@ -3983,7 +4156,7 @@ mod tests {
         let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
         let repair_payload = Bytes::from(vec![0x33; startup_floor]);
 
-        assert!(sender.enqueue_repair_frame(
+        assert!(sender.enqueue_repair_frame_with_priority(
             &mut sender_queue,
             Frame::StreamData {
                 stream_id,
@@ -3993,8 +4166,9 @@ mod tests {
             },
             RelaySendCause::AckGapRepair,
             mux_limits,
+            false,
         ));
-        assert!(!sender.enqueue_repair_frame(
+        assert!(!sender.enqueue_repair_frame_with_priority(
             &mut sender_queue,
             Frame::StreamData {
                 stream_id,
@@ -4004,10 +4178,11 @@ mod tests {
             },
             RelaySendCause::AckGapRepair,
             mux_limits,
+            false,
         ));
 
         sender.record_owner_payload_for_test(startup_floor.saturating_mul(100));
-        assert!(sender.enqueue_repair_frame(
+        assert!(sender.enqueue_repair_frame_with_priority(
             &mut sender_queue,
             Frame::StreamData {
                 stream_id,
@@ -4017,6 +4192,7 @@ mod tests {
             },
             RelaySendCause::PathFailureRepair,
             mux_limits,
+            false,
         ));
     }
 
@@ -4038,11 +4214,12 @@ mod tests {
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0x33; startup_floor]),
         };
-        assert!(sender.enqueue_repair_frame(
+        assert!(sender.enqueue_repair_frame_with_priority(
             &mut sender_queue,
             frame,
             RelaySendCause::AckGapRepair,
             mux_limits,
+            false,
         ));
 
         let closure_frame = Frame::StreamData {
@@ -4051,11 +4228,12 @@ mod tests {
             flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"tail"),
         };
-        assert!(!sender.enqueue_repair_frame(
+        assert!(!sender.enqueue_repair_frame_with_priority(
             &mut sender_queue,
             closure_frame.clone(),
             RelaySendCause::AckGapRepair,
             mux_limits,
+            false,
         ));
 
         sender.enqueue_critical_repair_frame(
@@ -6797,6 +6975,66 @@ mod tests {
         assert_eq!(
             selected.key, candidate.key,
             "ordered-owner history must not pin the Service family once the product frontier is clear"
+        );
+    }
+
+    #[test]
+    fn cross_underlay_bulk_rate_candidate_that_owns_lower_flight_remains_eligible() {
+        let service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = vec![CarrierPathFlightDebt {
+            key: candidate.key,
+            bytes: 64 * 1024,
+        }];
+
+        let selected = choose_response_sender_data_target(
+            &[service.clone(), candidate.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &lower_flights,
+            Some(service.key),
+        )
+        .expect("candidate owning the lower flight should remain eligible");
+
+        assert_eq!(
+            selected.key, candidate.key,
+            "a bulk-rate-proven path that already owns the lower range must not be blocked by a stale cross-family frontier check"
+        );
+    }
+
+    #[test]
+    fn owner_debt_pressure_keeps_cross_underlay_candidate_that_owns_lower_flight() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = vec![CarrierPathFlightDebt {
+            key: candidate.key,
+            bytes: payload_bytes as u64,
+        }];
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &service,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), candidate.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower_flights,
+            Some(service.key),
+            owner_debt_pressure.saturating_add(payload_bytes),
+            None,
+        )
+        .expect("candidate owning the lower flight should survive debt-pressure filtering");
+
+        assert_eq!(
+            selected.target.key, candidate.key,
+            "owner-debt pressure must filter by candidate ordering safety, not by carrier family alone"
         );
     }
 }

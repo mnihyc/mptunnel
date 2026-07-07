@@ -78,20 +78,6 @@ pub(super) fn stream_ack_ranges_expose_authoritative_gap(
             .is_some_and(|first| first.start > 0 || ranges.len() > 1)
 }
 
-pub(super) fn reliable_relay_owner_gap_blocks_product_source(
-    lane: FlowLane,
-    repair_bytes: usize,
-    ack_complete: bool,
-    ack_ranges: &[OffsetRange],
-    ack_frontier: u64,
-    next_offset: u64,
-) -> bool {
-    relay_lane_is_bulk(lane)
-        && repair_bytes > 0
-        && ack_frontier < next_offset
-        && stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reliable_relay_authoritative_owner_debt_bytes(
     lane: FlowLane,
@@ -124,36 +110,8 @@ pub(super) fn reliable_relay_authoritative_owner_debt_bytes(
     }
 }
 
-pub(super) fn reliable_relay_queued_lane_blocked_by_owner_backpressure(
-    queued_lane: Option<ReliableRelayQueuedWorkLane>,
-    owner_backpressure_blocks_product_source: bool,
-) -> bool {
-    owner_backpressure_blocks_product_source
-        && queued_lane == Some(ReliableRelayQueuedWorkLane::Data)
-}
-
-pub(super) fn reliable_relay_owner_debt_blocks_product_source(
-    lane: FlowLane,
-    authoritative_owner_debt_bytes: usize,
-) -> bool {
-    relay_lane_is_bulk(lane) && authoritative_owner_debt_bytes > 0
-}
-
-pub(super) fn reliable_relay_owner_backpressure_blocks_product_source(
-    lane: FlowLane,
-    owner_gap_blocks_product_source: bool,
-    authoritative_owner_debt_bytes: usize,
-) -> bool {
-    relay_lane_is_bulk(lane)
-        && (owner_gap_blocks_product_source
-            || reliable_relay_owner_debt_blocks_product_source(
-                lane,
-                authoritative_owner_debt_bytes,
-            ))
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(super) fn reliable_relay_owner_backpressure_state(
+pub(super) fn reliable_relay_authoritative_owner_debt_state(
     lane: FlowLane,
     repair_bytes: usize,
     ack_complete: bool,
@@ -163,16 +121,8 @@ pub(super) fn reliable_relay_owner_backpressure_state(
     last_ack_progress_at: Instant,
     now: Instant,
     path: Option<PathSnapshot>,
-) -> (bool, usize) {
-    let owner_gap_blocks_product_source = reliable_relay_owner_gap_blocks_product_source(
-        lane,
-        repair_bytes,
-        ack_complete,
-        ack_ranges,
-        ack_frontier,
-        next_offset,
-    );
-    let authoritative_owner_debt_bytes = reliable_relay_authoritative_owner_debt_bytes(
+) -> usize {
+    reliable_relay_authoritative_owner_debt_bytes(
         lane,
         repair_bytes,
         ack_complete,
@@ -182,18 +132,10 @@ pub(super) fn reliable_relay_owner_backpressure_state(
         last_ack_progress_at,
         now,
         path,
-    );
-    (
-        reliable_relay_owner_backpressure_blocks_product_source(
-            lane,
-            owner_gap_blocks_product_source,
-            authoritative_owner_debt_bytes,
-        ),
-        authoritative_owner_debt_bytes,
     )
 }
 
-fn reliable_relay_current_owner_backpressure_state(
+fn reliable_relay_current_authoritative_owner_debt_bytes(
     lane: FlowLane,
     send_stream: &ReliableSendStream,
     ack_complete: bool,
@@ -201,8 +143,8 @@ fn reliable_relay_current_owner_backpressure_state(
     ack_frontier: u64,
     last_ack_progress_at: Instant,
     path: Option<PathSnapshot>,
-) -> (bool, usize) {
-    reliable_relay_owner_backpressure_state(
+) -> usize {
+    reliable_relay_authoritative_owner_debt_state(
         lane,
         send_stream.repair_bytes(),
         ack_complete,
@@ -674,7 +616,6 @@ fn response_sender_wait_state(
     queue_nonempty: bool,
     queue_ready: bool,
     front_has_carrier_credit: bool,
-    front_blocked_by_owner_gap: bool,
     retry_at: Option<tokio::time::Instant>,
     now: tokio::time::Instant,
     retry_delay: Duration,
@@ -685,17 +626,6 @@ fn response_sender_wait_state(
             ready: false,
             subscribe_capacity: false,
             retry_at: None,
-        };
-    }
-    if front_blocked_by_owner_gap {
-        let retry_at = retry_at
-            .filter(|deadline| *deadline > now)
-            .unwrap_or(now + retry_delay);
-        return ResponseSenderWaitState {
-            blocked: true,
-            ready: false,
-            subscribe_capacity: false,
-            retry_at: Some(retry_at),
         };
     }
     if front_has_carrier_credit {
@@ -1332,7 +1262,7 @@ fn enqueue_reliable_tail_repair(
         let queued = if critical_closure_repair {
             Some(response_sender.enqueue_critical_repair_frame(frame))
         } else {
-            response_sender.enqueue_repair_frame(frame, mux_limits)
+            response_sender.enqueue_repair_frame_with_priority(frame, mux_limits, true)
         };
         if queued.is_some() {
             repair_count = repair_count.saturating_add(1);
@@ -1345,7 +1275,6 @@ fn enqueue_reliable_tail_repair(
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
-    owner_backpressure_blocks_product_source: bool,
     product_owner_debt_bytes: usize,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
@@ -1363,13 +1292,6 @@ async fn drain_server_response_sender_ready(
         && dispatched_items < sender_dispatch_item_budget
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
-        if reliable_relay_queued_lane_blocked_by_owner_backpressure(
-            response_sender.front_lane(),
-            owner_backpressure_blocks_product_source,
-        ) {
-            blocked_by_carrier = true;
-            break;
-        }
         let dispatch = match response_sender
             .dispatch_next_with_product_owner_debt(
                 path_stream,
@@ -1552,16 +1474,15 @@ where
             && !last_send_ack_ranges.is_empty()
             && last_send_ack_complete
             && last_send_ack_frontier < send_stream.next_offset();
-        let (owner_backpressure_blocks_product_source, authoritative_owner_debt_bytes) =
-            reliable_relay_current_owner_backpressure_state(
-                relay_lane,
-                &send_stream,
-                last_send_ack_complete,
-                &last_send_ack_ranges,
-                last_send_ack_frontier,
-                last_send_ack_progress_at,
-                send_path_snapshot,
-            );
+        let authoritative_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+            relay_lane,
+            &send_stream,
+            last_send_ack_complete,
+            &last_send_ack_ranges,
+            last_send_ack_frontier,
+            last_send_ack_progress_at,
+            send_path_snapshot,
+        );
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
             send_path_snapshot,
@@ -1586,11 +1507,6 @@ where
             .min(path_stream.max_frame_payload_bytes)
             .min(sender_queue_limit)
             .min(latency_owner_credit);
-        let source_read_ceiling = if owner_backpressure_blocks_product_source {
-            0
-        } else {
-            source_read_ceiling
-        };
         if source_read_ceiling > 0 {
             resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
         }
@@ -1651,10 +1567,6 @@ where
             !response_sender.is_empty(),
             response_sender.queued_send_ready(),
             queued_front_has_carrier_credit,
-            reliable_relay_queued_lane_blocked_by_owner_backpressure(
-                response_sender.front_lane(),
-                owner_backpressure_blocks_product_source,
-            ),
             response_sender_retry_at,
             now,
             sender_service_retry_delay(send_path_snapshot, relay_lane),
@@ -1709,10 +1621,7 @@ where
                     false,
                 );
                 last_tail_repair_at = Instant::now();
-                let (
-                    owner_backpressure_blocks_product_source,
-                    product_owner_debt_bytes,
-                ) = reliable_relay_current_owner_backpressure_state(
+                let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
                     last_send_ack_complete,
@@ -1724,7 +1633,6 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
-                    owner_backpressure_blocks_product_source,
                     product_owner_debt_bytes,
                     &mut send_stream,
                     relay_lane,
@@ -1945,7 +1853,7 @@ where
                                 true
                             } else {
                                 response_sender
-                                    .enqueue_repair_frame(frame, mux_limits)
+                                    .enqueue_repair_frame_with_priority(frame, mux_limits, true)
                                     .is_some()
                             };
                             #[cfg(not(feature = "lab-diagnostics"))]
@@ -2042,10 +1950,7 @@ where
                     }
                 }
                 if response_sender.queued_send_ready() {
-                    let (
-                        owner_backpressure_blocks_product_source,
-                        product_owner_debt_bytes,
-                    ) = reliable_relay_current_owner_backpressure_state(
+                    let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
                         last_send_ack_complete,
@@ -2057,8 +1962,7 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                        owner_backpressure_blocks_product_source,
-                        product_owner_debt_bytes,
+                    product_owner_debt_bytes,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2134,10 +2038,7 @@ where
                     }
                 }
                 if response_sender.queued_send_ready() {
-                    let (
-                        owner_backpressure_blocks_product_source,
-                        product_owner_debt_bytes,
-                    ) = reliable_relay_current_owner_backpressure_state(
+                    let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
                         last_send_ack_complete,
@@ -2149,8 +2050,7 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                        owner_backpressure_blocks_product_source,
-                        product_owner_debt_bytes,
+                    product_owner_debt_bytes,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2190,10 +2090,7 @@ where
                     last_recv_progress_sent_at = Instant::now();
                 }
                 if response_sender.queued_send_ready() {
-                    let (
-                        owner_backpressure_blocks_product_source,
-                        product_owner_debt_bytes,
-                    ) = reliable_relay_current_owner_backpressure_state(
+                    let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
                         last_send_ack_complete,
@@ -2205,8 +2102,7 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                        owner_backpressure_blocks_product_source,
-                        product_owner_debt_bytes,
+                    product_owner_debt_bytes,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2231,10 +2127,7 @@ where
                 response_sender_retry_at = None;
                 close_sent = true;
                 pending_local_fin = false;
-                let (
-                    owner_backpressure_blocks_product_source,
-                    product_owner_debt_bytes,
-                ) = reliable_relay_current_owner_backpressure_state(
+                let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
                     last_send_ack_complete,
@@ -2246,7 +2139,6 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
-                    owner_backpressure_blocks_product_source,
                     product_owner_debt_bytes,
                     &mut send_stream,
                     relay_lane,
@@ -2263,10 +2155,7 @@ where
                 }
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let (
-                    owner_backpressure_blocks_product_source,
-                    product_owner_debt_bytes,
-                ) = reliable_relay_current_owner_backpressure_state(
+                let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
                     last_send_ack_complete,
@@ -2278,7 +2167,6 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
-                    owner_backpressure_blocks_product_source,
                     product_owner_debt_bytes,
                     &mut send_stream,
                     relay_lane,
@@ -2386,10 +2274,7 @@ where
                         );
                     }
                     if response_sender.queued_send_ready() {
-                        let (
-                            owner_backpressure_blocks_product_source,
-                            product_owner_debt_bytes,
-                        ) = reliable_relay_current_owner_backpressure_state(
+                        let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
                             relay_lane,
                             &send_stream,
                             last_send_ack_complete,
@@ -2401,8 +2286,7 @@ where
                         if drain_server_response_sender_ready(
                             &mut response_sender,
                             &path_stream,
-                            owner_backpressure_blocks_product_source,
-                            product_owner_debt_bytes,
+                    product_owner_debt_bytes,
                             &mut send_stream,
                             relay_lane,
                             mux_limits,
@@ -2426,20 +2310,18 @@ where
     let mut result = result;
     if result.is_ok() && pending_local_fin && !close_sent {
         while result.is_ok() && !response_sender.is_empty() {
-            let (owner_backpressure_blocks_product_source, product_owner_debt_bytes) =
-                reliable_relay_current_owner_backpressure_state(
-                    last_relay_lane,
-                    &send_stream,
-                    last_send_ack_complete,
-                    &last_send_ack_ranges,
-                    last_send_ack_frontier,
-                    last_send_ack_progress_at,
-                    None,
-                );
+            let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                last_relay_lane,
+                &send_stream,
+                last_send_ack_complete,
+                &last_send_ack_ranges,
+                last_send_ack_frontier,
+                last_send_ack_progress_at,
+                None,
+            );
             match drain_server_response_sender_ready(
                 &mut response_sender,
                 &path_stream,
-                owner_backpressure_blocks_product_source,
                 product_owner_debt_bytes,
                 &mut send_stream,
                 last_relay_lane,
@@ -2597,7 +2479,7 @@ mod tests {
         let now = tokio::time::Instant::now();
         let retry_delay = Duration::from_millis(10);
 
-        let state = response_sender_wait_state(true, true, false, false, None, now, retry_delay);
+        let state = response_sender_wait_state(true, true, false, None, now, retry_delay);
 
         assert!(state.blocked);
         assert!(!state.ready);
@@ -2606,19 +2488,19 @@ mod tests {
     }
 
     #[test]
-    fn response_sender_wait_state_blocks_owner_gap_without_carrier_capacity_spin() {
+    fn response_sender_wait_state_allows_admission_when_carrier_has_credit() {
         let now = tokio::time::Instant::now();
         let retry_delay = Duration::from_millis(10);
 
-        let state = response_sender_wait_state(true, true, true, true, None, now, retry_delay);
+        let state = response_sender_wait_state(true, true, true, None, now, retry_delay);
 
-        assert!(state.blocked);
-        assert!(!state.ready);
+        assert!(!state.blocked);
+        assert!(state.ready);
         assert!(
             !state.subscribe_capacity,
-            "owner-gap debt is product-ordering pressure, not carrier pipe exhaustion"
+            "product-ordering pressure is handled by sender admission, not carrier pipe exhaustion"
         );
-        assert_eq!(state.retry_at, Some(now + retry_delay));
+        assert_eq!(state.retry_at, None);
     }
 
     #[test]
@@ -2680,7 +2562,8 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_owner_gap_blocks_new_bulk_owner_reads() {
+    fn authoritative_ack_gap_creates_owner_debt_pressure() {
+        let now = Instant::now();
         let ranges = [
             OffsetRange {
                 start: 0,
@@ -2692,41 +2575,65 @@ mod tests {
             },
         ];
 
-        assert!(reliable_relay_owner_gap_blocks_product_source(
-            FlowLane::Throughput,
-            4096,
-            true,
-            &ranges,
-            1024,
-            8192,
-        ));
-        assert!(!reliable_relay_owner_gap_blocks_product_source(
-            FlowLane::Latency,
-            4096,
-            true,
-            &ranges,
-            1024,
-            8192,
-        ));
-        assert!(!reliable_relay_owner_gap_blocks_product_source(
-            FlowLane::Throughput,
-            0,
-            true,
-            &ranges,
-            1024,
-            8192,
-        ));
-        assert!(!reliable_relay_owner_gap_blocks_product_source(
-            FlowLane::Throughput,
-            4096,
-            true,
-            &[OffsetRange {
-                start: 0,
-                end: 8192,
-            }],
-            8192,
-            8192,
-        ));
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Throughput,
+                4096,
+                true,
+                &ranges,
+                1024,
+                8192,
+                now,
+                now,
+                None,
+            ),
+            4096
+        );
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Latency,
+                4096,
+                true,
+                &ranges,
+                1024,
+                8192,
+                now,
+                now,
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Throughput,
+                0,
+                true,
+                &ranges,
+                1024,
+                8192,
+                now,
+                now,
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Throughput,
+                4096,
+                true,
+                &[OffsetRange {
+                    start: 0,
+                    end: 8192,
+                }],
+                8192,
+                8192,
+                now,
+                now,
+                None,
+            ),
+            0
+        );
     }
 
     #[test]
@@ -2786,54 +2693,6 @@ mod tests {
             "latency traffic should not enter bulk owner-debt pressure"
         );
     }
-
-    #[test]
-    fn authoritative_owner_backpressure_blocks_only_queued_owner_data() {
-        assert!(reliable_relay_queued_lane_blocked_by_owner_backpressure(
-            Some(ReliableRelayQueuedWorkLane::Data),
-            true,
-        ));
-        assert!(!reliable_relay_queued_lane_blocked_by_owner_backpressure(
-            Some(ReliableRelayQueuedWorkLane::Repair),
-            true,
-        ));
-        assert!(!reliable_relay_queued_lane_blocked_by_owner_backpressure(
-            Some(ReliableRelayQueuedWorkLane::Control),
-            true,
-        ));
-        assert!(!reliable_relay_queued_lane_blocked_by_owner_backpressure(
-            Some(ReliableRelayQueuedWorkLane::Data),
-            false,
-        ));
-        assert!(!reliable_relay_queued_lane_blocked_by_owner_backpressure(
-            None, true,
-        ));
-    }
-
-    #[test]
-    fn authoritative_owner_backpressure_blocks_bulk_source_reads() {
-        assert!(reliable_relay_owner_backpressure_blocks_product_source(
-            FlowLane::Throughput,
-            false,
-            4096,
-        ));
-        assert!(reliable_relay_owner_backpressure_blocks_product_source(
-            FlowLane::Throughput,
-            true,
-            0,
-        ));
-        assert!(!reliable_relay_owner_backpressure_blocks_product_source(
-            FlowLane::Latency,
-            false,
-            4096,
-        ));
-        assert!(!reliable_relay_owner_backpressure_blocks_product_source(
-            FlowLane::Throughput,
-            false,
-            0,
-        ));
-    }
-
     #[test]
     fn tail_repair_uses_persistent_congestion_timeout() {
         let last_progress = Instant::now();
@@ -2900,7 +2759,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_stall_repair_limit_scales_with_owner_tail_debt() {
+    fn tail_stall_repair_limit_spends_earned_budget_to_close_owner_tail() {
         let limits = MuxLimits::default();
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
         let repair_debt = base_limit.saturating_mul(32);
@@ -2915,11 +2774,11 @@ mod tests {
 
         assert!(
             repair_limit > base_limit,
-            "persistent owner-tail repair must not be capped to a single send quantum"
+            "persistent owner-tail repair must spend earned repair budget when a retained owner tail is blocking delivery"
         );
         assert_eq!(
             repair_limit, repair_debt,
-            "the stall repair burst should cover available owner-tail debt when the earned repair budget allows it"
+            "the repair budget, not a single timer quantum, caps terminal owner-tail closure"
         );
     }
 

@@ -697,7 +697,7 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
 }
 
 #[test]
-fn reliable_relay_sender_queue_prioritizes_repair_lane() {
+fn reliable_relay_sender_queue_prioritizes_only_critical_repair_lane() {
     let mut queue = ReliableRelaySenderQueue::default();
     queue.push_data(Bytes::from_static(b"ordinary"));
     queue.push_repair(Frame::StreamData {
@@ -707,7 +707,22 @@ fn reliable_relay_sender_queue_prioritizes_repair_lane() {
         payload: Bytes::from_static(b"repair"),
     });
 
-    let (lane, work) = queue.pop_front().expect("repair work");
+    let (lane, work) = queue.pop_front().expect("owner data");
+    assert_eq!(lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(work.payload_bytes, b"ordinary".len());
+    assert_eq!(queue.data_bytes(), 0);
+
+    queue.push_data(Bytes::from_static(b"ordinary"));
+    queue.push_critical_repair_with_cause(
+        Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"repair"),
+        },
+        RelaySendCause::AckGapRepair,
+    );
+    let (lane, work) = queue.pop_front().expect("critical repair work");
     assert_eq!(lane, ReliableRelayQueuedWorkLane::Repair);
     assert!(matches!(
         work.kind,
@@ -1060,7 +1075,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
     assert!(
         sender
-            .enqueue_repair_frame(
+            .enqueue_repair_frame_with_priority(
                 Frame::StreamData {
                     stream_id,
                     offset: 64,
@@ -1068,6 +1083,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
                     payload: Bytes::from_static(b"repair"),
                 },
                 MuxLimits::default(),
+                true,
             )
             .is_some()
     );
@@ -1628,7 +1644,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
     sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
     assert!(
         sender
-            .enqueue_repair_frame(
+            .enqueue_repair_frame_with_priority(
                 Frame::StreamData {
                     stream_id,
                     offset: 64,
@@ -1636,6 +1652,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
                     payload: Bytes::from_static(b"repair"),
                 },
                 MuxLimits::default(),
+                true,
             )
             .is_some()
     );

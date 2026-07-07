@@ -1340,11 +1340,12 @@ where
                                 );
                                 true
                             } else {
-                                sender.enqueue_repair_frame(
+                                sender.enqueue_repair_frame_with_priority(
                                     &mut sender_queue,
                                     frame,
                                     RelaySendCause::AckGapRepair,
                                     context.mux_limits,
+                                    true,
                                 )
                             };
                             #[cfg(feature = "lab-diagnostics")]

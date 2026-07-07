@@ -34,9 +34,10 @@ pub(super) enum PathRuntimeRole {
     /// A validated additional path that may carry unique ordered bytes.
     ///
     /// `Subflow` is intentionally the same term used by MPTCP. In mptunnel it
-    /// means an additional same-family path admitted by the no-worse guard. It
-    /// may spend bounded startup owner credit with path-scoped sender evidence,
-    /// then requires bulk-rate evidence for steady-state owner bytes.
+    /// means an additional path admitted by the no-worse guard. It may spend
+    /// bounded startup owner credit with path-scoped sender evidence only when
+    /// the startup policy permits it, then requires bulk-rate evidence for
+    /// steady-state owner bytes.
     Subflow,
     /// Path-manager/control-plane probing only. A probe cannot own product
     /// offsets and cannot create product delivery proof.
@@ -83,7 +84,7 @@ pub(super) fn cross_family_reliable_owner_health(
     current_owner_bulk_rate_proven: bool,
     candidate: CarrierPathKey,
     candidate_bulk_rate_proven: bool,
-    frontier_clear: bool,
+    candidate_ordering_safe: bool,
 ) -> CarrierFamilyHealth {
     let Some(owner) = current_owner else {
         return CarrierFamilyHealth::Healthy;
@@ -92,16 +93,14 @@ pub(super) fn cross_family_reliable_owner_health(
         return CarrierFamilyHealth::Healthy;
     }
 
-    // Production v1 deliberately does not stripe one ordered product stream
-    // across TCP and QUIC owner paths while lower bytes are unresolved. MPTCP
-    // subflows share one transport family and MPQUIC paths share one QUIC
-    // connection/path model; in mptunnel a TCP carrier and a QUIC reliable
-    // carrier have independent recovery, pacing, flow-control, and ACK clocks.
-    // Treating both as concurrent OwnerData subflows created cross-family holes
-    // and repair storms. At a clear product frontier, however, a bulk-rate
-    // proven candidate may become the next Service owner; otherwise the old
-    // Service family becomes sticky and mixed paths cannot adapt by metrics.
-    if frontier_clear && candidate_bulk_rate_proven {
+    // MPTCP/MPQUIC schedule by path state, not by a static carrier-family
+    // preference. mptunnel still must avoid expanding one ordered stream across
+    // independent TCP and QUIC recovery clocks when that would create unresolved
+    // lower-byte debt. Therefore cross-family OwnerData is health-eligible only
+    // when the candidate is bulk-rate-proven and the candidate would not expand
+    // cross-path ordering debt. The no-worse admission model still decides
+    // whether that eligible candidate actually gets owner credit.
+    if candidate_ordering_safe && candidate_bulk_rate_proven {
         return CarrierFamilyHealth::Healthy;
     }
     if candidate_bulk_rate_proven {
@@ -668,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_family_reliable_owner_requires_clear_frontier_and_bulk_rate() {
+    fn cross_family_reliable_owner_requires_ordering_safe_candidate_and_bulk_rate() {
         let owner = CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(0),

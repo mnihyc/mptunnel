@@ -374,6 +374,9 @@ against a clear-frontier same-family Service handoff; the ETA/no-worse selector
 decides the next Service owner. This is a Service handoff, not Subflow
 admission. ACK-data-only evidence from a tiny or application-limited probe is
 not Service-handoff evidence by itself and does not grant ordinary owner rights.
+Hint-only Service handoff remains bounded by the active Service startup product
+envelope; it MUST NOT emit an unbounded run of ordered bytes before local
+ACK-derived bulk-rate evidence arrives.
 A same-family Subflow may carry ordinary unique bytes only after bulk-rate
 evidence exists and sender-service admission proves that doing so will not
 expand product receive-hole debt or worsen the completion horizon. This rule is
@@ -1197,10 +1200,13 @@ the peer's advisory rate/RTT prior before direction-correct bulk-rate evidence
 exists. Conversely, a peer hint MUST NOT overwrite local carrier queue, flight,
 ACK-derived data, or delivery samples. The sender-service ETA model may combine
 local liveness with peer advisory rate for clear-frontier Service selection, but
-Subflow admission still requires local bulk-rate evidence. Once local
-ACK-derived DATA has been seen without enough non-application-limited volume to
-become bulk-rate evidence, the peer hint remains only an advisory rate prior; it
-no longer authorizes Service handoff for that path.
+Subflow admission still requires local bulk-rate evidence. Configured startup
+rate hints are advisory priors and MUST be published as non-app-limited metrics.
+An app-limited peer metric that came from proof/control or a tiny sample MUST NOT
+seed the response rate prior. Once local ACK-derived DATA has been seen without
+enough non-application-limited volume to become bulk-rate evidence, the peer hint
+remains only an advisory rate prior; it no longer authorizes Service handoff for
+that path.
 
 Each endpoint also keeps local lane occupancy for every session path. This
 state is not trusted from the peer because it reflects local product work

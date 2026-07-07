@@ -3059,6 +3059,10 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         .parse::<PathSpec>()
         .expect("path spec");
     let initial_metrics = path_startup_metrics(&path, 0, PathMetricDirection::ServerToClient);
+    assert!(
+        !initial_metrics.app_limited,
+        "configured startup rate hints are advisory priors, not app-limited samples"
+    );
     let stream = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {

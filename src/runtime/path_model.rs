@@ -606,7 +606,7 @@ pub(super) fn path_startup_snapshot(path: &PathSpec, index: usize) -> PathSnapsh
         index,
         ClientPathObservation {
             state: SchedulerPathState::Active,
-            carrier_app_limited: true,
+            carrier_app_limited: path.metadata.initial_rate == RateHint::Unknown,
             ..ClientPathObservation::default()
         },
     )
@@ -619,7 +619,7 @@ pub(super) fn path_startup_metrics(
 ) -> PathMetrics {
     let observation = ClientPathObservation {
         state: SchedulerPathState::Active,
-        carrier_app_limited: true,
+        carrier_app_limited: path.metadata.initial_rate == RateHint::Unknown,
         ..ClientPathObservation::default()
     };
     path_metrics_from_snapshot(

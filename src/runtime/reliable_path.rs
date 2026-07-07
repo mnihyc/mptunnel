@@ -2141,6 +2141,7 @@ mod tests {
             assert_eq!(snapshot.pacing_rate_bps, snapshot.delivery_rate_bps);
             assert_eq!(snapshot.inflight_limit_bytes, 0);
             assert_eq!(snapshot.bytes_in_flight, 0);
+            assert_eq!(snapshot.confidence, 0.0);
             assert!(snapshot.app_limited);
         }
     }

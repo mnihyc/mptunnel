@@ -339,11 +339,13 @@ and live carrier membership still match the admission envelope. It is recreated
 on material envelope change, detach/failover, or carrier-membership change, not
 on ordinary ACK progress. Product byte ownership still belongs to the per-range
 flight ledger, not to the subflow set itself. The Service path is the current
-lower-frontier owner, a direction-correct active owner with bulk-rate evidence,
-or the measured bulk-rate owner selected at a clear frontier. An active
-attachment without bulk-rate evidence is only a bootstrap Service when no
-measured owner exists yet; it is not simply the lowest-ETA candidate or the
-first/live attachment selected for the next quantum.
+lower-frontier owner or live active ordered-owner anchor for that stream
+direction. It is not simply the lowest-ETA candidate, and a measured same-family
+alternate MUST NOT be relabeled as Service merely because it wins the next
+payload quantum. A Service change is an explicit migration/failover result:
+detach/close of the old owner, loss of a live owner, or a frontier-clear service
+handoff chosen by the Service migration policy. Otherwise, lower-ETA measured
+same-family contributors are Subflows.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -353,8 +355,9 @@ range, that path is the lower-frontier owner until ACK progress or repair clears
 the range. The sender service MUST allow that owner to lead the next ordinary
 quantum when it is still attached and can accept work, because sending later
 unique bytes on a different path would expand the ordered receive hole. Conversely
-a previously active path MUST NOT keep ordinary ownership merely because it was
-the first or latest active attachment.
+a previously active path MUST NOT receive owner bytes merely because it was the
+first or latest active attachment; it remains only the Service anchor until the
+ordinary admission model grants Service or Subflow `OwnerData`.
 
 Same-underlay carrier subflow sets SHOULD be opened together when the sender has
 already admitted multiple paths from the same carrier family for bulk work. This
@@ -374,11 +377,12 @@ output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
 At a clear frontier, liveness, path-proof, configured hints, and peer hints MAY
 rank validation/probe order, but they MUST NOT make a non-active path the
-Service owner for ordered product bytes. A
-same-family path may replace the current Service for ordinary owner data only
-after direction-correct bulk-rate evidence exists and the ETA/no-worse selector
-admits that change. ACK-data-only evidence from a tiny or application-limited
-probe is still not bulk-rate evidence and does not grant Service rights. A
+Service owner for ordered product bytes. A same-family measured path may become
+an admitted Subflow after direction-correct bulk-rate evidence exists and the
+ETA/no-worse selector admits that owner range; it does not replace the Service
+anchor unless the explicit Service migration policy performs a handoff.
+ACK-data-only evidence from a tiny or application-limited probe is still not
+bulk-rate evidence and does not grant Service rights. A
 same-family Subflow may carry a bounded startup `OwnerData` window at a clear
 ordered frontier after the current Service has direction-correct bulk-rate
 evidence and the Subflow has path-scoped sender evidence. Configured or peer
@@ -2734,10 +2738,11 @@ except for failover, explicit repair, or another bounded validation event after
 the admission envelope is refreshed.
 
 Reliable path membership uses explicit roles. An attached output starts as
-`Standby` or `Probe`, not as a data owner. `Service` is the current best owner
-path and MUST remain fed while it is healthy. A live response stream that has
-any live carrier output MUST expose exactly one live `Service` owner key to
-the sender scheduler. If the current Service output is detached or closed, the
+`Standby` or `Probe`, not as a data owner. `Service` is the current ordered-owner
+anchor and MUST remain the scheduler baseline while it is healthy. A live
+response stream that has any live carrier output MUST expose exactly one live
+`Service` owner key to the sender scheduler. If the current Service output is
+detached or closed, the
 binding promotes an existing live survivor by path evidence and measured rate:
 bulk-rate-proven survivors rank first, sender-evidence survivors rank next, and
 plain attached outputs are only a last-resort failover. Output-list tail

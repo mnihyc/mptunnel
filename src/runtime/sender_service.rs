@@ -634,7 +634,7 @@ fn response_service_anchor_key(
             candidates
                 .iter()
                 .copied()
-                .find(|candidate| candidate.is_active && candidate.has_bulk_rate_evidence)
+                .find(|candidate| candidate.is_active)
                 .map(|candidate| candidate.key)
         })
         .unwrap_or(fallback)
@@ -656,48 +656,12 @@ fn response_unique_quic_data_would_expand_ordering_debt(
     )
 }
 
-fn response_target_is_service_owner_candidate(
-    target: &ResponseSenderPathTarget,
-    candidates: &[&ResponseSenderPathTarget],
-    lead: ResponseBulkLead,
-) -> bool {
-    if target.key != lead.key {
-        return false;
-    }
-    let active_bulk_owner = candidates.iter().copied().any(|candidate| {
-        candidate.key != target.key && candidate.is_active && candidate.has_bulk_rate_evidence
-    });
-    let any_other_bulk_owner = candidates
-        .iter()
-        .copied()
-        .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence);
-
-    if target.is_active {
-        target.has_bulk_rate_evidence || !any_other_bulk_owner
-    } else {
-        target.has_bulk_rate_evidence && !active_bulk_owner
-    }
+fn response_target_has_service_anchor_rights(target: &ResponseSenderPathTarget) -> bool {
+    target.is_active
 }
 
-fn response_target_has_service_anchor_rights(
-    target: &ResponseSenderPathTarget,
-    candidates: &[&ResponseSenderPathTarget],
-) -> bool {
-    if !target.is_active {
-        return false;
-    }
-    target.has_bulk_rate_evidence
-        || !candidates
-            .iter()
-            .copied()
-            .any(|candidate| candidate.key != target.key && candidate.has_bulk_rate_evidence)
-}
-
-fn response_target_is_plausible_unique_owner_candidate(
-    target: &ResponseSenderPathTarget,
-    candidates: &[&ResponseSenderPathTarget],
-) -> bool {
-    response_target_has_service_anchor_rights(target, candidates) || target.has_bulk_rate_evidence
+fn response_target_is_plausible_unique_owner_candidate(target: &ResponseSenderPathTarget) -> bool {
+    response_target_has_service_anchor_rights(target) || target.has_bulk_rate_evidence
 }
 
 #[cfg(test)]
@@ -743,6 +707,7 @@ fn response_target_unique_owner_admission_with_epoch(
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
+    let service_key = response_service_anchor_key(candidates, lower_owner, lead.key);
     if lower_owner == Some(target.key) {
         return if target.is_active || target.has_bulk_rate_evidence {
             (PathAdmission::service(), None)
@@ -753,18 +718,13 @@ fn response_target_unique_owner_admission_with_epoch(
     if lower_owner.is_some() {
         return (PathAdmission::standby(), None);
     }
-    if response_target_is_service_owner_candidate(target, candidates, lead) {
+    if target.key == service_key {
         return (PathAdmission::service(), None);
     }
     if target.is_active {
-        return if target.has_bulk_rate_evidence {
-            (PathAdmission::service(), None)
-        } else {
-            (PathAdmission::standby(), None)
-        };
+        return (PathAdmission::standby(), None);
     }
 
-    let service_key = response_service_anchor_key(candidates, lower_owner, lead.key);
     let role = response_bulk_admission_role(service_key, target.key, lower_owner, ordering_debt);
     let model_allows_owner =
         !response_unique_quic_data_would_expand_ordering_debt(lower_owner, target, ordering_debt)
@@ -1029,11 +989,24 @@ fn choose_response_admissible_lead(
         }
     }
 
+    if let Some(active) = candidate_targets
+        .iter()
+        .copied()
+        .find(|target| target.is_active)
+        && response_active_lead_suppression(active, mux_limits, payload_bytes, 0).is_none()
+    {
+        return Some(ResponseBulkLead {
+            key: active.key,
+            snapshot: active.snapshot,
+            eta_ms: active.eta_ms,
+        });
+    }
+
     let admissible = candidate_targets
         .iter()
         .copied()
         .filter(|target| {
-            response_target_is_plausible_unique_owner_candidate(target, candidate_targets)
+            response_target_is_plausible_unique_owner_candidate(target)
                 && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
         })
         .min_by(|left, right| {
@@ -1051,17 +1024,6 @@ fn choose_response_admissible_lead(
     }
 
     if lower_owner.is_none() {
-        if let Some(active) = candidate_targets
-            .iter()
-            .copied()
-            .find(|target| target.is_active)
-        {
-            return Some(ResponseBulkLead {
-                key: active.key,
-                snapshot: active.snapshot,
-                eta_ms: active.eta_ms,
-            });
-        }
         return candidate_targets
             .iter()
             .copied()
@@ -4570,7 +4532,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_udp_owner_replaces_unmeasured_active_udp_at_clear_frontier() {
+    fn measured_udp_alternate_does_not_replace_active_service_at_clear_frontier() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active_unproven_udp = response_target(
@@ -4605,8 +4567,12 @@ mod tests {
         .expect("bulk-rate-proven UDP owner should be eligible at a clear frontier");
 
         assert_eq!(
-            selected.key, measured_udp.key,
-            "active attachment is only a bootstrap owner when no measured bulk owner exists"
+            selected.key,
+            CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            },
+            "a measured alternate must not steal Service ownership merely by existing"
         );
     }
 
@@ -6338,7 +6304,58 @@ mod tests {
     }
 
     #[test]
-    fn active_attachment_without_bulk_evidence_is_not_service_when_measured_lead_exists() {
+    fn active_service_remains_lead_when_measured_subflow_has_lower_eta() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
+        let measured_subflow =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        let candidates = [&service, &measured_subflow];
+
+        let lead = choose_response_admissible_lead(&candidates, mux_limits, payload_bytes, &[])
+            .expect("active Service should remain the lead anchor");
+
+        assert_eq!(
+            lead.key, service.key,
+            "a lower-ETA same-family Subflow must not redefine Service ownership"
+        );
+    }
+
+    #[test]
+    fn measured_same_family_alternate_is_subflow_not_service() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
+        let measured_subflow =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), measured_subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("measured same-family path should remain an admissible Subflow");
+
+        assert_eq!(selected.target.key, measured_subflow.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "additional same-family owner bytes must be labeled Subflow, not Service"
+        );
+        assert!(
+            selected.subflow_set_commit.is_some(),
+            "Subflow OwnerData must be committed through the Subflow admission ledger"
+        );
+    }
+
+    #[test]
+    fn active_attachment_without_bulk_evidence_remains_service_anchor_when_measured_subflow_exists()
+    {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active_attachment =
@@ -6365,8 +6382,8 @@ mod tests {
 
         assert_eq!(
             admission.decision,
-            PathAdmissionDecision::Standby,
-            "an active attachment is not Service ownership once a bulk-rate-proven lead exists"
+            PathAdmissionDecision::Service,
+            "the active attachment remains the Service anchor; measured alternates are Subflows"
         );
     }
 

@@ -1250,12 +1250,14 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         sender.release_normalized_acked_ranges(context, &normalized_ranges);
-                        let repair_limit = adaptive_reliable_relay_repair_bytes(
+                        let base_repair_limit = adaptive_reliable_relay_repair_bytes(
                             path_snapshot,
                             relay_lane,
                             context.mux_limits,
-                        )
-                        .min(sender.repair_extra_event_budget_remaining(context.mux_limits));
+                        );
+                        let repair_event_budget =
+                            sender.repair_extra_event_budget_remaining(context.mux_limits);
+                        let repair_limit = base_repair_limit.min(repair_event_budget);
                         let has_multipath_repair_alternative = remotes.path_keys().len() > 1;
                         let ack_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
@@ -1273,11 +1275,29 @@ where
                             has_multipath_repair_alternative,
                             ack_gap_repair_ready,
                         );
+                        let mut critical_closure_repair = false;
                         let repair_kind = if repair_frames.is_empty() {
+                            let fin_tail_limit = if !local_open {
+                                let limit = reliable_tail_stall_repair_limit_bytes(
+                                    base_repair_limit,
+                                    send_stream.repair_bytes(),
+                                    repair_event_budget,
+                                    context.mux_limits,
+                                );
+                                critical_closure_repair = repair_event_budget == 0
+                                    && limit > 0
+                                    && send_stream.repair_bytes()
+                                        <= reliable_tail_stall_critical_closure_bytes(
+                                            context.mux_limits,
+                                        );
+                                limit
+                            } else {
+                                repair_limit
+                            };
                             let fin_tail_frames = stream_final_offset_tail_repair_frames(
                                 &send_stream,
                                 &ranges,
-                                repair_limit,
+                                fin_tail_limit,
                                 !local_open,
                                 has_multipath_repair_alternative,
                             );
@@ -1312,12 +1332,21 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let queued = sender.enqueue_repair_frame(
-                                &mut sender_queue,
-                                frame,
-                                RelaySendCause::AckGapRepair,
-                                context.mux_limits,
-                            );
+                            let queued = if critical_closure_repair && repair_kind == "fin_tail" {
+                                sender.enqueue_critical_repair_frame(
+                                    &mut sender_queue,
+                                    frame,
+                                    RelaySendCause::AckGapRepair,
+                                );
+                                true
+                            } else {
+                                sender.enqueue_repair_frame(
+                                    &mut sender_queue,
+                                    frame,
+                                    RelaySendCause::AckGapRepair,
+                                    context.mux_limits,
+                                )
+                            };
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
                                 "repair",

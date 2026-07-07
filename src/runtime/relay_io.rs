@@ -973,8 +973,16 @@ pub(super) fn reliable_tail_stall_repair_limit_bytes(
     budget_remaining: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    if repair_debt_bytes == 0 || budget_remaining == 0 {
+    if repair_debt_bytes == 0 {
         return 0;
+    }
+    if budget_remaining == 0 {
+        let closure_cap = reliable_tail_stall_critical_closure_bytes(mux_limits);
+        return if repair_debt_bytes <= closure_cap {
+            repair_debt_bytes
+        } else {
+            0
+        };
     }
     let resource_cap = mux_limits
         .max_repair_bytes
@@ -984,6 +992,15 @@ pub(super) fn reliable_tail_stall_repair_limit_bytes(
         .max(base_repair_limit.max(1))
         .min(resource_cap)
         .min(budget_remaining)
+}
+
+pub(super) fn reliable_tail_stall_critical_closure_bytes(mux_limits: MuxLimits) -> usize {
+    reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
+        .saturating_mul(2)
+        .min(reliable_relay_buffer_len(mux_limits))
+        .min(mux_limits.max_repair_bytes)
+        .min(mux_limits.max_path_flight_bytes)
+        .max(1)
 }
 
 pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
@@ -1266,12 +1283,16 @@ fn enqueue_reliable_tail_repair(
         relay_lane,
         mux_limits,
     ));
+    let budget_remaining = response_sender.repair_extra_event_budget_remaining(mux_limits);
     let repair_limit = reliable_tail_stall_repair_limit_bytes(
         base_repair_limit,
         send_stream.repair_bytes(),
-        response_sender.repair_extra_event_budget_remaining(mux_limits),
+        budget_remaining,
         mux_limits,
     );
+    let critical_closure_repair = budget_remaining == 0
+        && repair_limit > 0
+        && send_stream.repair_bytes() <= reliable_tail_stall_critical_closure_bytes(mux_limits);
     let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
         send_stream,
         last_send_ack_ranges,
@@ -1308,10 +1329,12 @@ fn enqueue_reliable_tail_repair(
     );
     let mut repair_count = 0usize;
     for frame in repair_frames {
-        if response_sender
-            .enqueue_repair_frame(frame, mux_limits)
-            .is_some()
-        {
+        let queued = if critical_closure_repair {
+            Some(response_sender.enqueue_critical_repair_frame(frame))
+        } else {
+            response_sender.enqueue_repair_frame(frame, mux_limits)
+        };
+        if queued.is_some() {
             repair_count = repair_count.saturating_add(1);
         }
     }
@@ -1819,8 +1842,9 @@ where
                         last_send_ack_complete = complete;
                         let base_repair_limit =
                             adaptive_reliable_relay_repair_bytes(None, relay_lane, mux_limits);
-                        let repair_limit = base_repair_limit
-                            .min(response_sender.repair_extra_event_budget_remaining(mux_limits));
+                        let repair_event_budget =
+                            response_sender.repair_extra_event_budget_remaining(mux_limits);
+                        let repair_limit = base_repair_limit.min(repair_event_budget);
                         let has_multipath_repair_alternative =
                             path_stream.has_multipath_repair_alternative();
                         let ack_gap_repair_ready = ack_gap_repair.repair_ready(
@@ -1839,15 +1863,32 @@ where
                             has_multipath_repair_alternative,
                             ack_gap_repair_ready,
                         );
+                        let mut critical_closure_repair = false;
                         let repair_kind = if repair_frames.is_empty() {
+                            let fin_tail_ready = close_sent || pending_local_fin;
+                            let fin_tail_limit = if fin_tail_ready {
+                                let limit = reliable_tail_stall_repair_limit_bytes(
+                                    base_repair_limit,
+                                    send_stream.repair_bytes(),
+                                    repair_event_budget,
+                                    mux_limits,
+                                );
+                                critical_closure_repair = repair_event_budget == 0
+                                    && limit > 0
+                                    && send_stream.repair_bytes()
+                                        <= reliable_tail_stall_critical_closure_bytes(mux_limits);
+                                limit
+                            } else {
+                                repair_limit
+                            };
                             let (fin_tail_frames, blocked_frontier_offset) =
                                 prefix_repair_frames_with_available_output(
                                     &path_stream,
                                     stream_final_offset_tail_repair_frames(
                                         &send_stream,
                                         &ranges,
-                                        repair_limit,
-                                        close_sent || pending_local_fin,
+                                        fin_tail_limit,
+                                        fin_tail_ready,
                                         has_multipath_repair_alternative,
                                     ),
                                     false,
@@ -1899,8 +1940,14 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let queued =
-                                response_sender.enqueue_repair_frame(frame, mux_limits).is_some();
+                            let queued = if critical_closure_repair && repair_kind == "fin_tail" {
+                                response_sender.enqueue_critical_repair_frame(frame);
+                                true
+                            } else {
+                                response_sender
+                                    .enqueue_repair_frame(frame, mux_limits)
+                                    .is_some()
+                            };
                             #[cfg(not(feature = "lab-diagnostics"))]
                             let _ = queued;
                             #[cfg(feature = "lab-diagnostics")]
@@ -2873,6 +2920,32 @@ mod tests {
         assert_eq!(
             repair_limit, repair_debt,
             "the stall repair burst should cover available owner-tail debt when the earned repair budget allows it"
+        );
+    }
+
+    #[test]
+    fn tail_stall_repair_limit_reserves_small_closure_after_budget_exhaustion() {
+        let limits = MuxLimits::default();
+        let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+        let closure_cap = reliable_tail_stall_critical_closure_bytes(limits);
+        let small_tail = closure_cap.saturating_sub(1024).max(1);
+
+        let repair_limit =
+            reliable_tail_stall_repair_limit_bytes(base_limit, small_tail, 0, limits);
+
+        assert_eq!(
+            repair_limit, small_tail,
+            "a tiny persistent owner tail must be closeable even after optional repair budget is exhausted"
+        );
+        assert_eq!(
+            reliable_tail_stall_repair_limit_bytes(
+                base_limit,
+                closure_cap.saturating_add(1),
+                0,
+                limits
+            ),
+            0,
+            "the closure reserve must not become an unbounded over-budget repair path"
         );
     }
 

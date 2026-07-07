@@ -2403,6 +2403,14 @@ impl ServerResponseSenderService {
         Some(self.queue.push_repair(frame))
     }
 
+    pub(super) fn enqueue_critical_repair_frame(&mut self, frame: Frame) -> u64 {
+        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
+        self.extra_traffic
+            .record_optional(ExtraTrafficKind::Repair, payload_bytes);
+        self.queue.push_repair(frame)
+    }
+
     pub(super) async fn dispatch_next(
         &mut self,
         path_stream: &ReliablePathStream,
@@ -2729,6 +2737,19 @@ impl RelaySenderService {
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
         sender_queue.push_repair_with_cause(frame, cause);
         true
+    }
+
+    pub(super) fn enqueue_critical_repair_frame(
+        &mut self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        frame: Frame,
+        cause: RelaySendCause,
+    ) {
+        debug_assert!(cause.is_repair());
+        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        self.extra_traffic
+            .record_optional(ExtraTrafficKind::Repair, payload_bytes);
+        sender_queue.push_repair_with_cause(frame, cause);
     }
 
     #[cfg(test)]
@@ -3950,6 +3971,43 @@ mod tests {
     }
 
     #[test]
+    fn response_critical_repair_closes_tail_after_optional_budget_exhaustion() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(94);
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(94),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+        let frame = Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x44; startup_floor]),
+        };
+        assert!(sender.enqueue_repair_frame(frame, mux_limits).is_some());
+
+        let closure_frame = Frame::StreamData {
+            stream_id,
+            offset: startup_floor as u64,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"tail"),
+        };
+        assert!(
+            sender
+                .enqueue_repair_frame(closure_frame.clone(), mux_limits)
+                .is_none(),
+            "ordinary optional repair budget should be exhausted"
+        );
+
+        sender.enqueue_critical_repair_frame(closure_frame);
+        assert_eq!(sender.repair_extra_budget_remaining(mux_limits), 0);
+    }
+
+    #[test]
     fn client_repair_extra_budget_is_cumulative_not_per_event() {
         let mux_limits = MuxLimits::default();
         let stream_id = StreamId(93);
@@ -3998,6 +4056,52 @@ mod tests {
             RelaySendCause::PathFailureRepair,
             mux_limits,
         ));
+    }
+
+    #[test]
+    fn client_critical_repair_closes_tail_after_optional_budget_exhaustion() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(95);
+        let mut sender = RelaySenderService::new_with_performance(
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let mut sender_queue = ReliableRelaySenderQueue::default();
+        let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+        let frame = Frame::StreamData {
+            stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x33; startup_floor]),
+        };
+        assert!(sender.enqueue_repair_frame(
+            &mut sender_queue,
+            frame,
+            RelaySendCause::AckGapRepair,
+            mux_limits,
+        ));
+
+        let closure_frame = Frame::StreamData {
+            stream_id,
+            offset: startup_floor as u64,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"tail"),
+        };
+        assert!(!sender.enqueue_repair_frame(
+            &mut sender_queue,
+            closure_frame.clone(),
+            RelaySendCause::AckGapRepair,
+            mux_limits,
+        ));
+
+        sender.enqueue_critical_repair_frame(
+            &mut sender_queue,
+            closure_frame,
+            RelaySendCause::AckGapRepair,
+        );
+        assert_eq!(sender.extra_traffic_budget_remaining(mux_limits), 0);
     }
 
     #[test]

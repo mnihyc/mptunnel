@@ -1880,7 +1880,12 @@ repair-eligible on an eligible survivor path. This is a correctness recovery for
 a blocked product stream, not a throughput striping mechanism: it MUST be
 prefix-preserving, charged to the extra-traffic budget, bounded by outstanding
 repair debt and configured repair/path-flight resources, and repeated only after
-the persistent repair delay. Terminal tail recovery is separate: once a final
+the persistent repair delay. If the optional repair budget is exhausted while
+only a small persistent owner tail remains, the sender MAY spend a bounded
+critical-closure reserve to unblock the stream. That reserve is not new optional
+probe credit: it MUST be limited by the live repair debt and the configured
+repair/path-flight resources, and it MUST still be counted as repair overhead in
+the extra-traffic ledger. Terminal tail recovery is separate: once a final
 offset is known, a sender may repair unacknowledged bytes below that final
 offset on an eligible survivor path so the DATA_FIN/STREAM_FIN can be
 acknowledged. Repair candidate selection is prefix-preserving: if the lowest

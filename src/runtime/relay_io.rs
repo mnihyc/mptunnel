@@ -537,8 +537,10 @@ pub(super) fn reliable_stream_recv_progress_interval(
 }
 
 pub(super) fn sender_service_retry_delay(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
-    let _ = (path, lane);
-    QUIC_TIMER_GRANULARITY
+    let _ = lane;
+    (transport_pto_from_snapshot(path) / 16)
+        .max(Duration::from_millis(5))
+        .min(QUIC_MAX_ACK_DELAY)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2211,17 +2211,27 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
 }
 
 #[test]
-fn sender_service_retry_delay_is_not_receive_progress_stall_timer() {
+fn sender_service_retry_delay_is_ack_paced_not_one_millisecond_spin() {
+    let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, 30_000_000.0);
     let cross_continent = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 900.0, 300_000_000.0);
 
     assert!(
         reliable_stream_recv_progress_interval(Some(cross_continent), FlowLane::Throughput)
             > Duration::from_millis(100)
     );
-    assert_eq!(
-        sender_service_retry_delay(Some(cross_continent), FlowLane::Throughput),
-        QUIC_TIMER_GRANULARITY,
-        "carrier writer backpressure retry must be fast and independent from receive-progress/repair cadence"
+    let low_retry = sender_service_retry_delay(Some(low_latency), FlowLane::Throughput);
+    let high_retry = sender_service_retry_delay(Some(cross_continent), FlowLane::Throughput);
+    assert!(
+        low_retry > QUIC_TIMER_GRANULARITY,
+        "blocked sender retry must not spin at timer granularity"
+    );
+    assert!(
+        high_retry >= low_retry,
+        "higher RTT paths should not retry more aggressively than low-latency paths"
+    );
+    assert!(
+        high_retry <= QUIC_MAX_ACK_DELAY,
+        "retry remains capped so missed capacity notifications do not stall the sender"
     );
 }
 

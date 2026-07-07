@@ -2354,12 +2354,15 @@ FIN/RESET/DETACH, and bounded repair lanes remain priority work and MUST NOT be
 delayed behind bulk writer-pipe debt. If capacity is unavailable, the sender
 SHOULD wait on carrier capacity release or path-output feedback rather than
 sleeping for the receive-progress, repair, or path-stall timer. A fixed retry
-timer MAY exist only as a lost-notification race fallback, and it MUST be no
-coarser than the carrier timer granularity used for QUIC recovery; it MUST NOT
-be the primary pacing mechanism for a high-rate reliable stream. This rule
-follows the same ownership split as QUIC and MPTCP: product bytes remain in the
-sender queue while the carrier is full, but the byte-producing side is
-credit-clocked by actual carrier progress instead of by an unrelated timer.
+timer MAY exist only as a lost-notification race fallback, and it MUST be
+derived from transport feedback cadence rather than a fixed tight poll. The
+fallback MUST be no finer than the carrier timer granularity and SHOULD be
+capped by the QUIC max-ack-delay-scale feedback window so missed notifications
+do not stall the sender. It MUST NOT be the primary pacing mechanism for a
+high-rate reliable stream. This rule follows the same ownership split as QUIC
+and MPTCP: product bytes remain in the sender queue while the carrier is full,
+but the byte-producing side is credit-clocked by actual carrier progress instead
+of by an unrelated timer.
 The blocked state is derived from the current front queued item and current
 carrier credit, not from whether an earlier dispatch attempt already failed.
 When the front item has no eligible carrier credit, the sender service is

@@ -86,9 +86,9 @@ pub(super) fn reliable_relay_authoritative_owner_debt_bytes(
     ack_ranges: &[OffsetRange],
     ack_frontier: u64,
     next_offset: u64,
-    last_ack_progress_at: Instant,
-    now: Instant,
-    path: Option<PathSnapshot>,
+    _last_ack_progress_at: Instant,
+    _now: Instant,
+    _path: Option<PathSnapshot>,
 ) -> usize {
     if !relay_lane_is_bulk(lane)
         || repair_bytes == 0
@@ -100,14 +100,7 @@ pub(super) fn reliable_relay_authoritative_owner_debt_bytes(
     if stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges) {
         return repair_bytes;
     }
-    if ack_frontier == 0 {
-        return 0;
-    }
-    if now.duration_since(last_ack_progress_at) >= reliable_relay_stall_timeout(path, lane) {
-        repair_bytes
-    } else {
-        0
-    }
+    0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -225,10 +218,6 @@ pub(super) fn stream_tail_stall_repair_frames(
         let gap_frames = send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit);
         if !gap_frames.is_empty() {
             return (gap_frames, "ack_gap");
-        }
-        let tail_frames = send_stream.retransmission_frames_after_ack_frontier(ranges, byte_limit);
-        if !tail_frames.is_empty() {
-            return (tail_frames, "owner_tail");
         }
     }
     (Vec::new(), "none")
@@ -1474,8 +1463,10 @@ where
             && stream_tail_repair_allowed(has_tail_repair_alternative)
             && send_stream.repair_bytes() > 0
             && !last_send_ack_ranges.is_empty()
-            && last_send_ack_complete
-            && last_send_ack_frontier < send_stream.next_offset();
+            && stream_ack_ranges_expose_authoritative_gap(
+                last_send_ack_complete,
+                &last_send_ack_ranges,
+            );
         let authoritative_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
             relay_lane,
             &send_stream,
@@ -2021,20 +2012,58 @@ where
                     ),
                 );
                 if final_tail_repair_ready {
-                    let repair_count = enqueue_reliable_tail_repair(
-                        &mut response_sender,
-                        &path_stream,
-                        stream_id,
-                        &send_stream,
-                        &last_send_ack_ranges,
-                        last_send_ack_complete,
-                        send_path_snapshot,
-                        relay_lane,
-                        mux_limits,
-                        performance,
-                        path_stream.max_frame_payload_bytes,
-                        last_send_ack_frontier,
-                        false,
+                    let repair_limit =
+                        reliable_critical_tail_repair_limit_bytes(send_stream.repair_bytes(), mux_limits);
+                    let (repair_frames, blocked_frontier_offset) =
+                        prefix_repair_frames_with_available_output(
+                            &path_stream,
+                            stream_final_offset_tail_repair_frames(
+                                &send_stream,
+                                &last_send_ack_ranges,
+                                repair_limit,
+                                true,
+                                now_has_repair_alternative,
+                            ),
+                            false,
+                        );
+                    #[cfg(feature = "lab-diagnostics")]
+                    if blocked_frontier_offset.is_some() {
+                        lab_diagnostic(
+                            "tail_stall_repair_blocked_frontier",
+                            format_args!(
+                                "stream_id={} blocked_frontier_offset={:?} repair_kind=fin_tail",
+                                stream_id.0, blocked_frontier_offset,
+                            ),
+                        );
+                    }
+                    #[cfg(not(feature = "lab-diagnostics"))]
+                    let _ = blocked_frontier_offset;
+                    let mut repair_count = 0usize;
+                    for frame in repair_frames {
+                        response_sender.enqueue_critical_repair_frame(frame);
+                        repair_count = repair_count.saturating_add(1);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "repair",
+                            format_args!("stream_id={} cause=fin_tail queued=true", stream_id.0),
+                        );
+                    }
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "tail_stall_repair",
+                        format_args!(
+                            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit=false base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind=fin_tail",
+                            stream_id.0,
+                            relay_lane,
+                            last_send_ack_frontier,
+                            send_stream.next_offset(),
+                            send_stream.repair_bytes(),
+                            repair_count,
+                            blocked_frontier_offset,
+                            repair_limit,
+                            repair_limit,
+                            performance.extra_traffic_hint_percent,
+                        ),
                     );
                     if repair_count > 0 {
                         last_tail_repair_at = Instant::now();
@@ -2640,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_contiguous_ack_frontier_creates_owner_debt_pressure() {
+    fn stalled_contiguous_ack_frontier_does_not_create_owner_debt_pressure() {
         let stall_timeout = reliable_relay_stall_timeout(None, FlowLane::Throughput);
         let now = Instant::now();
         let old_progress = now - stall_timeout - Duration::from_millis(1);
@@ -2662,8 +2691,8 @@ mod tests {
                 now,
                 None,
             ),
-            4096,
-            "stalled contiguous ACK frontier is authoritative owner-debt pressure"
+            0,
+            "stalled contiguous ACK frontier is below-carrier in-flight state, not an authoritative product gap"
         );
         assert_eq!(
             reliable_relay_authoritative_owner_debt_bytes(
@@ -2733,7 +2762,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_stall_repairs_unacked_owner_tail_after_contiguous_frontier() {
+    fn tail_stall_does_not_repair_contiguous_live_owner_tail() {
         let limits = MuxLimits::default();
         let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
         send_stream
@@ -2750,19 +2779,15 @@ mod tests {
             true,
         );
 
-        assert_eq!(
-            repair_kind, "owner_tail",
-            "persistent failover repair must cover unacked owner bytes after a contiguous ACK frontier"
+        assert!(
+            repair_frames.is_empty(),
+            "contiguous live owner tail is below-carrier in-flight data, not correctness repair"
         );
-        assert_eq!(repair_frames.len(), 1);
-        assert_eq!(
-            reliable_stream_frame_extent(&repair_frames[0]),
-            Some((1024, 3072, 2048))
-        );
+        assert_eq!(repair_kind, "none");
     }
 
     #[test]
-    fn tail_stall_repair_limit_spends_earned_budget_for_live_owner_tail() {
+    fn persistent_ack_gap_repair_limit_spends_earned_budget() {
         let limits = MuxLimits::default();
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
         let repair_debt = base_limit.saturating_mul(32);
@@ -2777,16 +2802,16 @@ mod tests {
 
         assert!(
             repair_limit > base_limit,
-            "live owner-tail repair may spend earned optional repair budget after a persistent stall"
+            "persistent ACK-gap repair may spend earned optional repair budget"
         );
         assert_eq!(
             repair_limit, repair_debt,
-            "the optional repair budget, not a single timer quantum, caps live owner-tail repair"
+            "the optional repair budget, not a single timer quantum, caps persistent ACK-gap repair"
         );
     }
 
     #[test]
-    fn tail_stall_repair_limit_stops_after_optional_budget_exhaustion() {
+    fn persistent_ack_gap_repair_limit_stops_after_optional_budget_exhaustion() {
         let limits = MuxLimits::default();
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
         let small_tail = base_limit.saturating_sub(1024).max(1);
@@ -2796,7 +2821,7 @@ mod tests {
 
         assert_eq!(
             repair_limit, 0,
-            "live owner-tail repair is optional traffic and must stop after the optional budget is exhausted"
+            "persistent ACK-gap repair is optional traffic and must stop after the optional budget is exhausted"
         );
         assert_eq!(
             reliable_tail_stall_repair_limit_bytes(
@@ -2806,7 +2831,7 @@ mod tests {
                 limits
             ),
             0,
-            "live owner-tail repair must not mint critical budget for larger retained tails"
+            "persistent ACK-gap repair must not mint critical budget for larger retained tails"
         );
     }
 
@@ -2839,7 +2864,7 @@ mod tests {
     }
 
     #[test]
-    fn live_tail_stall_repair_does_not_bypass_optional_budget() {
+    fn live_tail_stall_repair_is_not_queued_even_with_optional_budget() {
         let limits = MuxLimits::default();
         let stream_id = StreamId(98);
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
@@ -2853,24 +2878,6 @@ mod tests {
         );
         let initial_budget = response_sender.repair_extra_budget_remaining(limits);
         assert!(initial_budget > 0);
-        assert!(
-            response_sender
-                .enqueue_repair_frame_with_priority(
-                    Frame::StreamData {
-                        stream_id,
-                        offset: 0,
-                        flags: StreamFlags::NONE,
-                        payload: Bytes::from(vec![0x98; initial_budget]),
-                    },
-                    limits,
-                    false,
-                )
-                .is_some()
-        );
-        assert_eq!(
-            response_sender.repair_extra_event_budget_remaining(limits),
-            0
-        );
 
         let (commands, _receivers) = reliable_path_command_channels(8);
         let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -2918,7 +2925,7 @@ mod tests {
 
         assert_eq!(
             queued, 0,
-            "live contiguous owner-tail repair is optional traffic and must not bypass the extra-traffic budget"
+            "live contiguous owner-tail bytes are neither ACK-gap nor final-tail correctness repair"
         );
     }
 

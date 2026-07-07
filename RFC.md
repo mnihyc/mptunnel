@@ -1910,14 +1910,12 @@ unacknowledged gap below its largest end offset, the repair extent is that gap,
 not bytes after the ACK frontier. If no authoritative lower gap is known, the
 live contiguous owner tail after the ACK frontier is not a path-scoped missing
 range; TCP and QUIC still own recovery for the carrier stream that holds those
-bytes. A sender MAY retransmit such a live owner tail only as optional
-`RepairData` while the extra-traffic budget has remaining credit, and MUST stop
-once that budget is exhausted. It MUST NOT relabel the live contiguous owner
-tail as critical repair merely because product ACK progress is slow. Terminal
-tail recovery is separate: once a final offset is known, a sender may repair
-unacknowledged bytes below that final offset on an eligible survivor path so the
-DATA_FIN/STREAM_FIN can be acknowledged, and that final-tail repair may use the
-bounded critical repair path. Repair candidate selection is
+bytes. A sender MUST NOT retransmit such a live owner tail merely because
+product ACK progress is slow. Terminal tail recovery is separate: once a final
+offset is known, a sender may repair unacknowledged bytes below that final
+offset on an eligible survivor path so the DATA_FIN/STREAM_FIN can be
+acknowledged, and that final-tail repair may use the bounded critical repair
+path. Repair candidate selection is
 prefix-preserving: if the lowest unresolved repair frame cannot be sent on an
 alternate eligible output, the sender MUST NOT skip it and send a later ordered
 range instead. This is targeted duplicate repair, not whole-cache replay.
@@ -3007,14 +3005,16 @@ would prevent the latency-first stream from moving to a better bulk path on
 demand. Once authoritative owner-debt pressure exists, the sender MUST treat the
 current ordered-data owner as a family/evidence filter, not a priority bypass
 or queue-credit bypass. An explicit ACK-range hole creates this pressure
-immediately; a contiguous ACK frontier that stops advancing creates it only
-after the bulk stall timeout. The Service anchor may identify the path that
-owns the lower unresolved bytes, but that identity is not permission to emit
-more later `OwnerData`. The sender MUST wait, repair/fail over the explicit
-gap, or admit a candidate whose ordering-debt input is safe under the normal
-no-worse checks. Proof-only and unmeasured candidates remain `Probe`,
-`Standby`, or `RepairOnly` until the debt falls below pressure or explicit
-loss/failure/stall evidence converts the affected range into `RepairData`. A
+immediately. A contiguous ACK frontier that stops advancing is retained
+`OwnerData` recovery state until carrier failure, detach, or known-final-tail
+evidence makes repair a correctness action; it is not by itself authoritative
+owner-debt pressure. The Service anchor may identify the path that owns the
+lower unresolved bytes, but that identity is not permission to emit more later
+`OwnerData`. The sender MUST wait, repair/fail over the explicit gap, or admit
+a candidate whose ordering-debt input is safe under the normal no-worse checks.
+Proof-only and unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly`
+until the debt falls below pressure or explicit loss/failure/final-tail evidence
+converts the affected range into `RepairData`. A
 mixed-family Subflow is eligible under debt
 pressure only when it is bulk-rate-proven and the candidate-specific ordering
 debt for the next range is zero, for example when that candidate already owns
@@ -3369,13 +3369,13 @@ known-final-offset tail recovery, and the numeric traffic hint only scales the
 sender-service repair budget.
 
 Repair `STREAM_DATA` is still stream data for correctness and flow accounting,
-but its service lane is repair/latency, not ordinary bulk. It therefore uses
-the priority product queue and may interleave ahead of already queued bulk
-frames. This lane override changes queue service, not stream semantics: the
-receiver still accepts the data by stream offset and discards duplicates after
-the corresponding range is ACKed or delivered. An implementation MUST NOT allow
-a repair frame to wait behind the bulk queue for the same path merely because
-the parent stream has been classified as throughput.
+but ordinary budgeted repair is not a priority bypass. It remains `RepairData`,
+is charged to the stream extra-traffic ledger, and is queued behind already
+admitted `OwnerData` unless it closes an authoritative ACK gap, a failed-owner
+gap, or a known final tail. This service rule changes queue priority only for
+bounded correctness repair; it does not change stream semantics. The receiver
+still accepts the data by stream offset and discards duplicates after the
+corresponding range is ACKed or delivered.
 
 For the lead path, `lead_product_queue_envelope` is the preemptible product
 repair and flow-control envelope, not the UDP carrier cwnd. This larger
@@ -3828,16 +3828,17 @@ MPTCP/MPQUIC anti-pattern where normal multipath reordering is mistaken for a
 dead subflow and creates repeated detach/reopen churn.
 
 Owner backpressure is a sender wait state, but it is not automatically a
-product-source starvation signal. The backpressure condition is the union of an
-explicit authoritative ACK gap and a persistent contiguous owner-tail debt that
-has crossed the same bulk stall timeout. While owner backpressure exists, the
-sender MUST NOT dispatch queued bulk bytes as later `OwnerData` if doing so
-would expand the unresolved lower frontier. However, reading from the local
-product source into the bounded sender queue does not assign product offsets and
-does not create ordering debt by itself. A conforming sender MAY continue
-bounded product-source reads while dispatch is owner-debt blocked, subject to
-stream flow control, queue limits, and memory limits, so the service path is not
-starved by target-read shutdown. The repair cache is retained unacked
+product-source starvation signal. The backpressure condition is an explicit
+authoritative ACK gap, failed-owner gap, or known final tail. A persistent
+contiguous owner-tail stall is carrier recovery state until one of those facts
+exists. While owner backpressure exists, the sender MUST NOT dispatch queued
+bulk bytes as later `OwnerData` if doing so would expand the unresolved lower
+frontier. However, reading from the local product source into the bounded sender
+queue does not assign product offsets and does not create ordering debt by
+itself. A conforming sender MAY continue bounded product-source reads while
+dispatch is owner-debt blocked, subject to stream flow control, queue limits,
+and memory limits, so the service path is not starved by target-read shutdown.
+The repair cache is retained unacked
 `OwnerData` memory and MUST NOT be counted as already-queued source bytes for
 product-source read admission. Repair-cache capacity is enforced when bytes are
 assigned product offsets and committed as `OwnerData`; the sender queue remains
@@ -3853,18 +3854,15 @@ can make a different work item admissible. This keeps product-ordering debt
 separate from carrier pipe availability and prevents CPU spin or repeated
 non-emitting scheduling decisions.
 
-Persistent owner-tail stalls are not automatically critical repair when the
-peer's ACK ranges are contiguous. If the ACK frontier has stopped below the
-sender's next product offset, the stream has retained unacked `OwnerData`, and
-an independent survivor output exists, the sender may reinject the lowest
-unacked live tail bytes as optional `RepairData` after the persistent-stall
-timer only while extra-traffic budget remains. This is failover assistance, not
-throughput probing: it must not create path delivery evidence, move the Service
-owner, or become probe credit. A live contiguous owner tail MUST NOT exceed the
-optional extra-traffic hint. Once a final offset is known, terminal owner-tail
-repair may spend bounded critical repair needed to close retained final debt,
-bounded by repair-cache, path-flight, and sender resource limits; those bytes
-are still counted as repair overhead.
+Persistent owner-tail stalls are not repair when the peer's ACK ranges are
+contiguous. If the ACK frontier has stopped below the sender's next product
+offset, the stream has retained unacked `OwnerData`, and no authoritative ACK
+gap or known final tail exists, the sender waits for ACK progress, carrier
+failure/detach evidence, or a final-offset condition. It MUST NOT reinject the
+live contiguous owner tail as optional `RepairData`. Once a final offset is
+known, terminal owner-tail repair may spend bounded critical repair needed to
+close retained final debt, bounded by repair-cache, path-flight, and sender
+resource limits; those bytes are still counted as repair overhead.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

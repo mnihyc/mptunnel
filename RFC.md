@@ -2996,22 +2996,25 @@ unacknowledged `OwnerData` retained in the repair cache is recovery state, not
 by itself product ordering debt; treating cache occupancy as owner-debt pressure
 would prevent the latency-first stream from moving to a better bulk path on
 demand. Once authoritative owner-debt pressure exists, the sender MUST treat the
-current ordered-data owner as a family/evidence filter, not a priority bypass.
-An explicit ACK-range hole creates this pressure immediately; a contiguous ACK
-frontier that stops advancing creates it only after the bulk stall timeout.
-The current Service owner and already measured Subflows that do not expand
-cross-path ordering debt remain eligible for `OwnerData`; proof-only and
-unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly` until the debt
-falls below pressure or explicit loss/failure/stall evidence converts the
-affected range into `RepairData`. A mixed-family Subflow is eligible under debt
+current ordered-data owner as a family/evidence filter, not a priority bypass
+or queue-credit bypass. An explicit ACK-range hole creates this pressure
+immediately; a contiguous ACK frontier that stops advancing creates it only
+after the bulk stall timeout. The Service anchor may identify the path that
+owns the lower unresolved bytes, but that identity is not permission to emit
+more later `OwnerData`. The sender MUST wait, repair/fail over the explicit
+gap, or admit a candidate whose ordering-debt input is safe under the normal
+no-worse checks. Proof-only and unmeasured candidates remain `Probe`,
+`Standby`, or `RepairOnly` until the debt falls below pressure or explicit
+loss/failure/stall evidence converts the affected range into `RepairData`. A
+mixed-family Subflow is eligible under debt
 pressure only when it is bulk-rate-proven and the candidate-specific ordering
 debt for the next range is zero, for example when that candidate already owns
 the lower outstanding range. The surviving OwnerData candidates still pass the normal
 ECF/BLEST-style no-worse checks for ETA, inflight, ordering debt, read-gap,
 queue, overhead, and completion horizon. This prevents per-quantum ETA changes
 from turning an unhealthy flow into cross-family owner migration, receive-hole
-growth, and repeated duplicate traffic without hard-pinning a stalled Service
-owner when a measured Subflow can reduce completion time. Optional
+growth, and repeated duplicate traffic without treating a stalled Service
+owner's carrier queue credit as proof that the product frontier is safe. Optional
 paths may still carry `Probe`, `Control`, and gap-targeted `RepairData` that is
 justified by explicit evidence.
 
@@ -3677,16 +3680,16 @@ product-flight model. It MUST NOT be implemented as a floor that expands a
 smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
 Product owner debt pressure MUST NOT bypass the active Service product-flight
 admission check. If older owner debt is above pressure, debt pressure acts as a
-family/evidence filter: the current Service owner and already measured Subflows
-that do not expand cross-path ordering debt remain eligible for OwnerData,
-while proof-only candidates and debt-expanding cross-family candidates remain
-Probe, Standby, or RepairOnly until the debt clears. The surviving OwnerData
-candidates are then ranked by the
+family/evidence filter and an ordering-debt input. The current Service anchor
+does not get a special later-OwnerData exemption merely because it owns lower
+bytes or has carrier queue credit. Proof-only candidates and debt-expanding
+cross-family candidates remain Probe, Standby, or RepairOnly until the debt
+clears. The surviving OwnerData candidates are then ranked by the
 normal no-worse admission checks: ETA, inflight, ordering debt, read-gap/reorder
 budget, queue, and completion horizon. A sender MUST NOT hard-pin new OwnerData
 to the current owner merely because that owner owns older bytes; doing so turns
-ordering debt into sender starvation instead of an ECF/BLEST-style completion
-decision. A measured Subflow admitted at a clear frontier still
+ordering debt into receive-hole growth and sender starvation instead of an
+ECF/BLEST-style completion decision. A measured Subflow admitted at a clear frontier still
 MUST NOT change the Service owner hint merely because it carried the next range.
 The current Service may remain the subflow-set anchor even when it is temporarily
 over its local product-feed envelope. That anchor status is not send admission:

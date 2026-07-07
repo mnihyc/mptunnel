@@ -727,6 +727,9 @@ fn response_target_unique_owner_admission_with_epoch(
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     let service_key = response_service_anchor_key(candidates, lower_owner, lead.key);
     if lower_owner == Some(target.key) {
+        if ordering_debt > 0 {
+            return (PathAdmission::standby(), None);
+        }
         return if target.is_active || target.has_bulk_rate_evidence {
             (PathAdmission::service(), None)
         } else {
@@ -1522,8 +1525,8 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         .iter()
         .copied()
         .filter_map(|target| {
-            let ordering_debt = if let Some(owner_key) = debt_pressure_owner {
-                if lower_owner.is_none() && target.key != owner_key {
+            let ordering_debt = if debt_pressure_owner.is_some() {
+                if lower_owner.is_none() {
                     product_owner_debt_bytes as u64
                 } else {
                     response_ordering_debt_bytes(lower_flights, target.key)
@@ -6005,7 +6008,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_owner_data_does_not_use_same_family_subflow_under_product_owner_debt() {
+    async fn response_owner_data_waits_under_product_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -6142,15 +6145,14 @@ mod tests {
                 mux_limits,
                 product_owner_debt_bytes,
             )
-            .await
-            .expect("lower owner should remain dispatchable while product owner debt exists");
+            .await;
 
-        assert_eq!(dispatch.selected_path, Some(active_key));
+        assert!(
+            matches!(dispatch, Err(RuntimeError::SenderServiceBlocked)),
+            "authoritative product owner debt must backpressure later OwnerData until the frontier is safe"
+        );
         assert_eq!(binding.ordered_data_owner(), Some(active_key));
-        assert!(matches!(
-            recv_reliable_path_command(&mut active_rx).await,
-            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
-        ));
+        assert!(try_recv_reliable_path_command(&mut active_rx).is_none());
         assert!(
             try_recv_reliable_path_command(&mut alternate_rx).is_none(),
             "product owner debt must not move later OwnerData onto another Subflow"
@@ -6742,6 +6744,37 @@ mod tests {
     }
 
     #[test]
+    fn response_owner_debt_pressure_stops_later_service_owner_feed() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let owner = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, true);
+        let alternate = response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, false);
+        let owner_key = owner.key;
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &owner,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[owner, alternate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(owner_key),
+            owner_debt_pressure.saturating_add(payload_bytes),
+            None,
+        );
+
+        assert!(
+            selected.is_none(),
+            "authoritative product owner debt must stop later Service OwnerData instead of growing the receive hole"
+        );
+    }
+
+    #[test]
     fn response_owner_debt_pressure_waits_when_lower_owner_queue_is_full() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -6781,39 +6814,6 @@ mod tests {
         assert!(
             selected.is_none(),
             "when the lower owner is full, sender must wait instead of expanding the ordered receive hole on a Subflow"
-        );
-    }
-
-    #[test]
-    fn response_owner_debt_pressure_keeps_lower_owner_when_it_has_credit() {
-        let mux_limits = MuxLimits::default();
-        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let owner = response_target(0, UnderlayProtocol::Udp, 100.0, 0, 16 * 1024 * 1024, true);
-        let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
-            &owner,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
-
-        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
-            &[owner.clone(), alternate],
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-            &[],
-            Some(owner.key),
-            owner_debt_pressure.saturating_add(payload_bytes),
-            None,
-        )
-        .expect("lower owner should remain eligible under owner-debt pressure");
-
-        assert_eq!(selected.target.key.path_id, PathId(0));
-        assert_eq!(
-            selected.admission.role,
-            PathRuntimeRole::Service,
-            "owner-debt pressure must not reassign later OwnerData to a Subflow"
         );
     }
 

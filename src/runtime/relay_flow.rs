@@ -217,6 +217,20 @@ pub(super) fn reliable_relay_bulk_prevalidation_threshold_bytes(
     PATH_OPEN_SCORE_BYTES as u64
 }
 
+pub(super) fn reliable_latency_startup_owner_credit_remaining_bytes(
+    lane: FlowLane,
+    sent_offset: u64,
+    queued_data_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if lane != FlowLane::Latency {
+        return usize::MAX;
+    }
+    let cap = reliable_flow_rate_bulk_evidence_bytes(None, mux_limits, u64::MAX);
+    let committed = sent_offset.saturating_add(queued_data_bytes as u64);
+    usize::try_from(cap.saturating_sub(committed)).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +316,48 @@ mod tests {
         assert_eq!(decision.demand.lane, FlowLane::Throughput);
         assert!(decision.promoted_to_throughput);
         assert!(tracker.should_rebalance(decision));
+    }
+
+    #[test]
+    fn latency_startup_owner_credit_stops_after_bulk_evidence_floor() {
+        let limits = MuxLimits::default();
+        let floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
+
+        assert_eq!(
+            reliable_latency_startup_owner_credit_remaining_bytes(
+                FlowLane::Latency,
+                floor.saturating_sub(1),
+                0,
+                limits,
+            ),
+            1
+        );
+        assert_eq!(
+            reliable_latency_startup_owner_credit_remaining_bytes(
+                FlowLane::Latency,
+                floor,
+                0,
+                limits,
+            ),
+            0
+        );
+        assert_eq!(
+            reliable_latency_startup_owner_credit_remaining_bytes(
+                FlowLane::Latency,
+                floor / 2,
+                usize::try_from(floor - floor / 2).unwrap(),
+                limits,
+            ),
+            0
+        );
+        assert_eq!(
+            reliable_latency_startup_owner_credit_remaining_bytes(
+                FlowLane::Throughput,
+                floor,
+                usize::MAX,
+                limits,
+            ),
+            usize::MAX
+        );
     }
 }

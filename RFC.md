@@ -369,22 +369,23 @@ recovery engines. Therefore, for one ordered reliable stream, a proof-only
 validation output MUST NOT carry later unique `STREAM_DATA` while another
 output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
-At a clear frontier, liveness, path-proof, configured-hint, or other
-sender-evidence-only inputs MAY rank validation/probe order, but they MUST NOT
-make a non-active path the Service owner for ordered product bytes. A
+At a clear frontier, liveness, path-proof, configured hints, and peer hints MAY
+rank validation/probe order, but they MUST NOT make a non-active path the
+Service owner for ordered product bytes. A
 same-family path may replace the current Service for ordinary owner data only
 after direction-correct bulk-rate evidence exists and the ETA/no-worse selector
 admits that change. ACK-data-only evidence from a tiny or application-limited
 probe is still not bulk-rate evidence and does not grant Service rights. A
 same-family Subflow may carry a bounded startup `OwnerData` window at a clear
 ordered frontier after the current Service has direction-correct bulk-rate
-evidence and the Subflow has sender evidence. That window is unique payload
-data, not duplicate/probe traffic; it does not change the Service owner hint and
-it does not make the Subflow the lower-frontier Service for additional bytes.
-It is capped by the path-adaptive startup owner credit and is not a steady-state
-role. After that credit is spent, further Subflow `OwnerData` requires
-direction-correct bulk-rate evidence. Steady-state Subflow `OwnerData` requires
-bulk-rate evidence and
+evidence and the Subflow has path-scoped sender evidence. Configured or peer
+hints alone are not sender evidence and MUST NOT unlock this unique-data
+window. That window is unique payload data, not duplicate/probe traffic; it does
+not change the Service owner hint and it does not make the Subflow the
+lower-frontier Service for additional bytes. It is capped by the path-adaptive
+startup owner credit and is not a steady-state role. After that credit is
+spent, further Subflow `OwnerData` requires direction-correct bulk-rate
+evidence. Steady-state Subflow `OwnerData` requires bulk-rate evidence and
 sender-service admission proving that doing so will not expand product
 receive-hole debt or worsen the completion horizon. This rule is path-metric
 driven inside TCP+TCP and QUIC+QUIC sets; it is not a TCP-preferred or
@@ -437,6 +438,15 @@ make them safe for the specific decision. A STREAM_ACK for a unique outstanding
 flight ledger knows the only owner. A STREAM_ACK for duplicated `RepairData` or
 ambiguous copies releases product repair state and ordering debt but is not
 carrier bandwidth proof and cannot promote any path.
+
+When authoritative ACK ranges expose a lower product gap and repair bytes remain
+outstanding, a bulk sender MUST stop reading additional local product bytes for
+new `OwnerData` on that stream. Repair and control traffic may continue, but
+expanding future owner ranges behind a known hole violates the no-worse/HOL
+guard and turns repair into throughput churn. New `OwnerData` may resume after
+the ordered frontier closes or the gap no longer exposes repair debt. Repair
+remains charged to the extra-traffic budget so a lossy owner cannot convert the
+stream into unbounded duplicate traffic.
 
 Carrier engines own underlay mechanics. TCP owns encrypted framed records,
 writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
@@ -1999,6 +2009,17 @@ idle gaps, and path BDP promote sustained large flows toward throughput-first
 behavior. Idle gaps, stalls, repair pressure, and tails move behavior back
 toward latency-sensitive handling.
 
+Latency-first startup is finite owner credit, not an implicit bulk mode. Before
+a reliable stream has been promoted to throughput, the initial Service owner may
+carry only enough unique product bytes to establish the bulk evidence floor.
+After that credit is consumed, the sender MUST stop reading additional product
+bytes into the latency-owner queue until either throughput promotion/admission
+runs or the stream becomes idle again. Prevalidation may start at the smaller
+path-open score, but prevalidation alone MUST NOT allow the latency owner to
+accumulate megabytes of lower ordered bytes that later block Subflow admission.
+This preserves the negotiated model: open latency-first, then move toward the
+measured bandwidth carrier on demand without creating stale lower-owner debt.
+
 Flow demand is represented by lane and ppm weights rather than by user-visible
 traffic class names. The defined lanes are Control, Latency, Throughput,
 RealtimeDatagram, and Background.
@@ -2095,9 +2116,9 @@ as long-term bandwidth proof for ECF/BLEST completion-horizon rejection. QUIC's
 initial congestion window and early MPTCP subflow growth are probe mechanisms, not
 accurate bulk-rate priors. A same-underlay candidate may receive a bounded
 frontier-clear startup Subflow owner window after the current Service has
-bulk-rate evidence and the candidate has sender evidence, but it may be admitted
-for steady-state Subflow ownership only after bulk-rate evidence exists and it
-still fits product inflight, carrier credit, and reorder budgets. This is true
+bulk-rate evidence and the candidate has path-scoped sender evidence, but it may be
+admitted for steady-state Subflow ownership only after bulk-rate evidence exists
+and it still fits product inflight, carrier credit, and reorder budgets. This is true
 even if a candidate's current ETA is
 worse than the lead's ETA, because same-underlay ETA can be an artifact of
 underfeeding and validation; the correct proof is whether the additional path
@@ -2630,7 +2651,7 @@ or replaying repair outside the measured send loop.
 For bulk reliable streams, the scheduler maintains a small subflow set epoch for the
 current flow: one Service owner plus Subflow members admitted from live ETA,
 flow sharing, health, and capability state. Startup Subflow samples are bounded
-and require sender evidence; steady-state Subflow owner bytes require
+and require path-scoped sender evidence; steady-state Subflow owner bytes require
 bulk-rate evidence. Individual dispatches consume credit from that set; they do
 not recreate validation credit from scratch, and ordinary ACK progress does not
 reset spent startup Subflow credit. ACKs update the per-range flight ledger,
@@ -2911,16 +2932,19 @@ paths may still carry `Probe`, `Control`, and gap-targeted `RepairData` that is
 justified by explicit evidence.
 
 For mixed TCP+QUIC reliable streams, production v1 uses a stricter same-family
-`OwnerData` rule. A product stream that already has a Service carrier family
-MUST NOT stripe later ordinary `OwnerData` onto the other carrier family merely
-because both paths have proof or short-term rate samples. MPTCP subflows share
-TCP recovery semantics and MPQUIC paths share QUIC recovery semantics; mptunnel's
-TCP and QUIC reliable-stream carriers have independent ACK clocks, pacing, flow
-control, and loss recovery. Cross-family paths therefore remain `Probe`,
-`RepairOnly`, `Standby`, or explicit failover targets until a future scheduler
-proves a no-worse cross-family mode. This rule is carrier-neutral: it blocks
-TCP-to-QUIC and QUIC-to-TCP speculative owner migration equally, while preserving
-same-family TCP+TCP and QUIC+QUIC aggregation.
+`OwnerData` rule under unresolved lower bytes. A product stream that already has
+a lower-frontier Service carrier family MUST NOT stripe later ordinary
+`OwnerData` onto the other carrier family merely because both paths have proof
+or short-term rate samples. MPTCP subflows share TCP recovery semantics and
+MPQUIC paths share QUIC recovery semantics; mptunnel's TCP and QUIC
+reliable-stream carriers have independent ACK clocks, pacing, flow control, and
+loss recovery. Cross-family paths therefore remain `Probe`, `RepairOnly`, or
+`Standby` while lower bytes are unresolved. At a clear ordered frontier, the
+next Service family is metric-selected: a bulk-rate-proven TCP or QUIC candidate
+may become the next `OwnerData` Service owner if it wins the no-worse admission
+model. This rule is carrier-neutral: it blocks TCP-to-QUIC and QUIC-to-TCP
+speculative concurrent striping equally, while still allowing latency-first
+streams to move to the measured best bulk carrier on demand.
 
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
@@ -3500,11 +3524,12 @@ if path is the previously attached active path but not the lead path
 
 Admission gains are internal model-control coefficients, not operator-visible
 traffic modes. In production v1 they apply to additional same-family ordinary
-striping; cross-underlay TCP+QUIC `OwnerData` remains disabled except for
-explicit failover. Lead and same-underlay product queues use a BDP/inflight-
-derived envelope capped by the configured resource ceiling, while carrier
-controllers still enforce network flight. This follows BBR's separation between
-ready application data and paced network inflight, while preserving the
+striping and to clear-frontier Service-family selection. Cross-underlay TCP+QUIC
+`OwnerData` is not admitted as concurrent later-offset striping while another
+family owns unresolved lower bytes. Lead and same-underlay product queues use a
+BDP/inflight-derived envelope capped by the configured resource ceiling, while
+carrier controllers still enforce network flight. This follows BBR's separation
+between ready application data and paced network inflight, while preserving the
 ECF/BLEST rule that heterogeneous paths must not create avoidable head-of-line
 blocking.
 
@@ -4402,7 +4427,8 @@ production scheduler model. TCP+TCP and QUIC+QUIC candidates share a carrier
 family and can compete as same-family subflows once admitted by live metrics,
 ordering-debt, and no-worse checks. TCP+QUIC candidates are different carrier
 families with independent ACK clocks, recovery, pacing, and flow-control
-semantics, so they MUST NOT steal same-stream OwnerData by default. They remain
-valid Probe, Standby, RepairOnly, migration, and failover paths. Cross-family
-OwnerData requires an explicit future scheduler mode with its own proof that it
-does not increase receive-hole debt, repair traffic, or latency.
+semantics, so they MUST NOT steal same-stream OwnerData while another family
+owns unresolved lower bytes. They remain valid Probe, Standby, RepairOnly,
+migration, and failover paths. At a clear frontier, cross-family Service
+selection is allowed only for bulk-rate-proven candidates that pass the same
+no-worse admission model as any other Service switch.

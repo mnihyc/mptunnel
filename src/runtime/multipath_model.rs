@@ -35,8 +35,8 @@ pub(super) enum PathRuntimeRole {
     ///
     /// `Subflow` is intentionally the same term used by MPTCP. In mptunnel it
     /// means an additional same-family path admitted by the no-worse guard. It
-    /// may spend bounded startup owner credit with sender evidence, then
-    /// requires bulk-rate evidence for steady-state owner bytes.
+    /// may spend bounded startup owner credit with path-scoped sender evidence,
+    /// then requires bulk-rate evidence for steady-state owner bytes.
     Subflow,
     /// Path-manager/control-plane probing only. A probe cannot own product
     /// offsets and cannot create product delivery proof.
@@ -83,6 +83,7 @@ pub(super) fn cross_family_reliable_owner_health(
     current_owner_bulk_rate_proven: bool,
     candidate: CarrierPathKey,
     candidate_bulk_rate_proven: bool,
+    frontier_clear: bool,
 ) -> CarrierFamilyHealth {
     let Some(owner) = current_owner else {
         return CarrierFamilyHealth::Healthy;
@@ -92,15 +93,17 @@ pub(super) fn cross_family_reliable_owner_health(
     }
 
     // Production v1 deliberately does not stripe one ordered product stream
-    // across TCP and QUIC owner paths at the same time. MPTCP subflows share one
-    // transport family and MPQUIC paths share one QUIC connection/path model; in
-    // mptunnel a TCP carrier and a QUIC reliable-stream carrier have independent
-    // recovery, pacing, flow-control, and ACK clocks. Treating both as
-    // equal OwnerData subflows created cross-family holes, repair storms, and the
-    // shaped reliable-mixed all-path collapse. Cross-family paths remain useful
-    // as Probe/RepairOnly/Standby, but same-stream reliable OwnerData stays
-    // within the current service family until an explicit future scheduler can
-    // prove cross-family no-worse behavior.
+    // across TCP and QUIC owner paths while lower bytes are unresolved. MPTCP
+    // subflows share one transport family and MPQUIC paths share one QUIC
+    // connection/path model; in mptunnel a TCP carrier and a QUIC reliable
+    // carrier have independent recovery, pacing, flow-control, and ACK clocks.
+    // Treating both as concurrent OwnerData subflows created cross-family holes
+    // and repair storms. At a clear product frontier, however, a bulk-rate
+    // proven candidate may become the next Service owner; otherwise the old
+    // Service family becomes sticky and mixed paths cannot adapt by metrics.
+    if frontier_clear && candidate_bulk_rate_proven {
+        return CarrierFamilyHealth::Healthy;
+    }
     if candidate_bulk_rate_proven {
         CarrierFamilyHealth::RepairOnly
     } else if current_owner_bulk_rate_proven {
@@ -612,7 +615,7 @@ mod tests {
         assert_eq!(
             exhausted.decision,
             PathAdmissionDecision::ProbeOnly,
-            "sender-evidence startup Subflow OwnerData is bounded by owner credit, not a new steady-state role"
+            "startup Subflow OwnerData is bounded by owner credit, not a new steady-state role"
         );
         assert_eq!(
             epoch.members()[0].owner_sent_bytes,
@@ -655,17 +658,17 @@ mod tests {
         };
 
         assert_eq!(
-            cross_family_reliable_owner_health(Some(owner), true, candidate, true),
+            cross_family_reliable_owner_health(Some(owner), true, candidate, true, false),
             CarrierFamilyHealth::Healthy
         );
         assert!(
-            cross_family_reliable_owner_health(Some(owner), true, candidate, true)
+            cross_family_reliable_owner_health(Some(owner), true, candidate, true, false)
                 .reliable_owner_allowed()
         );
     }
 
     #[test]
-    fn cross_family_reliable_owner_disabled_for_same_stream_owner_data() {
+    fn cross_family_reliable_owner_requires_clear_frontier_and_bulk_rate() {
         let owner = CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(0),
@@ -676,23 +679,27 @@ mod tests {
         };
 
         assert!(
-            !cross_family_reliable_owner_health(Some(owner), true, candidate, true)
+            !cross_family_reliable_owner_health(Some(owner), true, candidate, true, false)
+                .reliable_owner_allowed()
+        );
+        assert!(
+            cross_family_reliable_owner_health(Some(owner), true, candidate, true, true)
                 .reliable_owner_allowed()
         );
         assert_eq!(
-            cross_family_reliable_owner_health(Some(owner), true, candidate, false),
+            cross_family_reliable_owner_health(Some(owner), true, candidate, false, true),
             CarrierFamilyHealth::ProbeOnly
         );
         assert_eq!(
-            cross_family_reliable_owner_health(Some(owner), false, candidate, true),
+            cross_family_reliable_owner_health(Some(owner), false, candidate, true, false),
             CarrierFamilyHealth::RepairOnly
         );
         assert_eq!(
-            cross_family_reliable_owner_health(Some(owner), false, candidate, false),
+            cross_family_reliable_owner_health(Some(owner), false, candidate, false, true),
             CarrierFamilyHealth::DisabledForReliableOwner
         );
         assert!(
-            cross_family_reliable_owner_health(None, false, candidate, false)
+            cross_family_reliable_owner_health(None, false, candidate, false, true)
                 .reliable_owner_allowed()
         );
     }

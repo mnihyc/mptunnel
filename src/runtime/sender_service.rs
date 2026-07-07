@@ -701,8 +701,8 @@ fn response_target_unique_owner_admission(
 // The important split is:
 // * Service: the current active/lower-frontier owner, kept fed while healthy.
 // * Subflow: same-family additional path, admitted with bounded startup owner
-//   credit from sender evidence or for steady-state owner bytes with bulk-rate
-//   evidence.
+//   credit from path-scoped sender evidence or for steady-state owner bytes
+//   with bulk-rate evidence.
 //
 // Path proof, ACK-data visibility, and carrier attachment are intentionally not
 // owner states. They are evidence inputs for this decision.
@@ -857,6 +857,7 @@ fn response_cross_underlay_owner_allowed(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
     ordered_data_owner: Option<CarrierPathKey>,
+    lower_owner: Option<CarrierPathKey>,
 ) -> bool {
     // Use the ordered owner when lower product bytes are outstanding; otherwise
     // use the current Service/active path as the family anchor. Without this, a
@@ -883,6 +884,7 @@ fn response_cross_underlay_owner_allowed(
         current_owner_bulk_rate_proven,
         target.key,
         target.has_bulk_rate_evidence,
+        lower_owner.is_none(),
     )
     .reliable_owner_allowed()
 }
@@ -1416,7 +1418,12 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         .iter()
         .copied()
         .filter(|target| {
-            response_cross_underlay_owner_allowed(target, &candidate_targets, ordered_data_owner)
+            response_cross_underlay_owner_allowed(
+                target,
+                &candidate_targets,
+                ordered_data_owner,
+                lower_owner,
+            )
         })
         .collect::<Vec<_>>();
     #[cfg(feature = "lab-diagnostics")]
@@ -4307,7 +4314,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_udp_bulk_path_does_not_steal_tcp_owner_by_default() {
+    fn measured_udp_bulk_path_does_not_steal_tcp_owner_under_lower_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_tcp = response_target(
@@ -4332,14 +4339,17 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            &[],
+            &[CarrierPathFlightDebt {
+                key: active_tcp.key,
+                bytes: payload_bytes as u64,
+            }],
             Some(active_tcp.key),
         )
-        .expect("current TCP primary remains eligible while mixed-family ownership is disabled");
+        .expect("current TCP primary remains eligible while it owns unresolved lower bytes");
 
         assert_eq!(
             selected.key, active_tcp.key,
-            "mixed TCP/QUIC paths may probe or repair, but must not steal same-stream OwnerData by default"
+            "mixed TCP/QUIC paths may probe or repair, but must not steal same-stream OwnerData under lower-owner debt"
         );
     }
 
@@ -5317,7 +5327,7 @@ mod tests {
         assert_eq!(
             plan.primary_key(),
             Some(optional),
-            "same-family sender-evidence path should get bounded startup Subflow owner credit at a clear frontier"
+            "same-family sender-evidence path should get bounded Subflow owner credit at a clear frontier"
         );
         assert_eq!(
             plan.primary_role(),
@@ -6156,7 +6166,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_clear_same_family_sender_evidence_is_startup_subflow_not_service() {
+    fn frontier_clear_same_family_sender_evidence_is_subflow_not_service() {
         let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let mut lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -6187,10 +6197,11 @@ mod tests {
     }
 
     #[test]
-    fn cross_underlay_candidate_does_not_displace_owner_until_both_families_have_bulk_rate() {
-        let mut owner = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-        owner.has_bulk_rate_evidence = false;
-        let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+    fn cross_underlay_candidate_does_not_displace_owner_without_bulk_rate() {
+        let owner = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        let mut candidate =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        candidate.has_bulk_rate_evidence = false;
 
         let selected = choose_response_sender_data_target(
             &[owner.clone(), candidate],
@@ -6201,9 +6212,30 @@ mod tests {
             Some(owner.key),
         )
         .expect(
-            "current service owner should remain eligible while mixed family health is partial",
+            "current service owner should remain eligible while cross-family candidate is unproven",
         );
 
         assert_eq!(selected.key, owner.key);
+    }
+
+    #[test]
+    fn cross_underlay_bulk_rate_candidate_can_become_service_at_clear_frontier() {
+        let owner = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = choose_response_sender_data_target(
+            &[owner.clone(), candidate.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(owner.key),
+        )
+        .expect("bulk-rate-proven cross-underlay candidate should be eligible at a clear frontier");
+
+        assert_eq!(
+            selected.key, candidate.key,
+            "ordered-owner history must not pin the Service family once the product frontier is clear"
+        );
     }
 }

@@ -82,6 +82,20 @@ pub(super) fn stream_ack_ranges_expose_authoritative_gap(
             .is_some_and(|first| first.start > 0 || ranges.len() > 1)
 }
 
+pub(super) fn reliable_relay_owner_gap_blocks_product_source(
+    lane: FlowLane,
+    repair_bytes: usize,
+    ack_complete: bool,
+    ack_ranges: &[OffsetRange],
+    ack_frontier: u64,
+    next_offset: u64,
+) -> bool {
+    relay_lane_is_bulk(lane)
+        && repair_bytes > 0
+        && ack_frontier < next_offset
+        && stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges)
+}
+
 pub(super) fn reliable_relay_tail_repair_deadline(
     last_progress_at: Instant,
     path: Option<PathSnapshot>,
@@ -1340,6 +1354,14 @@ where
                 &last_send_ack_ranges,
             )
             && last_send_ack_frontier < send_stream.next_offset();
+        let owner_gap_blocks_product_source = reliable_relay_owner_gap_blocks_product_source(
+            relay_lane,
+            send_stream.repair_bytes(),
+            last_send_ack_complete,
+            &last_send_ack_ranges,
+            last_send_ack_frontier,
+            send_stream.next_offset(),
+        );
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
             send_path_snapshot,
@@ -1354,11 +1376,24 @@ where
         let inflight_limit =
             adaptive_reliable_relay_inflight_bytes(send_path_snapshot, relay_lane, mux_limits);
         let sender_queue_limit = reliable_relay_sender_queue_limit(mux_limits, inflight_limit);
+        let latency_owner_credit = reliable_latency_startup_owner_credit_remaining_bytes(
+            relay_lane,
+            send_stream.next_offset(),
+            response_sender.data_bytes(),
+            mux_limits,
+        );
         let source_read_ceiling = reliable_relay_buffer_len(mux_limits)
             .min(path_stream.max_frame_payload_bytes)
             .min(sender_queue_limit)
-            .max(1);
-        resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
+            .min(latency_owner_credit);
+        let source_read_ceiling = if owner_gap_blocks_product_source {
+            0
+        } else {
+            source_read_ceiling
+        };
+        if source_read_ceiling > 0 {
+            resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
+        }
         let (sender_dispatch_byte_budget, sender_dispatch_item_budget) =
             reliable_relay_sender_dispatch_budget(
                 mux_limits,
@@ -1428,13 +1463,14 @@ where
             Vec::new()
         };
         let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
-        let can_read_by_flow = response_sender.can_read_product_source(
-            local_open,
-            queued_send_blocked,
-            &send_stream,
-            mux_limits,
-            sender_queue_limit,
-        );
+        let can_read_by_flow = source_read_ceiling > 0
+            && response_sender.can_read_product_source(
+                local_open,
+                queued_send_blocked,
+                &send_stream,
+                mux_limits,
+                sender_queue_limit,
+            );
         let read_budget = if can_read_by_flow {
             response_sender.read_budget(
                 &send_stream,
@@ -2317,6 +2353,56 @@ mod tests {
                     end: 4096,
                 },
             ],
+        ));
+    }
+
+    #[test]
+    fn authoritative_owner_gap_blocks_new_bulk_owner_reads() {
+        let ranges = [
+            OffsetRange {
+                start: 0,
+                end: 1024,
+            },
+            OffsetRange {
+                start: 2048,
+                end: 4096,
+            },
+        ];
+
+        assert!(reliable_relay_owner_gap_blocks_product_source(
+            FlowLane::Throughput,
+            4096,
+            true,
+            &ranges,
+            1024,
+            8192,
+        ));
+        assert!(!reliable_relay_owner_gap_blocks_product_source(
+            FlowLane::Latency,
+            4096,
+            true,
+            &ranges,
+            1024,
+            8192,
+        ));
+        assert!(!reliable_relay_owner_gap_blocks_product_source(
+            FlowLane::Throughput,
+            0,
+            true,
+            &ranges,
+            1024,
+            8192,
+        ));
+        assert!(!reliable_relay_owner_gap_blocks_product_source(
+            FlowLane::Throughput,
+            4096,
+            true,
+            &[OffsetRange {
+                start: 0,
+                end: 8192,
+            }],
+            8192,
+            8192,
         ));
     }
 

@@ -896,14 +896,10 @@ impl ResponseStreamBinding {
             .entries
             .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
         if outputs.entries.len() != before {
-            let live_keys = outputs
-                .entries
-                .iter()
-                .map(|entry| entry.key)
-                .collect::<Vec<_>>();
+            let live_entries = outputs.entries.clone();
             drop(outputs);
             self.lane_tracker.detach(self.session_id, key, lane);
-            self.repair_ordered_data_owner_after_output_change(&live_keys);
+            self.repair_ordered_data_owner_after_output_change(&live_entries);
             self.reset_subflow_set();
             self.notify_update();
         }
@@ -1162,14 +1158,17 @@ impl ResponseStreamBinding {
             .expect("server reliable stream subflow set lock") = None;
     }
 
-    fn repair_ordered_data_owner_after_output_change(&self, live_keys: &[CarrierPathKey]) {
+    fn repair_ordered_data_owner_after_output_change(
+        &self,
+        live_entries: &[ResponseStreamOutputEntry],
+    ) {
         let mut lead = self
             .ordered_data_owner
             .lock()
             .expect("server reliable stream ordered data owner lock");
-        let live_lead = lead.is_some_and(|key| live_keys.contains(&key));
+        let live_lead = lead.is_some_and(|key| live_entries.iter().any(|entry| entry.key == key));
         if !live_lead {
-            *lead = live_keys.last().copied();
+            *lead = response_best_failover_ordered_data_owner(live_entries);
         }
     }
 
@@ -1453,7 +1452,57 @@ fn response_live_ordered_data_owner(
 ) -> Option<CarrierPathKey> {
     stored
         .filter(|key| entries.iter().any(|entry| entry.key == *key))
-        .or_else(|| entries.last().map(|entry| entry.key))
+        .or_else(|| response_best_failover_ordered_data_owner(entries))
+}
+
+fn response_best_failover_ordered_data_owner(
+    entries: &[ResponseStreamOutputEntry],
+) -> Option<CarrierPathKey> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.commands.is_closed())
+        .max_by_key(|(index, entry)| {
+            (
+                response_failover_evidence_rank(entry),
+                response_failover_rate_bps(entry),
+                entry.delivery_samples,
+                usize::MAX.saturating_sub(*index),
+            )
+        })
+        .map(|(_, entry)| entry.key)
+}
+
+fn response_failover_evidence_rank(entry: &ResponseStreamOutputEntry) -> u8 {
+    if server_output_has_bulk_rate_evidence(entry) {
+        3
+    } else if server_output_has_sender_evidence(entry) {
+        2
+    } else {
+        1
+    }
+}
+
+fn response_failover_rate_bps(entry: &ResponseStreamOutputEntry) -> u64 {
+    entry
+        .local_path_metrics
+        .map(|path_metrics| path_metrics.metrics.delivery_rate_bps.max(1))
+        .or_else(|| entry.delivery_rate_bps.and_then(f64_to_positive_u64))
+        .or_else(|| {
+            entry
+                .product_progress_rate_bps
+                .and_then(f64_to_positive_u64)
+        })
+        .or_else(|| {
+            entry
+                .peer_path_metrics
+                .map(|path_metrics| path_metrics.metrics.delivery_rate_bps.max(1))
+        })
+        .unwrap_or(1)
+}
+
+fn f64_to_positive_u64(value: f64) -> Option<u64> {
+    value.is_finite().then_some(value.max(1.0) as u64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1816,6 +1865,92 @@ mod tests {
                 .find(|target| target.key == survivor)
                 .is_some_and(|target| target.is_active),
             "the promoted survivor must be exposed as the scheduler Service target"
+        );
+    }
+
+    #[test]
+    fn response_service_failover_prefers_measured_survivor_over_output_tail() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let measured = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let probe_only_tail = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let (measured_commands, _measured_receivers) = reliable_path_command_channels(8);
+        let (probe_commands, _probe_receivers) = reliable_path_command_channels(8);
+
+        assert_eq!(
+            binding.attach(
+                measured.underlay,
+                measured.path_id,
+                measured_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.update_path_metrics(
+            measured,
+            PathMetrics {
+                path_id: measured.path_id,
+                underlay: measured.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 200_000_000,
+                pacing_rate_bps: 200_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: 0,
+                inflight_hi_bytes: 0,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                data_sample_bytes: MIN_RATE_SAMPLE_BYTES,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        assert_eq!(
+            binding.attach(
+                probe_only_tail.underlay,
+                probe_only_tail.path_id,
+                probe_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let active_commands = {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == active)
+                .expect("active output exists")
+                .commands
+                .clone()
+        };
+        binding.detach(active, &active_commands);
+
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(measured),
+            "Service failover must be evidence-based; output-list tail is not an ownership signal"
         );
     }
 

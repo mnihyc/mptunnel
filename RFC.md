@@ -2727,16 +2727,19 @@ Reliable path membership uses explicit roles. An attached output starts as
 path and MUST remain fed while it is healthy. A live response stream that has
 any live carrier output MUST expose exactly one live `Service` owner key to
 the sender scheduler. If the current Service output is detached or closed, the
-binding promotes an existing live survivor as the failover Service; this is a
-survivor invariant, not delivery evidence, and it does not credit the survivor
-with bulk-rate samples. A measured Subflow may compete for owner credit, but
-its existence MUST NOT hide or invalidate the current Service as a lead
-candidate; a blocked optional Subflow creates backpressure or Standby/RepairOnly
-state, not a stream with no admissible Service. `Subflow` is an additional owner
-path admitted by the same no-worse completion and ordering-debt model used for
-the Service path. There is one Subflow owner admission mode: direction-correct
-bulk-rate evidence plus no-worse completion, ordering-debt, queue, and overhead
-guards.
+binding promotes an existing live survivor by path evidence and measured rate:
+bulk-rate-proven survivors rank first, sender-evidence survivors rank next, and
+plain attached outputs are only a last-resort failover. Output-list tail
+position, validation attach order, and recent repair selection are not ownership
+signals. This is a survivor invariant, not delivery evidence, and it does not
+credit the survivor with bulk-rate samples. A measured Subflow may compete for
+owner credit, but its existence MUST NOT hide or invalidate the current Service
+as a lead candidate; a blocked optional Subflow creates backpressure or
+Standby/RepairOnly state, not a stream with no admissible Service. `Subflow` is
+an additional owner path admitted by the same no-worse completion and
+ordering-debt model used for the Service path. There is one Subflow owner
+admission mode: direction-correct bulk-rate evidence plus no-worse completion,
+ordering-debt, queue, and overhead guards.
 `RepairOnly`, `Standby`, and `Failed` outputs cannot receive speculative owner
 bytes. Role transitions are monotonic with evidence and carrier state for the
 current decision; they are not implied by attachment order, carrier family,

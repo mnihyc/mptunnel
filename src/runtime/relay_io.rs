@@ -92,6 +92,38 @@ pub(super) fn reliable_relay_owner_gap_blocks_product_source(
         && stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reliable_relay_authoritative_owner_debt_bytes(
+    lane: FlowLane,
+    repair_bytes: usize,
+    ack_complete: bool,
+    ack_ranges: &[OffsetRange],
+    ack_frontier: u64,
+    next_offset: u64,
+    last_ack_progress_at: Instant,
+    now: Instant,
+    path: Option<PathSnapshot>,
+) -> usize {
+    if !relay_lane_is_bulk(lane)
+        || repair_bytes == 0
+        || ack_frontier >= next_offset
+        || !ack_complete
+    {
+        return 0;
+    }
+    if stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges) {
+        return repair_bytes;
+    }
+    if ack_frontier == 0 {
+        return 0;
+    }
+    if now.duration_since(last_ack_progress_at) >= reliable_relay_stall_timeout(path, lane) {
+        repair_bytes
+    } else {
+        0
+    }
+}
+
 pub(super) fn reliable_relay_queued_lane_blocked_by_owner_gap(
     queued_lane: Option<ReliableRelayQueuedWorkLane>,
     owner_gap_blocks_product_source: bool,
@@ -1168,6 +1200,7 @@ async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
     owner_gap_blocks_product_source: bool,
+    product_owner_debt_bytes: usize,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1192,7 +1225,13 @@ async fn drain_server_response_sender_ready(
             break;
         }
         let dispatch = match response_sender
-            .dispatch_next(path_stream, send_stream, relay_lane, mux_limits)
+            .dispatch_next_with_product_owner_debt(
+                path_stream,
+                send_stream,
+                relay_lane,
+                mux_limits,
+                product_owner_debt_bytes,
+            )
             .await
         {
             Ok(dispatch) => dispatch,
@@ -1378,6 +1417,17 @@ where
             last_send_ack_frontier,
             send_stream.next_offset(),
         );
+        let authoritative_owner_debt_bytes = reliable_relay_authoritative_owner_debt_bytes(
+            relay_lane,
+            send_stream.repair_bytes(),
+            last_send_ack_complete,
+            &last_send_ack_ranges,
+            last_send_ack_frontier,
+            send_stream.next_offset(),
+            last_send_ack_progress_at,
+            Instant::now(),
+            send_path_snapshot,
+        );
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
             send_path_snapshot,
@@ -1455,12 +1505,14 @@ where
         if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
             response_sender_retry_at = None;
         }
-        let queued_front_has_carrier_credit = response_sender.front_has_carrier_credit(
-            &path_stream,
-            &send_stream,
-            relay_lane,
-            mux_limits,
-        );
+        let queued_front_has_carrier_credit = response_sender
+            .front_has_carrier_credit_with_product_owner_debt(
+                &path_stream,
+                &send_stream,
+                relay_lane,
+                mux_limits,
+                authoritative_owner_debt_bytes,
+            );
         let sender_wait = response_sender_wait_state(
             !response_sender.is_empty(),
             response_sender.queued_send_ready(),
@@ -1529,6 +1581,17 @@ where
                         &last_send_ack_ranges,
                         last_send_ack_frontier,
                         send_stream.next_offset(),
+                    ),
+                    reliable_relay_authoritative_owner_debt_bytes(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                        last_send_ack_progress_at,
+                        Instant::now(),
+                        send_path_snapshot,
                     ),
                     &mut send_stream,
                     relay_lane,
@@ -1825,17 +1888,28 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                        reliable_relay_owner_gap_blocks_product_source(
-                            relay_lane,
-                            send_stream.repair_bytes(),
-                            last_send_ack_complete,
-                            &last_send_ack_ranges,
-                            last_send_ack_frontier,
-                            send_stream.next_offset(),
-                        ),
-                        &mut send_stream,
+                    reliable_relay_owner_gap_blocks_product_source(
                         relay_lane,
-                        mux_limits,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                    ),
+                    reliable_relay_authoritative_owner_debt_bytes(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                        last_send_ack_progress_at,
+                        Instant::now(),
+                        send_path_snapshot,
+                    ),
+                    &mut send_stream,
+                    relay_lane,
+                    mux_limits,
                         sender_dispatch_byte_budget,
                         sender_dispatch_item_budget,
                         &mut stats,
@@ -1919,6 +1993,17 @@ where
                             last_send_ack_frontier,
                             send_stream.next_offset(),
                         ),
+                        reliable_relay_authoritative_owner_debt_bytes(
+                            relay_lane,
+                            send_stream.repair_bytes(),
+                            last_send_ack_complete,
+                            &last_send_ack_ranges,
+                            last_send_ack_frontier,
+                            send_stream.next_offset(),
+                            last_send_ack_progress_at,
+                            Instant::now(),
+                            send_path_snapshot,
+                        ),
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -1969,6 +2054,17 @@ where
                             last_send_ack_frontier,
                             send_stream.next_offset(),
                         ),
+                        reliable_relay_authoritative_owner_debt_bytes(
+                            relay_lane,
+                            send_stream.repair_bytes(),
+                            last_send_ack_complete,
+                            &last_send_ack_ranges,
+                            last_send_ack_frontier,
+                            send_stream.next_offset(),
+                            last_send_ack_progress_at,
+                            Instant::now(),
+                            send_path_snapshot,
+                        ),
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2004,6 +2100,17 @@ where
                         last_send_ack_frontier,
                         send_stream.next_offset(),
                     ),
+                    reliable_relay_authoritative_owner_debt_bytes(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                        last_send_ack_progress_at,
+                        Instant::now(),
+                        send_path_snapshot,
+                    ),
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2029,6 +2136,17 @@ where
                         &last_send_ack_ranges,
                         last_send_ack_frontier,
                         send_stream.next_offset(),
+                    ),
+                    reliable_relay_authoritative_owner_debt_bytes(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                        last_send_ack_progress_at,
+                        Instant::now(),
+                        send_path_snapshot,
                     ),
                     &mut send_stream,
                     relay_lane,
@@ -2147,6 +2265,17 @@ where
                                 last_send_ack_frontier,
                                 send_stream.next_offset(),
                             ),
+                            reliable_relay_authoritative_owner_debt_bytes(
+                                relay_lane,
+                                send_stream.repair_bytes(),
+                                last_send_ack_complete,
+                                &last_send_ack_ranges,
+                                last_send_ack_frontier,
+                                send_stream.next_offset(),
+                                last_send_ack_progress_at,
+                                Instant::now(),
+                                send_path_snapshot,
+                            ),
                             &mut send_stream,
                             relay_lane,
                             mux_limits,
@@ -2180,6 +2309,17 @@ where
                     &last_send_ack_ranges,
                     last_send_ack_frontier,
                     send_stream.next_offset(),
+                ),
+                reliable_relay_authoritative_owner_debt_bytes(
+                    last_relay_lane,
+                    send_stream.repair_bytes(),
+                    last_send_ack_complete,
+                    &last_send_ack_ranges,
+                    last_send_ack_frontier,
+                    send_stream.next_offset(),
+                    last_send_ack_progress_at,
+                    Instant::now(),
+                    None,
                 ),
                 &mut send_stream,
                 last_relay_lane,
@@ -2451,6 +2591,64 @@ mod tests {
             8192,
             8192,
         ));
+    }
+
+    #[test]
+    fn stalled_contiguous_ack_frontier_creates_owner_debt_pressure() {
+        let stall_timeout = reliable_relay_stall_timeout(None, FlowLane::Throughput);
+        let now = Instant::now();
+        let old_progress = now - stall_timeout - Duration::from_millis(1);
+        let recent_progress = now - (stall_timeout / 2);
+        let ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Throughput,
+                4096,
+                true,
+                &ranges,
+                1024,
+                8192,
+                old_progress,
+                now,
+                None,
+            ),
+            4096,
+            "stalled contiguous ACK frontier is authoritative owner-debt pressure"
+        );
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Throughput,
+                4096,
+                true,
+                &ranges,
+                1024,
+                8192,
+                recent_progress,
+                now,
+                None,
+            ),
+            0,
+            "recent contiguous ACK progress remains ordinary in-flight repair-cache retention"
+        );
+        assert_eq!(
+            reliable_relay_authoritative_owner_debt_bytes(
+                FlowLane::Latency,
+                4096,
+                true,
+                &ranges,
+                1024,
+                8192,
+                old_progress,
+                now,
+                None,
+            ),
+            0,
+            "latency traffic should not enter bulk owner-debt pressure"
+        );
     }
 
     #[test]

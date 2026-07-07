@@ -370,11 +370,11 @@ fn bulk_active_lead_has_contiguous_frontier(
     role: BulkAdmissionRole,
     stream_ordering_debt_bytes: u64,
 ) -> bool {
+    let _ = candidate;
     matches!(
         role,
         BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
     ) && stream_ordering_debt_bytes == 0
-        && bulk_latency_pressure_flows(candidate) == 0
 }
 
 fn bulk_active_lead_product_envelope_bytes(
@@ -530,10 +530,10 @@ fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissi
             role,
             BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
         )
-    // Latency pressure still reduces the product envelope in
-    // `bulk_product_inflight_limit_bytes`; it must not move the active owner
-    // back onto the carrier cwnd hard gate. QUIC/TCP carriers own packet
-    // pacing below this layer.
+    // Lane fairness is enforced above carrier admission. It must not move the
+    // active owner back onto a tiny carrier/startup hard gate while the product
+    // ordered frontier is clear. QUIC/TCP carriers own packet pacing below
+    // this layer.
 }
 
 fn bulk_active_role_has_latency_pressure(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
@@ -846,7 +846,7 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit")
+            Some("reorder_budget")
         );
     }
 
@@ -1104,6 +1104,31 @@ mod tests {
                 BulkAdmissionRole::ActiveDataPath,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn tcp_active_service_under_bulk_demand_is_not_starved_by_latency_pressure_flag() {
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.product_bytes_in_flight = 380_304;
+        active.product_queue_bytes = 395_112;
+        active.session_active_latency_sensitive_flows = 1;
+        active.confidence = 0.1;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                57_482.654,
+                active,
+                57_482.654,
+                64 * 1024,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "latency-first startup state must not shrink an active bulk Service owner to a tiny startup-rate BDP while the ordered frontier is clear"
         );
     }
 

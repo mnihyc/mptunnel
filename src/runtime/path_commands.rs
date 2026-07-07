@@ -96,32 +96,25 @@ impl ReliablePathCommandSender {
     pub(super) async fn send_stream_ordered_close(
         &self,
         stream_id: StreamId,
-        lane: FlowLane,
+        _lane: FlowLane,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         let command = ReliablePathCommand::CloseStream(stream_id);
-        let queue = if reliable_path_frame_uses_priority_queue(lane) {
-            &self.priority
-        } else {
-            &self.data
-        };
+        #[cfg(feature = "lab-diagnostics")]
+        let ordered_lane = reliable_path_stream_ordered_queue_lane();
+        let queue = &self.data;
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
         let result = queue.send(command).await;
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
-            let queue_name = if reliable_path_frame_uses_priority_queue(lane) {
-                "priority"
-            } else {
-                "data"
-            };
             lab_diagnostic(
                 "path_command_queue_send",
                 format_args!(
-                    "queue={} command_kind=close_stream stream_id={} lane={:?} pacing_bytes=0 wait_ms={} result={}",
-                    queue_name,
+                    "queue=data command_kind=close_stream stream_id={} lane={:?} effective_lane={:?} pacing_bytes=0 wait_ms={} result={}",
                     stream_id.0,
-                    lane,
+                    _lane,
+                    ordered_lane,
                     elapsed.as_millis(),
                     if result.is_ok() { "queued" } else { "closed" },
                 ),
@@ -143,7 +136,11 @@ impl ReliablePathCommandSender {
         frame: Frame,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
-        self.try_enqueue_admitted_frame_with_effective_lane(frame, lane, Some(lane))
+        self.try_enqueue_admitted_frame_with_effective_lane(
+            frame,
+            lane,
+            Some(reliable_path_stream_ordered_queue_lane()),
+        )
     }
 
     fn try_enqueue_admitted_frame_with_effective_lane(
@@ -211,7 +208,8 @@ impl ReliablePathCommandSender {
     }
 
     pub(super) fn can_enqueue_stream_ordered_frame_now(&self, lane: FlowLane) -> bool {
-        self.can_enqueue_lane_now(lane)
+        let _ = lane;
+        self.can_enqueue_lane_now(reliable_path_stream_ordered_queue_lane())
     }
 
     pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
@@ -247,6 +245,10 @@ pub(super) fn reliable_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
+}
+
+pub(super) fn reliable_path_stream_ordered_queue_lane() -> FlowLane {
+    FlowLane::Throughput
 }
 
 pub(super) fn reliable_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane) -> FlowLane {

@@ -550,7 +550,7 @@ impl ResponseCarrierEmitMode {
     fn effective_lane(self, frame: &Frame, lane: FlowLane) -> FlowLane {
         match self {
             Self::Classified => reliable_path_effective_frame_lane(frame, lane),
-            Self::StreamOrdered => lane,
+            Self::StreamOrdered => reliable_path_stream_ordered_queue_lane(),
         }
     }
 }
@@ -1922,7 +1922,7 @@ async fn emit_planned_response_data_frame(
                 fixed.commands(),
                 frame.clone(),
                 lane,
-                ResponseCarrierEmitMode::Classified,
+                ResponseCarrierEmitMode::StreamOrdered,
             )
             .await?;
             fixed.record_owner_flight(&frame);
@@ -1940,7 +1940,7 @@ async fn emit_planned_response_data_frame(
                 &target.commands,
                 frame.clone(),
                 lane,
-                ResponseCarrierEmitMode::Classified,
+                ResponseCarrierEmitMode::StreamOrdered,
             )
             .await
             {
@@ -1997,6 +1997,11 @@ async fn emit_response_frame_from_sender_service(
     reason: &'static str,
     repair: bool,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
+    let emit_mode = if matches!(frame, Frame::StreamData { .. }) && !repair {
+        ResponseCarrierEmitMode::StreamOrdered
+    } else {
+        emit_mode
+    };
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             send_sender_service_frame_to_carrier(fixed.commands(), frame.clone(), lane, emit_mode)
@@ -2222,12 +2227,13 @@ impl ServerResponseSenderService {
         self.queue.front_lane()
     }
 
-    pub(super) fn front_has_carrier_credit(
+    pub(super) fn front_has_carrier_credit_with_product_owner_debt(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         relay_lane: FlowLane,
         mux_limits: MuxLimits,
+        product_owner_debt_bytes: usize,
     ) -> bool {
         let Some((_, queued)) = self.queue.front() else {
             return false;
@@ -2258,7 +2264,7 @@ impl ServerResponseSenderService {
                         mux_limits,
                         payload.len(),
                     ),
-                    send_stream.repair_bytes(),
+                    product_owner_debt_bytes,
                 )
                 .is_ok()
             }
@@ -2344,6 +2350,24 @@ impl ServerResponseSenderService {
         relay_lane: FlowLane,
         mux_limits: MuxLimits,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
+        self.dispatch_next_with_product_owner_debt(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            0,
+        )
+        .await
+    }
+
+    pub(super) async fn dispatch_next_with_product_owner_debt(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
+        relay_lane: FlowLane,
+        mux_limits: MuxLimits,
+        product_owner_debt_bytes: usize,
+    ) -> Result<ServerResponseDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
             .front()
@@ -2384,7 +2408,7 @@ impl ServerResponseSenderService {
                     data_lane,
                     send_stream.next_offset(),
                     dispatch_payload.len(),
-                    send_stream.repair_bytes(),
+                    product_owner_debt_bytes,
                 )?;
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
@@ -4995,6 +5019,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
+        let (commands, mut receiver) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(108),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            FlowLane::Throughput,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(108),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: 4,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, 4)
+            .into_iter()
+            .next()
+            .expect("binding has service target");
+
+        let bulk_first = ResponseDataDispatchPlan {
+            primary: ResponseDataDispatchTarget::Switchable {
+                binding: binding.clone(),
+                target: target.clone(),
+                role: PathRuntimeRole::Service,
+                subflow_set_commit: None,
+            },
+        };
+        let latency_second = ResponseDataDispatchPlan {
+            primary: ResponseDataDispatchTarget::Switchable {
+                binding,
+                target,
+                role: PathRuntimeRole::Service,
+                subflow_set_commit: None,
+            },
+        };
+
+        emit_planned_response_data_frame(
+            &stream,
+            bulk_first,
+            Frame::StreamData {
+                stream_id: StreamId(108),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"aaaa"),
+            },
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("bulk owner data should enqueue");
+        emit_planned_response_data_frame(
+            &stream,
+            latency_second,
+            Frame::StreamData {
+                stream_id: StreamId(108),
+                offset: 4,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"bbbb"),
+            },
+            FlowLane::Latency,
+        )
+        .await
+        .expect("latency owner data should enqueue");
+
+        assert!(matches!(
+            recv_reliable_path_command(&mut receiver).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset: 0,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            recv_reliable_path_command(&mut receiver).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset: 4,
+                ..
+            }))
+        ));
+    }
+
     #[test]
     fn proof_only_same_family_candidate_cannot_own_data_under_lower_owner_debt() {
         let mux_limits = MuxLimits::default();
@@ -5373,6 +5483,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_repair_cache_retention_does_not_create_owner_debt_pressure() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let active_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let alternate_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (active_commands, mut active_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(83),
+            UnderlayProtocol::Udp,
+            active_key.path_id,
+            active_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        binding.set_ordered_data_owner(active_key);
+        binding.update_path_metrics(
+            active_key,
+            PathMetrics {
+                path_id: active_key.path_id,
+                underlay: active_key.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 50_000,
+                srtt_us: 50_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 200_000_000,
+                pacing_rate_bps: 200_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: (16 * payload_bytes) as u64,
+                inflight_hi_bytes: (16 * payload_bytes) as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 4,
+                data_sample_bytes: (16 * payload_bytes) as u64,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (alternate_commands, mut alternate_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Udp,
+                alternate_key.path_id,
+                alternate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.update_path_metrics(
+            alternate_key,
+            PathMetrics {
+                path_id: alternate_key.path_id,
+                underlay: alternate_key.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 5_000,
+                srtt_us: 5_000,
+                rttvar_us: 500,
+                jitter_us: 500,
+                delivery_rate_bps: 1_000_000_000,
+                pacing_rate_bps: 1_000_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: (16 * payload_bytes) as u64,
+                inflight_hi_bytes: (16 * payload_bytes) as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 4,
+                data_sample_bytes: (16 * payload_bytes) as u64,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Udp,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let active_target = binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == active_key)
+            .expect("active target should be visible to sender planning");
+        let owner_debt_pressure = response_product_owner_debt_pressure_bytes(
+            &active_target,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+        let mut send_stream = ReliableSendStream::new(StreamId(7), mux_limits);
+        let mut retained_unacked_bytes = owner_debt_pressure.saturating_add(payload_bytes);
+        while retained_unacked_bytes > 0 {
+            let chunk = retained_unacked_bytes.min(payload_bytes);
+            let _unacked = send_stream
+                .send_data(Bytes::from(vec![1_u8; chunk]), StreamFlags::NONE)
+                .expect("seed normal retained unacked OwnerData above pressure threshold");
+            retained_unacked_bytes -= chunk;
+        }
+        assert!(send_stream.repair_bytes() > owner_debt_pressure);
+        assert!(
+            binding
+                .lower_flights_before_offset(send_stream.next_offset())
+                .is_empty(),
+            "this regression isolates repair-cache retention from authoritative path-flight debt"
+        );
+        while let Some(_setup_command) = try_recv_reliable_path_command(&mut alternate_rx) {}
+
+        let mut sender = ServerResponseSenderService::new(SessionId(83), StreamId(7));
+        sender.enqueue_data_for_lane(Bytes::from(vec![2_u8; payload_bytes]), FlowLane::Throughput);
+        let dispatch = sender
+            .dispatch_next(&stream, &mut send_stream, FlowLane::Throughput, mux_limits)
+            .await
+            .expect("normal repair-cache retention must not block measured Subflow OwnerData");
+
+        assert_eq!(dispatch.selected_path, Some(alternate_key));
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(active_key),
+            "Subflow OwnerData must not rewrite the Service owner hint"
+        );
+        assert!(
+            try_recv_reliable_path_command(&mut active_rx).is_none(),
+            "normal repair-cache retention is not an owner-debt reason to pin data to Service"
+        );
+        assert!(matches!(
+            recv_reliable_path_command(&mut alternate_rx).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+    }
+
+    #[tokio::test]
     async fn response_owner_data_does_not_use_same_family_subflow_under_product_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -5501,8 +5767,15 @@ mod tests {
 
         let mut sender = ServerResponseSenderService::new(SessionId(82), StreamId(7));
         sender.enqueue_data_for_lane(Bytes::from(vec![2_u8; payload_bytes]), FlowLane::Throughput);
+        let product_owner_debt_bytes = send_stream.repair_bytes();
         let dispatch = sender
-            .dispatch_next(&stream, &mut send_stream, FlowLane::Throughput, mux_limits)
+            .dispatch_next_with_product_owner_debt(
+                &stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+                product_owner_debt_bytes,
+            )
             .await
             .expect("lower owner should remain dispatchable while product owner debt exists");
 

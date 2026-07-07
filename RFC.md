@@ -411,6 +411,19 @@ selected carrier path. Server response bytes and client upload bytes MUST enter
 a sender-service queue before they can become STREAM_DATA carrier commands.
 Control, ACK, FIN, RESET, DETACH, repair, realtime, latency, throughput, and
 background lanes are sender-service concerns, not path-queue concerns.
+Once the sender service admits `OwnerData` to a carrier output, all `OwnerData`
+for the same product stream and output MUST enter one stream-ordered carrier
+emission queue. Flow lanes may influence when bytes are admitted and which path
+is selected, but they MUST NOT split ordered product bytes across priority and
+bulk carrier queues where later offsets can overtake earlier offsets. This is
+the mptunnel analogue of keeping connection-level data sequence ownership
+separate from subflow/path scheduling.
+Similarly, latency-first startup state and live latency-sensitive flow counters
+may affect sender-service fairness and preemption, but they MUST NOT reduce a
+clear-frontier bulk Service owner to a tiny startup-rate or carrier-cwnd
+product admission ceiling. While bulk demand exists and the ordered frontier is
+clear, the Service owner is fed through the product Service envelope; lower
+carrier congestion and pacing remain the carrier engine's responsibility.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,
@@ -2916,16 +2929,20 @@ unique owner bytes only after path-scoped bulk-rate evidence exists and the
 no-worse admission model accepts it.
 
 The production SafeBestPath guard is stricter while a reliable stream has
-owner-debt pressure: unacknowledged owner ranges in its repair cache exceed the
-same path-aware ACK/progress quantum used to decide when product ACK feedback is
-needed. Small normal in-flight debt is not enough to pin the service path; that
+authoritative owner-debt pressure: ACK ranges or the path-flight ledger show
+that lower-frontier owner bytes are unresolved beyond the same path-aware
+ACK/progress quantum used to decide when product ACK feedback is needed. Normal
+unacknowledged `OwnerData` retained in the repair cache is recovery state, not
+by itself product ordering debt; treating cache occupancy as owner-debt pressure
 would prevent the latency-first stream from moving to a better bulk path on
-demand. Once owner-debt pressure exists, the sender MUST treat the current
-ordered-data owner as a family/evidence filter, not a priority bypass. The
-current Service owner and already measured same-family Subflows remain eligible
-for `OwnerData`; proof-only, cross-family, and unmeasured candidates remain
-`Probe`, `Standby`, or `RepairOnly` until the debt falls below pressure or
-explicit loss/failure/stall evidence converts the affected range into
+demand. Once authoritative owner-debt pressure exists, the sender MUST treat the
+current ordered-data owner as a family/evidence filter, not a priority bypass.
+An explicit ACK-range hole creates this pressure immediately; a contiguous ACK
+frontier that stops advancing creates it only after the bulk stall timeout.
+The current Service owner and already measured same-family Subflows remain
+eligible for `OwnerData`; proof-only, cross-family, and unmeasured candidates
+remain `Probe`, `Standby`, or `RepairOnly` until the debt falls below pressure
+or explicit loss/failure/stall evidence converts the affected range into
 `RepairData`. The surviving OwnerData candidates still pass the normal
 ECF/BLEST-style no-worse checks for ETA, inflight, ordering debt, read-gap,
 queue, overhead, and completion horizon. This prevents per-quantum ETA changes

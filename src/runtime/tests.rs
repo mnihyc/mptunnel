@@ -1004,7 +1004,7 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
         .expect("dispatch first latency slice");
     assert_eq!(first.payload_bytes, latency_quantum);
     assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut receivers),
+        recv_emitted_tcp_path_command(&mut receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             offset: 0,
             payload,
@@ -1024,14 +1024,14 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
     assert_eq!(second.payload_bytes, latency_quantum);
     assert!(
         matches!(
-            try_recv_reliable_path_priority_command(&mut receivers),
+            recv_emitted_tcp_path_command(&mut receivers).await,
             Some(ReliablePathCommand::SendFrame(Frame::StreamData {
                 offset,
                 payload,
                 ..
             })) if offset == latency_quantum as u64 && payload.len() == latency_quantum
         ),
-        "already-queued latency data must not be reclassified into the throughput data queue"
+        "already-queued latency data must keep its enqueue-time dispatch quantum without splitting OwnerData across carrier priority queues"
     );
 }
 

@@ -96,6 +96,13 @@ pub(super) fn reliable_relay_owner_gap_blocks_product_source(
         && stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges)
 }
 
+pub(super) fn reliable_relay_queued_lane_blocked_by_owner_gap(
+    queued_lane: Option<ReliableRelayQueuedWorkLane>,
+    owner_gap_blocks_product_source: bool,
+) -> bool {
+    owner_gap_blocks_product_source && queued_lane == Some(ReliableRelayQueuedWorkLane::Data)
+}
+
 pub(super) fn reliable_relay_tail_repair_deadline(
     last_progress_at: Instant,
     path: Option<PathSnapshot>,
@@ -1159,6 +1166,7 @@ fn enqueue_reliable_tail_repair(
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
+    owner_gap_blocks_product_source: bool,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1175,6 +1183,13 @@ async fn drain_server_response_sender_ready(
         && dispatched_items < sender_dispatch_item_budget
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
+        if reliable_relay_queued_lane_blocked_by_owner_gap(
+            response_sender.front_lane(),
+            owner_gap_blocks_product_source,
+        ) {
+            blocked_by_carrier = true;
+            break;
+        }
         let dispatch = match response_sender
             .dispatch_next(path_stream, send_stream, relay_lane, mux_limits)
             .await
@@ -1506,6 +1521,14 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
+                    reliable_relay_owner_gap_blocks_product_source(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                    ),
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -1802,6 +1825,14 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
+                        reliable_relay_owner_gap_blocks_product_source(
+                            relay_lane,
+                            send_stream.repair_bytes(),
+                            last_send_ack_complete,
+                            &last_send_ack_ranges,
+                            last_send_ack_frontier,
+                            send_stream.next_offset(),
+                        ),
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -1880,6 +1911,14 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
+                        reliable_relay_owner_gap_blocks_product_source(
+                            relay_lane,
+                            send_stream.repair_bytes(),
+                            last_send_ack_complete,
+                            &last_send_ack_ranges,
+                            last_send_ack_frontier,
+                            send_stream.next_offset(),
+                        ),
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -1922,6 +1961,14 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
+                        reliable_relay_owner_gap_blocks_product_source(
+                            relay_lane,
+                            send_stream.repair_bytes(),
+                            last_send_ack_complete,
+                            &last_send_ack_ranges,
+                            last_send_ack_frontier,
+                            send_stream.next_offset(),
+                        ),
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -1949,6 +1996,14 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
+                    reliable_relay_owner_gap_blocks_product_source(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                    ),
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -1967,6 +2022,14 @@ where
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
+                    reliable_relay_owner_gap_blocks_product_source(
+                        relay_lane,
+                        send_stream.repair_bytes(),
+                        last_send_ack_complete,
+                        &last_send_ack_ranges,
+                        last_send_ack_frontier,
+                        send_stream.next_offset(),
+                    ),
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2076,6 +2139,14 @@ where
                         if drain_server_response_sender_ready(
                             &mut response_sender,
                             &path_stream,
+                            reliable_relay_owner_gap_blocks_product_source(
+                                relay_lane,
+                                send_stream.repair_bytes(),
+                                last_send_ack_complete,
+                                &last_send_ack_ranges,
+                                last_send_ack_frontier,
+                                send_stream.next_offset(),
+                            ),
                             &mut send_stream,
                             relay_lane,
                             mux_limits,
@@ -2102,6 +2173,14 @@ where
             match drain_server_response_sender_ready(
                 &mut response_sender,
                 &path_stream,
+                reliable_relay_owner_gap_blocks_product_source(
+                    last_relay_lane,
+                    send_stream.repair_bytes(),
+                    last_send_ack_complete,
+                    &last_send_ack_ranges,
+                    last_send_ack_frontier,
+                    send_stream.next_offset(),
+                ),
                 &mut send_stream,
                 last_relay_lane,
                 mux_limits,
@@ -2404,6 +2483,27 @@ mod tests {
             8192,
             8192,
         ));
+    }
+
+    #[test]
+    fn authoritative_owner_gap_blocks_only_queued_owner_data() {
+        assert!(reliable_relay_queued_lane_blocked_by_owner_gap(
+            Some(ReliableRelayQueuedWorkLane::Data),
+            true,
+        ));
+        assert!(!reliable_relay_queued_lane_blocked_by_owner_gap(
+            Some(ReliableRelayQueuedWorkLane::Repair),
+            true,
+        ));
+        assert!(!reliable_relay_queued_lane_blocked_by_owner_gap(
+            Some(ReliableRelayQueuedWorkLane::Control),
+            true,
+        ));
+        assert!(!reliable_relay_queued_lane_blocked_by_owner_gap(
+            Some(ReliableRelayQueuedWorkLane::Data),
+            false,
+        ));
+        assert!(!reliable_relay_queued_lane_blocked_by_owner_gap(None, true,));
     }
 
     #[test]

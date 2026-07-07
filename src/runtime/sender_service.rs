@@ -2218,6 +2218,10 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
+    pub(super) fn front_lane(&self) -> Option<ReliableRelayQueuedWorkLane> {
+        self.queue.front_lane()
+    }
+
     pub(super) fn front_has_carrier_credit(
         &self,
         path_stream: &ReliablePathStream,

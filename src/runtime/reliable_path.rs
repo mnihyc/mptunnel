@@ -632,7 +632,6 @@ impl ResponseStreamBinding {
                     delivery_samples: 0,
                     last_delivery_at: None,
                     path_metrics: None,
-                    subflow_startup_sent_bytes: 0,
                 }],
             }),
             ordered_data_owner: Mutex::new(Some(key)),
@@ -742,7 +741,6 @@ impl ResponseStreamBinding {
                 delivery_samples: 0,
                 last_delivery_at: None,
                 path_metrics: None,
-                subflow_startup_sent_bytes: 0,
             }
         };
         let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
@@ -1066,7 +1064,6 @@ impl ResponseStreamBinding {
         current: Option<FlowSubflowSet>,
         service: CarrierPathKey,
         owner_credit_bytes: usize,
-        startup_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
     ) -> FlowSubflowSet {
@@ -1075,7 +1072,6 @@ impl ResponseStreamBinding {
                 epoch.matches_envelope(
                     service,
                     owner_credit_bytes,
-                    startup_credit_bytes,
                     optional_overhead_budget_bytes,
                     max_read_gap_budget,
                 )
@@ -1085,7 +1081,6 @@ impl ResponseStreamBinding {
                     0,
                     service,
                     owner_credit_bytes,
-                    startup_credit_bytes,
                     optional_overhead_budget_bytes,
                     max_read_gap_budget,
                 )
@@ -1104,7 +1099,6 @@ impl ResponseStreamBinding {
         &self,
         service: CarrierPathKey,
         owner_credit_bytes: usize,
-        startup_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
@@ -1118,7 +1112,6 @@ impl ResponseStreamBinding {
             current,
             service,
             owner_credit_bytes,
-            startup_credit_bytes,
             optional_overhead_budget_bytes,
             max_read_gap_budget,
         );
@@ -1129,7 +1122,6 @@ impl ResponseStreamBinding {
         &self,
         service: CarrierPathKey,
         owner_credit_bytes: usize,
-        startup_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
@@ -1143,7 +1135,6 @@ impl ResponseStreamBinding {
             current,
             service,
             owner_credit_bytes,
-            startup_credit_bytes,
             optional_overhead_budget_bytes,
             max_read_gap_budget,
         );
@@ -1216,21 +1207,6 @@ impl ResponseStreamBinding {
                 sent_at: Instant::now(),
                 kind,
             });
-    }
-
-    pub(super) fn record_subflow_startup_bytes(&self, key: CarrierPathKey, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.subflow_startup_sent_bytes = entry
-                .subflow_startup_sent_bytes
-                .saturating_add(bytes as u64);
-        }
     }
 
     pub(super) fn lower_flights_before_frame(&self, frame: &Frame) -> Vec<CarrierPathFlightDebt> {
@@ -1337,7 +1313,6 @@ impl ResponseStreamBinding {
                     is_active: Some(entry.key) == active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
                     has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
-                    subflow_startup_sent_bytes: entry.subflow_startup_sent_bytes,
                 }
             })
             .collect()
@@ -1961,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn response_subflow_set_does_not_throttle_measured_subflows_by_startup_credit() {
+    fn response_subflow_set_allows_repeated_measured_subflow_admission() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -1982,7 +1957,6 @@ mod tests {
         let first = binding.preview_subflow_owner_admission(
             service,
             payload_bytes,
-            payload_bytes,
             0,
             Duration::ZERO,
             input,
@@ -1991,7 +1965,6 @@ mod tests {
 
         let committed = binding.commit_subflow_owner_admission(
             service,
-            payload_bytes,
             payload_bytes,
             0,
             Duration::ZERO,
@@ -2002,7 +1975,6 @@ mod tests {
         let second = binding.preview_subflow_owner_admission(
             service,
             payload_bytes,
-            payload_bytes,
             0,
             Duration::ZERO,
             input,
@@ -2010,13 +1982,12 @@ mod tests {
         assert_eq!(
             second.decision,
             PathAdmissionDecision::AdmitSubflow,
-            "measured subflows are paced by inflight/completion/reorder gates, not by one startup-credit quantum"
+            "measured subflows are paced by inflight/completion/reorder gates, not by a startup quantum"
         );
 
         binding.reset_subflow_set();
         let after_reset = binding.preview_subflow_owner_admission(
             service,
-            payload_bytes,
             payload_bytes,
             0,
             Duration::ZERO,
@@ -2026,7 +1997,7 @@ mod tests {
     }
 
     #[test]
-    fn response_subflow_set_persists_unproven_startup_credit_until_reset() {
+    fn response_subflow_set_rejects_unproven_owner_until_bulk_rate_evidence() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -2047,16 +2018,14 @@ mod tests {
         let committed = binding.commit_subflow_owner_admission(
             service,
             payload_bytes,
-            payload_bytes,
             0,
             Duration::ZERO,
             input,
         );
-        assert_eq!(committed.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(committed.decision, PathAdmissionDecision::ProbeOnly);
 
         let second = binding.preview_subflow_owner_admission(
             service,
-            payload_bytes,
             payload_bytes,
             0,
             Duration::ZERO,
@@ -2065,19 +2034,18 @@ mod tests {
         assert_eq!(
             second.decision,
             PathAdmissionDecision::ProbeOnly,
-            "unproven subflow startup OwnerData is a bounded bootstrap window and must not refresh every dispatch"
+            "unproven optional paths remain probes and cannot own product offsets"
         );
 
         binding.reset_subflow_set();
         let after_reset = binding.preview_subflow_owner_admission(
             service,
             payload_bytes,
-            payload_bytes,
             0,
             Duration::ZERO,
             input,
         );
-        assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(after_reset.decision, PathAdmissionDecision::ProbeOnly);
     }
 
     #[test]

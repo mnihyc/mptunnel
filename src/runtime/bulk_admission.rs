@@ -231,12 +231,12 @@ fn bulk_same_underlay_completion_suppression(check: BulkAdmissionCheck) -> Optio
 
 fn bulk_same_underlay_requires_completion_gain(candidate: PathSnapshot) -> bool {
     // This gate is for measured Subflow owner admission only.  It MUST NOT be
-    // applied to startup/probe candidates, because those paths do not yet have a
+    // applied to Probe candidates, because those paths do not yet have a
     // meaningful completion model.  Otherwise the scheduler becomes circular:
-    // the path needs bytes to prove a rate, while the rate proof is required to
-    // receive bytes.  Low-confidence or app-limited same-underlay paths remain
-    // bounded by startup credit, ordering-debt rules, and no-OwnerData-under-debt
-    // guards; they are simply not rejected by measured completion-gain math.
+    // the path needs evidence to prove a rate, while the rate proof is required
+    // to own bytes.  Low-confidence or app-limited same-underlay paths remain
+    // Probe/Standby/RepairOnly; they are simply not rejected by measured
+    // completion-gain math.
     !candidate.app_limited && candidate.confidence >= 1.0
 }
 

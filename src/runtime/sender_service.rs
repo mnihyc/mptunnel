@@ -476,7 +476,6 @@ enum ResponseDataDispatchTarget {
         binding: Arc<ResponseStreamBinding>,
         target: ResponseSenderPathTarget,
         role: PathRuntimeRole,
-        subflow_startup: bool,
         subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
     },
 }
@@ -506,14 +505,12 @@ impl ResponseDataDispatchPlan {
 
 struct ResponseDataEmitOutcome {
     selected_path: Option<CarrierPathKey>,
-    subflow_startup_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
 struct ResponseSubflowAdmissionCommit {
     service: CarrierPathKey,
     owner_credit_bytes: usize,
-    startup_credit_bytes: usize,
     optional_overhead_budget_bytes: usize,
     max_read_gap_budget: Duration,
     input: SubflowAdmissionInput,
@@ -563,21 +560,8 @@ fn response_target_is_service_owner_candidate(
 fn response_target_is_plausible_unique_owner_candidate(
     target: &ResponseSenderPathTarget,
     candidates: &[&ResponseSenderPathTarget],
-    lower_owner: Option<CarrierPathKey>,
-    ordinary_data_dispatched_bytes: u64,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
 ) -> bool {
-    response_target_is_service_owner_candidate(target, candidates)
-        || target.has_bulk_rate_evidence
-        || response_target_can_receive_subflow_startup(
-            target,
-            candidates,
-            lower_owner,
-            ordinary_data_dispatched_bytes,
-            payload_bytes,
-            mux_limits,
-        )
+    response_target_is_service_owner_candidate(target, candidates) || target.has_bulk_rate_evidence
 }
 
 #[cfg(test)]
@@ -587,7 +571,6 @@ fn response_target_unique_owner_admission(
     lead: ResponseBulkLead,
     lower_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> PathAdmission {
@@ -597,7 +580,6 @@ fn response_target_unique_owner_admission(
         lead,
         lower_owner,
         ordering_debt,
-        ordinary_data_dispatched_bytes,
         payload_bytes,
         mux_limits,
         None,
@@ -609,10 +591,8 @@ fn response_target_unique_owner_admission(
 //
 // The important split is:
 // * Service: the current active/lower-frontier owner, kept fed while healthy.
-// * Subflow startup: one bounded same-underlay OwnerData range after path proof,
-//   used to get real delivery samples without spending repair traffic.
-// * Measured Subflow: bulk-rate-proven additional path, controlled by the
-//   no-worse completion/order-debt model rather than startup credit.
+// * Subflow: bulk-rate-proven additional path, controlled by the
+//   no-worse completion/order-debt model.
 //
 // Path proof, ACK-data visibility, and carrier attachment are intentionally not
 // owner states. They are evidence inputs for this decision.
@@ -622,7 +602,6 @@ fn response_target_unique_owner_admission_with_epoch(
     lead: ResponseBulkLead,
     lower_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
@@ -654,17 +633,7 @@ fn response_target_unique_owner_admission_with_epoch(
                 stream_ordering_debt_bytes: ordering_debt,
             })
             .is_none();
-    let startup_candidate = response_target_can_receive_subflow_startup(
-        target,
-        candidates,
-        lower_owner,
-        ordinary_data_dispatched_bytes,
-        payload_bytes,
-        mux_limits,
-    );
-    let completion_improves =
-        model_allows_owner && (target.has_bulk_rate_evidence || startup_candidate);
-    let startup_credit_bytes = response_subflow_startup_credit_bytes(payload_bytes, mux_limits);
+    let completion_improves = model_allows_owner && target.has_bulk_rate_evidence;
     let service_key = lower_owner
         .or_else(|| {
             candidates
@@ -685,32 +654,14 @@ fn response_target_unique_owner_admission_with_epoch(
         optional_overhead_bytes: 0,
     };
     let mut epoch = subflow_set
-        .filter(|epoch| {
-            epoch.matches_envelope(
-                service_key,
-                payload_bytes,
-                startup_credit_bytes,
-                0,
-                Duration::ZERO,
-            )
-        })
+        .filter(|epoch| epoch.matches_envelope(service_key, payload_bytes, 0, Duration::ZERO))
         .cloned()
-        .unwrap_or_else(|| {
-            FlowSubflowSet::new(
-                0,
-                service_key,
-                payload_bytes,
-                startup_credit_bytes,
-                0,
-                Duration::ZERO,
-            )
-        });
+        .unwrap_or_else(|| FlowSubflowSet::new(0, service_key, payload_bytes, 0, Duration::ZERO));
     let admission = epoch.admit_subflow_owner(input);
     let commit = (admission.decision == PathAdmissionDecision::AdmitSubflow).then_some(
         ResponseSubflowAdmissionCommit {
             service: service_key,
             owner_credit_bytes: payload_bytes,
-            startup_credit_bytes,
             optional_overhead_budget_bytes: 0,
             max_read_gap_budget: Duration::ZERO,
             input,
@@ -725,7 +676,6 @@ fn response_target_can_own_unique_bulk_data(
     lead: ResponseBulkLead,
     lower_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> bool {
@@ -735,7 +685,6 @@ fn response_target_can_own_unique_bulk_data(
         lead,
         lower_owner,
         ordering_debt,
-        ordinary_data_dispatched_bytes,
         payload_bytes,
         mux_limits,
         None,
@@ -748,7 +697,6 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
     lead: ResponseBulkLead,
     lower_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    ordinary_data_dispatched_bytes: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
@@ -759,7 +707,6 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         lead,
         lower_owner,
         ordering_debt,
-        ordinary_data_dispatched_bytes,
         payload_bytes,
         mux_limits,
         subflow_set,
@@ -772,40 +719,11 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         && admission.role.may_own_unique_data()
 }
 
-// True only for the bounded same-family subflow bootstrap that turns a
-// proven-live path into a measured subflow candidate.  It is unique OwnerData,
-// not probe or repair traffic, and is allowed only while the ordered
-// frontier is clear so it cannot create a lower-offset receive hole behind an
-// existing Service owner.
-fn response_target_can_receive_subflow_startup(
-    target: &ResponseSenderPathTarget,
-    candidates: &[&ResponseSenderPathTarget],
-    lower_owner: Option<CarrierPathKey>,
-    ordinary_data_dispatched_bytes: u64,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> bool {
-    lower_owner.is_none()
-        && !target.is_active
-        && target.has_sender_evidence
-        && !target.has_bulk_rate_evidence
-        && candidates
-            .iter()
-            .any(|candidate| candidate.key != target.key && candidate.is_active)
-        && candidates
-            .iter()
-            .filter(|candidate| candidate.key != target.key)
-            .all(|candidate| candidate.key.underlay == target.key.underlay)
-        && ordinary_data_dispatched_bytes
-            >= response_extra_traffic_startup_floor_bytes(mux_limits) as u64
-        && response_target_has_subflow_startup_credit(target, payload_bytes, mux_limits)
-}
-
 fn response_target_runtime_role(
     target: &ResponseSenderPathTarget,
     ordered_data_owner: Option<CarrierPathKey>,
 ) -> PathRuntimeRole {
-    if ordered_data_owner == Some(target.key) || target.is_active {
+    if ordered_data_owner.is_none() || ordered_data_owner == Some(target.key) || target.is_active {
         PathRuntimeRole::Service
     } else {
         PathRuntimeRole::Subflow
@@ -942,7 +860,6 @@ fn choose_response_admissible_lead(
     mux_limits: MuxLimits,
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
-    ordinary_data_dispatched_bytes: u64,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if let Some(owner) = lower_owner {
@@ -969,14 +886,8 @@ fn choose_response_admissible_lead(
         .iter()
         .copied()
         .filter(|target| {
-            response_target_is_plausible_unique_owner_candidate(
-                target,
-                candidate_targets,
-                lower_owner,
-                ordinary_data_dispatched_bytes,
-                payload_bytes,
-                mux_limits,
-            ) && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
+            response_target_is_plausible_unique_owner_candidate(target, candidate_targets)
+                && response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
         })
         .min_by(|left, right| {
             left.eta_ms
@@ -1026,6 +937,35 @@ fn choose_response_repair_target(
         .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false))
 }
 
+fn choose_response_service_or_proven_data_target(
+    targets: &[ResponseSenderPathTarget],
+    lower_flights: &[CarrierPathFlightDebt],
+    avoid_keys: &[CarrierPathKey],
+) -> Option<ResponseSenderPathTarget> {
+    if let Some(lower_owner) = response_oldest_lower_flight_owner(lower_flights)
+        && let Some(target) = targets
+            .iter()
+            .find(|target| target.key == lower_owner && !avoid_keys.contains(&target.key))
+    {
+        return Some(target.clone());
+    }
+    if let Some(active) = targets
+        .iter()
+        .find(|target| target.is_active && !avoid_keys.contains(&target.key))
+    {
+        return Some(active.clone());
+    }
+    let proven_targets = targets
+        .iter()
+        .filter(|target| target.has_bulk_rate_evidence)
+        .cloned()
+        .collect::<Vec<_>>();
+    choose_lowest_eta_response_target(&proven_targets, avoid_keys, true)
+        .or_else(|| choose_lowest_eta_response_target(&proven_targets, avoid_keys, false))
+        .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, true))
+        .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false))
+}
+
 fn choose_response_sender_target(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
@@ -1034,7 +974,6 @@ fn choose_response_sender_target(
     mux_limits: MuxLimits,
     lower_flights: &[CarrierPathFlightDebt],
     avoid_keys: &[CarrierPathKey],
-    ordinary_data_dispatched_bytes: u64,
     repair: bool,
 ) -> Option<ResponseSenderPathTarget> {
     if targets.is_empty() {
@@ -1080,6 +1019,13 @@ fn choose_response_sender_target(
         return choose_response_repair_target(targets, avoid_keys);
     }
     if !relay_frame_is_bulk_stream_data(frame, lane) {
+        if matches!(frame, Frame::StreamData { .. }) {
+            return choose_response_service_or_proven_data_target(
+                targets,
+                lower_flights,
+                avoid_keys,
+            );
+        }
         return choose_lowest_eta_response_target(targets, avoid_keys, true)
             .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false));
     }
@@ -1098,7 +1044,6 @@ fn choose_response_sender_target(
         mux_limits,
         payload_bytes,
         lower_flights,
-        ordinary_data_dispatched_bytes,
     )?;
     let selected = candidate_targets
         .iter()
@@ -1111,7 +1056,6 @@ fn choose_response_sender_target(
                 lead,
                 lower_owner,
                 ordering_debt,
-                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 mux_limits,
             ) {
@@ -1160,7 +1104,6 @@ fn choose_response_sender_data_target(
     lane: FlowLane,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    ordinary_data_dispatched_bytes: u64,
     lower_flights: &[CarrierPathFlightDebt],
     ordered_data_owner: Option<CarrierPathKey>,
 ) -> Option<ResponseSenderPathTarget> {
@@ -1169,7 +1112,6 @@ fn choose_response_sender_data_target(
         lane,
         payload_bytes,
         mux_limits,
-        ordinary_data_dispatched_bytes,
         lower_flights,
         ordered_data_owner,
         0,
@@ -1182,7 +1124,6 @@ fn choose_response_sender_data_target_with_product_debt(
     lane: FlowLane,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    ordinary_data_dispatched_bytes: u64,
     lower_flights: &[CarrierPathFlightDebt],
     ordered_data_owner: Option<CarrierPathKey>,
     product_owner_debt_bytes: usize,
@@ -1192,7 +1133,6 @@ fn choose_response_sender_data_target_with_product_debt(
         lane,
         payload_bytes,
         mux_limits,
-        ordinary_data_dispatched_bytes,
         lower_flights,
         ordered_data_owner,
         product_owner_debt_bytes,
@@ -1205,7 +1145,6 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
     lane: FlowLane,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    ordinary_data_dispatched_bytes: u64,
     lower_flights: &[CarrierPathFlightDebt],
     ordered_data_owner: Option<CarrierPathKey>,
     product_owner_debt_bytes: usize,
@@ -1226,11 +1165,11 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
         return None;
     }
     if !relay_lane_is_bulk(lane) {
-        return capacity_targets.into_iter().min_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-        });
+        return choose_response_service_or_proven_data_target(
+            &capacity_targets,
+            lower_flights,
+            &[],
+        );
     }
 
     if let Some(forced_owner) = response_forced_owner_under_product_debt(
@@ -1272,7 +1211,6 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
         mux_limits,
         payload_bytes,
         lower_flights,
-        ordinary_data_dispatched_bytes,
     )?;
     let admitted = candidate_targets
         .iter()
@@ -1285,7 +1223,6 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
                 lead,
                 lower_owner,
                 ordering_debt,
-                ordinary_data_dispatched_bytes,
                 payload_bytes,
                 mux_limits,
                 subflow_set,
@@ -1342,22 +1279,6 @@ fn choose_response_sender_data_target_with_product_debt_and_epoch(
     Some(best.clone())
 }
 
-fn response_target_has_subflow_startup_credit(
-    target: &ResponseSenderPathTarget,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> bool {
-    let startup_credit = response_subflow_startup_credit_bytes(payload_bytes, mux_limits) as u64;
-    target.subflow_startup_sent_bytes < startup_credit
-        && response_target_optional_product_debt_bytes(target) < startup_credit
-}
-
-fn response_subflow_startup_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> usize {
-    reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
-        .max(payload_bytes)
-        .max(1)
-}
-
 fn response_extra_traffic_startup_floor_bytes(mux_limits: MuxLimits) -> usize {
     reliable_bulk_carrier_feed_quantum_bytes(mux_limits)
         .max(PATH_OPEN_SCORE_BYTES)
@@ -1370,16 +1291,6 @@ fn response_repair_minimum_useful_burst_bytes(mux_limits: MuxLimits) -> usize {
         .min(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
         .min(mux_limits.max_repair_bytes)
         .max(1)
-}
-
-fn response_target_optional_product_debt_bytes(target: &ResponseSenderPathTarget) -> u64 {
-    target
-        .snapshot
-        .product_bytes_in_flight
-        .saturating_add(target.snapshot.bytes_in_flight)
-        .saturating_add(target.snapshot.queue_bytes)
-        .saturating_add(target.snapshot.product_queue_bytes)
-        .saturating_add(target.commands.pending_bytes())
 }
 
 fn response_target_within_adaptive_lead_hysteresis(
@@ -1482,16 +1393,8 @@ fn plan_response_data_dispatch(
     relay_lane: FlowLane,
     next_offset: u64,
     payload_bytes: usize,
-    ordinary_data_dispatched_bytes: u64,
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
-    plan_response_data_dispatch_with_product_debt(
-        stream,
-        relay_lane,
-        next_offset,
-        payload_bytes,
-        ordinary_data_dispatched_bytes,
-        0,
-    )
+    plan_response_data_dispatch_with_product_debt(stream, relay_lane, next_offset, payload_bytes, 0)
 }
 
 fn plan_response_data_dispatch_with_product_debt(
@@ -1499,7 +1402,6 @@ fn plan_response_data_dispatch_with_product_debt(
     relay_lane: FlowLane,
     next_offset: u64,
     payload_bytes: usize,
-    ordinary_data_dispatched_bytes: u64,
     product_owner_debt_bytes: usize,
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
     match &stream.output {
@@ -1524,7 +1426,6 @@ fn plan_response_data_dispatch_with_product_debt(
                 relay_lane,
                 payload_bytes,
                 binding.mux_limits(),
-                ordinary_data_dispatched_bytes,
                 &lower_flights,
                 ordered_data_owner,
                 product_owner_debt_bytes,
@@ -1532,12 +1433,21 @@ fn plan_response_data_dispatch_with_product_debt(
             ) else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
-            let role = response_target_runtime_role(&target, ordered_data_owner);
-            // A startup subflow is the only unmeasured unique-data exception.
-            // It is bounded by FlowSubflowSet startup credit and deliberately
-            // does not update ordered_data_owner after the frame is emitted.
-            let subflow_startup =
-                role == PathRuntimeRole::Subflow && !target.has_bulk_rate_evidence;
+            let role = response_target_runtime_role(
+                &target,
+                response_oldest_lower_flight_owner(&lower_flights).or(ordered_data_owner),
+            );
+            debug_assert!(
+                role != PathRuntimeRole::Subflow || target.has_bulk_rate_evidence,
+                "Subflow OwnerData requires bulk-rate evidence: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
+                target.key,
+                role,
+                ordered_data_owner,
+                response_oldest_lower_flight_owner(&lower_flights),
+                target.is_active,
+                target.has_sender_evidence,
+                target.has_bulk_rate_evidence,
+            );
             let subflow_set_commit = role.is_subflow_owner().then(|| {
                 let service = response_oldest_lower_flight_owner(&lower_flights)
                     .or(ordered_data_owner)
@@ -1551,15 +1461,11 @@ fn plan_response_data_dispatch_with_product_debt(
                 ResponseSubflowAdmissionCommit {
                     service,
                     owner_credit_bytes: payload_bytes,
-                    startup_credit_bytes: response_subflow_startup_credit_bytes(
-                        payload_bytes,
-                        binding.mux_limits(),
-                    ),
                     optional_overhead_budget_bytes: 0,
                     max_read_gap_budget: Duration::ZERO,
                     input: SubflowAdmissionInput {
                         key: target.key,
-                        bulk_rate_proven: !subflow_startup,
+                        bulk_rate_proven: target.has_bulk_rate_evidence,
                         frontier_clear: true,
                         completion_improves: true,
                         observed_goodput_non_degrading: true,
@@ -1574,7 +1480,6 @@ fn plan_response_data_dispatch_with_product_debt(
                     binding: binding.clone(),
                     target,
                     role,
-                    subflow_startup,
                     subflow_set_commit,
                 },
             })
@@ -1636,7 +1541,6 @@ fn response_frame_has_carrier_credit(
                 binding.mux_limits(),
                 &lower_flights,
                 &avoid_keys,
-                0,
                 repair,
             )
             .is_some()
@@ -1663,14 +1567,12 @@ async fn emit_planned_response_data_frame(
             fixed.record_owner_flight(&frame);
             Ok(ResponseDataEmitOutcome {
                 selected_path: Some(fixed.key()),
-                subflow_startup_bytes: 0,
             })
         }
         ResponseDataDispatchTarget::Switchable {
             binding,
             target,
             role,
-            subflow_startup,
             subflow_set_commit,
         } => {
             match send_sender_service_frame_to_carrier(
@@ -1695,32 +1597,19 @@ async fn emit_planned_response_data_frame(
                 let _ = binding.commit_subflow_owner_admission(
                     commit.service,
                     commit.owner_credit_bytes,
-                    commit.startup_credit_bytes,
                     commit.optional_overhead_budget_bytes,
                     commit.max_read_gap_budget,
                     commit.input,
                 );
             }
-            if subflow_startup {
-                binding.record_subflow_startup_bytes(
-                    target.key,
-                    reliable_stream_frame_payload_bytes(&frame),
-                );
-            } else {
-                // Measured subflows may update the flow's primary-owner hint.
-                // Startup subflow bytes deliberately do not: they are only the
-                // bounded MPTCP-style initial window used to collect delivery
-                // samples while the frontier is clear.
-                binding.set_ordered_data_owner(target.key);
-            }
-            let decision_reason = match (role, subflow_startup) {
-                (PathRuntimeRole::Service, _) => "data_service",
-                (PathRuntimeRole::Subflow, true) => "data_subflow_startup",
-                (PathRuntimeRole::Subflow, false) => "data_subflow",
-                (PathRuntimeRole::Probe, _)
-                | (PathRuntimeRole::RepairOnly, _)
-                | (PathRuntimeRole::Standby, _)
-                | (PathRuntimeRole::Failed, _) => "data",
+            binding.set_ordered_data_owner(target.key);
+            let decision_reason = match role {
+                PathRuntimeRole::Service => "data_service",
+                PathRuntimeRole::Subflow => "data_subflow",
+                PathRuntimeRole::Probe
+                | PathRuntimeRole::RepairOnly
+                | PathRuntimeRole::Standby
+                | PathRuntimeRole::Failed => "data",
             };
             record_server_sender_decision(
                 binding.session_id(),
@@ -1732,11 +1621,6 @@ async fn emit_planned_response_data_frame(
             );
             Ok(ResponseDataEmitOutcome {
                 selected_path: Some(target.key),
-                subflow_startup_bytes: if subflow_startup {
-                    reliable_stream_frame_payload_bytes(&frame)
-                } else {
-                    0
-                },
             })
         }
     }
@@ -1790,7 +1674,6 @@ async fn emit_response_frame_from_sender_service(
                     binding.mux_limits(),
                     &lower_flights,
                     &avoid_keys,
-                    0,
                     repair,
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
@@ -2008,7 +1891,6 @@ impl ServerResponseSenderService {
                         mux_limits,
                         payload.len(),
                     ),
-                    self.extra_traffic.owner_payload_bytes(),
                     send_stream.repair_bytes(),
                 )
                 .is_ok()
@@ -2135,7 +2017,6 @@ impl ServerResponseSenderService {
                     data_lane,
                     send_stream.next_offset(),
                     dispatch_payload.len(),
-                    self.extra_traffic.owner_payload_bytes(),
                     send_stream.repair_bytes(),
                 )?;
                 #[cfg(feature = "lab-diagnostics")]
@@ -2156,10 +2037,6 @@ impl ServerResponseSenderService {
                 .await
                 {
                     Ok(outcome) => {
-                        if outcome.subflow_startup_bytes > 0 {
-                            self.extra_traffic
-                                .record_subflow_startup(outcome.subflow_startup_bytes);
-                        }
                         let committed = self
                             .queue
                             .commit_front_data_prefix(dispatch_payload_bytes)
@@ -3296,7 +3173,6 @@ mod tests {
             is_active,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
-            subflow_startup_sent_bytes: 0,
         }
     }
 
@@ -3695,7 +3571,6 @@ mod tests {
             mux_limits,
             &[],
             &[],
-            0,
             false,
         )
         .expect("admissible higher ETA path should lead");
@@ -3721,7 +3596,6 @@ mod tests {
             MuxLimits::default(),
             &[],
             &[],
-            0,
             false,
         )
         .expect("stream-ordered final control should remain dispatchable");
@@ -3763,7 +3637,6 @@ mod tests {
             MuxLimits::default(),
             &[],
             &[],
-            0,
             false,
         );
 
@@ -3785,7 +3658,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             mux_limits,
-            0,
             &[],
             None,
         );
@@ -3820,7 +3692,6 @@ mod tests {
             is_active: true,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
-            subflow_startup_sent_bytes: 0,
         };
         let credit = response_target_emission_credit_bytes(
             &saturated,
@@ -3849,7 +3720,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             None,
         )
@@ -3980,7 +3850,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(active.key),
         )
@@ -3998,7 +3867,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(active.key),
         )
@@ -4031,7 +3899,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(active.key),
         )
@@ -4069,7 +3936,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -4110,7 +3976,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(active_tcp.key),
         )
@@ -4173,7 +4038,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -4235,7 +4099,6 @@ mod tests {
             mux_limits,
             &[],
             &[original_owner.key],
-            0,
             true,
         )
         .expect("repair should remain dispatchable on the proven alternate");
@@ -4281,7 +4144,6 @@ mod tests {
             mux_limits,
             &[],
             &[original_owner.key],
-            0,
             true,
         )
         .expect("repair may fall back to the only non-owner path");
@@ -4362,7 +4224,7 @@ mod tests {
             frames: frames_rx,
         };
 
-        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes, 0)
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
             .expect("active owner should remain dispatchable");
 
         assert_eq!(
@@ -4376,7 +4238,7 @@ mod tests {
         assert_eq!(
             plan.primary_role(),
             PathRuntimeRole::Service,
-            "ACK-data-only paths must not become subflow-startup owners"
+            "ACK-data-only paths must not become Subflow owners"
         );
     }
 
@@ -4397,15 +4259,14 @@ mod tests {
             true,
         );
         active.has_bulk_rate_evidence = false;
-        let mut startup_subflow = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-        startup_subflow.has_bulk_rate_evidence = false;
+        let mut ack_data_only_path = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
+        ack_data_only_path.has_bulk_rate_evidence = false;
 
         let selected = choose_response_sender_data_target(
-            &[active.clone(), startup_subflow.clone()],
+            &[active.clone(), ack_data_only_path.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[CarrierPathFlightDebt {
                 key: active_key,
                 bytes: PATH_OPEN_SCORE_BYTES as u64,
@@ -4421,7 +4282,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_data_quic_startup_subflow_does_not_preempt_service_owner_under_lower_debt() {
+    fn ack_data_quic_path_does_not_preempt_service_owner_under_lower_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -4437,18 +4298,18 @@ mod tests {
             true,
         );
         active.has_bulk_rate_evidence = true;
-        let mut startup_subflow = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
-        startup_subflow.has_bulk_rate_evidence = false;
-        startup_subflow.snapshot.delivery_rate_bps = default_path_rate_bps(UnderlayProtocol::Udp);
-        startup_subflow.snapshot.pacing_rate_bps = startup_subflow.snapshot.delivery_rate_bps;
-        startup_subflow.snapshot.app_limited = true;
+        let mut ack_data_only_path = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
+        ack_data_only_path.has_bulk_rate_evidence = false;
+        ack_data_only_path.snapshot.delivery_rate_bps =
+            default_path_rate_bps(UnderlayProtocol::Udp);
+        ack_data_only_path.snapshot.pacing_rate_bps = ack_data_only_path.snapshot.delivery_rate_bps;
+        ack_data_only_path.snapshot.app_limited = true;
 
         let selected = choose_response_sender_data_target(
-            &[active.clone(), startup_subflow.clone()],
+            &[active.clone(), ack_data_only_path.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[CarrierPathFlightDebt {
                 key: active_key,
                 bytes: PATH_OPEN_SCORE_BYTES as u64,
@@ -4476,18 +4337,15 @@ mod tests {
             true,
         );
         active.has_bulk_rate_evidence = true;
-        let mut startup_subflow = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-        startup_subflow.has_bulk_rate_evidence = false;
-        startup_subflow.subflow_startup_sent_bytes =
-            response_subflow_startup_credit_bytes(payload_bytes, mux_limits) as u64
-                + payload_bytes as u64;
+        let mut ack_data_only = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
+        ack_data_only.has_bulk_rate_evidence = false;
+        ack_data_only.has_sender_evidence = true;
 
         let selected = choose_response_sender_data_target(
-            &[active.clone(), startup_subflow.clone()],
+            &[active.clone(), ack_data_only.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            0,
             &[],
             Some(CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
@@ -4604,7 +4462,7 @@ mod tests {
             frames: frames_rx,
         };
 
-        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes, 0)
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
             .expect("TCP primary remains dispatchable");
 
         assert_eq!(
@@ -4652,7 +4510,7 @@ mod tests {
             output: ReliablePathStreamOutput::Switchable(binding.clone()),
             frames: frames_rx,
         };
-        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes, 0)
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
             .expect("active path should remain dispatchable");
         let frame = Frame::StreamData {
             stream_id: StreamId(7),
@@ -4693,7 +4551,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_safe_subflow_startup_is_admitted_without_becoming_service_role() {
+    fn proof_only_same_family_candidate_cannot_own_startup_data() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -4708,7 +4566,7 @@ mod tests {
             4 * payload_bytes as u64,
             true,
         );
-        let mut startup_subflow = response_target(
+        let mut proof_only = response_target(
             1,
             UnderlayProtocol::Tcp,
             5.0,
@@ -4716,30 +4574,31 @@ mod tests {
             4 * payload_bytes as u64,
             false,
         );
-        startup_subflow.has_bulk_rate_evidence = false;
-        startup_subflow.has_sender_evidence = true;
+        proof_only.has_bulk_rate_evidence = false;
+        proof_only.has_sender_evidence = true;
 
         let selected = choose_response_sender_data_target(
-            &[active.clone(), startup_subflow.clone()],
+            &[active.clone(), proof_only.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            response_extra_traffic_startup_floor_bytes(mux_limits) as u64,
             &[],
             Some(active_key),
         )
-        .expect("frontier-safe subflow startup should be selected when it improves ETA");
+        .expect("service path should remain dispatchable");
 
-        assert_eq!(selected.key, startup_subflow.key);
+        assert_eq!(
+            selected.key, active.key,
+            "path proof/liveness evidence is Probe evidence; it must not assign unique ordered bytes to an unmeasured Subflow"
+        );
         assert_eq!(
             response_target_runtime_role(&selected, Some(active_key)),
-            PathRuntimeRole::Subflow,
-            "a startup subflow may own a bounded range, but it is not the service owner"
+            PathRuntimeRole::Service
         );
     }
 
     #[test]
-    fn proof_only_sender_evidence_can_receive_bounded_subflow_startup_only() {
+    fn proof_only_sender_evidence_is_probe_not_subflow_owner() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -4770,62 +4629,23 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
-            response_extra_traffic_startup_floor_bytes(mux_limits) as u64,
             &[],
             Some(active_key),
         )
-        .expect("frontier-safe proof path should receive one bounded subflow-startup owner range");
+        .expect("service path should remain dispatchable");
 
         assert_eq!(
-            selected.key, proof_only.key,
-            "path proof/liveness evidence may bootstrap exactly bounded same-family startup OwnerData; it is not bulk-rate proof"
+            selected.key, active.key,
+            "path proof/liveness evidence must not bootstrap same-stream OwnerData"
         );
         assert_eq!(
             response_target_runtime_role(&selected, Some(active_key)),
-            PathRuntimeRole::Subflow,
-            "startup OwnerData is an additional subflow role and must not become the service owner"
+            PathRuntimeRole::Service
         );
     }
 
     #[test]
-    fn subflow_startup_credit_is_not_extra_traffic_hint_budget() {
-        let mux_limits = MuxLimits::default();
-        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let active = response_target(
-            0,
-            UnderlayProtocol::Tcp,
-            100.0,
-            0,
-            4 * payload_bytes as u64,
-            true,
-        );
-        let mut startup_subflow = response_target(
-            1,
-            UnderlayProtocol::Tcp,
-            5.0,
-            0,
-            4 * payload_bytes as u64,
-            false,
-        );
-        startup_subflow.has_bulk_rate_evidence = false;
-        startup_subflow.has_sender_evidence = true;
-        let candidates = vec![&active, &startup_subflow];
-
-        assert!(
-            response_target_can_receive_subflow_startup(
-                &startup_subflow,
-                &candidates,
-                None,
-                response_extra_traffic_startup_floor_bytes(mux_limits) as u64,
-                payload_bytes,
-                mux_limits,
-            ),
-            "frontier-safe OwnerData subflow-startup credit is not repair overhead"
-        );
-    }
-
-    #[test]
-    fn quic_same_underlay_proof_path_can_receive_bounded_subflow_startup() {
+    fn proof_only_candidate_admission_is_probe_only() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active = response_target(
@@ -4839,26 +4659,32 @@ mod tests {
         let mut proof_only = response_target(
             1,
             UnderlayProtocol::Udp,
-            5.0,
+            50.0,
             0,
             4 * payload_bytes as u64,
             false,
         );
-        proof_only.has_sender_evidence = true;
         proof_only.has_bulk_rate_evidence = false;
+        proof_only.has_sender_evidence = true;
         let candidates = vec![&active, &proof_only];
+        let lead = ResponseBulkLead {
+            key: active.key,
+            snapshot: active.snapshot,
+            eta_ms: active.eta_ms,
+        };
 
-        assert!(
-            response_target_can_receive_subflow_startup(
-                &proof_only,
-                &candidates,
-                None,
-                response_extra_traffic_startup_floor_bytes(mux_limits) as u64,
-                payload_bytes,
-                mux_limits,
-            ),
-            "same-underlay QUIC proof paths need bounded frontier-clear Subflow startup because discovery is not a duplicate data-plane role"
+        let admission = response_target_unique_owner_admission(
+            &proof_only,
+            &candidates,
+            lead,
+            None,
+            0,
+            payload_bytes,
+            mux_limits,
         );
+
+        assert_eq!(admission.decision, PathAdmissionDecision::ProbeOnly);
+        assert_eq!(admission.role, PathRuntimeRole::Probe);
     }
 
     #[test]
@@ -4880,7 +4706,6 @@ mod tests {
             lead,
             None,
             0,
-            (payload_bytes as u64).saturating_mul(200),
             payload_bytes,
             mux_limits,
         );
@@ -4890,7 +4715,7 @@ mod tests {
     }
 
     #[test]
-    fn response_planning_reuses_persistent_subflow_set_credit() {
+    fn response_planning_keeps_proof_only_optional_path_out_of_owner_set() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let (active_commands, _active_rx) = reliable_path_command_channels(8);
@@ -4965,12 +4790,11 @@ mod tests {
         let committed = binding.commit_subflow_owner_admission(
             service,
             payload_bytes,
-            response_subflow_startup_credit_bytes(payload_bytes, mux_limits),
             0,
             Duration::ZERO,
             input,
         );
-        assert_eq!(committed.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(committed.decision, PathAdmissionDecision::ProbeOnly);
 
         let (_frames_tx, frames_rx) = mpsc::channel(1);
         let stream = ReliablePathStream {
@@ -4982,19 +4806,13 @@ mod tests {
             output: ReliablePathStreamOutput::Switchable(binding),
             frames: frames_rx,
         };
-        let plan = plan_response_data_dispatch(
-            &stream,
-            FlowLane::Throughput,
-            0,
-            payload_bytes,
-            payload_bytes as u64,
-        )
-        .expect("service path remains dispatchable when subflow startup credit is spent");
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+            .expect("service path remains dispatchable when optional path is proof-only");
 
         assert_eq!(
             plan.primary_key(),
             Some(service),
-            "planning must not recreate subflow startup credit for every dispatch"
+            "planning must not create OwnerData for a proof-only optional path"
         );
         assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
     }
@@ -5171,27 +4989,27 @@ mod tests {
         };
         binding.record_owner_flight(active_key, &active_frame);
 
-        let (startup_subflow_commands, mut startup_subflow_rx) = reliable_path_command_channels(8);
+        let (ack_data_path_commands, mut ack_data_path_rx) = reliable_path_command_channels(8);
         assert_eq!(
             binding.attach(
                 UnderlayProtocol::Udp,
                 PathId(1),
-                startup_subflow_commands,
+                ack_data_path_commands,
                 FlowLane::Throughput,
                 StreamOpenRole::Validation,
                 payload_bytes,
             ),
             ResponseStreamAttachOutcome::Attached
         );
-        let startup_subflow_key = CarrierPathKey {
+        let ack_data_path_key = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
         binding.update_path_metrics(
-            startup_subflow_key,
+            ack_data_path_key,
             PathMetrics {
-                path_id: startup_subflow_key.path_id,
-                underlay: startup_subflow_key.underlay,
+                path_id: ack_data_path_key.path_id,
+                underlay: ack_data_path_key.underlay,
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
@@ -5232,7 +5050,6 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes as u64,
             payload_bytes,
-            (payload_bytes as u64).saturating_mul(200),
         )
         .expect("active owner should remain dispatchable");
         assert_eq!(plan.primary_key(), Some(active_key));
@@ -5242,20 +5059,16 @@ mod tests {
             "validation paths must not receive unique owner data while lower bytes are unresolved"
         );
 
-        let startup_subflow_frame = Frame::StreamData {
+        let service_frame = Frame::StreamData {
             stream_id: StreamId(7),
             offset: payload_bytes as u64,
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![4_u8; payload_bytes]),
         };
-        let outcome = emit_planned_response_data_frame(
-            &stream,
-            plan,
-            startup_subflow_frame,
-            FlowLane::Throughput,
-        )
-        .await
-        .expect("service owner data should emit");
+        let outcome =
+            emit_planned_response_data_frame(&stream, plan, service_frame, FlowLane::Throughput)
+                .await
+                .expect("service owner data should emit");
 
         assert_eq!(outcome.selected_path, Some(active_key));
         assert_eq!(
@@ -5263,9 +5076,9 @@ mod tests {
             Some(active_key),
             "service owner remains the ordinary lead"
         );
-        while let Some(_command) = try_recv_reliable_path_command(&mut startup_subflow_rx) {}
+        while let Some(_command) = try_recv_reliable_path_command(&mut ack_data_path_rx) {}
         let lower = binding.lower_flights_before_offset((payload_bytes * 2) as u64);
-        assert!(!lower.iter().any(|flight| flight.key == startup_subflow_key));
+        assert!(!lower.iter().any(|flight| flight.key == ack_data_path_key));
     }
 
     #[test]
@@ -5288,7 +5101,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &lower_flights,
             Some(target.key),
         )
@@ -5318,7 +5130,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &lower_flights,
             Some(owner.key),
         )
@@ -5349,7 +5160,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &lower_flights,
             Some(owner.key),
         )
@@ -5381,7 +5191,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &lower_flights,
             Some(owner.key),
         )
@@ -5404,7 +5213,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &[],
             Some(bulk_proven_udp.key),
         )
@@ -5424,7 +5232,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &[],
             Some(lead.key),
         )
@@ -5446,7 +5253,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &[],
             Some(lead.key),
         )
@@ -5488,7 +5294,6 @@ mod tests {
                 FlowLane::Throughput,
                 payload_bytes,
                 mux_limits,
-                0,
                 &[],
                 Some(owner.key),
                 owner_debt_pressure.saturating_add(payload_bytes),
@@ -5509,7 +5314,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &[],
             Some(owner.key),
             64 * 1024,
@@ -5530,7 +5334,6 @@ mod tests {
             FlowLane::Throughput,
             64 * 1024,
             MuxLimits::default(),
-            0,
             &[],
             Some(owner.key),
         )

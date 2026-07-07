@@ -17,7 +17,6 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) delivery_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) path_metrics: Option<ServerPathMetricsEntry>,
-    pub(super) subflow_startup_sent_bytes: u64,
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
@@ -33,7 +32,6 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) is_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
-    pub(in crate::runtime) subflow_startup_sent_bytes: u64,
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -590,7 +588,6 @@ mod tests {
             delivery_samples: 1,
             last_delivery_at: Some(Instant::now()),
             path_metrics: None,
-            subflow_startup_sent_bytes: 0,
         };
 
         assert!(
@@ -649,7 +646,6 @@ mod tests {
                     data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
-            subflow_startup_sent_bytes: 0,
         };
 
         assert!(
@@ -704,7 +700,6 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
-            subflow_startup_sent_bytes: 0,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();
@@ -779,7 +774,6 @@ mod tests {
                     data_sample_bytes: 0,
                 },
             }),
-            subflow_startup_sent_bytes: 0,
         };
 
         assert!(server_output_has_sender_evidence(&entry));
@@ -837,7 +831,6 @@ mod tests {
                     data_sample_bytes: PATH_OPEN_SCORE_BYTES as u64,
                 },
             }),
-            subflow_startup_sent_bytes: 0,
         };
 
         assert!(matches!(
@@ -881,7 +874,6 @@ mod tests {
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             last_delivery_at: Some(Instant::now()),
             path_metrics: None,
-            subflow_startup_sent_bytes: 0,
         };
 
         let lane_tracker = ServerPathLaneTracker::default();

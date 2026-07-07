@@ -329,7 +329,7 @@ authentication. A path MUST NOT own product stream offsets or decide that a
 reliable stream should stripe onto it merely because it has capacity.
 
 A path group or carrier subflow set is not a product-offset owner. It is a bounded
-scheduler epoch for one flow: one Service path plus startup Subflow or bulk-rate-proven Subflow
+scheduler epoch for one flow: one Service path plus bulk-rate-proven Subflow
 members admitted from session paths, path-model evidence, queue state, and
 ECF/BLEST/no-worse admission. The epoch remains valid only while ACK progress,
 read-gap debt, repair pressure, overhead budget, and path metrics remain within
@@ -1203,8 +1203,8 @@ protection part of admission rather than a late path-writer preference.
 An all-startup state where every stream is still classified as latency MUST NOT
 reserve those startup streams against each other as protected latency work; once
 one flow is classified as throughput/background, separately active latency or
-realtime flows become protected. This prevents frontier-safe subflow startup owner
-admission from deadlocking while still protecting browsing, SSH-like,
+realtime flows become protected. This prevents validation/probe admission from
+deadlocking while still protecting browsing, SSH-like,
 ACK/control, repair, and datagram traffic from already-proven bulk.
 
 ## 10. TCP Underlay Transport
@@ -2060,11 +2060,11 @@ observed actual delivery.
 Once a stream has an ordered-data owner and the scheduler has opened
 same-underlay candidate outputs, app-limited startup samples MUST NOT be treated
 as long-term bandwidth proof for ECF/BLEST completion-horizon rejection. QUIC's
-initial congestion window and MPTCP subflow startup are probe mechanisms, not
+initial congestion window and early MPTCP subflow growth are probe mechanisms, not
 accurate bulk-rate priors. A same-underlay candidate may be admitted for
-bounded ordinary startup or steady-state service when there is no lower
-frontier owner on another path and it still fits product inflight, carrier
-credit, and reorder budgets. This is true even if a candidate's current ETA is
+steady-state Subflow ownership only after bulk-rate evidence exists and it
+still fits product inflight, carrier credit, and reorder budgets. This is true
+even if a candidate's current ETA is
 worse than the lead's ETA, because same-underlay ETA can be an artifact of
 underfeeding and validation; the correct proof is whether the additional path
 creates ordered receive-hole debt. If same-underlay service later creates real
@@ -2416,7 +2416,7 @@ sorting. Probe-only RTT or rate samples MUST NOT by themselves make a path
 steal the first reliable stream when no product delivery evidence exists, and
 tiny carrier/accounting differences such as path-proof bytes, ACK/control
 flights, or command-queue noise MUST NOT reorder an otherwise unknown
-endpoint-only latency startup subflow set. In that exact no-load/no-delivery-evidence
+endpoint-only latency-started candidate set. In that exact no-load/no-delivery-evidence
 state, configured path order is only a deterministic startup fallback; it is not
 a throughput preference. If fresh latency opens are already active but no
 sender delivery evidence exists, active startup load MAY spread new opens away
@@ -2581,9 +2581,9 @@ or replaying repair outside the measured send loop.
 ### 18.1 Bulk Assignment and Striping
 
 For bulk reliable streams, the scheduler maintains a small subflow set epoch for the
-current flow: one Service owner plus startup Subflow or bulk-rate-proven Subflow members admitted
+current flow: one Service owner plus bulk-rate-proven Subflow members admitted
 from live ETA, flow sharing, health, and capability state. Individual dispatches
-consume credit from that set; they do not recreate subflow startup credit from
+consume credit from that set; they do not recreate validation credit from
 scratch. Additional paths attached to the same stream are not automatically
 ordinary data paths. Their role decides what the scheduler may do: Repair paths
 carry gap-targeted repair or failover repair, Validation paths may receive
@@ -2606,32 +2606,28 @@ Validation is the bridge between conservative startup and useful aggregation.
 An unknown path does not join ordinary same-stream bulk merely because it is
 open, but a Validation attachment can receive path-scoped proof traffic.
 Path proof creates liveness/sender evidence only; it is not product delivery
-proof and does not itself make the path a bulk subflow. Same-family paths may
-use one bounded startup `Subflow` OwnerData range once the ordered frontier is
-clear, because product ACK progress is the sender-visible way to obtain real
-delivery evidence for an additional subflow. That startup range is unique owner
-data, not repair or probe traffic, and it is forbidden while another path
-owns unresolved lower bytes. Validation attachment is triggered by bulk demand
-and path admission; it MUST NOT depend on the sender having outbound repair
-bytes.
+proof and does not itself make the path a bulk subflow. Same-family proof paths
+MUST NOT receive product `OwnerData` until they have bulk-rate evidence; a path
+that lacks bulk-rate evidence stays `Probe`, `Standby`, or `RepairOnly`.
+Validation attachment is triggered by bulk
+demand and path admission; it MUST NOT depend on the sender having outbound
+repair bytes.
 This matters for ordinary downloads, where the client may have little or no
 outbound data after the request while the server-to-client stream is clearly
-bulk. If startup OwnerData or QUIC carrier-ACK validation yields
-direction-correct bulk-rate evidence, the path can compete in the ordinary
-ECF/BLEST subflow set. If it does not, the path remains excluded except for
-failover, explicit repair, or another bounded validation event after the
-admission envelope is refreshed.
+bulk. If QUIC carrier-ACK metrics, configured path hints, or other path-scoped
+sender evidence yield direction-correct bulk-rate evidence, the path can compete
+in the ordinary ECF/BLEST subflow set. If it does not, the path remains excluded
+except for failover, explicit repair, or another bounded validation event after
+the admission envelope is refreshed.
 
 Reliable path membership uses explicit roles. An attached output starts as
 `Standby` or `Probe`, not as a data owner. `Service` is the current best owner
 path and MUST remain fed while it is healthy. `Subflow` is an additional owner
 path admitted by the same no-worse completion and ordering-debt model used for
-the Service path. There are two admission modes, not two protocol roles: a
-startup Subflow is a bounded same-family, frontier-clear OwnerData range
-used to gather delivery evidence; a measured Subflow has direction-correct
-bulk-rate evidence and may carry ordinary unique bytes without being throttled
-by startup credit. `RepairOnly`, `Standby`, and `Failed` outputs cannot receive
-speculative owner bytes. Role transitions are monotonic with evidence and carrier state for
+the Service path. There is one Subflow owner admission mode: direction-correct
+bulk-rate evidence plus no-worse completion, ordering-debt, queue, and overhead
+guards. `RepairOnly`, `Standby`, and `Failed` outputs cannot receive speculative
+owner bytes. Role transitions are monotonic with evidence and carrier state for
 the current decision; they are not implied by attachment order, carrier family,
 configured path order, or temporary queue availability. In particular, `Probe`,
 path-proof-only, and sender-evidence-only paths are not permission to carry an
@@ -2800,16 +2796,15 @@ When the UDP production engine is QUIC, the response sender MUST preserve both
 ACK-derived delivery rate and QUIC pacing/cwnd-derived pacing rate in its path
 snapshot. Application-limited ACK samples MUST NOT initialize or reduce the
 bulk delivery-rate model to a tiny value. The sender keeps two separate facts:
-ACK-derived data seen and non-application-limited bulk-rate evidence. A bounded
-startup Subflow range that is acknowledged by the local QUIC carrier may set
-ACK-derived data seen for that carrier path, which proves the path can carry
-data and keeps it visible to subflow admission policy. It does not by itself
-make the path eligible for unbounded future ordered `STREAM_DATA` ownership.
+ACK-derived data seen and non-application-limited bulk-rate evidence. Carrier
+ACK-derived data seen proves that the path carried carrier data and keeps it
+visible to admission policy, but it does not by itself make the path eligible
+for ordered `STREAM_DATA` ownership.
 The resulting ACK-derived rate becomes bulk-rate evidence only after the
 acknowledged DATA byte volume is large enough for the path's modeled flight
 envelope; otherwise the sample remains ACK-data evidence for validation
-visibility only. ACK-data evidence is not an owner state, is not a subflow-startup
-state, and MUST NOT bypass lower-frontier ownership. Ordinary unique bulk
+visibility only. ACK-data evidence is not an owner state and MUST NOT bypass
+lower-frontier ownership. Ordinary unique bulk
 ownership requires either that the path is already the active service path or
 that the path has non-application-limited bulk-rate evidence and passes the
 normal ECF/BLEST admission and no-worse guards. ACK-data seen does not set
@@ -2817,11 +2812,10 @@ bulk-rate evidence, does not overwrite the delivery rate, does not rewrite the
 ordinary lead, and does not permit the path to own later offsets while another
 path owns unresolved lower bytes.
 
-Validation outputs do not receive product `STREAM_DATA` for
-discovery. Attached but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK`
-and control traffic for bootstrap. A startup Subflow may receive a bounded
-unique owner range only after path-scoped sender evidence exists, the family is
-the same as the Service family, and the ordered frontier is clear.
+Validation outputs do not receive product `STREAM_DATA` for discovery. Attached
+but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic
+for bootstrap. A Subflow may receive unique owner bytes only after path-scoped
+bulk-rate evidence exists and the no-worse admission model accepts it.
 
 The production SafeBestPath guard is stricter while a reliable stream has
 owner-debt pressure: unacknowledged owner ranges in its repair cache exceed the
@@ -2918,10 +2912,10 @@ validation gate. Sharing a carrier family, such as QUIC+QUIC or TCP+TCP, is not
 proof that later offsets will arrive before the lead can send the next quantum;
 therefore a bulk-rate-proven same-underlay path that wants ordinary unique
 `OwnerData` MUST show positive incremental completion gain before joining the
-ordinary bulk subflow set. A same-underlay path that has only startup, proof,
+ordinary bulk subflow set. A same-underlay path that has only proof,
 low-confidence sender samples, or app-limited evidence is not rejected by this
-measured completion-gain rule; it remains governed by bounded startup/probe
-credit, owner-debt safety, and no-ordering-debt-expansion rules. Reorder budget
+measured completion-gain rule; it remains governed by probe admission,
+owner-debt safety, and no-ordering-debt-expansion rules. Reorder budget
 is a safety envelope for already-admitted work; it MUST NOT be used as extra
 time slack to put unique ordered bytes onto a high-latency path that loses the
 ECF/BLEST next-quantum comparison.

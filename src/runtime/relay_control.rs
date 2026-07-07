@@ -1281,13 +1281,11 @@ where
                         let mut critical_tail_repair = false;
                         let repair_kind = if repair_frames.is_empty() {
                             let fin_tail_limit = if !local_open {
-                                let limit = reliable_tail_stall_repair_limit_bytes(
-                                    base_repair_limit,
+                                let limit = reliable_critical_tail_repair_limit_bytes(
                                     send_stream.repair_bytes(),
-                                    repair_event_budget,
                                     context.mux_limits,
                                 );
-                                critical_tail_repair = reliable_tail_stall_repair_is_critical(
+                                critical_tail_repair = reliable_critical_tail_repair_is_over_budget(
                                     repair_event_budget,
                                     limit,
                                 );

@@ -477,13 +477,13 @@ duplicate traffic.
 The sender-service queue MUST NOT treat all `RepairData` as a priority lane.
 Ordinary budgeted repair is queued behind `OwnerData`; it can use otherwise idle
 carrier capacity but cannot starve the service path. Only repair explicitly
-classified as critical because it closes an active product hole, terminal tail,
-or failed-owner gap may preempt later `OwnerData`. Critical priority is separate
-from budget bypass: critical repair still consumes the extra-traffic budget
-unless the implementation is repairing a persistent ordered-stream hole that
-would otherwise leave the product stream permanently blocked. That correctness
-repair is still `RepairData`: it does not prove the repair path, does not move
-the Service owner, and is bounded by outstanding repair debt plus configured
+classified as critical because it closes an authoritative product ACK gap, known
+terminal tail, or failed-owner gap may preempt later `OwnerData`. Critical
+priority is separate from budget bypass: critical repair still consumes the
+extra-traffic budget unless the implementation is repairing one of those bounded
+correctness cases and the optional budget is exhausted. That correctness repair
+is still `RepairData`: it does not prove the repair path, does not move the
+Service owner, and is bounded by outstanding repair debt plus configured
 repair/path-flight resource caps.
 
 Carrier engines own underlay mechanics. TCP owns encrypted framed records,
@@ -588,9 +588,9 @@ above `100` bias the sender toward redundant repair under severe instability.
 This value is a hard sender-side budget for optional repair work, with a small
 startup floor to avoid repair deadlock. It is not a fixed rate, not a
 product-data throttle, and not a condition that can terminate production
-traffic or prevent correctness repair for a persistent ordered-stream stall.
-Such repair may exceed the optional hint only when it unblocks already-owned
-product bytes, and remains bounded by repair-cache, path-flight, and sender
+traffic or prevent correctness repair for an authoritative ACK gap, failed-owner
+gap, or known final tail. Such repair may exceed the optional hint only in those
+bounded cases, and remains bounded by repair-cache, path-flight, and sender
 resource limits. Auto scheduling remains the default and MUST adapt from
 measurements even when the hint is left unset.
 
@@ -1898,22 +1898,17 @@ reattach.
 When a tail-stall repair timer fires on a live stream, a sender MUST inspect the
 most recent repair-authoritative `STREAM_ACK`. If that ACK proves an
 unacknowledged gap below its largest end offset, the repair extent is that gap,
-not bytes after the ACK frontier. If no authoritative lower gap is known, but
-the ACK is complete and the contiguous frontier remains persistently stalled
-below `sent_offset`, the unacknowledged owner tail after that frontier is
-repair-eligible on an eligible survivor path. This is a correctness recovery for
-a blocked product stream, not a throughput striping mechanism: it MUST be
-prefix-preserving, charged to the extra-traffic budget, bounded by outstanding
-repair debt and configured repair/path-flight resources, and repeated only after
-the persistent repair delay. If the optional repair budget is exhausted and the
-retained owner tail is the lowest persistent ordered-stream blocker, the sender
-MAY spend bounded correctness repair to unblock already-owned bytes. That repair
-is not new optional probe credit and not throughput exploration: it MUST be
-limited by live repair debt and configured repair/path-flight resources, and it
-MUST still be counted as repair overhead in the extra-traffic ledger. Terminal
+not bytes after the ACK frontier. If no authoritative lower gap is known, the
+live contiguous owner tail after the ACK frontier is not a path-scoped missing
+range; TCP and QUIC still own recovery for the carrier stream that holds those
+bytes. A sender MAY retransmit such a live owner tail only as optional
+`RepairData` while the extra-traffic budget has remaining credit, and MUST stop
+once that budget is exhausted. It MUST NOT relabel the live contiguous owner
+tail as critical repair merely because product ACK progress is slow. Terminal
 tail recovery is separate: once a final offset is known, a sender may repair
 unacknowledged bytes below that final offset on an eligible survivor path so the
-DATA_FIN/STREAM_FIN can be acknowledged. Repair candidate selection is
+DATA_FIN/STREAM_FIN can be acknowledged, and that final-tail repair may use the
+bounded critical repair path. Repair candidate selection is
 prefix-preserving: if the lowest unresolved repair frame cannot be sent on an
 alternate eligible output, the sender MUST NOT skip it and send a later ordered
 range instead. This is targeted duplicate repair, not whole-cache replay.
@@ -3331,9 +3326,8 @@ was earned. The value is a continuous hint for how aggressively the sender may
 trade duplicate traffic for recovery speed; it is not a fixed rate, not a
 per-event multiplier, not a product-data throttle, and not permission to send
 speculative unique bytes that deepen ordered receive debt. Correctness repair
-for the lowest persistent ordered-stream blocker may exceed the optional hint,
-but only as bounded `RepairData` and only to unblock already-owned product
-bytes.
+may exceed the optional hint only for an authoritative ACK gap, failed-owner gap,
+or known final tail, and only as bounded `RepairData`.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
 a gap, a path failure or detach event, or known-final-offset tail recovery.
@@ -3847,19 +3841,18 @@ can make a different work item admissible. This keeps product-ordering debt
 separate from carrier pipe availability and prevents CPU spin or repeated
 non-emitting scheduling decisions.
 
-Persistent owner-tail stalls are repairable even when the peer's ACK ranges are
-contiguous. If the ACK frontier has stopped below the sender's next product
-offset, the stream has retained unacked `OwnerData`, and an independent survivor
-output exists, the sender may reinject the lowest unacked tail bytes as
-`RepairData` after the persistent-stall timer. This is failover repair, not
+Persistent owner-tail stalls are not automatically critical repair when the
+peer's ACK ranges are contiguous. If the ACK frontier has stopped below the
+sender's next product offset, the stream has retained unacked `OwnerData`, and
+an independent survivor output exists, the sender may reinject the lowest
+unacked live tail bytes as optional `RepairData` after the persistent-stall
+timer only while extra-traffic budget remains. This is failover assistance, not
 throughput probing: it must not create path delivery evidence, move the Service
-owner, or become optional probe credit. Once the persistent-stall timer has
-fired, terminal owner-tail repair may spend the earned repair budget needed to
-close retained owner debt, bounded by repair-cache, path-flight, and sender
-resource limits. It MAY exceed the optional extra-traffic hint only when the
-retained owner tail is the lowest persistent ordered-stream blocker and the
-stream would otherwise remain stuck; the bytes are still counted as repair
-overhead and remain subject to configured repair/path-flight caps.
+owner, or become probe credit. A live contiguous owner tail MUST NOT exceed the
+optional extra-traffic hint. Once a final offset is known, terminal owner-tail
+repair may spend bounded critical repair needed to close retained final debt,
+bounded by repair-cache, path-flight, and sender resource limits; those bytes
+are still counted as repair overhead.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

@@ -282,22 +282,28 @@ pub(super) fn server_bulk_output_snapshot(
     let peer_hint_rate_bps = peer_hint_metrics
         .filter(|path_metrics| !path_metrics.metrics.app_limited)
         .map(server_path_metrics_rate_bps);
+    let product_owner_rate_bps = entry
+        .product_progress_rate_bps
+        .filter(|_| entry.delivery_samples > 0);
     let prior_rate_bps = model_rate_bps
         .or(peer_hint_rate_bps)
+        .or(product_owner_rate_bps)
         .unwrap_or_else(|| default_path_rate_bps(entry.key.underlay));
     let rate_bps = match (
         entry.key.underlay,
         bulk_rate_metrics,
         entry.delivery_rate_bps,
+        product_owner_rate_bps,
     ) {
-        (_, Some(path_metrics), _) => Some(server_path_metrics_rate_bps(path_metrics)),
-        (UnderlayProtocol::Tcp, None, Some(rate))
+        (_, Some(path_metrics), _, _) => Some(server_path_metrics_rate_bps(path_metrics)),
+        (UnderlayProtocol::Tcp, None, Some(rate), _)
             if !super::product_delivery_samples_override_startup_prior(entry.delivery_samples) =>
         {
             Some(rate.max(prior_rate_bps))
         }
-        (_, None, Some(rate)) => Some(rate),
-        (_, None, None) => None,
+        (_, None, Some(rate), _) => Some(rate),
+        (_, None, None, Some(rate)) => Some(rate),
+        (_, None, None, None) => None,
     }
     .unwrap_or(prior_rate_bps)
     .max(1.0);
@@ -474,11 +480,16 @@ fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
 }
 
 fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
+    let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
+    let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
     path_metrics.source == ServerPathMetricsSource::LocalSender
         && path_metrics.metrics.has_ack_derived_data_sample
         && path_metrics.metrics.data_sample_count > 0
-        && path_metrics.metrics.data_sample_bytes
-            >= server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics)
+        && path_metrics
+            .metrics
+            .data_sample_bytes
+            .saturating_add(packet_accounting_slack)
+            >= sample_floor
 }
 
 fn server_path_metrics_has_ack_data_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
@@ -521,12 +532,14 @@ pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
         entry.local_path_metrics,
         Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
     );
+    let has_path_scoped_product_bulk =
+        entry.delivery_samples > 0 && entry.product_progress_rate_bps.is_some();
     match entry.key.underlay {
-        UnderlayProtocol::Udp => has_local_carrier_bulk,
-        // TCP response output is one encrypted carrier stream, so product
-        // STREAM_ACK samples are path-scoped sender evidence. QUIC/UDP exposes
-        // carrier ACK-derived samples separately and must use those for
-        // ordinary bulk-rate proof.
+        UnderlayProtocol::Udp => has_local_carrier_bulk || has_path_scoped_product_bulk,
+        // TCP response output is one encrypted carrier stream. UDP also gets
+        // path-scoped product evidence when the flight ledger proves a unique
+        // OwnerData copy was ACKed; duplicated RepairData ACKs never increment
+        // delivery_samples.
         UnderlayProtocol::Tcp => {
             entry.delivery_samples > 0
                 || entry.delivery_rate_bps.is_some()
@@ -584,7 +597,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn udp_bulk_rate_evidence_requires_local_quic_ack_sample() {
+    fn udp_product_ack_without_unique_owner_rate_is_sender_evidence_not_bulk_rate() {
         let (commands, _receivers) = reliable_path_command_channels(8);
         let entry = ResponseStreamOutputEntry {
             key: CarrierPathKey {
@@ -594,7 +607,7 @@ mod tests {
             commands,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
-            product_progress_rate_bps: Some(500_000_000.0),
+            product_progress_rate_bps: None,
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 1,
@@ -609,8 +622,73 @@ mod tests {
         );
         assert!(
             !server_output_has_bulk_rate_evidence(&entry),
-            "UDP ordinary bulk-rate evidence must be local QUIC ACK-derived carrier data, not product STREAM_ACK alone"
+            "a UDP product ACK without a path-scoped owner rate is sender evidence, not bulk-rate evidence"
         );
+    }
+
+    #[test]
+    fn udp_unique_owner_ack_product_rate_counts_as_bulk_rate_evidence() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let product_rate = 42_000_000.0;
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: Some(product_rate),
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 1,
+            last_delivery_at: Some(Instant::now()),
+            local_path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 160_000,
+                    srtt_us: 160_000,
+                    rttvar_us: 5_000,
+                    jitter_us: 5_000,
+                    delivery_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
+                    pacing_rate_bps: 200_000_000,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: 0,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    inflight_hi_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    confidence_ppm: 1_000_000,
+                    app_limited: true,
+                    has_ack_derived_data_sample: true,
+                    data_sample_count: 0,
+                    data_sample_bytes: 0,
+                },
+            }),
+            peer_path_metrics: None,
+        };
+
+        assert!(
+            server_output_has_bulk_rate_evidence(&entry),
+            "a unique OwnerData ACK is path-scoped product delivery evidence for its owner"
+        );
+        let snapshot = server_bulk_output_snapshot(
+            &entry,
+            SessionId(78),
+            FlowLane::Throughput,
+            &ServerPathLaneTracker::default(),
+            MuxLimits::default(),
+            Instant::now(),
+        );
+        assert_eq!(snapshot.delivery_rate_bps, product_rate);
     }
 
     #[test]
@@ -926,6 +1004,62 @@ mod tests {
         assert!(
             server_output_has_bulk_rate_evidence(&entry),
             "a path with substantial non-app-limited QUIC ACK-derived product data must not be trapped below a transient inflight-limit floor"
+        );
+    }
+
+    #[test]
+    fn udp_near_startup_window_sample_graduates_with_packet_accounting_slack() {
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(12),
+        };
+        let sample_floor = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES / 2;
+        let entry = ResponseStreamOutputEntry {
+            key,
+            commands,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            last_delivery_at: None,
+            local_path_metrics: Some(ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics: PathMetrics {
+                    path_id: key.path_id,
+                    underlay: key.underlay,
+                    direction: PathMetricDirection::ServerToClient,
+                    metric_epoch: metric_epoch_now(),
+                    metric_age_us: 0,
+                    min_rtt_us: 160_000,
+                    srtt_us: 160_000,
+                    rttvar_us: 5_000,
+                    jitter_us: 5_000,
+                    delivery_rate_bps: 42_000_000,
+                    pacing_rate_bps: 42_000_000,
+                    loss_ppm: 0,
+                    ecn_ppm: 0,
+                    loss_observed: false,
+                    ecn_observed: false,
+                    bytes_in_flight: 0,
+                    queue_bytes: 0,
+                    inflight_limit_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    inflight_hi_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    confidence_ppm: 1_000_000,
+                    app_limited: true,
+                    has_ack_derived_data_sample: true,
+                    data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                    data_sample_bytes: sample_floor.saturating_sub(TRANSPORT_MSS_BYTES as u64),
+                },
+            }),
+            peer_path_metrics: None,
+        };
+
+        assert!(
+            server_output_has_bulk_rate_evidence(&entry),
+            "bulk-rate graduation should tolerate packet-accounting slack around the startup evidence floor"
         );
     }
 

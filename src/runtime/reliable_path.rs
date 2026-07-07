@@ -896,6 +896,7 @@ impl ResponseStreamBinding {
             drop(outputs);
             self.lane_tracker.detach(self.session_id, key, lane);
             self.clear_ordered_data_owner_if(key);
+            self.reset_subflow_set();
             self.notify_update();
         }
     }
@@ -928,7 +929,6 @@ impl ResponseStreamBinding {
                 .expect("server response ACK ordering lock")
                 .apply_normalized_ack(ranges, &[]);
             if ordering_update.changed {
-                self.reset_subflow_set();
                 self.notify_update();
             }
             return;
@@ -1038,7 +1038,9 @@ impl ResponseStreamBinding {
         }
         drop(outputs);
         if changed || ordering_update.changed {
-            self.reset_subflow_set();
+            // ACK progress updates path evidence and ordering, but Subflow
+            // admission credit is epoch state. Recreate it only when membership
+            // or the admission envelope changes.
             self.notify_update();
         }
     }
@@ -2062,6 +2064,101 @@ mod tests {
             input,
         );
         assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
+    }
+
+    #[test]
+    fn response_subflow_startup_credit_survives_ack_progress() {
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
+        let optional = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let input = SubflowAdmissionInput {
+            key: optional,
+            sender_evidence: true,
+            bulk_rate_proven: false,
+            frontier_clear: true,
+            completion_improves: true,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        assert_eq!(
+            binding
+                .preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
+                .decision,
+            PathAdmissionDecision::ProbeOnly
+        );
+
+        let service_frame = stream_data_frame(payload_bytes);
+        binding.record_owner_flight(service, &service_frame);
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: payload_bytes as u64,
+        }]);
+
+        assert_eq!(
+            binding
+                .preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
+                .decision,
+            PathAdmissionDecision::ProbeOnly,
+            "ordinary ACK progress must not recreate startup Subflow owner credit"
+        );
+    }
+
+    #[test]
+    fn response_subflow_startup_credit_resets_when_output_detaches() {
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
+        let optional = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            optional.underlay,
+            optional.path_id,
+            commands.clone(),
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let input = SubflowAdmissionInput {
+            key: optional,
+            sender_evidence: true,
+            bulk_rate_proven: false,
+            frontier_clear: true,
+            completion_improves: true,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        assert!(binding.subflow_set_snapshot().is_some());
+
+        binding.detach(optional, &commands);
+
+        assert!(
+            binding.subflow_set_snapshot().is_none(),
+            "carrier output membership changes invalidate the Subflow set"
+        );
     }
 
     #[test]

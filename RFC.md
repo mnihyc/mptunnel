@@ -331,13 +331,16 @@ reliable stream should stripe onto it merely because it has capacity.
 A path group or carrier subflow set is not a product-offset owner. It is a bounded
 scheduler epoch for one flow: one Service path plus admitted Subflow members
 selected from session paths, path-model evidence, queue state, and
-ECF/BLEST/no-worse admission. The epoch remains valid only while ACK progress,
-read-gap debt, repair pressure, overhead budget, and path metrics remain within
-the admission envelope. It is refreshed or demoted on progress, loss/repair
-escalation, material metric change, or timer expiry. Product byte ownership
-still belongs to the per-range flight ledger, not to the subflow set itself. The
-Service path is the current active or lower-frontier owner; it is not simply the
-lowest-ETA candidate selected for the next quantum.
+ECF/BLEST/no-worse admission. ACK progress updates delivery metrics, ordering
+frontier, and later admission inputs, but it MUST NOT erase the subflow set's
+spent startup owner credit or recreate validation credit. The epoch remains
+valid while its Service, owner-credit envelope, overhead budget, read-gap budget,
+and live carrier membership still match the admission envelope. It is recreated
+on material envelope change, detach/failover, or carrier-membership change, not
+on ordinary ACK progress. Product byte ownership still belongs to the per-range
+flight ledger, not to the subflow set itself. The Service path is the current
+active or lower-frontier owner; it is not simply the lowest-ETA candidate
+selected for the next quantum.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -429,8 +432,11 @@ The path model owns evidence and provenance. Local sender-side evidence from
 carrier ACKs, QUIC delivery samples, unpolluted ordered stream delivery, and
 datagram feedback is authoritative for scheduling. Peer PATH_METRICS are bounded
 validation hints unless their provenance, freshness, confidence, and direction
-make them safe for the specific decision. STREAM_ACK releases product repair
-state and ordering debt; it is not by itself carrier bandwidth proof.
+make them safe for the specific decision. A STREAM_ACK for a unique outstanding
+`OwnerData` range is path-scoped product delivery evidence because the sender's
+flight ledger knows the only owner. A STREAM_ACK for duplicated `RepairData` or
+ambiguous copies releases product repair state and ordering debt but is not
+carrier bandwidth proof and cannot promote any path.
 
 Carrier engines own underlay mechanics. TCP owns encrypted framed records,
 writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
@@ -2626,12 +2632,15 @@ current flow: one Service owner plus Subflow members admitted from live ETA,
 flow sharing, health, and capability state. Startup Subflow samples are bounded
 and require sender evidence; steady-state Subflow owner bytes require
 bulk-rate evidence. Individual dispatches consume credit from that set; they do
-not recreate validation credit from scratch. Additional paths attached to the
-same stream are not automatically ordinary data paths. Their role decides what
-the scheduler may do: Repair paths carry gap-targeted repair or failover repair,
-Validation paths may receive bounded proof traffic, and the Service path may
-carry ordinary data. A path with any role may carry a specific repair frame when
-it is the best survivor and
+not recreate validation credit from scratch, and ordinary ACK progress does not
+reset spent startup Subflow credit. ACKs update the per-range flight ledger,
+delivery samples, and the next admission calculation; detach, carrier close,
+failover, or a changed Service/envelope resets the subflow set. Additional paths
+attached to the same stream are not automatically ordinary data paths. Their
+role decides what the scheduler may do: Repair paths carry gap-targeted repair
+or failover repair, Validation paths may receive bounded proof traffic, and the
+Service path may carry ordinary data. A path with any role may carry a specific
+repair frame when it is the best survivor and
 avoids the path that likely lost the original bytes.
 
 Same-stream bulk striping is allowed for TCP, UDP, and mixed TCP+UDP reliable
@@ -2656,6 +2665,11 @@ evidence. They MAY receive only the bounded clear-frontier startup Subflow
 direction-correct bulk-rate evidence. A path that lacks bulk-rate evidence and
 has no remaining startup Subflow credit stays `Probe`, `Standby`, or
 `RepairOnly`.
+The bulk-rate evidence floor is byte-counted, but it MUST tolerate one
+packet-scale accounting slack around the startup graduation threshold. QUIC ACK
+accounting, stream segmentation, and product-frame boundaries can differ by a
+small number of bytes; such slack must not decide whether a path is permanently
+excluded. This slack does not make tiny ACK-data samples bulk-rate evidence.
 Validation attachment is triggered by bulk
 demand and path admission; it MUST NOT depend on the sender having outbound
 repair bytes.
@@ -2842,32 +2856,36 @@ layers.
 When the UDP production engine is QUIC, the response sender MUST preserve both
 ACK-derived delivery rate and QUIC pacing/cwnd-derived pacing rate in its path
 snapshot. Application-limited ACK samples MUST NOT initialize or reduce the
-bulk delivery-rate model to a tiny value. The sender keeps two separate facts:
-ACK-derived data seen and non-application-limited bulk-rate evidence. Carrier
-ACK-derived data seen proves that the path carried carrier data and keeps it
-visible to admission policy, but it does not by itself make the path eligible
-for ordered `STREAM_DATA` ownership.
-The resulting ACK-derived rate becomes bulk-rate evidence only after the
-acknowledged DATA byte volume is large enough for the path's modeled flight
-envelope, with two bounds. The floor MUST be at least a small multi-packet
-DATA sample so a tiny ACK burst cannot create a bulk-rate Subflow, and it MUST
-be capped by a bounded startup graduation window so a large transient QUIC
-cwnd/inflight estimate cannot make proof self-defeating by requiring more
-bytes than the product scheduler will feed before graduation. Otherwise the
-sample remains ACK-data evidence for validation visibility only. ACK-data
-evidence is not an owner state and MUST NOT bypass lower-frontier ownership.
-Ordinary unique bulk
-ownership requires either that the path is already the active service path or
-that the path has non-application-limited bulk-rate evidence and passes the
-normal ECF/BLEST admission and no-worse guards. ACK-data seen does not set
-bulk-rate evidence, does not overwrite the delivery rate, does not rewrite the
-ordinary lead, and does not permit the path to own later offsets while another
-path owns unresolved lower bytes.
+bulk delivery-rate model to a tiny value. The sender keeps separate facts:
+carrier ACK-derived data seen, carrier non-application-limited bulk-rate
+evidence, and product-ledger owner progress. Carrier ACK-derived data seen proves
+that the path carried carrier data and keeps it visible to admission policy, but
+it does not by itself make the path eligible for ordered `STREAM_DATA`
+ownership. The carrier ACK-derived rate becomes bulk-rate evidence only after
+the acknowledged DATA byte volume is large enough for the path's modeled flight
+envelope, with two bounds. The floor MUST be at least a small multi-packet DATA
+sample so a tiny ACK burst cannot create a bulk-rate Subflow, and it MUST be
+capped by a bounded startup graduation window so a large transient QUIC
+cwnd/inflight estimate cannot make proof self-defeating by requiring more bytes
+than the product scheduler will feed before graduation. Otherwise the sample
+remains ACK-data evidence for validation visibility only.
+
+Product-ledger owner progress is also path-scoped bulk-rate evidence when the
+ACKed range had exactly one outstanding `OwnerData` copy and the release handler
+records a product progress rate for that owner. This does not conflict with the
+RepairData rule: duplicated repair ACKs never increment owner delivery samples
+and never create product-owner progress for the repair path. ACK-data seen does
+not set bulk-rate evidence, does not overwrite the delivery rate, does not
+rewrite the ordinary lead, and does not permit the path to own later offsets
+while another path owns unresolved lower bytes.
 
 Validation outputs do not receive product `STREAM_DATA` for discovery. Attached
 but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic
-for bootstrap. A Subflow may receive unique owner bytes only after path-scoped
-bulk-rate evidence exists and the no-worse admission model accepts it.
+for bootstrap. A same-family Subflow may receive only the bounded clear-frontier
+startup `OwnerData` window described in the Service/Subflow rules before
+bulk-rate evidence exists. After that window is spent, a Subflow may receive
+unique owner bytes only after path-scoped bulk-rate evidence exists and the
+no-worse admission model accepts it.
 
 The production SafeBestPath guard is stricter while a reliable stream has
 owner-debt pressure: unacknowledged owner ranges in its repair cache exceed the

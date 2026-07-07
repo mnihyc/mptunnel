@@ -1409,7 +1409,7 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
 }
 
 #[tokio::test]
-async fn response_binding_duplicate_live_path_keeps_existing_output() {
+async fn response_binding_duplicate_live_path_rejects_fresh_output() {
     let stream_id = StreamId(47);
     let session_id = SessionId(12);
     let (first_commands, mut first_receivers) = reliable_path_command_channels(4);
@@ -1430,7 +1430,7 @@ async fn response_binding_duplicate_live_path_keeps_existing_output() {
             StreamOpenRole::Active,
             reliable_relay_buffer_len(MuxLimits::default()),
         ),
-        ResponseStreamAttachOutcome::Attached
+        ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
     );
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -1456,7 +1456,7 @@ async fn response_binding_duplicate_live_path_keeps_existing_output() {
             MuxLimits::default(),
         )
         .await
-        .expect("duplicate live same-path attach should keep existing output usable");
+        .expect("rejecting a duplicate live output must keep the existing output usable");
 
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut first_receivers).await,
@@ -2967,7 +2967,7 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
 }
 
 #[test]
-fn server_registry_accepts_active_duplicate_same_path_input_without_output_replacement() {
+fn server_registry_ignores_active_duplicate_same_path_input_without_output_replacement() {
     let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let session_id = SessionId(1);
@@ -3017,7 +3017,10 @@ fn server_registry_accepts_active_duplicate_same_path_input_without_output_repla
         )
         .expect("duplicate live attach should be handled");
 
-    assert!(matches!(duplicate, ServerReliableStreamOpen::Existing));
+    assert!(matches!(
+        duplicate,
+        ServerReliableStreamOpen::DuplicateLiveIgnored
+    ));
     assert_eq!(registry.management_snapshot().active_streams, 1);
 }
 

@@ -667,14 +667,30 @@ impl ResponseStreamBinding {
             if !entry.commands.is_closed() {
                 let same_channel = entry.commands.same_channel(&commands);
                 #[cfg(feature = "lab-diagnostics")]
+                let attach_result = if same_channel {
+                    "same_channel_role_update"
+                } else {
+                    "duplicate_live"
+                };
+                #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "server_stream_output_attach",
                     format_args!(
-                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=duplicate_live same_channel={}",
-                        self.session_id.0, underlay, path_id.0, role, lane, same_channel,
+                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result={} same_channel={}",
+                        self.session_id.0,
+                        underlay,
+                        path_id.0,
+                        role,
+                        lane,
+                        attach_result,
+                        same_channel,
                     ),
                 );
-                if role == StreamOpenRole::Active || same_channel {
+                if same_channel {
+                    if role == StreamOpenRole::Active {
+                        let entry = outputs.entries.remove(position);
+                        outputs.entries.push(entry);
+                    }
                     let attached_keys = outputs
                         .entries
                         .iter()
@@ -695,6 +711,9 @@ impl ResponseStreamBinding {
                             previous_lane,
                             lane,
                         );
+                    }
+                    if role == StreamOpenRole::Active && self.can_migrate_ordered_data_owner() {
+                        self.set_ordered_data_owner(key);
                     }
                     self.notify_update();
                     return ResponseStreamAttachOutcome::Attached;
@@ -1769,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn response_duplicate_active_attach_is_idempotent_for_live_output() {
+    fn response_duplicate_active_attach_with_different_channel_is_rejected() {
         let (binding, active) = binding_for_underlay(UnderlayProtocol::Udp);
         let validation = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -1806,7 +1825,7 @@ mod tests {
                 StreamOpenRole::Active,
                 reliable_relay_buffer_len(MuxLimits::default()),
             ),
-            ResponseStreamAttachOutcome::Attached
+            ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
         );
 
         let after = {
@@ -1819,6 +1838,53 @@ mod tests {
         };
         assert_eq!(after, before);
         assert_eq!(binding.ordered_data_owner(), Some(active));
+    }
+
+    #[test]
+    fn response_validation_same_channel_active_attach_promotes_service_owner() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let validation = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (validation_commands, _validation_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert_eq!(binding.ordered_data_owner(), Some(active));
+
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        assert_eq!(
+            outputs.entries.last().map(|entry| entry.key),
+            Some(validation),
+            "same-channel Active reannouncement upgrades the existing output instead of opening a duplicate"
+        );
+        drop(outputs);
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(validation),
+            "the server-side Service owner must match the Active reannouncement accepted by the client"
+        );
     }
 
     #[test]

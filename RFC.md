@@ -359,6 +359,15 @@ a previously active path MUST NOT receive owner bytes merely because it was the
 first or latest active attachment; it remains only the Service anchor until the
 ordinary admission model grants Service or Subflow `OwnerData`.
 
+A live response output has a single command-channel owner for a given
+`(stream_id, underlay, path_id)`. Reannouncing the same live channel as
+`Active` is a role upgrade of the existing output: it may become the Service
+owner only through the same frontier-clear Service migration rule used for any
+other handoff. Reannouncing the same path key with a different live command
+channel is a duplicate live output and MUST be ignored or rejected; it MUST NOT
+replace the existing output, split owner bytes across two command channels for
+the same path key, or use output-list tail position as a hidden ownership signal.
+
 Same-underlay carrier subflow sets SHOULD be opened together when the sender has
 already admitted multiple paths from the same carrier family for bulk work. This
 keeps TCP+TCP and QUIC+QUIC path groups from being serialized by path-opening

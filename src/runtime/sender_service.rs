@@ -684,6 +684,15 @@ fn response_target_is_plausible_unique_owner_candidate(target: &ResponseSenderPa
     response_target_has_service_anchor_rights(target) || target.has_bulk_rate_evidence
 }
 
+fn response_targets_are_single_underlay(candidates: &[&ResponseSenderPathTarget]) -> bool {
+    let Some(first) = candidates.first() else {
+        return false;
+    };
+    candidates
+        .iter()
+        .all(|candidate| candidate.key.underlay == first.key.underlay)
+}
+
 #[cfg(test)]
 fn response_target_unique_owner_admission(
     target: &ResponseSenderPathTarget,
@@ -893,7 +902,13 @@ fn response_cross_underlay_owner_allowed(
     // candidate's actual ordering debt. A lower-flight record owned by this
     // candidate is not a reason to block it; it means continuing the candidate
     // will not expand cross-path lower-byte debt.
-    let current_owner = ordered_data_owner;
+    let current_owner = ordered_data_owner.or_else(|| {
+        candidates
+            .iter()
+            .copied()
+            .find(|entry| entry.is_active)
+            .map(|entry| entry.key)
+    });
     let current_owner_bulk_rate_proven = current_owner
         .and_then(|owner_key| {
             candidates
@@ -1255,12 +1270,14 @@ fn choose_response_sender_target(
     } else {
         proven_targets
     };
+    let allow_sender_evidence_service_restart =
+        response_targets_are_single_underlay(&candidate_targets);
     let lead = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
         payload_bytes,
         lower_flights,
-        false,
+        allow_sender_evidence_service_restart,
     )?;
     let service_key = response_service_anchor_key(&candidate_targets, lower_owner, None, lead.key);
     let selected = candidate_targets
@@ -1608,14 +1625,16 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     } else {
         mixed_safe_targets
     };
+    let allow_sender_evidence_service_restart = effective_lower_owner.is_none()
+        && ordered_owner_anchor.is_none()
+        && ordered_owner_debt_bytes == 0
+        && response_targets_are_single_underlay(&candidate_targets);
     let Some(lead) = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
         payload_bytes,
         lower_flights,
-        effective_lower_owner.is_none()
-            && ordered_owner_anchor.is_none()
-            && ordered_owner_debt_bytes == 0,
+        allow_sender_evidence_service_restart,
     ) else {
         #[cfg(feature = "lab-diagnostics")]
         for target in &candidate_targets {
@@ -1662,9 +1681,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
                 payload_bytes,
                 mux_limits,
                 subflow_set,
-                effective_lower_owner.is_none()
-                    && ordered_owner_anchor.is_none()
-                    && ordered_owner_debt_bytes == 0,
+                allow_sender_evidence_service_restart,
             );
             if !matches!(
                 admission.decision,
@@ -3332,6 +3349,11 @@ impl RelaySenderService {
         ordinary_stream_data: bool,
     ) -> Result<usize, RuntimeError> {
         let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+        if matches!(cause, RelaySendCause::RecvProgress)
+            && let Some(position) = choose_active_recv_progress_path_position(remotes, frame, cause)
+        {
+            return Ok(position);
+        }
         let has_active_path = remotes
             .paths
             .iter()
@@ -3664,6 +3686,23 @@ impl RelaySenderService {
     }
 }
 
+fn choose_active_recv_progress_path_position(
+    remotes: &ReliableRelayRemoteSet,
+    frame: &Frame,
+    cause: RelaySendCause,
+) -> Option<usize> {
+    remotes
+        .paths
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, path)| {
+            path.placement == RelayPathPlacement::Active
+                && relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
+        })
+        .map(|(position, _)| position)
+}
+
 fn relay_path_can_enqueue_frame_for_cause_now(
     path: &ReliableRelayRemotePath,
     frame: &Frame,
@@ -3685,7 +3724,7 @@ mod tests {
         lab_assert_server_sender_service_balanced, lab_diag_test_guard,
         lab_sender_service_counts_for_test,
     };
-    use crate::runtime::bulk_admission::bulk_service_horizon_payload_bytes;
+    use crate::runtime::bulk_admission::bulk_startup_service_horizon_payload_bytes;
 
     #[test]
     fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
@@ -3898,6 +3937,20 @@ mod tests {
         path_index: usize,
         commands: ReliablePathCommandSender,
     ) -> OpenedRemoteStream {
+        opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Tcp,
+            path_index,
+            commands,
+        )
+    }
+
+    fn opened_test_relay_stream_with_underlay(
+        stream_id: StreamId,
+        underlay: UnderlayProtocol,
+        path_index: usize,
+        commands: ReliablePathCommandSender,
+    ) -> OpenedRemoteStream {
         let (_frame_tx, frame_rx) = mpsc::channel(1);
         OpenedRemoteStream {
             path_index,
@@ -3905,11 +3958,11 @@ mod tests {
                 stream_id,
                 max_offset: MuxLimits::default().max_stream_window_bytes,
                 lane: FlowLane::Throughput,
-                underlay: UnderlayProtocol::Tcp,
+                underlay,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                 output: ReliablePathStreamOutput::fixed(
-                    UnderlayProtocol::Tcp,
-                    PathId(0),
+                    underlay,
+                    PathId(path_index as u16),
                     commands,
                     MuxLimits::default(),
                 ),
@@ -4037,6 +4090,66 @@ mod tests {
             try_recv_reliable_path_priority_command(&mut second_rx),
             Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn client_recv_progress_prefers_active_service_path_over_validation_probe() {
+        let stream_id = StreamId(96);
+        let tcp_path = "tcp://127.0.0.1:10270?srtt-ms=500&rate-mbps=50"
+            .parse::<PathSpec>()
+            .expect("tcp path");
+        let udp_path = "udp://127.0.0.1:10271?srtt-ms=5&rate-mbps=500"
+            .parse::<PathSpec>()
+            .expect("udp path");
+        let context = ClientPathContext::new(
+            vec![tcp_path, udp_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+        let (tcp_commands, mut tcp_rx) = reliable_path_command_channels(8);
+        let (udp_commands, _udp_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Tcp,
+                0,
+                tcp_commands,
+            ),
+            8,
+        );
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            udp_commands,
+        ));
+        let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
+        recv_stream
+            .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+            .expect("receive response bytes");
+        let mut progress = ReliableRecvProgress::default();
+        let mut sender = RelaySenderService::new(stream_id);
+
+        let sent = sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::new(None, FlowLane::Throughput, false),
+            )
+            .await
+            .expect("recv progress should use the active service return path");
+
+        assert!(sent);
+        assert!(
+            matches!(
+                try_recv_reliable_path_priority_command(&mut tcp_rx),
+                Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+            ),
+            "STREAM_ACK for received OwnerData should prefer the Active Service path; a lower-ETA validation probe must not own the product ACK clock while the Service path is usable"
+        );
     }
 
     #[tokio::test]
@@ -4718,7 +4831,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_response_owner_without_product_progress_uses_service_horizon_credit() {
+    fn active_tcp_response_owner_without_product_progress_uses_startup_feedback_credit() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
@@ -4734,8 +4847,8 @@ mod tests {
 
         assert_eq!(
             credit,
-            bulk_service_horizon_payload_bytes(payload_bytes, mux_limits),
-            "unproven Service startup uses a finite product Service horizon, not a tiny carrier quantum and not the full resource envelope"
+            bulk_startup_service_horizon_payload_bytes(payload_bytes, mux_limits),
+            "unproven Service startup uses bounded startup-feedback credit, not a tiny carrier quantum and not the full geometric Service horizon"
         );
         assert!(
             credit >= payload_bytes,
@@ -5103,7 +5216,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_frontier_without_live_service_allows_sender_evidence_service_restart() {
+    fn clear_frontier_without_live_service_allows_same_family_sender_evidence_restart() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut restart = response_target(
@@ -5126,16 +5239,59 @@ mod tests {
             None,
             0,
             None,
-        )
-        .expect("a clear frontier with no live Service must be able to restart on sender evidence");
+        );
+
+        let selected = selected
+            .expect("single-family sender evidence may restart Service at a clear frontier");
 
         assert_eq!(selected.target.key, restart.key);
         assert_eq!(
-            selected.admission.decision,
-            PathAdmissionDecision::Service,
-            "clear-frontier failover restart is Service OwnerData, not Probe/Standby"
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "same-family continuity restart is Service OwnerData, not cross-family migration"
         );
-        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn mixed_family_clear_frontier_rejects_sender_evidence_service_restart() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut tcp = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            50.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        tcp.has_sender_evidence = true;
+        tcp.has_bulk_rate_evidence = false;
+        let mut udp = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        udp.has_sender_evidence = true;
+        udp.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[tcp, udp],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            0,
+            None,
+        );
+
+        assert!(
+            selected.is_none(),
+            "mixed TCP/UDP Service restart requires bulk-rate evidence; sender evidence alone remains Probe/Standby"
+        );
     }
 
     #[test]
@@ -7492,6 +7648,27 @@ mod tests {
         assert_eq!(
             selected.key, owner.key,
             "mixed-family Service migration must be explicit; lower-ETA cross-underlay candidates do not become Service through per-quantum selection"
+        );
+    }
+
+    #[test]
+    fn cross_underlay_candidate_does_not_become_service_when_owner_hint_is_missing() {
+        let owner = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = choose_response_sender_data_target(
+            &[owner.clone(), candidate.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            None,
+        )
+        .expect("active Service output should anchor family ownership even if the owner hint was cleared");
+
+        assert_eq!(
+            selected.key, owner.key,
+            "a missing ordered-owner hint is not permission for implicit cross-family Service migration while an active Service output is live"
         );
     }
 

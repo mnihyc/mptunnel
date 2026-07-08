@@ -152,6 +152,19 @@ pub(super) fn bulk_service_horizon_payload_bytes(
     horizon.clamp(payload_bytes.max(1), envelope)
 }
 
+pub(super) fn bulk_startup_service_horizon_payload_bytes(
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+    let startup_floor = usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES)
+        .unwrap_or(usize::MAX)
+        .max(payload_bytes.saturating_mul(16))
+        .max(payload_bytes)
+        .max(1);
+    startup_floor.min(service_horizon).max(payload_bytes.max(1))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn bulk_candidate_admission_suppression(
     best_snapshot: PathSnapshot,
@@ -389,7 +402,8 @@ pub(super) fn bulk_active_service_product_envelope_bytes(
         .min(stream_window)
         .min(mux_limits.max_reorder_bytes)
         .max(payload_bytes) as u64;
-    let startup_feed_limit = (bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64)
+    let startup_feed_limit = (bulk_startup_service_horizon_payload_bytes(payload_bytes, mux_limits)
+        as u64)
         .min(configured)
         .max(payload_bytes as u64);
     let Some(progress_rate_bps) = candidate
@@ -430,10 +444,25 @@ fn bulk_app_limited_service_feedback_horizon_bytes(
         .max((payload_bytes as u64).saturating_mul(8))
         .max(payload_bytes as u64);
     if feedback_horizon < meaningful_floor {
-        return startup_feed_limit;
+        return startup_feed_limit
+            .min(bulk_tiny_app_limited_service_horizon_bytes(
+                payload_bytes,
+                startup_feed_limit,
+            ))
+            .max(payload_bytes as u64);
     }
     startup_feed_limit
         .min(feedback_horizon.max(meaningful_floor).min(configured))
+        .max(payload_bytes as u64)
+}
+
+fn bulk_tiny_app_limited_service_horizon_bytes(
+    payload_bytes: usize,
+    startup_feed_limit: u64,
+) -> u64 {
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
+        .max((payload_bytes as u64).saturating_mul(16))
+        .min(startup_feed_limit)
         .max(payload_bytes as u64)
 }
 
@@ -1044,6 +1073,69 @@ mod tests {
             ),
             Some("inflight_limit"),
             "an app-limited Service path with observed progress should be bounded by an ACK-feedback horizon, not the full geometric Service horizon that can create large ordered receive holes"
+        );
+    }
+
+    #[test]
+    fn tiny_app_limited_service_progress_uses_bounded_startup_feedback_horizon() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.delivery_rate_bps = mbps(0.351);
+        active.product_progress_rate_bps = Some(mbps(0.351));
+        active.product_bytes_in_flight = 1_048_576;
+        active.product_queue_bytes = 0;
+        active.queue_bytes = 0;
+        active.app_limited = true;
+        active.confidence = 0.1;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                72_439.0,
+                active,
+                72_439.0,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "tiny app-limited progress is ACK-clock visibility, not bulk-rate proof; it must cap Service preload below the geometric Service horizon to avoid megabyte-scale lower-owner stalls"
+        );
+    }
+
+    #[test]
+    fn pre_progress_service_startup_uses_bounded_startup_feedback_horizon() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.delivery_rate_bps = mbps(0.351);
+        active.product_progress_rate_bps = None;
+        active.product_bytes_in_flight = 1_048_576;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                72_439.0,
+                active,
+                72_439.0,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "before product progress exists, Service startup may stay above one quantum but must not preload the full geometric horizon onto a slow lower-owner path"
         );
     }
 

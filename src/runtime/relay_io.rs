@@ -1214,7 +1214,7 @@ fn enqueue_reliable_tail_repair(
                 prefix_repair_frames_with_available_output(
                     path_stream,
                     failover_source_frames,
-                    false,
+                    true,
                 );
             if !tail_repair_frames.is_empty() {
                 critical_tail_repair = true;
@@ -2894,6 +2894,97 @@ mod tests {
         assert_eq!(
             queued, 1,
             "a detached owner path turns a persistent contiguous tail into failover repair on the remaining output"
+        );
+    }
+
+    #[test]
+    fn persistent_tail_repair_retries_frontier_when_all_outputs_have_stale_copy() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(105);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let repair_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(105),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                repair_key.underlay,
+                repair_key.path_id,
+                repair_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x48; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        binding.record_repair_flight(repair_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(105),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(
+            queued, 1,
+            "persistent tail repair must retry the lowest blocked frontier range once when every live output only has stale overlapping flight"
         );
     }
 

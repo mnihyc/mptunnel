@@ -3031,6 +3031,11 @@ owner-debt pressure. The Service anchor may identify the path that owns the
 lower unresolved bytes, but that identity is not permission to emit more later
 `OwnerData`. The sender MUST wait, repair/fail over the explicit gap, or admit
 a candidate whose ordering-debt input is safe under the normal no-worse checks.
+The scheduler lower-flight debt input MUST therefore be derived from
+authoritative ACK-hole state, not from every older unacknowledged `OwnerData`
+flight retained in the repair cache. Repair overlap avoidance may inspect the
+full product-flight ledger separately, but that ledger is not itself admission
+debt.
 Proof-only and unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly`
 until the debt falls below pressure or explicit loss/failure/final-tail evidence
 converts the affected range into `RepairData`. A

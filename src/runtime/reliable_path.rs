@@ -1244,23 +1244,6 @@ impl ResponseStreamBinding {
     pub(super) fn lower_flights_before_offset(&self, offset: u64) -> Vec<CarrierPathFlightDebt> {
         let mut debts = BTreeMap::<u64, CarrierPathFlightDebt>::new();
         {
-            let flights = self
-                .flights
-                .lock()
-                .expect("server reliable stream flight lock");
-            for (flight_offset, path_flights) in flights.range(..offset) {
-                if let Some(latest) = response_latest_ordering_flight(path_flights) {
-                    debts.insert(
-                        *flight_offset,
-                        CarrierPathFlightDebt {
-                            key: latest.key,
-                            bytes: latest.bytes as u64,
-                        },
-                    );
-                }
-            }
-        }
-        {
             let ack_ordering = self
                 .ack_ordering
                 .lock()
@@ -2055,9 +2038,10 @@ mod tests {
         binding.record_repair_flight(duplicate, &frame);
 
         let lower = binding.lower_flights_before_offset(4096);
-        assert_eq!(lower.len(), 1);
-        assert_eq!(lower[0].key, owner);
-        assert_eq!(lower[0].bytes, 4096);
+        assert!(
+            lower.is_empty(),
+            "plain unacked owner flight is recovery state, not authoritative ordering debt"
+        );
 
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
@@ -2083,6 +2067,31 @@ mod tests {
         assert_eq!(
             duplicate_entry.delivery_samples, 0,
             "repair duplicate STREAM_ACK must not become response bulk evidence"
+        );
+    }
+
+    #[test]
+    fn lower_flight_debt_ignores_plain_unacked_owner_data_until_ack_hole() {
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Tcp);
+        binding.record_owner_flight(owner, &stream_data_frame_at(0, 1024));
+        binding.record_owner_flight(owner, &stream_data_frame_at(1024, 2048));
+
+        assert!(
+            binding.lower_flights_before_offset(3072).is_empty(),
+            "ordinary unacked owner flight is recovery state, not authoritative ordering debt"
+        );
+
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 3072,
+        }]);
+
+        let lower = binding.lower_flights_before_offset(3072);
+        assert_eq!(lower.len(), 1);
+        assert_eq!(lower[0].key, owner);
+        assert_eq!(
+            lower[0].bytes, 2048,
+            "ACK-hole evidence remains ordering debt until the frontier becomes contiguous"
         );
     }
 
@@ -2166,9 +2175,10 @@ mod tests {
         binding.record_repair_flight(repair, &repair_frame);
 
         let lower = binding.lower_flights_before_offset(2048);
-        assert_eq!(lower.len(), 1);
-        assert_eq!(lower[0].key, owner);
-        assert_eq!(lower[0].bytes, 1024);
+        assert!(
+            lower.is_empty(),
+            "plain owner flight and repair-only flight must not become admission ordering debt"
+        );
 
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 1024,
@@ -2430,12 +2440,10 @@ mod tests {
         }]);
 
         let lower = binding.lower_flights_before_offset(5120);
-        assert_eq!(lower.len(), 2);
+        assert_eq!(lower.len(), 1);
         assert_eq!(lower[0].key, owner);
-        assert_eq!(lower[0].bytes, 1024);
-        assert_eq!(lower[1].key, owner);
         assert_eq!(
-            lower[1].bytes, 4096,
+            lower[0].bytes, 4096,
             "acked hole debt must not double-count repair duplicate copies"
         );
         let ordering = binding

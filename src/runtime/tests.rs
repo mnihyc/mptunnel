@@ -1574,6 +1574,16 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
             payload: Bytes::from_static(b"x"),
         },
     );
+    binding.record_owner_flight(
+        lower_owner_key,
+        &Frame::StreamData {
+            stream_id,
+            offset: 1,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"y"),
+        },
+    );
+    binding.release_normalized_acked_ranges(&[OffsetRange { start: 1, end: 2 }]);
     binding.detach(lower_owner_key, &tcp_commands_for_detach);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -1589,8 +1599,8 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     send_stream
-        .send_data(Bytes::from_static(b"x"), StreamFlags::NONE)
-        .expect("advance response sender past the lower-frontier byte");
+        .send_data(Bytes::from_static(b"xy"), StreamFlags::NONE)
+        .expect("advance response sender past the lower ACK-hole byte");
     let mut sender = ServerResponseSenderService::new(SessionId(10), stream_id);
     sender.enqueue_data_for_lane(Bytes::from_static(b"later"), FlowLane::Throughput);
 
@@ -1607,7 +1617,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
     assert!(matches!(err, RuntimeError::SenderServiceBlocked));
     assert_eq!(sender.bytes(), b"later".len());
     assert_eq!(sender.data_bytes(), b"later".len());
-    assert_eq!(send_stream.next_offset(), 1);
+    assert_eq!(send_stream.next_offset(), 2);
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),

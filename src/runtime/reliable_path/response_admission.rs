@@ -171,15 +171,6 @@ impl ResponseAckOrderingState {
     }
 }
 
-pub(in crate::runtime) fn response_latest_ordering_flight(
-    flights: &[CarrierPathFlight],
-) -> Option<&CarrierPathFlight> {
-    flights
-        .iter()
-        .rev()
-        .find(|flight| flight.kind.is_ordering_owner())
-}
-
 pub(in crate::runtime) fn response_latest_ordering_hole(
     holes: &[CarrierPathAckedHole],
 ) -> Option<&CarrierPathAckedHole> {

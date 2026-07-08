@@ -5503,13 +5503,9 @@ mod tests {
             "Probe paths must not receive product STREAM_DATA"
         );
         let lower = binding.lower_flights_before_offset(payload_bytes as u64);
-        assert_eq!(lower.len(), 1);
-        assert_eq!(
-            lower[0].key,
-            CarrierPathKey {
-                underlay: UnderlayProtocol::Udp,
-                path_id: PathId(0),
-            }
+        assert!(
+            lower.is_empty(),
+            "plain unacked OwnerData stays in the flight ledger but is not ACK-hole ordering debt"
         );
     }
 
@@ -5923,10 +5919,12 @@ mod tests {
             FlowLane::Throughput,
             payload_bytes as u64,
             payload_bytes,
-        );
-        assert!(
-            matches!(followup_plan, Err(RuntimeError::SenderServiceBlocked)),
-            "later OwnerData must wait for the startup Subflow's lower range to clear instead of expanding an ordered receive hole"
+        )
+        .expect("plain unacked startup Subflow OwnerData must not block the Service feed");
+        assert_eq!(
+            followup_plan.primary_role(),
+            PathRuntimeRole::Subflow,
+            "normal unacked lower bytes are recovery state; bounded startup Subflow credit may continue until ACK-hole evidence appears or credit is spent"
         );
     }
 

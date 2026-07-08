@@ -3788,17 +3788,14 @@ into mixed-carrier reorder permission and reintroduce the all-path
 below-best-single-path failure mode.
 
 Product admission and carrier congestion control are separate gates, but they
-must be consistent. QUIC carrier inflight or congestion-window state limits UDP
-packet emission inside QUIC and also constrains how much new product work may be
-admitted onto an active UDP path. The configured product limit MUST NOT be
-treated as a floor over carrier credit or BDP-derived credit. The product
-scheduler admits bounded, preemptible stream work; the QUIC or TCP carrier
-drains that work only when its own send, pacing, and congestion gates permit;
-the stream repair layer separately retains product byte ranges until
-`STREAM_ACK` releases them. Cross-underlay additional paths remain stricter and
-may be rejected when carrier queue debt plus the next chunk exceeds the
-validation queue limit, because a heterogeneous speculative path can create
-head-of-line debt without
+must be consistent. The active Service path is admitted by the carrier-neutral
+product envelope when the ordered frontier is contiguous; the TCP or QUIC
+carrier then drains that preemptible stream work only when its own send, pacing,
+and congestion gates permit. QUIC carrier inflight or congestion-window state
+MUST NOT be reinterpreted as a tiny product-admission ceiling for the active
+UDP Service owner. Additional Subflows remain stricter and may be rejected when
+carrier queue debt plus the next chunk exceeds the validation queue limit,
+because speculative paths can create head-of-line debt without
 improving completion time.
 
 For TCP reliable streams, the lower-frontier active lead is different from an

@@ -376,7 +376,11 @@ requires bulk-sized direction-correct owner-byte evidence for the target path:
 at least one current Service quantum of product `OwnerData` ACK evidence or an
 equivalent non-app-limited carrier ACK sample. A startup/probe-sized delivery
 sample may admit Probe/Subflow discovery, but it MUST NOT move the Service
-owner. Reannouncing the same path key with a different live command channel is a
+owner. If the live Service owner has not yet produced bulk-rate evidence, a
+clear-frontier migration may choose a materially better path only after that
+target has bulk-rate evidence; otherwise sender evidence keeps the target in
+Probe, Standby, RepairOnly, or no-live-Service failover eligibility. Reannouncing
+the same path key with a different live command channel is a
 duplicate live output and MUST be ignored or rejected; it MUST NOT replace the
 existing output, split owner bytes across two command channels for the same path
 key, or use output-list tail position as a hidden ownership signal.

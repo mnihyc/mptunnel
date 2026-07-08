@@ -645,9 +645,11 @@ fn response_bulk_admission_role(
 fn response_service_anchor_key(
     candidates: &[&ResponseSenderPathTarget],
     lower_owner: Option<CarrierPathKey>,
+    ordered_data_owner: Option<CarrierPathKey>,
     fallback: CarrierPathKey,
 ) -> CarrierPathKey {
     lower_owner
+        .or(ordered_data_owner)
         .or_else(|| {
             candidates
                 .iter()
@@ -697,6 +699,7 @@ fn response_target_unique_owner_admission(
         candidates,
         lead,
         lower_owner,
+        None,
         ordering_debt,
         payload_bytes,
         mux_limits,
@@ -720,12 +723,14 @@ fn response_target_unique_owner_admission_with_epoch(
     candidates: &[&ResponseSenderPathTarget],
     lead: ResponseBulkLead,
     lower_owner: Option<CarrierPathKey>,
+    ordered_data_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
-    let service_key = response_service_anchor_key(candidates, lower_owner, lead.key);
+    let service_key =
+        response_service_anchor_key(candidates, lower_owner, ordered_data_owner, lead.key);
     if lower_owner == Some(target.key) {
         if ordering_debt > 0 {
             return (PathAdmission::standby(), None);
@@ -740,7 +745,11 @@ fn response_target_unique_owner_admission_with_epoch(
         return (PathAdmission::standby(), None);
     }
     if target.key == service_key {
-        return (PathAdmission::service(), None);
+        return if target.is_active || target.has_bulk_rate_evidence {
+            (PathAdmission::service(), None)
+        } else {
+            (PathAdmission::probe_only(), None)
+        };
     }
     if target.is_active {
         return (PathAdmission::standby(), None);
@@ -848,6 +857,7 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         candidates,
         lead,
         lower_owner,
+        None,
         ordering_debt,
         payload_bytes,
         mux_limits,
@@ -886,13 +896,17 @@ fn response_cross_underlay_owner_allowed(
                 .find(|entry| entry.key == owner_key)
         })
         .is_none_or(|owner| owner.has_bulk_rate_evidence);
-    let candidate_ordering_safe = response_ordering_debt_bytes(lower_flights, target.key) == 0;
+    let candidate_continues_lower_frontier =
+        response_oldest_lower_flight_owner(lower_flights) == Some(target.key);
+    if candidate_continues_lower_frontier && (target.is_active || target.has_bulk_rate_evidence) {
+        return true;
+    }
     cross_family_reliable_owner_health(
         current_owner,
         current_owner_bulk_rate_proven,
         target.key,
         target.has_bulk_rate_evidence,
-        candidate_ordering_safe,
+        candidate_continues_lower_frontier,
     )
     .reliable_owner_allowed()
 }
@@ -1209,7 +1223,7 @@ fn choose_response_sender_target(
         payload_bytes,
         lower_flights,
     )?;
-    let service_key = response_service_anchor_key(&candidate_targets, lower_owner, lead.key);
+    let service_key = response_service_anchor_key(&candidate_targets, lower_owner, None, lead.key);
     let selected = candidate_targets
         .iter()
         .copied()
@@ -1431,6 +1445,41 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
     } else {
         proven_targets
     };
+    let ordered_owner_anchor =
+        ordered_data_owner.filter(|owner| targets.iter().any(|target| target.key == *owner));
+    if let Some(service_key) = ordered_owner_anchor
+        && let Some(service) = targets.iter().find(|target| target.key == service_key)
+    {
+        let service_has_capacity = candidate_targets
+            .iter()
+            .any(|target| target.key == service_key);
+        let service_is_backpressured = !service_has_capacity
+            || response_active_lead_suppression(service, mux_limits, payload_bytes, 0).is_some();
+        if service_is_backpressured {
+            #[cfg(feature = "lab-diagnostics")]
+            for target in &candidate_targets {
+                if target.key != service_key && target.key.underlay != service_key.underlay {
+                    lab_response_bulk_output_candidate(
+                        "service_owner_backpressure",
+                        target,
+                        payload_bytes,
+                        mux_limits,
+                        ResponseBulkCandidateDiag {
+                            lead: None,
+                            role: None,
+                            ordering_debt: 0,
+                        },
+                    );
+                }
+            }
+            candidate_targets.retain(|target| {
+                target.key == service_key || target.key.underlay == service_key.underlay
+            });
+            if candidate_targets.is_empty() {
+                return None;
+            }
+        }
+    }
     if let Some(owner_key) = debt_pressure_owner {
         #[cfg(feature = "lab-diagnostics")]
         for target in &candidate_targets {
@@ -1520,8 +1569,12 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         }
         return None;
     };
-    let service_key =
-        response_service_anchor_key(&candidate_targets, effective_lower_owner, lead.key);
+    let service_key = response_service_anchor_key(
+        &candidate_targets,
+        effective_lower_owner,
+        ordered_owner_anchor,
+        lead.key,
+    );
     let admitted = candidate_targets
         .iter()
         .copied()
@@ -1540,6 +1593,7 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
                 &candidate_targets,
                 lead,
                 effective_lower_owner,
+                ordered_owner_anchor,
                 ordering_debt,
                 payload_bytes,
                 mux_limits,
@@ -4941,6 +4995,44 @@ mod tests {
     }
 
     #[test]
+    fn proof_only_fallback_lead_cannot_become_response_service_owner() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut proof_only = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        proof_only.has_sender_evidence = true;
+        proof_only.has_bulk_rate_evidence = false;
+        let lead = ResponseBulkLead {
+            key: proof_only.key,
+            snapshot: proof_only.snapshot,
+            eta_ms: proof_only.eta_ms,
+        };
+
+        let admission = response_target_unique_owner_admission(
+            &proof_only,
+            &[&proof_only],
+            lead,
+            None,
+            0,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert_eq!(
+            admission.decision,
+            PathAdmissionDecision::ProbeOnly,
+            "sender/proof evidence is not Service ownership; only an active anchor or bulk-rate-proven failover may own the Service role"
+        );
+        assert_eq!(admission.role, PathRuntimeRole::Probe);
+    }
+
+    #[test]
     fn repair_prefers_bulk_proven_path_over_proof_only_low_eta_path() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -6541,6 +6633,60 @@ mod tests {
     }
 
     #[test]
+    fn ordered_owner_outside_dispatchable_set_still_anchors_service_role() {
+        let (service_commands, _service_receivers) = reliable_path_command_channels(1);
+        let mut service_snapshot =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 500_000_000.0);
+        service_snapshot.inflight_limit_bytes = 16 * 1024 * 1024;
+        service_snapshot.confidence = 1.0;
+        let service = ResponseSenderPathTarget {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(1),
+            },
+            commands: service_commands,
+            snapshot: service_snapshot,
+            eta_ms: 50.0,
+            is_active: true,
+            has_sender_evidence: true,
+            has_bulk_rate_evidence: true,
+        };
+        service
+            .commands
+            .try_enqueue_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(900),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"x"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("test setup should fill the service data queue");
+        let lower_eta_subflow =
+            response_target(2, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[service.clone(), lower_eta_subflow.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("bulk-rate-proven alternate should remain eligible as a Subflow");
+
+        assert_eq!(selected.target.key, lower_eta_subflow.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Subflow,
+            "a dispatchable alternate must not become Service merely because the current ordered owner is temporarily not dispatchable"
+        );
+    }
+
+    #[test]
     fn lower_eta_same_family_subflow_does_not_borrow_active_service_envelope() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -6975,6 +7121,30 @@ mod tests {
     }
 
     #[test]
+    fn cross_underlay_alternate_waits_when_service_owner_is_backpressured() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let owner = response_target(1, UnderlayProtocol::Tcp, 50.0, 4 * 1024 * 1024, 0, true);
+        let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = select_response_sender_data_target_with_product_debt_and_epoch(
+            &[owner.clone(), alternate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(owner.key),
+            0,
+            None,
+        );
+
+        assert!(
+            selected.is_none(),
+            "a cross-underlay alternate must not own later bytes while the current Service owner is backpressured by unresolved contiguous tail"
+        );
+    }
+
+    #[test]
     fn response_owner_debt_pressure_blocks_proof_only_same_family_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -7094,7 +7264,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_underlay_bulk_rate_candidate_can_become_service_at_clear_frontier() {
+    fn cross_underlay_bulk_rate_candidate_does_not_become_service_at_clear_frontier() {
         let owner = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
         let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
 
@@ -7106,11 +7276,11 @@ mod tests {
             &[],
             Some(owner.key),
         )
-        .expect("bulk-rate-proven cross-underlay candidate should be eligible at a clear frontier");
+        .expect("current Service owner should remain eligible at a clear frontier");
 
         assert_eq!(
-            selected.key, candidate.key,
-            "ordered-owner history must not pin the Service family once the product frontier is clear"
+            selected.key, owner.key,
+            "mixed-family Service migration must be explicit; lower-ETA cross-underlay candidates do not become Service through per-quantum selection"
         );
     }
 

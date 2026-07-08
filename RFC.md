@@ -388,10 +388,22 @@ output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
 At a clear frontier, liveness, path-proof, configured hints, and peer hints MAY
 rank validation/probe order, but they MUST NOT make a non-active path the
-Service owner for ordered product bytes. A measured path may become an admitted
-Subflow after direction-correct bulk-rate evidence exists and the ETA/no-worse
-selector admits that owner range; it does not replace the Service anchor unless
-the explicit Service migration policy performs a handoff.
+Service owner for ordered product bytes. A path also MUST NOT become Service
+merely because the selector has no better lead fallback; fallback lead selection
+without active Service anchor rights or direction-correct bulk-rate evidence is
+still Probe/Standby, not product ownership. Temporary sender-service
+backpressure or capacity filtering on the current ordered owner also MUST NOT
+erase that Service anchor; dispatchable alternates remain Subflows unless an
+explicit Service migration/failover decision changes the owner. A measured path
+may become an admitted Subflow after direction-correct bulk-rate evidence exists
+and the ETA/no-worse selector admits that owner range; it does not replace the
+Service anchor unless the explicit Service migration policy performs a handoff.
+When the current Service owner is alive but backpressured by unresolved
+contiguous owner tail, a cross-underlay alternate MUST wait instead of owning
+later byte ranges. Same-underlay Subflow startup or steady-state admission may
+still proceed through its normal no-worse gates because it shares the same
+carrier-family recovery assumptions; cross-underlay ownership requires the
+Service owner to be feedable, failed, or explicitly migrated.
 ACK-data-only evidence from a tiny or application-limited probe is still not
 bulk-rate evidence and does not grant Service rights. A
 Subflow on the current Service family may carry a bounded startup `OwnerData`
@@ -409,9 +421,11 @@ sender-service admission proving that doing so will not expand product
 receive-hole debt or worsen the completion horizon. This rule is path-metric
 driven; it is not a TCP-preferred or UDP-preferred policy. Mixed TCP+QUIC paths
 are deliberately stricter in production v1 because they do not share one
-carrier-family recovery model, but a bulk-rate-proven mixed candidate that
-already owns the lower outstanding range, or otherwise has zero cross-path
-ordering debt for the next range, remains owner-eligible.
+carrier-family recovery model. A bulk-rate-proven mixed candidate that already
+owns the lower outstanding range may continue that range through the normal
+no-worse gates. A clear-frontier mixed candidate that does not already own the
+Service role remains Probe/RepairOnly/Standby until an explicit Service
+migration or failover decision changes the owner.
 
 A product reliable stream owns only stream semantics: stream ID, target metadata,
 ingress metadata, outbound policy metadata, send offset space, receive offset
@@ -3038,11 +3052,9 @@ full product-flight ledger separately, but that ledger is not itself admission
 debt.
 Proof-only and unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly`
 until the debt falls below pressure or explicit loss/failure/final-tail evidence
-converts the affected range into `RepairData`. A
-mixed-family Subflow is eligible under debt
-pressure only when it is bulk-rate-proven and the candidate-specific ordering
-debt for the next range is zero, for example when that candidate already owns
-the lower outstanding range. The surviving OwnerData candidates still pass the normal
+converts the affected range into `RepairData`. A mixed-family path is
+owner-eligible under debt pressure only when it is bulk-rate-proven and already
+owns the lower outstanding range. The surviving OwnerData candidates still pass the normal
 ECF/BLEST-style no-worse checks for ETA, inflight, ordering debt, read-gap,
 queue, overhead, and completion horizon. This prevents per-quantum ETA changes
 from turning an unhealthy flow into cross-family owner migration, receive-hole
@@ -3065,11 +3077,11 @@ and remains eligible when the path is bulk-rate-proven or is the live active
 path currently responsible for that lower frontier. Mixed-family health filters
 MUST NOT remove the effective lower-frontier owner before lead selection; they
 may only block optional paths that would expand the hole. At a clear ordered
-frontier, the next Service family is metric-selected: a bulk-rate-proven TCP or
-QUIC candidate may become the next `OwnerData` Service owner if it wins the
-no-worse admission model. This rule is carrier-neutral: it blocks TCP-to-QUIC
-and QUIC-to-TCP speculative concurrent striping equally, while still allowing
-latency-first streams to move to the measured best bulk carrier on demand.
+frontier, mixed-family Service change is still an explicit migration/failover
+decision, not a side effect of per-quantum ETA selection. This rule is
+carrier-neutral: it blocks TCP-to-QUIC and QUIC-to-TCP speculative same-stream
+ownership equally, while still allowing latency-first streams to move to the
+measured best bulk carrier through the dedicated Service migration policy.
 
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It
@@ -3650,9 +3662,9 @@ if path is the previously attached active path but not the lead path
 
 Admission gains are internal model-control coefficients, not operator-visible
 traffic modes. In production v1 they apply to additional same-family ordinary
-striping and to clear-frontier Service-family selection. Cross-underlay TCP+QUIC
-`OwnerData` is not admitted as concurrent later-offset striping while another
-family owns unresolved lower bytes. Lead and same-underlay product queues use a
+striping and explicit Service migration/failover decisions. Cross-underlay TCP+QUIC
+`OwnerData` is not admitted as concurrent later-offset striping or implicit
+clear-frontier Service reselection. Lead and same-underlay product queues use a
 BDP/inflight-derived envelope capped by the configured resource ceiling, while
 carrier controllers still enforce network flight. This follows BBR's separation
 between ready application data and paced network inflight, while preserving the
@@ -3680,8 +3692,8 @@ governed by explicit product inflight, live carrier credit, and reorder budgets.
 Once stream-ordering debt exists for a non-owner candidate, additional
 same-stream `OwnerData` is suppressed until the lower frontier clears. The
 completion horizon remains the positive-contribution gate for clear-frontier
-same-family admission and for cross-underlay admission once both carrier
-families are healthy enough to own reliable bytes.
+same-family admission and for explicit cross-underlay Service migration once
+the migration policy decides the carrier family may change.
 
 For same-underlay startup, the reorder/feed budget uses live carrier credit when
 available. If the carrier reports an inflight or congestion-window limit, that
@@ -4604,8 +4616,7 @@ semantics, so they MUST NOT steal same-stream OwnerData while another family
 owns unresolved lower bytes that the candidate would extend into a receive
 hole. They remain valid Probe, Standby, RepairOnly, migration, and failover
 paths. A bulk-rate-proven cross-family path that already owns the lower
-outstanding range, or whose candidate-specific ordering debt is otherwise zero,
-is not stealing ownership; it is continuing an existing safe owner sequence. At
-a clear frontier, cross-family Service selection is allowed only for
-bulk-rate-proven candidates that pass the same no-worse admission model as any
-other Service switch.
+outstanding range is not stealing ownership; it is continuing an existing safe
+owner sequence. At a clear frontier, cross-family Service selection is allowed
+only through explicit migration/failover policy, followed by the same no-worse
+admission model as any other Service switch.

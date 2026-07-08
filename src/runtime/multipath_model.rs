@@ -84,7 +84,7 @@ pub(super) fn cross_family_reliable_owner_health(
     current_owner_bulk_rate_proven: bool,
     candidate: CarrierPathKey,
     candidate_bulk_rate_proven: bool,
-    candidate_ordering_safe: bool,
+    candidate_continues_lower_frontier: bool,
 ) -> CarrierFamilyHealth {
     let Some(owner) = current_owner else {
         return CarrierFamilyHealth::Healthy;
@@ -93,14 +93,14 @@ pub(super) fn cross_family_reliable_owner_health(
         return CarrierFamilyHealth::Healthy;
     }
 
-    // MPTCP/MPQUIC schedule by path state, not by a static carrier-family
-    // preference. mptunnel still must avoid expanding one ordered stream across
-    // independent TCP and QUIC recovery clocks when that would create unresolved
-    // lower-byte debt. Therefore cross-family OwnerData is health-eligible only
-    // when the candidate is bulk-rate-proven and the candidate would not expand
-    // cross-path ordering debt. The no-worse admission model still decides
-    // whether that eligible candidate actually gets owner credit.
-    if candidate_ordering_safe && candidate_bulk_rate_proven {
+    // MPTCP/MPQUIC schedule by path state inside one carrier-family recovery
+    // model. mptunnel's mixed TCP+QUIC reliable streams have independent ACK
+    // clocks, pacing, flow control, and loss recovery. A cross-family path
+    // therefore cannot become an ordered-byte owner merely because it is
+    // lower-ETA at a clear frontier; it is owner-eligible only when it is
+    // continuing a lower-frontier range it already owns. Explicit Service
+    // migration/failover is handled outside this health predicate.
+    if candidate_continues_lower_frontier && candidate_bulk_rate_proven {
         return CarrierFamilyHealth::Healthy;
     }
     if candidate_bulk_rate_proven {
@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_family_reliable_owner_requires_ordering_safe_candidate_and_bulk_rate() {
+    fn cross_family_reliable_owner_requires_lower_frontier_continuation_and_bulk_rate() {
         let owner = CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(0),

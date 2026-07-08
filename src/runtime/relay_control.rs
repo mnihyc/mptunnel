@@ -49,20 +49,6 @@ where
     );
     let mut pending_validation_opens = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
     let mut attempted_validation_paths = std::collections::HashSet::<RelayPathKey>::new();
-    if reliable_relay_has_evidenced_bulk_alternative(context, &remotes, &send_stream)
-        && spawn_reliable_relay_validation_opens(
-            context,
-            &spec,
-            FlowLane::Throughput,
-            &remotes,
-            &send_stream,
-            &mut pending_validation_opens,
-            &mut attempted_validation_paths,
-            &validation_open_tx,
-        )
-    {
-        last_stream_progress_at = Instant::now();
-    }
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -1716,22 +1702,6 @@ fn reliable_relay_should_wait_for_pending_path_recovery(
     pending_validation_opens: &HashMap<RelayPathKey, RelayValidationOpenTask>,
 ) -> bool {
     remote_open && !pending_validation_opens.is_empty()
-}
-
-fn reliable_relay_has_evidenced_bulk_alternative(
-    context: &ClientPathContext,
-    remotes: &ReliableRelayRemoteSet,
-    send_stream: &ReliableSendStream,
-) -> bool {
-    let payload_bytes =
-        reliable_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
-    context
-        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
-        .into_iter()
-        .any(|key| {
-            !remotes.contains_path_key(key)
-                && context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
-        })
 }
 
 async fn handle_validation_open_result(

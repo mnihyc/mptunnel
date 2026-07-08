@@ -213,8 +213,18 @@ pub(super) fn reliable_relay_bulk_prevalidation_threshold_bytes(
     path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
 ) -> u64 {
-    let _ = (path, mux_limits);
-    PATH_OPEN_SCORE_BYTES as u64
+    let bulk_floor = reliable_flow_rate_bulk_evidence_bytes(
+        path,
+        mux_limits,
+        reliable_flow_bulk_threshold_bytes(path, mux_limits),
+    );
+    let initial_window = PATH_OPEN_SCORE_BYTES as u64;
+    let amortized_probe_floor = initial_window.saturating_mul(BBR_MIN_PIPE_CWND_PACKETS as u64);
+    if bulk_floor <= initial_window {
+        bulk_floor
+    } else {
+        amortized_probe_floor.clamp(initial_window.saturating_add(1), bulk_floor)
+    }
 }
 
 pub(super) fn reliable_latency_startup_owner_credit_remaining_bytes(
@@ -282,10 +292,14 @@ mod tests {
 
         assert_eq!(decision.demand.lane, FlowLane::Latency);
         assert!(!decision.promoted_to_throughput);
+        assert!(
+            decision.prevalidate_bulk,
+            "amortized bulk validation should be allowed before full throughput promotion"
+        );
     }
 
     #[test]
-    fn initial_window_response_triggers_prevalidation_before_throughput_promotion() {
+    fn initial_window_response_stays_latency_and_does_not_prevalidate_bulk() {
         let mut tracker = ReliableRelayFlowDemandTracker::new();
         let limits = MuxLimits::default();
         let threshold = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
@@ -300,9 +314,33 @@ mod tests {
         assert_eq!(decision.demand.lane, FlowLane::Latency);
         assert!(!decision.promoted_to_throughput);
         assert!(
-            decision.prevalidate_bulk,
-            "one QUIC/MPTCP-style initial window is enough to start path proof, not enough to promote data bulk"
+            !decision.prevalidate_bulk,
+            "one initial window is ordinary short-flow traffic, not enough to spawn per-stream bulk validation"
         );
+    }
+
+    #[test]
+    fn bulk_prevalidation_uses_amortized_floor_before_throughput_promotion() {
+        let mut tracker = ReliableRelayFlowDemandTracker::new();
+        let limits = MuxLimits::default();
+        let full_floor = reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX);
+        let prevalidation_floor = reliable_relay_bulk_prevalidation_threshold_bytes(None, limits);
+
+        assert!(prevalidation_floor > PATH_OPEN_SCORE_BYTES as u64);
+        assert!(
+            prevalidation_floor < full_floor,
+            "prevalidation should start after several startup windows, not wait for the full throughput promotion floor"
+        );
+
+        let decision = tracker.refresh(
+            ReliableRelayFlowSignals::new(prevalidation_floor, 0, 0),
+            None,
+            limits,
+        );
+
+        assert_eq!(decision.demand.lane, FlowLane::Latency);
+        assert!(!decision.promoted_to_throughput);
+        assert!(decision.prevalidate_bulk);
     }
 
     #[test]

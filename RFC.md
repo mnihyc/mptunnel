@@ -844,7 +844,7 @@ their origin is explicit and they do not become hidden modes.
 | Parameter or family | Current value or formula | Design source and exact origin | Performance risk | Final handling |
 | --- | --- | --- | --- | --- |
 | Standard packet floor | `TRANSPORT_MSS_BYTES = 1460` | Portable Ethernet TCP MSS floor used only as a lower-bound packet quantum | Jumbo/offload paths may support more, but this does not cap high-rate quantum | Keep as floor below adaptive BDP/BBR sizing |
-| QUIC initial window seed | `PATH_OPEN_SCORE_BYTES = 10 * MSS` | QUIC RFC 9002 initial congestion-window packet-count shape | Too small if reused as bulk cap | Keep only as startup/evidence seed and minimum useful path-open score, never as sustained bulk cap |
+| QUIC initial window seed | `PATH_OPEN_SCORE_BYTES = 10 * MSS` | QUIC RFC 9002 initial congestion-window packet-count shape | Too small if reused as bulk cap or one-window per-stream bulk-validation trigger | Keep only as startup/evidence seed and minimum useful path-open score; bulk prevalidation uses an amortized multi-window floor capped by the service-quantum/rate-evidence floor |
 | QUIC timer granularity | 1 ms | QUIC RFC 9002 timer granularity | Too coarse would delay feedback; too fine would waste wakeups | Keep as standard timing floor |
 | QUIC initial RTT seed | 333 ms | QUIC RFC 9002 initial RTT before a sample exists | Wrong if treated as measured RTT after live data | Keep only before live RTT evidence |
 | QUIC max ACK delay input | 25 ms | QUIC default max ACK delay shape | Wrong if used as arbitrary retry sleep | Keep only inside PTO/RTT-derived formulas |
@@ -862,7 +862,7 @@ their origin is explicit and they do not become hidden modes.
 | Service frame quantum | Latency/control use small BBR-style quanta; reliable bulk feeds TCP/QUIC with the bounded 64 KiB BBR send quantum under the configured read/payload envelope and live condition cap | BBR send-quantum model applied at the product-record boundary, with TCP/QUIC packet pacing below | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta while control/repair/latency remain preemptive |
 | Inflight target | BDP * BBR cwnd gain, send quantum, and MinPipeCwnd under configured flight envelope; latency/realtime lanes use the smaller preemptive target | BBR inflight model and product lane priority | Too low underfeeds; too high queues | Keep adaptive from live BDP/queue/loss/carrier evidence |
 | Stability/backlog factors | Shrink by loss/jitter/queue/backlog relative to BDP with floor derived from MinPipeCwnd or send quantum divided by BDP | Congestion-sensitive adaptation; floor is no longer a fixed fraction | Over-shrinking can create low-rate loops | Keep adaptive; diagnostics must show shrink reason |
-| Auto bulk classification | EWMA/rate/byte/idle-gap evidence promotes/demotes demand using service quantum, BDP, and PTO | Product-specific but measurement-based | Late/early promotion affects latency/throughput | Keep adaptive; no user-visible mode tag or port rule |
+| Auto bulk classification | EWMA/rate/byte/idle-gap evidence promotes/demotes demand using service quantum, BDP, and PTO; per-stream bulk prevalidation requires an amortized multi-window floor, not merely one initial window and not a full throughput-promotion delay | Product-specific but measurement-based | Late/early promotion affects latency/throughput; too-early prevalidation creates short-flow open/close churn | Keep adaptive; no user-visible mode tag or port rule |
 | ACK progress cadence | Product `STREAM_ACK` uses BDP/2 when measured, otherwise the bounded bulk service quantum, under the repair/flow-control resource ceiling; `STREAM_MAX_DATA` uses larger flow-control hysteresis | SACK/QUIC ACK-range practice with MPTCP-style product repair ownership release | Sparse ACKs fill repair cache and stall senders; chatty ACKs waste reverse bandwidth | Keep dynamic from receive progress and separate from MAX_DATA cadence |
 | MAX_DATA cadence | Credit update after a window/chunk-derived threshold | QUIC flow-control update logic | Coarse credit can stall high-BDP streams | Keep adaptive from window/chunk |
 | Active stall and retry timing | Derived from QUIC PTO, observed RTT/rttvar, lane state, TTL, and persistent congestion threshold | QUIC PTO/recovery model | Fixed sleeps underfeed high-rate carriers or delay failover | Fixed retry/stall constants are removed from data-plane policy |
@@ -2169,9 +2169,13 @@ a reliable stream has been promoted to throughput, the initial Service owner may
 carry only enough unique product bytes to establish the bulk evidence floor.
 After that credit is consumed, the sender MUST stop reading additional product
 bytes into the latency-owner queue until either throughput promotion/admission
-runs or the stream becomes idle again. Prevalidation may start at the smaller
-path-open score, but prevalidation alone MUST NOT allow the latency owner to
-accumulate megabytes of lower ordered bytes that later block Subflow admission.
+runs or the stream becomes idle again. Bulk prevalidation is not a one-initial-
+window event and it is not an eager start-of-stream event: it uses an amortized
+multi-window floor capped by the service-quantum/rate-evidence floor, so short
+latency streams do not spawn per-stream Probe opens that cannot be amortized,
+while sustained bulk can start Subflow validation before full throughput
+promotion. Prevalidation alone MUST NOT allow the latency owner to accumulate
+megabytes of lower ordered bytes that later block Subflow admission.
 This preserves the negotiated model: open latency-first, then move toward the
 measured bandwidth carrier on demand without creating stale lower-owner debt.
 

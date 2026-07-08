@@ -330,6 +330,7 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
     pub(super) delivery_samples: u32,
+    pub(super) product_delivery_sample_bytes: u64,
     pub(super) datagram_feedback_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) failed_until: Option<Instant>,
@@ -363,6 +364,7 @@ impl Default for ClientPathHealthRecord {
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
             delivery_samples: 0,
+            product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             failed_until: None,
@@ -396,6 +398,7 @@ pub(super) struct ClientPathObservation {
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
     pub(super) delivery_samples: u32,
+    pub(super) product_delivery_sample_bytes: u64,
     pub(super) datagram_feedback_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) active_flows: u32,
@@ -427,6 +430,7 @@ impl Default for ClientPathObservation {
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
             delivery_samples: 0,
+            product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
             active_flows: 0,
@@ -487,6 +491,7 @@ impl ClientPathHealthRecord {
                 measured_loss_rate: self.measured_loss_rate,
                 measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
                 delivery_samples: self.delivery_samples,
+                product_delivery_sample_bytes: self.product_delivery_sample_bytes,
                 datagram_feedback_samples: self.datagram_feedback_samples,
                 last_delivery_at: self.last_delivery_at,
                 active_flows: self.active_flows,
@@ -522,6 +527,7 @@ impl ClientPathHealthRecord {
             measured_loss_rate: self.measured_loss_rate,
             measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
             delivery_samples: self.delivery_samples,
+            product_delivery_sample_bytes: self.product_delivery_sample_bytes,
             datagram_feedback_samples: self.datagram_feedback_samples,
             last_delivery_at: self.last_delivery_at,
             active_flows: self.active_flows,
@@ -626,6 +632,16 @@ impl ClientPathHealthRecord {
             Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
             None => sample_bps,
         });
+    }
+
+    pub(super) fn mark_product_delivery(&mut self, sample: PathRateSample) {
+        if self.manual_disabled {
+            return;
+        }
+        self.product_delivery_sample_bytes = self
+            .product_delivery_sample_bytes
+            .saturating_add(sample.bytes);
+        self.mark_delivery(sample);
     }
 
     pub(super) fn mark_udp_datagram_feedback(&mut self, observation: UdpDatagramPathObservation) {
@@ -772,6 +788,10 @@ impl PathDeliveryStats {
         let last = self.last_payload_at.unwrap_or(first);
         PathRateSample::new(self.payload_bytes, last.duration_since(first))
     }
+}
+
+fn reliable_relay_bulk_service_migration_sample_bytes(payload_bytes: usize) -> usize {
+    payload_bytes.max(BBR_MAX_SEND_QUANTUM_BYTES)
 }
 
 #[derive(Debug)]
@@ -1896,8 +1916,34 @@ impl ClientPathContext {
             UnderlayProtocol::Udp => &mut health.udp,
         };
         if let Some(current) = records.get_mut(index) {
-            current.mark_delivery(sample);
+            current.mark_product_delivery(sample);
         }
+    }
+
+    pub(super) fn relay_path_has_bulk_service_migration_evidence(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        payload_bytes: usize,
+    ) -> bool {
+        let required_bytes =
+            reliable_relay_bulk_service_migration_sample_bytes(payload_bytes) as u64;
+        let health = self.health.lock().expect("client path health lock");
+        let Some(record) = (match underlay {
+            UnderlayProtocol::Tcp => health.tcp.get(index),
+            UnderlayProtocol::Udp => health.udp.get(index),
+        }) else {
+            return false;
+        };
+        let product_samples = record
+            .delivery_samples
+            .saturating_sub(record.datagram_feedback_samples);
+        let product_evidence =
+            product_samples > 0 && record.product_delivery_sample_bytes >= required_bytes;
+        let carrier_evidence = record.carrier_delivery_samples > 0
+            && !record.carrier_app_limited
+            && record.carrier_delivery_sample_bytes >= required_bytes;
+        product_evidence || carrier_evidence
     }
 
     #[cfg(test)]
@@ -1943,7 +1989,7 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
         {
-            current.mark_delivery(sample);
+            current.mark_product_delivery(sample);
         }
     }
 
@@ -2025,7 +2071,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.mark_delivery(sample);
+            current.mark_product_delivery(sample);
         }
     }
 

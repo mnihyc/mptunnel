@@ -364,11 +364,15 @@ A live response output has a single command-channel owner for a given
 `Active` is an attachment/liveness update of the existing output; it does not
 change Service ownership. Service ownership changes only through explicit
 sender-service `OwnerData` admission, measured failover, or a dedicated
-frontier-clear Service migration decision. Reannouncing the same path key with a
-different live command channel is a duplicate live output and MUST be ignored or
-rejected; it MUST NOT replace the existing output, split owner bytes across two
-command channels for the same path key, or use output-list tail position as a
-hidden ownership signal.
+frontier-clear Service migration decision. Throughput-lane Service migration
+requires bulk-sized direction-correct owner-byte evidence for the target path:
+at least one current Service quantum of product `OwnerData` ACK evidence or an
+equivalent non-app-limited carrier ACK sample. A startup/probe-sized delivery
+sample may admit Probe/Subflow discovery, but it MUST NOT move the Service
+owner. Reannouncing the same path key with a different live command channel is a
+duplicate live output and MUST be ignored or rejected; it MUST NOT replace the
+existing output, split owner bytes across two command channels for the same path
+key, or use output-list tail position as a hidden ownership signal.
 
 Same-underlay carrier subflow sets SHOULD be opened together when the sender has
 already admitted multiple paths from the same carrier family for bulk work. This
@@ -3081,7 +3085,12 @@ frontier, mixed-family Service change is still an explicit migration/failover
 decision, not a side effect of per-quantum ETA selection. This rule is
 carrier-neutral: it blocks TCP-to-QUIC and QUIC-to-TCP speculative same-stream
 ownership equally, while still allowing latency-first streams to move to the
-measured best bulk carrier through the dedicated Service migration policy.
+measured best bulk carrier through the dedicated Service migration policy. That
+policy requires bulk-sized direction-correct owner-byte evidence for the target
+family: at least one current Service quantum of product `OwnerData` ACK evidence
+or an equivalent non-app-limited carrier ACK sample. A tiny startup/probe-sized
+sample can keep the path eligible for Probe/Subflow discovery, but it MUST NOT
+move Service ownership across TCP/QUIC families.
 
 ACK-data seen is a durable path-local fact derived from local QUIC ACKed bytes
 after product `STREAM_DATA` or `DATAGRAM_DATA` was written on that carrier. It

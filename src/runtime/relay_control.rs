@@ -2430,6 +2430,15 @@ pub(super) fn reliable_relay_delivery_path_should_become_active(
     {
         return false;
     }
+    if relay_lane_is_bulk(lane)
+        && !context.relay_path_has_bulk_service_migration_evidence(
+            delivered.underlay,
+            delivered.index,
+            payload_bytes,
+        )
+    {
+        return false;
+    }
     let Some(delivered_eta) = context.reliable_relay_path_eta_ms(delivered, lane, payload_bytes)
     else {
         return false;

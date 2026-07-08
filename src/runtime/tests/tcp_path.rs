@@ -3238,6 +3238,22 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
     context.mark_relay_path_rate_sample(
         UnderlayProtocol::Udp,
         0,
+        PathRateSample::new(PATH_OPEN_SCORE_BYTES as u64, Duration::from_millis(2))
+            .expect("startup-sized rate sample"),
+    );
+    assert!(
+        !reliable_relay_delivery_path_should_become_active(
+            &context,
+            remotes.active_path_key(),
+            fast_instance.key,
+            FlowLane::Throughput,
+            64 * 1024,
+        ),
+        "startup-sized owner-byte evidence may keep a same-family Subflow eligible, but must not migrate the Service owner"
+    );
+    context.mark_relay_path_rate_sample(
+        UnderlayProtocol::Udp,
+        0,
         PathRateSample::new(512 * 1024, Duration::from_millis(50)).expect("rate sample"),
     );
     assert!(reliable_relay_delivery_path_should_become_active(
@@ -3297,6 +3313,67 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
         FlowLane::Throughput,
         64 * 1024,
     ));
+}
+
+#[tokio::test]
+async fn cross_underlay_bulk_promotion_requires_bulk_sized_delivery_sample() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11020?srtt-ms=80&rate-mbps=80"
+                .parse()
+                .expect("tcp service path"),
+            "udp://127.0.0.1:11021?srtt-ms=20&rate-mbps=500"
+                .parse()
+                .expect("udp candidate"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let current = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let delivered = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+
+    context.mark_relay_path_rate_sample(
+        UnderlayProtocol::Udp,
+        0,
+        PathRateSample::new(PATH_OPEN_SCORE_BYTES as u64, Duration::from_millis(1))
+            .expect("startup-sized sample"),
+    );
+
+    assert!(
+        !reliable_relay_delivery_path_should_become_active(
+            &context,
+            Some(current),
+            delivered,
+            FlowLane::Throughput,
+            BBR_MAX_SEND_QUANTUM_BYTES,
+        ),
+        "a startup-sized product sample must not migrate reliable Service ownership across TCP/QUIC families"
+    );
+
+    context.mark_relay_path_rate_sample(
+        UnderlayProtocol::Udp,
+        0,
+        PathRateSample::new(BBR_MAX_SEND_QUANTUM_BYTES as u64, Duration::from_millis(40))
+            .expect("bulk-sized sample"),
+    );
+
+    assert!(
+        reliable_relay_delivery_path_should_become_active(
+            &context,
+            Some(current),
+            delivered,
+            FlowLane::Throughput,
+            BBR_MAX_SEND_QUANTUM_BYTES,
+        ),
+        "bulk-sized product evidence may explicitly migrate Service ownership when the metric model prefers it"
+    );
 }
 
 #[tokio::test]

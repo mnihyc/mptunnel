@@ -313,11 +313,13 @@ fn endpoint_only_startup_observation_for_scoring(
         measured_loss_rate: None,
         measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
         delivery_samples: 0,
+        product_delivery_sample_bytes: 0,
         last_delivery_at: None,
         carrier_srtt_ms: None,
         carrier_rttvar_ms: None,
         carrier_delivery_rate_bps: None,
         carrier_delivery_samples: 0,
+        carrier_delivery_sample_bytes: 0,
         carrier_last_delivery_at: None,
         ..observation
     }
@@ -810,7 +812,9 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
     observation: ClientPathObservation,
 ) -> bool {
     let product_rate = observation.measured_rate_bps.is_some()
-        && reliable_product_delivery_samples(path, observation) > 0;
+        && reliable_product_delivery_samples(path, observation) > 0
+        && observation.product_delivery_sample_bytes
+            >= client_path_observation_bulk_sample_floor_bytes(observation);
     product_rate
         || (observation.carrier_delivery_rate_bps.is_some()
             && !observation.carrier_app_limited
@@ -839,6 +843,7 @@ fn observation_has_sender_delivery_evidence(observation: ClientPathObservation) 
 fn client_path_observation_bulk_sample_floor_bytes(observation: ClientPathObservation) -> u64 {
     observation
         .carrier_inflight_limit_bytes
+        .max(BBR_MAX_SEND_QUANTUM_BYTES as u64)
         .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 

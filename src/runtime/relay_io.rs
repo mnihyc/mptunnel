@@ -112,14 +112,24 @@ fn reliable_relay_current_ordered_owner_debt_bytes(
 
 pub(super) fn reliable_relay_tail_repair_deadline(
     last_progress_at: Instant,
+    last_repair_at: Instant,
     path: Option<PathSnapshot>,
     lane: FlowLane,
 ) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(
-        last_progress_at
-            + reliable_relay_stall_timeout(path, lane)
-                .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
-    )
+    let stall_timeout = reliable_relay_tail_repair_delay(path, lane);
+    if last_repair_at > last_progress_at {
+        return tokio::time::Instant::from_std(
+            last_repair_at + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+        );
+    }
+    tokio::time::Instant::from_std(last_progress_at + stall_timeout)
+}
+
+pub(super) fn reliable_relay_tail_repair_delay(
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+) -> Duration {
+    reliable_relay_stall_timeout(path, lane)
 }
 
 pub(super) fn reliable_ack_gap_repair_delay(
@@ -1482,7 +1492,8 @@ where
             last_send_ack_frontier,
         );
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
-            last_send_ack_progress_at.max(last_tail_repair_at),
+            last_send_ack_progress_at,
+            last_tail_repair_at,
             send_path_snapshot,
             relay_lane,
         );
@@ -2659,12 +2670,34 @@ mod tests {
     }
 
     #[test]
-    fn tail_repair_uses_persistent_congestion_timeout() {
+    fn tail_repair_uses_single_pto_stall_timeout() {
         let last_progress = Instant::now();
-        let deadline =
-            reliable_relay_tail_repair_deadline(last_progress, None, FlowLane::Throughput);
+        let last_repair = last_progress - Duration::from_secs(1);
+        let deadline = reliable_relay_tail_repair_deadline(
+            last_progress,
+            last_repair,
+            None,
+            FlowLane::Throughput,
+        );
         let expected = tokio::time::Instant::from_std(
-            last_progress
+            last_progress + reliable_relay_stall_timeout(None, FlowLane::Throughput),
+        );
+
+        assert_eq!(deadline, expected);
+    }
+
+    #[test]
+    fn tail_repair_repeats_after_persistent_delay_without_progress() {
+        let last_progress = Instant::now();
+        let last_repair = last_progress + reliable_relay_stall_timeout(None, FlowLane::Throughput);
+        let deadline = reliable_relay_tail_repair_deadline(
+            last_progress,
+            last_repair,
+            None,
+            FlowLane::Throughput,
+        );
+        let expected = tokio::time::Instant::from_std(
+            last_repair
                 + reliable_relay_stall_timeout(None, FlowLane::Throughput)
                     .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
         );

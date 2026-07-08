@@ -555,15 +555,21 @@ offset, the unacknowledged suffix is not repairable merely because it is
 unacknowledged. A live TCP or QUIC carrier owns its own packet recovery, and
 same-output product retransmission cannot overtake the missing bytes. A live
 owner tail with no complete ACK frontier is normal in-flight data, not repair
-debt. If a complete ACK frontier exists, the frontier remains blocked across
-the persistent tail-stall guard, and a different live output can carry the
+debt. If a complete ACK frontier exists, the frontier remains blocked for one
+PTO-derived product stall timeout, and a different live output can carry the
 lowest blocked range, that suffix becomes tail correctness repair: it may be
 retransmitted as `RepairData` only on an output that did not own the offset
-range, after persistent stall evidence and under the same repair/path-flight
-caps. Detached, failed, or no-longer-serviceable owners use the same bounded
-tail-repair mechanism because the original owner can no longer make progress.
-This repair remains duplicate product data and MUST NOT create path delivery
-proof, move the Service owner, or reset Subflow admission state.
+range and under the same repair/path-flight caps. The first tail probe
+deliberately uses one product stall timeout, not the persistent-congestion
+multiplier used for authoritative ACK-gap repair, because the repair is a
+bounded reinjection of the exact lowest HOL-blocking suffix on a different
+output. If that probe does not produce ACK-frontier progress, repeated tail
+repair backs off to the persistent-congestion multiplier so a live carrier is
+not converted into continuous duplicate traffic. Detached, failed, or
+no-longer-serviceable owners use the same bounded tail-repair mechanism because
+the original owner can no longer make progress. This repair remains duplicate
+product data and MUST NOT create path delivery proof, move the Service owner,
+or reset Subflow admission state.
 
 For scheduling and tail-repair timers, the product ACK frontier is the end of
 the first ACK range only when that range starts at offset 0. It is not the
@@ -2000,14 +2006,17 @@ When a tail-stall repair timer fires on a live stream, a sender MUST inspect the
 most recent repair-authoritative `STREAM_ACK`. If that ACK proves an
 unacknowledged gap below its largest end offset, the repair extent is that gap,
 not bytes after the ACK frontier. If no authoritative lower gap is known, the
-live contiguous owner tail after the ACK frontier is not a path-scoped missing
-range; TCP and QUIC still own recovery for the carrier stream that holds those
-bytes. A sender MUST NOT retransmit such a live owner tail merely because
-product ACK progress is slow. Terminal tail recovery is separate: once a final
-offset is known, a sender may repair unacknowledged bytes below that final
-offset on an eligible survivor path so the DATA_FIN/STREAM_FIN can be
-acknowledged, and that final-tail repair may use the bounded critical repair
-path. Repair candidate selection is
+live contiguous owner tail after the ACK frontier is not immediately a
+path-scoped missing range; TCP and QUIC still own recovery for the carrier
+stream that holds those bytes until the PTO-derived product tail timer fires.
+After that first timer, the sender MAY reinject only the lowest blocked suffix
+as bounded `RepairData` on a different eligible output, and MUST NOT treat that
+repair ACK as path delivery proof. If no ACK-frontier progress follows that
+probe, repeated live-tail repair uses the persistent-congestion delay. Terminal
+tail recovery is separate: once a final offset is known, a sender may repair
+unacknowledged bytes below that final offset on an eligible survivor path so the
+DATA_FIN/STREAM_FIN can be acknowledged, and that final-tail repair may use the
+bounded critical repair path. Repair candidate selection is
 prefix-preserving: if the lowest unresolved repair frame cannot be sent on an
 alternate eligible output, the sender MUST NOT skip it and send a later ordered
 range instead. This is targeted duplicate repair, not whole-cache replay.
@@ -3997,15 +4006,17 @@ non-emitting scheduling decisions.
 Persistent owner-tail stalls are repair only when they can make progress on a
 different output. If the ACK frontier has stopped below the sender's next
 product offset, the stream has retained unacked `OwnerData`, and no
-authoritative ACK gap exists, the sender waits for ACK progress until the tail
-stall timer fires. After that persistent-stall evidence, it MAY reinject the
-lowest blocked suffix as bounded critical `RepairData` on an alternate output
-that did not own the range. It MUST NOT retransmit the live contiguous owner
-tail on the same/only carrier merely because the product ACK frontier is
-stalled. A known final offset is not sufficient by itself: terminal owner-tail
-repair may spend bounded critical repair only after persistent stall, carrier
-failure/detach, or equivalent final-debt evidence shows the retained tail is no
-longer making progress. That repair remains bounded by repair-cache,
+authoritative ACK gap exists, the sender waits for ACK progress until the
+PTO-derived tail-stall timer fires. After that stall evidence, it MAY reinject
+the lowest blocked suffix as bounded critical `RepairData` on an alternate
+output that did not own the range. It MUST NOT retransmit the live contiguous
+owner tail on the same/only carrier merely because the product ACK frontier is
+stalled, and if the first alternate repair does not advance the ACK frontier it
+MUST wait for the persistent repair delay before repeating. A known final offset
+is not sufficient by itself: terminal owner-tail repair may spend bounded
+critical repair only after tail-stall, carrier failure/detach, or equivalent
+final-debt evidence shows the retained tail is no longer making progress. That
+repair remains bounded by repair-cache,
 path-flight, and sender resource limits; those bytes are still counted as
 repair overhead and MUST NOT move Service ownership.
 

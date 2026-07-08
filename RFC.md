@@ -470,9 +470,14 @@ product admission ceiling. While bulk demand exists and the ordered frontier is
 clear, the Service owner is fed through the product Service envelope; lower
 carrier congestion and pacing remain the carrier engine's responsibility. The
 Service envelope MAY use non-app-limited product progress samples as a capacity
-signal, but an app-limited progress sample is not a product-flight ceiling and
-MUST NOT shrink the clear-frontier Service envelope below the configured product
-Service envelope. App-limited samples may still inform ETA and diagnostics.
+signal. An app-limited progress sample is not bulk-rate proof and MUST NOT
+initialize a tiny startup-rate or carrier-cwnd product ceiling. When that
+sample already shows meaningful ACK feedback, however, it MAY cap the
+clear-frontier Service feed to the ACK-feedback horizon until non-app-limited
+bulk evidence arrives. That prevents the Service owner from preloading later
+ordered bytes far beyond the receiver's observed progress. Tiny app-limited
+samples may still inform ETA and diagnostics, but they do not shrink the
+Service feed below the startup Service horizon.
 This Service rule is deliberately different from optional Subflow admission:
 the Service is the current primary owner and must remain fed while its ordered
 frontier is clear, whereas optional paths must prove positive contribution
@@ -847,7 +852,7 @@ their origin is explicit and they do not become hidden modes.
 | UDP target/datagram path model | UDP/QUIC response deadline derives from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. A product datagram ID is emitted once on the selected carrier and expires on absent target response instead of being replayed on another carrier |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active Service flight on any carrier uses the finite product Service horizon, not the full resource envelope, not a multi-megabyte preload, and not a tiny carrier-cwnd or one-quantum gate; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active Service flight on any carrier uses the finite product Service horizon, not the full resource envelope and not a tiny carrier-cwnd or one-quantum gate; after product-progress evidence exists, active Service flight is capped by meaningful app-limited ACK feedback or non-app-limited product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
 | Validation traffic | Probe/control traffic only; repair data only after explicit gap/failover evidence; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -3762,8 +3767,10 @@ However, an app-limited sample also does not prove that the path can safely hold
 the path's bulk capacity. It therefore MUST NOT initialize a tiny BDP-derived
 bulk model or make another path Service, but it also MUST NOT unlock the full
 configured product envelope. It may raise the clear-frontier Service owner from
-the pre-progress startup window to the bounded Service horizon. Only
-non-app-limited bulk evidence can replace that Service horizon with a
+the pre-progress startup window to the bounded Service horizon, and a
+meaningful app-limited ACK-feedback sample MAY cap that Service feed below the
+geometric horizon until stable non-app-limited evidence exists. Only
+non-app-limited bulk evidence can replace that Service/feed horizon with a
 BDP-derived product envelope.
 While there is no lower-frontier owner on another path, same-underlay admission
 is governed by explicit product inflight, live carrier credit, and reorder

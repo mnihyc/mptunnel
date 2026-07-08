@@ -1,6 +1,6 @@
-use super::BBR_DEFAULT_CWND_GAIN;
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
+use super::{BBR_DEFAULT_CWND_GAIN, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
@@ -399,9 +399,13 @@ pub(super) fn bulk_active_service_product_envelope_bytes(
         return startup_feed_limit;
     };
     if candidate.app_limited {
-        return (bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64)
-            .min(configured)
-            .max(startup_feed_limit);
+        return bulk_app_limited_service_feedback_horizon_bytes(
+            candidate,
+            progress_rate_bps,
+            payload_bytes,
+            configured,
+            startup_feed_limit,
+        );
     }
 
     let progress_bdp =
@@ -410,6 +414,27 @@ pub(super) fn bulk_active_service_product_envelope_bytes(
         .max((payload_bytes as u64).saturating_mul(8))
         .max(startup_feed_limit);
     configured.min(progress_limit)
+}
+
+fn bulk_app_limited_service_feedback_horizon_bytes(
+    candidate: PathSnapshot,
+    progress_rate_bps: f64,
+    payload_bytes: usize,
+    configured: u64,
+    startup_feed_limit: u64,
+) -> u64 {
+    let progress_bdp =
+        bulk_rate_bdp_bytes(progress_rate_bps, bulk_product_budget_rtt_ms(candidate));
+    let feedback_horizon = bulk_bbr_inflight_bytes(progress_bdp);
+    let meaningful_floor = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
+        .max((payload_bytes as u64).saturating_mul(8))
+        .max(payload_bytes as u64);
+    if feedback_horizon < meaningful_floor {
+        return startup_feed_limit;
+    }
+    startup_feed_limit
+        .min(feedback_horizon.max(meaningful_floor).min(configured))
+        .max(payload_bytes as u64)
 }
 
 fn bulk_product_inflight_limit_bytes(
@@ -984,6 +1009,41 @@ mod tests {
             ),
             Some("inflight_limit"),
             "app-limited product progress escapes tiny BDP/cwnd caps, but it must not unlock the full configured envelope before non-app-limited bulk evidence"
+        );
+    }
+
+    #[test]
+    fn app_limited_service_progress_uses_observed_feedback_horizon_before_bulk_rate_proof() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let observed_rate_bps = mbps(57.0);
+        let mut active =
+            PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 60.0, observed_rate_bps);
+        active.pacing_rate_bps = mbps(1_500.0);
+        active.delivery_rate_bps = observed_rate_bps;
+        active.product_progress_rate_bps = Some(observed_rate_bps);
+        active.app_limited = true;
+        active.product_bytes_in_flight = bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(
+            observed_rate_bps,
+            bulk_product_budget_rtt_ms(active),
+        ));
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                10.0,
+                active,
+                10.0,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "an app-limited Service path with observed progress should be bounded by an ACK-feedback horizon, not the full geometric Service horizon that can create large ordered receive holes"
         );
     }
 

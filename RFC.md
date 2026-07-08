@@ -3481,6 +3481,14 @@ may it resend the same lowest unresolved repair range on the current survivor
 output. This is the MPTCP reinjection rule applied only after loss, failure, or
 explicit repair evidence exists, with the QUIC-style recovery constraint that a
 repair action is small, ACK-clocked, and never a replay of unrelated cached bytes. A
+sender MUST NOT enqueue another `RepairData` copy for a byte range that is
+already pending in the sender-service queue; the already queued copy is treated
+as the current repair attempt and the repair timer backs off until ACK,
+capacity, detach/failover, or the next repair deadline changes the decision.
+Repair already in carrier flight is controlled by the same repair cadence and
+normal target selection; an implementation MUST NOT use a late global
+in-flight-overlap skip that prevents an eligible cleaner repair output from
+being selected.
 sender MUST NOT substitute a later range merely because the frontier range is
 already in flight. A sender MUST NOT duplicate every lower outstanding byte
 merely because a faster active path is available. Speculative reinjection outside

@@ -1206,6 +1206,18 @@ pub(super) fn prefix_repair_frames_with_failed_owner_output(
     (accepted, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailRepairEnqueueOutcome {
+    queued: usize,
+    pending: bool,
+}
+
+impl TailRepairEnqueueOutcome {
+    fn record_as_repair_attempt(self) -> bool {
+        self.queued > 0 || self.pending
+    }
+}
+
 fn enqueue_reliable_tail_repair(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
@@ -1221,7 +1233,7 @@ fn enqueue_reliable_tail_repair(
     max_frame_payload_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     last_send_ack_frontier: u64,
-) -> usize {
+) -> TailRepairEnqueueOutcome {
     let base_repair_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         tail_repair_path_snapshot,
         FlowLane::Throughput,
@@ -1321,7 +1333,12 @@ fn enqueue_reliable_tail_repair(
         ),
     );
     let mut repair_count = 0usize;
+    let mut repair_pending = false;
     for frame in repair_frames {
+        if response_sender.has_queued_repair_overlap(&frame) {
+            repair_pending = true;
+            continue;
+        }
         let queued = if critical_tail_repair {
             Some(response_sender.enqueue_critical_repair_frame(frame))
         } else {
@@ -1331,7 +1348,10 @@ fn enqueue_reliable_tail_repair(
             repair_count = repair_count.saturating_add(1);
         }
     }
-    repair_count
+    TailRepairEnqueueOutcome {
+        queued: repair_count,
+        pending: repair_pending,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1691,7 +1711,7 @@ where
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
-                let repair_count = enqueue_reliable_tail_repair(
+                let repair_outcome = enqueue_reliable_tail_repair(
                     &mut response_sender,
                     &path_stream,
                     stream_id,
@@ -1705,7 +1725,7 @@ where
                     path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
                 );
-                if repair_count > 0 {
+                if repair_outcome.record_as_repair_attempt() {
                     last_tail_repair_at = Instant::now();
                 }
                 let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
@@ -3129,7 +3149,7 @@ mod tests {
             .expect("owner data");
         let ack_frontier = base_limit as u64;
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3150,9 +3170,10 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 0,
+            outcome.queued, 0,
             "live contiguous owner-tail bytes are neither ACK-gap nor final-tail correctness repair"
         );
+        assert!(!outcome.pending);
     }
 
     #[test]
@@ -3223,7 +3244,7 @@ mod tests {
         );
         response_sender.record_owner_progress(1024);
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3241,9 +3262,124 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 1,
+            outcome.queued, 1,
             "a detached owner path turns a persistent contiguous tail into failover repair on the remaining output"
         );
+        assert!(!outcome.pending);
+    }
+
+    #[test]
+    fn failed_owner_tail_repair_does_not_duplicate_queued_repair_range() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(109);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(109),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        binding.detach(owner_key, &owner_commands);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(109),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+        let performance = MppPerformanceConfig {
+            extra_traffic_hint_percent: 5,
+        };
+
+        let first = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            performance,
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+        let queued_bytes_after_first = response_sender.bytes();
+        let second = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            performance,
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(first.queued, 1);
+        assert!(!first.pending);
+        assert_eq!(
+            second.queued, 0,
+            "tail repair must not enqueue the same RepairData range while it is already queued"
+        );
+        assert!(
+            second.pending,
+            "already queued RepairData should count as a pending repair attempt so the tail timer backs off"
+        );
+        assert_eq!(response_sender.bytes(), queued_bytes_after_first);
     }
 
     #[test]
@@ -3314,7 +3450,7 @@ mod tests {
         );
         response_sender.record_owner_progress(1024);
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3332,9 +3468,10 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 1,
+            outcome.queued, 1,
             "persistent tail repair must retry the lowest blocked frontier range once when every live output only has stale overlapping flight"
         );
+        assert!(!outcome.pending);
     }
 
     #[tokio::test]
@@ -3399,7 +3536,7 @@ mod tests {
             },
         );
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3417,9 +3554,10 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 1,
+            outcome.queued, 1,
             "failed-owner repair must retransmit from offset zero when no response ACK frontier exists"
         );
+        assert!(!outcome.pending);
         response_sender
             .dispatch_next_with_ordered_owner_debt(
                 &path_stream,
@@ -3503,7 +3641,7 @@ mod tests {
             },
         );
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3521,9 +3659,10 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 0,
+            outcome.queued, 0,
             "without a complete ACK frontier or failed owner, live owner bytes are normal in-flight data and must not be duplicated onto an alternate"
         );
+        assert!(!outcome.pending);
     }
 
     #[test]
@@ -3613,7 +3752,7 @@ mod tests {
             0
         );
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3631,9 +3770,10 @@ mod tests {
         );
 
         assert!(
-            queued > 0,
+            outcome.queued > 0,
             "failed-owner tail recovery is correctness repair and must not depend on optional duplicate/probe budget"
         );
+        assert!(!outcome.pending);
     }
 
     #[test]
@@ -3728,7 +3868,7 @@ mod tests {
             0
         );
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3746,9 +3886,10 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 0,
+            outcome.queued, 0,
             "persistent ACK gaps are repaired by the ACK-gap controller; the tail timer must not duplicate live-owner gap repair"
         );
+        assert!(!outcome.pending);
     }
 
     #[test]
@@ -3818,7 +3959,7 @@ mod tests {
         );
         response_sender.record_owner_progress(1024);
 
-        let queued = enqueue_reliable_tail_repair(
+        let outcome = enqueue_reliable_tail_repair(
             &mut response_sender,
             &path_stream,
             stream_id,
@@ -3836,9 +3977,10 @@ mod tests {
         );
 
         assert_eq!(
-            queued, 1,
+            outcome.queued, 1,
             "a persistent live-owner tail stall should reinject the lowest blocked range as RepairData on an alternate output without migrating Service ownership"
         );
+        assert!(!outcome.pending);
         assert_eq!(
             binding.ordered_data_owner(),
             Some(owner_key),

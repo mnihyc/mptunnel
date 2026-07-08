@@ -301,6 +301,25 @@ impl ReliableRelaySenderQueue {
         self.front().map(|(lane, _)| lane)
     }
 
+    pub(super) fn has_queued_repair_overlap(&self, frame: &Frame) -> bool {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return false;
+        };
+        self.critical_repair
+            .iter()
+            .chain(self.repair.iter())
+            .any(|work| {
+                let ReliableRelayQueuedWorkKind::Repair { frame: queued, .. } = &work.kind else {
+                    return false;
+                };
+                let Some((queued_start, queued_end, _)) = reliable_stream_frame_extent(queued)
+                else {
+                    return false;
+                };
+                queued_start < end && start < queued_end
+            })
+    }
+
     pub(super) fn commit_front(
         &mut self,
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
@@ -2458,6 +2477,10 @@ impl ServerResponseSenderService {
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
         self.queue
             .push_critical_repair_with_cause(frame, RelaySendCause::AckGapRepair)
+    }
+
+    pub(super) fn has_queued_repair_overlap(&self, frame: &Frame) -> bool {
+        self.queue.has_queued_repair_overlap(frame)
     }
 
     pub(super) async fn dispatch_next(

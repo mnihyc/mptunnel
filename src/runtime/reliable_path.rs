@@ -687,10 +687,6 @@ impl ResponseStreamBinding {
                     ),
                 );
                 if same_channel {
-                    if role == StreamOpenRole::Active {
-                        let entry = outputs.entries.remove(position);
-                        outputs.entries.push(entry);
-                    }
                     let attached_keys = outputs
                         .entries
                         .iter()
@@ -711,9 +707,6 @@ impl ResponseStreamBinding {
                             previous_lane,
                             lane,
                         );
-                    }
-                    if role == StreamOpenRole::Active && self.can_migrate_ordered_data_owner() {
-                        self.set_ordered_data_owner(key);
                     }
                     self.notify_update();
                     return ResponseStreamAttachOutcome::Attached;
@@ -764,9 +757,7 @@ impl ResponseStreamBinding {
                 peer_path_metrics: None,
             }
         };
-        let promote_or_keep_active_slot = server_stream_open_role_promotes_data_path(role)
-            || was_active
-            || outputs.entries.is_empty();
+        let promote_or_keep_active_slot = was_active || outputs.entries.is_empty();
         if promote_or_keep_active_slot {
             outputs.entries.push(entry);
         } else {
@@ -789,10 +780,6 @@ impl ResponseStreamBinding {
         }
         if !already_attached {
             self.lane_tracker.attach(self.session_id, key, lane);
-        }
-        if server_stream_open_role_promotes_data_path(role) && self.can_migrate_ordered_data_owner()
-        {
-            self.set_ordered_data_owner(key);
         }
         if role == StreamOpenRole::Validation {
             let _ = enqueue_path_proof_frame(&proof_commands, path_id, self.mux_limits);
@@ -1191,19 +1178,6 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn can_migrate_ordered_data_owner(&self) -> bool {
-        self.flights
-            .lock()
-            .expect("server reliable stream flight lock")
-            .is_empty()
-            && self
-                .ack_ordering
-                .lock()
-                .expect("server response ACK ordering lock")
-                .acked_holes
-                .is_empty()
-    }
-
     pub(super) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
         self.record_product_flight(key, frame, CarrierWorkKind::OwnerData)
     }
@@ -1459,10 +1433,6 @@ fn carrier_path_flights_have_unambiguous_owner_ack(flights: &[CarrierPathFlight]
         flights,
         [flight] if flight.kind.is_ordering_owner()
     )
-}
-
-fn server_stream_open_role_promotes_data_path(role: StreamOpenRole) -> bool {
-    role == StreamOpenRole::Active
 }
 
 fn response_live_ordered_data_owner(
@@ -1841,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn response_validation_same_channel_active_attach_promotes_service_owner() {
+    fn response_validation_same_channel_active_attach_does_not_promote_service_owner() {
         let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
         let validation = CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -1875,15 +1845,19 @@ mod tests {
 
         let outputs = binding.outputs.lock().expect("test response outputs lock");
         assert_eq!(
-            outputs.entries.last().map(|entry| entry.key),
-            Some(validation),
-            "same-channel Active reannouncement upgrades the existing output instead of opening a duplicate"
+            outputs
+                .entries
+                .iter()
+                .filter(|entry| entry.key == validation)
+                .count(),
+            1,
+            "same-channel Active reannouncement updates the existing output instead of opening a duplicate"
         );
         drop(outputs);
         assert_eq!(
             binding.ordered_data_owner(),
-            Some(validation),
-            "the server-side Service owner must match the Active reannouncement accepted by the client"
+            Some(active),
+            "Active reannouncement is attachment state, not Service ownership"
         );
     }
 

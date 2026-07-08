@@ -1,6 +1,6 @@
 use super::bulk_admission::{
-    BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
-    bulk_candidate_admission_suppression_with_ordering_debt,
+    BulkAdmissionCheck, BulkAdmissionRole, bulk_active_service_product_envelope_bytes,
+    bulk_additional_admission_role, bulk_candidate_admission_suppression_with_ordering_debt,
 };
 use super::*;
 
@@ -1466,12 +1466,13 @@ fn select_response_sender_data_target_with_product_debt_and_epoch(
         .iter()
         .copied()
         .filter(|target| {
-            response_cross_underlay_owner_allowed(
-                target,
-                &candidate_targets,
-                ordered_data_owner,
-                lower_flights,
-            )
+            Some(target.key) == effective_lower_owner
+                || response_cross_underlay_owner_allowed(
+                    target,
+                    &candidate_targets,
+                    ordered_data_owner,
+                    lower_flights,
+                )
         })
         .collect::<Vec<_>>();
     #[cfg(feature = "lab-diagnostics")]
@@ -1682,7 +1683,7 @@ fn response_target_committed_product_bytes(target: &ResponseSenderPathTarget) ->
 
 fn response_subflow_retention_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
     let service_credit = response_active_owner_feed_credit_bytes(payload_bytes, mux_limits) as u64;
-    RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
         .saturating_div(2)
         .min(service_credit)
         .max(payload_bytes as u64)
@@ -1748,7 +1749,14 @@ fn response_target_emission_credit_bytes(
 ) -> usize {
     if relay_lane_is_bulk(lane) {
         if target.is_active {
-            return response_active_owner_feed_credit_bytes(payload_bytes, mux_limits);
+            return usize::try_from(bulk_active_service_product_envelope_bytes(
+                target.snapshot,
+                payload_bytes,
+                mux_limits,
+            ))
+            .unwrap_or(usize::MAX)
+            .max(payload_bytes)
+            .max(1);
         }
         if target.key.underlay == UnderlayProtocol::Udp {
             return response_quic_carrier_feed_credit_bytes(target, payload_bytes, mux_limits);
@@ -1788,7 +1796,7 @@ fn response_startup_subflow_owner_credit_bytes(
     ))
     .unwrap_or(usize::MAX);
     let active_envelope = response_active_owner_feed_credit_bytes(payload_bytes, mux_limits);
-    let startup_ceiling = usize::try_from(RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES)
+    let startup_ceiling = usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES)
         .unwrap_or(usize::MAX)
         .min(active_envelope)
         .max(payload_bytes);
@@ -4505,12 +4513,42 @@ mod tests {
 
         assert_eq!(
             credit,
-            response_active_owner_feed_credit_bytes(payload_bytes, mux_limits),
+            usize::try_from(bulk_active_service_product_envelope_bytes(
+                active.snapshot,
+                payload_bytes,
+                mux_limits,
+            ))
+            .unwrap(),
             "active response owner must be fed by the product envelope, not current carrier cwnd"
         );
         assert!(
             credit > payload_bytes,
             "the regression requires credit above one carrier quantum"
+        );
+    }
+
+    #[test]
+    fn active_tcp_response_owner_without_product_progress_uses_startup_feed_credit() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut active = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        active.has_sender_evidence = false;
+        active.has_bulk_rate_evidence = false;
+
+        let credit = response_target_emission_credit_bytes(
+            &active,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert!(
+            credit <= usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES).unwrap(),
+            "unproven TCP Service startup must not enqueue the full active owner feed envelope before product progress exists"
+        );
+        assert!(
+            credit >= payload_bytes,
+            "startup Service credit must still admit at least one bulk quantum"
         );
     }
 
@@ -4536,13 +4574,19 @@ mod tests {
             mux_limits,
         );
 
-        assert!(
-            quic_credit >= 8 * 1024 * 1024,
-            "QUIC feed credit must follow live carrier debt so the product sender keeps QUIC fed"
+        assert_eq!(
+            quic_credit,
+            usize::try_from(bulk_active_service_product_envelope_bytes(
+                loaded_quic.snapshot,
+                payload_bytes,
+                mux_limits,
+            ))
+            .unwrap(),
+            "active QUIC Service feed credit must follow the product Service envelope, not live carrier debt"
         );
         assert!(
             quic_credit > outdated_bdp_credit,
-            "app-limited BDP must not be the only QUIC writer-feed ceiling"
+            "app-limited BDP must not be the only active QUIC Service writer-feed ceiling"
         );
 
         let mut loaded_tcp = response_target(1, UnderlayProtocol::Tcp, 250.0, 0, 64 * 1024, true);
@@ -4550,6 +4594,7 @@ mod tests {
         loaded_tcp.snapshot.pacing_rate_bps = 351_000.0;
         loaded_tcp.snapshot.bytes_in_flight = 8 * 1024 * 1024;
         loaded_tcp.snapshot.queue_bytes = 1024 * 1024;
+        loaded_tcp.snapshot.product_progress_rate_bps = Some(351_000.0);
         let tcp_credit = response_target_emission_credit_bytes(
             &loaded_tcp,
             FlowLane::Throughput,
@@ -4559,8 +4604,13 @@ mod tests {
 
         assert_eq!(
             tcp_credit,
-            response_active_owner_feed_credit_bytes(payload_bytes, mux_limits),
-            "active TCP owners use the same product feed envelope as active QUIC owners"
+            usize::try_from(bulk_active_service_product_envelope_bytes(
+                loaded_tcp.snapshot,
+                payload_bytes,
+                mux_limits,
+            ))
+            .unwrap(),
+            "active TCP owners use the same carrier-neutral product Service envelope as active QUIC owners"
         );
 
         let mut subflow_quic =
@@ -4750,7 +4800,7 @@ mod tests {
     fn active_tcp_response_owner_uses_product_feed_envelope() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let target = response_target(
+        let mut target = response_target(
             0,
             UnderlayProtocol::Tcp,
             50.0,
@@ -4758,15 +4808,22 @@ mod tests {
             payload_bytes as u64,
             true,
         );
+        target.snapshot.product_progress_rate_bps = Some(10_000_000_000.0);
 
-        assert!(
+        assert_eq!(
             response_target_emission_credit_bytes(
                 &target,
                 FlowLane::Throughput,
                 payload_bytes,
                 mux_limits
-            ) >= response_active_owner_feed_credit_bytes(payload_bytes, mux_limits),
-            "active TCP and QUIC owners should use the same product feed envelope; transport pacing belongs below the sender service"
+            ),
+            usize::try_from(bulk_active_service_product_envelope_bytes(
+                target.snapshot,
+                payload_bytes,
+                mux_limits,
+            ))
+            .unwrap(),
+            "active TCP and QUIC owners should use the same product Service envelope; transport pacing belongs below the sender service"
         );
     }
 
@@ -6233,7 +6290,7 @@ mod tests {
 
     #[test]
     fn single_response_carrier_uses_sliding_window_not_multipath_ordering_debt() {
-        let target = response_target(
+        let mut target = response_target(
             0,
             UnderlayProtocol::Tcp,
             5.0,
@@ -6241,6 +6298,7 @@ mod tests {
             16 * 1024 * 1024,
             true,
         );
+        target.snapshot.product_progress_rate_bps = Some(10_000_000_000.0);
         let lower_flights = vec![CarrierPathFlightDebt {
             key: target.key,
             bytes: 8 * 1024 * 1024,
@@ -6424,9 +6482,9 @@ mod tests {
         let mut saturated_subflow =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 512 * 1024, false);
         saturated_subflow.snapshot.product_bytes_in_flight =
-            RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64);
+            RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64);
         saturated_subflow.snapshot.bytes_in_flight =
-            RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64);
+            RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64);
 
         let selected = select_response_sender_data_target_with_product_debt_and_epoch(
             &[service.clone(), saturated_subflow],
@@ -6630,7 +6688,7 @@ mod tests {
             0,
             UnderlayProtocol::Udp,
             5.0,
-            RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64),
+            RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64),
             16 * 1024 * 1024,
             true,
         );
@@ -7012,6 +7070,36 @@ mod tests {
         assert_eq!(
             selected.key, candidate.key,
             "a bulk-rate-proven path that already owns the lower range must not be blocked by a stale cross-family frontier check"
+        );
+    }
+
+    #[test]
+    fn active_cross_underlay_path_that_owns_lower_flight_remains_service_candidate() {
+        let mut old_service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, false);
+        old_service.has_bulk_rate_evidence = true;
+        let mut lower_active =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
+        lower_active.has_sender_evidence = true;
+        lower_active.has_bulk_rate_evidence = false;
+        let lower_flights = vec![CarrierPathFlightDebt {
+            key: lower_active.key,
+            bytes: 64 * 1024,
+        }];
+
+        let selected = choose_response_sender_data_target(
+            &[old_service.clone(), lower_active.clone()],
+            FlowLane::Throughput,
+            64 * 1024,
+            MuxLimits::default(),
+            &lower_flights,
+            Some(old_service.key),
+        )
+        .expect("active lower-owner path must remain eligible to advance its own frontier");
+
+        assert_eq!(
+            selected.key, lower_active.key,
+            "mixed-family health gates must not remove the active path that already owns unresolved lower bytes"
         );
     }
 

@@ -466,7 +466,7 @@ fn reliable_stream_advertised_window_from_underlay(
     let min_window = RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES
         .max(relay_chunk.saturating_mul(4))
         .min(configured);
-    let startup_window = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
+    let startup_window = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
         .max(min_window)
         .min(configured);
     if !relay_lane_is_bulk(lane) {

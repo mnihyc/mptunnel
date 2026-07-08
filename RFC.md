@@ -784,7 +784,7 @@ their origin is explicit and they do not become hidden modes.
 | UDP target/datagram path model | UDP/QUIC response timeout and retry budget derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. TCP-underlay datagrams send once per datagram ID on the reliable carrier and do not reopen the carrier merely because the UDP target response is absent |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active UDP Service flight uses the UDP startup product window, not the full resource envelope; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active UDP Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active Service flight on any carrier uses the finite startup product window, not the full resource envelope; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
 | Validation traffic | Probe/control traffic only; repair data only after explicit gap/failover evidence; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -3043,7 +3043,10 @@ pacing, flow control, and loss recovery. Cross-family paths therefore remain
 `Probe`, `RepairOnly`, or `Standby` while they would expand unresolved
 cross-family lower-byte debt. If the mixed candidate already owns the lower
 outstanding range, continuing that candidate does not expand the ordered hole
-and remains eligible when the path is bulk-rate-proven. At a clear ordered
+and remains eligible when the path is bulk-rate-proven or is the live active
+path currently responsible for that lower frontier. Mixed-family health filters
+MUST NOT remove the effective lower-frontier owner before lead selection; they
+may only block optional paths that would expand the hole. At a clear ordered
 frontier, the next Service family is metric-selected: a bulk-rate-proven TCP or
 QUIC candidate may become the next `OwnerData` Service owner if it wins the
 no-worse admission model. This rule is carrier-neutral: it blocks TCP-to-QUIC
@@ -3583,11 +3586,9 @@ if path is the lead path:
     if product_budget_rate is known:
         product_inflight_limit = min(2 * product_budget_bdp,
                                      configured_path_inflight)
-    else if path uses the UDP carrier:
-        product_inflight_limit = min(udp_startup_product_window,
-                                     configured_path_inflight)
     else:
-        product_inflight_limit = configured_path_inflight
+        product_inflight_limit = min(service_startup_product_window,
+                                     configured_path_inflight)
     product_inflight_limit = max(product_inflight_limit, chunk.len)
 else if path uses the same underlay family as the lead path:
     product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
@@ -3664,11 +3665,11 @@ completion horizon remains the positive-contribution gate for clear-frontier
 same-family admission and for cross-underlay admission once both carrier
 families are healthy enough to own reliable bytes.
 
-For QUIC same-underlay startup, the reorder/feed budget uses live QUIC carrier
-credit when available. If the QUIC implementation reports an inflight or
-congestion-window limit, that carrier limit shapes ETA and emission credit, but
-the startup owner credit is derived from the existing ACK/update BDP window and
-capped by the UDP startup product window plus the product reorder/resource
+For same-underlay startup, the reorder/feed budget uses live carrier credit when
+available. If the carrier reports an inflight or congestion-window limit, that
+carrier limit shapes ETA and emission credit, but the startup owner credit is
+derived from the existing ACK/update BDP window and capped by the
+carrier-neutral startup product window plus the product reorder/resource
 envelope. The sender MUST NOT replace that credit with a tiny product-rate BDP
 derived from the default path-open score or from one app-limited sample. This
 follows MPQUIC's per-path congestion-state model: QUIC decides packet pacing and

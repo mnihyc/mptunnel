@@ -469,7 +469,7 @@ fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
         UnderlayProtocol::Tcp => carrier_floor,
         UnderlayProtocol::Udp => {
             let minimum_meaningful_sample = (PATH_OPEN_SCORE_BYTES as u64).saturating_mul(4);
-            let startup_graduation_sample = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
+            let startup_graduation_sample = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
                 .saturating_div(2)
                 .max(minimum_meaningful_sample);
             carrier_floor
@@ -664,8 +664,8 @@ mod tests {
                     ecn_observed: false,
                     bytes_in_flight: 0,
                     queue_bytes: 0,
-                    inflight_limit_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
-                    inflight_hi_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    inflight_limit_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+                    inflight_hi_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
                     confidence_ppm: 1_000_000,
                     app_limited: true,
                     has_ack_derived_data_sample: true,
@@ -962,7 +962,7 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(11),
         };
-        let sample_bytes = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES / 2;
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
@@ -993,8 +993,8 @@ mod tests {
                     ecn_observed: false,
                     bytes_in_flight: 0,
                     queue_bytes: 0,
-                    inflight_limit_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
-                    inflight_hi_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    inflight_limit_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+                    inflight_hi_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
                     confidence_ppm: 1_000_000,
                     app_limited: false,
                     has_ack_derived_data_sample: true,
@@ -1018,7 +1018,7 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(12),
         };
-        let sample_floor = RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES / 2;
+        let sample_floor = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
@@ -1049,8 +1049,8 @@ mod tests {
                     ecn_observed: false,
                     bytes_in_flight: 0,
                     queue_bytes: 0,
-                    inflight_limit_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
-                    inflight_hi_bytes: RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES,
+                    inflight_limit_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+                    inflight_hi_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
                     confidence_ppm: 1_000_000,
                     app_limited: true,
                     has_ack_derived_data_sample: true,

@@ -1,6 +1,6 @@
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
-use super::{BBR_DEFAULT_CWND_GAIN, RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES};
+use super::{BBR_DEFAULT_CWND_GAIN, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
@@ -310,7 +310,7 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
     let role = check.role;
     if bulk_active_lead_has_contiguous_frontier(candidate, role, check.stream_ordering_debt_bytes) {
         let inflight_limit =
-            bulk_active_lead_product_envelope_bytes(candidate, payload_bytes, mux_limits);
+            bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits);
         let committed = candidate
             .product_bytes_in_flight
             .saturating_add(candidate.product_queue_bytes)
@@ -365,7 +365,7 @@ fn bulk_active_lead_has_contiguous_frontier(
     ) && stream_ordering_debt_bytes == 0
 }
 
-fn bulk_active_lead_product_envelope_bytes(
+pub(super) fn bulk_active_service_product_envelope_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
@@ -376,13 +376,9 @@ fn bulk_active_lead_product_envelope_bytes(
         .min(stream_window)
         .min(mux_limits.max_reorder_bytes)
         .max(payload_bytes) as u64;
-    let startup_limit = if candidate.underlay == UnderlayProtocol::Udp {
-        RELIABLE_UDP_INITIAL_PRODUCT_WINDOW_BYTES
-            .min(configured)
-            .max(payload_bytes as u64)
-    } else {
-        configured
-    };
+    let startup_limit = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
+        .min(configured)
+        .max(payload_bytes as u64);
     let Some(progress_rate_bps) = candidate
         .product_progress_rate_bps
         .filter(|rate| rate.is_finite() && *rate > 0.0)
@@ -410,7 +406,7 @@ fn bulk_product_inflight_limit_bytes(
             BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
         )
     {
-        return bulk_active_lead_product_envelope_bytes(candidate, payload_bytes, mux_limits);
+        return bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits);
     }
     let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
     let payload_floor = payload_bytes as u64;
@@ -607,7 +603,7 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
                     BulkAdmissionRole::ActiveDataPath,
                 )
             } else {
-                bulk_active_lead_product_envelope_bytes(candidate, payload_bytes, mux_limits)
+                bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits)
             }
         }
         BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
@@ -826,6 +822,7 @@ mod tests {
         let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
         active.queue_bytes = 8 * 1024 * 1024;
         active.product_bytes_in_flight = 8 * 1024 * 1024;
+        active.product_progress_rate_bps = Some(mbps(1_000.0));
         active.session_active_latency_sensitive_flows = 1;
 
         assert_eq!(
@@ -1037,6 +1034,32 @@ mod tests {
     }
 
     #[test]
+    fn active_tcp_without_product_progress_uses_startup_envelope_not_full_resource_ceiling() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, mbps(500.0));
+        candidate.pacing_rate_bps = mbps(2_000.0);
+        candidate.product_bytes_in_flight = 8 * 1024 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                candidate,
+                10.0,
+                candidate,
+                10.0,
+                64 * 1024,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "active TCP Service startup must use the same finite owner-credit model as QUIC before product progress exists"
+        );
+    }
+
+    #[test]
     fn cross_underlay_product_inflight_limit_is_bdp_modeled() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 32 * 1024 * 1024,
@@ -1114,6 +1137,7 @@ mod tests {
         active.snapshot.app_limited = true;
         active.snapshot.bytes_in_flight = 8 * 1024 * 1024;
         active.snapshot.product_bytes_in_flight = 8 * 1024 * 1024;
+        active.snapshot.product_progress_rate_bps = Some(mbps(1_000.0));
 
         assert_eq!(
             bulk_candidate_admission_suppression(

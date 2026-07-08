@@ -2344,6 +2344,15 @@ stream resets, detach/close frames, and received stream data before treating a
 local path-output update as sufficient progress. Output-update wakeups are
 scheduler housekeeping; they MUST NOT outrank feedback that can release
 product ownership, repair state, or flow-control credit.
+Sender-service retry state is independent from raw carrier queue capacity. A
+blocked dispatch may mean no admitted owner path, unresolved lower-byte debt,
+flow-control exhaustion, optional-traffic budget exhaustion, or a full carrier
+pipe. Therefore a pending retry MUST block additional source reads and ordinary
+queued-data dispatch until one of the real release events occurs: ACK/control
+feedback is processed, flow-control credit changes, path admission state
+changes, a carrier-capacity notification fires, or the retry deadline expires.
+It MUST NOT be cleared merely because the front carrier queue currently reports
+spare capacity.
 
 Carrier command queues are emission pipes, not permits around the sender
 service. For ordinary and repair `STREAM_DATA`, carrier queue capacity is a

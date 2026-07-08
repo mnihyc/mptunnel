@@ -260,12 +260,13 @@ where
             sender_retry_at = None;
         }
         let inbound_frame_ready = remotes.has_buffered_frame();
-        let queued_front_has_carrier_credit = sender_queue
-            .front_lane()
-            .is_some_and(|work_lane| remotes.can_enqueue_work_lane_now(work_lane, relay_lane));
-        let queued_send_blocked = !sender_queue.is_empty()
-            && sender_retry_at.is_some()
-            && !queued_front_has_carrier_credit;
+        let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
+            sender_queue.is_empty(),
+            sender_retry_at,
+            sender_queue
+                .front_lane()
+                .is_some_and(|work_lane| remotes.can_enqueue_work_lane_now(work_lane, relay_lane)),
+        );
         let queued_send_ready =
             !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
         let queued_send_retry_deadline = sender_retry_at.unwrap_or_else(tokio::time::Instant::now);
@@ -278,6 +279,7 @@ where
         } else {
             Vec::new()
         };
+        let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
         let can_read_by_flow = reliable_relay_can_read_product_source(
             local_open,
             queued_send_blocked,
@@ -729,7 +731,7 @@ where
                 sender_retry_at = None;
                 continue;
             }
-            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked => {
+            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked && has_carrier_capacity_notify => {
                 sender_retry_at = None;
                 continue;
             }
@@ -1690,6 +1692,14 @@ fn reliable_relay_can_send_pending_fin(pending_local_fin: bool, sender_queue_emp
     pending_local_fin && sender_queue_empty
 }
 
+fn reliable_relay_queued_send_blocked_for_retry(
+    sender_queue_empty: bool,
+    sender_retry_at: Option<tokio::time::Instant>,
+    _front_has_carrier_credit: bool,
+) -> bool {
+    !sender_queue_empty && sender_retry_at.is_some()
+}
+
 fn reliable_relay_should_wait_for_pending_path_recovery(
     remote_open: bool,
     pending_validation_opens: &HashMap<RelayPathKey, RelayValidationOpenTask>,
@@ -2498,6 +2508,23 @@ mod tests {
         assert!(reliable_relay_can_send_pending_fin(true, true));
         assert!(!reliable_relay_can_send_pending_fin(true, false));
         assert!(!reliable_relay_can_send_pending_fin(false, true));
+    }
+
+    #[test]
+    fn queued_sender_retry_blocks_even_when_carrier_has_capacity() {
+        assert!(reliable_relay_queued_send_blocked_for_retry(
+            false,
+            Some(tokio::time::Instant::now()),
+            true,
+        ));
+        assert!(!reliable_relay_queued_send_blocked_for_retry(
+            true,
+            Some(tokio::time::Instant::now()),
+            true,
+        ));
+        assert!(!reliable_relay_queued_send_blocked_for_retry(
+            false, None, false,
+        ));
     }
 
     #[test]

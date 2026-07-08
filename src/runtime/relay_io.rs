@@ -617,6 +617,14 @@ fn response_sender_wait_state(
             retry_at: None,
         };
     }
+    if let Some(retry_at) = retry_at.filter(|deadline| *deadline > now) {
+        return ResponseSenderWaitState {
+            blocked: true,
+            ready: false,
+            subscribe_capacity: true,
+            retry_at: Some(retry_at),
+        };
+    }
     if front_has_carrier_credit {
         return ResponseSenderWaitState {
             blocked: false,
@@ -625,9 +633,7 @@ fn response_sender_wait_state(
             retry_at: None,
         };
     }
-    let retry_at = retry_at
-        .filter(|deadline| *deadline > now)
-        .unwrap_or(now + retry_delay);
+    let retry_at = now + retry_delay;
     ResponseSenderWaitState {
         blocked: true,
         ready: false,
@@ -2533,6 +2539,20 @@ mod tests {
             "product-ordering pressure is handled by sender admission, not carrier pipe exhaustion"
         );
         assert_eq!(state.retry_at, None);
+    }
+
+    #[test]
+    fn response_sender_wait_state_preserves_pending_retry_with_carrier_credit() {
+        let now = tokio::time::Instant::now();
+        let retry_delay = Duration::from_millis(10);
+        let retry_at = now + retry_delay;
+
+        let state = response_sender_wait_state(true, true, true, Some(retry_at), now, retry_delay);
+
+        assert!(state.blocked);
+        assert!(!state.ready);
+        assert!(state.subscribe_capacity);
+        assert_eq!(state.retry_at, Some(retry_at));
     }
 
     #[test]

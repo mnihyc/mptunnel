@@ -714,9 +714,8 @@ fn response_target_unique_owner_admission(
 //
 // The important split is:
 // * Service: the current active/lower-frontier owner, kept fed while healthy.
-// * Subflow: additional path admitted with bounded startup owner credit when
-//   startup policy permits it, or for steady-state owner bytes with bulk-rate
-//   evidence and candidate-specific ordering safety.
+// * Subflow: additional path admitted for owner bytes only after path-scoped
+//   bulk-rate evidence and candidate-specific ordering safety.
 //
 // Path proof, ACK-data visibility, and carrier attachment are intentionally not
 // owner states. They are evidence inputs for this decision.
@@ -727,7 +726,7 @@ fn response_target_unique_owner_admission_with_epoch(
     lower_owner: Option<CarrierPathKey>,
     ordered_data_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    ordered_owner_debt_bytes: usize,
+    _ordered_owner_debt_bytes: usize,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
@@ -779,32 +778,10 @@ fn response_target_unique_owner_admission_with_epoch(
                 stream_ordering_debt_bytes: ordering_debt,
             })
             .is_none();
-    let startup_subflow_sample = lower_owner.is_none()
-        && ordered_owner_debt_bytes == 0
-        && !target.is_active
-        && target.key.underlay == service_key.underlay
-        && candidates
-            .iter()
-            .copied()
-            .find(|candidate| candidate.key == service_key)
-            .is_some_and(|candidate| candidate.has_bulk_rate_evidence)
-        && target.has_sender_evidence
-        && !target.has_bulk_rate_evidence;
-    let completion_improves =
-        model_allows_owner && (target.has_bulk_rate_evidence || startup_subflow_sample);
-    let owner_credit_bytes = if startup_subflow_sample {
-        response_startup_subflow_owner_credit_bytes(
-            target,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        )
-    } else {
-        payload_bytes
-    };
+    let completion_improves = model_allows_owner && target.has_bulk_rate_evidence;
+    let owner_credit_bytes = payload_bytes;
     let input = SubflowAdmissionInput {
         key: target.key,
-        sender_evidence: target.has_sender_evidence,
         bulk_rate_proven: target.has_bulk_rate_evidence,
         frontier_clear: model_allows_owner,
         completion_improves,
@@ -1874,37 +1851,6 @@ fn response_target_emission_credit_bytes(
         .max(1)
 }
 
-fn response_active_owner_feed_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> usize {
-    mux_limits
-        .max_path_flight_bytes
-        .min(mux_limits.max_repair_bytes)
-        .min(mux_limits.max_reorder_bytes)
-        .min(usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX))
-        .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
-        .max(payload_bytes)
-        .max(1)
-}
-
-fn response_startup_subflow_owner_credit_bytes(
-    target: &ResponseSenderPathTarget,
-    lane: FlowLane,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    let ack_step = usize::try_from(reliable_stream_ack_update_bytes(
-        Some(target.snapshot),
-        lane,
-        mux_limits,
-    ))
-    .unwrap_or(usize::MAX);
-    let active_envelope = response_active_owner_feed_credit_bytes(payload_bytes, mux_limits);
-    let startup_ceiling = usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES)
-        .unwrap_or(usize::MAX)
-        .min(active_envelope)
-        .max(payload_bytes);
-    ack_step.clamp(payload_bytes, startup_ceiling).max(1)
-}
-
 fn response_quic_carrier_feed_credit_bytes(
     target: &ResponseSenderPathTarget,
     payload_bytes: usize,
@@ -1982,10 +1928,8 @@ fn plan_response_data_dispatch_with_product_debt(
             let target = selected.target;
             let role = selected.admission.role;
             debug_assert!(
-                role != PathRuntimeRole::Subflow
-                    || target.has_bulk_rate_evidence
-                    || target.has_sender_evidence,
-                "Subflow OwnerData requires sender evidence for startup or bulk-rate evidence for steady state: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
+                role != PathRuntimeRole::Subflow || target.has_bulk_rate_evidence,
+                "Subflow OwnerData requires bulk-rate evidence: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
                 target.key,
                 role,
                 ordered_data_owner,
@@ -5481,7 +5425,7 @@ mod tests {
                 underlay: UnderlayProtocol::Udp,
                 path_id: PathId(0),
             }),
-            "ACK-data evidence cannot create a startup Subflow sample before the Service path has bulk-rate evidence"
+            "ACK-data evidence cannot create Subflow OwnerData before the candidate has bulk-rate evidence"
         );
         assert_eq!(
             plan.primary_role(),
@@ -5573,7 +5517,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_ack_data_seen_path_does_not_displace_bulk_rate_proven_owner() {
+    fn quic_ack_data_seen_path_keeps_bulk_rate_proven_service_owner() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active = response_target(
@@ -5602,21 +5546,21 @@ mod tests {
             0,
             None,
         )
-        .expect("ACK-data-seen path should receive same-family startup owner credit");
+        .expect("bulk-rate-proven Service should remain dispatchable");
 
         assert_eq!(
-            selected.target.key, ack_data_only.key,
-            "ACK-data-seen path may receive startup Subflow owner credit without displacing Service"
+            selected.target.key, active.key,
+            "ACK-data-seen path must not receive ordered owner bytes until it has bulk-rate proof"
         );
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "ACK-data-seen startup owner credit must be Subflow, not Service"
+            PathRuntimeRole::Service,
+            "ACK-data-only evidence is not a Subflow owner state"
         );
     }
 
     #[test]
-    fn same_family_startup_subflow_credit_is_window_not_single_frame() {
+    fn same_family_bulk_rate_subflow_admission_is_per_decision_not_startup_credit() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -5632,12 +5576,12 @@ mod tests {
             true,
         );
         active.has_bulk_rate_evidence = true;
-        let mut ack_data_only = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-        ack_data_only.has_sender_evidence = true;
-        ack_data_only.has_bulk_rate_evidence = false;
+        let mut bulk_rate_subflow = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
+        bulk_rate_subflow.has_sender_evidence = true;
+        bulk_rate_subflow.has_bulk_rate_evidence = true;
 
         let first = select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[active.clone(), ack_data_only.clone()],
+            &[active.clone(), bulk_rate_subflow.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
@@ -5646,14 +5590,14 @@ mod tests {
             0,
             None,
         )
-        .expect("first startup Subflow frame should be admitted");
+        .expect("first measured Subflow frame should be admitted");
         let commit = first
             .subflow_set_commit
-            .expect("startup Subflow admission should carry commit state");
+            .expect("measured Subflow admission should carry commit state");
         assert_eq!(first.admission.role, PathRuntimeRole::Subflow);
-        assert!(
-            commit.owner_credit_bytes > payload_bytes,
-            "startup Subflow credit should be a bounded window large enough to produce non-app-limited carrier evidence"
+        assert_eq!(
+            commit.owner_credit_bytes, payload_bytes,
+            "measured Subflow decisions use the assigned owner range, not startup sampling credit"
         );
 
         let mut subflow_set = FlowSubflowSet::new(
@@ -5669,7 +5613,7 @@ mod tests {
         );
 
         let second = select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[active.clone(), ack_data_only.clone()],
+            &[active.clone(), bulk_rate_subflow.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
@@ -5678,8 +5622,8 @@ mod tests {
             0,
             Some(&subflow_set),
         )
-        .expect("startup Subflow should remain admissible while its bounded owner credit remains");
-        assert_eq!(second.target.key, ack_data_only.key);
+        .expect("measured Subflow should remain eligible if per-decision no-worse gates pass");
+        assert_eq!(second.target.key, bulk_rate_subflow.key);
         assert_eq!(second.admission.role, PathRuntimeRole::Subflow);
     }
 
@@ -5768,7 +5712,7 @@ mod tests {
                 inflight_hi_bytes: payload_bytes as u64,
                 confidence_ppm: 1_000_000,
                 app_limited: true,
-                has_ack_derived_data_sample: false,
+                has_ack_derived_data_sample: true,
                 data_sample_count: 0,
                 data_sample_bytes: 0,
             },
@@ -6075,8 +6019,8 @@ mod tests {
             mux_limits,
         );
 
-        assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-        assert_eq!(admission.role, PathRuntimeRole::Subflow);
+        assert_eq!(admission.decision, PathAdmissionDecision::ProbeOnly);
+        assert_eq!(admission.role, PathRuntimeRole::Probe);
     }
 
     #[test]
@@ -6107,7 +6051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_planning_keeps_feedable_service_before_same_family_startup_sample() {
+    async fn response_planning_keeps_service_before_app_limited_subflow_candidate() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let (active_commands, mut active_rx) = reliable_path_command_channels(8);
@@ -6193,7 +6137,7 @@ mod tests {
                 inflight_hi_bytes: (payload_bytes * 8) as u64,
                 confidence_ppm: 900_000,
                 app_limited: true,
-                has_ack_derived_data_sample: false,
+                has_ack_derived_data_sample: true,
                 data_sample_count: 0,
                 data_sample_bytes: 0,
             },
@@ -6241,17 +6185,17 @@ mod tests {
             frames: frames_rx,
         };
         let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("feedable Service should be dispatchable before startup Subflow sample");
+            .expect("feedable Service should be dispatchable");
 
         assert_eq!(
             plan.primary_key(),
             Some(service),
-            "same-family sender-evidence path must not displace a feedable Service quantum"
+            "app-limited ACK-data evidence must not displace the Service owner"
         );
         assert_eq!(
             plan.primary_role(),
             PathRuntimeRole::Service,
-            "startup sender evidence must not become a Service migration or replace Service OwnerData"
+            "Subflow OwnerData requires bulk-rate proof"
         );
 
         let frame = Frame::StreamData {
@@ -6272,7 +6216,7 @@ mod tests {
         );
         assert!(
             try_recv_reliable_path_command(&mut active_rx).is_some(),
-            "feedable Service quantum must be emitted on Service"
+            "Service quantum must be emitted on the Service path"
         );
 
         let followup_plan = plan_response_data_dispatch(
@@ -6285,7 +6229,12 @@ mod tests {
         assert_eq!(
             followup_plan.primary_role(),
             PathRuntimeRole::Service,
-            "normal unacked lower bytes are recovery state; startup Subflow credit must not replace a feedable Service follow-up"
+            "normal Service tail remains on Service instead of creating Subflow ordered debt"
+        );
+        assert_eq!(
+            followup_plan.primary_key(),
+            Some(service),
+            "the Service path remains responsible for the ordered tail"
         );
     }
 
@@ -7166,7 +7115,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_service_does_not_block_clear_frontier_startup_subflow() {
+    fn saturated_service_does_not_admit_unproven_subflow_owner() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut service = response_target(
@@ -7194,17 +7143,14 @@ mod tests {
             Some(service.key),
             0,
             None,
-        )
-        .expect("same-family startup Subflow should be admitted at a clear frontier");
-
-        assert_eq!(
-            selected.target.key, startup_subflow.key,
-            "Service feed backpressure must not suppress a bounded same-family startup Subflow sample"
         );
-        assert_eq!(
-            selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "startup sample is Subflow OwnerData, not a Service migration"
+
+        assert!(
+            selected.is_none()
+                || selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.target.key != startup_subflow.key),
+            "sender-evidence-only paths must not receive OwnerData even when Service is saturated"
         );
     }
 
@@ -7245,7 +7191,7 @@ mod tests {
                     selected.target.key != startup_subflow.key
                         || selected.target.has_bulk_rate_evidence
                 }),
-            "proof-only startup Subflow OwnerData is frontier-clear only; it must wait behind a live lower Service tail"
+            "proof-only Subflow OwnerData must wait behind a live lower Service tail"
         );
     }
 
@@ -7591,7 +7537,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_clear_same_family_sender_evidence_is_subflow_not_service() {
+    fn frontier_clear_same_family_sender_evidence_remains_service_not_subflow() {
         let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let mut lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -7608,16 +7554,16 @@ mod tests {
             0,
             None,
         )
-        .expect("same-family sender-evidence path should receive bounded startup owner credit");
+        .expect("current Service owner should remain eligible");
 
         assert_eq!(
-            selected.target.key, lower_eta_alternate.key,
-            "sender evidence is enough for bounded startup Subflow owner credit at a clear same-family frontier"
+            selected.target.key, owner.key,
+            "sender evidence alone must not create Subflow owner credit at a clear same-family frontier"
         );
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "startup owner credit must not be classified as Service migration"
+            PathRuntimeRole::Service,
+            "unproven alternates remain Probe/Standby instead of becoming Subflow owners"
         );
     }
 

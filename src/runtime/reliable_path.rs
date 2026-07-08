@@ -1236,7 +1236,7 @@ impl ResponseStreamBinding {
             max_read_gap_budget,
         );
         let admission = epoch.admit_subflow_owner(input);
-        *guard = Some(epoch);
+        *guard = epoch.has_members().then_some(epoch);
         admission
     }
 
@@ -2361,7 +2361,6 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         let input = SubflowAdmissionInput {
             key: optional,
-            sender_evidence: true,
             bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: true,
@@ -2414,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn response_subflow_set_rejects_unproven_startup_after_credit_is_spent() {
+    fn response_subflow_set_rejects_unproven_owner_without_bulk_rate() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -2423,7 +2422,6 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         let input = SubflowAdmissionInput {
             key: optional,
-            sender_evidence: true,
             bulk_rate_proven: false,
             frontier_clear: true,
             completion_improves: true,
@@ -2442,9 +2440,10 @@ mod tests {
         );
         assert_eq!(
             committed.decision,
-            PathAdmissionDecision::AdmitSubflow,
-            "same-family startup Subflow owner windows are unique payload bytes that produce real delivery evidence"
+            PathAdmissionDecision::ProbeOnly,
+            "sender/proof/ACK-data evidence is not enough to enter the owner Subflow set"
         );
+        assert!(binding.subflow_set_snapshot().is_none());
 
         let second = binding.preview_subflow_owner_admission(
             service,
@@ -2456,7 +2455,7 @@ mod tests {
         assert_eq!(
             second.decision,
             PathAdmissionDecision::ProbeOnly,
-            "unproven Subflows return to Probe after bounded startup owner credit is spent"
+            "unproven Subflows remain Probe until they have bulk-rate evidence"
         );
 
         binding.reset_subflow_set();
@@ -2467,11 +2466,11 @@ mod tests {
             Duration::ZERO,
             input,
         );
-        assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(after_reset.decision, PathAdmissionDecision::ProbeOnly);
     }
 
     #[test]
-    fn response_subflow_startup_credit_survives_ack_progress() {
+    fn response_subflow_unproven_probe_state_survives_ack_progress() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -2480,7 +2479,6 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         let input = SubflowAdmissionInput {
             key: optional,
-            sender_evidence: true,
             bulk_rate_proven: false,
             frontier_clear: true,
             completion_improves: true,
@@ -2494,7 +2492,7 @@ mod tests {
             binding
                 .commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
                 .decision,
-            PathAdmissionDecision::AdmitSubflow
+            PathAdmissionDecision::ProbeOnly
         );
         assert_eq!(
             binding
@@ -2515,12 +2513,12 @@ mod tests {
                 .preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
                 .decision,
             PathAdmissionDecision::ProbeOnly,
-            "ordinary ACK progress must not recreate startup Subflow owner credit"
+            "ordinary ACK progress must not convert an unproven path into a Subflow owner"
         );
     }
 
     #[test]
-    fn response_subflow_startup_credit_resets_when_output_detaches() {
+    fn response_subflow_set_resets_when_output_detaches() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -2539,8 +2537,7 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         let input = SubflowAdmissionInput {
             key: optional,
-            sender_evidence: true,
-            bulk_rate_proven: false,
+            bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,

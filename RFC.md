@@ -332,8 +332,8 @@ A path group or carrier subflow set is not a product-offset owner. It is a bound
 scheduler epoch for one flow: one Service path plus admitted Subflow members
 selected from session paths, path-model evidence, queue state, and
 ECF/BLEST/no-worse admission. ACK progress updates delivery metrics, ordering
-frontier, and later admission inputs, but it MUST NOT erase the subflow set's
-spent startup owner credit or recreate validation credit. The epoch remains
+frontier, and later admission inputs, but it MUST NOT recreate validation
+credit or reinterpret probe evidence as owner evidence. The epoch remains
 valid while its Service, owner-credit envelope, overhead budget, read-gap budget,
 and live carrier membership still match the admission envelope. It is recreated
 on material envelope change, detach/failover, or carrier-membership change, not
@@ -413,23 +413,15 @@ admits that owner range; it does not replace the Service anchor unless the
 explicit Service migration policy performs a handoff.
 When the current Service owner is alive but backpressured by unresolved
 contiguous owner tail, a cross-underlay alternate MUST wait instead of owning
-later byte ranges. Same-underlay Subflow startup or steady-state admission may
-still proceed through its normal no-worse gates because it shares the same
-carrier-family recovery assumptions; cross-underlay ownership requires the
-Service owner to be feedable, failed, or explicitly migrated.
+later byte ranges. Same-underlay Subflow admission may proceed only after the
+candidate has direction-correct bulk-rate evidence and passes its no-worse
+gates; sharing a carrier family is not enough to create ordered ownership.
+Cross-underlay ownership requires the Service owner to be feedable, failed, or
+explicitly migrated.
 ACK-data-only evidence from a tiny or application-limited probe is still not
-bulk-rate evidence and does not grant Service rights. A
-Subflow on the current Service family may carry a bounded startup `OwnerData`
-window at a clear ordered frontier after the current Service has
-direction-correct bulk-rate evidence and the Subflow has path-scoped sender
-evidence. Configured or peer
-hints alone are not sender evidence and MUST NOT unlock this unique-data
-window. That window is unique payload data, not duplicate/probe traffic; it does
-not change the Service owner hint and it does not make the Subflow the
-lower-frontier Service for additional bytes. It is capped by the path-adaptive
-startup owner credit and is not a steady-state role. After that credit is
-spent, further Subflow `OwnerData` requires direction-correct bulk-rate
-evidence. Steady-state Subflow `OwnerData` requires bulk-rate evidence and
+bulk-rate evidence and does not grant Service or Subflow owner rights.
+Configured or peer hints alone are not sender evidence and MUST NOT unlock
+unique-data ownership. `Subflow` `OwnerData` requires bulk-rate evidence and
 sender-service admission proving that doing so will not expand product
 receive-hole debt or worsen the completion horizon. This rule is path-metric
 driven; it is not a TCP-preferred or UDP-preferred policy. Mixed TCP+QUIC paths
@@ -2276,20 +2268,17 @@ observed actual delivery.
 Once a stream has an ordered-data owner and the scheduler has opened
 same-underlay candidate outputs, app-limited startup samples MUST NOT be treated
 as long-term bandwidth proof for ECF/BLEST completion-horizon rejection. QUIC's
-initial congestion window and early MPTCP subflow growth are probe mechanisms, not
-accurate bulk-rate priors. A same-underlay candidate may receive a bounded
-frontier-clear startup Subflow owner window after the current Service has
-bulk-rate evidence and the candidate has path-scoped sender evidence, but it may
-be admitted for steady-state Subflow ownership only after bulk-rate evidence
-exists and it still fits product inflight, carrier credit, completion, and
-reorder budgets. This is true even if a candidate's current ETA is worse than
-the lead's ETA, because same-underlay ETA can be an artifact of
-underfeeding and validation; the correct proof is whether the additional path
-creates ordered receive-hole debt. If same-underlay Service later creates real
-stream-ordering debt, the lower-frontier owner rule and completion-horizon gate
-become authoritative for further unique bytes. Cross-underlay candidates remain
-strict even during startup, because TCP and QUIC expose different queueing and
-HOL behavior.
+initial congestion window and early MPTCP subflow growth are probe mechanisms,
+not accurate bulk-rate priors. A same-underlay candidate may be admitted for
+Subflow ownership only after direction-correct bulk-rate evidence exists and it
+still fits product inflight, carrier credit, completion, and reorder budgets.
+Same-underlay ETA can be an artifact of underfeeding and validation; the
+authoritative proof is whether the additional path has delivered enough
+path-scoped data without creating ordered receive-hole debt. If same-underlay
+Service later creates real stream-ordering debt, the lower-frontier owner rule
+and completion-horizon gate become authoritative for further unique bytes.
+Cross-underlay candidates remain strict during startup because TCP and QUIC
+expose different queueing and HOL behavior.
 
 ### 17.3 ETA Scoring
 
@@ -2825,11 +2814,10 @@ or replaying repair outside the measured send loop.
 
 For bulk reliable streams, the scheduler maintains a small subflow set epoch for the
 current flow: one Service owner plus Subflow members admitted from live ETA,
-flow sharing, health, and capability state. Startup Subflow samples are bounded
-and require path-scoped sender evidence; steady-state Subflow owner bytes require
-bulk-rate evidence. Individual dispatches consume credit from that set; they do
-not recreate validation credit from scratch, and ordinary ACK progress does not
-reset spent startup Subflow credit. ACKs update the per-range flight ledger,
+flow sharing, health, and capability state. Subflow owner bytes require
+direction-correct bulk-rate evidence. Individual dispatches consume credit from
+that set; they do not recreate validation credit from scratch, and ordinary ACK
+progress does not reset validation/probe credit. ACKs update the per-range flight ledger,
 delivery samples, and the next admission calculation; detach, carrier close,
 failover, or a changed Service/envelope resets the subflow set. Additional paths
 attached to the same stream are not automatically ordinary data paths. Their
@@ -2855,12 +2843,10 @@ An unknown path does not join ordinary same-stream bulk merely because it is
 open, but a Validation attachment can receive path-scoped proof traffic.
 Path proof creates liveness/sender evidence only; it is not product delivery
 proof and does not itself make the path a bulk subflow. Same-family proof paths
-MUST NOT receive steady-state product `OwnerData` until they have bulk-rate
-evidence. They MAY receive only the bounded clear-frontier startup Subflow
-`OwnerData` window described above, and only after the current Service has
-direction-correct bulk-rate evidence. A path that lacks bulk-rate evidence and
-has no remaining startup Subflow credit stays `Probe`, `Standby`, or
-`RepairOnly`.
+MUST NOT receive product `OwnerData` until they have direction-correct bulk-rate
+evidence. A path with ACK-data evidence but no bulk-rate evidence remains
+`Probe`, `Standby`, or `RepairOnly`; ACK-data visibility can keep the path in
+the validation/ranking set, but it cannot own ordered product offsets.
 The bulk-rate evidence floor is byte-counted, but it MUST tolerate one
 packet-scale accounting slack around the startup graduation threshold. QUIC ACK
 accounting, stream segmentation, and product-frame boundaries can differ by a
@@ -3109,11 +3095,8 @@ while another path owns unresolved lower bytes.
 
 Validation outputs do not receive product `STREAM_DATA` for discovery. Attached
 but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic
-for bootstrap. A same-family Subflow may receive only the bounded clear-frontier
-startup `OwnerData` window described in the Service/Subflow rules before
-bulk-rate evidence exists. After that window is spent, a Subflow may receive
-unique owner bytes only after path-scoped bulk-rate evidence exists and the
-no-worse admission model accepts it.
+for bootstrap. A Subflow may receive unique owner bytes only after path-scoped
+bulk-rate evidence exists and the no-worse admission model accepts it.
 
 The production SafeBestPath guard separates two debt ledgers. Ordered-owner
 scheduling debt is any bulk `OwnerData` suffix below the sender's highest owner
@@ -3863,11 +3846,10 @@ MUST NOT change the Service owner hint merely because it carried the next range.
 The current Service may remain the subflow-set anchor even when it is temporarily
 over its local product-feed envelope. That anchor status is not send admission:
 it only supplies the measured baseline for evaluating Subflow candidates. A
-clear-frontier Subflow on the current Service family with path-scoped sender
-evidence may spend its bounded startup OwnerData credit while the Service waits
-for ACK or queue progress, provided the Subflow's own no-worse gates pass. If no
-candidate passes those gates, the sender waits; it MUST NOT bypass the Service
-admission check by relabeling another path as Service.
+clear-frontier Subflow may receive OwnerData only when it already has
+path-scoped bulk-rate evidence and its no-worse gates pass. If no candidate
+passes those gates, the sender waits; it MUST NOT bypass the Service admission
+check by relabeling another path as Service.
 An app-limited Subflow is not a positive-contribution proof strong enough to
 replace a feedable Service quantum. A non-app-limited bulk-rate-proven Subflow
 may still win the normal no-worse ETA/completion admission. The sender MUST NOT

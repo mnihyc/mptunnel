@@ -34,10 +34,10 @@ pub(super) enum PathRuntimeRole {
     /// A validated additional path that may carry unique ordered bytes.
     ///
     /// `Subflow` is intentionally the same term used by MPTCP. In mptunnel it
-    /// means an additional path admitted by the no-worse guard. It may spend
-    /// bounded startup owner credit with path-scoped sender evidence only when
-    /// the startup policy permits it, then requires bulk-rate evidence for
-    /// steady-state owner bytes.
+    /// means an additional path admitted by the no-worse guard after it has
+    /// path-scoped bulk-rate evidence. Liveness, proof, ACK-data visibility,
+    /// and configured hints remain probe/ranking inputs; they do not grant
+    /// ordered-byte ownership.
     Subflow,
     /// Path-manager/control-plane probing only. A probe cannot own product
     /// offsets and cannot create product delivery proof.
@@ -263,7 +263,6 @@ pub(super) struct SubflowMember {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SubflowAdmissionInput {
     pub(super) key: CarrierPathKey,
-    pub(super) sender_evidence: bool,
     pub(super) bulk_rate_proven: bool,
     pub(super) frontier_clear: bool,
     pub(super) completion_improves: bool,
@@ -313,6 +312,10 @@ impl FlowSubflowSet {
     #[cfg(test)]
     pub(super) fn members(&self) -> &[SubflowMember] {
         &self.members
+    }
+
+    pub(super) fn has_members(&self) -> bool {
+        !self.members.is_empty()
     }
 
     #[cfg(test)]
@@ -374,13 +377,8 @@ impl FlowSubflowSet {
     }
 
     fn subflow_owner_allowed(&self, input: SubflowAdmissionInput) -> bool {
-        // Common gates are the invariant part of the no-worse rule: a
-        // non-Service path may only receive unique bytes when the ordered
-        // frontier is clear, modeled completion improves, observed goodput is
-        // not degrading, read-gap pressure is within budget, and repair
-        // overhead remains bounded.
-
-        let common_ok = input.frontier_clear
+        input.bulk_rate_proven
+            && input.frontier_clear
             && input.completion_improves
             && input.observed_goodput_non_degrading
             && input.read_gap <= self.max_read_gap_budget
@@ -388,24 +386,7 @@ impl FlowSubflowSet {
                 .optional_overhead_spent_bytes
                 .saturating_add(input.optional_overhead_bytes as u64)
                 <= self.optional_overhead_budget_bytes
-            && (input.owner_bytes as u64) <= self.owner_credit_bytes;
-        if !common_ok {
-            return false;
-        }
-        if input.bulk_rate_proven {
-            return true;
-        }
-
-        if !input.sender_evidence || input.key.underlay != self.service.underlay {
-            return false;
-        }
-
-        let already_sent = self
-            .members
-            .iter()
-            .find(|member| member.key == input.key)
-            .map_or(0, |member| member.owner_sent_bytes);
-        already_sent.saturating_add(input.owner_bytes as u64) <= self.owner_credit_bytes
+            && (input.owner_bytes as u64) <= self.owner_credit_bytes
     }
 
     fn probe_allowed(&self, input: SubflowAdmissionInput) -> bool {
@@ -505,7 +486,6 @@ mod tests {
 
         let rejected = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
-            sender_evidence: true,
             bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: false,
@@ -520,7 +500,6 @@ mod tests {
 
         let admitted = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
-            sender_evidence: true,
             bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: true,
@@ -544,7 +523,6 @@ mod tests {
 
         let unproven_owner = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
-            sender_evidence: false,
             bulk_rate_proven: false,
             frontier_clear: true,
             completion_improves: true,
@@ -561,7 +539,6 @@ mod tests {
 
         let too_much_read_gap = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
-            sender_evidence: true,
             bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: true,
@@ -574,7 +551,6 @@ mod tests {
 
         let too_much_overhead = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
-            sender_evidence: true,
             bulk_rate_proven: true,
             frontier_clear: true,
             completion_improves: true,
@@ -588,13 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn subflow_set_allows_sender_evidence_startup_until_owner_credit_is_spent() {
+    fn subflow_set_rejects_sender_evidence_without_bulk_rate_proof() {
         let payload_bytes = 64 * 1024;
         let mut epoch =
             FlowSubflowSet::new(10, key(0), payload_bytes * 3, 0, Duration::from_millis(100));
         let input = SubflowAdmissionInput {
             key: key(1),
-            sender_evidence: true,
             bulk_rate_proven: false,
             frontier_clear: true,
             completion_improves: true,
@@ -604,21 +579,15 @@ mod tests {
             optional_overhead_bytes: 0,
         };
 
-        for _ in 0..3 {
-            let admission = epoch.admit_subflow_owner(input);
-            assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-            assert_eq!(admission.role, PathRuntimeRole::Subflow);
-        }
-
-        let exhausted = epoch.admit_subflow_owner(input);
+        let rejected = epoch.admit_subflow_owner(input);
         assert_eq!(
-            exhausted.decision,
+            rejected.decision,
             PathAdmissionDecision::ProbeOnly,
-            "startup Subflow OwnerData is bounded by owner credit, not a new steady-state role"
+            "sender/path-proof evidence is probe evidence, not enough to own ordered product bytes"
         );
-        assert_eq!(
-            epoch.members()[0].owner_sent_bytes,
-            (payload_bytes * 3) as u64
+        assert!(
+            epoch.members().is_empty(),
+            "unproven paths must not enter the owner Subflow set"
         );
     }
 
@@ -629,7 +598,6 @@ mod tests {
 
         let service = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(3),
-            sender_evidence: false,
             bulk_rate_proven: false,
             frontier_clear: false,
             completion_improves: false,

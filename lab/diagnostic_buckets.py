@@ -174,7 +174,7 @@ def collect_metrics(
                 reliable_open_timeouts += 1
             elif event == "reliable_stream_open_success":
                 reliable_open_successes += 1
-            elif event in {"udp_datagram_response_timeout", "udp_datagram_retransmit_after_timeout"}:
+            elif event == "udp_datagram_response_timeout":
                 datagram_timeouts += 1
 
     control_waits = [

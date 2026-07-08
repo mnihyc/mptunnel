@@ -36,8 +36,13 @@ def application_payload_bytes(row: dict[str, Any]) -> tuple[int | None, str | No
             return value, field
 
     if row.get("protocol") == "udp":
+        attempted = _int_number(row.get("count"))
         received = _int_number(row.get("received"))
         payload_bytes = _int_number(row.get("payload_bytes"))
+        if attempted is not None and received is not None and payload_bytes is not None:
+            total_payloads = attempted + received
+            if total_payloads > 0:
+                return total_payloads * payload_bytes, "udp_count_plus_received*payload_bytes"
         if received is not None and payload_bytes is not None and received > 0:
             return received * payload_bytes, "received*payload_bytes"
 

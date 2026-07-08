@@ -781,7 +781,7 @@ their origin is explicit and they do not become hidden modes.
 | MAX_DATA cadence | Credit update after a window/chunk-derived threshold | QUIC flow-control update logic | Coarse credit can stall high-BDP streams | Keep adaptive from window/chunk |
 | Active stall and retry timing | Derived from QUIC PTO, observed RTT/rttvar, lane state, TTL, and persistent congestion threshold | QUIC PTO/recovery model | Fixed sleeps underfeed high-rate carriers or delay failover | Fixed retry/stall constants are removed from data-plane policy |
 | Path failure cooldown | Derived from PTO and consecutive failures, capped by QUIC persistent congestion threshold | QUIC persistent-congestion backoff applied to path reuse | Fixed cooldown can hide recovered paths | Fixed 5s cooldown is removed |
-| UDP target/datagram path model | UDP/QUIC response timeout and retry budget derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. TCP-underlay datagrams send once per datagram ID on the reliable carrier and do not reopen the carrier merely because the UDP target response is absent |
+| UDP target/datagram path model | UDP/QUIC response deadline derives from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. A product datagram ID is emitted once on the selected carrier and expires on absent target response instead of being replayed on another carrier |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
 | Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active Service flight on any carrier uses the finite startup product window, not the full resource envelope; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
@@ -797,20 +797,20 @@ them.
 | --- | --- |
 | `max_udp_replay_window_packets` and `udp_replay_window_packets_for_inflight` | Removed. Production UDP is QUIC-only, and mptunnel does not expose or compute a custom UDP replay-window parameter. |
 | `max_tcp_path_inflight_bytes` | Renamed to `max_path_flight_bytes` because the envelope applies to product path flight and QUIC send-window resource mapping, not only TCP. |
-| `UDP_BBR_PACING_GAIN` / `UDP_DATAGRAM_MODEL_PACING_GAIN` | Removed. UDP target/datagram pacing now uses measured delivery rate, loss backoff, one-payload-per-PTO floor, and TTL/PTO-derived retry state. QUIC packet pacing remains owned by the QUIC library. |
+| `UDP_BBR_PACING_GAIN` / `UDP_DATAGRAM_MODEL_PACING_GAIN` | Removed. UDP target/datagram pacing now uses measured delivery rate, loss backoff, one-payload-per-PTO floor, and TTL/PTO-derived freshness state. QUIC packet pacing remains owned by the QUIC library. |
 | Fixed scheduler millisecond weights | Removed. Expensive, suspect, backup, TCP-reorder, loss, confidence, shared-bottleneck, tail, and duplicate-admission decisions now derive from PTO, BDP, jitter, loss, transmit time, queue debt, and confidence. |
 | Fixed tail/duplication byte thresholds | Removed. Tail avoidance derives from latency-path BDP, and duplication slack derives from jitter or a QUIC initial-window fraction of PTO. |
 | Fixed lane BDP fractions | Removed from production data-plane policy. Service quanta now use BBR send quantum, MinPipeCwnd, BBR cwnd gain, and condition factors derived from queue/loss/jitter/backlog. |
 | Fixed stability/backlog floors such as 0.125/0.25 | Removed. Floors now come from MinPipeCwnd or send quantum divided by current BDP, so low-BDP/idle paths stay efficient while high-BDP paths are not arbitrarily capped. |
 | Fixed path-open 4 KiB score sample | Removed. Startup scoring uses QUIC initial-window packet-count shape, `10 * MSS`, not an unrelated small byte count. |
 | Fixed 5s path failure cooldown | Removed. Cooldown is derived from PTO and consecutive failure count under the QUIC persistent-congestion threshold. |
-| UDP target/datagram clamps `50ms..1s`, `250ms`, `8*SRTT`, and `64Kbps` | Removed. Datagram response, retry, suppression, and path-open timing derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold. |
+| UDP target/datagram clamps `50ms..1s`, `250ms`, `8*SRTT`, and `64Kbps` | Removed. Datagram response deadlines, suppression, and path-open timing derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold. |
 | QUIC sampler clamp `10..250ms` | Removed. Active sampling uses SRTT/2 with timer granularity; idle/app-limited sampling uses PTO. |
 | TCP/session/TUN queue slot caps such as `+4`, `1024`, and `4096` where byte envelopes already exist | Removed from data-plane queues. Queue depth is byte envelope divided by actual payload quantum plus lane-derived priority headroom. Security/control-plane cache caps remain separate. |
 | Hard-coded egress and MPP path connect timeout call sites | Removed. Egress target/proxy connect timeout is owned by the selected outbound or routing member. MPP TCP path connect timeout is owned by the MPP path group probe/open timeout. Transport-layer defaults remain only as library fallbacks and tests. |
 | Fixed closed-stream and `PATH_JOIN` replay cache clamps | Removed. Closed-stream retention scales from configured stream count without preallocation; `PATH_JOIN` nonce replay retention scales from configured stream count and the QUIC persistent-congestion threshold. |
-| Fixed datagram retry exponent cap | Removed. UDP target retry timing uses PTO/TTL budget-bounded doubling, so short TTLs stay cheap and long unstable flows can spend more attempts without a magic exponent ceiling. |
-| TCP-underlay datagram product retransmit/reopen loop | Removed. TCP owns reliable carrier retransmission; mptunnel MUST NOT duplicate a datagram ID or open a replacement TCP carrier only because a UDP target response timed out. Real TCP/session/encryption errors remain retryable carrier failures. |
+| Fixed datagram retry exponent cap | Removed. Product datagrams are not retransmitted by mptunnel after emission; PTO/TTL-derived budgets bound only response waiting, carrier setup, and path suppression. |
+| TCP/QUIC-underlay datagram product retransmit/reopen loop | Removed. The carrier owns packet/stream retransmission below mptunnel; mptunnel MUST NOT duplicate a datagram ID or open a replacement carrier only because a UDP target response timed out. Real setup, encryption, authentication, and session errors before useful product expiry remain retryable carrier failures. |
 | Config example numbers | Annotated as examples and recommended ranges. Operators and tests MUST read defaults from the config model and this RFC, not from commented examples alone. |
 | Diagnostic tooling constants | Remain tooling-only. Sample intervals, benchmark durations, and failure thresholds are not production protocol parameters and MUST NOT ship as release-bundle behavior unless explicitly part of the management API contract. |
 
@@ -1940,10 +1940,11 @@ ttl_ms:u32
 payload:u32 bytes
 ```
 
-Datagrams are unordered. TTL controls retry and scheduling freshness. A path
-whose ETA cannot fit the TTL SHOULD be avoided. `DGRAM_FEEDBACK` acknowledges
-received datagram ID ranges and feeds RTT/loss/delivery-rate observations into
-path models.
+Datagrams are unordered. TTL controls freshness, carrier selection, and the
+response-wait budget; it is not permission to replay an emitted product
+datagram. A path whose ETA cannot fit the TTL SHOULD be avoided.
+`DGRAM_FEEDBACK` acknowledges received datagram ID ranges and feeds
+RTT/loss/delivery-rate observations into path models.
 
 Datagram workers MUST treat target responses, `DGRAM_FEEDBACK`, and
 `DGRAM_CLOSE` as realtime feedback. If target responses and additional outbound
@@ -1970,11 +1971,14 @@ falls away, the flow can shrink back to latency/realtime behavior. If the
 selected carrier fails in a retryable path-level way, the client MAY try the
 next schedulable TCP or QUIC UDP carrier by the same evidence order.
 
-While using any reliable carrier, a sender MUST NOT treat an absent UDP target
-response as carrier-loss proof. TCP and QUIC already own retransmission for the
-carried `DGRAM_DATA` frame. The client sends one product datagram ID once on
-the selected carrier, waits for response or expiry using the PTO/TTL-derived
-useful budget, and reopens or migrates the carrier only for actual carrier,
+After a `DGRAM_DATA` frame for a product datagram has been emitted on any
+carrier, the sender MUST NOT resend that same product datagram ID on another
+carrier, reopen a carrier for it, or retransmit it after receiving
+`DGRAM_FEEDBACK`. TCP and QUIC already own packet/stream recovery below this
+layer, and QUIC DATAGRAM-style applications are freshness-bound rather than
+reliable. The client sends one product datagram ID once on the selected
+carrier, waits for response or expiry using the PTO/TTL-derived useful budget,
+and reopens or migrates the carrier only for actual setup, carrier,
 encryption, authentication, or session errors. This prevents product-level
 duplicates from consuming target UDP state and prevents response absence from
 poisoning path health.

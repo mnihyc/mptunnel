@@ -250,7 +250,7 @@ pub(super) async fn run_udp_edge_lane<M: Send + 'static>(
             metadata,
         } = request;
         let result = association
-            .send_to_with_adaptive_retries(target.clone(), payload, ttl_ms)
+            .send_to_fresh_datagram(target.clone(), payload, ttl_ms)
             .await;
         if completions
             .send(UdpEdgeCompletion {

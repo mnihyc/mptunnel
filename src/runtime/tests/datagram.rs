@@ -373,62 +373,20 @@ fn udp_association_sticks_to_successful_path_until_suppressed() {
 }
 
 #[test]
-fn udp_acked_timeout_migration_requires_validated_alternative() {
-    let proven_path = "udp://127.0.0.1:10033"
-        .parse::<PathSpec>()
-        .expect("proven path");
-    let endpoint_only_alternative = "udp://127.0.0.1:10034"
-        .parse::<PathSpec>()
-        .expect("endpoint-only alternative");
-    let hinted_alternative = "udp://127.0.0.1:10035?srtt-ms=80&rate-mbps=30"
-        .parse::<PathSpec>()
-        .expect("hinted alternative");
-    let context = ClientPathContext::new(
-        vec![proven_path, endpoint_only_alternative, hinted_alternative],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("ctx");
-    context.mark_udp_path_feedback(
-        0,
-        UdpDatagramPathObservation {
-            rtt: Duration::from_millis(40),
-            jitter: Duration::from_millis(4),
-            loss_rate: 0.0,
-            rate_sample: None,
-        },
-    );
-    let association = UdpDatagramClientAssociation::new(context).expect("assoc");
-    let attempted = HashSet::from([0]);
+fn datagram_response_timeout_is_terminal_product_expiry() {
+    assert!(!datagram_underlay_error_is_retryable(
+        &RuntimeError::DatagramResponseTimedOut
+    ));
+    assert!(!tcp_datagram_error_is_path_retryable(
+        &RuntimeError::DatagramResponseTimedOut
+    ));
+    assert!(!udp_datagram_error_is_path_retryable(
+        &RuntimeError::DatagramResponseTimedOut
+    ));
 
-    assert!(!association.has_validated_udp_retry_alternative(
-        &[
-            UdpPathCandidate {
-                path_index: 0,
-                eta_ms: 40.0,
-            },
-            UdpPathCandidate {
-                path_index: 1,
-                eta_ms: 80.0,
-            },
-        ],
-        &attempted,
-        0,
-    ));
-    assert!(association.has_validated_udp_retry_alternative(
-        &[
-            UdpPathCandidate {
-                path_index: 0,
-                eta_ms: 40.0,
-            },
-            UdpPathCandidate {
-                path_index: 2,
-                eta_ms: 80.0,
-            },
-        ],
-        &attempted,
-        0,
-    ));
+    let legacy_timeout = RuntimeError::Protocol("UDP datagram response timed out");
+    assert!(!datagram_underlay_error_is_retryable(&legacy_timeout));
+    assert!(!udp_datagram_error_is_path_retryable(&legacy_timeout));
 }
 
 #[test]
@@ -540,14 +498,17 @@ fn udp_runtime_model_backs_off_response_timeout_after_loss() {
 }
 
 #[test]
-fn udp_association_retry_budget_tracks_live_loss_model() {
+fn udp_response_budget_tracks_live_loss_model() {
     let path = "udp://127.0.0.1:10036?srtt-ms=80&rate-mbps=30"
         .parse::<PathSpec>()
         .expect("path");
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
-    let stable_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+    let stable_model = context
+        .udp_path_runtime_model(0, DEFAULT_SOCKS5_UDP_TTL_MS)
+        .expect("stable model");
+    let stable_budget =
+        datagram_response_deadline_budget(stable_model.response_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
     assert!(stable_budget >= QUIC_TIMER_GRANULARITY);
 
     context.mark_udp_path_feedback(
@@ -560,21 +521,25 @@ fn udp_association_retry_budget_tracks_live_loss_model() {
         },
     );
 
-    let lossy_budget = association.adaptive_retry_budget(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+    let lossy_model = context
+        .udp_path_runtime_model(0, DEFAULT_SOCKS5_UDP_TTL_MS)
+        .expect("lossy model");
+    let lossy_budget =
+        datagram_response_deadline_budget(lossy_model.response_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
     assert!(lossy_budget > stable_budget);
     assert!(lossy_budget > Duration::from_millis(500));
 }
 
 #[test]
-fn datagram_retry_budget_scales_from_ttl_slack_and_response_model() {
+fn datagram_response_deadline_budget_scales_from_ttl_slack_and_response_model() {
     let high_rtt_timeout = Duration::from_millis(900);
-    let budget = datagram_retry_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
+    let budget = datagram_response_deadline_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
     let low_rtt_budget =
-        datagram_retry_budget(Duration::from_millis(50), DEFAULT_SOCKS5_UDP_TTL_MS);
+        datagram_response_deadline_budget(Duration::from_millis(50), DEFAULT_SOCKS5_UDP_TTL_MS);
     assert!(budget > low_rtt_budget);
     assert!(budget < Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into()));
 
-    let tight_ttl_budget = datagram_retry_budget(high_rtt_timeout, 1_000);
+    let tight_ttl_budget = datagram_response_deadline_budget(high_rtt_timeout, 1_000);
     assert_eq!(tight_ttl_budget, Duration::from_millis(1_000));
 }
 

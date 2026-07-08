@@ -193,6 +193,23 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
 }
 
 impl ResponseStreamOutputs {
+    pub(super) fn snapshot_for_key(
+        &self,
+        key: CarrierPathKey,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        mux_limits: MuxLimits,
+    ) -> Option<PathSnapshot> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| {
+                server_bulk_output_snapshot(entry, session_id, lane, lane_tracker, mux_limits, now)
+            })
+    }
+
     pub(super) fn read_backpressure_snapshot(
         &self,
         active_key: Option<CarrierPathKey>,

@@ -70,6 +70,17 @@ impl ReliablePathStream {
         self.output.send_path_snapshot(lane, payload_bytes)
     }
 
+    pub(super) fn tail_repair_snapshot(
+        &self,
+        ack_frontier: u64,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Option<PathSnapshot> {
+        self.output
+            .tail_repair_snapshot(ack_frontier, lane)
+            .or_else(|| self.send_path_snapshot(lane, payload_bytes))
+    }
+
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
         self.output.set_sender_queue_bytes(bytes);
     }
@@ -482,6 +493,20 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    pub(super) fn tail_repair_snapshot(
+        &self,
+        ack_frontier: u64,
+        lane: FlowLane,
+    ) -> Option<PathSnapshot> {
+        match self {
+            Self::Fixed(fixed) => {
+                let _ = (ack_frontier, lane);
+                Some(fixed.send_path_snapshot())
+            }
+            Self::Switchable(binding) => binding.tail_repair_snapshot(ack_frontier, lane),
+        }
+    }
+
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
         match self {
             Self::Fixed(fixed) => fixed.set_sender_queue_bytes(bytes),
@@ -830,6 +855,29 @@ impl ResponseStreamBinding {
             payload_bytes,
             self.mux_limits,
         )
+    }
+
+    pub(super) fn tail_repair_snapshot(
+        &self,
+        ack_frontier: u64,
+        lane: FlowLane,
+    ) -> Option<PathSnapshot> {
+        let owner_key = self
+            .blocking_owner_key_at_or_after(ack_frontier)
+            .or_else(|| self.ordered_data_owner());
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        owner_key.and_then(|key| {
+            outputs.snapshot_for_key(
+                key,
+                self.session_id,
+                &self.lane_tracker,
+                lane,
+                self.mux_limits,
+            )
+        })
     }
 
     fn set_sender_queue_bytes(&self, bytes: usize) {
@@ -1296,6 +1344,21 @@ impl ResponseStreamBinding {
             }
         }
         debts.into_values().collect()
+    }
+
+    fn blocking_owner_key_at_or_after(&self, offset: u64) -> Option<CarrierPathKey> {
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        for path_flights in flights.values() {
+            for flight in path_flights {
+                if flight.kind.is_ordering_owner() && flight.end > offset {
+                    return Some(flight.key);
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn sender_path_targets(

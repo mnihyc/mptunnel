@@ -1156,7 +1156,7 @@ fn enqueue_reliable_tail_repair(
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
     last_send_ack_complete: bool,
-    send_path_snapshot: Option<PathSnapshot>,
+    tail_repair_path_snapshot: Option<PathSnapshot>,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
@@ -1166,13 +1166,13 @@ fn enqueue_reliable_tail_repair(
     last_send_ack_frontier: u64,
 ) -> usize {
     let base_repair_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
-        send_path_snapshot,
+        tail_repair_path_snapshot,
         FlowLane::Throughput,
         mux_limits,
         max_frame_payload_bytes,
     )
     .max(adaptive_reliable_relay_repair_bytes(
-        send_path_snapshot,
+        tail_repair_path_snapshot,
         relay_lane,
         mux_limits,
     ));
@@ -1469,6 +1469,12 @@ where
             relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
                 .min(path_stream.max_frame_payload_bytes),
         );
+        let tail_repair_path_snapshot = path_stream.tail_repair_snapshot(
+            last_send_ack_frontier,
+            relay_lane,
+            relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
+                .min(path_stream.max_frame_payload_bytes),
+        );
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(send_path_snapshot, relay_lane),
@@ -1494,7 +1500,7 @@ where
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at,
             last_tail_repair_at,
-            send_path_snapshot,
+            tail_repair_path_snapshot,
             relay_lane,
         );
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
@@ -1621,7 +1627,7 @@ where
                     &send_stream,
                     &last_send_ack_ranges,
                     last_send_ack_complete,
-                    send_path_snapshot,
+                    tail_repair_path_snapshot,
                     relay_lane,
                     mux_limits,
                     performance,
@@ -2040,7 +2046,11 @@ where
                 );
                 if final_tail_repair_ready {
                     let repair_limit = reliable_critical_tail_repair_limit_bytes(
-                        adaptive_reliable_relay_repair_bytes(send_path_snapshot, relay_lane, mux_limits),
+                        adaptive_reliable_relay_repair_bytes(
+                            tail_repair_path_snapshot,
+                            relay_lane,
+                            mux_limits,
+                        ),
                         send_stream.repair_bytes(),
                         mux_limits,
                     );
@@ -2703,6 +2713,120 @@ mod tests {
         );
 
         assert_eq!(deadline, expected);
+    }
+
+    #[test]
+    fn live_tail_repair_timer_uses_blocking_owner_snapshot_not_fast_alternate() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(110);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let fast_alternate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(110),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                fast_alternate.underlay,
+                fast_alternate.path_id,
+                alternate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let slow_owner_metrics = PathMetrics {
+            path_id: owner_key.path_id,
+            underlay: owner_key.underlay,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 480_000,
+            srtt_us: 500_000,
+            rttvar_us: 60_000,
+            jitter_us: 60_000,
+            delivery_rate_bps: 80_000_000,
+            pacing_rate_bps: 80_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 0,
+            inflight_hi_bytes: 0,
+            confidence_ppm: 1_000_000,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 1,
+            data_sample_bytes: 65_536,
+        };
+        let fast_alternate_metrics = PathMetrics {
+            path_id: fast_alternate.path_id,
+            underlay: fast_alternate.underlay,
+            min_rtt_us: 20_000,
+            srtt_us: 25_000,
+            rttvar_us: 2_000,
+            jitter_us: 2_000,
+            delivery_rate_bps: 200_000_000,
+            pacing_rate_bps: 200_000_000,
+            ..slow_owner_metrics
+        };
+        binding.update_path_metrics(
+            owner_key,
+            slow_owner_metrics,
+            ServerPathMetricsSource::LocalSender,
+        );
+        binding.update_path_metrics(
+            fast_alternate,
+            fast_alternate_metrics,
+            ServerPathMetricsSource::LocalSender,
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let owner_frame = Frame::StreamData {
+            stream_id,
+            offset: 1024,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x55; 65_536]),
+        };
+        binding.record_owner_flight(owner_key, &owner_frame);
+
+        let snapshot = path_stream
+            .tail_repair_snapshot(1024, FlowLane::Throughput, 65_536)
+            .expect("blocking owner path is still attached");
+
+        assert_eq!(snapshot.id, owner_key.path_id);
+        assert_eq!(snapshot.underlay, owner_key.underlay);
+        assert!(
+            transport_pto_from_snapshot(Some(snapshot))
+                > transport_pto_from_snapshot(
+                    path_stream.send_path_snapshot(FlowLane::Throughput, 65_536)
+                ),
+            "tail repair timing must follow the blocking OwnerData path, not the fastest attached alternate"
+        );
     }
 
     #[test]

@@ -1433,26 +1433,17 @@ fn response_best_failover_ordered_data_owner(
     entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| !entry.commands.is_closed())
+        .filter(|(_, entry)| {
+            !entry.commands.is_closed() && server_output_has_bulk_rate_evidence(entry)
+        })
         .max_by_key(|(index, entry)| {
             (
-                response_failover_evidence_rank(entry),
                 response_failover_rate_bps(entry),
                 entry.delivery_samples,
                 usize::MAX.saturating_sub(*index),
             )
         })
         .map(|(_, entry)| entry.key)
-}
-
-fn response_failover_evidence_rank(entry: &ResponseStreamOutputEntry) -> u8 {
-    if server_output_has_bulk_rate_evidence(entry) {
-        3
-    } else if server_output_has_sender_evidence(entry) {
-        2
-    } else {
-        1
-    }
 }
 
 fn response_failover_rate_bps(entry: &ResponseStreamOutputEntry) -> u64 {
@@ -1845,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn response_detaching_service_owner_promotes_live_survivor_to_service() {
+    fn response_detaching_service_owner_does_not_promote_probe_only_survivor_to_service() {
         let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
         let survivor = CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -1863,6 +1854,36 @@ mod tests {
             ),
             ResponseStreamAttachOutcome::Attached
         );
+        binding.update_path_metrics(
+            survivor,
+            PathMetrics {
+                path_id: survivor.path_id,
+                underlay: survivor.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 200_000_000,
+                pacing_rate_bps: 200_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: 0,
+                inflight_hi_bytes: 0,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
 
         let active_commands = {
             let outputs = binding.outputs.lock().expect("test response outputs lock");
@@ -1878,16 +1899,16 @@ mod tests {
 
         assert_eq!(
             binding.ordered_data_owner(),
-            Some(survivor),
-            "a live response stream must not be left without a Service owner after failover"
+            None,
+            "proof/liveness evidence is not enough to promote a failover Service owner"
         );
         let targets = binding.sender_path_targets(FlowLane::Throughput, 4096);
         assert!(
             targets
                 .iter()
                 .find(|target| target.key == survivor)
-                .is_some_and(|target| target.is_active),
-            "the promoted survivor must be exposed as the scheduler Service target"
+                .is_some_and(|target| !target.is_active && target.has_sender_evidence),
+            "probe-only survivor stays attached for validation but is not scheduler-active"
         );
     }
 

@@ -343,9 +343,12 @@ lower-frontier owner or live active ordered-owner anchor for that stream
 direction. It is not simply the lowest-ETA candidate, and a measured
 alternate MUST NOT be relabeled as Service merely because it wins the next
 payload quantum. A Service change is an explicit migration/failover result:
-detach/close of the old owner, loss of a live owner, or a frontier-clear service
-handoff chosen by the Service migration policy. Otherwise, lower-ETA measured
-contributors are Subflows.
+detach/close of the old owner with a direction-correct bulk-rate-proven
+survivor, loss of a live owner with a measured survivor, or a frontier-clear
+service handoff chosen by the Service migration policy. A proof/liveness-only
+survivor remains Probe/Standby until it produces bulk-rate evidence; it is not
+promoted to Service merely because it is the only remaining attached output.
+Otherwise, lower-ETA measured contributors are Subflows.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were

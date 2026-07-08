@@ -466,10 +466,17 @@ clear-frontier bulk Service owner to a tiny startup-rate or carrier-cwnd
 product admission ceiling. While bulk demand exists and the ordered frontier is
 clear, the Service owner is fed through the product Service envelope; lower
 carrier congestion and pacing remain the carrier engine's responsibility. The
-same envelope applies to clear-frontier Service reorder admission. Reorder
+Service envelope MAY use non-app-limited product progress samples as a capacity
+signal, but an app-limited progress sample is not a product-flight ceiling and
+MUST NOT shrink the clear-frontier Service envelope below the configured product
+Service envelope. App-limited samples may still inform ETA and diagnostics.
+When latency-sensitive work is active, the clear-frontier Service feed envelope
+uses the preemptible Service horizon for queued sender-service bytes. That
+backlog cap is feed/backpressure accounting, not reorder accounting. Reorder
 budgets are for additional paths, cross-path lower-byte debt, and explicit
-owner-debt pressure; they MUST NOT make the active Service owner inadmissible
-because an app-limited BDP estimate is smaller than one queued carrier quantum.
+owner-debt pressure; they MUST NOT count same-Service queued carrier work as
+cross-path reorder debt or make the active Service owner inadmissible because an
+app-limited BDP estimate is smaller than one queued carrier quantum.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,

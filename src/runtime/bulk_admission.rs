@@ -315,8 +315,21 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
             .product_bytes_in_flight
             .saturating_add(candidate.product_queue_bytes)
             .saturating_add(candidate.queue_bytes);
-        return committed.saturating_add(payload_bytes as u64) <= inflight_limit
-            || committed < inflight_limit;
+        if committed.saturating_add(payload_bytes as u64) > inflight_limit
+            && committed >= inflight_limit
+        {
+            return false;
+        }
+        if bulk_active_role_has_latency_pressure(candidate, role) {
+            let backlog_limit =
+                bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
+            let backlog_committed = candidate
+                .product_queue_bytes
+                .saturating_add(candidate.queue_bytes);
+            return backlog_committed.saturating_add(payload_bytes as u64) <= backlog_limit
+                || backlog_committed < backlog_limit;
+        }
+        return true;
     }
     let use_carrier_gate = candidate.underlay == UnderlayProtocol::Udp
         && !bulk_uses_product_only_active_gate(candidate, role);
@@ -385,6 +398,9 @@ pub(super) fn bulk_active_service_product_envelope_bytes(
     else {
         return startup_limit;
     };
+    if candidate.app_limited {
+        return configured;
+    }
 
     let progress_bdp =
         bulk_rate_bdp_bytes(progress_rate_bps, bulk_product_budget_rtt_ms(candidate));
@@ -547,9 +563,7 @@ fn bulk_total_reorder_debt_bytes(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     let path_debt = match role {
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
-            candidate.queue_bytes
-        }
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => 0,
         BulkAdmissionRole::AdditionalSameUnderlay | BulkAdmissionRole::AdditionalCrossUnderlay => {
             bulk_product_reorder_debt_bytes(candidate)
         }
@@ -596,12 +610,7 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
             if stream_ordering_debt_bytes == 0 =>
         {
             if bulk_active_role_has_latency_pressure(candidate, role) {
-                bulk_product_inflight_limit_bytes(
-                    candidate,
-                    payload_bytes,
-                    mux_limits,
-                    BulkAdmissionRole::ActiveDataPath,
-                )
+                bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64
             } else {
                 bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits)
             }
@@ -835,7 +844,50 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("reorder_budget")
+            Some("inflight_limit")
+        );
+    }
+
+    #[test]
+    fn active_service_same_path_backlog_is_not_reorder_debt() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.product_progress_rate_bps = Some(mbps(0.322));
+        active.product_bytes_in_flight = 8_912_896;
+        active.product_queue_bytes = 512 * 1024;
+        active.queue_bytes = 2 * 1024 * 1024;
+        active.session_active_latency_sensitive_flows = 1;
+        active.confidence = 1.0;
+        active.app_limited = true;
+
+        assert!(
+            bulk_candidate_within_reorder_budget(
+                active,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+                0,
+            ),
+            "same-Service queued bytes are feed/backpressure debt, not cross-path reorder debt"
+        );
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                117_551.370,
+                active,
+                117_551.370,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "the active Service may be backpressured, but the reason must not be reorder_budget when stream_ordering_debt is zero"
         );
     }
 
@@ -866,6 +918,70 @@ mod tests {
             ),
             None,
             "a clear-frontier Service owner must not lose lead eligibility because the reorder gate reuses a tiny app-limited BDP budget"
+        );
+    }
+
+    #[test]
+    fn active_tcp_service_with_latency_pressure_still_keeps_feed_credit() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.369));
+        active.pacing_rate_bps = mbps(0.369);
+        active.product_progress_rate_bps = Some(mbps(0.369));
+        active.queue_bytes = payload as u64;
+        active.product_bytes_in_flight = 613_248;
+        active.session_active_latency_sensitive_flows = 1;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                50_286.929,
+                active,
+                50_286.929,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "latency pressure may bound optional Subflows, but must not starve the clear-frontier Service owner at one pending quantum"
+        );
+    }
+
+    #[test]
+    fn clear_frontier_service_owner_ignores_app_limited_progress_bdp_floor() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.product_progress_rate_bps = Some(mbps(0.288));
+        active.product_bytes_in_flight = 3_670_016;
+        active.product_queue_bytes = 512 * 1024;
+        active.queue_bytes = 0;
+        active.inflight_limit_bytes = 0;
+        active.confidence = 1.0;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                73_038.285,
+                active,
+                73_038.285,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "app-limited product progress samples inform ETA but must not shrink a clear-frontier Service owner below the configured product envelope"
         );
     }
 

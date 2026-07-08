@@ -125,6 +125,22 @@ pub(super) fn reliable_relay_tail_repair_deadline(
     tokio::time::Instant::from_std(last_progress_at + stall_timeout)
 }
 
+pub(super) fn reliable_relay_effective_tail_repair_deadline(
+    last_progress_at: Instant,
+    last_repair_at: Instant,
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+    failed_owner_tail_repair_ready: bool,
+) -> tokio::time::Instant {
+    if failed_owner_tail_repair_ready {
+        if last_repair_at <= last_progress_at {
+            return tokio::time::Instant::from_std(last_progress_at);
+        }
+        return reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, None, lane);
+    }
+    reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, path, lane)
+}
+
 pub(super) fn reliable_relay_tail_repair_delay(
     path: Option<PathSnapshot>,
     lane: FlowLane,
@@ -880,6 +896,47 @@ pub(super) fn reliable_critical_tail_repair_is_over_budget(
     budget_remaining == 0 && repair_limit > 0
 }
 
+fn reliable_failed_owner_tail_repair_ready(
+    path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
+    last_send_ack_ranges: &[OffsetRange],
+    last_send_ack_complete: bool,
+    last_send_ack_frontier: u64,
+    mux_limits: MuxLimits,
+) -> bool {
+    if send_stream.repair_bytes() == 0 || last_send_ack_frontier >= send_stream.next_offset() {
+        return false;
+    }
+    let no_ack_frontier_failed_owner_tail = last_send_ack_ranges.is_empty()
+        && last_send_ack_frontier == 0
+        && send_stream.next_offset() > 0;
+    if !last_send_ack_complete && !no_ack_frontier_failed_owner_tail {
+        return false;
+    }
+    let probe_limit =
+        reliable_critical_tail_repair_limit_bytes(1, send_stream.repair_bytes(), mux_limits);
+    if probe_limit == 0 {
+        return false;
+    }
+    let source_frames = if last_send_ack_ranges.is_empty() {
+        send_stream.retransmission_frames_for_ranges(
+            &[OffsetRange {
+                start: 0,
+                end: send_stream.next_offset(),
+            }],
+            probe_limit,
+        )
+    } else {
+        send_stream.retransmission_frames_after_ack_frontier(last_send_ack_ranges, probe_limit)
+    };
+    if source_frames.is_empty() {
+        return false;
+    }
+    let (failed_owner_frames, _) =
+        prefix_repair_frames_with_failed_owner_output(path_stream, source_frames);
+    !failed_owner_frames.is_empty()
+}
+
 pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
     let rate_bps = path.delivery_rate_bps.max(
         path.product_progress_rate_bps
@@ -1489,11 +1546,20 @@ where
         let live_owner_tail_repair_candidate = has_tail_repair_alternative
             && last_send_ack_complete
             && last_send_ack_frontier < send_stream.next_offset();
+        let failed_owner_tail_repair_ready = tail_failover_repair_candidate
+            && reliable_failed_owner_tail_repair_ready(
+                &path_stream,
+                &send_stream,
+                &last_send_ack_ranges,
+                last_send_ack_complete,
+                last_send_ack_frontier,
+                mux_limits,
+            );
         let tail_repair_active = relay_lane_is_bulk(relay_lane)
             && send_stream.repair_bytes() > 0
             && stream_tail_timer_repair_allowed(
                 live_owner_tail_repair_candidate,
-                tail_failover_repair_candidate,
+                failed_owner_tail_repair_ready,
             );
         let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
             relay_lane,
@@ -1501,11 +1567,12 @@ where
             last_send_ack_complete,
             last_send_ack_frontier,
         );
-        let tail_repair_deadline = reliable_relay_tail_repair_deadline(
+        let tail_repair_deadline = reliable_relay_effective_tail_repair_deadline(
             last_send_ack_progress_at,
             last_tail_repair_at,
             tail_repair_path_snapshot,
             relay_lane,
+            failed_owner_tail_repair_ready,
         );
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
             send_path_snapshot,
@@ -1624,7 +1691,7 @@ where
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
-                enqueue_reliable_tail_repair(
+                let repair_count = enqueue_reliable_tail_repair(
                     &mut response_sender,
                     &path_stream,
                     stream_id,
@@ -1638,7 +1705,9 @@ where
                     path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
                 );
-                last_tail_repair_at = Instant::now();
+                if repair_count > 0 {
+                    last_tail_repair_at = Instant::now();
+                }
                 let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
@@ -2830,6 +2899,125 @@ mod tests {
                     path_stream.send_path_snapshot(FlowLane::Throughput, 65_536)
                 ),
             "tail repair timing must follow the blocking OwnerData path, not the fastest attached alternate"
+        );
+    }
+
+    #[test]
+    fn failed_owner_tail_repair_deadline_is_immediate_for_repairable_detached_owner() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(111);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(111),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x51; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        binding.detach(owner_key, &owner_commands);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let last_progress = Instant::now();
+        let last_repair = last_progress - Duration::from_secs(1);
+        let generic_deadline = reliable_relay_tail_repair_deadline(
+            last_progress,
+            last_repair,
+            None,
+            FlowLane::Throughput,
+        );
+        let failover_deadline = reliable_relay_effective_tail_repair_deadline(
+            last_progress,
+            last_repair,
+            None,
+            FlowLane::Throughput,
+            reliable_failed_owner_tail_repair_ready(
+                &path_stream,
+                &send_stream,
+                &ack_ranges,
+                true,
+                1024,
+                limits,
+            ),
+        );
+
+        assert_eq!(
+            failover_deadline,
+            tokio::time::Instant::from_std(last_progress),
+            "detached-owner tail repair should not wait a generic PTO before failing over"
+        );
+        assert!(
+            failover_deadline < generic_deadline,
+            "failed-owner repair timing must be faster than live-owner tail repair"
+        );
+    }
+
+    #[test]
+    fn failed_owner_tail_repair_retry_uses_persistent_backoff() {
+        let last_progress = Instant::now();
+        let last_repair = last_progress + Duration::from_millis(1);
+        let slow_stale_owner = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 1.0);
+
+        let deadline = reliable_relay_effective_tail_repair_deadline(
+            last_progress,
+            last_repair,
+            Some(slow_stale_owner),
+            FlowLane::Throughput,
+            true,
+        );
+        let expected = reliable_relay_tail_repair_deadline(
+            last_progress,
+            last_repair,
+            None,
+            FlowLane::Throughput,
+        );
+
+        assert_eq!(
+            deadline, expected,
+            "failed-owner repair may fire immediately once, then retries use default persistent backoff rather than a stale owner path"
         );
     }
 

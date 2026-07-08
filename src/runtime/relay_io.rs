@@ -228,9 +228,14 @@ pub(super) fn stream_final_offset_tail_repair_frames(
     ranges: &[OffsetRange],
     byte_limit: usize,
     final_offset_known: bool,
+    final_tail_stall_ready: bool,
     has_multipath_repair_alternative: bool,
 ) -> Vec<Frame> {
-    if !final_offset_known || !has_multipath_repair_alternative || byte_limit == 0 {
+    if !final_offset_known
+        || !final_tail_stall_ready
+        || !has_multipath_repair_alternative
+        || byte_limit == 0
+    {
         return Vec::new();
     }
     let largest_ack_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
@@ -1775,6 +1780,9 @@ where
                         );
                         let mut critical_tail_repair = false;
                         let repair_kind = if repair_frames.is_empty() {
+                            let fin_tail_stall_ready =
+                                tokio::time::Instant::now() >= tail_repair_deadline
+                                    && !ack_made_progress;
                             let fin_tail_ready = close_sent || pending_local_fin;
                             let fin_tail_limit = if fin_tail_ready {
                                 let limit = reliable_critical_tail_repair_limit_bytes(
@@ -1797,6 +1805,7 @@ where
                                         &ranges,
                                         fin_tail_limit,
                                         fin_tail_ready,
+                                        fin_tail_stall_ready,
                                         has_multipath_repair_alternative,
                                     ),
                                     false,
@@ -1998,7 +2007,8 @@ where
                 let final_tail_repair_ready = (close_sent || pending_local_fin)
                     && send_stream.repair_bytes() > 0
                     && !last_send_ack_ranges.is_empty()
-                    && last_send_ack_frontier < send_stream.next_offset();
+                    && last_send_ack_frontier < send_stream.next_offset()
+                    && tokio::time::Instant::now() >= tail_repair_deadline;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "server_output_update",
@@ -2027,6 +2037,7 @@ where
                                 &send_stream,
                                 &last_send_ack_ranges,
                                 repair_limit,
+                                true,
                                 true,
                                 now_has_repair_alternative,
                             ),
@@ -2998,12 +3009,39 @@ mod tests {
             4096,
             true,
             true,
+            true,
         );
 
         assert_eq!(repair_frames.len(), 1);
         assert_eq!(
             reliable_stream_frame_extent(&repair_frames[0]),
             Some((1024, 4096, 3072))
+        );
+    }
+
+    #[test]
+    fn final_offset_tail_repair_waits_for_persistent_stall_evidence() {
+        let limits = MuxLimits::default();
+        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
+        send_stream
+            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+            .expect("send stream data");
+
+        let repair_frames = stream_final_offset_tail_repair_frames(
+            &send_stream,
+            &[OffsetRange {
+                start: 0,
+                end: 1024,
+            }],
+            4096,
+            true,
+            false,
+            true,
+        );
+
+        assert!(
+            repair_frames.is_empty(),
+            "known final offset is not enough to reinject a contiguous owner tail before persistent stall/failure evidence"
         );
     }
 

@@ -470,6 +470,10 @@ Service envelope MAY use non-app-limited product progress samples as a capacity
 signal, but an app-limited progress sample is not a product-flight ceiling and
 MUST NOT shrink the clear-frontier Service envelope below the configured product
 Service envelope. App-limited samples may still inform ETA and diagnostics.
+This Service rule is deliberately different from optional Subflow admission:
+the Service is the current primary owner and must remain fed while its ordered
+frontier is clear, whereas optional paths must prove positive contribution
+before receiving owner bytes.
 When latency-sensitive work is active, the clear-frontier Service feed envelope
 uses the preemptible Service horizon for queued sender-service bytes. That
 backlog cap is feed/backpressure accounting, not reorder accounting. Reorder
@@ -3912,10 +3916,12 @@ contiguous. If the ACK frontier has stopped below the sender's next product
 offset, the stream has retained unacked `OwnerData`, and no authoritative ACK
 gap or known final tail exists, the sender waits for ACK progress, carrier
 failure/detach evidence, or a final-offset condition. It MUST NOT reinject the
-live contiguous owner tail as optional `RepairData`. Once a final offset is
-known, terminal owner-tail repair may spend bounded critical repair needed to
-close retained final debt, bounded by repair-cache, path-flight, and sender
-resource limits; those bytes are still counted as repair overhead.
+live contiguous owner tail as optional `RepairData`. A known final offset is
+not sufficient by itself: terminal owner-tail repair may spend bounded critical
+repair only after persistent stall, carrier failure/detach, or equivalent
+final-debt evidence shows the retained tail is no longer making progress. That
+repair remains bounded by repair-cache, path-flight, and sender resource
+limits; those bytes are still counted as repair overhead.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

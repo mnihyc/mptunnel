@@ -5475,7 +5475,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_only_same_family_candidate_cannot_own_data_under_lower_owner_debt() {
+    fn sender_evidence_same_family_candidate_cannot_own_under_lower_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -5516,7 +5516,7 @@ mod tests {
 
         assert_eq!(
             selected.key, active.key,
-            "path proof/liveness evidence must not assign later unique bytes to an unmeasured Subflow while lower-owner debt exists"
+            "same-family sender evidence is not enough to assign later unique bytes while the Service owns unresolved lower bytes"
         );
     }
 
@@ -5551,52 +5551,6 @@ mod tests {
         assert_eq!(
             selected.key, owner.key,
             "bulk-rate evidence proves the alternate path is eligible at a clear frontier, not that it may extend an existing ordered receive hole"
-        );
-    }
-
-    #[test]
-    fn proof_only_sender_evidence_is_not_subflow_owner_under_lower_owner_debt() {
-        let mux_limits = MuxLimits::default();
-        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let active_key = CarrierPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            path_id: PathId(0),
-        };
-        let active = response_target(
-            active_key.path_id.0,
-            active_key.underlay,
-            100.0,
-            0,
-            4 * payload_bytes as u64,
-            true,
-        );
-        let mut proof_only = response_target(
-            1,
-            UnderlayProtocol::Tcp,
-            5.0,
-            0,
-            4 * payload_bytes as u64,
-            false,
-        );
-        proof_only.has_sender_evidence = true;
-        proof_only.has_bulk_rate_evidence = false;
-
-        let selected = choose_response_sender_data_target(
-            &[active.clone(), proof_only.clone()],
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-            &[CarrierPathFlightDebt {
-                key: active_key,
-                bytes: payload_bytes as u64,
-            }],
-            Some(active_key),
-        )
-        .expect("service path should remain dispatchable");
-
-        assert_eq!(
-            selected.key, active.key,
-            "path proof/liveness evidence must not bootstrap same-stream Subflow OwnerData under lower-owner debt"
         );
     }
 

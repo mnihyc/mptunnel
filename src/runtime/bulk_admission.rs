@@ -180,9 +180,6 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     if let Some(reason) = bulk_cross_underlay_completion_suppression(check) {
         return Some(reason);
     }
-    if let Some(reason) = bulk_same_underlay_ordering_debt_suppression(check) {
-        return Some(reason);
-    }
     if let Some(reason) = bulk_same_underlay_completion_suppression(check) {
         return Some(reason);
     }
@@ -211,15 +208,6 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
             )
     {
         return Some("completion_horizon");
-    }
-    None
-}
-
-fn bulk_same_underlay_ordering_debt_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
-    if check.role == BulkAdmissionRole::AdditionalSameUnderlay
-        && check.stream_ordering_debt_bytes > 0
-    {
-        return Some("same_underlay_ordering_debt");
     }
     None
 }
@@ -1562,7 +1550,7 @@ mod tests {
                 role: BulkAdmissionRole::AdditionalSameUnderlay,
                 stream_ordering_debt_bytes: 512 * 1024,
             }),
-            Some("same_underlay_ordering_debt")
+            Some("same_underlay_no_completion_gain")
         );
     }
 

@@ -2177,13 +2177,13 @@ as long-term bandwidth proof for ECF/BLEST completion-horizon rejection. QUIC's
 initial congestion window and early MPTCP subflow growth are probe mechanisms, not
 accurate bulk-rate priors. A same-underlay candidate may receive a bounded
 frontier-clear startup Subflow owner window after the current Service has
-bulk-rate evidence and the candidate has path-scoped sender evidence, but it may be
-admitted for steady-state Subflow ownership only after bulk-rate evidence exists
-and it still fits product inflight, carrier credit, and reorder budgets. This is true
-even if a candidate's current ETA is
-worse than the lead's ETA, because same-underlay ETA can be an artifact of
+bulk-rate evidence and the candidate has path-scoped sender evidence, but it may
+be admitted for steady-state Subflow ownership only after bulk-rate evidence
+exists and it still fits product inflight, carrier credit, completion, and
+reorder budgets. This is true even if a candidate's current ETA is worse than
+the lead's ETA, because same-underlay ETA can be an artifact of
 underfeeding and validation; the correct proof is whether the additional path
-creates ordered receive-hole debt. If same-underlay service later creates real
+creates ordered receive-hole debt. If same-underlay Service later creates real
 stream-ordering debt, the lower-frontier owner rule and completion-horizon gate
 become authoritative for further unique bytes. Cross-underlay candidates remain
 strict even during startup, because TCP and QUIC expose different queueing and

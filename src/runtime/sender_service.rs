@@ -1747,15 +1747,12 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
             })
         })
         .collect::<Vec<_>>();
-    if let Some(retention_target) = response_underfed_same_family_subflow_retention_target(
-        &admitted,
-        ordered_data_owner,
-        payload_bytes,
-        mux_limits,
-    ) {
+    if let Some(service_target) =
+        response_feedable_service_owner_target_before_app_limited_subflows(&admitted)
+    {
         #[cfg(feature = "lab-diagnostics")]
-        lab_response_bulk_output_selected("retention", &retention_target, payload_bytes);
-        return Some(retention_target);
+        lab_response_bulk_output_selected("service_feed", &service_target, payload_bytes);
+        return Some(service_target);
     }
     let best = admitted.iter().min_by(|left, right| {
         left.target
@@ -1819,47 +1816,23 @@ fn response_target_committed_product_bytes(target: &ResponseSenderPathTarget) ->
         .saturating_add(target.snapshot.queue_bytes)
 }
 
-fn response_subflow_retention_credit_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
-    let service_credit = response_active_owner_feed_credit_bytes(payload_bytes, mux_limits) as u64;
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
-        .saturating_div(2)
-        .min(service_credit)
-        .max(payload_bytes as u64)
-}
-
-fn response_underfed_same_family_subflow_retention_target(
+fn response_feedable_service_owner_target_before_app_limited_subflows(
     admitted: &[ResponseSelectedDataTarget],
-    service_key: Option<CarrierPathKey>,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
 ) -> Option<ResponseSelectedDataTarget> {
-    let service_key = service_key.or_else(|| {
-        admitted
-            .iter()
-            .find(|selected| selected.admission.role == PathRuntimeRole::Service)
-            .map(|selected| selected.target.key)
-    })?;
-    let _service = admitted
+    let service = admitted
         .iter()
-        .find(|selected| selected.target.key == service_key)?;
-    let retention_credit = response_subflow_retention_credit_bytes(payload_bytes, mux_limits);
-
-    admitted
-        .iter()
-        .filter(|selected| {
-            selected.admission.role == PathRuntimeRole::Subflow
-                && selected.target.key.underlay == service_key.underlay
-                && selected.target.has_bulk_rate_evidence
-                && selected.target.snapshot.app_limited
-                && response_target_committed_product_bytes(&selected.target) < retention_credit
-        })
+        .filter(|selected| selected.admission.role == PathRuntimeRole::Service)
         .min_by(|left, right| {
             response_target_committed_product_bytes(&left.target)
                 .cmp(&response_target_committed_product_bytes(&right.target))
                 .then_with(|| left.target.eta_ms.total_cmp(&right.target.eta_ms))
                 .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
         })
-        .cloned()
+        .cloned()?;
+    let non_app_limited_subflow = admitted.iter().any(|selected| {
+        selected.admission.role == PathRuntimeRole::Subflow && !selected.target.snapshot.app_limited
+    });
+    (!non_app_limited_subflow).then_some(service)
 }
 
 fn response_target_has_emission_credit(
@@ -6101,7 +6074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_planning_uses_same_family_startup_sample_as_subflow_not_service() {
+    async fn response_planning_keeps_feedable_service_before_same_family_startup_sample() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let (active_commands, mut active_rx) = reliable_path_command_channels(8);
@@ -6235,17 +6208,17 @@ mod tests {
             frames: frames_rx,
         };
         let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
-            .expect("same-family startup Subflow sample should be dispatchable");
+            .expect("feedable Service should be dispatchable before startup Subflow sample");
 
         assert_eq!(
             plan.primary_key(),
-            Some(optional),
-            "same-family sender-evidence path should get bounded Subflow owner credit at a clear frontier"
+            Some(service),
+            "same-family sender-evidence path must not displace a feedable Service quantum"
         );
         assert_eq!(
             plan.primary_role(),
-            PathRuntimeRole::Subflow,
-            "startup owner credit must not become a Service migration"
+            PathRuntimeRole::Service,
+            "startup sender evidence must not become a Service migration or replace Service OwnerData"
         );
 
         let frame = Frame::StreamData {
@@ -6256,17 +6229,17 @@ mod tests {
         };
         let outcome = emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput)
             .await
-            .expect("startup Subflow sample should emit");
+            .expect("Service OwnerData should emit");
 
-        assert_eq!(outcome.selected_path, Some(optional));
+        assert_eq!(outcome.selected_path, Some(service));
         assert_eq!(
             binding.ordered_data_owner(),
             Some(service),
-            "startup Subflow sample must not rewrite the Service owner hint"
+            "Service OwnerData keeps the Service owner hint"
         );
         assert!(
-            try_recv_reliable_path_command(&mut active_rx).is_none(),
-            "startup Subflow sample must be emitted only on the admitted Subflow"
+            try_recv_reliable_path_command(&mut active_rx).is_some(),
+            "feedable Service quantum must be emitted on Service"
         );
 
         let followup_plan = plan_response_data_dispatch(
@@ -6275,11 +6248,11 @@ mod tests {
             payload_bytes as u64,
             payload_bytes,
         )
-        .expect("plain unacked startup Subflow OwnerData must not block the Service feed");
+        .expect("plain unacked Service OwnerData must not block the next Service feed");
         assert_eq!(
             followup_plan.primary_role(),
-            PathRuntimeRole::Subflow,
-            "normal unacked lower bytes are recovery state; bounded startup Subflow credit may continue until ACK-hole evidence appears or credit is spent"
+            PathRuntimeRole::Service,
+            "normal unacked lower bytes are recovery state; startup Subflow credit must not replace a feedable Service follow-up"
         );
     }
 
@@ -7053,10 +7026,51 @@ mod tests {
     }
 
     #[test]
-    fn measured_same_family_alternate_is_subflow_not_service() {
+    fn feedable_service_owner_is_selected_before_lower_eta_same_family_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
+        let mut service =
+            response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+        service.has_sender_evidence = true;
+        service.has_bulk_rate_evidence = true;
+
+        let mut measured_subflow =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        measured_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
+        measured_subflow.snapshot.app_limited = true;
+        measured_subflow.has_sender_evidence = true;
+        measured_subflow.has_bulk_rate_evidence = true;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), measured_subflow],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("feedable Service owner should remain dispatchable");
+
+        assert_eq!(
+            selected.target.key, service.key,
+            "same-family Subflow OwnerData is additive; it must not replace a feedable Service quantum just because its instantaneous ETA is lower"
+        );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
+        let service_envelope =
+            bulk_active_service_product_envelope_bytes(service.snapshot, payload_bytes, mux_limits);
+        service.snapshot.product_queue_bytes = service_envelope;
+        service.snapshot.queue_bytes = payload_bytes as u64;
         let measured_subflow =
             response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
 
@@ -7070,7 +7084,7 @@ mod tests {
             0,
             None,
         )
-        .expect("measured same-family path should remain an admissible Subflow");
+        .expect("measured same-family path should remain an admissible Subflow when Service is not feedable");
 
         assert_eq!(selected.target.key, measured_subflow.key);
         assert_eq!(
@@ -7158,81 +7172,6 @@ mod tests {
             selected.admission.role,
             PathRuntimeRole::Subflow,
             "startup sample is Subflow OwnerData, not a Service migration"
-        );
-    }
-
-    #[test]
-    fn underfed_same_family_subflow_gets_retention_feed_when_service_window_is_nearly_full() {
-        let mux_limits = MuxLimits::default();
-        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let mut service = response_target(
-            0,
-            UnderlayProtocol::Udp,
-            5.0,
-            RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.saturating_sub(payload_bytes as u64),
-            16 * 1024 * 1024,
-            true,
-        );
-        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
-        let mut subflow =
-            response_target(1, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, false);
-        subflow.snapshot.delivery_rate_bps = 45_000_000.0;
-        subflow.snapshot.product_progress_rate_bps = Some(45_000_000.0);
-        subflow.snapshot.app_limited = true;
-        subflow.has_sender_evidence = true;
-        subflow.has_bulk_rate_evidence = true;
-
-        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[service.clone(), subflow.clone()],
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-            &[],
-            Some(service.key),
-            0,
-            None,
-        )
-        .expect("same-family bulk-rate Subflow should remain eligible for retention feed");
-
-        assert_eq!(selected.target.key, subflow.key);
-        assert_eq!(
-            selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "retention feed must not migrate the Service owner"
-        );
-    }
-
-    #[test]
-    fn underfed_same_family_subflow_retention_does_not_wait_for_service_saturation() {
-        let mux_limits = MuxLimits::default();
-        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let mut service = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
-        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
-        let mut subflow =
-            response_target(1, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, false);
-        subflow.snapshot.delivery_rate_bps = 45_000_000.0;
-        subflow.snapshot.product_progress_rate_bps = Some(45_000_000.0);
-        subflow.snapshot.app_limited = true;
-        subflow.has_sender_evidence = true;
-        subflow.has_bulk_rate_evidence = true;
-
-        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[service.clone(), subflow.clone()],
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-            &[],
-            Some(service.key),
-            0,
-            None,
-        )
-        .expect("measured app-limited same-family Subflow should receive retention feed");
-
-        assert_eq!(selected.target.key, subflow.key);
-        assert_eq!(
-            selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "retention feed keeps a measured Subflow sampled without making it Service"
         );
     }
 

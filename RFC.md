@@ -3852,16 +3852,15 @@ evidence may spend its bounded startup OwnerData credit while the Service waits
 for ACK or queue progress, provided the Subflow's own no-worse gates pass. If no
 candidate passes those gates, the sender waits; it MUST NOT bypass the Service
 admission check by relabeling another path as Service.
-When an already bulk-rate-proven Subflow is application-limited with
-little or no product flight, the sender MAY feed that Subflow up to a bounded
-retention window before ordinary ETA tie-breaking. This MUST NOT wait for the
-Service path to become locally saturated: doing so can permanently starve the
-Subflow, then use the underfed rate sample as proof that the path cannot
-contribute. This is not a new proof state and it does not make the Subflow the
-Service owner; it is a stable-subflow scheduling rule.
-The retention feed remains subject to the same OwnerData admission checks and
-MUST NOT apply to proof-only, cross-family, RepairOnly, or Standby paths.
-Its ETA input is the retained Subflow owner range, not the full Service horizon.
+An app-limited Subflow is not a positive-contribution proof strong enough to
+replace a feedable Service quantum. A non-app-limited bulk-rate-proven Subflow
+may still win the normal no-worse ETA/completion admission. The sender MUST NOT
+use periodic Subflow OwnerData "retention" merely to keep an app-limited rate
+sample warm; that is a hidden proof/discovery semantic and can turn a lower-ETA
+but weak path into the dominant owner. Subflow health is maintained through
+ACKed OwnerData it already owns, carrier metrics, probes, repair-only work, and
+future frontier-clear admission, not by replacing a feedable Service quantum
+with app-limited keepalive OwnerData.
 When no live path snapshot exists yet, startup product flight is derived from
 the normal startup path model and lane gain, then capped by the same ceiling.
 Unknown-path startup MUST NOT jump directly to the configured maximum merely

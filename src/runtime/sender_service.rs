@@ -2639,6 +2639,23 @@ impl ServerResponseSenderService {
                         path_stream.underlay, send_lane, pacing_bytes,
                     ),
                 );
+            } else if queued_lane == ReliableRelayQueuedWorkLane::Data
+                && matches!(&path_stream.output, ReliablePathStreamOutput::Fixed(_))
+            {
+                let selected_path =
+                    selected_path.expect("selected fixed output path must be available");
+                lab_sender_service_decision(
+                    "server",
+                    Some(self.session_id.0),
+                    self.stream_id.0,
+                    dispatch_lane_name,
+                    "stream_data",
+                    payload_bytes,
+                    format_args!(
+                        "path_underlay={:?} path_id={} lane={:?} pacing_bytes={} fixed_output=true",
+                        selected_path.underlay, selected_path.path_id.0, send_lane, pacing_bytes,
+                    ),
+                );
             }
             let (selected_underlay, selected_path_id) = selected_path
                 .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
@@ -3542,6 +3559,11 @@ fn relay_path_can_enqueue_frame_for_cause_now(
 mod tests {
     use super::*;
     use crate::config::SharedSecret;
+    #[cfg(feature = "lab-diagnostics")]
+    use crate::lab_diagnostics::{
+        lab_assert_server_sender_service_balanced, lab_diag_test_guard,
+        lab_sender_service_counts_for_test,
+    };
 
     #[test]
     fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
@@ -4168,6 +4190,52 @@ mod tests {
             0,
             "emitted OwnerData must not earn optional repair budget until ordered ACK progress releases it"
         );
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    #[tokio::test]
+    async fn fixed_output_owner_data_records_sender_service_decision_for_conformance() {
+        let _guard = lab_diag_test_guard();
+        let mux_limits = MuxLimits::default();
+        let session_id = SessionId(97);
+        let stream_id = StreamId(97);
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                mux_limits,
+            ),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        let mut sender = ServerResponseSenderService::new(session_id, stream_id);
+
+        sender.enqueue_data_for_lane(Bytes::from_static(b"owner"), FlowLane::Throughput);
+        sender
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+            )
+            .await
+            .expect("fixed output OwnerData dispatch should succeed");
+
+        assert_eq!(
+            lab_sender_service_counts_for_test(session_id.0, stream_id.0),
+            (1, 1),
+            "fixed output OwnerData must be accounted as a sender-service decision"
+        );
+        lab_assert_server_sender_service_balanced(session_id.0, stream_id.0);
     }
 
     #[test]

@@ -58,7 +58,10 @@ pub(crate) fn lab_sender_service_decision(
         return;
     }
     if role == "server"
-        && matches!(decision_kind, "primary" | "data")
+        && matches!(
+            decision_kind,
+            "primary" | "data" | "data_service" | "data_subflow"
+        )
         && frame_kind == "stream_data"
         && let Some(session_id) = session_id
     {
@@ -91,9 +94,12 @@ pub(crate) fn lab_assert_server_sender_service_balanced(session_id: u64, stream_
         return;
     }
     let counts = LAB_SENDER_SERVICE_COUNTS.get_or_init(Default::default);
-    let counts = counts.lock().expect("lab sender-service counts lock");
-    let Some(counts) = counts.get(&(session_id, stream_id)).copied() else {
-        return;
+    let counts = {
+        let counts = counts.lock().expect("lab sender-service counts lock");
+        let Some(counts) = counts.get(&(session_id, stream_id)).copied() else {
+            return;
+        };
+        counts
     };
     lab_diagnostic(
         "sender_service_conformance",
@@ -157,10 +163,110 @@ static LAB_PERF_SEQ: AtomicU64 = AtomicU64::new(1);
 static LAB_SENDER_SERVICE_COUNTS: OnceLock<Mutex<HashMap<(u64, u64), LabSenderServiceCounts>>> =
     OnceLock::new();
 
+#[cfg(all(test, feature = "lab-diagnostics"))]
+static LAB_DIAG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(all(test, feature = "lab-diagnostics"))]
+pub(crate) struct LabDiagTestGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, feature = "lab-diagnostics"))]
+pub(crate) fn lab_diag_test_guard() -> LabDiagTestGuard {
+    let lock = LAB_DIAG_TEST_LOCK
+        .lock()
+        .expect("lab diagnostics test lock");
+    let previous = std::env::var_os("MPTUNNEL_LAB_DIAG");
+    // SAFETY: tests that use this helper hold LAB_DIAG_TEST_LOCK, so they do
+    // not concurrently mutate or inspect the process diagnostic flag.
+    unsafe {
+        std::env::set_var("MPTUNNEL_LAB_DIAG", "1");
+    }
+    if let Some(counts) = LAB_SENDER_SERVICE_COUNTS.get() {
+        counts
+            .lock()
+            .expect("lab sender-service counts lock")
+            .clear();
+    }
+    LabDiagTestGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
+#[cfg(all(test, feature = "lab-diagnostics"))]
+impl Drop for LabDiagTestGuard {
+    fn drop(&mut self) {
+        // SAFETY: tests that use this helper hold LAB_DIAG_TEST_LOCK, so they
+        // serialize mutation of the process diagnostic flag.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("MPTUNNEL_LAB_DIAG", value),
+                None => std::env::remove_var("MPTUNNEL_LAB_DIAG"),
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "lab-diagnostics"))]
+pub(crate) fn lab_sender_service_counts_for_test(session_id: u64, stream_id: u64) -> (u64, u64) {
+    let counts = LAB_SENDER_SERVICE_COUNTS.get_or_init(Default::default);
+    let counts = counts.lock().expect("lab sender-service counts lock");
+    let counts = counts
+        .get(&(session_id, stream_id))
+        .copied()
+        .unwrap_or_default();
+    (
+        counts.response_stream_data_frames,
+        counts.sender_service_stream_data_decisions,
+    )
+}
+
 #[derive(Clone, Copy, Default)]
 struct LabSenderServiceCounts {
     response_stream_data_frames: u64,
     sender_service_stream_data_decisions: u64,
+}
+
+#[cfg(all(test, feature = "lab-diagnostics"))]
+mod tests {
+    use super::*;
+    use std::panic::{self, AssertUnwindSafe};
+
+    #[test]
+    fn data_service_decision_counts_as_server_owner_data() {
+        let _guard = lab_diag_test_guard();
+
+        for (index, decision_kind) in ["data_service", "data_subflow"].into_iter().enumerate() {
+            lab_sender_service_decision(
+                "server",
+                Some(7),
+                9,
+                decision_kind,
+                "stream_data",
+                1024,
+                format_args!("path_underlay=Tcp path_id={index}"),
+            );
+            lab_server_response_stream_data(7, 9, (index as u64) * 1024, 1024);
+        }
+
+        assert_eq!(lab_sender_service_counts_for_test(7, 9), (2, 2));
+        lab_assert_server_sender_service_balanced(7, 9);
+    }
+
+    #[test]
+    fn failed_conformance_assertion_does_not_poison_counts_lock() {
+        let _guard = lab_diag_test_guard();
+
+        lab_server_response_stream_data(11, 13, 0, 64);
+        let failed = panic::catch_unwind(AssertUnwindSafe(|| {
+            lab_assert_server_sender_service_balanced(11, 13);
+        }));
+
+        assert!(failed.is_err());
+        assert_eq!(lab_sender_service_counts_for_test(11, 13), (1, 0));
+    }
 }
 
 struct LabPerfState {

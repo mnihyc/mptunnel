@@ -80,16 +80,16 @@ pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     ack_frontier: u64,
     next_offset: u64,
 ) -> usize {
-    if !relay_lane_is_bulk(lane) || !ack_complete || ack_frontier >= next_offset {
+    if !relay_lane_is_bulk(lane) || ack_frontier >= next_offset {
+        return 0;
+    }
+    if !ack_complete && ack_frontier == 0 {
         return 0;
     }
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
 }
 
-pub(super) fn stream_ack_contiguous_frontier(complete: bool, ranges: &[OffsetRange]) -> u64 {
-    if !complete {
-        return 0;
-    }
+pub(super) fn stream_ack_contiguous_frontier(_complete: bool, ranges: &[OffsetRange]) -> u64 {
     ranges
         .first()
         .filter(|range| range.start == 0)
@@ -2745,6 +2745,11 @@ mod tests {
             "the same suffix is still ordered-owner scheduling debt and must block unsafe Service migration"
         );
         assert_eq!(
+            reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, false, 1024, 8192,),
+            7168,
+            "an incomplete ACK chunk can still prove the contiguous prefix; incompleteness must not erase owner-tail scheduling debt"
+        );
+        assert_eq!(
             reliable_relay_ordered_owner_debt_bytes(FlowLane::Latency, true, 1024, 8192,),
             0,
             "latency traffic must not be pinned by bulk owner-tail pressure"
@@ -2769,7 +2774,11 @@ mod tests {
             1024,
             "sparse ACK ranges must keep the scheduling frontier at the first hole, not the largest ACK end"
         );
-        assert_eq!(stream_ack_contiguous_frontier(false, &ranges), 0);
+        assert_eq!(
+            stream_ack_contiguous_frontier(false, &ranges),
+            1024,
+            "an incomplete ACK chunk still explicitly proves its contiguous 0-based prefix; incompleteness only forbids inferring gaps from omitted higher ranges"
+        );
     }
 
     #[test]

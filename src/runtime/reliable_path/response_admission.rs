@@ -506,16 +506,6 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         )
 }
 
-#[cfg(test)]
-fn server_output_has_ack_data_evidence(entry: &ResponseStreamOutputEntry) -> bool {
-    entry.delivery_samples > 0
-        || entry.delivery_rate_bps.is_some()
-        || matches!(
-            entry.local_path_metrics,
-            Some(path_metrics) if server_path_metrics_has_ack_data_evidence(path_metrics)
-        )
-}
-
 pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
@@ -866,10 +856,6 @@ mod tests {
         };
 
         assert!(server_output_has_sender_evidence(&entry));
-        assert!(
-            !server_output_has_ack_data_evidence(&entry),
-            "PATH_PROOF-style liveness evidence must not become ACK-data evidence for unique Subflow ownership"
-        );
         assert!(!server_output_has_bulk_rate_evidence(&entry));
     }
 

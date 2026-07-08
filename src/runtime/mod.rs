@@ -24,7 +24,7 @@ mod tun_l4;
 mod udp_metrics;
 mod udp_path;
 
-pub(super) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(super) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(super) const RELIABLE_UDP_BULK_BDP_GAIN: f64 = 4.0;
 

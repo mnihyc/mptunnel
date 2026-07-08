@@ -99,6 +99,14 @@ impl ReliablePathStream {
         self.output.has_repair_output_for_frame(frame)
     }
 
+    pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        self.output.has_failed_owner_repair_output_for_frame(frame)
+    }
+
+    pub(super) fn can_attempt_failed_owner_tail_repair(&self) -> bool {
+        matches!(self.output, ReliablePathStreamOutput::Switchable(_))
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -514,6 +522,13 @@ impl ReliablePathStreamOutput {
             Self::Switchable(binding) => binding.has_repair_output_for_frame(frame),
         }
     }
+
+    pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_failed_owner_repair_output_for_frame(frame),
+        }
+    }
 }
 
 pub(super) fn reliable_work_lane_to_carrier_lane(
@@ -891,6 +906,26 @@ impl ResponseStreamBinding {
             .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
+    pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        let avoid_keys = self.flight_keys_overlapping_frame(frame);
+        if avoid_keys.is_empty() {
+            return false;
+        }
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let recorded_output_still_live = outputs
+            .entries
+            .iter()
+            .any(|entry| avoid_keys.contains(&entry.key));
+        !recorded_output_still_live
+            && outputs
+                .entries
+                .iter()
+                .any(|entry| !avoid_keys.contains(&entry.key))
+    }
+
     pub(super) fn detach(&self, key: CarrierPathKey, commands: &ReliablePathCommandSender) {
         let lane = self.lane();
         let mut outputs = self
@@ -1174,7 +1209,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream ordered data owner lock");
         let live_lead = lead.is_some_and(|key| live_entries.iter().any(|entry| entry.key == key));
         if !live_lead {
-            *lead = response_best_failover_ordered_data_owner(live_entries);
+            *lead = None;
         }
     }
 
@@ -1422,50 +1457,7 @@ fn response_live_ordered_data_owner(
     stored: Option<CarrierPathKey>,
     entries: &[ResponseStreamOutputEntry],
 ) -> Option<CarrierPathKey> {
-    stored
-        .filter(|key| entries.iter().any(|entry| entry.key == *key))
-        .or_else(|| response_best_failover_ordered_data_owner(entries))
-}
-
-fn response_best_failover_ordered_data_owner(
-    entries: &[ResponseStreamOutputEntry],
-) -> Option<CarrierPathKey> {
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            !entry.commands.is_closed() && server_output_has_bulk_rate_evidence(entry)
-        })
-        .max_by_key(|(index, entry)| {
-            (
-                response_failover_rate_bps(entry),
-                entry.delivery_samples,
-                usize::MAX.saturating_sub(*index),
-            )
-        })
-        .map(|(_, entry)| entry.key)
-}
-
-fn response_failover_rate_bps(entry: &ResponseStreamOutputEntry) -> u64 {
-    entry
-        .local_path_metrics
-        .map(|path_metrics| path_metrics.metrics.delivery_rate_bps.max(1))
-        .or_else(|| entry.delivery_rate_bps.and_then(f64_to_positive_u64))
-        .or_else(|| {
-            entry
-                .product_progress_rate_bps
-                .and_then(f64_to_positive_u64)
-        })
-        .or_else(|| {
-            entry
-                .peer_path_metrics
-                .map(|path_metrics| path_metrics.metrics.delivery_rate_bps.max(1))
-        })
-        .unwrap_or(1)
-}
-
-fn f64_to_positive_u64(value: f64) -> Option<u64> {
-    value.is_finite().then_some(value.max(1.0) as u64)
+    stored.filter(|key| entries.iter().any(|entry| entry.key == *key))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1913,7 +1905,84 @@ mod tests {
     }
 
     #[test]
-    fn response_service_failover_prefers_measured_survivor_over_output_tail() {
+    fn response_detaching_service_owner_does_not_promote_ack_data_survivor() {
+        let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let survivor = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (survivor_commands, _survivor_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                survivor.underlay,
+                survivor.path_id,
+                survivor_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.update_path_metrics(
+            survivor,
+            PathMetrics {
+                path_id: survivor.path_id,
+                underlay: survivor.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 614_000,
+                pacing_rate_bps: 1_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
+                queue_bytes: 0,
+                inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: true,
+                data_sample_count: 1,
+                data_sample_bytes: 1,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+
+        let active_commands = {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == active)
+                .expect("active output exists")
+                .commands
+                .clone()
+        };
+        binding.detach(active, &active_commands);
+
+        assert_eq!(
+            binding.ordered_data_owner(),
+            None,
+            "carrier output detachment is not a Service ownership transfer; later OwnerData must wait for frontier-clear admission or repair"
+        );
+        let targets = binding.sender_path_targets(FlowLane::Throughput, 4096);
+        assert!(
+            targets
+                .iter()
+                .find(|target| target.key == survivor)
+                .is_some_and(|target| !target.is_active && target.has_sender_evidence),
+            "ACK-data survivor remains attached evidence, not the scheduler-active Service"
+        );
+    }
+
+    #[test]
+    fn response_service_detach_does_not_pick_measured_survivor_by_output_tail() {
         let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
         let measured = CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -1993,8 +2062,8 @@ mod tests {
 
         assert_eq!(
             binding.ordered_data_owner(),
-            Some(measured),
-            "Service failover must be evidence-based; output-list tail is not an ownership signal"
+            None,
+            "output membership changes are not Service admission; measured survivors compete only when ordered debt is clear"
         );
     }
 

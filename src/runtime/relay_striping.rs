@@ -1301,12 +1301,18 @@ mod tests {
             index: 1,
         };
         context.mark_relay_path_rate_sample(
+            owner.underlay,
+            owner.index,
+            PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(80))
+                .expect("owner evidence"),
+        );
+        context.mark_relay_path_rate_sample(
             alternate.underlay,
             alternate.index,
             PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(80))
                 .expect("sender evidence"),
         );
-        context.record_relay_path_send(owner.underlay, owner.index, 2 * 1024 * 1024);
+        context.record_relay_path_send(owner.underlay, owner.index, 1024 * 1024);
         let paths = vec![
             relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
             relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
@@ -1322,7 +1328,7 @@ mod tests {
             admitted_bulk_keys: &[owner, alternate],
             restrict_to_admitted: true,
             lower_flight_owner: Some(owner),
-            lower_owner_cross_path_debt: 0,
+            lower_owner_cross_path_debt: 1024 * 1024,
             policy: SchedulerPolicy::default(),
         })
         .expect("same-carrier lower flight is sliding-window flight");

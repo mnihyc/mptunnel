@@ -2278,7 +2278,13 @@ fn udp_reliable_stream_uses_adaptive_product_window_below_config_ceiling() {
 
     assert_eq!(tcp_initial, mux_limits.max_stream_window_bytes);
     assert!(udp_initial < mux_limits.max_stream_window_bytes);
-    assert!(udp_initial >= 4 * 1024 * 1024);
+    let udp_min_window = RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES
+        .max((reliable_relay_buffer_len(mux_limits) as u64).saturating_mul(4))
+        .min(mux_limits.max_stream_window_bytes);
+    assert_eq!(
+        udp_initial,
+        RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.max(udp_min_window)
+    );
 
     let snapshot = PathSnapshot::new(PathId(7), UnderlayProtocol::Udp, 40.0, 200_000_000.0);
     let measured_window =
@@ -2654,7 +2660,7 @@ fn stream_ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
 }
 
 #[test]
-fn tail_stall_repair_prefers_authoritative_ack_gap_before_frontier_tail() {
+fn ack_gap_repair_prefers_authoritative_gap_before_frontier_tail() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(32), mux_limits);
     send_stream
@@ -2669,9 +2675,8 @@ fn tail_stall_repair_prefers_authoritative_ack_gap_before_frontier_tail() {
 
     let ranges = [OffsetRange { start: 4, end: 12 }];
     let _ = send_stream.apply_ack(&ranges);
-    let (repairs, kind) = stream_tail_stall_repair_frames(&send_stream, &ranges, usize::MAX, true);
+    let repairs = stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, true, true);
 
-    assert_eq!(kind, "ack_gap");
     assert_eq!(repairs.len(), 1);
     assert!(matches!(
         &repairs[0],
@@ -2684,7 +2689,7 @@ fn tail_stall_repair_prefers_authoritative_ack_gap_before_frontier_tail() {
 }
 
 #[test]
-fn tail_stall_repair_ignores_contiguous_unacked_owner_tail() {
+fn ack_gap_repair_ignores_contiguous_unacked_owner_tail() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(33), mux_limits);
     send_stream
@@ -2699,12 +2704,11 @@ fn tail_stall_repair_ignores_contiguous_unacked_owner_tail() {
 
     let ranges = [OffsetRange { start: 0, end: 4 }];
     let _ = send_stream.apply_ack(&ranges);
-    let (repairs, kind) = stream_tail_stall_repair_frames(&send_stream, &ranges, 6, true);
+    let repairs = stream_ack_gap_repair_frames(&send_stream, &ranges, 6, true, true, true);
 
-    assert_eq!(kind, "none");
     assert!(
         repairs.is_empty(),
-        "contiguous unacked owner tail is retained carrier flight, not product repair"
+        "contiguous unacked owner tail is retained carrier flight, not ACK-gap repair"
     );
 }
 

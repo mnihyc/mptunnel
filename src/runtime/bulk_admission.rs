@@ -1,6 +1,6 @@
+use super::BBR_DEFAULT_CWND_GAIN;
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
-use super::{BBR_DEFAULT_CWND_GAIN, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
@@ -389,24 +389,26 @@ pub(super) fn bulk_active_service_product_envelope_bytes(
         .min(stream_window)
         .min(mux_limits.max_reorder_bytes)
         .max(payload_bytes) as u64;
-    let startup_limit = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
+    let startup_feed_limit = (bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64)
         .min(configured)
         .max(payload_bytes as u64);
     let Some(progress_rate_bps) = candidate
         .product_progress_rate_bps
         .filter(|rate| rate.is_finite() && *rate > 0.0)
     else {
-        return startup_limit;
+        return startup_feed_limit;
     };
     if candidate.app_limited {
-        return configured;
+        return (bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64)
+            .min(configured)
+            .max(startup_feed_limit);
     }
 
     let progress_bdp =
         bulk_rate_bdp_bytes(progress_rate_bps, bulk_product_budget_rtt_ms(candidate));
     let progress_limit = bulk_bbr_inflight_bytes(progress_bdp)
         .max((payload_bytes as u64).saturating_mul(8))
-        .max(startup_limit);
+        .max(startup_feed_limit);
     configured.min(progress_limit)
 }
 
@@ -953,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_frontier_service_owner_ignores_app_limited_progress_bdp_floor() {
+    fn app_limited_service_progress_uses_bounded_service_horizon_not_full_envelope() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -980,8 +982,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            None,
-            "app-limited product progress samples inform ETA but must not shrink a clear-frontier Service owner below the configured product envelope"
+            Some("inflight_limit"),
+            "app-limited product progress escapes tiny BDP/cwnd caps, but it must not unlock the full configured envelope before non-app-limited bulk evidence"
         );
     }
 
@@ -1021,6 +1023,7 @@ mod tests {
         let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 60.0, mbps(200.0));
         candidate.inflight_limit_bytes = 512 * 1024;
         candidate.product_bytes_in_flight = 512 * 1024;
+        candidate.product_progress_rate_bps = Some(mbps(200.0));
         candidate.queue_bytes = 0;
 
         assert_eq!(
@@ -1245,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_active_path_without_ordering_debt_uses_lead_product_envelope() {
+    fn app_limited_tcp_active_path_uses_bounded_service_horizon() {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut active = candidate(0, 100.0, 50.0, 0.35);
         active.snapshot.underlay = UnderlayProtocol::Tcp;
@@ -1265,7 +1268,7 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            None
+            Some("inflight_limit")
         );
     }
 
@@ -1275,6 +1278,7 @@ mod tests {
         active.pacing_rate_bps = mbps(0.351);
         active.product_bytes_in_flight = 380_304;
         active.product_queue_bytes = 395_112;
+        active.product_progress_rate_bps = Some(mbps(0.351));
         active.session_active_latency_sensitive_flows = 1;
         active.confidence = 0.1;
         active.app_limited = true;

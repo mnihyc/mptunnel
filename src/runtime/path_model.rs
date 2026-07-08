@@ -546,6 +546,10 @@ pub(super) fn path_snapshot(
         RateHint::Unlimited => 1_000_000_000_000.0,
         RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     };
+    let product_progress_rate_bps = (reliable_product_delivery_samples(path, observation) > 0
+        && observation.product_delivery_sample_bytes > 0)
+        .then_some(observation.measured_rate_bps)
+        .flatten();
     let delivery_rate_bps = observation
         .carrier_delivery_rate_bps
         .or(observation.measured_rate_bps)
@@ -582,7 +586,7 @@ pub(super) fn path_snapshot(
         min_rtt_ms: srtt_ms,
         jitter_ms,
         delivery_rate_bps,
-        product_progress_rate_bps: None,
+        product_progress_rate_bps,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
         queue_bytes: observation.carrier_queue_bytes,
         product_queue_bytes: observation.relay_queue_bytes,

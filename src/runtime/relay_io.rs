@@ -57,15 +57,11 @@ pub(super) fn stream_ack_gap_repair_allowed(
     ack_gap_repair_ready
 }
 
-/// Product tail repair is reinjection onto an independent subflow, not a
-/// second retransmission layer behind the same reliable TCP/QUIC stream.
-///
-/// Same-output retransmission cannot overtake the missing carrier bytes on an
-/// in-order reliable carrier, but it does consume tunnel traffic and can create
-/// duplicate ACK/repair feedback loops. This guard keeps repair available for
-/// real multipath failover while preventing single-path QUIC/TCP repair storms.
-pub(super) fn stream_tail_repair_allowed(has_multipath_repair_alternative: bool) -> bool {
-    has_multipath_repair_alternative
+pub(super) fn stream_tail_timer_repair_allowed(
+    live_owner_tail_repair_candidate: bool,
+    has_failed_owner_repair_output: bool,
+) -> bool {
+    live_owner_tail_repair_candidate || has_failed_owner_repair_output
 }
 
 pub(super) fn stream_ack_ranges_expose_authoritative_gap(
@@ -78,75 +74,39 @@ pub(super) fn stream_ack_ranges_expose_authoritative_gap(
             .is_some_and(|first| first.start > 0 || ranges.len() > 1)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn reliable_relay_authoritative_owner_debt_bytes(
+pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     lane: FlowLane,
-    repair_bytes: usize,
     ack_complete: bool,
-    ack_ranges: &[OffsetRange],
     ack_frontier: u64,
     next_offset: u64,
-    _last_ack_progress_at: Instant,
-    _now: Instant,
-    _path: Option<PathSnapshot>,
 ) -> usize {
-    if !relay_lane_is_bulk(lane)
-        || repair_bytes == 0
-        || ack_frontier >= next_offset
-        || !ack_complete
-    {
+    if !relay_lane_is_bulk(lane) || !ack_complete || ack_frontier >= next_offset {
         return 0;
     }
-    if stream_ack_ranges_expose_authoritative_gap(ack_complete, ack_ranges) {
-        return repair_bytes;
+    usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
+}
+
+pub(super) fn stream_ack_contiguous_frontier(complete: bool, ranges: &[OffsetRange]) -> u64 {
+    if !complete {
+        return 0;
     }
-    0
+    ranges
+        .first()
+        .filter(|range| range.start == 0)
+        .map_or(0, |range| range.end)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn reliable_relay_authoritative_owner_debt_state(
-    lane: FlowLane,
-    repair_bytes: usize,
-    ack_complete: bool,
-    ack_ranges: &[OffsetRange],
-    ack_frontier: u64,
-    next_offset: u64,
-    last_ack_progress_at: Instant,
-    now: Instant,
-    path: Option<PathSnapshot>,
-) -> usize {
-    reliable_relay_authoritative_owner_debt_bytes(
-        lane,
-        repair_bytes,
-        ack_complete,
-        ack_ranges,
-        ack_frontier,
-        next_offset,
-        last_ack_progress_at,
-        now,
-        path,
-    )
-}
-
-fn reliable_relay_current_authoritative_owner_debt_bytes(
+fn reliable_relay_current_ordered_owner_debt_bytes(
     lane: FlowLane,
     send_stream: &ReliableSendStream,
     ack_complete: bool,
-    ack_ranges: &[OffsetRange],
     ack_frontier: u64,
-    last_ack_progress_at: Instant,
-    path: Option<PathSnapshot>,
 ) -> usize {
-    reliable_relay_authoritative_owner_debt_state(
+    reliable_relay_ordered_owner_debt_bytes(
         lane,
-        send_stream.repair_bytes(),
         ack_complete,
-        ack_ranges,
         ack_frontier,
         send_stream.next_offset(),
-        last_ack_progress_at,
-        Instant::now(),
-        path,
     )
 }
 
@@ -178,11 +138,13 @@ pub(super) fn stream_ack_gap_repair_frames(
     has_multipath_repair_alternative: bool,
     ack_gap_repair_ready: bool,
 ) -> Vec<Frame> {
-    if stream_ack_gap_repair_allowed(
-        complete,
-        has_multipath_repair_alternative,
-        ack_gap_repair_ready,
-    ) {
+    if stream_ack_ranges_expose_authoritative_gap(complete, ranges)
+        && stream_ack_gap_repair_allowed(
+            complete,
+            has_multipath_repair_alternative,
+            ack_gap_repair_ready,
+        )
+    {
         send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit)
     } else {
         Vec::new()
@@ -197,30 +159,17 @@ pub(super) fn stream_ack_gap_repair_frames_normalized(
     has_multipath_repair_alternative: bool,
     ack_gap_repair_ready: bool,
 ) -> Vec<Frame> {
-    if stream_ack_gap_repair_allowed(
-        complete,
-        has_multipath_repair_alternative,
-        ack_gap_repair_ready,
-    ) {
+    if stream_ack_ranges_expose_authoritative_gap(complete, ranges)
+        && stream_ack_gap_repair_allowed(
+            complete,
+            has_multipath_repair_alternative,
+            ack_gap_repair_ready,
+        )
+    {
         send_stream.retransmission_frames_for_normalized_ack_gaps(ranges, byte_limit)
     } else {
         Vec::new()
     }
-}
-
-pub(super) fn stream_tail_stall_repair_frames(
-    send_stream: &ReliableSendStream,
-    ranges: &[OffsetRange],
-    byte_limit: usize,
-    complete: bool,
-) -> (Vec<Frame>, &'static str) {
-    if complete {
-        let gap_frames = send_stream.retransmission_frames_for_ack_gaps(ranges, byte_limit);
-        if !gap_frames.is_empty() {
-            return (gap_frames, "ack_gap");
-        }
-    }
-    (Vec::new(), "none")
 }
 
 pub(super) fn stream_final_offset_tail_repair_frames(
@@ -897,26 +846,8 @@ pub(super) fn adaptive_reliable_relay_repair_bytes(
     adaptive_reliable_relay_chunk_bytes(path, repair_lane, mux_limits).max(1)
 }
 
-pub(super) fn reliable_tail_stall_repair_limit_bytes(
-    base_repair_limit: usize,
-    repair_debt_bytes: usize,
-    budget_remaining: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    if repair_debt_bytes == 0 || budget_remaining == 0 {
-        return 0;
-    }
-    let resource_cap = mux_limits
-        .max_repair_bytes
-        .min(mux_limits.max_path_flight_bytes)
-        .max(1);
-    repair_debt_bytes
-        .max(base_repair_limit.max(1))
-        .min(resource_cap)
-        .min(budget_remaining)
-}
-
 pub(super) fn reliable_critical_tail_repair_limit_bytes(
+    event_repair_limit: usize,
     repair_debt_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
@@ -927,7 +858,9 @@ pub(super) fn reliable_critical_tail_repair_limit_bytes(
         .max_repair_bytes
         .min(mux_limits.max_path_flight_bytes)
         .max(1);
-    repair_debt_bytes.min(resource_cap)
+    repair_debt_bytes
+        .min(event_repair_limit.max(1))
+        .min(resource_cap)
 }
 
 pub(super) fn reliable_critical_tail_repair_is_over_budget(
@@ -1189,6 +1122,23 @@ pub(super) fn prefix_repair_frames_with_available_output(
     (accepted, None)
 }
 
+pub(super) fn prefix_repair_frames_with_failed_owner_output(
+    path_stream: &ReliablePathStream,
+    repair_frames: Vec<Frame>,
+) -> (Vec<Frame>, Option<u64>) {
+    let mut accepted = Vec::with_capacity(repair_frames.len());
+    for frame in repair_frames {
+        if !path_stream.has_failed_owner_repair_output_for_frame(&frame) {
+            return (
+                accepted,
+                reliable_stream_frame_extent(&frame).map(|(offset, _, _)| offset),
+            );
+        }
+        accepted.push(frame);
+    }
+    (accepted, None)
+}
+
 fn enqueue_reliable_tail_repair(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
@@ -1204,7 +1154,6 @@ fn enqueue_reliable_tail_repair(
     max_frame_payload_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
     last_send_ack_frontier: u64,
-    allow_same_output_frontier_retransmit: bool,
 ) -> usize {
     let base_repair_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         send_path_snapshot,
@@ -1217,34 +1166,80 @@ fn enqueue_reliable_tail_repair(
         relay_lane,
         mux_limits,
     ));
-    let budget_remaining = response_sender.repair_extra_event_budget_remaining(mux_limits);
-    let repair_limit = reliable_tail_stall_repair_limit_bytes(
-        base_repair_limit,
-        send_stream.repair_bytes(),
-        budget_remaining,
-        mux_limits,
-    );
-    let critical_tail_repair = false;
-    let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
-        send_stream,
-        last_send_ack_ranges,
-        repair_limit,
-        last_send_ack_complete,
-    );
-    let (repair_frames, blocked_frontier_offset) = prefix_repair_frames_with_available_output(
-        path_stream,
-        repair_frames,
-        allow_same_output_frontier_retransmit,
-    );
+    let mut repair_limit = 0usize;
+    let mut critical_tail_repair = false;
+    let mut repair_kind = "none";
+    let mut repair_frames = Vec::new();
+    let mut blocked_frontier_offset = None;
+    let no_ack_frontier_failed_owner_tail = last_send_ack_ranges.is_empty()
+        && last_send_ack_frontier == 0
+        && send_stream.next_offset() > 0;
+    if last_send_ack_complete || no_ack_frontier_failed_owner_tail {
+        let failover_limit = reliable_critical_tail_repair_limit_bytes(
+            base_repair_limit,
+            send_stream.repair_bytes(),
+            mux_limits,
+        );
+        let failover_source_frames = if last_send_ack_ranges.is_empty() {
+            send_stream.retransmission_frames_for_ranges(
+                &[OffsetRange {
+                    start: 0,
+                    end: send_stream.next_offset(),
+                }],
+                failover_limit,
+            )
+        } else {
+            send_stream
+                .retransmission_frames_after_ack_frontier(last_send_ack_ranges, failover_limit)
+        };
+        let (failover_frames, failover_blocked_offset) =
+            prefix_repair_frames_with_failed_owner_output(
+                path_stream,
+                failover_source_frames.clone(),
+            );
+        if !failover_frames.is_empty() {
+            critical_tail_repair = true;
+            repair_limit = failover_limit;
+            repair_frames = failover_frames;
+            blocked_frontier_offset = failover_blocked_offset;
+            repair_kind = "tail_failover";
+        } else if blocked_frontier_offset.is_none() {
+            blocked_frontier_offset = failover_blocked_offset;
+        }
+        if repair_frames.is_empty()
+            && last_send_ack_complete
+            && path_stream.has_multipath_repair_alternative()
+        {
+            let (tail_repair_frames, tail_repair_blocked_offset) =
+                prefix_repair_frames_with_available_output(
+                    path_stream,
+                    failover_source_frames,
+                    false,
+                );
+            if !tail_repair_frames.is_empty() {
+                critical_tail_repair = true;
+                repair_limit = failover_limit;
+                repair_frames = tail_repair_frames;
+                blocked_frontier_offset = tail_repair_blocked_offset;
+                repair_kind = "tail_repair";
+            } else if blocked_frontier_offset.is_none() {
+                blocked_frontier_offset = tail_repair_blocked_offset;
+            }
+        }
+    }
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = base_repair_limit;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = repair_kind;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = blocked_frontier_offset;
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = repair_limit;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "tail_stall_repair",
         format_args!(
-            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind={}",
+            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} blocked_frontier_offset={:?} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind={}",
             stream_id.0,
             relay_lane,
             last_send_ack_frontier,
@@ -1252,7 +1247,6 @@ fn enqueue_reliable_tail_repair(
             send_stream.repair_bytes(),
             repair_frames.len(),
             blocked_frontier_offset,
-            allow_same_output_frontier_retransmit,
             base_repair_limit,
             repair_limit,
             performance.extra_traffic_hint_percent,
@@ -1277,7 +1271,7 @@ fn enqueue_reliable_tail_repair(
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
-    product_owner_debt_bytes: usize,
+    ordered_owner_debt_bytes: usize,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1295,12 +1289,12 @@ async fn drain_server_response_sender_ready(
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
         let dispatch = match response_sender
-            .dispatch_next_with_product_owner_debt(
+            .dispatch_next_with_ordered_owner_debt(
                 path_stream,
                 send_stream,
                 relay_lane,
                 mux_limits,
-                product_owner_debt_bytes,
+                ordered_owner_debt_bytes,
             )
             .await
         {
@@ -1470,22 +1464,22 @@ where
                 + reliable_stream_recv_progress_interval(send_path_snapshot, relay_lane),
         );
         let has_tail_repair_alternative = path_stream.has_multipath_repair_alternative();
+        let tail_failover_repair_candidate = path_stream.can_attempt_failed_owner_tail_repair()
+            && last_send_ack_frontier < send_stream.next_offset();
+        let live_owner_tail_repair_candidate = has_tail_repair_alternative
+            && last_send_ack_complete
+            && last_send_ack_frontier < send_stream.next_offset();
         let tail_repair_active = relay_lane_is_bulk(relay_lane)
-            && stream_tail_repair_allowed(has_tail_repair_alternative)
             && send_stream.repair_bytes() > 0
-            && !last_send_ack_ranges.is_empty()
-            && stream_ack_ranges_expose_authoritative_gap(
-                last_send_ack_complete,
-                &last_send_ack_ranges,
+            && stream_tail_timer_repair_allowed(
+                live_owner_tail_repair_candidate,
+                tail_failover_repair_candidate,
             );
-        let authoritative_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+        let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
             relay_lane,
             &send_stream,
             last_send_ack_complete,
-            &last_send_ack_ranges,
             last_send_ack_frontier,
-            last_send_ack_progress_at,
-            send_path_snapshot,
         );
         let tail_repair_deadline = reliable_relay_tail_repair_deadline(
             last_send_ack_progress_at.max(last_tail_repair_at),
@@ -1560,12 +1554,12 @@ where
             response_sender_retry_at = None;
         }
         let queued_front_has_carrier_credit = response_sender
-            .front_has_carrier_credit_with_product_owner_debt(
+            .front_has_carrier_credit_with_ordered_owner_debt(
                 &path_stream,
                 &send_stream,
                 relay_lane,
                 mux_limits,
-                authoritative_owner_debt_bytes,
+                ordered_owner_debt_bytes,
             );
         let sender_wait = response_sender_wait_state(
             !response_sender.is_empty(),
@@ -1622,22 +1616,18 @@ where
                     performance,
                     path_stream.max_frame_payload_bytes,
                     last_send_ack_frontier,
-                    false,
                 );
                 last_tail_repair_at = Instant::now();
-                let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
                     last_send_ack_complete,
-                    &last_send_ack_ranges,
                     last_send_ack_frontier,
-                    last_send_ack_progress_at,
-                    send_path_snapshot,
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -1745,21 +1735,23 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         path_stream.release_normalized_acked_ranges(&normalized_ranges);
+                        #[cfg(feature = "lab-diagnostics")]
                         let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
-                        let ack_made_progress =
-                            ack.released_bytes > 0 || largest_ack_end > last_send_ack_frontier;
+                        let contiguous_ack_frontier =
+                            stream_ack_contiguous_frontier(complete, &normalized_ranges);
+                        let ack_made_progress = contiguous_ack_frontier > last_send_ack_frontier;
                         if ack_made_progress {
                             last_send_ack_progress_at = Instant::now();
                             last_tail_repair_at = last_send_ack_progress_at;
                         }
-                        last_send_ack_frontier = last_send_ack_frontier.max(largest_ack_end);
+                        last_send_ack_frontier =
+                            last_send_ack_frontier.max(contiguous_ack_frontier);
                         last_send_ack_ranges = normalized_ranges.clone();
                         last_send_ack_complete = complete;
                         let base_repair_limit =
                             adaptive_reliable_relay_repair_bytes(None, relay_lane, mux_limits);
                         let repair_event_budget =
                             response_sender.repair_extra_event_budget_remaining(mux_limits);
-                        let repair_limit = base_repair_limit.min(repair_event_budget);
                         let has_multipath_repair_alternative =
                             path_stream.has_multipath_repair_alternative();
                         let ack_gap_repair_ready = ack_gap_repair.repair_ready(
@@ -1770,6 +1762,15 @@ where
                             None,
                             relay_lane,
                         );
+                        let repair_limit = if ack_gap_repair_ready {
+                            reliable_critical_tail_repair_limit_bytes(
+                                base_repair_limit,
+                                send_stream.repair_bytes(),
+                                mux_limits,
+                            )
+                        } else {
+                            base_repair_limit.min(repair_event_budget)
+                        };
                         let mut repair_frames = stream_ack_gap_repair_frames_normalized(
                             &send_stream,
                             &normalized_ranges,
@@ -1778,7 +1779,8 @@ where
                             has_multipath_repair_alternative,
                             ack_gap_repair_ready,
                         );
-                        let mut critical_tail_repair = false;
+                        let mut critical_tail_repair =
+                            ack_gap_repair_ready && !repair_frames.is_empty();
                         let repair_kind = if repair_frames.is_empty() {
                             let fin_tail_stall_ready =
                                 tokio::time::Instant::now() >= tail_repair_deadline
@@ -1786,6 +1788,7 @@ where
                             let fin_tail_ready = close_sent || pending_local_fin;
                             let fin_tail_limit = if fin_tail_ready {
                                 let limit = reliable_critical_tail_repair_limit_bytes(
+                                    base_repair_limit,
                                     send_stream.repair_bytes(),
                                     mux_limits,
                                 );
@@ -1857,7 +1860,7 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let queued = if critical_tail_repair && repair_kind == "fin_tail" {
+                            let queued = if critical_tail_repair {
                                 response_sender.enqueue_critical_repair_frame(frame);
                                 true
                             } else {
@@ -1959,19 +1962,16 @@ where
                     }
                 }
                 if response_sender.queued_send_ready() {
-                    let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                    let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
                         last_send_ack_complete,
-                        &last_send_ack_ranges,
                         last_send_ack_frontier,
-                        last_send_ack_progress_at,
-                        send_path_snapshot,
                     );
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2028,8 +2028,11 @@ where
                     ),
                 );
                 if final_tail_repair_ready {
-                    let repair_limit =
-                        reliable_critical_tail_repair_limit_bytes(send_stream.repair_bytes(), mux_limits);
+                    let repair_limit = reliable_critical_tail_repair_limit_bytes(
+                        adaptive_reliable_relay_repair_bytes(send_path_snapshot, relay_lane, mux_limits),
+                        send_stream.repair_bytes(),
+                        mux_limits,
+                    );
                     let (repair_frames, blocked_frontier_offset) =
                         prefix_repair_frames_with_available_output(
                             &path_stream,
@@ -2087,19 +2090,16 @@ where
                     }
                 }
                 if response_sender.queued_send_ready() {
-                    let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                    let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
                         last_send_ack_complete,
-                        &last_send_ack_ranges,
                         last_send_ack_frontier,
-                        last_send_ack_progress_at,
-                        send_path_snapshot,
                     );
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2139,19 +2139,16 @@ where
                     last_recv_progress_sent_at = Instant::now();
                 }
                 if response_sender.queued_send_ready() {
-                    let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                    let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
                         last_send_ack_complete,
-                        &last_send_ack_ranges,
                         last_send_ack_frontier,
-                        last_send_ack_progress_at,
-                        send_path_snapshot,
                     );
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2176,19 +2173,16 @@ where
                 response_sender_retry_at = None;
                 close_sent = true;
                 pending_local_fin = false;
-                let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
                     last_send_ack_complete,
-                    &last_send_ack_ranges,
                     last_send_ack_frontier,
-                    last_send_ack_progress_at,
-                    send_path_snapshot,
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2204,19 +2198,16 @@ where
                 }
             }
             _ = std::future::ready(()), if queued_send_ready => {
-                let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
                     last_send_ack_complete,
-                    &last_send_ack_ranges,
                     last_send_ack_frontier,
-                    last_send_ack_progress_at,
-                    send_path_snapshot,
                 );
                 if drain_server_response_sender_ready(
                     &mut response_sender,
                     &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2230,6 +2221,7 @@ where
                     response_sender_retry_at =
                         Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
                 }
+                tokio::task::yield_now().await;
             }
             read = async {
                 #[cfg(feature = "lab-diagnostics")]
@@ -2323,19 +2315,16 @@ where
                         );
                     }
                     if response_sender.queued_send_ready() {
-                        let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+                        let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                             relay_lane,
                             &send_stream,
                             last_send_ack_complete,
-                            &last_send_ack_ranges,
                             last_send_ack_frontier,
-                            last_send_ack_progress_at,
-                            send_path_snapshot,
                         );
                         if drain_server_response_sender_ready(
                             &mut response_sender,
                             &path_stream,
-                    product_owner_debt_bytes,
+                    ordered_owner_debt_bytes,
                             &mut send_stream,
                             relay_lane,
                             mux_limits,
@@ -2359,19 +2348,16 @@ where
     let mut result = result;
     if result.is_ok() && pending_local_fin && !close_sent {
         while result.is_ok() && !response_sender.is_empty() {
-            let product_owner_debt_bytes = reliable_relay_current_authoritative_owner_debt_bytes(
+            let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                 last_relay_lane,
                 &send_stream,
                 last_send_ack_complete,
-                &last_send_ack_ranges,
                 last_send_ack_frontier,
-                last_send_ack_progress_at,
-                None,
             );
             match drain_server_response_sender_ready(
                 &mut response_sender,
                 &path_stream,
-                product_owner_debt_bytes,
+                ordered_owner_debt_bytes,
                 &mut send_stream,
                 last_relay_lane,
                 mux_limits,
@@ -2575,13 +2561,17 @@ mod tests {
     }
 
     #[test]
-    fn tail_repair_requires_independent_repair_subflow() {
-        assert!(!stream_tail_repair_allowed(false));
-        assert!(stream_tail_repair_allowed(true));
+    fn tail_timer_repair_allows_failed_owner_failover_without_second_live_alternative() {
+        assert!(
+            stream_tail_timer_repair_allowed(false, true),
+            "after the owner output is gone, the remaining output is the failover path even though it is no longer a second live alternative"
+        );
+        assert!(!stream_tail_timer_repair_allowed(false, false));
+        assert!(stream_tail_timer_repair_allowed(true, false));
     }
 
     #[test]
-    fn tail_repair_timer_requires_repair_authoritative_ack_gap_shape() {
+    fn ack_gap_repair_requires_authoritative_ack_gap_shape() {
         assert!(!stream_ack_ranges_expose_authoritative_gap(
             false,
             &[
@@ -2625,137 +2615,49 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_ack_gap_creates_owner_debt_pressure() {
-        let now = Instant::now();
+    fn contiguous_ack_frontier_creates_ordered_owner_scheduling_debt_not_repair_debt() {
+        let ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+
+        assert!(
+            !stream_ack_ranges_expose_authoritative_gap(true, &ranges),
+            "a contiguous unacknowledged suffix is not an authoritative product repair gap"
+        );
+        assert_eq!(
+            reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, true, 1024, 8192,),
+            7168,
+            "the same suffix is still ordered-owner scheduling debt and must block unsafe Service migration"
+        );
+        assert_eq!(
+            reliable_relay_ordered_owner_debt_bytes(FlowLane::Latency, true, 1024, 8192,),
+            0,
+            "latency traffic must not be pinned by bulk owner-tail pressure"
+        );
+    }
+
+    #[test]
+    fn sparse_ack_largest_end_is_not_contiguous_frontier() {
         let ranges = [
             OffsetRange {
                 start: 0,
                 end: 1024,
             },
             OffsetRange {
-                start: 2048,
-                end: 4096,
+                start: 4096,
+                end: 8192,
             },
         ];
 
         assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Throughput,
-                4096,
-                true,
-                &ranges,
-                1024,
-                8192,
-                now,
-                now,
-                None,
-            ),
-            4096
+            stream_ack_contiguous_frontier(true, &ranges),
+            1024,
+            "sparse ACK ranges must keep the scheduling frontier at the first hole, not the largest ACK end"
         );
-        assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Latency,
-                4096,
-                true,
-                &ranges,
-                1024,
-                8192,
-                now,
-                now,
-                None,
-            ),
-            0
-        );
-        assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Throughput,
-                0,
-                true,
-                &ranges,
-                1024,
-                8192,
-                now,
-                now,
-                None,
-            ),
-            0
-        );
-        assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Throughput,
-                4096,
-                true,
-                &[OffsetRange {
-                    start: 0,
-                    end: 8192,
-                }],
-                8192,
-                8192,
-                now,
-                now,
-                None,
-            ),
-            0
-        );
+        assert_eq!(stream_ack_contiguous_frontier(false, &ranges), 0);
     }
 
-    #[test]
-    fn stalled_contiguous_ack_frontier_does_not_create_owner_debt_pressure() {
-        let stall_timeout = reliable_relay_stall_timeout(None, FlowLane::Throughput);
-        let now = Instant::now();
-        let old_progress = now - stall_timeout - Duration::from_millis(1);
-        let recent_progress = now - (stall_timeout / 2);
-        let ranges = [OffsetRange {
-            start: 0,
-            end: 1024,
-        }];
-
-        assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Throughput,
-                4096,
-                true,
-                &ranges,
-                1024,
-                8192,
-                old_progress,
-                now,
-                None,
-            ),
-            0,
-            "stalled contiguous ACK frontier is below-carrier in-flight state, not an authoritative product gap"
-        );
-        assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Throughput,
-                4096,
-                true,
-                &ranges,
-                1024,
-                8192,
-                recent_progress,
-                now,
-                None,
-            ),
-            0,
-            "recent contiguous ACK progress remains ordinary in-flight repair-cache retention"
-        );
-        assert_eq!(
-            reliable_relay_authoritative_owner_debt_bytes(
-                FlowLane::Latency,
-                4096,
-                true,
-                &ranges,
-                1024,
-                8192,
-                old_progress,
-                now,
-                None,
-            ),
-            0,
-            "latency traffic should not enter bulk owner-debt pressure"
-        );
-    }
     #[test]
     fn tail_repair_uses_persistent_congestion_timeout() {
         let last_progress = Instant::now();
@@ -2771,98 +2673,41 @@ mod tests {
     }
 
     #[test]
-    fn tail_stall_without_authoritative_ack_gap_does_not_repair_live_tail() {
-        let limits = MuxLimits::default();
-        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
-        send_stream
-            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
-            .expect("send stream data");
-
-        let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
-            &send_stream,
-            &[OffsetRange {
-                start: 0,
-                end: 1024,
-            }],
-            4096,
-            false,
-        );
-
-        assert!(repair_frames.is_empty());
-        assert_eq!(repair_kind, "none");
-    }
-
-    #[test]
-    fn tail_stall_does_not_repair_contiguous_live_owner_tail() {
-        let limits = MuxLimits::default();
-        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
-        send_stream
-            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
-            .expect("send stream data");
-
-        let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
-            &send_stream,
-            &[OffsetRange {
-                start: 0,
-                end: 1024,
-            }],
-            2048,
-            true,
-        );
-
-        assert!(
-            repair_frames.is_empty(),
-            "contiguous live owner tail is below-carrier in-flight data, not correctness repair"
-        );
-        assert_eq!(repair_kind, "none");
-    }
-
-    #[test]
-    fn persistent_ack_gap_repair_limit_spends_earned_budget() {
+    fn persistent_ack_gap_repair_limit_uses_critical_event_quantum() {
         let limits = MuxLimits::default();
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
         let repair_debt = base_limit.saturating_mul(32);
-        let budget_remaining = repair_debt;
 
-        let repair_limit = reliable_tail_stall_repair_limit_bytes(
-            base_limit,
-            repair_debt,
-            budget_remaining,
-            limits,
-        );
+        let repair_limit =
+            reliable_critical_tail_repair_limit_bytes(base_limit, repair_debt, limits);
 
-        assert!(
-            repair_limit > base_limit,
-            "persistent ACK-gap repair may spend earned optional repair budget"
-        );
         assert_eq!(
-            repair_limit, repair_debt,
-            "the optional repair budget, not a single timer quantum, caps persistent ACK-gap repair"
+            repair_limit, base_limit,
+            "persistent ACK-gap repair may bypass optional budget, but one event repairs only one bounded quantum"
         );
     }
 
     #[test]
-    fn persistent_ack_gap_repair_limit_stops_after_optional_budget_exhaustion() {
+    fn persistent_ack_gap_repair_limit_ignores_optional_budget_exhaustion() {
         let limits = MuxLimits::default();
         let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
         let small_tail = base_limit.saturating_sub(1024).max(1);
 
         let repair_limit =
-            reliable_tail_stall_repair_limit_bytes(base_limit, small_tail, 0, limits);
+            reliable_critical_tail_repair_limit_bytes(base_limit, small_tail, limits);
 
         assert_eq!(
-            repair_limit, 0,
-            "persistent ACK-gap repair is optional traffic and must stop after the optional budget is exhausted"
+            repair_limit, small_tail,
+            "persistent ACK-gap repair is correctness repair and must not depend on optional duplicate/probe budget"
         );
         assert_eq!(
-            reliable_tail_stall_repair_limit_bytes(
-                base_limit,
+            reliable_critical_tail_repair_limit_bytes(
                 limits.max_repair_bytes.saturating_add(base_limit),
-                0,
+                limits.max_repair_bytes.saturating_add(base_limit),
                 limits
             ),
-            0,
-            "persistent ACK-gap repair must not mint critical budget for larger retained tails"
+            limits.max_repair_bytes.min(limits.max_path_flight_bytes),
+            "persistent ACK-gap repair remains bounded by configured repair/path-flight caps"
         );
     }
 
@@ -2875,17 +2720,19 @@ mod tests {
         let repair_debt = base_limit.saturating_mul(8);
 
         assert_eq!(
-            reliable_critical_tail_repair_limit_bytes(small_tail, limits),
+            reliable_critical_tail_repair_limit_bytes(base_limit, small_tail, limits),
             small_tail,
             "terminal owner-tail repair may close a retained final tail even after optional repair budget is exhausted"
         );
 
-        assert!(
-            reliable_critical_tail_repair_limit_bytes(repair_debt, limits) >= base_limit,
+        assert_eq!(
+            reliable_critical_tail_repair_limit_bytes(base_limit, repair_debt, limits),
+            base_limit,
             "terminal owner-tail repair keeps a bounded critical path for final stream closure"
         );
         assert_eq!(
             reliable_critical_tail_repair_limit_bytes(
+                resource_cap.saturating_add(base_limit),
                 resource_cap.saturating_add(base_limit),
                 limits
             ),
@@ -2951,7 +2798,6 @@ mod tests {
             },
             path_stream.max_frame_payload_bytes,
             ack_frontier,
-            false,
         );
 
         assert_eq!(
@@ -2961,14 +2807,614 @@ mod tests {
     }
 
     #[test]
-    fn tail_stall_repair_still_repairs_authoritative_ack_gap() {
+    fn failed_owner_tail_repair_uses_remaining_output_after_persistent_stall() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(99);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(99),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x42; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(99),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(
+            queued, 1,
+            "a detached owner path turns a persistent contiguous tail into failover repair on the remaining output"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_owner_repair_without_ack_frontier_starts_at_zero() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(103);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(103),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, mut failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x46; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(103),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &[],
+            false,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            0,
+        );
+
+        assert_eq!(
+            queued, 1,
+            "failed-owner repair must retransmit from offset zero when no response ACK frontier exists"
+        );
+        response_sender
+            .dispatch_next_with_ordered_owner_debt(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                limits,
+                0,
+            )
+            .await
+            .expect("dispatch failed-owner repair");
+        let command =
+            try_recv_reliable_path_priority_command(&mut failover_receivers).expect("repair frame");
+        match command {
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset, payload, ..
+            }) => {
+                assert_eq!(offset, 0);
+                assert!(!payload.is_empty());
+            }
+            _ => panic!("expected failed-owner repair STREAM_DATA"),
+        }
+    }
+
+    #[test]
+    fn live_owner_tail_without_ack_frontier_does_not_repair_on_alternate() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(104);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let alternative_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(104),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (alternative_commands, _alternative_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                alternative_key.underlay,
+                alternative_key.path_id,
+                alternative_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x47; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(104),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &[],
+            false,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            0,
+        );
+
+        assert_eq!(
+            queued, 0,
+            "without a complete ACK frontier or failed owner, live owner bytes are normal in-flight data and must not be duplicated onto an alternate"
+        );
+    }
+
+    #[test]
+    fn failed_owner_tail_repair_is_not_blocked_by_optional_budget() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(101);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(101),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x44; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(101),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        let optional_budget = response_sender.repair_extra_budget_remaining(limits);
+        assert!(optional_budget > 0);
+        assert!(
+            response_sender
+                .enqueue_repair_frame_with_priority(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: 10_000,
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0x99; optional_budget]),
+                    },
+                    limits,
+                    true,
+                )
+                .is_some()
+        );
+        assert_eq!(
+            response_sender.repair_extra_event_budget_remaining(limits),
+            0
+        );
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert!(
+            queued > 0,
+            "failed-owner tail recovery is correctness repair and must not depend on optional duplicate/probe budget"
+        );
+    }
+
+    #[test]
+    fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(102);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let repair_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(102),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                repair_key.underlay,
+                repair_key.path_id,
+                repair_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x45; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [
+            OffsetRange {
+                start: 0,
+                end: 1024,
+            },
+            OffsetRange {
+                start: 2048,
+                end: 4096,
+            },
+        ];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(102),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        let optional_budget = response_sender.repair_extra_budget_remaining(limits);
+        assert!(optional_budget > 0);
+        assert!(
+            response_sender
+                .enqueue_repair_frame_with_priority(
+                    Frame::StreamData {
+                        stream_id,
+                        offset: 10_000,
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0x99; optional_budget]),
+                    },
+                    limits,
+                    true,
+                )
+                .is_some()
+        );
+        assert_eq!(
+            response_sender.repair_extra_event_budget_remaining(limits),
+            0
+        );
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            4096,
+        );
+
+        assert_eq!(
+            queued, 0,
+            "persistent ACK gaps are repaired by the ACK-gap controller; the tail timer must not duplicate live-owner gap repair"
+        );
+    }
+
+    #[test]
+    fn persistent_live_owner_tail_with_alternative_gets_repairdata_without_failover() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(100);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let alternative_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(100),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (alternative_commands, _alternative_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                alternative_key.underlay,
+                alternative_key.path_id,
+                alternative_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(100),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let queued = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(
+            queued, 1,
+            "a persistent live-owner tail stall should reinject the lowest blocked range as RepairData on an alternate output without migrating Service ownership"
+        );
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(owner_key),
+            "tail repair is RepairData; it must not rewrite the Service owner"
+        );
+    }
+
+    #[test]
+    fn ack_gap_repair_still_repairs_authoritative_ack_gap() {
         let limits = MuxLimits::default();
         let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
         send_stream
             .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
             .expect("send stream data");
 
-        let (repair_frames, repair_kind) = stream_tail_stall_repair_frames(
+        let repair_frames = stream_ack_gap_repair_frames(
             &send_stream,
             &[
                 OffsetRange {
@@ -2982,9 +3428,10 @@ mod tests {
             ],
             4096,
             true,
+            true,
+            true,
         );
 
-        assert_eq!(repair_kind, "ack_gap");
         assert_eq!(repair_frames.len(), 1);
         assert_eq!(
             reliable_stream_frame_extent(&repair_frames[0]),

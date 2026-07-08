@@ -339,16 +339,19 @@ and live carrier membership still match the admission envelope. It is recreated
 on material envelope change, detach/failover, or carrier-membership change, not
 on ordinary ACK progress. Product byte ownership still belongs to the per-range
 flight ledger, not to the subflow set itself. The Service path is the current
-lower-frontier owner or live active ordered-owner anchor for that stream
-direction. It is not simply the lowest-ETA candidate, and a measured
+lower-frontier owner or live ordered-owner anchor for that stream direction. It
+is not simply the lowest-ETA candidate, and a measured
 alternate MUST NOT be relabeled as Service merely because it wins the next
-payload quantum. A Service change is an explicit migration/failover result:
-detach/close of the old owner with a direction-correct bulk-rate-proven
-survivor, loss of a live owner with a measured survivor, or a frontier-clear
-service handoff chosen by the Service migration policy. A proof/liveness-only
-survivor remains Probe/Standby until it produces bulk-rate evidence; it is not
-promoted to Service merely because it is the only remaining attached output.
-Otherwise, lower-ETA measured contributors are Subflows.
+payload quantum. Detach, close, or carrier loss invalidates the old live output,
+but it MUST NOT by itself transfer Service ownership to a survivor while
+ordered-owner scheduling debt remains. In that state the sender waits, performs
+bounded failover repair, or resumes only after the contiguous frontier catches
+up. A new Service owner is chosen by explicit sender-service admission at a
+clear frontier or by a dedicated failover policy after lower ownership has been
+resolved. A proof/liveness-only survivor remains Probe/Standby until it
+produces bulk-rate evidence; it is not promoted to Service merely because it is
+the only remaining attached output. Otherwise, lower-ETA measured contributors
+are Subflows.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -517,21 +520,48 @@ sender-service queue; reading source bytes is memory staging, not ownership.
 Repair and control traffic may continue, but expanding future owner ranges
 behind a known hole violates the no-worse/HOL guard and turns repair into
 throughput churn. New `OwnerData` may resume after the ordered frontier closes
-or the gap no longer exposes repair debt. Repair remains charged to the
-extra-traffic budget so a lossy owner cannot convert the stream into unbounded
-duplicate traffic.
+or the gap no longer exposes repair debt. Fresh or speculative repair remains
+charged to the extra-traffic budget so a lossy owner cannot convert the stream
+into unbounded duplicate traffic. A persistent authoritative gap is correctness
+repair: it may exceed the optional extra-traffic budget only after the
+persistent-gap guard fires, and each repair event remains bounded by the current
+repair quantum, outstanding repair debt, and configured repair/path-flight
+resource caps.
+
+When ACK ranges are contiguous but stop before the sender's highest owner
+offset, the unacknowledged suffix is not repairable merely because it is
+unacknowledged. A live TCP or QUIC carrier owns its own packet recovery, and
+same-output product retransmission cannot overtake the missing bytes. A live
+owner tail with no complete ACK frontier is normal in-flight data, not repair
+debt. If a complete ACK frontier exists, the frontier remains blocked across
+the persistent tail-stall guard, and a different live output can carry the
+lowest blocked range, that suffix becomes tail correctness repair: it may be
+retransmitted as `RepairData` only on an output that did not own the offset
+range, after persistent stall evidence and under the same repair/path-flight
+caps. Detached, failed, or no-longer-serviceable owners use the same bounded
+tail-repair mechanism because the original owner can no longer make progress.
+This repair remains duplicate product data and MUST NOT create path delivery
+proof, move the Service owner, or reset Subflow admission state.
+
+For scheduling and tail-repair timers, the product ACK frontier is the end of
+the first ACK range only when that range starts at offset 0. It is not the
+largest end offset carried by a sparse `STREAM_ACK`. Sparse higher ranges may
+release per-range flight bookkeeping, but they do not prove contiguous
+application delivery and MUST NOT erase ordered-owner scheduling debt, reset the
+lower-frontier stall clock, or authorize later `OwnerData` on a fallback path.
 
 The sender-service queue MUST NOT treat all `RepairData` as a priority lane.
 Ordinary budgeted repair is queued behind `OwnerData`; it can use otherwise idle
 carrier capacity but cannot starve the service path. Only repair explicitly
 classified as critical because it closes an authoritative product ACK gap, known
-terminal tail, or failed-owner gap may preempt later `OwnerData`. Critical
-priority is separate from budget bypass: critical repair still consumes the
-extra-traffic budget unless the implementation is repairing one of those bounded
-correctness cases and the optional budget is exhausted. That correctness repair
-is still `RepairData`: it does not prove the repair path, does not move the
-Service owner, and is bounded by outstanding repair debt plus configured
-repair/path-flight resource caps.
+terminal tail, failed-owner gap/tail, or persistent live-owner tail on an
+alternate output may preempt later `OwnerData`. Critical priority is separate
+from budget bypass: critical repair still consumes the extra-traffic budget
+unless the implementation is repairing one of those bounded correctness cases
+and the optional budget is exhausted. That correctness repair is still
+`RepairData`: it does not prove the repair path, does not move the Service
+owner, and each event is bounded by the current repair quantum,
+outstanding repair debt, and configured repair/path-flight resource caps.
 
 Carrier engines own underlay mechanics. TCP owns encrypted framed records,
 writer backpressure, TCP path heartbeat, and TCP session shutdown. QUIC UDP owns
@@ -635,8 +665,9 @@ above `100` bias the sender toward redundant repair under severe instability.
 This value is a hard sender-side budget for optional repair work, with a small
 startup floor to avoid repair deadlock. It is not a fixed rate, not a
 product-data throttle, and not a condition that can terminate production
-traffic or prevent correctness repair for an authoritative ACK gap, failed-owner
-gap, or known final tail. Such repair may exceed the optional hint only in those
+traffic or prevent correctness repair for an authoritative ACK gap, a
+failed-owner gap/tail, a persistent live-owner tail with an alternate output, or
+a known final tail. Such repair may exceed the optional hint only in those
 bounded cases, and remains bounded by repair-cache, path-flight, and sender
 resource limits. Auto scheduling remains the default and MUST adapt from
 measurements even when the hint is left unset.
@@ -816,7 +847,7 @@ their origin is explicit and they do not become hidden modes.
 | UDP target/datagram path model | UDP/QUIC response deadline derives from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. A product datagram ID is emitted once on the selected carrier and expires on absent target response instead of being replayed on another carrier |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active Service flight on any carrier uses the finite startup product window, not the full resource envelope; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Bulk admission | Product flight/queue <= BDP/resource envelope for active owners; before product-progress evidence exists, active Service flight on any carrier uses the finite product Service horizon, not the full resource envelope, not a multi-megabyte preload, and not a tiny carrier-cwnd or one-quantum gate; after product-progress evidence exists, active Service flight is capped by product-progress BDP using queue-resistant RTT, not queue-inflated SRTT or carrier pacing; latency pressure may shrink or preempt Service bursts but MUST NOT switch active Service ownership back to a carrier-pacing-derived product backlog limit; QUIC active owners additionally count carrier-accepted-but-unacked product data as queue debt; carrier inflight/queue/RTT/loss/pacing shape ETA and extra-path admission; cross-underlay and debt-bearing same-stream sends use completion horizon while clear-frontier same-underlay sends use writer credit and reorder budget | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
 | Validation traffic | Probe/control traffic only; repair data only after explicit gap/failover evidence; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -1689,7 +1720,8 @@ carrier channel MAY be accepted as an overlapping input/control channel when the
 sender has already abandoned or is replacing the previous carrier instance; in
 that case valid product frames are still routed by stream offset, but unique
 response bytes continue to use the already-owned response output until carrier
-teardown or explicit detach changes ownership. Non-active duplicate proof
+teardown or explicit detach clears the live Service owner and the sender
+performs frontier-safe repair or re-admission. Non-active duplicate proof
 channels SHOULD be ignored or closed when an equivalent live output already
 exists. Any
 duplicate-carrier close MUST NOT be encoded as a product `STREAM_RESET`, because
@@ -2813,18 +2845,17 @@ the admission envelope is refreshed.
 
 Reliable path membership uses explicit roles. An attached output starts as
 `Standby` or `Probe`, not as a data owner. `Service` is the current ordered-owner
-anchor and MUST remain the scheduler baseline while it is healthy. A live
-response stream that has any live carrier output MUST expose exactly one live
-`Service` owner key to the sender scheduler. If the current Service output is
-detached or closed, the
-binding promotes an existing live survivor by path evidence and measured rate:
-bulk-rate-proven survivors rank first, sender-evidence survivors rank next, and
-plain attached outputs are only a last-resort failover. Output-list tail
-position, validation attach order, and recent repair selection are not ownership
-signals. This is a survivor invariant, not delivery evidence, and it does not
-credit the survivor with bulk-rate samples. A measured Subflow may compete for
-owner credit, but its existence MUST NOT hide or invalidate the current Service
-as a lead candidate; a blocked optional Subflow creates backpressure or
+anchor and MUST remain the scheduler baseline while it is live and healthy. If
+the current Service output is detached or closed, the binding clears the live
+Service owner key instead of promoting a survivor from output membership. While
+ordered-owner scheduling debt remains, that absent-owner state is a
+wait/repair/failover state, not permission to send later `OwnerData` on another
+path. Once the contiguous frontier is clear, sender-service admission may choose
+the best measured live output as the next Service. Output-list tail position,
+validation attach order, and recent repair selection are not ownership signals.
+A measured Subflow may compete for owner credit, but its existence MUST NOT
+hide or invalidate the current Service as a lead candidate; a blocked optional
+Subflow creates backpressure or
 Standby/RepairOnly state, not a stream with no admissible Service. `Subflow` is
 an additional owner path admitted by the same no-worse completion and
 ordering-debt model used for the Service path. There is one Subflow owner
@@ -2845,7 +2876,7 @@ as established bulk data.
 Validation attachment adds a path-manager output; it does not remove or hide the
 active service output. If the active output still has carrier credit for the
 queued lane, the sender service MUST remain wakeable even while validation proof
-traffic is pending on other outputs or survivor promotion is in progress.
+traffic is pending on other outputs or replacement control is in progress.
 Product-source backpressure and sender target snapshots MUST use the same live
 Service owner identity as ordinary OwnerData scheduling; using output-list tail
 position as a second active-owner model is stale and invalid. This prevents
@@ -3046,33 +3077,39 @@ bulk-rate evidence exists. After that window is spent, a Subflow may receive
 unique owner bytes only after path-scoped bulk-rate evidence exists and the
 no-worse admission model accepts it.
 
-The production SafeBestPath guard is stricter while a reliable stream has
-authoritative owner-debt pressure: ACK ranges or the path-flight ledger show
-that lower-frontier owner bytes are unresolved beyond the same path-aware
-ACK/progress quantum used to decide when product ACK feedback is needed. Normal
-unacknowledged `OwnerData` retained in the repair cache is recovery state, not
-by itself product ordering debt; treating cache occupancy as owner-debt pressure
-would prevent the latency-first stream from moving to a better bulk path on
-demand. Once authoritative owner-debt pressure exists, the sender MUST treat the
-current ordered-data owner as a family/evidence filter, not a priority bypass
-or queue-credit bypass. An explicit ACK-range hole creates this pressure
-immediately. A contiguous ACK frontier that stops advancing is retained
-`OwnerData` recovery state until carrier failure, detach, or known-final-tail
-evidence makes repair a correctness action; it is not by itself authoritative
-owner-debt pressure. The Service anchor may identify the path that owns the
-lower unresolved bytes, but that identity is not permission to emit more later
-`OwnerData`. The sender MUST wait, repair/fail over the explicit gap, or admit
-a candidate whose ordering-debt input is safe under the normal no-worse checks.
-The scheduler lower-flight debt input MUST therefore be derived from
-authoritative ACK-hole state, not from every older unacknowledged `OwnerData`
-flight retained in the repair cache. Repair overlap avoidance may inspect the
-full product-flight ledger separately, but that ledger is not itself admission
-debt.
+The production SafeBestPath guard separates two debt ledgers. Ordered-owner
+scheduling debt is any bulk `OwnerData` suffix below the sender's highest owner
+offset that the peer has not yet acknowledged contiguously. Authoritative repair
+debt is narrower: an explicit ACK-range gap, a failed/detached owner tail, a
+persistent live-owner tail with alternate-output repair evidence, or a known
+final tail with persistent stall evidence. Ordered-owner scheduling debt MUST
+be passed into Service/Subflow admission so an alternate cannot own later bytes
+behind an unresolved lower owner. Authoritative repair debt alone may create
+`RepairData`.
+
+Normal unacknowledged `OwnerData` retained in the repair cache is carrier
+recovery state for repair purposes, but it is still owner scheduling pressure
+while the ACK frontier is behind the sender's highest owner offset. Treating
+every retained repair-cache byte as immediate repair would create duplicate
+storms; treating the same contiguous suffix as zero scheduling debt lets
+cross-underlay Service migration create large receive holes. The sender MUST
+wait, keep feeding the current Service owner when safe, or admit only a
+candidate whose ordering-debt input passes the normal no-worse checks. A
+remembered Service owner that is absent, or an unknown Service owner ledger while
+ordered-owner scheduling debt remains, is not a hint to elect another Service
+path; it is a wait/repair/failover state until lower ownership is resolved or
+the debt is converted into explicit `RepairData`. A
+contiguous ACK frontier that stops advancing becomes `RepairData` only after
+carrier failure, detach, or known-final-tail evidence makes repair a correctness
+action. Repair overlap avoidance may inspect the full product-flight ledger
+separately, but that ledger is not itself repair debt.
+
 Proof-only and unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly`
-until the debt falls below pressure or explicit loss/failure/final-tail evidence
-converts the affected range into `RepairData`. A mixed-family path is
-owner-eligible under debt pressure only when it is bulk-rate-proven and already
-owns the lower outstanding range. The surviving OwnerData candidates still pass the normal
+until ordered-owner scheduling debt falls below pressure or explicit
+loss/failure/final-tail evidence converts the affected range into `RepairData`.
+A mixed-family path is owner-eligible under debt pressure only when it is
+bulk-rate-proven and already owns the lower outstanding range. The surviving
+OwnerData candidates still pass the normal
 ECF/BLEST-style no-worse checks for ETA, inflight, ordering debt, read-gap,
 queue, overhead, and completion horizon. This prevents per-quantum ETA changes
 from turning an unhealthy flow into cross-family owner migration, receive-hole
@@ -3393,25 +3430,27 @@ repair debits that ledger. Path proof traffic is bounded by validation attach
 fan-out and the path-proof startup payload, not by the sender's data queue. A
 small startup floor prevents repair deadlock before enough ordinary bytes have
 made ACK progress, but the floor is spent once and does not refresh on every
-ACK-gap or tail-stall event. After that floor is spent, newly earned repair
+ACK-gap event or tail-failover event. After that floor is spent, newly earned repair
 budget accumulates until it can fund at least one useful repair burst; sub-MSS
 or crumb-sized repairs are not emitted merely because a small fractional budget
 was earned. The value is a continuous hint for how aggressively the sender may
 trade duplicate traffic for recovery speed; it is not a fixed rate, not a
 per-event multiplier, not a product-data throttle, and not permission to send
 speculative unique bytes that deepen ordered receive debt. Correctness repair
-may exceed the optional hint only for an authoritative ACK gap, failed-owner gap,
-or known final tail, and only as bounded `RepairData`.
+may exceed the optional hint only for an authoritative ACK gap, failed-owner
+gap/tail, persistent live-owner tail on an alternate output, or known final
+tail, and only as bounded `RepairData`.
 
 Repair is triggered by explicit evidence: a complete `STREAM_ACK` that exposes
-a gap, a path failure or detach event, or known-final-offset tail recovery.
-Data-plane PTO/stall evidence is a timer input for deciding when to act on those
-facts; it is not by itself permission to duplicate arbitrary live tail bytes.
-The same sender-owned extra-traffic ledger applies to persistent ACK-gap repair
-and later final-tail repair, because both cases spend duplicate traffic from the
-same stream-level budget. The repair extent is the missing or suspect
-unacknowledged byte range indicated by that event, not every cached chunk below
-the frontier.
+a gap, a path failure or detach event, persistent live-owner tail stall with an
+alternate output, or known-final-offset tail recovery. Data-plane PTO/stall
+evidence is a timer input for deciding when to act on those facts; it is not by
+itself permission to duplicate arbitrary live tail bytes on the same/only
+carrier. The same sender-owned extra-traffic ledger applies to persistent
+ACK-gap repair, alternate-output tail repair, and later final-tail repair,
+because all cases spend duplicate traffic from the same stream-level budget.
+The repair extent is the missing or suspect unacknowledged byte range indicated
+by that event, not every cached chunk below the frontier.
 Repair target choice is evidence-ordered, not carrier-family ordered. The
 sender first prefers an eligible path that did not carry the last outstanding
 copy of the repaired range and that is active or bulk-rate proven for this
@@ -3426,18 +3465,19 @@ already in flight. A sender MUST NOT duplicate every lower outstanding byte
 merely because a faster active path is available. Speculative reinjection outside
 the sender-service queue is prohibited because it can occupy path queues before
 the receiver has proven useful repair. A queued sender may spend additional
-repair traffic only after explicit ACK-gap, path failure/detach, or
-known-final-offset tail recovery, and the numeric traffic hint only scales the
-sender-service repair budget.
+repair traffic only after explicit ACK-gap, path failure/detach, persistent
+alternate-output tail stall, or known-final-offset tail recovery, and the
+numeric traffic hint only scales the sender-service repair budget.
 
 Repair `STREAM_DATA` is still stream data for correctness and flow accounting,
 but ordinary budgeted repair is not a priority bypass. It remains `RepairData`,
 is charged to the stream extra-traffic ledger, and is queued behind already
 admitted `OwnerData` unless it closes an authoritative ACK gap, a failed-owner
-gap, or a known final tail. This service rule changes queue priority only for
-bounded correctness repair; it does not change stream semantics. The receiver
-still accepts the data by stream offset and discards duplicates after the
-corresponding range is ACKed or delivered.
+gap/tail, a persistent live-owner tail on an alternate output, or a known final
+tail. This service rule changes queue priority only for bounded correctness
+repair; it does not change stream semantics. The receiver still accepts the
+data by stream offset and discards duplicates after the corresponding range is
+ACKed or delivered.
 
 For the lead path, `lead_product_queue_envelope` is the preemptible product
 repair and flow-control envelope, not the UDP carrier cwnd. This larger
@@ -3523,9 +3563,10 @@ the same in-order carrier stream. Same-output tail retransmission cannot overtak
 missing carrier bytes, but it can consume duplicate tunnel traffic and create
 ACK/repair feedback loops. A sender therefore MAY arm tail repair only when an
 independent repair subflow is available, and the tail timer may emit repair only
-for an authoritative ACK gap or a known final-offset tail. It SHOULD wait for a
-persistent congestion-scale stall rather than one ordinary PTO before sending
-that repair.
+for failed-owner tail failover or a known final-offset tail. Authoritative ACK
+gaps are handled by the ACK-gap repair controller, not by the tail timer. Both
+paths SHOULD wait for persistent congestion-scale stall evidence rather than one
+ordinary PTO before sending repair.
 
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,
@@ -3636,7 +3677,14 @@ product_budget_rate = path.product_progress_rate if known else none
 product_budget_bdp = product_budget_rate * path.srtt
 lead_path = min_eta_candidate_that_is_eligible_and_admissible_for_ordinary_bulk()
 if path is the lead path:
-    if product_budget_rate is known:
+    if product_budget_rate is known and path is app-limited:
+        # The sample proves product ACK progress but not path capacity.  It
+        # must not seed a tiny BDP cap or move ownership, and it must not
+        # unlock the full configured product envelope before non-app-limited
+        # bulk evidence exists.
+        product_inflight_limit = min(service_horizon_window,
+                                     configured_path_inflight)
+    else if product_budget_rate is known:
         product_inflight_limit = min(2 * product_budget_bdp,
                                      configured_path_inflight)
     else:
@@ -3709,9 +3757,17 @@ or debt-bearing scheduling, not a blanket same-underlay stickiness rule. It
 MUST NOT reject a same-underlay candidate with a clear ordered frontier solely
 because an app-limited initial-window sample or underfed validation history
 implies a tiny rate. Such a sample proves that the sender was not feeding the
-path enough to measure capacity; it does not prove that the path is slow. While
-there is no lower-frontier owner on another path, same-underlay admission is
-governed by explicit product inflight, live carrier credit, and reorder budgets.
+path enough to measure capacity; it does not prove that the path is slow.
+However, an app-limited sample also does not prove that the path can safely hold
+the path's bulk capacity. It therefore MUST NOT initialize a tiny BDP-derived
+bulk model or make another path Service, but it also MUST NOT unlock the full
+configured product envelope. It may raise the clear-frontier Service owner from
+the pre-progress startup window to the bounded Service horizon. Only
+non-app-limited bulk evidence can replace that Service horizon with a
+BDP-derived product envelope.
+While there is no lower-frontier owner on another path, same-underlay admission
+is governed by explicit product inflight, live carrier credit, and reorder
+budgets.
 Once stream-ordering debt exists for a non-owner candidate, additional
 same-stream `OwnerData` is suppressed until the lower frontier clears. The
 completion horizon remains the positive-contribution gate for clear-frontier
@@ -3720,14 +3776,17 @@ the migration policy decides the carrier family may change.
 
 For same-underlay startup, the reorder/feed budget uses live carrier credit when
 available. If the carrier reports an inflight or congestion-window limit, that
-carrier limit shapes ETA and emission credit, but the startup owner credit is
-derived from the existing ACK/update BDP window and capped by the
-carrier-neutral startup product window plus the product reorder/resource
-envelope. The sender MUST NOT replace that credit with a tiny product-rate BDP
-derived from the default path-open score or from one app-limited sample. This
-follows MPQUIC's per-path congestion-state model: QUIC decides packet pacing and
-packet flight, while mptunnel bounds the amount of ordered product data it is
-willing to expose to reordering risk.
+carrier limit shapes ETA and emission credit, but the pre-progress Service owner
+credit is derived from the finite product Service horizon. It is a preemptible
+product horizon, not a carrier congestion window and not permission to preload
+the full configured resource envelope before the first product ACK. Startup
+Subflow owner credit remains capped by the existing ACK/update BDP window and
+the product reorder/resource envelope.
+The sender MUST NOT replace these credits with a tiny product-rate BDP derived
+from the default path-open score or from one app-limited sample. This follows
+MPQUIC's per-path congestion-state model: QUIC decides packet pacing and packet
+flight, while mptunnel bounds the amount of ordered product data it is willing
+to expose to reordering risk.
 
 The same completion-horizon logic applies to the previously attached active path
 when it is no longer the Service path and continuing it would expand an existing
@@ -3747,7 +3806,7 @@ repair, and latency frames must still interleave with any admitted bulk work.
 The configured ceiling MUST be applied as an upper bound over the adaptive
 product-flight model. It MUST NOT be implemented as a floor that expands a
 smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
-Product owner debt pressure MUST NOT bypass the active Service product-flight
+Ordered-owner scheduling debt MUST NOT bypass the active Service product-flight
 admission check. If older owner debt is above pressure, debt pressure acts as a
 family/evidence filter and an ordering-debt input. The current Service anchor
 does not get a special later-OwnerData exemption merely because it owns lower
@@ -3791,9 +3850,9 @@ unknown paths from being trusted as production bulk lanes while still allowing
 aggressive proof traffic when the model predicts it will not increase
 completion time.
 
-Confidence scaling does not shrink the lead path's basic ACK-clocked
-product-flight window below `product_inflight_limit`; otherwise a single path
-would bootstrap too slowly and bulk throughput would regress. It also does not
+Confidence scaling does not shrink the lead path's basic product Service
+horizon below `product_inflight_limit`; otherwise a single path would bootstrap
+too slowly and bulk throughput would regress. It also does not
 shrink same-underlay aggregation below the unscaled BDP reorder budget, because
 that turns a healthy pure-UDP or pure-TCP multipath transfer into a permanent
 probe. The unscaled lead/same-underlay rule MUST NOT be applied to
@@ -3885,14 +3944,14 @@ MPTCP/MPQUIC anti-pattern where normal multipath reordering is mistaken for a
 dead subflow and creates repeated detach/reopen churn.
 
 Owner backpressure is a sender wait state, but it is not automatically a
-product-source starvation signal. The backpressure condition is an explicit
-authoritative ACK gap, failed-owner gap, or known final tail. A persistent
-contiguous owner-tail stall is carrier recovery state until one of those facts
-exists. While owner backpressure exists, the sender MUST NOT dispatch queued
-bulk bytes as later `OwnerData` if doing so would expand the unresolved lower
-frontier. However, reading from the local product source into the bounded sender
-queue does not assign product offsets and does not create ordering debt by
-itself. A conforming sender MAY continue bounded product-source reads while
+product-source starvation signal. The backpressure condition for scheduling is
+ordered-owner scheduling debt above the path's pressure threshold; the
+backpressure condition for repair is the narrower authoritative repair debt
+described above. While owner backpressure exists, the sender MUST NOT dispatch
+queued bulk bytes as later `OwnerData` if doing so would expand the unresolved
+lower frontier. However, reading from the local product source into the bounded
+sender queue does not assign product offsets and does not create ordering debt
+by itself. A conforming sender MAY continue bounded product-source reads while
 dispatch is owner-debt blocked, subject to stream flow control, queue limits,
 and memory limits, so the service path is not starved by target-read shutdown.
 The repair cache is retained unacked
@@ -3911,17 +3970,20 @@ can make a different work item admissible. This keeps product-ordering debt
 separate from carrier pipe availability and prevents CPU spin or repeated
 non-emitting scheduling decisions.
 
-Persistent owner-tail stalls are not repair when the peer's ACK ranges are
-contiguous. If the ACK frontier has stopped below the sender's next product
-offset, the stream has retained unacked `OwnerData`, and no authoritative ACK
-gap or known final tail exists, the sender waits for ACK progress, carrier
-failure/detach evidence, or a final-offset condition. It MUST NOT reinject the
-live contiguous owner tail as optional `RepairData`. A known final offset is
-not sufficient by itself: terminal owner-tail repair may spend bounded critical
-repair only after persistent stall, carrier failure/detach, or equivalent
-final-debt evidence shows the retained tail is no longer making progress. That
-repair remains bounded by repair-cache, path-flight, and sender resource
-limits; those bytes are still counted as repair overhead.
+Persistent owner-tail stalls are repair only when they can make progress on a
+different output. If the ACK frontier has stopped below the sender's next
+product offset, the stream has retained unacked `OwnerData`, and no
+authoritative ACK gap exists, the sender waits for ACK progress until the tail
+stall timer fires. After that persistent-stall evidence, it MAY reinject the
+lowest blocked suffix as bounded critical `RepairData` on an alternate output
+that did not own the range. It MUST NOT retransmit the live contiguous owner
+tail on the same/only carrier merely because the product ACK frontier is
+stalled. A known final offset is not sufficient by itself: terminal owner-tail
+repair may spend bounded critical repair only after persistent stall, carrier
+failure/detach, or equivalent final-debt evidence shows the retained tail is no
+longer making progress. That repair remains bounded by repair-cache,
+path-flight, and sender resource limits; those bytes are still counted as
+repair overhead and MUST NOT move Service ownership.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has
@@ -4329,12 +4391,16 @@ on_stream_ack(stream_id, complete, ranges):
         do_not_infer_holes_from_omitted_ranges()
 
 on_tail_stall_repair(stream_id, last_complete_ack_ranges):
-    repair_budget = min(base_repair_budget, sender_extra_traffic_remaining())
+    repair_budget = critical_repair_budget(base_repair_budget)
     holes = unacked_chunks_below_largest_acked_not_covered_by(last_complete_ack_ranges)
     if holes is not empty:
         schedule_prefix_repair(holes, repair_budget)
+    else if no_complete_ack_frontier_exists and original_owner_is_live:
+        do_not_repair_live_tail_without_ack_frontier()
+    else if lowest_unacked_owner_tail_can_use_alternate_output():
+        schedule_lowest_tail_repair_on_alternate_output(repair_budget)
     else:
-        do_not_repair_live_tail_without_authoritative_gap_or_final_offset()
+        do_not_repair_live_tail_on_same_or_only_output()
     if lowest_repair_range_is_already_in_flight_on_only_survivor
        and stall_or_PTO_evidence_exists:
         retransmit_same_lowest_range_once()

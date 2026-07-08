@@ -1281,7 +1281,7 @@ fn enqueue_reliable_tail_repair(
 async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
-    ordered_owner_debt_bytes: usize,
+    mut ordered_owner_debt_bytes: usize,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1339,6 +1339,10 @@ async fn drain_server_response_sender_ready(
             dispatched_payload_bytes =
                 dispatched_payload_bytes.saturating_add(dispatch.payload_bytes);
             stats.record_payload_bytes(dispatch.payload_bytes);
+            if dispatch.lane == ReliableRelayQueuedWorkLane::Data {
+                ordered_owner_debt_bytes =
+                    ordered_owner_debt_bytes.saturating_add(dispatch.payload_bytes);
+            }
         }
     }
 

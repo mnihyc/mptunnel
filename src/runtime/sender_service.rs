@@ -684,15 +684,6 @@ fn response_target_is_plausible_unique_owner_candidate(target: &ResponseSenderPa
     response_target_has_service_anchor_rights(target) || target.has_bulk_rate_evidence
 }
 
-fn response_targets_are_single_underlay(candidates: &[&ResponseSenderPathTarget]) -> bool {
-    let Some(first) = candidates.first() else {
-        return false;
-    };
-    candidates
-        .iter()
-        .all(|candidate| candidate.key.underlay == first.key.underlay)
-}
-
 #[cfg(test)]
 fn response_target_unique_owner_admission(
     target: &ResponseSenderPathTarget,
@@ -710,6 +701,7 @@ fn response_target_unique_owner_admission(
         lower_owner,
         None,
         ordering_debt,
+        0,
         payload_bytes,
         mux_limits,
         None,
@@ -735,17 +727,15 @@ fn response_target_unique_owner_admission_with_epoch(
     lower_owner: Option<CarrierPathKey>,
     ordered_data_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
+    ordered_owner_debt_bytes: usize,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
-    allow_sender_evidence_service_restart: bool,
+    allow_sender_evidence_service_failover: bool,
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     let service_key =
         response_service_anchor_key(candidates, lower_owner, ordered_data_owner, lead.key);
-    let sender_evidence_service_restart = allow_sender_evidence_service_restart
-        && lower_owner.is_none()
-        && ordered_data_owner.is_none()
-        && ordering_debt == 0
+    let sender_evidence_service_failover = allow_sender_evidence_service_failover
         && target.key == service_key
         && target.has_sender_evidence;
     if lower_owner == Some(target.key) {
@@ -764,7 +754,7 @@ fn response_target_unique_owner_admission_with_epoch(
     if target.key == service_key {
         return if target.is_active
             || target.has_bulk_rate_evidence
-            || sender_evidence_service_restart
+            || sender_evidence_service_failover
         {
             (PathAdmission::service(), None)
         } else {
@@ -790,6 +780,7 @@ fn response_target_unique_owner_admission_with_epoch(
             })
             .is_none();
     let startup_subflow_sample = lower_owner.is_none()
+        && ordered_owner_debt_bytes == 0
         && !target.is_active
         && target.key.underlay == service_key.underlay
         && candidates
@@ -879,6 +870,7 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         lower_owner,
         None,
         ordering_debt,
+        0,
         payload_bytes,
         mux_limits,
         subflow_set,
@@ -1032,7 +1024,7 @@ fn choose_response_admissible_lead(
     mux_limits: MuxLimits,
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
-    allow_sender_evidence_service_restart: bool,
+    allow_sender_evidence_service_failover: bool,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if let Some(owner) = lower_owner {
@@ -1092,27 +1084,27 @@ fn choose_response_admissible_lead(
         return admissible;
     }
 
-    if lower_owner.is_none() {
-        if allow_sender_evidence_service_restart
-            && let Some(restart) = candidate_targets
-                .iter()
-                .copied()
-                .filter(|target| target.has_sender_evidence)
-                .filter(|target| {
-                    response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
-                })
-                .min_by(|left, right| {
-                    left.eta_ms
-                        .total_cmp(&right.eta_ms)
-                        .then_with(|| carrier_path_key_order(left.key, right.key))
-                })
-        {
-            return Some(ResponseBulkLead {
-                key: restart.key,
-                snapshot: restart.snapshot,
-                eta_ms: restart.eta_ms,
+    if lower_owner.is_none() && allow_sender_evidence_service_failover {
+        return candidate_targets
+            .iter()
+            .copied()
+            .filter(|target| target.has_sender_evidence)
+            .filter(|target| {
+                response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
+            })
+            .min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+            .map(|target| ResponseBulkLead {
+                key: target.key,
+                snapshot: target.snapshot,
+                eta_ms: target.eta_ms,
             });
-        }
+    }
+
+    if lower_owner.is_none() {
         return candidate_targets
             .iter()
             .copied()
@@ -1270,14 +1262,12 @@ fn choose_response_sender_target(
     } else {
         proven_targets
     };
-    let allow_sender_evidence_service_restart =
-        response_targets_are_single_underlay(&candidate_targets);
     let lead = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
         payload_bytes,
         lower_flights,
-        allow_sender_evidence_service_restart,
+        false,
     )?;
     let service_key = response_service_anchor_key(&candidate_targets, lower_owner, None, lead.key);
     let selected = candidate_targets
@@ -1625,16 +1615,16 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     } else {
         mixed_safe_targets
     };
-    let allow_sender_evidence_service_restart = effective_lower_owner.is_none()
+    let allow_sender_evidence_service_failover = effective_lower_owner.is_none()
         && ordered_owner_anchor.is_none()
         && ordered_owner_debt_bytes == 0
-        && response_targets_are_single_underlay(&candidate_targets);
+        && !candidate_targets.iter().any(|target| target.is_active);
     let Some(lead) = choose_response_admissible_lead(
         &candidate_targets,
         mux_limits,
         payload_bytes,
         lower_flights,
-        allow_sender_evidence_service_restart,
+        allow_sender_evidence_service_failover,
     ) else {
         #[cfg(feature = "lab-diagnostics")]
         for target in &candidate_targets {
@@ -1678,10 +1668,11 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
                 effective_lower_owner,
                 ordered_owner_anchor,
                 ordering_debt,
+                ordered_owner_debt_bytes,
                 payload_bytes,
                 mux_limits,
                 subflow_set,
-                allow_sender_evidence_service_restart,
+                allow_sender_evidence_service_failover,
             );
             if !matches!(
                 admission.decision,
@@ -5189,7 +5180,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_frontier_without_live_service_allows_same_family_sender_evidence_restart() {
+    fn clear_frontier_without_live_service_elects_sender_evidence_service_failover() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut restart = response_target(
@@ -5214,19 +5205,22 @@ mod tests {
             None,
         );
 
-        let selected = selected
-            .expect("single-family sender evidence may restart Service at a clear frontier");
-
-        assert_eq!(selected.target.key, restart.key);
+        let selected = selected.expect(
+            "when the previous Service is gone and the ordered frontier is clear, the stream must elect a new Service failover path",
+        );
+        assert_eq!(
+            selected.target.key, restart.key,
+            "path-scoped sender evidence is enough for Service failover only when no live Service owner remains"
+        );
         assert_eq!(
             selected.admission.role,
             PathRuntimeRole::Service,
-            "same-family continuity restart is Service OwnerData, not cross-family migration"
+            "failover owner bytes are Service OwnerData, not optional Subflow exploration"
         );
     }
 
     #[test]
-    fn mixed_family_clear_frontier_rejects_sender_evidence_service_restart() {
+    fn mixed_family_clear_frontier_service_failover_is_metric_first() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut tcp = response_target(
@@ -5251,7 +5245,7 @@ mod tests {
         udp.has_bulk_rate_evidence = false;
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[tcp, udp],
+            &[tcp, udp.clone()],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
@@ -5261,9 +5255,48 @@ mod tests {
             None,
         );
 
+        let selected = selected
+            .expect("Service failover must be carrier-neutral when no live ordered owner remains");
+        assert_eq!(
+            selected.target.key, udp.key,
+            "clear-frontier Service failover is selected by path metrics, not by TCP/UDP family"
+        );
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "the elected failover path becomes the new Service owner"
+        );
+    }
+
+    #[test]
+    fn sender_evidence_service_failover_waits_behind_live_ordered_owner_debt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut failover = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        failover.has_sender_evidence = true;
+        failover.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[failover],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            payload_bytes,
+            None,
+        );
+
         assert!(
             selected.is_none(),
-            "mixed TCP/UDP Service restart requires bulk-rate evidence; sender evidence alone remains Probe/Standby"
+            "sender-evidenced Service failover can only own future bytes after the live lower owner frontier is clear"
         );
     }
 
@@ -7172,6 +7205,47 @@ mod tests {
             selected.admission.role,
             PathRuntimeRole::Subflow,
             "startup sample is Subflow OwnerData, not a Service migration"
+        );
+    }
+
+    #[test]
+    fn proof_only_startup_subflow_waits_behind_live_service_tail() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            25.0,
+            mux_limits.max_path_flight_bytes as u64,
+            16 * 1024 * 1024,
+            true,
+        );
+        service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.has_sender_evidence = true;
+        service.has_bulk_rate_evidence = true;
+        let mut startup_subflow =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        startup_subflow.has_sender_evidence = true;
+        startup_subflow.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), startup_subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            payload_bytes,
+            None,
+        );
+
+        assert!(
+            selected.is_none()
+                || selected.as_ref().is_some_and(|selected| {
+                    selected.target.key != startup_subflow.key
+                        || selected.target.has_bulk_rate_evidence
+                }),
+            "proof-only startup Subflow OwnerData is frontier-clear only; it must wait behind a live lower Service tail"
         );
     }
 

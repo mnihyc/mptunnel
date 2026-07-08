@@ -348,10 +348,11 @@ ordered-owner scheduling debt remains. In that state the sender waits, performs
 bounded failover repair, or resumes only after the contiguous frontier catches
 up. A new Service owner is chosen by explicit sender-service admission at a
 clear frontier or by a dedicated failover policy after lower ownership has been
-resolved. A proof/liveness-only survivor remains Probe/Standby until it
-produces bulk-rate evidence; it is not promoted to Service merely because it is
-the only remaining attached output. Otherwise, lower-ETA measured contributors
-are Subflows.
+resolved. A survivor is not promoted to Service merely because it is the only
+remaining attached output; it needs explicit frontier-clear Service failover
+admission and path-scoped sender evidence. Otherwise, proof/liveness-only
+survivors remain Probe/Standby, and lower-ETA measured contributors are
+Subflows.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -398,16 +399,18 @@ output owns an unresolved lower outstanding range. A validation output may carry
 control, ACK, explicit repair, path proof, or a new independent product stream.
 At a clear frontier, liveness, path-proof, configured hints, and peer hints MAY
 rank validation/probe order, but they MUST NOT make a non-active path the
-Service owner for ordered product bytes. A path also MUST NOT become Service
-merely because the selector has no better lead fallback; fallback lead selection
-without active Service anchor rights or direction-correct bulk-rate evidence is
-still Probe/Standby, not product ownership. Temporary sender-service
-backpressure or capacity filtering on the current ordered owner also MUST NOT
-erase that Service anchor; dispatchable alternates remain Subflows unless an
-explicit Service migration/failover decision changes the owner. A measured path
-may become an admitted Subflow after direction-correct bulk-rate evidence exists
-and the ETA/no-worse selector admits that owner range; it does not replace the
-Service anchor unless the explicit Service migration policy performs a handoff.
+Service owner for ordered product bytes while a live Service owner remains. A
+path also MUST NOT become Service merely because the selector has no better
+lead fallback; fallback lead selection without active Service anchor rights,
+direction-correct bulk-rate evidence, or explicit frontier-clear failover
+admission with path-scoped sender evidence is still Probe/Standby, not product
+ownership. Temporary sender-service backpressure or capacity filtering on the
+current ordered owner also MUST NOT erase that Service anchor; dispatchable
+alternates remain Subflows unless an explicit Service migration/failover
+decision changes the owner. A measured path may become an admitted Subflow
+after direction-correct bulk-rate evidence exists and the ETA/no-worse selector
+admits that owner range; it does not replace the Service anchor unless the
+explicit Service migration policy performs a handoff.
 When the current Service owner is alive but backpressured by unresolved
 contiguous owner tail, a cross-underlay alternate MUST wait instead of owning
 later byte ranges. Same-underlay Subflow startup or steady-state admission may
@@ -2897,7 +2900,10 @@ bytes. Role transitions are monotonic with evidence and carrier state for the
 current decision; they are not implied by attachment order, carrier family,
 configured path order, or temporary queue availability. In particular, `Probe`,
 path-proof-only, and sender-evidence-only paths are not permission to carry an
-unbounded stream of future offsets.
+unbounded stream of future offsets. The only exception is explicit
+frontier-clear Service failover after the previous Service is gone; that
+exception elects one new Service path and remains subject to ordinary Service
+feed/admission limits.
 
 Validation admission is evaluated with the bounded proof payload, not with the
 full product path inflight envelope. This keeps validation aggressive enough to
@@ -3036,10 +3042,11 @@ download bytes onto a validation path merely from generic TCP or UDP defaults,
 but it MUST send bounded `PATH_PROOF_DATA` on validation attachments so TCP and
 QUIC UDP outputs can gather local sender evidence without consuming unique
 ordered response bytes. Before proof succeeds, a validation output remains
-excluded from ordinary unique response `STREAM_DATA` except for duplicate proof,
-gap-targeted repair, failover, or the exceptional case where no ordinary
-sender-evidence candidate exists and ECF/BLEST admission says continuing the
-current ordinary path would be worse.
+excluded from ordinary unique response `STREAM_DATA` except for duplicate proof
+or gap-targeted repair. After path-scoped sender evidence exists, it can become
+the single Service failover only when the prior Service owner is gone and the
+ordered frontier is clear; it still cannot become an optional Subflow owner
+while another Service/lower owner has unresolved bytes.
 Client-supplied `PATH_METRICS` are hints, not final proof of response-direction
 throughput. They are useful to distinguish a plausible
 high-bandwidth path from a poor or high-loss path before bounded proof is sent,

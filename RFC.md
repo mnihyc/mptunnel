@@ -566,6 +566,14 @@ metrics, reset, detach, FIN, and similar protocol state. Implementations MAY
 encode these meanings with existing frame types, but the ledgers MUST preserve
 the distinction; a `STREAM_DATA` frame used for repair does not become
 `OwnerData` merely because its wire frame type is `STREAM_DATA`.
+Critical completion repair remains `RepairData`; it does not become a
+repeatable owner stream. While a repair frame for a product byte range is still
+queued in the sender service, later tail/FIN/output-update events for the same
+range MUST be treated as already pending and MUST NOT enqueue another copy,
+debit extra-traffic accounting again, or increase sender-service queued bytes.
+Only ACK progress, carrier dispatch completion followed by a new repair
+deadline, or a materially different missing range can create a new bounded
+repair attempt.
 
 Terminal FIN reliability is `Control`, not repair or path proof. `STREAM_FIN`
 is idempotent for a stream ID and final offset, and a sender MAY replay it once

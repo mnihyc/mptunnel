@@ -2640,8 +2640,13 @@ impl ServerResponseSenderService {
         self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::AckGapRepair)
     }
 
-    pub(super) fn enqueue_critical_tail_repair_frame(&mut self, frame: Frame) -> u64 {
-        self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::PathFailureRepair)
+    pub(super) fn enqueue_critical_tail_repair_frame(&mut self, frame: Frame) -> Option<u64> {
+        if self.has_queued_repair_overlap(&frame) {
+            return None;
+        }
+        Some(
+            self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::PathFailureRepair),
+        )
     }
 
     pub(super) fn enqueue_critical_repair_frame_with_cause(
@@ -3026,8 +3031,12 @@ impl RelaySenderService {
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         frame: Frame,
-    ) {
+    ) -> bool {
+        if sender_queue.has_queued_repair_overlap(&frame) {
+            return false;
+        }
         self.enqueue_critical_repair_frame(sender_queue, frame, RelaySendCause::PathFailureRepair);
+        true
     }
 
     #[cfg(test)]
@@ -4707,6 +4716,42 @@ mod tests {
     }
 
     #[test]
+    fn response_critical_tail_repair_is_idempotent_while_range_is_queued() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(96);
+        let mut sender = ServerResponseSenderService::new_with_performance(
+            SessionId(96),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let first = Frame::StreamData {
+            stream_id,
+            offset: 128,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(&[0x44; 64]),
+        };
+        let duplicate = first.clone();
+
+        assert!(sender.enqueue_critical_tail_repair_frame(first).is_some());
+        let bytes_after_first = sender.bytes();
+        let budget_after_first = sender.repair_extra_budget_remaining(mux_limits);
+
+        assert!(
+            sender
+                .enqueue_critical_tail_repair_frame(duplicate)
+                .is_none(),
+            "final-tail RepairData is a one pending repair per offset range, not a repeatable owner-data substitute"
+        );
+        assert_eq!(sender.bytes(), bytes_after_first);
+        assert_eq!(
+            sender.repair_extra_budget_remaining(mux_limits),
+            budget_after_first
+        );
+    }
+
+    #[test]
     fn client_repair_extra_budget_is_cumulative_not_per_event() {
         let mux_limits = MuxLimits::default();
         let stream_id = StreamId(93);
@@ -4806,6 +4851,40 @@ mod tests {
             RelaySendCause::AckGapRepair,
         );
         assert_eq!(sender.extra_traffic_budget_remaining(mux_limits), 0);
+    }
+
+    #[test]
+    fn client_critical_tail_repair_is_idempotent_while_range_is_queued() {
+        let mux_limits = MuxLimits::default();
+        let stream_id = StreamId(97);
+        let mut sender = RelaySenderService::new_with_performance(
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 1,
+            },
+        );
+        let mut sender_queue = ReliableRelaySenderQueue::default();
+        let first = Frame::StreamData {
+            stream_id,
+            offset: 128,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(&[0x55; 64]),
+        };
+        let duplicate = first.clone();
+
+        assert!(sender.enqueue_critical_tail_repair_frame(&mut sender_queue, first));
+        let bytes_after_first = sender_queue.bytes();
+        let budget_after_first = sender.extra_traffic_budget_remaining(mux_limits);
+
+        assert!(
+            !sender.enqueue_critical_tail_repair_frame(&mut sender_queue, duplicate),
+            "client final-tail RepairData must not stack duplicate pending ranges"
+        );
+        assert_eq!(sender_queue.bytes(), bytes_after_first);
+        assert_eq!(
+            sender.extra_traffic_budget_remaining(mux_limits),
+            budget_after_first
+        );
     }
 
     #[test]

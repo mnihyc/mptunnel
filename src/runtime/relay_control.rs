@@ -1469,15 +1469,15 @@ where
                                     sender.enqueue_critical_tail_repair_frame(
                                         &mut sender_queue,
                                         frame,
-                                    );
+                                    )
                                 } else {
                                     sender.enqueue_critical_repair_frame(
                                         &mut sender_queue,
                                         frame,
                                         RelaySendCause::AckGapRepair,
                                     );
+                                    true
                                 }
-                                true
                             } else {
                                 sender.enqueue_repair_frame_with_priority(
                                     &mut sender_queue,

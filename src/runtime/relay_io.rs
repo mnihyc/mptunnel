@@ -2166,11 +2166,13 @@ where
                         for frame in repair_frames {
                             let queued = if critical_tail_repair {
                                 if repair_kind == "fin_tail" {
-                                    response_sender.enqueue_critical_tail_repair_frame(frame);
+                                    response_sender
+                                        .enqueue_critical_tail_repair_frame(frame)
+                                        .is_some()
                                 } else {
                                     response_sender.enqueue_critical_repair_frame(frame);
+                                    true
                                 }
-                                true
                             } else {
                                 response_sender
                                     .enqueue_repair_frame_with_priority(frame, mux_limits, true)
@@ -2378,12 +2380,19 @@ where
                     let _ = same_output_frontier_retransmit;
                     let mut repair_count = 0usize;
                     for frame in repair_frames {
-                        response_sender.enqueue_critical_tail_repair_frame(frame);
-                        repair_count = repair_count.saturating_add(1);
+                        let queued = response_sender
+                            .enqueue_critical_tail_repair_frame(frame)
+                            .is_some();
+                        if queued {
+                            repair_count = repair_count.saturating_add(1);
+                        }
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "repair",
-                            format_args!("stream_id={} cause=fin_tail queued=true", stream_id.0),
+                            format_args!(
+                                "stream_id={} cause=fin_tail queued={}",
+                                stream_id.0, queued
+                            ),
                         );
                     }
                     #[cfg(feature = "lab-diagnostics")]
@@ -4642,7 +4651,7 @@ mod tests {
         assert!(!same_output_frontier_retransmit);
         assert_eq!(repair_frames.len(), 1);
         for frame in repair_frames {
-            response_sender.enqueue_critical_tail_repair_frame(frame);
+            let _ = response_sender.enqueue_critical_tail_repair_frame(frame);
         }
 
         repair_commands_for_fill
@@ -4738,7 +4747,7 @@ mod tests {
         assert!(same_output_frontier_retransmit);
         assert_eq!(repair_frames.len(), 1);
         for frame in repair_frames {
-            response_sender.enqueue_critical_tail_repair_frame(frame);
+            let _ = response_sender.enqueue_critical_tail_repair_frame(frame);
         }
 
         response_sender

@@ -34,6 +34,7 @@ pub(super) enum RelaySendCause {
     StreamData,
     StreamFin,
     RecvProgress,
+    RecvProgressRecovery,
     AckGapRepair,
     LiveOwnerTailRepair,
     PathFailureRepair,
@@ -46,6 +47,7 @@ impl RelaySendCause {
             Self::StreamData => "stream_data",
             Self::StreamFin => "stream_fin",
             Self::RecvProgress => "recv_progress",
+            Self::RecvProgressRecovery => "recv_progress_recovery",
             Self::AckGapRepair => "ack_gap_repair",
             Self::LiveOwnerTailRepair => "live_owner_tail_repair",
             Self::PathFailureRepair => "path_failure_repair",
@@ -57,6 +59,10 @@ impl RelaySendCause {
             self,
             Self::AckGapRepair | Self::LiveOwnerTailRepair | Self::PathFailureRepair
         )
+    }
+
+    fn is_recv_progress(self) -> bool {
+        matches!(self, Self::RecvProgress | Self::RecvProgressRecovery)
     }
 }
 
@@ -90,6 +96,7 @@ pub(super) struct RelayRecvProgressSend {
     path: Option<PathSnapshot>,
     lane: FlowLane,
     force_max_data: bool,
+    recover_stalled_service: bool,
 }
 
 impl RelayRecvProgressSend {
@@ -98,7 +105,13 @@ impl RelayRecvProgressSend {
             path,
             lane,
             force_max_data,
+            recover_stalled_service: false,
         }
+    }
+
+    pub(super) fn recover_stalled_service(mut self) -> Self {
+        self.recover_stalled_service = true;
+        self
     }
 }
 
@@ -1316,9 +1329,10 @@ fn response_target_can_receive_repair(
         RelaySendCause::LiveOwnerTailRepair | RelaySendCause::PathFailureRepair => {
             response_target_has_path_failure_repair_evidence(target)
         }
-        RelaySendCause::StreamData | RelaySendCause::StreamFin | RelaySendCause::RecvProgress => {
-            false
-        }
+        RelaySendCause::StreamData
+        | RelaySendCause::StreamFin
+        | RelaySendCause::RecvProgress
+        | RelaySendCause::RecvProgressRecovery => false,
     }
 }
 
@@ -3668,10 +3682,16 @@ impl RelaySenderService {
     ) -> Result<usize, RuntimeError> {
         let requires_distinct_output = cause == RelaySendCause::LiveOwnerTailRepair;
         let payload_bytes = reliable_stream_frame_payload_bytes(frame);
-        if matches!(cause, RelaySendCause::RecvProgress)
-            && let Some(position) = choose_active_recv_progress_path_position(remotes, frame, cause)
+        if cause == RelaySendCause::RecvProgressRecovery
+            && let Some(position) = choose_repair_recv_progress_path_position(remotes, frame, cause)
         {
             return Ok(position);
+        }
+        if cause.is_recv_progress() {
+            if let Some(position) = choose_active_recv_progress_path_position(remotes, frame, cause)
+            {
+                return Ok(position);
+            }
         }
         let has_active_path = remotes
             .paths
@@ -3681,6 +3701,8 @@ impl RelaySenderService {
             (!ordinary_stream_data
                 || !has_active_path
                 || path.placement == RelayPathPlacement::Active)
+                && (cause != RelaySendCause::RecvProgressRecovery
+                    || path.placement != RelayPathPlacement::Validation)
                 && (!requires_distinct_output || path.placement != RelayPathPlacement::Validation)
         };
         let can_enqueue = |path: &ReliableRelayRemotePath| {
@@ -3983,6 +4005,11 @@ impl RelaySenderService {
         request: RelayRecvProgressSend,
     ) -> Result<bool, RuntimeError> {
         let mut sent_any = false;
+        let cause = if request.recover_stalled_service {
+            RelaySendCause::RecvProgressRecovery
+        } else {
+            RelaySendCause::RecvProgress
+        };
         let ack_progress_before = progress.clone();
         if progress.should_send_ack(
             recv_stream,
@@ -3998,7 +4025,7 @@ impl RelaySenderService {
             lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
             for ack_frame in ack_frames {
                 match self
-                    .send_control_frame(context, remotes, ack_frame, RelaySendCause::RecvProgress)
+                    .send_control_frame(context, remotes, ack_frame, cause)
                     .await
                 {
                     Ok(_) => {
@@ -4034,7 +4061,7 @@ impl RelaySenderService {
                     context,
                     remotes,
                     recv_stream.max_data_frame_with_window(advertised_window),
-                    RelaySendCause::RecvProgress,
+                    cause,
                 )
                 .await
             {
@@ -4259,6 +4286,23 @@ fn choose_active_recv_progress_path_position(
         .rev()
         .find(|(_, path)| {
             path.placement == RelayPathPlacement::Active
+                && relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
+        })
+        .map(|(position, _)| position)
+}
+
+fn choose_repair_recv_progress_path_position(
+    remotes: &ReliableRelayRemoteSet,
+    frame: &Frame,
+    cause: RelaySendCause,
+) -> Option<usize> {
+    remotes
+        .paths
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, path)| {
+            path.placement == RelayPathPlacement::Repair
                 && relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
         })
         .map(|(position, _)| position)
@@ -4906,6 +4950,220 @@ mod tests {
                 Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
             ),
             "STREAM_ACK for received OwnerData should prefer the Active Service path; a lower-ETA validation probe must not own the product ACK clock while the Service path is usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_stall_recv_progress_prefers_accepted_repair_path() {
+        let stream_id = StreamId(97);
+        let tcp_path = "tcp://127.0.0.1:10272?srtt-ms=5&rate-mbps=500"
+            .parse::<PathSpec>()
+            .expect("tcp path");
+        let udp_path = "udp://127.0.0.1:10273?srtt-ms=500&rate-mbps=50"
+            .parse::<PathSpec>()
+            .expect("udp path");
+        let context = ClientPathContext::new(
+            vec![tcp_path, udp_path],
+            security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+        let (tcp_commands, mut tcp_rx) = reliable_path_command_channels(8);
+        let (udp_commands, mut udp_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Tcp,
+                0,
+                tcp_commands,
+            ),
+            8,
+        );
+        remotes.attach_for_repair(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            udp_commands,
+        ));
+        let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
+        recv_stream
+            .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+            .expect("receive response bytes");
+        let mut progress = ReliableRecvProgress::default();
+        let mut sender = RelaySenderService::new(stream_id);
+
+        let ordinary_sent = sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::new(None, FlowLane::Latency, true),
+            )
+            .await
+            .expect("ordinary receive progress should use Active");
+
+        assert!(ordinary_sent);
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut tcp_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+        ));
+        while try_recv_reliable_path_priority_command(&mut tcp_rx).is_some() {}
+        assert!(try_recv_reliable_path_priority_command(&mut udp_rx).is_none());
+
+        let mut progress = ReliableRecvProgress::default();
+        let sent = sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::new(None, FlowLane::Latency, true).recover_stalled_service(),
+            )
+            .await
+            .expect("stall receive progress should use an accepted repair carrier");
+
+        assert!(sent);
+        assert!(
+            try_recv_reliable_path_priority_command(&mut tcp_rx).is_none(),
+            "the stalled Active path must not keep the recovery ACK when Repair is usable"
+        );
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut udp_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+        ));
+        assert_eq!(
+            remotes.active_path_key(),
+            Some(RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            }),
+            "routing recovery control over Repair must not promote it to Active"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_stall_recv_progress_falls_back_to_active_when_repair_is_full() {
+        let stream_id = StreamId(98);
+        let context = client_test_context();
+        let (active_commands, mut active_rx) = reliable_path_command_channels(1);
+        let (repair_commands, mut repair_rx) = reliable_path_command_channels(1);
+        repair_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamAck {
+                    stream_id,
+                    complete: false,
+                    ranges: Vec::new(),
+                },
+                FlowLane::Control,
+            )
+            .expect("prefill repair control queue");
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Tcp,
+                0,
+                active_commands,
+            ),
+            4,
+        );
+        remotes.attach_for_repair(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            repair_commands,
+        ));
+        let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
+        recv_stream
+            .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+            .expect("receive response bytes");
+        let mut progress = ReliableRecvProgress::default();
+        let mut sender = RelaySenderService::new(stream_id);
+
+        let sent = sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::new(None, FlowLane::Latency, true).recover_stalled_service(),
+            )
+            .await
+            .expect("a full repair queue should fall back to Active");
+
+        assert!(sent);
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut active_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+        ));
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut repair_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+        ));
+        assert!(try_recv_reliable_path_priority_command(&mut repair_rx).is_none());
+    }
+
+    #[tokio::test]
+    async fn client_stall_recv_progress_never_uses_validation_path() {
+        let stream_id = StreamId(99);
+        let context = client_test_context();
+        let (active_commands, mut active_rx) = reliable_path_command_channels(1);
+        active_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamAck {
+                    stream_id,
+                    complete: false,
+                    ranges: Vec::new(),
+                },
+                FlowLane::Control,
+            )
+            .expect("prefill active control queue");
+        let (validation_commands, mut validation_rx) = reliable_path_command_channels(2);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Tcp,
+                0,
+                active_commands,
+            ),
+            4,
+        );
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            0,
+            validation_commands,
+        ));
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut validation_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+        let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
+        recv_stream
+            .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+            .expect("receive response bytes");
+        let mut progress = ReliableRecvProgress::default();
+        let mut sender = RelaySenderService::new(stream_id);
+
+        let sent = sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::new(None, FlowLane::Latency, true).recover_stalled_service(),
+            )
+            .await
+            .expect("blocked recovery feedback remains retryable");
+
+        assert!(!sent);
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut active_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+        ));
+        assert!(
+            try_recv_reliable_path_priority_command(&mut validation_rx).is_none(),
+            "Validation must remain product-ineligible during ACK recovery"
         );
     }
 

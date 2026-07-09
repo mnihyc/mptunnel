@@ -370,6 +370,26 @@ where
                     Ok(attached) if attached > 0 => {
                         sender_retry_at = None;
                         send_stream.update_max_offset(remotes.max_offset());
+                        match sender
+                            .send_recv_progress(
+                                &mut remotes,
+                                context,
+                                &recv_stream,
+                                &mut recv_progress,
+                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                                    .recover_stalled_service(),
+                            )
+                            .await
+                        {
+                            Ok(sent) => {
+                                if sent {
+                                    last_recv_progress_sent_at = Instant::now();
+                                    last_stream_progress_at = Instant::now();
+                                }
+                            }
+                            Err(err) if reliable_relay_error_is_migratable(&err) => {}
+                            Err(err) => break Err(err),
+                        }
                         last_receive_hole_repair_at = Instant::now();
                         receive_hole_repair_attempts = 0;
                         continue;
@@ -383,7 +403,8 @@ where
                                 context,
                                 &recv_stream,
                                 &mut recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                                    .recover_stalled_service(),
                             )
                             .await
                         {
@@ -409,6 +430,32 @@ where
                                     Ok(attached) if attached > 0 => {
                                         sender_retry_at = None;
                                         send_stream.update_max_offset(remotes.max_offset());
+                                        match sender
+                                            .send_recv_progress(
+                                                &mut remotes,
+                                                context,
+                                                &recv_stream,
+                                                &mut recv_progress,
+                                                RelayRecvProgressSend::new(
+                                                    path_snapshot,
+                                                    relay_lane,
+                                                    true,
+                                                )
+                                                .recover_stalled_service(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(sent) => {
+                                                if sent {
+                                                    last_recv_progress_sent_at = Instant::now();
+                                                }
+                                            }
+                                            Err(recovery_err)
+                                                if reliable_relay_error_is_migratable(
+                                                    &recovery_err,
+                                                ) => {}
+                                            Err(recovery_err) => break Err(recovery_err),
+                                        }
                                         last_stream_progress_at = Instant::now();
                                     }
                                     Ok(_) => {}
@@ -456,7 +503,8 @@ where
                         context,
                         &recv_stream,
                         &mut recv_progress,
-                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                            .recover_stalled_service(),
                     )
                     .await
                     {
@@ -514,6 +562,27 @@ where
                                 relay_lane,
                             ) {
                                 sender_retry_at = None;
+                            }
+                            match sender
+                                .send_recv_progress(
+                                    &mut remotes,
+                                    context,
+                                    &recv_stream,
+                                    &mut recv_progress,
+                                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                                        .recover_stalled_service(),
+                                )
+                                .await
+                            {
+                                Ok(sent) => {
+                                    if sent {
+                                        last_recv_progress_sent_at = Instant::now();
+                                    }
+                                }
+                                Err(err) if reliable_relay_error_is_migratable(&err) => {
+                                    sender_retry_at = None;
+                                }
+                                Err(err) => break Err(err),
                             }
                             last_stream_progress_at = Instant::now();
                             last_response_stall_repair_at = Instant::now();
@@ -585,7 +654,8 @@ where
                     context,
                     &recv_stream,
                     &mut recv_progress,
-                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                        .recover_stalled_service(),
                 )
                 .await
                 {
@@ -610,6 +680,30 @@ where
                         {
                             Ok(attached) if attached > 0 => {
                                 send_stream.update_max_offset(remotes.max_offset());
+                                match sender
+                                    .send_recv_progress(
+                                        &mut remotes,
+                                        context,
+                                        &recv_stream,
+                                        &mut recv_progress,
+                                        RelayRecvProgressSend::new(
+                                            path_snapshot,
+                                            relay_lane,
+                                            true,
+                                        )
+                                        .recover_stalled_service(),
+                                    )
+                                    .await
+                                {
+                                    Ok(sent) => {
+                                        if sent {
+                                            last_recv_progress_sent_at = Instant::now();
+                                        }
+                                    }
+                                    Err(recovery_err)
+                                        if reliable_relay_error_is_migratable(&recovery_err) => {}
+                                    Err(recovery_err) => break Err(recovery_err),
+                                }
                             }
                             Ok(_) => break Err(err),
                             Err(err) => break Err(err),

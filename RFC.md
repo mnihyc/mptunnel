@@ -592,6 +592,14 @@ live and has control capacity, receive-progress `Control` such as `STREAM_ACK`
 and `STREAM_MAX_DATA` SHOULD be emitted on that Service return path before
 lower-ETA Probe or Validation paths are considered. If the Service return path
 is blocked or failed, the sender MAY fall back to any admissible control path.
+When a client relay's existing product-stall or receive-hole timer supplies
+explicit evidence that the Service ACK clock is not making progress, one forced
+receive-progress retry SHOULD instead prefer an already accepted Repair
+attachment with control capacity. That retry MUST NOT use a Validation
+attachment, promote Repair to Service, or credit the Repair carrier with
+delivery evidence. Normal feedback ticks continue to prefer Service, bounding
+the alternate control traffic while allowing an authoritative ACK frontier to
+escape a silently blackholed return path.
 Probe paths therefore cannot indirectly throttle or steer an ordered bytestream
 merely by becoming the preferred ACK carrier. This mirrors MPTCP's separation
 between connection-level DATA_ACK state and subflow/path validation state while

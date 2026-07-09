@@ -350,9 +350,11 @@ up. A new Service owner is chosen by explicit sender-service admission at a
 clear frontier or by a dedicated failover policy after lower ownership has been
 resolved. A survivor is not promoted to Service merely because it is the only
 remaining attached output; it needs explicit frontier-clear Service failover
-admission and path-scoped sender evidence. Otherwise, proof/liveness-only
-survivors remain Probe/Standby, and lower-ETA measured contributors are
-Subflows.
+admission. Path-scoped sender evidence is preferred, but if no live Service
+owner remains and the ordered frontier is clear, a live liveness-only candidate
+MAY become the bounded startup Service failover path so the stream does not
+stall without an owner. Otherwise, proof/liveness-only survivors remain
+Probe/Standby, and lower-ETA measured contributors are Subflows.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -407,8 +409,8 @@ Service owner for ordered product bytes while a live Service owner remains. A
 path also MUST NOT become Service merely because the selector has no better
 lead fallback; fallback lead selection without active Service anchor rights,
 direction-correct bulk-rate evidence, or explicit frontier-clear failover
-admission with path-scoped sender evidence is still Probe/Standby, not product
-ownership. Temporary sender-service backpressure or capacity filtering on the
+admission is still Probe/Standby, not product ownership. Temporary
+sender-service backpressure or capacity filtering on the
 current ordered owner also MUST NOT erase that Service anchor; dispatchable
 alternates remain Subflows unless an explicit Service migration/failover
 decision changes the owner. A measured path may become an admitted Subflow
@@ -490,9 +492,9 @@ When latency-sensitive work is active, the clear-frontier Service feed envelope
 uses the preemptible Service horizon for queued sender-service bytes. That
 backlog cap is feed/backpressure accounting, not reorder accounting. Reorder
 budgets are for additional paths, cross-path lower-byte debt, and explicit
-owner-debt pressure; they MUST NOT count same-Service queued carrier work as
-cross-path reorder debt or make the active Service owner inadmissible because an
-app-limited BDP estimate is smaller than one queued carrier quantum.
+owner-tail guards; they MUST NOT count same-Service queued carrier work as
+cross-path reorder debt or make the active Service owner inadmissible because
+an app-limited BDP estimate is smaller than one queued carrier quantum.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,
@@ -3037,10 +3039,12 @@ but it MUST send bounded `PATH_PROOF_DATA` on validation attachments so TCP and
 QUIC UDP outputs can gather local sender evidence without consuming unique
 ordered response bytes. Before proof succeeds, a validation output remains
 excluded from ordinary unique response `STREAM_DATA` except for duplicate proof
-or gap-targeted repair. After path-scoped sender evidence exists, it can become
-the single Service failover only when the prior Service owner is gone and the
-ordered frontier is clear; it still cannot become an optional Subflow owner
-while another Service/lower owner has unresolved bytes.
+or gap-targeted repair. If the prior Service owner is gone and the ordered
+frontier is clear, an attached live output can become the bounded startup
+Service failover path. Path-scoped sender evidence and bulk-rate evidence still
+control whether it can later become a measured Subflow or win ordinary
+migration; it still cannot become an optional Subflow owner while another
+Service/lower owner has unresolved bytes.
 Client-supplied `PATH_METRICS` are hints, not final proof of response-direction
 throughput. They are useful to distinguish a plausible
 high-bandwidth path from a poor or high-loss path before bounded proof is sent,
@@ -3106,37 +3110,38 @@ but unproven paths use `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic
 for bootstrap. A Subflow may receive unique owner bytes only after path-scoped
 bulk-rate evidence exists and the no-worse admission model accepts it.
 
-The production SafeBestPath guard separates two debt ledgers. Ordered-owner
-scheduling debt is any bulk `OwnerData` suffix below the sender's highest owner
-offset that the peer has not yet acknowledged contiguously. Authoritative repair
-debt is narrower: an explicit ACK-range gap, a failed/detached owner tail, a
-persistent live-owner tail with alternate-output repair evidence, or a known
-final tail with persistent stall evidence. Ordered-owner scheduling debt MUST
-be passed into Service/Subflow admission so an alternate cannot own later bytes
-behind an unresolved lower owner. Authoritative repair debt alone may create
+The production SafeBestPath guard separates live in-flight tail state from
+authoritative repair debt. A contiguous unacknowledged `OwnerData` suffix below
+the sender's highest owner offset is normal carrier recovery state while the
+Service owner is live. It is a tail guard for alternate-owner admission: it MAY
+block non-Service `OwnerData` and missing-owner failover from assigning later
+offsets, but it MUST NOT make the live Service owner inadmissible and MUST NOT
+by itself create duplicate repair. Authoritative debt is narrower: an explicit
+ACK-range hole tracked by the product flight ledger, a failed or detached owner
+tail, a persistent live-owner tail after the product tail timer, or a known
+final tail with persistent stall evidence. That authoritative debt MUST be
+passed into Service/Subflow admission so an alternate cannot own later bytes
+behind an unresolved lower owner. Only those debt states may create
 `RepairData`.
 
 Normal unacknowledged `OwnerData` retained in the repair cache is carrier
-recovery state for repair purposes, but it is still owner scheduling pressure
-while the ACK frontier is behind the sender's highest owner offset. Treating
-every retained repair-cache byte as immediate repair would create duplicate
-storms; treating the same contiguous suffix as zero scheduling debt lets
-cross-underlay Service migration create large receive holes. The sender MUST
-wait, keep feeding the current Service owner when safe, or admit only a
-candidate whose ordering-debt input passes the normal no-worse checks. A
-remembered Service owner that is absent, or an unknown Service owner ledger while
-ordered-owner scheduling debt remains, is not a hint to elect another Service
-path; it is a wait/repair/failover state until lower ownership is resolved or
-the debt is converted into explicit `RepairData`. A
-contiguous ACK frontier that stops advancing becomes `RepairData` only after
-carrier failure, detach, or known-final-tail evidence makes repair a correctness
-action. Repair overlap avoidance may inspect the full product-flight ledger
-separately, but that ledger is not itself repair debt.
+recovery state. Treating every retained repair-cache byte as immediate repair
+creates duplicate storms; treating a live contiguous suffix as generic
+Service-stopping debt starves the Service path and makes flapping links appear
+as sender starvation even when no receive hole exists. The sender MUST keep
+feeding the current Service owner when the normal product envelope permits,
+wait for ACK or carrier failure evidence, or convert the blocked range into
+bounded `RepairData` only after the explicit gap/failure/tail conditions above.
+A remembered Service owner that is absent is a wait/repair/failover state; it
+is not permission to elect another Service path for later bytes until lower
+ownership is resolved or converted into `RepairData`. Repair overlap avoidance
+may inspect the full product-flight ledger separately, but that ledger is not
+itself repair debt.
 
 Proof-only and unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly`
-until ordered-owner scheduling debt falls below pressure or explicit
-loss/failure/final-tail evidence converts the affected range into `RepairData`.
-A mixed-family path is owner-eligible under debt pressure only when it is
+until authoritative ordered-owner debt clears or explicit loss/failure/final-tail
+evidence converts the affected range into `RepairData`.
+A mixed-family path is owner-eligible under a tail guard only when it is
 bulk-rate-proven and already owns the lower outstanding range. The surviving
 OwnerData candidates still pass the normal
 ECF/BLEST-style no-worse checks for ETA, inflight, ordering debt, read-gap,
@@ -3646,7 +3651,7 @@ proof for unique ordinary data on the candidate. The candidate's stored path
 model changes only after local sender evidence or unpolluted product delivery
 evidence exists.
 
-When no active, evidenced, or validation candidate passes admission, the sender
+When no active, live failover, evidenced, or validation candidate passes admission, the sender
 keeps the frame queued and wakes the scheduler when stream ACKs release product
 flight bytes, when path metrics change, or when attachment state changes. This
 is backpressure, not a liveness failure: control, carrier ACK, stream ACK, and
@@ -3848,13 +3853,14 @@ repair, and latency frames must still interleave with any admitted bulk work.
 The configured ceiling MUST be applied as an upper bound over the adaptive
 product-flight model. It MUST NOT be implemented as a floor that expands a
 smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
-Ordered-owner scheduling debt MUST NOT bypass the active Service product-flight
-admission check. If older owner debt is above pressure, debt pressure acts as a
-family/evidence filter and an ordering-debt input. The current Service anchor
-does not get a special later-OwnerData exemption merely because it owns lower
-bytes or has carrier queue credit. Proof-only candidates and debt-expanding
-cross-family candidates remain Probe, Standby, or RepairOnly until the debt
-clears. The surviving OwnerData candidates are then ranked by the
+Tail guards and authoritative lower-flight debt MUST NOT bypass the active
+Service product-flight admission check. A live contiguous Service tail acts as
+a family/evidence filter for alternate owners but MUST NOT make the current
+Service owner inadmissible. Authoritative lower-flight debt remains an
+ordering-debt input for candidates that would expand a receive hole. Proof-only
+candidates and debt-expanding cross-family candidates remain Probe, Standby, or
+RepairOnly until the guard/debt clears. The surviving OwnerData candidates are
+then ranked by the
 normal no-worse admission checks: ETA, inflight, ordering debt, read-gap/reorder
 budget, queue, and completion horizon. A sender MUST NOT hard-pin new OwnerData
 to the current owner merely because that owner owns older bytes; doing so turns
@@ -3985,12 +3991,14 @@ dead subflow and creates repeated detach/reopen churn.
 
 Owner backpressure is a sender wait state, but it is not automatically a
 product-source starvation signal. The backpressure condition for scheduling is
-ordered-owner scheduling debt above the path's pressure threshold; the
-backpressure condition for repair is the narrower authoritative repair debt
-described above. While owner backpressure exists, the sender MUST NOT dispatch
-queued bulk bytes as later `OwnerData` if doing so would expand the unresolved
-lower frontier. However, reading from the local product source into the bounded
-sender queue does not assign product offsets and does not create ordering debt
+an explicit queue/flight/resource limit on the current Service owner or
+authoritative lower-flight debt that would make a later owner expand a receive
+hole; the backpressure condition for repair is the narrower authoritative
+repair debt described above. While owner backpressure exists, the sender MUST
+NOT dispatch queued bulk bytes as later `OwnerData` if doing so would expand
+the unresolved lower frontier. However, reading from the local product source
+into the bounded sender queue does not assign product offsets and does not
+create ordering debt
 by itself. A conforming sender MAY continue bounded product-source reads while
 dispatch is owner-debt blocked, subject to stream flow control, queue limits,
 and memory limits, so the service path is not starved by target-read shutdown.

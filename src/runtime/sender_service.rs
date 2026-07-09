@@ -749,13 +749,11 @@ fn response_target_unique_owner_admission_with_epoch(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
-    allow_sender_evidence_service_failover: bool,
+    allow_liveness_service_failover: bool,
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     let service_key =
         response_service_anchor_key(candidates, lower_owner, ordered_data_owner, lead.key);
-    let sender_evidence_service_failover = allow_sender_evidence_service_failover
-        && target.key == service_key
-        && target.has_sender_evidence;
+    let liveness_service_failover = allow_liveness_service_failover && target.key == service_key;
     if lower_owner == Some(target.key) {
         if ordering_debt > 0 {
             return (PathAdmission::standby(), None);
@@ -770,10 +768,7 @@ fn response_target_unique_owner_admission_with_epoch(
         return (PathAdmission::standby(), None);
     }
     if target.key == service_key {
-        return if target.is_active
-            || target.has_bulk_rate_evidence
-            || sender_evidence_service_failover
-        {
+        return if target.is_active || target.has_bulk_rate_evidence || liveness_service_failover {
             (PathAdmission::service(), None)
         } else {
             (PathAdmission::probe_only(), None)
@@ -923,67 +918,6 @@ fn response_cross_underlay_owner_allowed(
     .reliable_owner_allowed()
 }
 
-fn response_ordered_owner_debt_pressure_bytes(
-    owner: &ResponseSenderPathTarget,
-    lane: FlowLane,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    let ack_step = usize::try_from(reliable_stream_ack_update_bytes(
-        Some(owner.snapshot),
-        lane,
-        mux_limits,
-    ))
-    .unwrap_or(usize::MAX);
-    ack_step
-        .max(payload_bytes)
-        .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
-        .min(mux_limits.max_repair_bytes.max(payload_bytes))
-        .max(1)
-}
-
-fn response_ordered_owner_debt_exceeds_pressure(
-    owner: &ResponseSenderPathTarget,
-    lane: FlowLane,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    ordered_owner_debt_bytes: usize,
-) -> bool {
-    ordered_owner_debt_bytes
-        > response_ordered_owner_debt_pressure_bytes(owner, lane, payload_bytes, mux_limits)
-}
-
-fn response_owner_debt_pressure(
-    all_targets: &[ResponseSenderPathTarget],
-    lane: FlowLane,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    ordered_data_owner: Option<CarrierPathKey>,
-    ordered_owner_debt_bytes: usize,
-) -> Option<CarrierPathKey> {
-    if ordered_owner_debt_bytes == 0 {
-        return None;
-    }
-    let owner_key = ordered_data_owner?;
-    let owner_for_pressure = all_targets.iter().find(|target| target.key == owner_key)?;
-    if !response_ordered_owner_debt_exceeds_pressure(
-        owner_for_pressure,
-        lane,
-        payload_bytes,
-        mux_limits,
-        ordered_owner_debt_bytes,
-    ) {
-        return None;
-    }
-
-    // Ordered-owner scheduling debt is an evidence/ordering-safety filter, not a
-    // Service priority bypass. The current Service owner and measured Subflows
-    // that do not expand cross-path ordering debt compete through the normal
-    // no-worse admission checks; proof-only and debt-expanding cross-family
-    // candidates remain Probe/Standby/RepairOnly.
-    Some(owner_key)
-}
-
 fn response_ordered_owner_missing_under_debt(
     targets: &[ResponseSenderPathTarget],
     lower_flights: &[CarrierPathFlightDebt],
@@ -1023,7 +957,7 @@ fn choose_response_admissible_lead(
     mux_limits: MuxLimits,
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
-    allow_sender_evidence_service_failover: bool,
+    allow_liveness_service_failover: bool,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if let Some(owner) = lower_owner {
@@ -1083,11 +1017,10 @@ fn choose_response_admissible_lead(
         return admissible;
     }
 
-    if lower_owner.is_none() && allow_sender_evidence_service_failover {
+    if lower_owner.is_none() && allow_liveness_service_failover {
         return candidate_targets
             .iter()
             .copied()
-            .filter(|target| target.has_sender_evidence)
             .filter(|target| {
                 response_active_lead_suppression(target, mux_limits, payload_bytes, 0).is_none()
             })
@@ -1451,16 +1384,6 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
         });
     }
 
-    let debt_pressure = response_owner_debt_pressure(
-        targets,
-        lane,
-        payload_bytes,
-        mux_limits,
-        ordered_data_owner,
-        ordered_owner_debt_bytes,
-    );
-    let debt_pressure_owner = debt_pressure;
-
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
     if response_ordered_owner_missing_under_debt(
         targets,
@@ -1484,7 +1407,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
         }
         return None;
     }
-    let effective_lower_owner = lower_owner.or(debt_pressure_owner);
+    let effective_lower_owner = lower_owner;
     let proven_targets = capacity_targets
         .iter()
         .filter(|target| target.is_active || target.has_sender_evidence)
@@ -1547,37 +1470,6 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
             }
         }
     }
-    if let Some(owner_key) = debt_pressure_owner {
-        #[cfg(feature = "lab-diagnostics")]
-        for target in &candidate_targets {
-            if target.key != owner_key
-                && !(target.has_bulk_rate_evidence
-                    && (target.key.underlay == owner_key.underlay
-                        || response_ordering_debt_bytes(lower_flights, target.key) == 0))
-            {
-                lab_response_bulk_output_candidate(
-                    "debt_pressure_filter",
-                    target,
-                    payload_bytes,
-                    mux_limits,
-                    ResponseBulkCandidateDiag {
-                        lead: None,
-                        role: None,
-                        ordering_debt: ordered_owner_debt_bytes as u64,
-                    },
-                );
-            }
-        }
-        candidate_targets.retain(|target| {
-            target.key == owner_key
-                || (target.has_bulk_rate_evidence
-                    && (target.key.underlay == owner_key.underlay
-                        || response_ordering_debt_bytes(lower_flights, target.key) == 0))
-        });
-        if candidate_targets.is_empty() {
-            return None;
-        }
-    }
     let mixed_safe_targets = candidate_targets
         .iter()
         .copied()
@@ -1614,7 +1506,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     } else {
         mixed_safe_targets
     };
-    let allow_sender_evidence_service_failover = effective_lower_owner.is_none()
+    let allow_liveness_service_failover = effective_lower_owner.is_none()
         && ordered_owner_anchor.is_none()
         && ordered_owner_debt_bytes == 0
         && !candidate_targets.iter().any(|target| target.is_active);
@@ -1623,7 +1515,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
         mux_limits,
         payload_bytes,
         lower_flights,
-        allow_sender_evidence_service_failover,
+        allow_liveness_service_failover,
     ) else {
         #[cfg(feature = "lab-diagnostics")]
         for target in &candidate_targets {
@@ -1651,15 +1543,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
         .iter()
         .copied()
         .filter_map(|target| {
-            let ordering_debt = if debt_pressure_owner.is_some() {
-                if lower_owner.is_none() {
-                    ordered_owner_debt_bytes as u64
-                } else {
-                    response_ordering_debt_bytes(lower_flights, target.key)
-                }
-            } else {
-                response_ordering_debt_bytes(lower_flights, target.key)
-            };
+            let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
             let (admission, subflow_set_commit) = response_target_unique_owner_admission_with_epoch(
                 target,
                 &candidate_targets,
@@ -1671,7 +1555,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
                 payload_bytes,
                 mux_limits,
                 subflow_set,
-                allow_sender_evidence_service_failover,
+                allow_liveness_service_failover,
             );
             if !matches!(
                 admission.decision,
@@ -4793,7 +4677,7 @@ mod tests {
     #[test]
     fn response_quic_feed_credit_uses_live_carrier_debt_not_outdated_bdp() {
         let mux_limits = MuxLimits::default();
-        let payload_bytes = 64 * 1024;
+        let payload_bytes = 64 * 1024usize;
         let mut loaded_quic = response_target(0, UnderlayProtocol::Udp, 250.0, 0, 64 * 1024, true);
         loaded_quic.snapshot.delivery_rate_bps = 351_000.0;
         loaded_quic.snapshot.pacing_rate_bps = 351_000.0;
@@ -5150,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_frontier_without_live_service_elects_sender_evidence_service_failover() {
+    fn clear_frontier_without_live_service_elects_liveness_service_failover() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut restart = response_target(
@@ -5161,7 +5045,7 @@ mod tests {
             4 * payload_bytes as u64,
             false,
         );
-        restart.has_sender_evidence = true;
+        restart.has_sender_evidence = false;
         restart.has_bulk_rate_evidence = false;
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
@@ -5180,7 +5064,7 @@ mod tests {
         );
         assert_eq!(
             selected.target.key, restart.key,
-            "path-scoped sender evidence is enough for Service failover only when no live Service owner remains"
+            "liveness from an attached output is enough for bounded Service failover only when no live Service owner remains"
         );
         assert_eq!(
             selected.admission.role,
@@ -5239,7 +5123,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_evidence_service_failover_waits_behind_live_ordered_owner_debt() {
+    fn liveness_service_failover_waits_behind_live_owner_tail_guard() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut failover = response_target(
@@ -5266,7 +5150,7 @@ mod tests {
 
         assert!(
             selected.is_none(),
-            "sender-evidenced Service failover can only own future bytes after the live lower owner frontier is clear"
+            "liveness Service failover can only own future bytes after the live lower owner frontier is clear"
         );
     }
 
@@ -6265,7 +6149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_repair_cache_retention_does_not_create_owner_debt_pressure() {
+    async fn normal_repair_cache_retention_does_not_create_authoritative_owner_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -6368,27 +6252,17 @@ mod tests {
             output: ReliablePathStreamOutput::Switchable(binding.clone()),
             frames: frames_rx,
         };
-        let active_target = binding
-            .sender_path_targets(FlowLane::Throughput, payload_bytes)
-            .into_iter()
-            .find(|target| target.key == active_key)
-            .expect("active target should be visible to sender planning");
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &active_target,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
         let mut send_stream = ReliableSendStream::new(StreamId(7), mux_limits);
-        let mut retained_unacked_bytes = owner_debt_pressure.saturating_add(payload_bytes);
+        let mut retained_unacked_bytes = owner_tail_guard_bytes.saturating_add(payload_bytes);
         while retained_unacked_bytes > 0 {
             let chunk = retained_unacked_bytes.min(payload_bytes);
             let _unacked = send_stream
                 .send_data(Bytes::from(vec![1_u8; chunk]), StreamFlags::NONE)
-                .expect("seed normal retained unacked OwnerData above pressure threshold");
+                .expect("seed normal retained unacked OwnerData above the synthetic tail guard");
             retained_unacked_bytes -= chunk;
         }
-        assert!(send_stream.repair_bytes() > owner_debt_pressure);
+        assert!(send_stream.repair_bytes() > owner_tail_guard_bytes);
         assert!(
             binding
                 .lower_flights_before_offset(send_stream.next_offset())
@@ -6412,7 +6286,7 @@ mod tests {
         );
         assert!(
             try_recv_reliable_path_command(&mut active_rx).is_none(),
-            "normal repair-cache retention is not an owner-debt reason to pin data to Service"
+            "normal repair-cache retention alone is not authoritative owner debt"
         );
         assert!(matches!(
             recv_reliable_path_command(&mut alternate_rx).await,
@@ -6421,7 +6295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_owner_data_waits_under_ordered_owner_debt() {
+    async fn response_owner_tail_guard_feeds_service_and_blocks_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -6524,27 +6398,17 @@ mod tests {
             output: ReliablePathStreamOutput::Switchable(binding.clone()),
             frames: frames_rx,
         };
-        let active_target = binding
-            .sender_path_targets(FlowLane::Throughput, payload_bytes)
-            .into_iter()
-            .find(|target| target.key == active_key)
-            .expect("active target should be visible to sender planning");
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &active_target,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
         let mut send_stream = ReliableSendStream::new(StreamId(7), mux_limits);
-        let mut remaining_owner_debt = owner_debt_pressure.saturating_add(payload_bytes);
+        let mut remaining_owner_debt = owner_tail_guard_bytes.saturating_add(payload_bytes);
         while remaining_owner_debt > 0 {
             let chunk = remaining_owner_debt.min(payload_bytes);
             let _unacked = send_stream
                 .send_data(Bytes::from(vec![1_u8; chunk]), StreamFlags::NONE)
-                .expect("seed unacked ordered-owner scheduling debt above pressure threshold");
+                .expect("seed unacked ordered-owner tail guard");
             remaining_owner_debt -= chunk;
         }
-        assert!(send_stream.repair_bytes() > owner_debt_pressure);
+        assert!(send_stream.repair_bytes() > owner_tail_guard_bytes);
         while let Some(_setup_command) = try_recv_reliable_path_command(&mut alternate_rx) {}
 
         let mut sender = ServerResponseSenderService::new(SessionId(82), StreamId(7));
@@ -6560,15 +6424,17 @@ mod tests {
             )
             .await;
 
-        assert!(
-            matches!(dispatch, Err(RuntimeError::SenderServiceBlocked)),
-            "ordered-owner scheduling debt must backpressure later OwnerData until the frontier is safe"
-        );
+        let dispatch =
+            dispatch.expect("live Service owner should remain feedable under tail guard");
+        assert_eq!(dispatch.selected_path, Some(active_key));
         assert_eq!(binding.ordered_data_owner(), Some(active_key));
-        assert!(try_recv_reliable_path_command(&mut active_rx).is_none());
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut active_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
         assert!(
             try_recv_reliable_path_command(&mut alternate_rx).is_none(),
-            "ordered-owner scheduling debt must not move later OwnerData onto another Subflow"
+            "tail guard must not move later OwnerData onto another Subflow"
         );
     }
 
@@ -7222,18 +7088,13 @@ mod tests {
     }
 
     #[test]
-    fn response_owner_debt_pressure_stops_later_service_owner_feed() {
+    fn response_owner_tail_guard_keeps_service_owner_feedable_under_pressure() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let owner = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, true);
         let alternate = response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, false);
         let owner_key = owner.key;
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &owner,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[owner, alternate],
@@ -7242,18 +7103,20 @@ mod tests {
             mux_limits,
             &[],
             Some(owner_key),
-            owner_debt_pressure.saturating_add(payload_bytes),
+            owner_tail_guard_bytes,
             None,
-        );
+        )
+        .expect("live Service owner must remain feedable under contiguous owner-tail guard");
 
-        assert!(
-            selected.is_none(),
-            "ordered-owner scheduling debt must stop later Service OwnerData instead of growing the receive hole"
+        assert_eq!(
+            selected.target.key, owner_key,
+            "contiguous owner-tail guard blocks alternates but must not starve the current Service owner"
         );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
-    fn response_owner_debt_pressure_waits_when_lower_owner_queue_is_full() {
+    fn response_owner_tail_guard_waits_when_lower_owner_queue_is_full() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
@@ -7272,12 +7135,7 @@ mod tests {
             .expect("seed full owner data queue");
         owner.commands = owner_commands;
 
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &owner,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[owner.clone(), alternate],
@@ -7286,7 +7144,7 @@ mod tests {
             mux_limits,
             &[],
             Some(owner.key),
-            owner_debt_pressure.saturating_add(payload_bytes),
+            owner_tail_guard_bytes,
             None,
         );
         assert!(
@@ -7296,24 +7154,19 @@ mod tests {
     }
 
     #[test]
-    fn response_owner_debt_pressure_waits_when_lower_owner_is_over_budget() {
+    fn response_owner_tail_guard_waits_when_lower_owner_is_over_budget() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
             ..MuxLimits::default()
         };
-        let payload_bytes = 64 * 1024;
+        let payload_bytes = 64 * 1024usize;
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         owner.snapshot.product_progress_rate_bps = Some(10_000_000.0);
         owner.snapshot.product_bytes_in_flight = 8 * 1024 * 1024;
         owner.snapshot.pacing_rate_bps = 2_000_000_000.0;
         let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &owner,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[owner.clone(), alternate],
@@ -7322,7 +7175,7 @@ mod tests {
             mux_limits,
             &[],
             Some(owner.key),
-            owner_debt_pressure.saturating_add(payload_bytes),
+            owner_tail_guard_bytes,
             None,
         );
         assert!(
@@ -7332,7 +7185,7 @@ mod tests {
     }
 
     #[test]
-    fn response_owner_debt_pressure_blocks_cross_underlay_when_owner_queue_is_full() {
+    fn response_owner_tail_guard_blocks_cross_underlay_when_owner_queue_is_full() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
@@ -7351,12 +7204,7 @@ mod tests {
             .expect("seed full owner data queue");
         owner.commands = owner_commands;
 
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &owner,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         assert!(
             select_response_sender_data_target_with_ordered_debt_and_epoch(
@@ -7366,7 +7214,7 @@ mod tests {
                 mux_limits,
                 &[],
                 Some(owner.key),
-                owner_debt_pressure.saturating_add(payload_bytes),
+                owner_tail_guard_bytes,
                 None,
             )
             .is_none(),
@@ -7399,7 +7247,7 @@ mod tests {
     }
 
     #[test]
-    fn response_owner_debt_pressure_blocks_proof_only_same_family_subflow() {
+    fn response_owner_tail_guard_blocks_proof_only_same_family_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
@@ -7421,12 +7269,7 @@ mod tests {
             .expect("seed full owner data queue");
         owner.commands = owner_commands;
 
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &owner,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         assert!(
             select_response_sender_data_target_with_ordered_debt_and_epoch(
@@ -7436,7 +7279,7 @@ mod tests {
                 mux_limits,
                 &[],
                 Some(owner.key),
-                owner_debt_pressure.saturating_add(payload_bytes),
+                owner_tail_guard_bytes,
                 None,
             )
             .is_none(),
@@ -7542,7 +7385,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_only_active_fallback_cannot_extend_unresolved_ordered_debt() {
+    fn proof_only_active_service_can_continue_under_its_own_tail_guard() {
         let mut active_fallback =
             response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
         active_fallback.has_sender_evidence = true;
@@ -7559,9 +7402,13 @@ mod tests {
             None,
         );
 
-        assert!(
-            selected.is_none(),
-            "a reachability/proof-only fallback path must repair or wait under unresolved ordered debt; it must not become Service OwnerData for later offsets"
+        let selected =
+            selected.expect("the live active Service owner may continue under its own tail guard");
+        assert_eq!(selected.target.key, active_fallback.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "tail guard must not turn active Service OwnerData into Subflow exploration"
         );
     }
 
@@ -7716,7 +7563,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_debt_pressure_keeps_cross_underlay_candidate_that_owns_lower_flight() {
+    fn owner_tail_guard_keeps_cross_underlay_candidate_that_owns_lower_flight() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
@@ -7725,12 +7572,7 @@ mod tests {
             key: candidate.key,
             bytes: payload_bytes as u64,
         }];
-        let owner_debt_pressure = response_ordered_owner_debt_pressure_bytes(
-            &service,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        );
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[service.clone(), candidate.clone()],
@@ -7739,14 +7581,14 @@ mod tests {
             mux_limits,
             &lower_flights,
             Some(service.key),
-            owner_debt_pressure.saturating_add(payload_bytes),
+            owner_tail_guard_bytes,
             None,
         )
-        .expect("candidate owning the lower flight should survive debt-pressure filtering");
+        .expect("candidate owning the lower flight should survive tail-guard filtering");
 
         assert_eq!(
             selected.target.key, candidate.key,
-            "owner-debt pressure must filter by candidate ordering safety, not by carrier family alone"
+            "tail guard must filter by candidate ordering safety, not by carrier family alone"
         );
     }
 }

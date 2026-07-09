@@ -86,6 +86,9 @@ pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     if !ack_complete && ack_frontier == 0 {
         return 0;
     }
+    // This is a tail guard, not repair debt. It blocks alternate OwnerData and
+    // missing-owner failover while lower Service bytes are unresolved, but it
+    // must not make the live Service owner itself inadmissible.
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
 }
 
@@ -2772,7 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_ack_frontier_creates_ordered_owner_scheduling_debt_not_repair_debt() {
+    fn contiguous_ack_frontier_lag_is_tail_guard_not_repair_debt() {
         let ranges = [OffsetRange {
             start: 0,
             end: 1024,
@@ -2785,12 +2788,12 @@ mod tests {
         assert_eq!(
             reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, true, 1024, 8192,),
             7168,
-            "the same suffix is still ordered-owner scheduling debt and must block unsafe Service migration"
+            "a contiguous unacknowledged suffix is a tail guard for alternate owners"
         );
         assert_eq!(
             reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, false, 1024, 8192,),
             7168,
-            "an incomplete ACK chunk can still prove the contiguous prefix; incompleteness must not erase owner-tail scheduling debt"
+            "an incomplete ACK chunk can still prove the contiguous prefix for owner-tail guarding"
         );
         assert_eq!(
             reliable_relay_ordered_owner_debt_bytes(FlowLane::Latency, true, 1024, 8192,),

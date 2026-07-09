@@ -144,17 +144,38 @@ pub(super) fn bulk_service_horizon_payload_bytes(
     let service_payload = payload_bytes
         .max(BBR_MAX_SEND_QUANTUM_BYTES.min(mux_limits.max_reliable_relay_chunk_bytes))
         .max(1);
-    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
-    let envelope = mux_limits
-        .max_path_flight_bytes
-        .min(mux_limits.max_reorder_bytes)
-        .min(stream_window)
-        .max(service_payload)
-        .max(1);
+    let envelope = bulk_service_product_envelope_payload_bytes(service_payload, mux_limits);
     let horizon = ((service_payload as f64) * (envelope as f64))
         .sqrt()
         .round() as usize;
     horizon.clamp(service_payload, envelope)
+}
+
+pub(super) fn bulk_service_product_envelope_payload_bytes(
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let service_payload = payload_bytes
+        .max(BBR_MAX_SEND_QUANTUM_BYTES.min(mux_limits.max_reliable_relay_chunk_bytes))
+        .max(1);
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    mux_limits
+        .max_path_flight_bytes
+        .min(mux_limits.max_reorder_bytes)
+        .min(stream_window)
+        .max(service_payload)
+        .max(1)
+}
+
+pub(super) fn bulk_service_feed_reservoir_payload_bytes(
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+    let envelope = bulk_service_product_envelope_payload_bytes(payload_bytes, mux_limits);
+    ((horizon as f64) * BBR_DEFAULT_CWND_GAIN)
+        .ceil()
+        .clamp(horizon as f64, envelope as f64) as usize
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -544,9 +565,7 @@ fn bulk_active_role_has_latency_pressure(candidate: PathSnapshot, role: BulkAdmi
 }
 
 fn bulk_latency_pressure_flows(candidate: PathSnapshot) -> u32 {
-    candidate
-        .active_latency_sensitive_flows
-        .max(candidate.session_active_latency_sensitive_flows)
+    candidate.active_latency_sensitive_flows
 }
 
 fn bulk_product_reorder_debt_bytes(candidate: PathSnapshot) -> u64 {
@@ -786,13 +805,13 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_with_session_latency_pressure_uses_preemptible_service_horizon() {
+    fn active_tcp_with_same_path_latency_pressure_uses_preemptible_service_horizon() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 32 * 1024 * 1024,
             ..MuxLimits::default()
         };
         let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
-        candidate.session_active_latency_sensitive_flows = 1;
+        candidate.active_latency_sensitive_flows = 1;
         let payload = 64 * 1024;
         let limit = bulk_product_inflight_limit_bytes(
             candidate,
@@ -810,6 +829,28 @@ mod tests {
     }
 
     #[test]
+    fn active_tcp_with_session_only_latency_pressure_keeps_service_owner_reservoir() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 32 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
+        candidate.session_active_latency_sensitive_flows = 1;
+        let payload = 64 * 1024;
+        let limit = bulk_product_inflight_limit_bytes(
+            candidate,
+            payload,
+            mux_limits,
+            BulkAdmissionRole::ActiveDataPath,
+        );
+
+        assert!(
+            limit > bulk_service_horizon_payload_bytes(payload, mux_limits) as u64,
+            "latency work on other paths must not shrink this Service owner to the preemptible horizon"
+        );
+    }
+
+    #[test]
     fn bulk_service_horizon_is_geometric_mean_not_full_envelope() {
         let payload = 64 * 1024;
         let mux_limits = MuxLimits::default();
@@ -822,13 +863,13 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_with_session_latency_pressure_rejects_hidden_command_backlog() {
+    fn active_tcp_with_same_path_latency_pressure_rejects_hidden_command_backlog() {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
         active.queue_bytes = 8 * 1024 * 1024;
         active.product_bytes_in_flight = 8 * 1024 * 1024;
         active.product_progress_rate_bps = Some(mbps(1_000.0));
-        active.session_active_latency_sensitive_flows = 1;
+        active.active_latency_sensitive_flows = 1;
 
         assert_eq!(
             bulk_candidate_admission_suppression(
@@ -872,7 +913,7 @@ mod tests {
             ),
             "same-Service queued bytes are feed/backpressure debt, not cross-path reorder debt"
         );
-        assert_eq!(
+        assert_ne!(
             bulk_candidate_admission_suppression(
                 active,
                 117_551.370,
@@ -882,8 +923,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "the active Service may be backpressured, but the reason must not be reorder_budget when stream_ordering_debt is zero"
+            Some("reorder_budget"),
+            "the active Service may be allowed or backpressured, but same-path backlog must not be reported as cross-path reorder debt"
         );
     }
 
@@ -929,7 +970,7 @@ mod tests {
         active.pacing_rate_bps = mbps(0.369);
         active.product_progress_rate_bps = Some(mbps(0.369));
         active.product_bytes_in_flight = 8 * 1024 * 1024;
-        active.session_active_latency_sensitive_flows = 1;
+        active.active_latency_sensitive_flows = 1;
         active.app_limited = true;
 
         assert_eq!(
@@ -1123,7 +1164,7 @@ mod tests {
         active.product_progress_rate_bps = Some(mbps(0.351));
         active.product_bytes_in_flight = 773_728;
         active.product_queue_bytes = payload as u64;
-        active.session_active_latency_sensitive_flows = 1;
+        active.active_latency_sensitive_flows = 1;
         active.app_limited = true;
         active.confidence = 0.0;
 

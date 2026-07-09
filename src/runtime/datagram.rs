@@ -48,16 +48,14 @@ async fn client_udp_datagram_round_trip_with_limits(
         )
         .await
         .map_err(|err| match err {
-            UdpPathSendError::Runtime(err) => err,
-            UdpPathSendError::MtuExceeded { limit } => {
+            DatagramPathSendError::Runtime(err) => err,
+            DatagramPathSendError::MtuExceeded { limit } => {
                 RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                     actual: payload_len,
                     limit,
                 })
             }
-            UdpPathSendError::Timeout { .. } => {
-                RuntimeError::Protocol("UDP datagram response timed out")
-            }
+            DatagramPathSendError::Timeout { .. } => RuntimeError::DatagramResponseTimedOut,
         })?;
     session.close().await?;
     Ok(response)
@@ -73,6 +71,22 @@ pub(super) struct DatagramClientAssociation {
 struct DatagramUnderlayCandidate {
     key: RelayPathKey,
     eta_ms: f64,
+}
+
+pub(super) enum DatagramUnderlaySendError {
+    Timeout {
+        path_was_acked: bool,
+        source: RuntimeError,
+    },
+    Runtime(RuntimeError),
+}
+
+impl DatagramUnderlaySendError {
+    fn into_runtime(self) -> RuntimeError {
+        match self {
+            Self::Timeout { source, .. } | Self::Runtime(source) => source,
+        }
+    }
 }
 
 impl DatagramClientAssociation {
@@ -115,7 +129,9 @@ impl DatagramClientAssociation {
             let hinted = candidates.remove(position);
             candidates.insert(0, hinted);
         }
-        for candidate in candidates {
+        let candidate_count = candidates.len();
+        for (position, candidate) in candidates.into_iter().enumerate() {
+            let has_unattempted_alternative = position + 1 < candidate_count;
             match candidate.key.underlay {
                 UnderlayProtocol::Tcp => {
                     let result = self
@@ -123,10 +139,28 @@ impl DatagramClientAssociation {
                         .await;
                     match result {
                         Ok(response) => return Ok(response),
-                        Err(err) if datagram_underlay_error_is_retryable(&err) => {
+                        Err(DatagramUnderlaySendError::Timeout {
+                            path_was_acked,
+                            source,
+                        }) => {
+                            match datagram_timeout_action(
+                                path_was_acked,
+                                has_unattempted_alternative,
+                            ) {
+                                DatagramTimeoutAction::RetryAlternative => {
+                                    last_retryable_error = Some(source);
+                                }
+                                DatagramTimeoutAction::TerminalProductExpiry => {
+                                    return Err(source);
+                                }
+                            }
+                        }
+                        Err(DatagramUnderlaySendError::Runtime(err))
+                            if datagram_underlay_error_is_retryable(&err) =>
+                        {
                             last_retryable_error = Some(err);
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => return Err(err.into_runtime()),
                     }
                 }
                 UnderlayProtocol::Udp => {
@@ -135,10 +169,28 @@ impl DatagramClientAssociation {
                         .await;
                     match result {
                         Ok(response) => return Ok(response),
-                        Err(err) if datagram_underlay_error_is_retryable(&err) => {
+                        Err(DatagramUnderlaySendError::Timeout {
+                            path_was_acked,
+                            source,
+                        }) => {
+                            match datagram_timeout_action(
+                                path_was_acked,
+                                has_unattempted_alternative,
+                            ) {
+                                DatagramTimeoutAction::RetryAlternative => {
+                                    last_retryable_error = Some(source);
+                                }
+                                DatagramTimeoutAction::TerminalProductExpiry => {
+                                    return Err(source);
+                                }
+                            }
+                        }
+                        Err(DatagramUnderlaySendError::Runtime(err))
+                            if datagram_underlay_error_is_retryable(&err) =>
+                        {
                             last_retryable_error = Some(err);
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => return Err(err.into_runtime()),
                     }
                 }
             }
@@ -151,16 +203,16 @@ impl DatagramClientAssociation {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
-    ) -> Result<Bytes, RuntimeError> {
+    ) -> Result<Bytes, DatagramUnderlaySendError> {
         if self.udp.is_none() {
-            self.udp = Some(Box::new(UdpDatagramClientAssociation::new(
-                self.context.clone(),
-            )?));
+            self.udp = Some(Box::new(
+                UdpDatagramClientAssociation::new(self.context.clone())
+                    .map_err(DatagramUnderlaySendError::Runtime)?,
+            ));
         }
-        let udp = self
-            .udp
-            .as_mut()
-            .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+        let udp = self.udp.as_mut().ok_or(DatagramUnderlaySendError::Runtime(
+            RuntimeError::NoSchedulableUdpPath,
+        ))?;
         udp.send_to_fresh_datagram(target, payload, ttl_ms).await
     }
 
@@ -169,17 +221,17 @@ impl DatagramClientAssociation {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
-    ) -> Result<Bytes, RuntimeError> {
+    ) -> Result<Bytes, DatagramUnderlaySendError> {
         if self.tcp.is_none() {
             self.tcp = Some(Box::new(
                 TcpDatagramClientAssociation::open_best(self.context.clone(), payload.len())
-                    .await?,
+                    .await
+                    .map_err(DatagramUnderlaySendError::Runtime)?,
             ));
         }
-        let tcp = self
-            .tcp
-            .as_mut()
-            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        let tcp = self.tcp.as_mut().ok_or(DatagramUnderlaySendError::Runtime(
+            RuntimeError::NoSchedulableTcpPath,
+        ))?;
         tcp.send_to_with_carrier_recovery(target, payload, ttl_ms)
             .await
     }
@@ -290,11 +342,7 @@ pub(super) fn datagram_underlay_error_is_retryable(err: &RuntimeError) -> bool {
 }
 
 pub(super) fn runtime_error_is_datagram_response_timeout(err: &RuntimeError) -> bool {
-    matches!(
-        err,
-        RuntimeError::DatagramResponseTimedOut
-            | RuntimeError::Protocol("UDP datagram response timed out")
-    )
+    matches!(err, RuntimeError::DatagramResponseTimedOut)
 }
 
 pub(super) struct TcpDatagramClientAssociation {
@@ -344,7 +392,7 @@ impl TcpDatagramClientAssociation {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
-    ) -> Result<Bytes, RuntimeError> {
+    ) -> Result<Bytes, DatagramUnderlaySendError> {
         let started_at = Instant::now();
         loop {
             match self
@@ -353,17 +401,62 @@ impl TcpDatagramClientAssociation {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(err) if tcp_datagram_error_is_path_retryable(&err) => {
+                Err(DatagramPathSendError::Timeout {
+                    path_was_acked,
+                    response_timeout: _,
+                }) => {
+                    if path_was_acked {
+                        return Err(DatagramUnderlaySendError::Timeout {
+                            path_was_acked,
+                            source: RuntimeError::DatagramResponseTimedOut,
+                        });
+                    }
                     let failed_path_index = self.session.path_index;
                     self.context.mark_tcp_path_failure(failed_path_index);
                     let _ = self.session.close().await;
                     if started_at.elapsed() >= self.adaptive_retry_budget(ttl_ms) {
-                        return Err(err);
+                        return Err(DatagramUnderlaySendError::Timeout {
+                            path_was_acked,
+                            source: RuntimeError::DatagramResponseTimedOut,
+                        });
                     }
-                    let replacement = Self::open_best(self.context.clone(), payload.len()).await?;
+                    match Self::open_best(self.context.clone(), payload.len()).await {
+                        Ok(replacement) => {
+                            self.session = replacement.session;
+                        }
+                        Err(_) => {
+                            return Err(DatagramUnderlaySendError::Timeout {
+                                path_was_acked,
+                                source: RuntimeError::DatagramResponseTimedOut,
+                            });
+                        }
+                    }
+                }
+                Err(DatagramPathSendError::Runtime(err))
+                    if tcp_datagram_error_is_path_retryable(&err) =>
+                {
+                    let failed_path_index = self.session.path_index;
+                    self.context.mark_tcp_path_failure(failed_path_index);
+                    let _ = self.session.close().await;
+                    if started_at.elapsed() >= self.adaptive_retry_budget(ttl_ms) {
+                        return Err(DatagramUnderlaySendError::Runtime(err));
+                    }
+                    let replacement = Self::open_best(self.context.clone(), payload.len())
+                        .await
+                        .map_err(DatagramUnderlaySendError::Runtime)?;
                     self.session = replacement.session;
                 }
-                Err(err) => return Err(err),
+                Err(DatagramPathSendError::Runtime(err)) => {
+                    return Err(DatagramUnderlaySendError::Runtime(err));
+                }
+                Err(DatagramPathSendError::MtuExceeded { limit }) => {
+                    return Err(DatagramUnderlaySendError::Runtime(RuntimeError::Datagram(
+                        DatagramError::PayloadTooLarge {
+                            actual: payload.len(),
+                            limit,
+                        },
+                    )));
+                }
             }
         }
     }
@@ -437,26 +530,36 @@ impl TcpDatagramClientSession {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
-    ) -> Result<Bytes, RuntimeError> {
+    ) -> Result<Bytes, DatagramPathSendError> {
         if payload.len() > self.mux_limits.max_payload_bytes {
-            return Err(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                actual: payload.len(),
+            return Err(DatagramPathSendError::MtuExceeded {
                 limit: self.mux_limits.max_payload_bytes,
-            }));
+            });
         }
-        tick_client_tcp_path_heartbeat(&mut self.connection, self.mux_limits, true).await?;
+        tick_client_tcp_path_heartbeat(&mut self.connection, self.mux_limits, true)
+            .await
+            .map_err(DatagramPathSendError::Runtime)?;
         let response_timeout = self.response_timeout(ttl_ms);
-        let flow_id = self.ensure_flow(target).await?;
+        let flow_id = self
+            .ensure_flow(target)
+            .await
+            .map_err(DatagramPathSendError::Runtime)?;
         let frame = {
             let flow = self
                 .flows
                 .iter_mut()
                 .find(|flow| flow.flow_id == flow_id)
-                .ok_or(RuntimeError::Protocol("missing TCP datagram flow"))?;
-            flow.flow.enqueue(0, ttl_ms, payload)?;
+                .ok_or(DatagramPathSendError::Runtime(RuntimeError::Protocol(
+                    "missing TCP datagram flow",
+                )))?;
+            flow.flow
+                .enqueue(0, ttl_ms, payload)
+                .map_err(|err| DatagramPathSendError::Runtime(RuntimeError::Datagram(err)))?;
             flow.flow
                 .pop_frame(0)
-                .ok_or(RuntimeError::Protocol("datagram expired before TCP send"))?
+                .ok_or(DatagramPathSendError::Runtime(RuntimeError::Protocol(
+                    "datagram expired before TCP send",
+                )))?
         };
         let (request_datagram_id, request_len) = match &frame {
             Frame::DatagramData {
@@ -464,10 +567,15 @@ impl TcpDatagramClientSession {
                 payload,
                 ..
             } => (*datagram_id, payload.len()),
-            _ => return Err(RuntimeError::Protocol("unexpected queued datagram frame")),
+            _ => {
+                return Err(DatagramPathSendError::Runtime(RuntimeError::Protocol(
+                    "unexpected queued datagram frame",
+                )));
+            }
         };
         let request_key = (flow_id, request_datagram_id);
         let sent_at = Instant::now();
+        let mut request_acked = false;
         let response_budget = datagram_response_deadline_budget(response_timeout, ttl_ms)
             .max(response_timeout)
             .min(datagram_useful_ttl_budget(ttl_ms));
@@ -480,8 +588,16 @@ impl TcpDatagramClientSession {
                 ttl: Duration::from_millis(u64::from(ttl_ms)),
             },
         );
-        self.connection.writer.write_frame(&frame).await?;
-        self.connection.writer.flush().await?;
+        self.connection
+            .writer
+            .write_frame(&frame)
+            .await
+            .map_err(|err| DatagramPathSendError::Runtime(RuntimeError::Encrypted(err)))?;
+        self.connection
+            .writer
+            .flush()
+            .await
+            .map_err(|err| DatagramPathSendError::Runtime(RuntimeError::Encrypted(err)))?;
         loop {
             let now = Instant::now();
             if now >= response_deadline {
@@ -490,45 +606,65 @@ impl TcpDatagramClientSession {
                 lab_diagnostic(
                     "tcp_datagram_response_timeout",
                     format_args!(
-                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={}",
+                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} request_acked={}",
                         self.path_id.0,
                         self.path_index,
                         flow_id.0,
                         request_datagram_id.0,
                         response_timeout.as_millis(),
                         response_budget.as_millis(),
+                        request_acked,
                     ),
                 );
-                return Err(RuntimeError::DatagramResponseTimedOut);
+                return Err(DatagramPathSendError::Timeout {
+                    path_was_acked: request_acked,
+                    response_timeout,
+                });
             }
             let wait_for = response_deadline.saturating_duration_since(now);
             let received = match tokio::time::timeout(wait_for, self.connection.frames.recv()).await
             {
                 Ok(Some(Ok(frame))) => frame,
-                Ok(Some(Err(err))) => return Err(RuntimeError::Encrypted(err)),
-                Ok(None) => return Err(RuntimeError::ReliablePathSessionClosed),
+                Ok(Some(Err(err))) => {
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::Encrypted(err)));
+                }
+                Ok(None) => {
+                    return Err(DatagramPathSendError::Runtime(
+                        RuntimeError::ReliablePathSessionClosed,
+                    ));
+                }
                 Err(_) => {
                     self.sent_datagrams.remove(&request_key);
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "tcp_datagram_response_timeout",
                         format_args!(
-                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={}",
+                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} request_acked={}",
                             self.path_id.0,
                             self.path_index,
                             flow_id.0,
                             request_datagram_id.0,
                             response_timeout.as_millis(),
                             response_budget.as_millis(),
+                            request_acked,
                         ),
                     );
-                    return Err(RuntimeError::DatagramResponseTimedOut);
+                    return Err(DatagramPathSendError::Timeout {
+                        path_was_acked: request_acked,
+                        response_timeout,
+                    });
                 }
             };
             refresh_client_tcp_path_liveness(&mut self.connection, self.mux_limits);
             match received {
                 Frame::DatagramFeedback { flow_id, received } => {
-                    self.handle_datagram_feedback(flow_id, &received)?;
+                    if flow_id == request_key.0
+                        && datagram_id_is_in_ranges(request_datagram_id, &received)
+                    {
+                        request_acked = true;
+                    }
+                    self.handle_datagram_feedback(flow_id, &received)
+                        .map_err(DatagramPathSendError::Runtime)?;
                 }
                 Frame::DatagramData {
                     flow_id: response_flow_id,
@@ -545,10 +681,18 @@ impl TcpDatagramClientSession {
                         .writer
                         .write_frame(&Frame::DatagramFeedback {
                             flow_id,
-                            received: vec![datagram_ack_range(datagram_id)?],
+                            received: vec![
+                                datagram_ack_range(datagram_id)
+                                    .map_err(DatagramPathSendError::Runtime)?,
+                            ],
                         })
-                        .await?;
-                    self.connection.writer.flush().await?;
+                        .await
+                        .map_err(|err| {
+                            DatagramPathSendError::Runtime(RuntimeError::Encrypted(err))
+                        })?;
+                    self.connection.writer.flush().await.map_err(|err| {
+                        DatagramPathSendError::Runtime(RuntimeError::Encrypted(err))
+                    })?;
                     self.stats.record_payload_bytes(request_len);
                     self.stats.record_payload_bytes(payload.len());
                     return Ok(payload);
@@ -562,22 +706,37 @@ impl TcpDatagramClientSession {
                         .writer
                         .write_frame(&Frame::DatagramFeedback {
                             flow_id,
-                            received: vec![datagram_ack_range(datagram_id)?],
+                            received: vec![
+                                datagram_ack_range(datagram_id)
+                                    .map_err(DatagramPathSendError::Runtime)?,
+                            ],
                         })
-                        .await?;
-                    self.connection.writer.flush().await?;
+                        .await
+                        .map_err(|err| {
+                            DatagramPathSendError::Runtime(RuntimeError::Encrypted(err))
+                        })?;
+                    self.connection.writer.flush().await.map_err(|err| {
+                        DatagramPathSendError::Runtime(RuntimeError::Encrypted(err))
+                    })?;
                 }
                 Frame::DatagramClose {
                     flow_id: closed_flow_id,
                 } if closed_flow_id == flow_id => {
-                    return Err(RuntimeError::Protocol("TCP datagram flow closed"));
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::Protocol(
+                        "TCP datagram flow closed",
+                    )));
                 }
                 Frame::Ping { nonce } => {
                     self.connection
                         .writer
                         .write_frame(&Frame::Pong { nonce })
-                        .await?;
-                    self.connection.writer.flush().await?;
+                        .await
+                        .map_err(|err| {
+                            DatagramPathSendError::Runtime(RuntimeError::Encrypted(err))
+                        })?;
+                    self.connection.writer.flush().await.map_err(|err| {
+                        DatagramPathSendError::Runtime(RuntimeError::Encrypted(err))
+                    })?;
                 }
                 Frame::Pong { nonce } => {
                     if self
@@ -589,11 +748,21 @@ impl TcpDatagramClientSession {
                     }
                 }
                 Frame::PathStatus { .. } | Frame::SessionReady => {}
-                Frame::PathClose { .. } => return Err(RuntimeError::ReliablePathSessionClosed),
-                Frame::SessionClose { reason } => {
-                    return Err(RuntimeError::RemoteClosed(reason));
+                Frame::PathClose { .. } => {
+                    return Err(DatagramPathSendError::Runtime(
+                        RuntimeError::ReliablePathSessionClosed,
+                    ));
                 }
-                _ => return Err(RuntimeError::Protocol("unexpected TCP datagram frame")),
+                Frame::SessionClose { reason } => {
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::RemoteClosed(
+                        reason,
+                    )));
+                }
+                _ => {
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::Protocol(
+                        "unexpected TCP datagram frame",
+                    )));
+                }
             }
         }
     }
@@ -833,7 +1002,7 @@ impl UdpDatagramPacer {
     }
 }
 
-pub(super) enum UdpPathSendError {
+pub(super) enum DatagramPathSendError {
     MtuExceeded {
         limit: usize,
     },
@@ -842,6 +1011,23 @@ pub(super) enum UdpPathSendError {
         response_timeout: Duration,
     },
     Runtime(RuntimeError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DatagramTimeoutAction {
+    RetryAlternative,
+    TerminalProductExpiry,
+}
+
+pub(super) fn datagram_timeout_action(
+    path_was_acked: bool,
+    has_unattempted_alternative: bool,
+) -> DatagramTimeoutAction {
+    if !path_was_acked && has_unattempted_alternative {
+        DatagramTimeoutAction::RetryAlternative
+    } else {
+        DatagramTimeoutAction::TerminalProductExpiry
+    }
 }
 
 impl UdpDatagramClientAssociation {
@@ -860,12 +1046,14 @@ impl UdpDatagramClientAssociation {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
-    ) -> Result<Bytes, RuntimeError> {
+    ) -> Result<Bytes, DatagramUnderlaySendError> {
         if payload.len() > self.context.mux_limits.max_payload_bytes {
-            return Err(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                actual: payload.len(),
-                limit: self.context.mux_limits.max_payload_bytes,
-            }));
+            return Err(DatagramUnderlaySendError::Runtime(RuntimeError::Datagram(
+                DatagramError::PayloadTooLarge {
+                    actual: payload.len(),
+                    limit: self.context.mux_limits.max_payload_bytes,
+                },
+            )));
         }
         let candidates = self
             .context
@@ -910,7 +1098,9 @@ impl UdpDatagramClientAssociation {
                     ),
                 );
             }
-            return Err(RuntimeError::NoSchedulableUdpPath);
+            return Err(DatagramUnderlaySendError::Runtime(
+                RuntimeError::NoSchedulableUdpPath,
+            ));
         }
 
         self.prune_suppressed_paths();
@@ -937,35 +1127,63 @@ impl UdpDatagramClientAssociation {
                     self.last_successful_path = Some(path_index);
                     return Ok(response);
                 }
-                Err(UdpPathSendError::MtuExceeded { limit }) => {
+                Err(DatagramPathSendError::MtuExceeded { limit }) => {
                     last_retryable_error =
                         Some(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                             actual: payload.len(),
                             limit,
                         }));
                 }
-                Err(UdpPathSendError::Timeout {
+                Err(DatagramPathSendError::Timeout {
                     path_was_acked,
                     response_timeout,
                 }) => {
-                    if path_was_acked {
-                        self.context.mark_udp_path_feedback(
-                            path_index,
-                            UdpDatagramPathObservation {
-                                rtt: response_timeout,
-                                jitter: Duration::ZERO,
-                                loss_rate: 1.0,
-                                rate_sample: None,
-                            },
-                        );
-                    } else {
-                        self.remove_path(path_index).await;
-                        self.suppress_path_after_timeout(path_index, response_timeout, ttl_ms);
-                        self.context.mark_udp_path_failure(path_index);
+                    match datagram_timeout_action(path_was_acked, has_unattempted_alternative) {
+                        DatagramTimeoutAction::RetryAlternative => {
+                            self.remove_path(path_index).await;
+                            self.suppress_path_after_timeout(path_index, response_timeout, ttl_ms);
+                            self.context.mark_udp_path_failure(path_index);
+                            last_retryable_error = Some(RuntimeError::DatagramResponseTimedOut);
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "udp_datagram_unacked_timeout_retry_alternative",
+                                format_args!(
+                                    "path_index={} response_timeout_ms={} ttl_ms={}",
+                                    path_index,
+                                    response_timeout.as_millis(),
+                                    ttl_ms
+                                ),
+                            );
+                            continue;
+                        }
+                        DatagramTimeoutAction::TerminalProductExpiry => {
+                            if path_was_acked {
+                                self.context.mark_udp_path_feedback(
+                                    path_index,
+                                    UdpDatagramPathObservation {
+                                        rtt: response_timeout,
+                                        jitter: Duration::ZERO,
+                                        loss_rate: 1.0,
+                                        rate_sample: None,
+                                    },
+                                );
+                            } else {
+                                self.remove_path(path_index).await;
+                                self.suppress_path_after_timeout(
+                                    path_index,
+                                    response_timeout,
+                                    ttl_ms,
+                                );
+                                self.context.mark_udp_path_failure(path_index);
+                            }
+                        }
                     }
-                    return Err(RuntimeError::DatagramResponseTimedOut);
+                    return Err(DatagramUnderlaySendError::Timeout {
+                        path_was_acked,
+                        source: RuntimeError::DatagramResponseTimedOut,
+                    });
                 }
-                Err(UdpPathSendError::Runtime(err))
+                Err(DatagramPathSendError::Runtime(err))
                     if udp_datagram_error_is_path_retryable(&err) =>
                 {
                     self.remove_path(path_index).await;
@@ -973,10 +1191,14 @@ impl UdpDatagramClientAssociation {
                     self.context.mark_udp_path_failure(path_index);
                     last_retryable_error = Some(err);
                 }
-                Err(UdpPathSendError::Runtime(err)) => return Err(err),
+                Err(DatagramPathSendError::Runtime(err)) => {
+                    return Err(DatagramUnderlaySendError::Runtime(err));
+                }
             }
         }
-        Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath))
+        Err(DatagramUnderlaySendError::Runtime(
+            last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath),
+        ))
     }
 
     pub(super) async fn send_to_fresh_datagram(
@@ -984,7 +1206,7 @@ impl UdpDatagramClientAssociation {
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
-    ) -> Result<Bytes, RuntimeError> {
+    ) -> Result<Bytes, DatagramUnderlaySendError> {
         self.send_to(target, payload, ttl_ms).await
     }
 
@@ -1170,15 +1392,15 @@ impl UdpDatagramClientAssociation {
         payload: Bytes,
         ttl_ms: u32,
         has_unattempted_alternative: bool,
-    ) -> Result<Bytes, UdpPathSendError> {
+    ) -> Result<Bytes, DatagramPathSendError> {
         let model = self
             .context
             .udp_path_runtime_model(path_index, ttl_ms)
-            .ok_or(UdpPathSendError::Runtime(
+            .ok_or(DatagramPathSendError::Runtime(
                 RuntimeError::NoSchedulableUdpPath,
             ))?;
         if !model.accepts_or_can_probe(payload.len()) {
-            return Err(UdpPathSendError::MtuExceeded {
+            return Err(DatagramPathSendError::MtuExceeded {
                 limit: model.mtu_payload_bytes,
             });
         }
@@ -1200,11 +1422,11 @@ impl UdpDatagramClientAssociation {
         let position = self
             .ensure_path_session(path_index, handshake_timeout)
             .await
-            .map_err(UdpPathSendError::Runtime)?;
+            .map_err(DatagramPathSendError::Runtime)?;
         let current_mtu = self
             .paths
             .get(position)
-            .ok_or(UdpPathSendError::Runtime(
+            .ok_or(DatagramPathSendError::Runtime(
                 RuntimeError::NoSchedulableUdpPath,
             ))?
             .session
@@ -1214,7 +1436,7 @@ impl UdpDatagramClientAssociation {
                 let path = self
                     .paths
                     .get_mut(position)
-                    .ok_or(UdpPathSendError::Runtime(
+                    .ok_or(DatagramPathSendError::Runtime(
                         RuntimeError::NoSchedulableUdpPath,
                     ))?;
                 tokio::time::timeout(
@@ -1229,12 +1451,12 @@ impl UdpDatagramClientAssociation {
                 }
                 Ok(Err(err)) if udp_datagram_error_is_path_retryable(&err) => {
                     self.context.mark_udp_path_mtu(path_index, current_mtu);
-                    return Err(UdpPathSendError::MtuExceeded { limit: current_mtu });
+                    return Err(DatagramPathSendError::MtuExceeded { limit: current_mtu });
                 }
-                Ok(Err(err)) => return Err(UdpPathSendError::Runtime(err)),
+                Ok(Err(err)) => return Err(DatagramPathSendError::Runtime(err)),
                 Err(_) => {
                     self.context.mark_udp_path_mtu(path_index, current_mtu);
-                    return Err(UdpPathSendError::MtuExceeded { limit: current_mtu });
+                    return Err(DatagramPathSendError::MtuExceeded { limit: current_mtu });
                 }
             }
         }
@@ -1242,7 +1464,7 @@ impl UdpDatagramClientAssociation {
             let path = self
                 .paths
                 .get_mut(position)
-                .ok_or(UdpPathSendError::Runtime(
+                .ok_or(DatagramPathSendError::Runtime(
                     RuntimeError::NoSchedulableUdpPath,
                 ))?;
             path.pacer.wait_for_send(model, payload.len()).await;
@@ -1260,10 +1482,10 @@ impl UdpDatagramClientAssociation {
 
         match result {
             Ok(response) => Ok(response),
-            Err(UdpPathSendError::Timeout {
+            Err(DatagramPathSendError::Timeout {
                 path_was_acked,
                 response_timeout,
-            }) => Err(UdpPathSendError::Timeout {
+            }) => Err(DatagramPathSendError::Timeout {
                 path_was_acked,
                 response_timeout,
             }),
@@ -1473,25 +1695,25 @@ impl UdpDatagramClientSession {
         payload: Bytes,
         ttl_ms: u32,
         response_timeout: Duration,
-    ) -> Result<Bytes, UdpPathSendError> {
+    ) -> Result<Bytes, DatagramPathSendError> {
         let flow_id = self
             .ensure_flow(target)
             .await
-            .map_err(UdpPathSendError::Runtime)?;
+            .map_err(DatagramPathSendError::Runtime)?;
         let frame = {
             let flow = self
                 .flows
                 .iter_mut()
                 .find(|flow| flow.flow_id == flow_id)
-                .ok_or(UdpPathSendError::Runtime(RuntimeError::Protocol(
+                .ok_or(DatagramPathSendError::Runtime(RuntimeError::Protocol(
                     "missing UDP datagram flow",
                 )))?;
             flow.flow
                 .enqueue(0, ttl_ms, payload)
-                .map_err(|err| UdpPathSendError::Runtime(RuntimeError::Datagram(err)))?;
+                .map_err(|err| DatagramPathSendError::Runtime(RuntimeError::Datagram(err)))?;
             flow.flow
                 .pop_frame(0)
-                .ok_or(UdpPathSendError::Runtime(RuntimeError::Protocol(
+                .ok_or(DatagramPathSendError::Runtime(RuntimeError::Protocol(
                     "datagram expired before send",
                 )))?
         };
@@ -1502,7 +1724,7 @@ impl UdpDatagramClientSession {
                 ..
             } => (*datagram_id, payload.len()),
             _ => {
-                return Err(UdpPathSendError::Runtime(RuntimeError::Protocol(
+                return Err(DatagramPathSendError::Runtime(RuntimeError::Protocol(
                     "unexpected queued datagram frame",
                 )));
             }
@@ -1528,7 +1750,7 @@ impl UdpDatagramClientSession {
             self.stream.runtime.codec_limits,
         )
         .await
-        .map_err(UdpPathSendError::Runtime)?;
+        .map_err(DatagramPathSendError::Runtime)?;
 
         loop {
             let now = Instant::now();
@@ -1548,7 +1770,7 @@ impl UdpDatagramClientSession {
                     ),
                 );
                 self.sent_datagrams.remove(&request_key);
-                return Err(UdpPathSendError::Timeout {
+                return Err(DatagramPathSendError::Timeout {
                     path_was_acked: request_acked,
                     response_timeout,
                 });
@@ -1556,9 +1778,9 @@ impl UdpDatagramClientSession {
             let wait_for = response_deadline.saturating_duration_since(now);
             let received = match tokio::time::timeout(wait_for, self.stream.frames.recv()).await {
                 Ok(Some(Ok(frame))) => frame,
-                Ok(Some(Err(err))) => return Err(UdpPathSendError::Runtime(err)),
+                Ok(Some(Err(err))) => return Err(DatagramPathSendError::Runtime(err)),
                 Ok(None) => {
-                    return Err(UdpPathSendError::Runtime(
+                    return Err(DatagramPathSendError::Runtime(
                         RuntimeError::ReliablePathSessionClosed,
                     ));
                 }
@@ -1578,7 +1800,7 @@ impl UdpDatagramClientSession {
                         ),
                     );
                     self.sent_datagrams.remove(&request_key);
-                    return Err(UdpPathSendError::Timeout {
+                    return Err(DatagramPathSendError::Timeout {
                         path_was_acked: request_acked,
                         response_timeout,
                     });
@@ -1592,7 +1814,7 @@ impl UdpDatagramClientSession {
                         request_acked = true;
                     }
                     self.handle_datagram_feedback(flow_id, &received)
-                        .map_err(UdpPathSendError::Runtime)?;
+                        .map_err(DatagramPathSendError::Runtime)?;
                 }
                 Frame::DatagramData {
                     flow_id: response_flow_id,
@@ -1601,22 +1823,22 @@ impl UdpDatagramClientSession {
                     ..
                 } if response_flow_id == flow_id && datagram_id == request_datagram_id => {
                     let request_ack = datagram_ack_range(request_datagram_id)
-                        .map_err(UdpPathSendError::Runtime)?;
+                        .map_err(DatagramPathSendError::Runtime)?;
                     self.handle_datagram_feedback(flow_id, &[request_ack])
-                        .map_err(UdpPathSendError::Runtime)?;
+                        .map_err(DatagramPathSendError::Runtime)?;
                     udp_path_write_frame(
                         &mut self.stream.send,
                         &Frame::DatagramFeedback {
                             flow_id,
                             received: vec![
                                 datagram_ack_range(datagram_id)
-                                    .map_err(UdpPathSendError::Runtime)?,
+                                    .map_err(DatagramPathSendError::Runtime)?,
                             ],
                         },
                         self.stream.runtime.codec_limits,
                     )
                     .await
-                    .map_err(UdpPathSendError::Runtime)?;
+                    .map_err(DatagramPathSendError::Runtime)?;
                     self.stats.record_payload_bytes(request_len);
                     self.stats.record_payload_bytes(payload.len());
                     return Ok(payload);
@@ -1632,13 +1854,13 @@ impl UdpDatagramClientSession {
                             flow_id,
                             received: vec![
                                 datagram_ack_range(datagram_id)
-                                    .map_err(UdpPathSendError::Runtime)?,
+                                    .map_err(DatagramPathSendError::Runtime)?,
                             ],
                         },
                         self.stream.runtime.codec_limits,
                     )
                     .await
-                    .map_err(UdpPathSendError::Runtime)?;
+                    .map_err(DatagramPathSendError::Runtime)?;
                 }
                 Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                     self.observe_remote_path_metrics(metrics);
@@ -1648,17 +1870,17 @@ impl UdpDatagramClientSession {
                 Frame::DatagramClose {
                     flow_id: closed_flow_id,
                 } if closed_flow_id == flow_id => {
-                    return Err(UdpPathSendError::Runtime(RuntimeError::Protocol(
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::Protocol(
                         "datagram flow closed",
                     )));
                 }
                 Frame::SessionClose { reason } => {
-                    return Err(UdpPathSendError::Runtime(RuntimeError::RemoteClosed(
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::RemoteClosed(
                         reason,
                     )));
                 }
                 _ => {
-                    return Err(UdpPathSendError::Runtime(RuntimeError::Protocol(
+                    return Err(DatagramPathSendError::Runtime(RuntimeError::Protocol(
                         "unexpected UDP datagram frame",
                     )));
                 }

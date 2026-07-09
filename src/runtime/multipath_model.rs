@@ -264,6 +264,7 @@ pub(super) struct SubflowMember {
 pub(super) struct SubflowAdmissionInput {
     pub(super) key: CarrierPathKey,
     pub(super) bulk_rate_proven: bool,
+    pub(super) startup_owner_allowed: bool,
     pub(super) frontier_clear: bool,
     pub(super) completion_improves: bool,
     pub(super) observed_goodput_non_degrading: bool,
@@ -377,9 +378,13 @@ impl FlowSubflowSet {
     }
 
     fn subflow_owner_allowed(&self, input: SubflowAdmissionInput) -> bool {
-        input.bulk_rate_proven
+        let bulk_rate_owner = input.bulk_rate_proven && input.completion_improves;
+        let startup_owner = input.startup_owner_allowed
+            && !input.bulk_rate_proven
+            && !self.members.iter().any(|member| member.key == input.key);
+
+        (bulk_rate_owner || startup_owner)
             && input.frontier_clear
-            && input.completion_improves
             && input.observed_goodput_non_degrading
             && input.read_gap <= self.max_read_gap_budget
             && self
@@ -487,6 +492,7 @@ mod tests {
         let rejected = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: true,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
@@ -501,6 +507,7 @@ mod tests {
         let admitted = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: true,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -524,6 +531,7 @@ mod tests {
         let unproven_owner = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: false,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -540,6 +548,7 @@ mod tests {
         let too_much_read_gap = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: true,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -552,6 +561,7 @@ mod tests {
         let too_much_overhead = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: true,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -571,6 +581,7 @@ mod tests {
         let input = SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: false,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -592,6 +603,37 @@ mod tests {
     }
 
     #[test]
+    fn subflow_set_allows_one_explicit_startup_owner_without_bulk_rate() {
+        let payload_bytes = 64 * 1024;
+        let mut epoch =
+            FlowSubflowSet::new(11, key(0), payload_bytes, 0, Duration::from_millis(100));
+        let input = SubflowAdmissionInput {
+            key: key(1),
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        let admitted = epoch.admit_subflow_owner(input);
+        assert_eq!(admitted.decision, PathAdmissionDecision::AdmitSubflow);
+        assert_eq!(admitted.role, PathRuntimeRole::Subflow);
+        assert_eq!(epoch.members().len(), 1);
+
+        let second = epoch.admit_subflow_owner(input);
+        assert_eq!(
+            second.decision,
+            PathAdmissionDecision::ProbeOnly,
+            "startup Subflow owner credit is one bounded range until bulk-rate evidence arrives"
+        );
+        assert_eq!(epoch.members().len(), 1);
+    }
+
+    #[test]
     fn subflow_set_keeps_service_as_owner_without_spending_subflow_credit() {
         let mut epoch =
             FlowSubflowSet::new(9, key(3), 256 * 1024, 16 * 1024, Duration::from_millis(100));
@@ -599,6 +641,7 @@ mod tests {
         let service = epoch.admit_subflow_owner(SubflowAdmissionInput {
             key: key(3),
             bulk_rate_proven: false,
+            startup_owner_allowed: false,
             frontier_clear: false,
             completion_improves: false,
             observed_goodput_non_degrading: false,

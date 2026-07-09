@@ -1741,7 +1741,15 @@ impl ClientPathContext {
         }
     }
 
-    pub(super) fn mark_udp_stream_reserved_open_success(&self, index: usize, elapsed: Duration) {
+    pub(super) fn mark_udp_stream_reserved_open_success(
+        &self,
+        index: usize,
+        elapsed: Duration,
+        accepted: bool,
+    ) {
+        if !accepted {
+            return;
+        }
         if let Some(current) = self
             .health
             .lock()

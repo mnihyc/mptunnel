@@ -34,7 +34,7 @@ impl ClientUdpPathSessionHandle {
         target: TargetAddr,
         ingress: IngressKind,
         lane: FlowLane,
-        role: StreamOpenRole,
+        options: UdpStreamOpenOptions,
     ) -> Result<ReliablePathStream, RuntimeError> {
         let connection = self.ensure_connection().await?;
         match open_client_udp_stream_on_connection(
@@ -43,7 +43,7 @@ impl ClientUdpPathSessionHandle {
             target.clone(),
             ingress,
             lane,
-            role,
+            options,
             self.runtime.clone(),
         )
         .await
@@ -58,7 +58,7 @@ impl ClientUdpPathSessionHandle {
                     target,
                     ingress,
                     lane,
-                    role,
+                    options,
                     self.runtime.clone(),
                 )
                 .await
@@ -610,9 +610,13 @@ async fn open_client_udp_stream_on_connection(
     target: TargetAddr,
     ingress: IngressKind,
     lane: FlowLane,
-    role: StreamOpenRole,
+    options: UdpStreamOpenOptions,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<ReliablePathStream, RuntimeError> {
+    let UdpStreamOpenOptions {
+        wait_for_accept,
+        role,
+    } = options;
     let (mut send, mut recv) = connection.open_bi().await?;
     let open = Frame::OpenStream {
         stream_id,
@@ -623,25 +627,12 @@ async fn open_client_udp_stream_on_connection(
         role,
     };
     udp_path_write_frame(&mut send, &open, runtime.codec_limits).await?;
-    let max_offset = loop {
-        match udp_path_read_frame(&mut recv, runtime.codec_limits).await? {
-            Frame::StreamMaxData {
-                stream_id: max_stream_id,
-                max_offset,
-            } if max_stream_id == stream_id => break max_offset,
-            Frame::StreamReset {
-                stream_id: reset_stream_id,
-                reason,
-            } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
-            Frame::PathStatus { .. } | Frame::SessionReady => {}
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-            _ => {
-                return Err(RuntimeError::Protocol(
-                    "unexpected QUIC UDP path stream open frame",
-                ));
-            }
-        }
+    let accepted_max_offset = if wait_for_accept {
+        Some(read_client_udp_stream_open_accept(&mut recv, stream_id, runtime.codec_limits).await?)
+    } else {
+        None
     };
+    let max_offset = udp_stream_open_initial_max_offset(options, accepted_max_offset);
     let (commands, receivers) = reliable_path_command_channels(udp_path_command_queue(
         runtime.mux_limits,
         runtime.codec_limits,
@@ -677,6 +668,43 @@ async fn open_client_udp_stream_on_connection(
         ),
         frames: frames_rx,
     })
+}
+
+async fn read_client_udp_stream_open_accept(
+    recv: &mut UdpPathRecvStream,
+    stream_id: StreamId,
+    codec_limits: CodecLimits,
+) -> Result<u64, RuntimeError> {
+    loop {
+        match udp_path_read_frame(recv, codec_limits).await? {
+            Frame::StreamMaxData {
+                stream_id: max_stream_id,
+                max_offset,
+            } if max_stream_id == stream_id => return Ok(max_offset),
+            Frame::StreamReset {
+                stream_id: reset_stream_id,
+                reason,
+            } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
+            Frame::PathStatus { .. } | Frame::SessionReady => {}
+            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "unexpected QUIC UDP path stream open frame",
+                ));
+            }
+        }
+    }
+}
+
+fn udp_stream_open_initial_max_offset(
+    options: UdpStreamOpenOptions,
+    accepted_max_offset: Option<u64>,
+) -> u64 {
+    if options.wait_for_accept {
+        accepted_max_offset.unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 async fn open_client_udp_datagram_stream(
@@ -2265,6 +2293,24 @@ async fn resolve_first_socket_addr(path: &PathSpec) -> Result<SocketAddr, Runtim
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonblocking_udp_open_uses_zero_initial_window_without_accept() {
+        let options = UdpStreamOpenOptions {
+            wait_for_accept: false,
+            role: StreamOpenRole::Validation,
+        };
+
+        assert_eq!(udp_stream_open_initial_max_offset(options, None), 0);
+    }
+
+    #[test]
+    fn blocking_udp_open_uses_accepted_initial_window() {
+        assert_eq!(
+            udp_stream_open_initial_max_offset(UdpStreamOpenOptions::ACTIVE_WAIT, Some(8192)),
+            8192
+        );
+    }
 
     fn quic_congestion(
         congestion_window: u64,

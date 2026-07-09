@@ -1432,11 +1432,163 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
 }
 
 #[test]
+fn initial_active_open_timeout_uses_same_budget_as_attach_open() {
+    let low_latency_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("low latency path");
+    let high_rtt_path = "udp://127.0.0.1:10131?srtt-ms=900&jitter-ms=400&rate-mbps=500"
+        .parse::<PathSpec>()
+        .expect("high rtt path");
+    let context = ClientPathContext::new(
+        vec![low_latency_path, high_rtt_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let tcp_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let udp_key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+
+    assert_eq!(
+        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency),
+        reliable_relay_attach_open_timeout(&context, tcp_key, FlowLane::Latency),
+        "initial Active TCP open must use the same bounded path-open timeout as explicit attach, so a flapping first path can be retried"
+    );
+    assert_eq!(
+        reliable_initial_active_open_timeout(&context, udp_key, FlowLane::Latency),
+        reliable_relay_attach_open_timeout(&context, udp_key, FlowLane::Latency),
+        "initial Active UDP open must also be bounded; path racing/failover is transport-neutral"
+    );
+}
+
+#[test]
 fn path_open_timeout_is_a_migratable_retryable_path_failure() {
     let err = RuntimeError::PathOpenTimedOut;
     assert!(stream_open_error_is_path_retryable(&err));
+    assert!(udp_stream_open_error_is_path_retryable(&err));
+    assert!(relay_path_open_error_is_retryable(
+        UnderlayProtocol::Tcp,
+        &err
+    ));
+    assert!(relay_path_open_error_is_retryable(
+        UnderlayProtocol::Udp,
+        &err
+    ));
     assert!(reliable_relay_error_is_migratable(&err));
     assert!(relay_error_is_tcp_path_failure::<()>(&Err(err)));
+}
+
+#[test]
+fn initial_active_open_retry_uses_fresh_stream_id() {
+    let first_path = "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("first path");
+    let second_path = "tcp://127.0.0.1:10133?srtt-ms=80&rate-mbps=200"
+        .parse::<PathSpec>()
+        .expect("second path");
+    let context = ClientPathContext::new(
+        vec![first_path, second_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let mut attempted = Vec::new();
+
+    let first = reserve_reliable_initial_open_attempt(
+        &context,
+        FlowLane::Latency,
+        PATH_OPEN_SCORE_BYTES,
+        &mut attempted,
+    )
+    .expect("first attempt")
+    .expect("first candidate");
+    context.release_relay_path_load(first.key.underlay, first.key.index, FlowLane::Latency);
+    context.mark_relay_path_failure(first.key.underlay, first.key.index);
+
+    let second = reserve_reliable_initial_open_attempt(
+        &context,
+        FlowLane::Latency,
+        PATH_OPEN_SCORE_BYTES,
+        &mut attempted,
+    )
+    .expect("second attempt")
+    .expect("second candidate");
+
+    assert_ne!(
+        first.stream_id, second.stream_id,
+        "a timed-out initial Active open can arrive late at the server; retrying with a fresh product stream ID prevents that stale attempt from poisoning the next candidate"
+    );
+    assert_ne!(first.key, second.key);
+}
+
+#[test]
+fn initial_active_open_retryable_failure_cools_path_for_next_open() {
+    let failed_path = "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("failed path");
+    let survivor_path = "tcp://127.0.0.1:10133?srtt-ms=80&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("survivor path");
+    let context = ClientPathContext::new(
+        vec![failed_path, survivor_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let failed = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+
+    context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]);
+    mark_reliable_initial_open_retryable_failure(&context, failed, FlowLane::Latency);
+
+    assert_eq!(
+        context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        }),
+        "a retryable initial Active open failure is a data-plane failure; when a survivor exists, the failed candidate must cool down before the next user-visible open"
+    );
+}
+
+#[test]
+fn nonblocking_udp_attach_does_not_clear_data_plane_failure_before_accept() {
+    let failed_path = "udp://127.0.0.1:10142?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("failed path");
+    let survivor_path = "udp://127.0.0.1:10143?srtt-ms=80&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("survivor path");
+    let context = ClientPathContext::new(
+        vec![failed_path, survivor_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let failed = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+
+    context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]);
+    mark_reliable_initial_open_retryable_failure(&context, failed, FlowLane::Latency);
+    context.mark_udp_stream_reserved_open_success(0, Duration::from_millis(0), false);
+
+    assert_eq!(
+        context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        }),
+        "non-blocking UDP attach only proves local carrier stream creation; it must not clear an active-open data-plane failure until STREAM_MAX_DATA/proof/data evidence arrives"
+    );
 }
 
 #[test]

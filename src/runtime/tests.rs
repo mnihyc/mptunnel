@@ -2790,6 +2790,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             &recv_stream,
             true,
             FlowLane::Latency,
+            false,
             mux_limits,
         ),
         control_progress
@@ -2812,6 +2813,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             &recv_stream,
             true,
             FlowLane::Latency,
+            false,
             mux_limits,
         ),
         last_delivery
@@ -2826,6 +2828,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             &recv_stream,
             true,
             FlowLane::Latency,
+            false,
             mux_limits,
         ),
         repair_progress

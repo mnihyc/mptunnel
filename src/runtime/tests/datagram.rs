@@ -429,9 +429,28 @@ fn datagram_response_timeout_is_terminal_product_expiry() {
         &RuntimeError::DatagramResponseTimedOut
     ));
 
-    let legacy_timeout = RuntimeError::Protocol("UDP datagram response timed out");
-    assert!(!datagram_underlay_error_is_retryable(&legacy_timeout));
-    assert!(!udp_datagram_error_is_path_retryable(&legacy_timeout));
+    assert!(runtime_error_is_datagram_response_timeout(
+        &RuntimeError::DatagramResponseTimedOut
+    ));
+    assert!(!runtime_error_is_datagram_response_timeout(
+        &RuntimeError::Protocol("other datagram protocol error")
+    ));
+}
+
+#[test]
+fn unacked_datagram_timeout_retries_unattempted_alternative_before_product_feedback() {
+    assert_eq!(
+        datagram_timeout_action(false, true),
+        DatagramTimeoutAction::RetryAlternative
+    );
+    assert_eq!(
+        datagram_timeout_action(true, true),
+        DatagramTimeoutAction::TerminalProductExpiry
+    );
+    assert_eq!(
+        datagram_timeout_action(false, false),
+        DatagramTimeoutAction::TerminalProductExpiry
+    );
 }
 
 #[test]

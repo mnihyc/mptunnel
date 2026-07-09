@@ -226,6 +226,7 @@ where
             &recv_stream,
             remote_open,
             relay_lane,
+            interactive_response_pending,
             context.mux_limits,
         );
         let receive_hole_repair_active =
@@ -828,6 +829,7 @@ where
                 } else {
                     if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
                         interactive_response_pending = true;
+                        last_response_stall_repair_at = Instant::now();
                     }
                     let payload = payload.expect("positive read returns payload");
                     #[cfg(feature = "lab-diagnostics")]
@@ -880,6 +882,7 @@ where
                         }
                         if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
                             interactive_response_pending = true;
+                            last_response_stall_repair_at = Instant::now();
                         }
                         let payload = payload.expect("positive read returns payload");
                         #[cfg(feature = "lab-diagnostics")]
@@ -1954,31 +1957,44 @@ fn spawn_reliable_relay_validation_opens(
         let ingress = spec.ingress;
         let result_tx = result_tx.clone();
         let handle = tokio::spawn(async move {
+            let open_timeout = reliable_relay_attach_open_timeout(&context, key, lane);
             let result = match key.underlay {
                 UnderlayProtocol::Tcp => {
-                    open_remote_stream_on_reserved_path(
-                        &context,
-                        stream_id,
-                        target,
-                        ingress,
-                        lane,
-                        key.index,
-                        StreamOpenRole::Validation,
+                    let result = relay_path_open_with_timeout(
+                        open_timeout,
+                        open_remote_stream_on_reserved_path(
+                            &context,
+                            stream_id,
+                            target,
+                            ingress,
+                            lane,
+                            key.index,
+                            StreamOpenRole::Validation,
+                        ),
                     )
-                    .await
+                    .await;
+                    if matches!(result, Err(RuntimeError::PathOpenTimedOut))
+                        && let Some(session) = context.tcp_sessions.get(key.index)
+                    {
+                        session.cancel_stream_open(lane, stream_id).await;
+                    }
+                    result
                 }
                 UnderlayProtocol::Udp => {
-                    open_remote_stream_on_reserved_udp_path(
-                        &context,
-                        stream_id,
-                        target,
-                        ingress,
-                        lane,
-                        key.index,
-                        UdpStreamOpenOptions {
-                            wait_for_accept: false,
-                            role: StreamOpenRole::Validation,
-                        },
+                    relay_path_open_with_timeout(
+                        open_timeout,
+                        open_remote_stream_on_reserved_udp_path(
+                            &context,
+                            stream_id,
+                            target,
+                            ingress,
+                            lane,
+                            key.index,
+                            UdpStreamOpenOptions {
+                                wait_for_accept: false,
+                                role: StreamOpenRole::Validation,
+                            },
+                        ),
                     )
                     .await
                 }
@@ -2414,9 +2430,12 @@ pub(super) fn reliable_relay_stall_progress_anchor(
     recv_stream: &ReliableRecvStream,
     remote_open: bool,
     lane: FlowLane,
+    interactive_response_pending: bool,
     mux_limits: MuxLimits,
 ) -> Instant {
-    if reliable_relay_response_stall_watch_active(recv_stream, remote_open, lane, mux_limits) {
+    if (remote_open && interactive_response_pending)
+        || reliable_relay_response_stall_watch_active(recv_stream, remote_open, lane, mux_limits)
+    {
         last_delivery_progress_at.max(last_response_stall_repair_at)
     } else {
         last_stream_progress_at
@@ -2643,6 +2662,31 @@ mod tests {
             true,
             MuxLimits::default(),
         ));
+    }
+
+    #[test]
+    fn pending_response_stall_anchor_ignores_local_send_progress_before_first_byte() {
+        let recv_stream = ReliableRecvStream::new(StreamId(1), MuxLimits::default());
+        let started = Instant::now();
+        let last_delivery_progress_at = started;
+        let last_response_stall_repair_at = started + Duration::from_millis(100);
+        let last_local_send_progress_at = started + Duration::from_secs(5);
+
+        let anchor = reliable_relay_stall_progress_anchor(
+            last_local_send_progress_at,
+            last_delivery_progress_at,
+            last_response_stall_repair_at,
+            &recv_stream,
+            true,
+            FlowLane::Latency,
+            true,
+            MuxLimits::default(),
+        );
+
+        assert_eq!(
+            anchor, last_response_stall_repair_at,
+            "once a response is expected, later request-side send/control progress must not postpone response-stall recovery"
+        );
     }
 
     #[tokio::test]

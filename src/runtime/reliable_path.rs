@@ -110,6 +110,11 @@ impl ReliablePathStream {
         self.output.has_repair_output_for_frame(frame)
     }
 
+    pub(super) fn has_distinct_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        self.output
+            .has_distinct_owner_repair_output_for_frame(frame)
+    }
+
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
         self.output.has_failed_owner_repair_output_for_frame(frame)
     }
@@ -552,6 +557,13 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    pub(super) fn has_distinct_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_distinct_owner_repair_output_for_frame(frame),
+        }
+    }
+
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
         match self {
             Self::Fixed(_) => false,
@@ -573,7 +585,7 @@ pub(super) fn reliable_work_lane_to_carrier_lane(
 ) -> FlowLane {
     match work_lane {
         ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
-        ReliableRelayQueuedWorkLane::Repair => FlowLane::Latency,
+        ReliableRelayQueuedWorkLane::Repair => reliable_path_stream_ordered_queue_lane(),
         ReliableRelayQueuedWorkLane::Data => relay_lane,
     }
 }
@@ -955,6 +967,21 @@ impl ResponseStreamBinding {
 
     pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
         let avoid_keys = self.flight_keys_overlapping_frame(frame);
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .any(|entry| !avoid_keys.contains(&entry.key))
+    }
+
+    pub(super) fn has_distinct_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        let avoid_keys = self.flight_keys_overlapping_frame(frame);
+        if avoid_keys.is_empty() {
+            return false;
+        }
         let outputs = self
             .outputs
             .lock()
@@ -2387,6 +2414,7 @@ mod tests {
         let input = SubflowAdmissionInput {
             key: optional,
             bulk_rate_proven: true,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -2448,6 +2476,7 @@ mod tests {
         let input = SubflowAdmissionInput {
             key: optional,
             bulk_rate_proven: false,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -2505,6 +2534,7 @@ mod tests {
         let input = SubflowAdmissionInput {
             key: optional,
             bulk_rate_proven: false,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,
@@ -2563,6 +2593,7 @@ mod tests {
         let input = SubflowAdmissionInput {
             key: optional,
             bulk_rate_proven: true,
+            startup_owner_allowed: false,
             frontier_clear: true,
             completion_improves: true,
             observed_goodput_non_degrading: true,

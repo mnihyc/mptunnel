@@ -2094,7 +2094,11 @@ probe, repeated live-tail repair uses the persistent-congestion delay. Terminal
 tail recovery is separate: once a final offset is known, a sender may repair
 unacknowledged bytes below that final offset on an eligible survivor path so the
 DATA_FIN/STREAM_FIN can be acknowledged, and that final-tail repair may use the
-bounded critical repair path. Repair candidate selection is
+bounded critical repair path. Final-tail repair is connection-completion
+`RepairData`, not generic ACK-gap repair; if every distinct survivor lacks
+immediate stream-data queue credit, or no distinct survivor is currently
+attached, it may use the current Service survivor without changing Service
+ownership or creating path delivery evidence. Repair candidate selection is
 prefix-preserving: if the lowest unresolved repair frame cannot be sent on an
 alternate eligible output, the sender MUST NOT skip it and send a later ordered
 range instead. This is targeted duplicate repair, not whole-cache replay.
@@ -4638,10 +4642,17 @@ on_tail_stall_repair(stream_id, last_complete_ack_ranges):
         schedule_lowest_tail_repair_on_alternate_output(repair_budget)
     else:
         do_not_repair_live_tail_on_same_or_only_output()
-    if lowest_repair_range_is_already_in_flight_on_every_usable_survivor
+    if repair_is_final_tail
+       and no_distinct_survivor_is_currently_attached:
+        if stall_or_PTO_evidence_exists:
+            retransmit_same_lowest_range_once_as_RepairData()
+            route_as_connection_completion_repair_not_generic_ack_gap()
+    else if lowest_repair_range_is_already_in_flight_on_every_usable_survivor
        or every distinct survivor lacks immediate stream-data queue credit:
         if stall_or_PTO_evidence_exists:
             retransmit_same_lowest_range_once_as_RepairData()
+            if repair_is_final_tail:
+                route_as_connection_completion_repair_not_generic_ack_gap()
     never_skip_lowest_range_to_send_later_ordered_bytes()
     never_replay_whole_repair_cache()
 

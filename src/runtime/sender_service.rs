@@ -2640,6 +2640,10 @@ impl ServerResponseSenderService {
         self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::AckGapRepair)
     }
 
+    pub(super) fn enqueue_critical_tail_repair_frame(&mut self, frame: Frame) -> u64 {
+        self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::PathFailureRepair)
+    }
+
     pub(super) fn enqueue_critical_repair_frame_with_cause(
         &mut self,
         frame: Frame,
@@ -3016,6 +3020,14 @@ impl RelaySenderService {
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
         sender_queue.push_critical_repair_with_cause(frame, cause);
+    }
+
+    pub(super) fn enqueue_critical_tail_repair_frame(
+        &mut self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        frame: Frame,
+    ) {
+        self.enqueue_critical_repair_frame(sender_queue, frame, RelaySendCause::PathFailureRepair);
     }
 
     #[cfg(test)]

@@ -1362,7 +1362,6 @@ where
                                 fin_tail_limit,
                                 !local_open,
                                 false,
-                                has_multipath_repair_alternative,
                             );
                             if fin_tail_frames.is_empty() {
                                 "ack_gap"
@@ -1396,11 +1395,18 @@ where
                         );
                         for frame in repair_frames {
                             let queued = if critical_tail_repair {
-                                sender.enqueue_critical_repair_frame(
-                                    &mut sender_queue,
-                                    frame,
-                                    RelaySendCause::AckGapRepair,
-                                );
+                                if repair_kind == "fin_tail" {
+                                    sender.enqueue_critical_tail_repair_frame(
+                                        &mut sender_queue,
+                                        frame,
+                                    );
+                                } else {
+                                    sender.enqueue_critical_repair_frame(
+                                        &mut sender_queue,
+                                        frame,
+                                        RelaySendCause::AckGapRepair,
+                                    );
+                                }
                                 true
                             } else {
                                 sender.enqueue_repair_frame_with_priority(

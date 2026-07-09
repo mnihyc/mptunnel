@@ -237,13 +237,8 @@ pub(super) fn stream_final_offset_tail_repair_frames(
     byte_limit: usize,
     final_offset_known: bool,
     final_tail_stall_ready: bool,
-    has_multipath_repair_alternative: bool,
 ) -> Vec<Frame> {
-    if !final_offset_known
-        || !final_tail_stall_ready
-        || !has_multipath_repair_alternative
-        || byte_limit == 0
-    {
+    if !final_offset_known || !final_tail_stall_ready || byte_limit == 0 {
         return Vec::new();
     }
     let next_offset = send_stream.next_offset();
@@ -1269,6 +1264,7 @@ pub(super) fn reliable_sender_effective_relay_lane(local: FlowLane, peer: FlowLa
     }
 }
 
+#[cfg(test)]
 pub(super) fn prefix_repair_frames_with_available_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
@@ -1280,6 +1276,13 @@ pub(super) fn prefix_repair_frames_with_available_output(
         allow_same_output_frontier_retransmit,
     );
     (frames, blocked)
+}
+
+pub(super) fn prefix_final_tail_repair_frames_with_available_output(
+    path_stream: &ReliablePathStream,
+    repair_frames: Vec<Frame>,
+) -> (Vec<Frame>, Option<u64>, bool) {
+    prefix_repair_frames_with_available_output_classified(path_stream, repair_frames, true)
 }
 
 fn prefix_repair_frames_with_available_output_classified(
@@ -2147,19 +2150,20 @@ where
                             } else {
                                 repair_limit
                             };
-                            let (fin_tail_frames, blocked_frontier_offset) =
-                                prefix_repair_frames_with_available_output(
-                                    &path_stream,
-                                    stream_final_offset_tail_repair_frames(
-                                        &send_stream,
-                                        &ranges,
-                                        fin_tail_limit,
-                                        fin_tail_ready,
-                                        fin_tail_stall_ready,
-                                        has_multipath_repair_alternative,
-                                    ),
-                                    false,
-                                );
+                            let (
+                                fin_tail_frames,
+                                blocked_frontier_offset,
+                                _same_output_frontier_retransmit,
+                            ) = prefix_final_tail_repair_frames_with_available_output(
+                                &path_stream,
+                                stream_final_offset_tail_repair_frames(
+                                    &send_stream,
+                                    &ranges,
+                                    fin_tail_limit,
+                                    fin_tail_ready,
+                                    fin_tail_stall_ready,
+                                ),
+                            );
                             #[cfg(feature = "lab-diagnostics")]
                             if blocked_frontier_offset.is_some() {
                                 lab_diagnostic(
@@ -2208,7 +2212,11 @@ where
                         );
                         for frame in repair_frames {
                             let queued = if critical_tail_repair {
-                                response_sender.enqueue_critical_repair_frame(frame);
+                                if repair_kind == "fin_tail" {
+                                    response_sender.enqueue_critical_tail_repair_frame(frame);
+                                } else {
+                                    response_sender.enqueue_critical_repair_frame(frame);
+                                }
                                 true
                             } else {
                                 response_sender
@@ -2387,19 +2395,20 @@ where
                         send_stream.repair_bytes(),
                         mux_limits,
                     );
-                    let (repair_frames, blocked_frontier_offset) =
-                        prefix_repair_frames_with_available_output(
-                            &path_stream,
-                            stream_final_offset_tail_repair_frames(
-                                &send_stream,
-                                &last_send_ack_ranges,
-                                repair_limit,
-                                true,
-                                true,
-                                now_has_repair_alternative,
-                            ),
-                            false,
-                        );
+                    let (
+                        repair_frames,
+                        blocked_frontier_offset,
+                        same_output_frontier_retransmit,
+                    ) = prefix_final_tail_repair_frames_with_available_output(
+                        &path_stream,
+                        stream_final_offset_tail_repair_frames(
+                            &send_stream,
+                            &last_send_ack_ranges,
+                            repair_limit,
+                            true,
+                            true,
+                        ),
+                    );
                     #[cfg(feature = "lab-diagnostics")]
                     if blocked_frontier_offset.is_some() {
                         lab_diagnostic(
@@ -2412,9 +2421,11 @@ where
                     }
                     #[cfg(not(feature = "lab-diagnostics"))]
                     let _ = blocked_frontier_offset;
+                    #[cfg(not(feature = "lab-diagnostics"))]
+                    let _ = same_output_frontier_retransmit;
                     let mut repair_count = 0usize;
                     for frame in repair_frames {
-                        response_sender.enqueue_critical_repair_frame(frame);
+                        response_sender.enqueue_critical_tail_repair_frame(frame);
                         repair_count = repair_count.saturating_add(1);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
@@ -2426,7 +2437,7 @@ where
                     lab_diagnostic(
                         "tail_stall_repair",
                         format_args!(
-                            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit=false base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind=fin_tail",
+                            "stream_id={} lane={:?} ack_frontier={} sent_offset={} repair_bytes={} repair_frames={} blocked_frontier_offset={:?} same_output_frontier_retransmit={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={} repair_kind=fin_tail",
                             stream_id.0,
                             relay_lane,
                             last_send_ack_frontier,
@@ -2434,6 +2445,7 @@ where
                             send_stream.repair_bytes(),
                             repair_count,
                             blocked_frontier_offset,
+                            same_output_frontier_retransmit,
                             repair_limit,
                             repair_limit,
                             performance.extra_traffic_hint_percent,
@@ -4581,6 +4593,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_tail_repair_dispatches_on_service_when_alternate_lacks_queue_credit() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(125);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let repair_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(125),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Latency,
+        );
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(1);
+        let repair_commands_for_fill = repair_commands.clone();
+        assert_eq!(
+            binding.attach(
+                repair_key.underlay,
+                repair_key.path_id,
+                repair_commands,
+                FlowLane::Latency,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Latency,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x56; 192]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange { start: 0, end: 128 }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(125),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(128);
+
+        let (repair_frames, blocked_frontier_offset, same_output_frontier_retransmit) =
+            prefix_final_tail_repair_frames_with_available_output(
+                &path_stream,
+                stream_final_offset_tail_repair_frames(&send_stream, &ack_ranges, 64, true, true),
+            );
+        assert_eq!(blocked_frontier_offset, None);
+        assert!(!same_output_frontier_retransmit);
+        assert_eq!(repair_frames.len(), 1);
+        for frame in repair_frames {
+            response_sender.enqueue_critical_tail_repair_frame(frame);
+        }
+
+        repair_commands_for_fill
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 192,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                reliable_path_stream_ordered_queue_lane(),
+            )
+            .expect("test setup fills alternate data queue");
+
+        response_sender
+            .dispatch_next_with_ordered_owner_debt(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Latency,
+                limits,
+                0,
+            )
+            .await
+            .expect("final-tail RepairData must use the Service path when the alternate has no queue credit");
+
+        let command = try_recv_reliable_path_command(&mut owner_receivers)
+            .expect("expected same-Service final-tail repair frame");
+        match command {
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset, payload, ..
+            }) => {
+                assert_eq!(offset, 128);
+                assert_eq!(payload.len(), 64);
+            }
+            _ => panic!("expected same-Service final-tail repair STREAM_DATA"),
+        }
+    }
+
+    #[tokio::test]
+    async fn final_tail_repair_dispatches_on_service_when_no_alternate_survives() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(126);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(126),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Latency,
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Latency,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x57; 192]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange { start: 0, end: 128 }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(126),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(128);
+
+        let (repair_frames, blocked_frontier_offset, same_output_frontier_retransmit) =
+            prefix_final_tail_repair_frames_with_available_output(
+                &path_stream,
+                stream_final_offset_tail_repair_frames(&send_stream, &ack_ranges, 64, true, true),
+            );
+        assert_eq!(blocked_frontier_offset, None);
+        assert!(same_output_frontier_retransmit);
+        assert_eq!(repair_frames.len(), 1);
+        for frame in repair_frames {
+            response_sender.enqueue_critical_tail_repair_frame(frame);
+        }
+
+        response_sender
+            .dispatch_next_with_ordered_owner_debt(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Latency,
+                limits,
+                0,
+            )
+            .await
+            .expect("final-tail RepairData must use the only Service survivor");
+
+        let command = try_recv_reliable_path_command(&mut owner_receivers)
+            .expect("expected Service final-tail repair frame");
+        match command {
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset, payload, ..
+            }) => {
+                assert_eq!(offset, 128);
+                assert_eq!(payload.len(), 64);
+            }
+            _ => panic!("expected Service final-tail repair STREAM_DATA"),
+        }
+    }
+
+    #[tokio::test]
     async fn failed_owner_repair_without_ack_frontier_starts_at_zero() {
         let limits = MuxLimits::default();
         let stream_id = StreamId(103);
@@ -5151,13 +5360,39 @@ mod tests {
             4096,
             true,
             true,
-            true,
         );
 
         assert_eq!(repair_frames.len(), 1);
         assert_eq!(
             reliable_stream_frame_extent(&repair_frames[0]),
             Some((1024, 4096, 3072))
+        );
+    }
+
+    #[test]
+    fn final_offset_tail_repair_can_use_service_when_no_alternate_survives() {
+        let limits = MuxLimits::default();
+        let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
+        send_stream
+            .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+            .expect("send stream data");
+
+        let repair_frames = stream_final_offset_tail_repair_frames(
+            &send_stream,
+            &[OffsetRange {
+                start: 0,
+                end: 1024,
+            }],
+            4096,
+            true,
+            true,
+        );
+
+        assert_eq!(repair_frames.len(), 1);
+        assert_eq!(
+            reliable_stream_frame_extent(&repair_frames[0]),
+            Some((1024, 4096, 3072)),
+            "terminal final-tail RepairData is connection completion traffic and may use the Service survivor after stall evidence"
         );
     }
 
@@ -5170,7 +5405,7 @@ mod tests {
             .expect("send stream data");
 
         let repair_frames =
-            stream_final_offset_tail_repair_frames(&send_stream, &[], 4096, true, true, true);
+            stream_final_offset_tail_repair_frames(&send_stream, &[], 4096, true, true);
 
         assert_eq!(repair_frames.len(), 1);
         assert_eq!(
@@ -5216,7 +5451,6 @@ mod tests {
             4096,
             true,
             false,
-            true,
         );
 
         assert!(

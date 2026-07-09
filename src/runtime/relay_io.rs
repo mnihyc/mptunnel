@@ -933,8 +933,18 @@ fn reliable_failed_owner_tail_repair_ready(
         return false;
     }
     let (failed_owner_frames, _) =
-        prefix_repair_frames_with_failed_owner_output(path_stream, source_frames);
-    !failed_owner_frames.is_empty()
+        prefix_repair_frames_with_failed_owner_output(path_stream, source_frames.clone());
+    if !failed_owner_frames.is_empty() {
+        return true;
+    }
+    if last_send_ack_frontier == 0 || !last_send_ack_complete {
+        return false;
+    }
+    let source_frames =
+        send_stream.retransmission_frames_after_ack_frontier(last_send_ack_ranges, probe_limit);
+    let (unknown_owner_frames, _) =
+        prefix_repair_frames_with_unknown_owner_output(path_stream, source_frames);
+    !unknown_owner_frames.is_empty()
 }
 
 pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
@@ -1206,6 +1216,23 @@ pub(super) fn prefix_repair_frames_with_failed_owner_output(
     (accepted, None)
 }
 
+pub(super) fn prefix_repair_frames_with_unknown_owner_output(
+    path_stream: &ReliablePathStream,
+    repair_frames: Vec<Frame>,
+) -> (Vec<Frame>, Option<u64>) {
+    let mut accepted = Vec::with_capacity(repair_frames.len());
+    for frame in repair_frames {
+        if !path_stream.has_unknown_owner_repair_output_for_frame(&frame) {
+            return (
+                accepted,
+                reliable_stream_frame_extent(&frame).map(|(offset, _, _)| offset),
+            );
+        }
+        accepted.push(frame);
+    }
+    (accepted, None)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TailRepairEnqueueOutcome {
     queued: usize,
@@ -1284,6 +1311,22 @@ fn enqueue_reliable_tail_repair(
             repair_kind = "tail_failover";
         } else if blocked_frontier_offset.is_none() {
             blocked_frontier_offset = failover_blocked_offset;
+        }
+        if repair_frames.is_empty() && last_send_ack_complete && last_send_ack_frontier > 0 {
+            let (unknown_owner_frames, unknown_owner_blocked_offset) =
+                prefix_repair_frames_with_unknown_owner_output(
+                    path_stream,
+                    failover_source_frames.clone(),
+                );
+            if !unknown_owner_frames.is_empty() {
+                critical_tail_repair = true;
+                repair_limit = failover_limit;
+                repair_frames = unknown_owner_frames;
+                blocked_frontier_offset = unknown_owner_blocked_offset;
+                repair_kind = "tail_unknown_owner";
+            } else if blocked_frontier_offset.is_none() {
+                blocked_frontier_offset = unknown_owner_blocked_offset;
+            }
         }
         if repair_frames.is_empty()
             && last_send_ack_complete
@@ -3273,6 +3316,182 @@ mod tests {
         assert_eq!(
             outcome.queued, 1,
             "a detached owner path turns a persistent contiguous tail into failover repair on the remaining output"
+        );
+        assert!(!outcome.pending);
+    }
+
+    #[test]
+    fn unknown_owner_tail_repair_uses_remaining_output_after_persistent_stall() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(119);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(119),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(119),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let outcome = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(
+            outcome.queued, 1,
+            "when retained owner bytes have no live owner and no path-flight record, persistent tail repair must still use a live survivor instead of deadlocking"
+        );
+        assert!(!outcome.pending);
+    }
+
+    #[test]
+    fn unknown_owner_tail_repair_without_ack_frontier_waits() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(120);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(120),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x44; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(120),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+
+        let outcome = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &[],
+            false,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            0,
+        );
+
+        assert_eq!(
+            outcome.queued, 0,
+            "unknown-owner repair needs an ACK frontier; without one it can duplicate the entire startup tail and inflate overhead"
         );
         assert!(!outcome.pending);
     }

@@ -114,6 +114,10 @@ impl ReliablePathStream {
         self.output.has_failed_owner_repair_output_for_frame(frame)
     }
 
+    pub(super) fn has_unknown_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        self.output.has_unknown_owner_repair_output_for_frame(frame)
+    }
+
     pub(super) fn can_attempt_failed_owner_tail_repair(&self) -> bool {
         matches!(self.output, ReliablePathStreamOutput::Switchable(_))
     }
@@ -554,6 +558,13 @@ impl ReliablePathStreamOutput {
             Self::Switchable(binding) => binding.has_failed_owner_repair_output_for_frame(frame),
         }
     }
+
+    pub(super) fn has_unknown_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_unknown_owner_repair_output_for_frame(frame),
+        }
+    }
 }
 
 pub(super) fn reliable_work_lane_to_carrier_lane(
@@ -972,6 +983,20 @@ impl ResponseStreamBinding {
                 .entries
                 .iter()
                 .any(|entry| !avoid_keys.contains(&entry.key))
+    }
+
+    pub(super) fn has_unknown_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        if !self.flight_keys_overlapping_frame(frame).is_empty()
+            || self.ordered_data_owner().is_some()
+        {
+            return false;
+        }
+        !self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .is_empty()
     }
 
     pub(super) fn detach(&self, key: CarrierPathKey, commands: &ReliablePathCommandSender) {

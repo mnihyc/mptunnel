@@ -4024,6 +4024,14 @@ final-debt evidence shows the retained tail is no longer making progress. That
 repair remains bounded by repair-cache,
 path-flight, and sender resource limits; those bytes are still counted as
 repair overhead and MUST NOT move Service ownership.
+If the previous owner has detached, the sender has an ACK frontier, and the
+sender retains unacked product bytes but no longer has a path-flight owner
+record for that suffix, persistent tail-stall repair MAY use any live survivor
+as unknown-owner correctness repair. Without an ACK frontier, unknown-owner
+repair MUST wait; otherwise a sender can duplicate the entire startup tail and
+inflate overhead. This rule is intentionally narrower than Service failover: it
+sends `RepairData` only, creates no path delivery proof, and does not promote
+the survivor to Service or Subflow ownership.
 
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has

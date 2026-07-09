@@ -380,6 +380,7 @@ def small_http_worker(args, started_at, bulk_ready, result):
     latencies = []
     failures = 0
     attempts = 0
+    response_bytes = 0
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
     worker_started = time.monotonic()
     deadline = workload_deadline(started_at, args)
@@ -388,7 +389,7 @@ def small_http_worker(args, started_at, bulk_ready, result):
         started = time.monotonic()
         remaining = max(0.1, min(args.timeout, deadline - started))
         try:
-            status, _, _ = http_get(
+            status, body_bytes, _ = http_get(
                 args,
                 args.http_target,
                 args.small_path,
@@ -398,6 +399,7 @@ def small_http_worker(args, started_at, bulk_ready, result):
             if not 200 <= status < 400:
                 failures += 1
             else:
+                response_bytes += body_bytes
                 latencies.append((time.monotonic() - started) * 1000.0)
         except Exception:
             failures += 1
@@ -415,6 +417,7 @@ def small_http_worker(args, started_at, bulk_ready, result):
             "small_count": attempts,
             "small_ok": len(latencies),
             "small_fail": failures,
+            "small_response_bytes": response_bytes,
             "small_p50_ms": percentile(latencies, 0.50),
             "small_p95_ms": percentile(latencies, 0.95),
             "small_max_ms": max(latencies) if latencies else None,
@@ -435,6 +438,8 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
     max_success_gap_s = 0.0
     failover_gap_s = 0.0
     first_error = None
+    request_bytes = 0
+    response_bytes = 0
     timeout = args.tcp_echo_timeout_ms / 1000.0
     payload_len = max(8, args.tcp_echo_payload_bytes)
     deadline = workload_deadline(started_at, args)
@@ -477,10 +482,12 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
             started = time.monotonic()
             try:
                 sock.sendall(payload)
+                request_bytes += len(payload)
                 response = recv_exact(sock, len(payload))
                 if response != payload:
                     failures += 1
                 else:
+                    response_bytes += len(response)
                     finished_s = time.monotonic() - started_at
                     latency_ms = (time.monotonic() - started) * 1000.0
                     latencies.append(latency_ms)
@@ -531,6 +538,8 @@ def interactive_tcp_worker(args, started_at, interactive_ready, result):
             "interactive_count": len(latencies) + failures,
             "interactive_ok": len(latencies),
             "interactive_fail": failures,
+            "interactive_request_bytes": request_bytes,
+            "interactive_response_bytes": response_bytes,
             "interactive_p50_ms": percentile(latencies, 0.50),
             "interactive_p95_ms": percentile(latencies, 0.95),
             "interactive_max_ms": max(latencies) if latencies else None,
@@ -554,6 +563,8 @@ def udp_worker(args, started_at, bulk_ready, result):
     max_after_failover_end_s = None
     received = 0
     attempted = 0
+    request_bytes = 0
+    response_bytes = 0
     safety_deadline = started_at + args.timeout
     workload_deadline_at = workload_deadline(started_at, args)
     deadline_hit = False
@@ -576,6 +587,7 @@ def udp_worker(args, started_at, bulk_ready, result):
                         body_len - 4
                     )
                     attempted += 1
+                    request_bytes += len(payload)
                     started = time.monotonic()
                     started_s = started - started_at
                     udp.sendto(payload, (target_host, target_port))
@@ -595,6 +607,7 @@ def udp_worker(args, started_at, bulk_ready, result):
                             finished_s = time.monotonic() - started_at
                             latency_ms = (time.monotonic() - started) * 1000.0
                             received += 1
+                            response_bytes += len(response)
                             latencies.append(latency_ms)
                             if max_latency_ms is None or latency_ms > max_latency_ms:
                                 max_latency_ms = latency_ms
@@ -683,6 +696,7 @@ def udp_worker(args, started_at, bulk_ready, result):
                         body_len - 4
                     )
                     attempted += 1
+                    request_bytes += len(payload)
                     started = time.monotonic()
                     started_s = started - started_at
                     udp.sendto(target_prefix + payload, (relay_host, relay_port))
@@ -707,6 +721,7 @@ def udp_worker(args, started_at, bulk_ready, result):
                             finished_s = time.monotonic() - started_at
                             latency_ms = (time.monotonic() - started) * 1000.0
                             received += 1
+                            response_bytes += len(response)
                             latencies.append(latency_ms)
                             if max_latency_ms is None or latency_ms > max_latency_ms:
                                 max_latency_ms = latency_ms
@@ -751,6 +766,8 @@ def udp_worker(args, started_at, bulk_ready, result):
                 "udp_time_s": time.monotonic() - worker_started,
                 "udp_count": attempted,
                 "udp_received": received,
+                "udp_request_bytes": request_bytes,
+                "udp_response_bytes": response_bytes,
                 "udp_loss_rate": (attempted - received) / attempted
                 if attempted
                 else 0.0,
@@ -801,6 +818,19 @@ def build_record(args, bulk, small, interactive, udp):
     record.update(small)
     record.update(interactive)
     record.update(udp)
+    mixed_app_payload_bytes = sum(
+        int(record.get(field) or 0)
+        for field in (
+            "bulk_bytes",
+            "small_response_bytes",
+            "interactive_request_bytes",
+            "interactive_response_bytes",
+            "udp_request_bytes",
+            "udp_response_bytes",
+        )
+    )
+    if mixed_app_payload_bytes > 0:
+        record["mixed_app_payload_bytes"] = mixed_app_payload_bytes
     return record
 
 

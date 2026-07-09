@@ -25,12 +25,12 @@ def application_payload_bytes(row: dict[str, Any]) -> tuple[int | None, str | No
     """Return delivered/requested application bytes represented by a lab row.
 
     The value is intentionally the user-visible payload measured by the probe,
-    not mptunnel product-frame bytes. Mixed workload rows currently expose only
-    the bulk payload byte count; small HTTP, echo, and UDP datagram byte counts
-    are latency/loss guard signals rather than complete traffic-volume counters.
+    not mptunnel product-frame bytes. Mixed workload rows should provide an
+    explicit all-lane payload sum so overhead estimates do not subtract only the
+    bulk transfer while counting latency and datagram traffic in tunnel bytes.
     """
 
-    for field in ("bytes", "bulk_bytes"):
+    for field in ("mixed_app_payload_bytes", "bytes", "bulk_bytes"):
         value = _int_number(row.get(field))
         if value is not None and value > 0:
             return value, field

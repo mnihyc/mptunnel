@@ -9,6 +9,7 @@ use super::*;
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
     pub(super) commands: ReliablePathCommandSender,
+    pub(super) role: StreamOpenRole,
     pub(super) bytes_in_flight: u64,
     pub(super) product_queue_bytes: u64,
     pub(super) product_progress_rate_bps: Option<f64>,
@@ -603,6 +604,7 @@ mod tests {
                 path_id: PathId(0),
             },
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
@@ -635,6 +637,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: Some(product_rate),
@@ -703,6 +706,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: Some(500_000_000.0),
@@ -758,6 +762,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
@@ -833,6 +838,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
@@ -887,6 +893,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
@@ -960,6 +967,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
@@ -1016,6 +1024,7 @@ mod tests {
         let entry = ResponseStreamOutputEntry {
             key,
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
@@ -1071,6 +1080,7 @@ mod tests {
                 path_id: PathId(0),
             },
             commands,
+            role: StreamOpenRole::Active,
             bytes_in_flight: 0,
             product_queue_bytes: 0,
             product_progress_rate_bps: Some(prior_rate / 10.0),

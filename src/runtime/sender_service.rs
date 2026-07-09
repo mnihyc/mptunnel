@@ -3608,7 +3608,11 @@ impl RelaySenderService {
         spec: &ReliableRelayOpenSpec,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
-        let Some(position) = remotes.paths.len().checked_sub(1) else {
+        let Some(position) = remotes
+            .paths
+            .iter()
+            .rposition(|path| path.placement == RelayPathPlacement::Active)
+        else {
             return Err(RuntimeError::ReliablePathSessionClosed);
         };
         let instance = remotes.paths[position].instance();

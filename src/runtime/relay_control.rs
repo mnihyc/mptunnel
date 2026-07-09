@@ -52,6 +52,7 @@ where
     );
     let mut pending_validation_opens = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
     let mut attempted_validation_paths = std::collections::HashSet::<RelayPathKey>::new();
+    let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
@@ -332,7 +333,7 @@ where
 
         tokio::select! {
             _ = tokio::time::sleep_until(receive_hole_repair_deadline), if receive_hole_repair_active => {
-                match attach_reliable_relay_paths(
+                match attach_reliable_relay_paths_with_recovery_exclusions(
                     context,
                     &spec,
                     relay_lane,
@@ -340,6 +341,7 @@ where
                     &send_stream,
                     !local_open,
                     ReliableRelayAttachMode::Any,
+                    &mut recovery_excluded_paths,
                 )
                 .await
                 {
@@ -370,7 +372,7 @@ where
                                 }
                             }
                             Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                match attach_reliable_relay_paths(
+                                match attach_reliable_relay_paths_with_recovery_exclusions(
                                     context,
                                     &spec,
                                     relay_lane,
@@ -378,6 +380,7 @@ where
                                     &send_stream,
                                     !local_open,
                                     ReliableRelayAttachMode::Any,
+                                    &mut recovery_excluded_paths,
                                 )
                                 .await
                                 {
@@ -453,7 +456,7 @@ where
                     continue;
                 }
                 if reliable_relay_product_stall_should_try_alternate_attach(&remotes) {
-                    match attach_reliable_relay_paths(
+                    match attach_reliable_relay_paths_with_recovery_exclusions(
                         context,
                         &spec,
                         relay_lane,
@@ -461,6 +464,7 @@ where
                         &send_stream,
                         !local_open,
                         ReliableRelayAttachMode::Any,
+                        &mut recovery_excluded_paths,
                     )
                     .await
                     {
@@ -561,6 +565,9 @@ where
                 if let Some(instance) = remotes.active_path_instance() {
                     remotes.fail_path_instance(context, instance).await;
                 }
+                if let Some(failed_key) = failed_key {
+                    recovery_excluded_paths.insert(failed_key);
+                }
                 if !remotes.is_empty() {
                     match sender
                         .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
@@ -589,7 +596,7 @@ where
                         }
                     }
                 }
-                match attach_reliable_relay_paths(
+                match attach_reliable_relay_paths_with_recovery_exclusions(
                     context,
                     &spec,
                     relay_lane,
@@ -597,6 +604,7 @@ where
                     &send_stream,
                     !local_open,
                     ReliableRelayAttachMode::Any,
+                    &mut recovery_excluded_paths,
                 )
                 .await
                 {
@@ -649,7 +657,7 @@ where
                         last_recv_progress_sent_at = Instant::now();
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
-                        match attach_reliable_relay_paths(
+                        match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
                             relay_lane,
@@ -657,6 +665,7 @@ where
                             &send_stream,
                             !local_open,
                             ReliableRelayAttachMode::Any,
+                            &mut recovery_excluded_paths,
                         )
                         .await
                         {
@@ -693,7 +702,7 @@ where
                         last_stream_progress_at = Instant::now();
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
-                        match attach_reliable_relay_paths(
+                        match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
                             relay_lane,
@@ -701,6 +710,7 @@ where
                             &send_stream,
                             true,
                             ReliableRelayAttachMode::Any,
+                            &mut recovery_excluded_paths,
                         )
                         .await
                         {
@@ -746,7 +756,7 @@ where
                         );
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
-                        match attach_reliable_relay_paths(
+                        match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
                             relay_lane,
@@ -754,6 +764,7 @@ where
                             &send_stream,
                             true,
                             ReliableRelayAttachMode::Any,
+                            &mut recovery_excluded_paths,
                         )
                         .await
                         {
@@ -982,7 +993,7 @@ where
                 let ReliableRelayRemoteFrame { instance, frame } = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
-                        match attach_reliable_relay_paths(
+                        match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
                             &spec,
                             relay_lane,
@@ -990,6 +1001,7 @@ where
                             &send_stream,
                             !local_open,
                             ReliableRelayAttachMode::Any,
+                            &mut recovery_excluded_paths,
                         )
                         .await
                         {
@@ -1048,6 +1060,7 @@ where
                     Ok(frame) => frame,
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         remotes.fail_path_instance(context, instance).await;
+                        recovery_excluded_paths.insert(path_key);
                         if !remotes.is_empty()
                             && let Err(err) = sender
                                 .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
@@ -1072,7 +1085,7 @@ where
                             }
                         }
                         if remotes.is_empty() {
-                            match attach_reliable_relay_paths(
+                            match attach_reliable_relay_paths_with_recovery_exclusions(
                                 context,
                                 &spec,
                                 relay_lane,
@@ -1080,6 +1093,7 @@ where
                                 &send_stream,
                                 !local_open,
                                 ReliableRelayAttachMode::Any,
+                                &mut recovery_excluded_paths,
                             )
                             .await
                             {
@@ -1308,7 +1322,7 @@ where
                                 }
                             }
                             Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                match attach_reliable_relay_paths(
+                                match attach_reliable_relay_paths_with_recovery_exclusions(
                                     context,
                                     &spec,
                                     relay_lane,
@@ -1316,6 +1330,7 @@ where
                                     &send_stream,
                                     !local_open,
                                     ReliableRelayAttachMode::Any,
+                                    &mut recovery_excluded_paths,
                                 )
                             .await
                             {
@@ -1525,7 +1540,7 @@ where
                                     last_stream_progress_at = Instant::now();
                                 }
                                 Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                    match attach_reliable_relay_paths(
+                                    match attach_reliable_relay_paths_with_recovery_exclusions(
                                         context,
                                         &spec,
                                         relay_lane,
@@ -1533,6 +1548,7 @@ where
                                         &send_stream,
                                         true,
                                         ReliableRelayAttachMode::Any,
+                                        &mut recovery_excluded_paths,
                                     )
                                     .await
                                     {
@@ -1628,6 +1644,7 @@ where
                             Ok(false) => {}
                             Err(err) if reliable_relay_error_is_migratable(&err) => {
                                 remotes.fail_path_instance(context, instance).await;
+                                recovery_excluded_paths.insert(path_key);
                                 if remotes.is_empty() {
                                     break Err(err);
                                 }
@@ -2191,11 +2208,16 @@ pub(super) struct RelayPathAttachRequest<'a> {
     send_attach_control: bool,
 }
 
-pub(super) async fn attach_relay_path_candidates(
+struct RelayPathAttachResult {
+    attached: usize,
+    key: Option<RelayPathKey>,
+}
+
+async fn attach_relay_path_candidates(
     context: &ClientPathContext,
     remotes: &mut ReliableRelayRemoteSet,
     request: RelayPathAttachRequest<'_>,
-) -> Result<usize, RuntimeError> {
+) -> Result<RelayPathAttachResult, RuntimeError> {
     let stream_id = remotes.stream_id();
     let mut last_retryable_error = None;
     let mut attached = 0usize;
@@ -2235,7 +2257,10 @@ pub(super) async fn attach_relay_path_candidates(
                             StreamOpenRole::Validation => remotes.attach_for_validation(opened),
                         }
                         attached += 1;
-                        return Ok(attached);
+                        return Ok(RelayPathAttachResult {
+                            attached,
+                            key: Some(key),
+                        });
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         context.mark_relay_path_failure(key.underlay, key.index);
@@ -2256,11 +2281,17 @@ pub(super) async fn attach_relay_path_candidates(
         }
     }
     if attached > 0 {
-        Ok(attached)
+        Ok(RelayPathAttachResult {
+            attached,
+            key: None,
+        })
     } else if remotes.is_empty() {
         Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
     } else {
-        Ok(0)
+        Ok(RelayPathAttachResult {
+            attached: 0,
+            key: None,
+        })
     }
 }
 
@@ -2325,6 +2356,30 @@ pub(super) async fn attach_reliable_relay_paths(
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
 ) -> Result<usize, RuntimeError> {
+    let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
+    attach_reliable_relay_paths_with_recovery_exclusions(
+        context,
+        spec,
+        lane,
+        remotes,
+        send_stream,
+        resend_fin,
+        mode,
+        &mut recovery_excluded_paths,
+    )
+    .await
+}
+
+async fn attach_reliable_relay_paths_with_recovery_exclusions(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: FlowLane,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+    recovery_excluded_paths: &mut HashSet<RelayPathKey>,
+) -> Result<usize, RuntimeError> {
     let payload_bytes = match mode {
         ReliableRelayAttachMode::Any => {
             reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits)
@@ -2349,7 +2404,9 @@ pub(super) async fn attach_reliable_relay_paths(
         )
         .await;
         match result {
-            Ok(attached) if attached > 0 || !remotes.is_empty() => return Ok(attached),
+            Ok(result) if result.attached > 0 || !remotes.is_empty() => {
+                return Ok(result.attached);
+            }
             Ok(_) => {}
             Err(err)
                 if remotes.is_empty()
@@ -2366,7 +2423,7 @@ pub(super) async fn attach_reliable_relay_paths(
         StreamOpenRole::Active
     };
     if matches!(mode, ReliableRelayAttachMode::Any) && role == StreamOpenRole::Repair {
-        return attach_relay_path_candidates(
+        let result = attach_relay_path_candidates(
             context,
             remotes,
             RelayPathAttachRequest {
@@ -2374,19 +2431,24 @@ pub(super) async fn attach_reliable_relay_paths(
                 lane,
                 send_stream,
                 resend_fin,
-                candidates: reliable_relay_repair_path_candidates(
-                    context,
-                    remotes,
-                    lane,
-                    payload_bytes,
+                candidates: reliable_relay_recovery_attach_candidates(
+                    reliable_relay_repair_path_candidates(context, remotes, lane, payload_bytes),
+                    recovery_excluded_paths,
+                    remotes.is_empty(),
                 ),
                 role,
                 send_attach_control: true,
             },
         )
-        .await;
+        .await?;
+        if result.attached > 0
+            && let Some(key) = result.key
+        {
+            recovery_excluded_paths.insert(key);
+        }
+        return Ok(result.attached);
     }
-    attach_relay_path_candidates(
+    let result = attach_relay_path_candidates(
         context,
         remotes,
         RelayPathAttachRequest {
@@ -2394,17 +2456,17 @@ pub(super) async fn attach_reliable_relay_paths(
             lane,
             send_stream,
             resend_fin,
-            candidates: reliable_relay_active_path_candidates(
-                context,
-                remotes,
-                lane,
-                payload_bytes,
+            candidates: reliable_relay_recovery_attach_candidates(
+                reliable_relay_active_path_candidates(context, remotes, lane, payload_bytes),
+                recovery_excluded_paths,
+                remotes.is_empty(),
             ),
             role,
             send_attach_control: true,
         },
     )
-    .await
+    .await?;
+    Ok(result.attached)
 }
 
 pub(super) fn reliable_relay_active_path_candidates(
@@ -2418,6 +2480,26 @@ pub(super) fn reliable_relay_active_path_candidates(
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
         .collect()
+}
+
+fn reliable_relay_recovery_attach_candidates(
+    candidates: Vec<RelayPathKey>,
+    recovery_excluded_paths: &HashSet<RelayPathKey>,
+    allow_excluded_last_resort: bool,
+) -> Vec<RelayPathKey> {
+    if recovery_excluded_paths.is_empty() {
+        return candidates;
+    }
+    let filtered = candidates
+        .iter()
+        .copied()
+        .filter(|key| !recovery_excluded_paths.contains(key))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() && allow_excluded_last_resort {
+        candidates
+    } else {
+        filtered
+    }
 }
 
 pub(super) fn reliable_relay_repair_path_candidates(
@@ -2876,6 +2958,40 @@ mod tests {
             reliable_relay_validation_probe_candidates(vec![tcp0, udp0], &pending, &attempted)
                 .is_empty(),
             "rebalance cannot turn a closed validation handle into repeated OPEN_STREAM churn"
+        );
+    }
+
+    #[test]
+    fn recovery_attach_candidates_skip_failed_stream_path_when_alternative_exists() {
+        let tcp0 = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let tcp1 = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        };
+        let udp0 = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let excluded = HashSet::from([tcp0]);
+
+        assert_eq!(
+            reliable_relay_recovery_attach_candidates(vec![tcp0, tcp1, udp0], &excluded, false),
+            vec![tcp1, udp0],
+            "stream-local failover should not immediately reopen the same failed path while another candidate exists"
+        );
+
+        assert!(
+            reliable_relay_recovery_attach_candidates(vec![tcp0], &excluded, false).is_empty(),
+            "a failed path must not be reopened while the stream still has an attached survivor"
+        );
+
+        assert_eq!(
+            reliable_relay_recovery_attach_candidates(vec![tcp0], &excluded, true),
+            vec![tcp0],
+            "a failed path remains retryable only as a last-resort route when no survivor is attached"
         );
     }
 

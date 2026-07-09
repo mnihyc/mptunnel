@@ -93,12 +93,6 @@ impl ReliableRelayRemoteSet {
             .find(|path| {
                 path.stream.underlay == underlay && path.placement == RelayPathPlacement::Active
             })
-            .or_else(|| {
-                self.paths
-                    .iter()
-                    .rev()
-                    .find(|path| path.stream.underlay == underlay)
-            })
             .map(|path| path.path_index)
     }
 
@@ -306,7 +300,6 @@ impl ReliableRelayRemoteSet {
         self.paths
             .iter()
             .rposition(|path| path.placement == RelayPathPlacement::Active)
-            .or_else(|| self.paths.len().checked_sub(1))
     }
 }
 
@@ -574,7 +567,11 @@ pub(super) fn reliable_initial_active_open_timeout(
     key: RelayPathKey,
     lane: FlowLane,
 ) -> Duration {
-    reliable_relay_attach_open_timeout(context, key, lane)
+    let attach_timeout = reliable_relay_attach_open_timeout(context, key, lane);
+    attach_timeout
+        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+        .min(context.path_connect_timeout)
+        .max(attach_timeout)
 }
 
 pub(super) async fn open_remote_stream_on_reserved_path(

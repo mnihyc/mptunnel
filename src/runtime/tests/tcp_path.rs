@@ -1432,7 +1432,7 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
 }
 
 #[test]
-fn initial_active_open_timeout_uses_same_budget_as_attach_open() {
+fn initial_active_open_timeout_uses_persistent_handshake_budget() {
     let low_latency_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=100"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -1456,13 +1456,14 @@ fn initial_active_open_timeout_uses_same_budget_as_attach_open() {
 
     assert_eq!(
         reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency),
-        reliable_relay_attach_open_timeout(&context, tcp_key, FlowLane::Latency),
-        "initial Active TCP open must use the same bounded path-open timeout as explicit attach, so a flapping first path can be retried"
+        reliable_relay_attach_open_timeout(&context, tcp_key, FlowLane::Latency)
+            .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+        "initial Active TCP opens own product streams and must survive more than one lost open/accept exchange"
     );
     assert_eq!(
         reliable_initial_active_open_timeout(&context, udp_key, FlowLane::Latency),
         reliable_relay_attach_open_timeout(&context, udp_key, FlowLane::Latency),
-        "initial Active UDP open must also be bounded; path racing/failover is transport-neutral"
+        "the configured path timeout can cap a high-RTT Active open, but must not reduce it below the one-PTO attach budget"
     );
 }
 
@@ -2984,6 +2985,63 @@ async fn repair_race_attach_preserves_active_data_path() {
         .await
         .is_err(),
         "repair path should not become active for new data"
+    );
+}
+
+#[tokio::test]
+async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
+    let stream_id = StreamId(47);
+    let (active_stream, _active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 4);
+    let (repair_stream, mut repair_commands, _repair_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    remotes.attach_for_repair(repair_stream);
+    let active = remotes.active_path_instance().expect("active path");
+    remotes
+        .remove_path_instance(active)
+        .expect("remove active path");
+
+    assert_eq!(
+        remotes.active_path_key(),
+        None,
+        "RepairOnly attachment must not masquerade as the active service path"
+    );
+    assert_eq!(remotes.active_path_underlay(), None);
+    assert_eq!(
+        remotes.active_path_index_for(UnderlayProtocol::Udp),
+        None,
+        "active_path_index_for must describe Active placement only"
+    );
+
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11002".parse().expect("tcp path"),
+            "udp://127.0.0.1:11003".parse().expect("udp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let spec = ReliableRelayOpenSpec {
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+        ingress: IngressKind::Socks5,
+    };
+    let mut sender = RelaySenderService::new(stream_id);
+    assert!(matches!(
+        sender
+            .reannounce_active_path(&context, &mut remotes, &spec, FlowLane::Latency)
+            .await,
+        Err(RuntimeError::ReliablePathSessionClosed)
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_reliable_path_command(&mut repair_commands)
+        )
+        .await
+        .is_err(),
+        "reannounce must not emit Active OpenStream on a RepairOnly channel"
     );
 }
 

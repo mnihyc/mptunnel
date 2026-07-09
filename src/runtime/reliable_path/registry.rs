@@ -152,13 +152,24 @@ impl ServerReliableStreamRegistry {
             if matches!(
                 attach_outcome,
                 ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
+                    | ResponseStreamAttachOutcome::RejectedRepairToActiveOutput
             ) {
+                #[cfg(feature = "lab-diagnostics")]
+                let result = match attach_outcome {
+                    ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput => {
+                        "rejected_duplicate_live_output"
+                    }
+                    ResponseStreamAttachOutcome::RejectedRepairToActiveOutput => {
+                        "rejected_repair_to_active_output"
+                    }
+                    ResponseStreamAttachOutcome::Attached => "attached",
+                };
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "server_stream_open",
                     format_args!(
-                        "session_id={} stream_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=rejected_duplicate_live_output",
-                        session_id.0, stream_id.0, underlay, path_id.0, role, lane,
+                        "session_id={} stream_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result={}",
+                        session_id.0, stream_id.0, underlay, path_id.0, role, lane, result,
                     ),
                 );
                 return Ok(ServerReliableStreamOpen::DuplicateLiveIgnored);

@@ -4639,8 +4639,9 @@ on_tail_stall_repair(stream_id, last_complete_ack_ranges):
     else:
         do_not_repair_live_tail_on_same_or_only_output()
     if lowest_repair_range_is_already_in_flight_on_every_usable_survivor
-       and stall_or_PTO_evidence_exists:
-        retransmit_same_lowest_range_once()
+       or every distinct survivor lacks immediate stream-data queue credit:
+        if stall_or_PTO_evidence_exists:
+            retransmit_same_lowest_range_once_as_RepairData()
     never_skip_lowest_range_to_send_later_ordered_bytes()
     never_replay_whole_repair_cache()
 

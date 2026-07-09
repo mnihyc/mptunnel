@@ -1513,9 +1513,13 @@ fn enqueue_reliable_tail_repair(
                 repair_frames = tail_repair_frames;
                 blocked_frontier_offset = tail_repair_blocked_offset;
                 repair_kind = "tail_repair";
-                if same_output_frontier_retry {
-                    repair_cause = RelaySendCause::PathFailureRepair;
-                }
+                // Persistent tail closure is connection-level correctness
+                // repair. Prefer a distinct survivor, but do not pin the
+                // product stream behind an unavailable alternate: the frame
+                // remains RepairData and never path-proves or moves Service
+                // ownership even when it falls back to a stale live output.
+                let _ = same_output_frontier_retry;
+                repair_cause = RelaySendCause::PathFailureRepair;
             } else if blocked_frontier_offset.is_none() {
                 blocked_frontier_offset = tail_repair_blocked_offset;
             }
@@ -4451,6 +4455,128 @@ mod tests {
                 assert!(!payload.is_empty());
             }
             _ => panic!("expected stale-copy tail repair STREAM_DATA"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_tail_repair_dispatches_on_service_when_alternate_lacks_queue_credit() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(124);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let repair_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(124),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(1);
+        let repair_commands_for_fill = repair_commands.clone();
+        assert_eq!(
+            binding.attach(
+                repair_key.underlay,
+                repair_key.path_id,
+                repair_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x55; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(124),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let outcome = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+        assert_eq!(outcome.queued, 1);
+
+        repair_commands_for_fill
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id,
+                    offset: 4096,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("test setup fills alternate data queue");
+
+        response_sender
+            .dispatch_next_with_ordered_owner_debt(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                limits,
+                0,
+            )
+            .await
+            .expect("persistent tail RepairData must use the Service path when the alternate has no queue credit");
+
+        let command = try_recv_reliable_path_command(&mut owner_receivers)
+            .expect("expected same-Service tail repair frame");
+        match command {
+            ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset, payload, ..
+            }) => {
+                assert_eq!(offset, 1024);
+                assert!(!payload.is_empty());
+            }
+            _ => panic!("expected same-Service tail repair STREAM_DATA"),
         }
     }
 

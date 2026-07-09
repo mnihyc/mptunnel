@@ -1241,6 +1241,7 @@ pub(super) fn prefix_repair_frames_with_unknown_owner_output(
 struct TailRepairEnqueueOutcome {
     queued: usize,
     pending: bool,
+    service_tail_failover_allowed: bool,
 }
 
 impl TailRepairEnqueueOutcome {
@@ -1398,6 +1399,10 @@ fn enqueue_reliable_tail_repair(
     TailRepairEnqueueOutcome {
         queued: repair_count,
         pending: repair_pending,
+        service_tail_failover_allowed: critical_tail_repair
+            && last_send_ack_complete
+            && last_send_ack_frontier > 0
+            && (repair_count > 0 || repair_pending),
     }
 }
 
@@ -1406,6 +1411,7 @@ async fn drain_server_response_sender_ready(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
     mut ordered_owner_debt_bytes: usize,
+    service_tail_failover_allowed: &mut bool,
     send_stream: &mut ReliableSendStream,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1423,12 +1429,13 @@ async fn drain_server_response_sender_ready(
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
         let dispatch = match response_sender
-            .dispatch_next_with_ordered_owner_debt(
+            .dispatch_next_with_ordered_owner_debt_and_service_tail_failover(
                 path_stream,
                 send_stream,
                 relay_lane,
                 mux_limits,
                 ordered_owner_debt_bytes,
+                *service_tail_failover_allowed,
             )
             .await
         {
@@ -1464,6 +1471,7 @@ async fn drain_server_response_sender_ready(
                 dispatched_payload_bytes.saturating_add(dispatch.payload_bytes);
             stats.record_payload_bytes(dispatch.payload_bytes);
             if dispatch.lane == ReliableRelayQueuedWorkLane::Data {
+                *service_tail_failover_allowed = false;
                 ordered_owner_debt_bytes =
                     ordered_owner_debt_bytes.saturating_add(dispatch.payload_bytes);
             }
@@ -1539,6 +1547,7 @@ where
     let mut response_sender =
         ServerResponseSenderService::new_with_performance(session_id, stream_id, performance);
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
+    let mut service_tail_failover_allowed = false;
     let mut last_relay_lane = path_stream.current_lane();
     let mut last_sender_dispatch_byte_budget =
         relay_lane_startup_chunk_bytes(last_relay_lane, mux_limits)
@@ -1634,6 +1643,9 @@ where
             last_send_ack_complete,
             last_send_ack_frontier,
         );
+        if ordered_owner_debt_bytes == 0 {
+            service_tail_failover_allowed = false;
+        }
         let tail_repair_deadline = reliable_relay_effective_tail_repair_deadline(
             last_send_ack_progress_at,
             last_tail_repair_at,
@@ -1709,12 +1721,13 @@ where
             response_sender_retry_at = None;
         }
         let queued_front_has_carrier_credit = response_sender
-            .front_has_carrier_credit_with_ordered_owner_debt(
+            .front_has_carrier_credit_with_ordered_owner_debt_and_service_tail_failover(
                 &path_stream,
                 &send_stream,
                 relay_lane,
                 mux_limits,
                 ordered_owner_debt_bytes,
+                service_tail_failover_allowed,
             );
         let sender_wait = response_sender_wait_state(
             !response_sender.is_empty(),
@@ -1775,6 +1788,9 @@ where
                 if repair_outcome.record_as_repair_attempt() {
                     last_tail_repair_at = Instant::now();
                 }
+                if repair_outcome.service_tail_failover_allowed {
+                    service_tail_failover_allowed = true;
+                }
                 let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
@@ -1785,6 +1801,7 @@ where
                     &mut response_sender,
                     &path_stream,
                     ordered_owner_debt_bytes,
+                    &mut service_tail_failover_allowed,
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2128,7 +2145,8 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                    ordered_owner_debt_bytes,
+                        ordered_owner_debt_bytes,
+                        &mut service_tail_failover_allowed,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2260,7 +2278,8 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                    ordered_owner_debt_bytes,
+                        ordered_owner_debt_bytes,
+                        &mut service_tail_failover_allowed,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2309,7 +2328,8 @@ where
                     if drain_server_response_sender_ready(
                         &mut response_sender,
                         &path_stream,
-                    ordered_owner_debt_bytes,
+                        ordered_owner_debt_bytes,
+                        &mut service_tail_failover_allowed,
                         &mut send_stream,
                         relay_lane,
                         mux_limits,
@@ -2344,6 +2364,7 @@ where
                     &mut response_sender,
                     &path_stream,
                     ordered_owner_debt_bytes,
+                    &mut service_tail_failover_allowed,
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2369,6 +2390,7 @@ where
                     &mut response_sender,
                     &path_stream,
                     ordered_owner_debt_bytes,
+                    &mut service_tail_failover_allowed,
                     &mut send_stream,
                     relay_lane,
                     mux_limits,
@@ -2485,7 +2507,8 @@ where
                         if drain_server_response_sender_ready(
                             &mut response_sender,
                             &path_stream,
-                    ordered_owner_debt_bytes,
+                            ordered_owner_debt_bytes,
+                            &mut service_tail_failover_allowed,
                             &mut send_stream,
                             relay_lane,
                             mux_limits,
@@ -2519,6 +2542,7 @@ where
                 &mut response_sender,
                 &path_stream,
                 ordered_owner_debt_bytes,
+                &mut service_tail_failover_allowed,
                 &mut send_stream,
                 last_relay_lane,
                 mux_limits,
@@ -3787,6 +3811,10 @@ mod tests {
             "failed-owner repair must retransmit from offset zero when no response ACK frontier exists"
         );
         assert!(!outcome.pending);
+        assert!(
+            !outcome.service_tail_failover_allowed,
+            "without an ACK frontier, failed-owner recovery is RepairData-only; later OwnerData must wait for progress"
+        );
         response_sender
             .dispatch_next_with_ordered_owner_debt(
                 &path_stream,
@@ -4210,6 +4238,10 @@ mod tests {
             "a persistent live-owner tail stall should reinject the lowest blocked range as RepairData on an alternate output without migrating Service ownership"
         );
         assert!(!outcome.pending);
+        assert!(
+            outcome.service_tail_failover_allowed,
+            "after bounded RepairData is queued for a persistent Service-tail stall, the scheduler may elect a measured survivor for new Service bytes"
+        );
         assert_eq!(
             binding.ordered_data_owner(),
             Some(owner_key),

@@ -4052,6 +4052,21 @@ inflate overhead. This rule is intentionally narrower than Service failover: it
 sends `RepairData` only, creates no path delivery proof, and does not promote
 the survivor to Service or Subflow ownership.
 
+After persistent Service-tail stall evidence has queued or found pending
+critical `RepairData`, the sender MAY suppress the stale Service owner for the
+next `OwnerData` admission decision. This is an explicit Service failover
+permission, not path proof created by the repair ACK. It applies only when no
+different lower-frontier owner is unresolved and the sender has a nonzero
+contiguous ACK frontier anchoring progress on the stream. A zero-frontier failed
+owner tail is RepairData-only until ACK progress arrives; otherwise the survivor
+can own later bytes while the entire prefix is still unresolved. The replacement
+must be a live measured output that passes the same Service admission gates as
+any ordinary Service election. Proof-only, unmeasured, Standby, Probe, or
+RepairOnly outputs remain ineligible for later owner bytes. The queued repair
+continues to resolve the lower suffix as `RepairData`; it does not grant
+delivery samples, bulk-rate evidence, Subflow admission, or Service ownership to
+the repair path.
+
 A product-level stall on the only reliable carrier output is also not a reason
 to reannounce an active `OPEN_STREAM` on that same carrier before the carrier has
 failed. TCP and QUIC already own below-product reliability for the live carrier.

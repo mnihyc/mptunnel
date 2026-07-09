@@ -1321,6 +1321,7 @@ fn choose_response_sender_data_target_with_ordered_debt_and_epoch(
     .map(|selected| selected.target)
 }
 
+#[cfg(test)]
 fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
@@ -1330,6 +1331,30 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     ordered_data_owner: Option<CarrierPathKey>,
     ordered_owner_debt_bytes: usize,
     subflow_set: Option<&FlowSubflowSet>,
+) -> Option<ResponseSelectedDataTarget> {
+    select_response_sender_data_target_with_service_tail_failover(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        lower_flights,
+        ordered_data_owner,
+        ordered_owner_debt_bytes,
+        subflow_set,
+        false,
+    )
+}
+
+fn select_response_sender_data_target_with_service_tail_failover(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    ordered_data_owner: Option<CarrierPathKey>,
+    ordered_owner_debt_bytes: usize,
+    subflow_set: Option<&FlowSubflowSet>,
+    allow_service_tail_failover: bool,
 ) -> Option<ResponseSelectedDataTarget> {
     if targets.is_empty() {
         return None;
@@ -1385,12 +1410,18 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     }
 
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
-    if response_ordered_owner_missing_under_debt(
-        targets,
-        lower_flights,
-        ordered_data_owner,
-        ordered_owner_debt_bytes,
-    ) {
+    let service_tail_failover_owner =
+        (allow_service_tail_failover && lower_owner.is_none() && ordered_owner_debt_bytes > 0)
+            .then_some(ordered_data_owner)
+            .flatten();
+    if service_tail_failover_owner.is_none()
+        && response_ordered_owner_missing_under_debt(
+            targets,
+            lower_flights,
+            ordered_data_owner,
+            ordered_owner_debt_bytes,
+        )
+    {
         #[cfg(feature = "lab-diagnostics")]
         for target in &capacity_targets {
             lab_response_bulk_output_candidate(
@@ -1435,11 +1466,36 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     } else {
         proven_targets
     };
-    let ordered_owner_anchor = ordered_data_owner.filter(|owner| {
-        targets.iter().any(|target| target.key == *owner)
-            && (ordered_owner_debt_bytes > 0
-                || capacity_targets.iter().any(|target| target.key == *owner))
-    });
+    if let Some(stale_service) = service_tail_failover_owner {
+        #[cfg(feature = "lab-diagnostics")]
+        for target in &candidate_targets {
+            if target.key == stale_service {
+                lab_response_bulk_output_candidate(
+                    "service_tail_failover_suppressed",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: None,
+                        role: None,
+                        ordering_debt: ordered_owner_debt_bytes as u64,
+                    },
+                );
+            }
+        }
+        candidate_targets.retain(|target| target.key != stale_service);
+        if candidate_targets.is_empty() {
+            return None;
+        }
+    }
+    let ordered_owner_anchor = (service_tail_failover_owner.is_none())
+        .then_some(ordered_data_owner)
+        .flatten()
+        .filter(|owner| {
+            targets.iter().any(|target| target.key == *owner)
+                && (ordered_owner_debt_bytes > 0
+                    || capacity_targets.iter().any(|target| target.key == *owner))
+        });
     if let Some(service_key) = ordered_owner_anchor
         && let Some(service) = targets.iter().find(|target| target.key == service_key)
     {
@@ -1840,12 +1896,31 @@ fn plan_response_data_dispatch(
     plan_response_data_dispatch_with_product_debt(stream, relay_lane, next_offset, payload_bytes, 0)
 }
 
+#[cfg(test)]
 fn plan_response_data_dispatch_with_product_debt(
     stream: &ReliablePathStream,
     relay_lane: FlowLane,
     next_offset: u64,
     payload_bytes: usize,
     ordered_owner_debt_bytes: usize,
+) -> Result<ResponseDataDispatchPlan, RuntimeError> {
+    plan_response_data_dispatch_with_product_debt_and_service_tail_failover(
+        stream,
+        relay_lane,
+        next_offset,
+        payload_bytes,
+        ordered_owner_debt_bytes,
+        false,
+    )
+}
+
+fn plan_response_data_dispatch_with_product_debt_and_service_tail_failover(
+    stream: &ReliablePathStream,
+    relay_lane: FlowLane,
+    next_offset: u64,
+    payload_bytes: usize,
+    ordered_owner_debt_bytes: usize,
+    allow_service_tail_failover: bool,
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
@@ -1864,7 +1939,7 @@ fn plan_response_data_dispatch_with_product_debt(
             let targets = binding.sender_path_targets(relay_lane, payload_bytes);
             let ordered_data_owner = binding.ordered_data_owner();
             let subflow_set = binding.subflow_set_snapshot();
-            let Some(selected) = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            let Some(selected) = select_response_sender_data_target_with_service_tail_failover(
                 &targets,
                 relay_lane,
                 payload_bytes,
@@ -1873,6 +1948,7 @@ fn plan_response_data_dispatch_with_product_debt(
                 ordered_data_owner,
                 ordered_owner_debt_bytes,
                 subflow_set.as_ref(),
+                allow_service_tail_failover,
             ) else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
@@ -2280,13 +2356,14 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
-    pub(super) fn front_has_carrier_credit_with_ordered_owner_debt(
+    pub(super) fn front_has_carrier_credit_with_ordered_owner_debt_and_service_tail_failover(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         relay_lane: FlowLane,
         mux_limits: MuxLimits,
         ordered_owner_debt_bytes: usize,
+        allow_service_tail_failover: bool,
     ) -> bool {
         let Some((_, queued)) = self.queue.front() else {
             return false;
@@ -2307,7 +2384,7 @@ impl ServerResponseSenderService {
                 )
             }
             ReliableRelayQueuedWorkKind::Data(payload) => {
-                plan_response_data_dispatch_with_product_debt(
+                plan_response_data_dispatch_with_product_debt_and_service_tail_failover(
                     path_stream,
                     queued.data_lane.unwrap_or(relay_lane),
                     send_stream.next_offset(),
@@ -2318,6 +2395,7 @@ impl ServerResponseSenderService {
                         payload.len(),
                     ),
                     ordered_owner_debt_bytes,
+                    allow_service_tail_failover,
                 )
                 .is_ok()
             }
@@ -2440,6 +2518,26 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
         ordered_owner_debt_bytes: usize,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
+        self.dispatch_next_with_ordered_owner_debt_and_service_tail_failover(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            ordered_owner_debt_bytes,
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn dispatch_next_with_ordered_owner_debt_and_service_tail_failover(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &mut ReliableSendStream,
+        relay_lane: FlowLane,
+        mux_limits: MuxLimits,
+        ordered_owner_debt_bytes: usize,
+        allow_service_tail_failover: bool,
+    ) -> Result<ServerResponseDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
             .front()
@@ -2475,13 +2573,15 @@ impl ServerResponseSenderService {
                     payload.len(),
                 );
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
-                let planned = plan_response_data_dispatch_with_product_debt(
-                    path_stream,
-                    data_lane,
-                    send_stream.next_offset(),
-                    dispatch_payload.len(),
-                    ordered_owner_debt_bytes,
-                )?;
+                let planned =
+                    plan_response_data_dispatch_with_product_debt_and_service_tail_failover(
+                        path_stream,
+                        data_lane,
+                        send_stream.next_offset(),
+                        dispatch_payload.len(),
+                        ordered_owner_debt_bytes,
+                        allow_service_tail_failover,
+                    )?;
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
                 let frame = send_stream.send_data(dispatch_payload, StreamFlags::NONE)?;
@@ -7249,6 +7349,92 @@ mod tests {
         assert!(
             selected.is_none(),
             "when the lower owner is full, sender must wait instead of expanding the ordered receive hole on a Subflow"
+        );
+    }
+
+    #[test]
+    fn service_tail_failover_elects_measured_survivor_service_after_repair_attempt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut stale_service =
+            response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let (service_commands, _service_rx) = reliable_path_command_channels(1);
+        service_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(199),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("seed full stale Service data queue");
+        stale_service.commands = service_commands;
+        let survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
+
+        let selected = select_response_sender_data_target_with_service_tail_failover(
+            &[stale_service.clone(), survivor.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(stale_service.key),
+            owner_tail_guard_bytes,
+            None,
+            true,
+        )
+        .expect("persistent Service-tail repair should allow a measured survivor to take Service ownership");
+
+        assert_eq!(selected.target.key, survivor.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "explicit tail failover elects one new Service; it must not become an optional Subflow hidden behind stale Service debt"
+        );
+    }
+
+    #[test]
+    fn service_tail_failover_does_not_grant_owner_bytes_to_unmeasured_survivor() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut stale_service =
+            response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let (service_commands, _service_rx) = reliable_path_command_channels(1);
+        service_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(200),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("seed full stale Service data queue");
+        stale_service.commands = service_commands;
+        let mut proof_only =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        proof_only.has_sender_evidence = true;
+        proof_only.has_bulk_rate_evidence = false;
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
+
+        let selected = select_response_sender_data_target_with_service_tail_failover(
+            &[stale_service.clone(), proof_only],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(stale_service.key),
+            owner_tail_guard_bytes,
+            None,
+            true,
+        );
+
+        assert!(
+            selected.is_none(),
+            "tail failover is not a proof shortcut; an unmeasured survivor remains Probe/Standby until path-scoped bulk evidence exists"
         );
     }
 

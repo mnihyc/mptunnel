@@ -807,6 +807,7 @@ fn response_target_unique_owner_admission_with_epoch(
         if ordered_owner_debt_bytes > 0
             && Some(target.key) != ordered_data_owner
             && !target.has_bulk_rate_evidence
+            && !liveness_service_failover
         {
             return (PathAdmission::standby(), None);
         }
@@ -992,12 +993,12 @@ fn response_ordered_owner_missing_under_debt(
             let live_owner = targets.iter().any(|target| target.key == owner);
             // A missing Service owner with unresolved tail debt normally blocks
             // later OwnerData. The only non-clear-frontier failover is a
-            // bulk-rate-proven survivor in the same carrier family; RepairData
+            // sender-evidenced survivor in the same carrier family; RepairData
             // still never path-proves or transfers ownership.
-            let measured_same_underlay_failover = targets.iter().any(|target| {
-                target.key.underlay == owner.underlay && target.has_bulk_rate_evidence
-            });
-            !live_owner && !measured_same_underlay_failover
+            let same_underlay_sender_evidence_failover = targets
+                .iter()
+                .any(|target| target.key.underlay == owner.underlay && target.has_sender_evidence);
+            !live_owner && !same_underlay_sender_evidence_failover
         }
         None => true,
     }
@@ -1628,6 +1629,41 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
             }
         }
     }
+    let mut missing_owner_same_underlay_failover = false;
+    if effective_lower_owner.is_none()
+        && ordered_owner_anchor.is_none()
+        && ordered_owner_debt_bytes > 0
+        && let Some(owner) = ordered_data_owner
+    {
+        let owner_underlay = owner.underlay;
+        missing_owner_same_underlay_failover = candidate_targets
+            .iter()
+            .any(|target| target.key.underlay == owner_underlay && target.has_sender_evidence);
+        if missing_owner_same_underlay_failover {
+            #[cfg(feature = "lab-diagnostics")]
+            for target in &candidate_targets {
+                if target.key.underlay != owner_underlay || !target.has_sender_evidence {
+                    lab_response_bulk_output_candidate(
+                        "missing_owner_same_underlay_failover",
+                        target,
+                        payload_bytes,
+                        mux_limits,
+                        ResponseBulkCandidateDiag {
+                            lead: None,
+                            role: None,
+                            ordering_debt: ordered_owner_debt_bytes as u64,
+                        },
+                    );
+                }
+            }
+            candidate_targets.retain(|target| {
+                target.key.underlay == owner_underlay && target.has_sender_evidence
+            });
+            if candidate_targets.is_empty() {
+                return None;
+            }
+        }
+    }
     let mixed_safe_targets = candidate_targets
         .iter()
         .copied()
@@ -1666,7 +1702,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
     };
     let allow_liveness_service_failover = effective_lower_owner.is_none()
         && ordered_owner_anchor.is_none()
-        && ordered_owner_debt_bytes == 0
+        && (ordered_owner_debt_bytes == 0 || missing_owner_same_underlay_failover)
         && !candidate_targets.iter().any(|target| target.is_active);
     let Some(lead) = choose_response_admissible_lead(
         &candidate_targets,
@@ -8202,6 +8238,43 @@ mod tests {
             selected.admission.role,
             PathRuntimeRole::Service,
             "same-underlay failover resumes Service OwnerData; it is not optional Subflow exploration and does not credit RepairData as proof"
+        );
+    }
+
+    #[test]
+    fn missing_same_underlay_owner_debt_admits_sender_evidence_service_failover() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let missing_owner = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let mut liveness_survivor =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        liveness_survivor.has_sender_evidence = true;
+        liveness_survivor.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            std::slice::from_ref(&liveness_survivor),
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(missing_owner),
+            payload_bytes.saturating_mul(2),
+            None,
+        )
+        .expect("a same-underlay sender-evidenced survivor should receive bounded Service failover when the previous Service output is gone and no lower-flight owner remains");
+
+        assert_eq!(selected.target.key, liveness_survivor.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "same-underlay failover is Service continuation, not Subflow aggregation"
+        );
+        assert!(
+            selected.subflow_set_commit.is_none(),
+            "failover Service election must not spend Subflow owner credit"
         );
     }
 

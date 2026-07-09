@@ -102,8 +102,13 @@ impl ReliablePathStream {
         self.output.release_normalized_acked_ranges(ranges);
     }
 
-    pub(super) fn has_live_repair_flight_overlap(&self, frame: &Frame) -> bool {
-        self.output.has_live_repair_flight_overlap(frame)
+    pub(super) fn has_recent_live_repair_flight_overlap(
+        &self,
+        frame: &Frame,
+        retry_after: Duration,
+    ) -> bool {
+        self.output
+            .has_recent_live_repair_flight_overlap(frame, retry_after)
     }
 
     pub(super) fn has_multipath_repair_alternative(&self) -> bool {
@@ -392,12 +397,19 @@ impl FixedReliablePathOutput {
             .saturating_add(released_proven_flights);
     }
 
-    fn has_repair_flight_overlap(&self, frame: &Frame) -> bool {
+    fn has_recent_repair_flight_overlap(&self, frame: &Frame, retry_after: Duration) -> bool {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return false;
         };
         let model = self.model.lock().expect("fixed reliable path model lock");
-        product_flights_have_repair_overlap(&model.flights, start, end, |_| true)
+        product_flights_have_recent_repair_overlap(
+            &model.flights,
+            start,
+            end,
+            Instant::now(),
+            retry_after,
+            |_| true,
+        )
     }
 }
 
@@ -550,10 +562,16 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn has_live_repair_flight_overlap(&self, frame: &Frame) -> bool {
+    pub(super) fn has_recent_live_repair_flight_overlap(
+        &self,
+        frame: &Frame,
+        retry_after: Duration,
+    ) -> bool {
         match self {
-            Self::Fixed(fixed) => fixed.has_repair_flight_overlap(frame),
-            Self::Switchable(binding) => binding.has_live_repair_flight_overlap(frame),
+            Self::Fixed(fixed) => fixed.has_recent_repair_flight_overlap(frame, retry_after),
+            Self::Switchable(binding) => {
+                binding.has_recent_live_repair_flight_overlap(frame, retry_after)
+            }
         }
     }
 
@@ -984,10 +1002,15 @@ impl ResponseStreamBinding {
             .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
-    pub(super) fn has_live_repair_flight_overlap(&self, frame: &Frame) -> bool {
+    pub(super) fn has_recent_live_repair_flight_overlap(
+        &self,
+        frame: &Frame,
+        retry_after: Duration,
+    ) -> bool {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return false;
         };
+        let now = Instant::now();
         let live_keys = self
             .outputs
             .lock()
@@ -1000,7 +1023,9 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        product_flights_have_repair_overlap(&flights, start, end, |key| live_keys.contains(&key))
+        product_flights_have_recent_repair_overlap(&flights, start, end, now, retry_after, |key| {
+            live_keys.contains(&key)
+        })
     }
 
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
@@ -1332,6 +1357,22 @@ impl ResponseStreamBinding {
         self.record_product_flight(key, frame, CarrierWorkKind::RepairData)
     }
 
+    #[cfg(test)]
+    pub(super) fn age_repair_flights_for_test(&self, age: Duration) {
+        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        let mut flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        for path_flights in flights.values_mut() {
+            for flight in path_flights {
+                if flight.kind == CarrierWorkKind::RepairData {
+                    flight.sent_at = sent_at;
+                }
+            }
+        }
+    }
+
     fn record_product_flight(&self, key: CarrierPathKey, frame: &Frame, kind: CarrierWorkKind) {
         debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
@@ -1579,10 +1620,12 @@ fn carrier_path_flights_have_unambiguous_owner_ack(flights: &[CarrierPathFlight]
     )
 }
 
-fn product_flights_have_repair_overlap(
+fn product_flights_have_recent_repair_overlap(
     flights: &BTreeMap<u64, Vec<CarrierPathFlight>>,
     start: u64,
     end: u64,
+    now: Instant,
+    retry_after: Duration,
     mut live: impl FnMut(CarrierPathKey) -> bool,
 ) -> bool {
     if start >= end {
@@ -1593,7 +1636,10 @@ fn product_flights_have_repair_overlap(
             if offset >= end || flight.end <= start {
                 continue;
             }
-            if flight.kind == CarrierWorkKind::RepairData && live(flight.key) {
+            if flight.kind != CarrierWorkKind::RepairData || !live(flight.key) {
+                continue;
+            }
+            if now.saturating_duration_since(flight.sent_at) < retry_after {
                 return true;
             }
         }

@@ -3674,13 +3674,16 @@ output. This is the MPTCP reinjection rule applied only after loss, failure, or
 explicit repair evidence exists, with the QUIC-style recovery constraint that a
 repair action is small, ACK-clocked, and never a replay of unrelated cached bytes. A
 sender MUST NOT enqueue another `RepairData` copy for a byte range that is
-already pending in the sender-service queue or in live carrier flight; that
-copy is treated as the current repair attempt and the repair timer backs off
-until ACK, capacity, detach/failover, staleness timeout, or the next materially
-different repair range changes the decision. Repair already in carrier flight
-on a detached or failed output does not block failover repair on a live
-survivor; repair already in flight on a live output does block duplicate
-spending for the same range.
+already pending in the sender-service queue or in recent live carrier flight;
+that copy is treated as the current repair attempt and the repair timer backs
+off until ACK, capacity, detach/failover, the repair retry timeout, or the next
+materially different repair range changes the decision. The retry timeout is
+derived from the same path/lane stall model used to decide tail repair, so it is
+a bounded retransmission clock rather than a new packet semantic. Repair already
+in carrier flight on a detached or failed output does not block failover repair
+on a live survivor; stale unacknowledged repair in carrier flight on a live
+output does not block correctness repair forever. Fresh repair in flight on a
+live output still blocks duplicate spending for the same range.
 sender MUST NOT substitute a later range merely because the frontier range is
 already in flight. A sender MUST NOT duplicate every lower outstanding byte
 merely because a faster active path is available. Speculative reinjection outside

@@ -633,12 +633,19 @@ evidence, not immediate repair debt. If no complete ACK frontier exists while
 the recorded owner is still live, the sender MUST wait for ACK progress, carrier
 failure evidence, or a terminal-tail condition instead of converting live-owner
 bytes into product `RepairData`. Unknown-owner no-frontier startup
-tails likewise MUST wait instead of duplicating the whole repair cache. If a complete ACK
-frontier exists, the frontier remains blocked for one PTO-derived product stall
-timeout, and a different live output can carry the lowest blocked range, that
-suffix becomes tail correctness repair: it may be retransmitted as `RepairData`
-only on an output that did not own the offset range and under the same
-repair/path-flight caps. The first tail probe
+tails likewise MUST wait instead of duplicating the whole repair cache. If the
+latest repair-authoritative ACK is complete, contains exactly one contiguous
+`[0, frontier)` range, the frontier remains blocked for one PTO-derived product
+stall timeout, and a different live output can carry the lowest blocked range,
+that suffix becomes tail correctness repair: it may be retransmitted as
+`RepairData` only on an output that did not own that offset range and under the
+same repair/path-flight caps. A sparse ACK set MUST repair its lowest explicit
+gap first; the sender MUST NOT use its largest acknowledged end as a tail
+frontier and skip a lower hole. Ownership is evaluated for the range being
+repaired, not from the path that happened to carry the latest later
+`OwnerData`. This correctness rule applies to every reliable flow lane; the
+lane changes its PTO-derived delay and bounded quantum, not whether a proven
+blocked suffix can use a distinct repair output. The first tail probe
 deliberately uses one product stall timeout, not the persistent-congestion
 multiplier used for authoritative ACK-gap repair, because the repair is a
 bounded reinjection of the exact lowest HOL-blocking suffix on a different
@@ -3172,27 +3179,26 @@ stream. This mirrors MPTCP path managers and MPQUIC path validation: subflow or
 path discovery proceeds beside the connection-level byte stream rather than
 inside the hot data loop.
 
-For QUIC UDP carrier streams, non-blocking validation, repair, and survivor
-attachment means the client bounds carrier connection setup by the same
-attach/open deadline used for reliable-path recovery, sends `OPEN_STREAM`, starts
-the carrier reader and writer, and returns the attached carrier output with a
-zero initial product send window. The later `STREAM_MAX_DATA` accept frame is
-processed through the normal stream frame path and updates flow control when it
-arrives. Only the initial Service open, which has no existing product path to
-keep running, waits for the peer's accept frame before returning. A non-owner
-QUIC attachment MUST NOT block indefinitely on either QUIC connection setup or
-`STREAM_MAX_DATA` in the open call, because loss or jitter in that path-management
-round trip would otherwise stall Service data, ACKs, repair, and further path
-management.
+For QUIC UDP carrier streams, Validation attachment is non-blocking with respect
+to the byte-producing path. The client bounds carrier connection setup by the
+reliable-path attach deadline, sends `OPEN_STREAM`, starts the carrier reader and
+writer, and may return a Validation output with a zero initial product send
+window. The later `STREAM_MAX_DATA` accept frame is processed through the normal
+stream frame path and updates flow control when it arrives. Completing that
+optimistic Validation attach proves only that the local endpoint queued
+`OPEN_STREAM`; it is not peer acceptance or path liveness proof.
 
-Completing a non-blocking QUIC UDP attach is not path liveness proof by itself.
-It proves only that the local endpoint opened a carrier stream and queued
-`OPEN_STREAM`. It MUST NOT clear a recent data-plane failure or promote the path
-for new Active Service opens until peer evidence arrives: `STREAM_MAX_DATA`,
-`PATH_PROOF_ACK`, carrier ACK-derived data evidence, or ordinary accepted
-owner-data delivery according to the role rules below. This prevents a flapping
-path from immediately erasing an Active-open timeout through a validation or
-repair attach that has not reached the peer.
+An Active or Repair attachment is usable product state, not speculative proof.
+It MUST receive the peer's `STREAM_MAX_DATA` accept or terminal reset within the
+bounded attach deadline before entering the attached path set. This includes a
+survivor expected to carry unique Service bytes and a Repair output expected to
+carry correctness `RepairData`. A timed-out candidate remains path-failure
+evidence and the path manager continues to the next candidate; it MUST NOT leave
+a local-only attachment that suppresses further recovery. Validation still MUST
+NOT clear a recent data-plane failure or promote a path for new Active Service
+opens until peer evidence arrives: `STREAM_MAX_DATA`, `PATH_PROOF_ACK`, carrier
+ACK-derived data evidence, or ordinary accepted owner-data delivery according to
+the role rules below.
 
 A stream ACK for duplicated data proves end-to-end byte delivery but does not
 identify which underlay path delivered the bytes. It therefore releases product

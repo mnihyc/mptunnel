@@ -63,32 +63,42 @@ impl RelayPathFlightLedger {
         if ranges.is_empty() || self.flights.is_empty() {
             return Vec::new();
         }
+
+        let original_flights = std::mem::take(&mut self.flights)
+            .into_iter()
+            .flat_map(|(start, flights)| flights.into_iter().map(move |flight| (start, flight)))
+            .collect::<Vec<_>>();
+        let ambiguous_intervals = relay_path_ambiguous_flight_intervals(&original_flights);
+        let now = Instant::now();
         let mut released = Vec::new();
-        let mut acked_offsets = Vec::new();
-        for range in ranges {
-            for (offset, flights) in self.flights.range(range.start..) {
-                if *offset >= range.end {
-                    break;
+        for (start, flight) in original_flights.iter().copied() {
+            let split = split_flight_interval_by_ack(start, flight.end, ranges);
+            for (acked_start, acked_end) in split.acked {
+                let bytes = flight_interval_bytes(acked_start, acked_end);
+                if bytes == 0 {
+                    continue;
                 }
-                if flights.iter().any(|flight| range.end >= flight.end) {
-                    acked_offsets.push(*offset);
-                }
+                released.push(RelayPathRelease {
+                    key: flight.key,
+                    bytes,
+                    elapsed: now.saturating_duration_since(flight.sent_at),
+                    path_proving: flight.kind.is_ordering_owner()
+                        && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
+                });
             }
-        }
-        acked_offsets.sort_unstable();
-        acked_offsets.dedup();
-        for offset in acked_offsets {
-            if let Some(flights) = self.flights.remove(&offset) {
-                let path_proving = relay_path_flights_have_unambiguous_owner_ack(&flights);
-                let now = Instant::now();
-                for flight in flights {
-                    released.push(RelayPathRelease {
-                        key: flight.key,
-                        bytes: flight.bytes,
-                        elapsed: now.saturating_duration_since(flight.sent_at),
-                        path_proving: path_proving && flight.kind.is_ordering_owner(),
-                    });
+            for (retained_start, retained_end) in split.retained {
+                let bytes = flight_interval_bytes(retained_start, retained_end);
+                if bytes == 0 {
+                    continue;
                 }
+                self.flights
+                    .entry(retained_start)
+                    .or_default()
+                    .push(RelayPathFlight {
+                        end: retained_end,
+                        bytes,
+                        ..flight
+                    });
             }
         }
         released
@@ -109,6 +119,16 @@ impl RelayPathFlightLedger {
         released
     }
 
+    #[cfg(test)]
+    pub(super) fn age_product_flights_for_test(&mut self, age: Duration) {
+        let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        for flights in self.flights.values_mut() {
+            for flight in flights {
+                flight.sent_at = sent_at;
+            }
+        }
+    }
+
     pub(super) fn sent_keys_for_frame(&self, frame: &Frame) -> Vec<RelayPathKey> {
         let Some((offset, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
@@ -122,6 +142,106 @@ impl RelayPathFlightLedger {
             }
         }
         keys
+    }
+
+    pub(super) fn ordering_owner_keys(&self) -> Vec<RelayPathKey> {
+        let mut keys = Vec::new();
+        for flights in self.flights.values() {
+            for flight in flights {
+                if flight.kind.is_ordering_owner() && !keys.contains(&flight.key) {
+                    keys.push(flight.key);
+                }
+            }
+        }
+        keys
+    }
+
+    pub(super) fn has_missing_ordering_owner_before_offset(
+        &self,
+        offset: u64,
+        live_keys: &[RelayPathKey],
+    ) -> bool {
+        self.flights.range(..offset).any(|(_, flights)| {
+            flights
+                .iter()
+                .any(|flight| flight.kind.is_ordering_owner() && !live_keys.contains(&flight.key))
+        })
+    }
+
+    pub(super) fn ordering_owner_keys_for_frame(
+        &self,
+        frame: &Frame,
+        live_keys: &[RelayPathKey],
+    ) -> Vec<RelayPathKey> {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return Vec::new();
+        };
+        let mut owner_keys = Vec::new();
+        for (offset, flights) in self.flights.range(..end) {
+            if *offset > start {
+                break;
+            }
+            for flight in flights {
+                if flight.kind.is_ordering_owner()
+                    && flight.end >= end
+                    && live_keys.contains(&flight.key)
+                    && !owner_keys.contains(&flight.key)
+                {
+                    owner_keys.push(flight.key);
+                }
+            }
+        }
+        owner_keys
+    }
+
+    pub(super) fn live_owner_tail_repair_owner_keys(
+        &self,
+        frame: &Frame,
+        live_keys: &[RelayPathKey],
+        first_repair_after: Duration,
+        repeat_repair_after: Duration,
+    ) -> Vec<RelayPathKey> {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let expected_owner_keys = self.ordering_owner_keys_for_frame(frame, live_keys);
+        let mut owner_keys = Vec::new();
+        for (offset, flights) in self.flights.range(..end) {
+            if *offset > start {
+                break;
+            }
+            for flight in flights {
+                if !flight.kind.is_ordering_owner()
+                    || flight.end < end
+                    || !live_keys.contains(&flight.key)
+                    || now.saturating_duration_since(flight.sent_at) < first_repair_after
+                {
+                    continue;
+                }
+                if expected_owner_keys.contains(&flight.key) && !owner_keys.contains(&flight.key) {
+                    owner_keys.push(flight.key);
+                }
+            }
+        }
+        if owner_keys.is_empty() {
+            return owner_keys;
+        }
+        let recent_distinct_repair = self.flights.range(..end).any(|(offset, flights)| {
+            *offset < end
+                && flights.iter().any(|flight| {
+                    flight.end > start
+                        && flight.kind == CarrierWorkKind::RepairData
+                        && live_keys.contains(&flight.key)
+                        && !owner_keys.contains(&flight.key)
+                        && now.saturating_duration_since(flight.sent_at) < repeat_repair_after
+                })
+        });
+        if recent_distinct_repair {
+            Vec::new()
+        } else {
+            owner_keys
+        }
     }
 
     pub(super) fn latest_unacked_ranges_for_path(&self, key: RelayPathKey) -> Vec<OffsetRange> {
@@ -167,11 +287,76 @@ fn latest_ordering_owner(flights: &[RelayPathFlight]) -> Option<&RelayPathFlight
         .find(|flight| flight.kind.is_ordering_owner())
 }
 
-fn relay_path_flights_have_unambiguous_owner_ack(flights: &[RelayPathFlight]) -> bool {
-    matches!(
-        flights,
-        [flight] if flight.kind.is_ordering_owner()
-    )
+fn relay_path_ambiguous_flight_intervals(flights: &[(u64, RelayPathFlight)]) -> Vec<(u64, u64)> {
+    let mut events = BTreeMap::<u64, i64>::new();
+    for (start, flight) in flights {
+        *events.entry(*start).or_default() += 1;
+        *events.entry(flight.end).or_default() -= 1;
+    }
+    let mut intervals = Vec::new();
+    let mut active = 0_i64;
+    let mut previous = None;
+    for (position, delta) in events {
+        if let Some(previous) = previous
+            && previous < position
+            && active > 1
+        {
+            intervals.push((previous, position));
+        }
+        active += delta;
+        previous = Some(position);
+    }
+    intervals
+}
+
+fn flight_intervals_overlap(intervals: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let position = intervals.partition_point(|(_, interval_end)| *interval_end <= start);
+    intervals
+        .get(position)
+        .is_some_and(|(interval_start, _)| *interval_start < end)
+}
+
+struct FlightIntervalSplit {
+    acked: Vec<(u64, u64)>,
+    retained: Vec<(u64, u64)>,
+}
+
+fn split_flight_interval_by_ack(
+    start: u64,
+    end: u64,
+    ranges: &[OffsetRange],
+) -> FlightIntervalSplit {
+    let mut acked = Vec::new();
+    let mut retained = Vec::new();
+    let mut cursor = start;
+    for range in ranges {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start >= end {
+            break;
+        }
+        let ack_start = cursor.max(range.start);
+        if cursor < ack_start {
+            retained.push((cursor, ack_start));
+        }
+        let ack_end = end.min(range.end);
+        if ack_start < ack_end {
+            acked.push((ack_start, ack_end));
+            cursor = ack_end;
+        }
+        if cursor >= end {
+            break;
+        }
+    }
+    if cursor < end {
+        retained.push((cursor, end));
+    }
+    FlightIntervalSplit { acked, retained }
+}
+
+fn flight_interval_bytes(start: u64, end: u64) -> usize {
+    usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
 pub(super) fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
@@ -1115,6 +1300,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_later_owner_is_detected_even_when_oldest_owner_is_live() {
+        let live_owner = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let missing_owner = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let mut ledger = RelayPathFlightLedger::default();
+        ledger.record_owner_frame(live_owner, &data_frame(0, 4096));
+        ledger.record_owner_frame(missing_owner, &data_frame(4096, 4096));
+
+        assert!(ledger.has_missing_ordering_owner_before_offset(8192, &[live_owner]));
+        assert!(
+            !ledger.has_missing_ordering_owner_before_offset(8192, &[live_owner, missing_owner],)
+        );
+    }
+
+    #[test]
     fn repair_copy_does_not_become_ordering_owner() {
         let owner = RelayPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -1173,6 +1378,59 @@ mod tests {
             released[0].path_proving,
             "a single outstanding owner copy is path-scoped STREAM_ACK evidence"
         );
+    }
+
+    #[test]
+    fn partial_same_start_duplicate_ack_retains_owner_suffix() {
+        let owner = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let repair = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let mut ledger = RelayPathFlightLedger::default();
+        ledger.record_owner_frame(owner, &data_frame(0, 4096));
+        ledger.record_repair_frame(repair, &data_frame(0, 1024));
+
+        let prefix_releases = ledger.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 1024,
+        }]);
+        assert_eq!(prefix_releases.len(), 2);
+        assert!(prefix_releases.iter().all(|release| release.bytes == 1024));
+        assert!(
+            prefix_releases.iter().all(|release| !release.path_proving),
+            "an ACK shared by OwnerData and RepairData cannot identify a delivery path"
+        );
+        assert_eq!(
+            ledger.latest_unacked_ranges_for_path(owner),
+            vec![OffsetRange {
+                start: 1024,
+                end: 4096,
+            }],
+            "releasing the shorter same-start RepairData copy must retain the OwnerData suffix"
+        );
+        assert!(ledger.latest_unacked_ranges_for_path(repair).is_empty());
+        assert_eq!(
+            ledger.ordering_owner_keys_for_frame(&data_frame(1024, 3072), &[owner, repair],),
+            vec![owner],
+            "the trimmed suffix retains OwnerData identity without retaining the RepairData key"
+        );
+
+        let suffix_releases = ledger.release_normalized_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 4096,
+        }]);
+        assert_eq!(suffix_releases.len(), 1);
+        assert_eq!(suffix_releases[0].key, owner);
+        assert_eq!(suffix_releases[0].bytes, 3072);
+        assert!(
+            suffix_releases[0].path_proving,
+            "the retained owner-only suffix is unambiguous when it is acknowledged later"
+        );
+        assert!(ledger.latest_unacked_ranges_for_path(owner).is_empty());
     }
 
     #[test]

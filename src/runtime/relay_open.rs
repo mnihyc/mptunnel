@@ -113,6 +113,23 @@ impl ReliableRelayRemoteSet {
             .collect()
     }
 
+    pub(super) fn repair_path_instance_for_service_recovery(&self) -> Option<RelayPathInstance> {
+        self.paths
+            .iter()
+            .rev()
+            .find(|path| path.placement == RelayPathPlacement::Repair)
+            .map(ReliableRelayRemotePath::instance)
+    }
+
+    pub(super) fn accepted_product_path_count(&self) -> usize {
+        // Active and Repair opens enter this set only after peer acceptance.
+        // Validation remains product-ineligible until explicit Active promotion.
+        self.paths
+            .iter()
+            .filter(|path| path.placement != RelayPathPlacement::Validation)
+            .count()
+    }
+
     #[cfg(test)]
     pub(super) fn path_instance_for_key(&self, key: RelayPathKey) -> Option<RelayPathInstance> {
         self.paths
@@ -290,8 +307,14 @@ impl ReliableRelayRemoteSet {
         else {
             return false;
         };
-        if position + 1 == self.paths.len() {
+        if position + 1 == self.paths.len()
+            && self.paths[position].placement == RelayPathPlacement::Active
+        {
             return false;
+        }
+        if position + 1 == self.paths.len() {
+            self.paths[position].placement = RelayPathPlacement::Active;
+            return true;
         }
         let mut path = self.paths.remove(position);
         path.placement = RelayPathPlacement::Active;
@@ -346,6 +369,13 @@ impl UdpStreamOpenOptions {
         wait_for_accept: true,
         role: StreamOpenRole::Active,
     };
+}
+
+pub(super) fn udp_relay_attachment_open_options(role: StreamOpenRole) -> UdpStreamOpenOptions {
+    UdpStreamOpenOptions {
+        wait_for_accept: role != StreamOpenRole::Validation,
+        role,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -841,6 +871,22 @@ pub(super) fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliable_udp_service_and_repair_attachments_wait_for_peer_acceptance() {
+        assert!(
+            udp_relay_attachment_open_options(StreamOpenRole::Active).wait_for_accept,
+            "an Active attachment is not usable until the peer accepts it"
+        );
+        assert!(
+            udp_relay_attachment_open_options(StreamOpenRole::Repair).wait_for_accept,
+            "a Repair attachment must exist at the peer before correctness repair uses it"
+        );
+        assert!(
+            !udp_relay_attachment_open_options(StreamOpenRole::Validation).wait_for_accept,
+            "Validation remains an optimistic proof attachment"
+        );
+    }
 
     #[tokio::test]
     async fn relay_attach_open_timeout_bounds_pending_connection_setup() {

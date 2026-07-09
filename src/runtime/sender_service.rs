@@ -35,6 +35,7 @@ pub(super) enum RelaySendCause {
     StreamFin,
     RecvProgress,
     AckGapRepair,
+    LiveOwnerTailRepair,
     PathFailureRepair,
 }
 
@@ -46,12 +47,16 @@ impl RelaySendCause {
             Self::StreamFin => "stream_fin",
             Self::RecvProgress => "recv_progress",
             Self::AckGapRepair => "ack_gap_repair",
+            Self::LiveOwnerTailRepair => "live_owner_tail_repair",
             Self::PathFailureRepair => "path_failure_repair",
         }
     }
 
     fn is_repair(self) -> bool {
-        matches!(self, Self::AckGapRepair | Self::PathFailureRepair)
+        matches!(
+            self,
+            Self::AckGapRepair | Self::LiveOwnerTailRepair | Self::PathFailureRepair
+        )
     }
 }
 
@@ -65,6 +70,7 @@ pub(super) struct RelaySendOutcome {
 pub(super) enum ClientQueuedDispatch {
     Data { payload_bytes: usize },
     Repair { payload_bytes: usize },
+    RepairDeferred,
 }
 
 #[derive(Debug)]
@@ -73,6 +79,7 @@ pub(super) struct RelaySenderService {
     stream_id: StreamId,
     flights: RelayPathFlightLedger,
     ordered_data_owner: Option<RelayPathKey>,
+    missing_owner_repair_attempts: HashMap<RelayPathKey, Instant>,
     next_send_index: usize,
     performance: MppPerformanceConfig,
     extra_traffic: ExtraTrafficLedger,
@@ -109,7 +116,7 @@ pub(super) enum ReliableRelayQueuedWorkLane {
     Repair,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Byte-bounded queue for product reliable work awaiting sender admission.
 ///
 /// This is above carrier paths: it is sized by product flow-control and repair
@@ -320,6 +327,30 @@ impl ReliableRelaySenderQueue {
             })
     }
 
+    pub(super) fn release_normalized_acked_repairs(&mut self, ranges: &[OffsetRange]) -> usize {
+        if ranges.is_empty() {
+            return 0;
+        }
+        let released = prune_acked_repair_queue(&mut self.critical_repair, ranges)
+            .saturating_add(prune_acked_repair_queue(&mut self.repair, ranges));
+        self.bytes = self.bytes.saturating_sub(released);
+        released
+    }
+
+    pub(super) fn discard_unusable_live_owner_tail_repairs(
+        &mut self,
+        usable: impl Fn(&Frame) -> bool,
+    ) -> usize {
+        let released =
+            discard_unusable_live_owner_tail_repair_queue(&mut self.critical_repair, &usable)
+                .saturating_add(discard_unusable_live_owner_tail_repair_queue(
+                    &mut self.repair,
+                    &usable,
+                ));
+        self.bytes = self.bytes.saturating_sub(released);
+        released
+    }
+
     pub(super) fn commit_front(
         &mut self,
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
@@ -380,6 +411,105 @@ impl ReliableRelaySenderQueue {
     ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
         self.commit_front()
     }
+}
+
+fn prune_acked_repair_queue(
+    queue: &mut VecDeque<ReliableRelayQueuedWork>,
+    ranges: &[OffsetRange],
+) -> usize {
+    let mut released = 0usize;
+    let mut retained = VecDeque::with_capacity(queue.len());
+    while let Some(work) = queue.pop_front() {
+        let ReliableRelayQueuedWorkKind::Repair { frame, cause } = &work.kind else {
+            retained.push_back(work);
+            continue;
+        };
+        let slices = unacked_repair_frame_slices(frame, ranges);
+        let retained_bytes = slices
+            .iter()
+            .map(reliable_stream_frame_payload_bytes)
+            .sum::<usize>();
+        released = released.saturating_add(work.payload_bytes.saturating_sub(retained_bytes));
+        for frame in slices {
+            let mut retained_work = work.clone();
+            retained_work.payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+            retained_work.kind = ReliableRelayQueuedWorkKind::Repair {
+                frame,
+                cause: *cause,
+            };
+            retained.push_back(retained_work);
+        }
+    }
+    *queue = retained;
+    released
+}
+
+fn discard_unusable_live_owner_tail_repair_queue(
+    queue: &mut VecDeque<ReliableRelayQueuedWork>,
+    usable: &impl Fn(&Frame) -> bool,
+) -> usize {
+    let mut released = 0usize;
+    queue.retain(|work| {
+        let ReliableRelayQueuedWorkKind::Repair { frame, cause } = &work.kind else {
+            return true;
+        };
+        let keep = *cause != RelaySendCause::LiveOwnerTailRepair || usable(frame);
+        if !keep {
+            released = released.saturating_add(work.payload_bytes);
+        }
+        keep
+    });
+    released
+}
+
+fn unacked_repair_frame_slices(frame: &Frame, ranges: &[OffsetRange]) -> Vec<Frame> {
+    let Frame::StreamData {
+        stream_id,
+        offset,
+        flags,
+        payload,
+    } = frame
+    else {
+        return vec![frame.clone()];
+    };
+    let frame_end = offset.saturating_add(payload.len() as u64);
+    let mut remaining = vec![(*offset, frame_end)];
+    for range in ranges {
+        let mut next = Vec::with_capacity(remaining.len().saturating_add(1));
+        for (start, end) in remaining {
+            if range.end <= start || range.start >= end {
+                next.push((start, end));
+                continue;
+            }
+            if start < range.start {
+                next.push((start, range.start.min(end)));
+            }
+            if range.end < end {
+                next.push((range.end.max(start), end));
+            }
+        }
+        remaining = next;
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    remaining
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let slice_start = usize::try_from(start.saturating_sub(*offset)).ok()?;
+            let slice_end = usize::try_from(end.saturating_sub(*offset)).ok()?;
+            (slice_start < slice_end && slice_end <= payload.len()).then(|| Frame::StreamData {
+                stream_id: *stream_id,
+                offset: start,
+                flags: if end == frame_end {
+                    *flags
+                } else {
+                    StreamFlags::NONE
+                },
+                payload: payload.slice(slice_start..slice_end),
+            })
+        })
+        .collect()
 }
 
 pub(super) fn reliable_relay_sender_queue_limit(
@@ -1183,7 +1313,7 @@ fn response_target_can_receive_repair(
 ) -> bool {
     match cause {
         RelaySendCause::AckGapRepair => response_target_has_ack_gap_repair_evidence(target),
-        RelaySendCause::PathFailureRepair => {
+        RelaySendCause::LiveOwnerTailRepair | RelaySendCause::PathFailureRepair => {
             response_target_has_path_failure_repair_evidence(target)
         }
         RelaySendCause::StreamData | RelaySendCause::StreamFin | RelaySendCause::RecvProgress => {
@@ -1211,7 +1341,12 @@ fn choose_response_repair_target(
         return Some(same_family_survivor);
     }
     let distinct = choose_lowest_eta_response_target(&repair_targets, avoid_keys, true);
-    if distinct.is_some() || cause == RelaySendCause::AckGapRepair {
+    if distinct.is_some()
+        || matches!(
+            cause,
+            RelaySendCause::AckGapRepair | RelaySendCause::LiveOwnerTailRepair
+        )
+    {
         return distinct;
     }
     choose_lowest_eta_response_target(&repair_targets, avoid_keys, false)
@@ -1262,6 +1397,14 @@ fn choose_response_sender_target(
     let repair = repair_cause.is_some();
     let path_failure_repair = matches!(repair_cause, Some(RelaySendCause::PathFailureRepair));
     let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+    if !repair
+        && matches!(frame, Frame::StreamData { .. })
+        && lower_flights
+            .iter()
+            .any(|flight| !targets.iter().any(|target| target.key == flight.key))
+    {
+        return None;
+    }
     if !repair
         && emit_mode == ResponseCarrierEmitMode::StreamOrdered
         && !relay_frame_is_bulk_stream_data(frame, lane)
@@ -1520,6 +1663,12 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
         capacity_targets.push(target.clone());
     }
     if capacity_targets.is_empty() {
+        return None;
+    }
+    if lower_flights
+        .iter()
+        .any(|flight| !targets.iter().any(|target| target.key == flight.key))
+    {
         return None;
     }
     if !relay_lane_is_bulk(lane) {
@@ -2168,15 +2317,17 @@ fn response_frame_has_carrier_credit(
         },
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_payload_bytes(frame);
-            let lower_flights = if relay_frame_is_bulk_stream_data(frame, lane) && !repair {
+            let lower_flights = if matches!(frame, Frame::StreamData { .. }) && !repair {
                 binding.lower_flights_before_frame(frame)
             } else {
                 Vec::new()
             };
-            let avoid_keys = if repair {
-                binding.flight_keys_overlapping_frame(frame)
-            } else {
-                Vec::new()
+            let avoid_keys = match repair_cause {
+                Some(RelaySendCause::LiveOwnerTailRepair) => {
+                    binding.owner_flight_keys_overlapping_frame(frame)
+                }
+                Some(_) => binding.flight_keys_overlapping_frame(frame),
+                None => Vec::new(),
             };
             let targets = binding.sender_path_targets(lane, payload_bytes);
             choose_response_sender_target(
@@ -2308,15 +2459,17 @@ async fn emit_response_frame_from_sender_service(
         }
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
-            let lower_flights = if relay_frame_is_bulk_stream_data(&frame, lane) && !repair {
+            let lower_flights = if matches!(frame, Frame::StreamData { .. }) && !repair {
                 binding.lower_flights_before_frame(&frame)
             } else {
                 Vec::new()
             };
-            let avoid_keys = if repair {
-                binding.flight_keys_overlapping_frame(&frame)
-            } else {
-                Vec::new()
+            let avoid_keys = match repair_cause {
+                Some(RelaySendCause::LiveOwnerTailRepair) => {
+                    binding.owner_flight_keys_overlapping_frame(&frame)
+                }
+                Some(_) => binding.flight_keys_overlapping_frame(&frame),
+                None => Vec::new(),
             };
             let mut last_error = None;
             loop {
@@ -2477,6 +2630,20 @@ impl ServerResponseSenderService {
 
     pub(super) fn data_bytes(&self) -> usize {
         self.queue.data_bytes()
+    }
+
+    pub(super) fn release_normalized_acked_repairs(&mut self, ranges: &[OffsetRange]) -> usize {
+        self.queue.release_normalized_acked_repairs(ranges)
+    }
+
+    pub(super) fn discard_unusable_live_owner_tail_repairs(
+        &mut self,
+        path_stream: &ReliablePathStream,
+    ) -> usize {
+        self.queue
+            .discard_unusable_live_owner_tail_repairs(|frame| {
+                path_stream.has_live_owner_tail_repair_output_for_frame(frame)
+            })
     }
 
     pub(super) fn extra_traffic_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
@@ -2963,6 +3130,7 @@ impl RelaySenderService {
             stream_id,
             flights: RelayPathFlightLedger::default(),
             ordered_data_owner: None,
+            missing_owner_repair_attempts: HashMap::new(),
             next_send_index: 0,
             performance,
             extra_traffic: ExtraTrafficLedger::default(),
@@ -3253,6 +3421,15 @@ impl RelaySenderService {
                 })
             }
             Err(RuntimeError::SenderServiceBlocked) => Err(RuntimeError::SenderServiceBlocked),
+            Err(err)
+                if cause == RelaySendCause::LiveOwnerTailRepair
+                    && reliable_relay_error_is_migratable(&err) =>
+            {
+                let (_, _) = sender_queue
+                    .commit_front()
+                    .expect("deferred live-tail repair must still be at queue front");
+                Ok(ClientQueuedDispatch::RepairDeferred)
+            }
             Err(err) if reliable_relay_error_is_migratable(&err) => {
                 match attach_reliable_relay_paths(
                     context,
@@ -3314,10 +3491,15 @@ impl RelaySenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
-        let avoid_keys = if cause.is_repair() {
-            self.flights.sent_keys_for_frame(&sent_frame)
-        } else {
-            Vec::new()
+        let avoid_keys = match cause {
+            RelaySendCause::LiveOwnerTailRepair => self.flights.live_owner_tail_repair_owner_keys(
+                &sent_frame,
+                &remotes.path_keys(),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+            cause if cause.is_repair() => self.flights.sent_keys_for_frame(&sent_frame),
+            _ => Vec::new(),
         };
         let path_key = self
             .emit_relay_frame(context, remotes, frame, cause, &avoid_keys)
@@ -3431,6 +3613,14 @@ impl RelaySenderService {
         if remotes.paths.is_empty() {
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
+        if !cause.is_repair()
+            && let Some((offset, _, _)) = reliable_stream_frame_extent(frame)
+            && self
+                .flights
+                .has_missing_ordering_owner_before_offset(offset, &remotes.path_keys())
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         self.next_send_index %= remotes.paths.len();
         if self
             .ordered_data_owner
@@ -3476,6 +3666,7 @@ impl RelaySenderService {
         avoid_keys: &[RelayPathKey],
         ordinary_stream_data: bool,
     ) -> Result<usize, RuntimeError> {
+        let requires_distinct_output = cause == RelaySendCause::LiveOwnerTailRepair;
         let payload_bytes = reliable_stream_frame_payload_bytes(frame);
         if matches!(cause, RelaySendCause::RecvProgress)
             && let Some(position) = choose_active_recv_progress_path_position(remotes, frame, cause)
@@ -3487,9 +3678,10 @@ impl RelaySenderService {
             .iter()
             .any(|path| path.placement == RelayPathPlacement::Active);
         let ordinary_path_allowed = |path: &ReliableRelayRemotePath| {
-            !ordinary_stream_data
+            (!ordinary_stream_data
                 || !has_active_path
-                || path.placement == RelayPathPlacement::Active
+                || path.placement == RelayPathPlacement::Active)
+                && (!requires_distinct_output || path.placement != RelayPathPlacement::Validation)
         };
         let can_enqueue = |path: &ReliableRelayRemotePath| {
             relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
@@ -3524,18 +3716,26 @@ impl RelaySenderService {
                 })
                 .map(|(position, _, _)| position)
         };
-        if let Some(position) = choose(true).or_else(|| choose(false)) {
+        let selected = if requires_distinct_output {
+            choose(true)
+        } else {
+            choose(true).or_else(|| choose(false))
+        };
+        if let Some(position) = selected {
             return Ok(position);
         }
-        let capacity_fallback = remotes
+        let distinct_capacity_fallback = remotes
             .paths
             .iter()
             .enumerate()
             .filter(|(_, path)| ordinary_path_allowed(path))
             .filter(|(_, path)| can_enqueue(path))
             .map(|(position, _)| position)
-            .find(|position| !avoid_keys.contains(&remotes.paths[*position].key()))
-            .or_else(|| {
+            .find(|position| !avoid_keys.contains(&remotes.paths[*position].key()));
+        let capacity_fallback = if requires_distinct_output {
+            distinct_capacity_fallback
+        } else {
+            distinct_capacity_fallback.or_else(|| {
                 remotes
                     .paths
                     .iter()
@@ -3544,11 +3744,19 @@ impl RelaySenderService {
                     .filter(|(_, path)| can_enqueue(path))
                     .map(|(position, _)| position)
                     .next()
-            });
+            })
+        };
         if let Some(position) = capacity_fallback {
             return Ok(position);
         }
-        if remotes.paths.iter().any(ordinary_path_allowed) {
+        let has_eligible_path = remotes.paths.iter().any(ordinary_path_allowed);
+        let has_distinct_eligible_path = remotes
+            .paths
+            .iter()
+            .any(|path| ordinary_path_allowed(path) && !avoid_keys.contains(&path.key()));
+        if (requires_distinct_output && has_distinct_eligible_path)
+            || (!requires_distinct_output && has_eligible_path)
+        {
             Err(RuntimeError::SenderServiceBlocked)
         } else {
             Err(RuntimeError::ReliablePathSessionClosed)
@@ -3561,6 +3769,7 @@ impl RelaySenderService {
         ranges: &[OffsetRange],
     ) {
         for release in self.flights.release_normalized_acked_ranges(ranges) {
+            self.missing_owner_repair_attempts.remove(&release.key);
             context.release_relay_path_inflight(
                 release.key.underlay,
                 release.key.index,
@@ -3591,6 +3800,48 @@ impl RelaySenderService {
         }
     }
 
+    pub(super) fn discard_unusable_live_owner_tail_repairs(
+        &self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        remotes: &ReliableRelayRemoteSet,
+    ) -> usize {
+        let live_keys = remotes
+            .paths
+            .iter()
+            .filter(|path| path.placement != RelayPathPlacement::Validation)
+            .map(ReliableRelayRemotePath::key)
+            .collect::<Vec<_>>();
+        sender_queue.discard_unusable_live_owner_tail_repairs(|frame| {
+            let owner_keys = self
+                .flights
+                .ordering_owner_keys_for_frame(frame, &live_keys);
+            !owner_keys.is_empty() && live_keys.iter().any(|key| !owner_keys.contains(key))
+        })
+    }
+
+    pub(super) fn unreported_missing_owner_keys(
+        &mut self,
+        remotes: &ReliableRelayRemoteSet,
+        retry_after: Duration,
+    ) -> Vec<RelayPathKey> {
+        let owner_keys = self.flights.ordering_owner_keys();
+        self.missing_owner_repair_attempts
+            .retain(|key, _| owner_keys.contains(key) && !remotes.contains_path_key(*key));
+        let now = Instant::now();
+        owner_keys
+            .into_iter()
+            .filter(|key| {
+                !remotes.contains_path_key(*key)
+                    && self
+                        .missing_owner_repair_attempts
+                        .get(key)
+                        .is_none_or(|attempt| {
+                            now.saturating_duration_since(*attempt) >= retry_after
+                        })
+            })
+            .collect()
+    }
+
     pub(super) fn release_all(&mut self, context: &ClientPathContext) {
         for release in self.flights.drain_all() {
             context.release_relay_path_inflight(
@@ -3599,6 +3850,22 @@ impl RelaySenderService {
                 release.bytes,
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn age_product_flights_for_test(&mut self, age: Duration) {
+        self.flights.age_product_flights_for_test(age);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_owner_frame_for_test(&mut self, key: RelayPathKey, frame: &Frame) {
+        self.flights.record_owner_frame(key, frame);
+        self.ordered_data_owner = Some(key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn ordered_data_owner_for_test(&self) -> Option<RelayPathKey> {
+        self.ordered_data_owner
     }
 
     pub(super) async fn reannounce_active_path(
@@ -3784,6 +4051,117 @@ impl RelaySenderService {
         Ok(sent_any)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_live_owner_tail_repair(
+        &mut self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &ReliableSendStream,
+        last_send_ack_ranges: &[OffsetRange],
+        last_send_ack_complete: bool,
+        last_send_ack_frontier: u64,
+        lane: FlowLane,
+    ) -> bool {
+        if !last_send_ack_complete
+            || last_send_ack_frontier == 0
+            || last_send_ack_frontier >= send_stream.next_offset()
+            || send_stream.repair_bytes() == 0
+            || !matches!(
+                last_send_ack_ranges,
+                [range] if range.start == 0 && range.end == last_send_ack_frontier
+            )
+        {
+            return false;
+        }
+        let live_keys = remotes
+            .paths
+            .iter()
+            .filter(|path| path.placement != RelayPathPlacement::Validation)
+            .map(ReliableRelayRemotePath::key)
+            .collect::<Vec<_>>();
+        if live_keys.len() <= 1 {
+            return false;
+        }
+        let repair_limit = reliable_critical_tail_repair_limit_bytes(
+            live_keys
+                .iter()
+                .map(|key| {
+                    adaptive_reliable_relay_repair_bytes(
+                        context.reliable_path_snapshot(*key),
+                        lane,
+                        context.mux_limits,
+                    )
+                })
+                .max()
+                .unwrap_or(0),
+            send_stream.repair_bytes(),
+            context.mux_limits,
+        );
+        if repair_limit == 0 {
+            return false;
+        }
+        let repair_frames = send_stream.retransmission_frames_for_ranges(
+            &[OffsetRange {
+                start: last_send_ack_frontier,
+                end: send_stream.next_offset(),
+            }],
+            repair_limit,
+        );
+        let mut queued = false;
+        for frame in repair_frames {
+            let expected_owner_keys = self
+                .flights
+                .ordering_owner_keys_for_frame(&frame, &live_keys);
+            if expected_owner_keys.is_empty()
+                || !live_keys
+                    .iter()
+                    .any(|key| !expected_owner_keys.contains(key))
+            {
+                break;
+            }
+            let first_repair_after = expected_owner_keys
+                .iter()
+                .map(|key| {
+                    reliable_relay_tail_repair_delay(context.reliable_path_snapshot(*key), lane)
+                })
+                .max()
+                .unwrap_or_default();
+            let repeat_repair_after =
+                first_repair_after.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+            let owner_keys = self.flights.live_owner_tail_repair_owner_keys(
+                &frame,
+                &live_keys,
+                first_repair_after,
+                repeat_repair_after,
+            );
+            if owner_keys.len() != expected_owner_keys.len() {
+                break;
+            }
+            if sender_queue.has_queued_repair_overlap(&frame) {
+                continue;
+            }
+            let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+            self.enqueue_critical_repair_frame(
+                sender_queue,
+                frame,
+                RelaySendCause::LiveOwnerTailRepair,
+            );
+            queued = true;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "repair",
+                format_args!(
+                    "stream_id={} owner_underlay={:?} owner_index={} cause=live_owner_tail queued=true payload_bytes={}",
+                    self.stream_id.0, owner_keys[0].underlay, owner_keys[0].index, payload_bytes,
+                ),
+            );
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = payload_bytes;
+        }
+        queued
+    }
+
     pub(super) fn enqueue_failed_path_gap_repairs(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
@@ -3800,22 +4178,27 @@ impl RelaySenderService {
         let repair_path = remotes
             .primary_path_key()
             .and_then(|key| context.reliable_path_snapshot(key));
-        let repair_limit =
-            adaptive_reliable_relay_repair_bytes(repair_path, lane, context.mux_limits)
-                .min(self.repair_extra_event_budget_remaining(context.mux_limits));
+        let repair_limit = reliable_critical_tail_repair_limit_bytes(
+            adaptive_reliable_relay_repair_bytes(repair_path, lane, context.mux_limits),
+            send_stream.repair_bytes(),
+            context.mux_limits,
+        );
         let repair_frames = send_stream.retransmission_frames_for_ranges(&ranges, repair_limit);
         if repair_frames.is_empty() {
             return false;
         }
         let mut queued = false;
         for frame in repair_frames {
-            let queued_frame = self.enqueue_repair_frame_with_priority(
-                sender_queue,
-                frame,
-                RelaySendCause::PathFailureRepair,
-                context.mux_limits,
-                true,
-            );
+            let queued_frame = if sender_queue.has_queued_repair_overlap(&frame) {
+                false
+            } else {
+                self.enqueue_critical_repair_frame(
+                    sender_queue,
+                    frame,
+                    RelaySendCause::PathFailureRepair,
+                );
+                true
+            };
             queued |= queued_frame;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -3825,6 +4208,10 @@ impl RelaySenderService {
                     self.stream_id.0, failed_key.underlay, failed_key.index, queued_frame,
                 ),
             );
+        }
+        if queued {
+            self.missing_owner_repair_attempts
+                .insert(failed_key, Instant::now());
         }
         queued
     }
@@ -3946,6 +4333,78 @@ mod tests {
             "critical RepairData closes an active product hole and must preempt later OwnerData"
         );
         assert_eq!(work.payload_bytes, 6);
+    }
+
+    #[test]
+    fn sender_queue_trims_and_releases_acked_live_tail_repair() {
+        let stream_id = StreamId(80);
+        let mut queue = ReliableRelaySenderQueue::default();
+        queue.push_critical_repair_with_cause(
+            Frame::StreamData {
+                stream_id,
+                offset: 128,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(&[0x5a; 64]),
+            },
+            RelaySendCause::LiveOwnerTailRepair,
+        );
+
+        assert_eq!(
+            queue.release_normalized_acked_repairs(&[OffsetRange { start: 0, end: 160 }]),
+            32,
+        );
+        assert_eq!(queue.bytes(), 32);
+        assert!(matches!(
+            queue.front().map(|(_, work)| &work.kind),
+            Some(ReliableRelayQueuedWorkKind::Repair {
+                frame: Frame::StreamData { offset: 160, payload, .. },
+                cause: RelaySendCause::LiveOwnerTailRepair,
+            }) if payload.len() == 32
+        ));
+
+        assert_eq!(
+            queue.release_normalized_acked_repairs(&[OffsetRange { start: 0, end: 192 }]),
+            32,
+        );
+        assert!(queue.is_empty());
+        assert_eq!(queue.bytes(), 0);
+    }
+
+    #[test]
+    fn sender_queue_discards_only_unusable_live_owner_tail_repair() {
+        let stream_id = StreamId(81);
+        let mut queue = ReliableRelaySenderQueue::default();
+        for cause in [
+            RelaySendCause::LiveOwnerTailRepair,
+            RelaySendCause::PathFailureRepair,
+        ] {
+            queue.push_critical_repair_with_cause(
+                Frame::StreamData {
+                    stream_id,
+                    offset: if cause == RelaySendCause::LiveOwnerTailRepair {
+                        0
+                    } else {
+                        64
+                    },
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(&[0x5b; 64]),
+                },
+                cause,
+            );
+        }
+
+        assert_eq!(
+            queue.discard_unusable_live_owner_tail_repairs(|_| false),
+            64,
+        );
+        assert_eq!(queue.bytes(), 64);
+        assert!(matches!(
+            queue.front().map(|(_, work)| &work.kind),
+            Some(ReliableRelayQueuedWorkKind::Repair {
+                cause: RelaySendCause::PathFailureRepair,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4117,6 +4576,57 @@ mod tests {
             )
             .is_none(),
             "RepairData is correctness traffic, not path discovery; unproven outputs must not receive repair merely because no proven target is available"
+        );
+    }
+
+    #[test]
+    fn response_owner_data_waits_for_missing_lower_owner_debt() {
+        let frame = Frame::StreamData {
+            stream_id: StreamId(82),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"owner"),
+        };
+        let survivor = response_target(1, UnderlayProtocol::Udp, 10.0, 0, 1_000_000, false);
+        let lower_flights = [
+            CarrierPathFlightDebt {
+                key: survivor.key,
+                bytes: 64,
+            },
+            CarrierPathFlightDebt {
+                key: CarrierPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    path_id: PathId(9),
+                },
+                bytes: 64,
+            },
+        ];
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_and_epoch(
+                std::slice::from_ref(&survivor),
+                FlowLane::Latency,
+                reliable_stream_frame_payload_bytes(&frame),
+                MuxLimits::default(),
+                &lower_flights,
+                None,
+                128,
+                None,
+            )
+            .is_none(),
+            "a sole survivor must not receive later OwnerData while a missing lower owner still has debt"
+        );
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[survivor],
+                FlowLane::Latency,
+                reliable_stream_frame_payload_bytes(&frame),
+                MuxLimits::default(),
+                &[],
+                None,
+                0,
+                None,
+            )
+            .is_some()
         );
     }
 

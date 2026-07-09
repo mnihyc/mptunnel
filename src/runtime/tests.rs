@@ -2480,16 +2480,6 @@ fn reliable_recv_progress_default_bulk_ack_step_tracks_service_quantum() {
 }
 
 #[test]
-fn tcp_sole_survivor_reannounce_budget_uses_persistent_congestion_threshold() {
-    let low_latency_budget =
-        reliable_relay_sole_survivor_reannounce_attempts(transport_pto_from_snapshot(None));
-    let max_timeout_budget =
-        reliable_relay_sole_survivor_reannounce_attempts(default_transport_pto() * 4);
-    assert_eq!(low_latency_budget, QUIC_PERSISTENT_CONGESTION_THRESHOLD);
-    assert_eq!(max_timeout_budget, QUIC_PERSISTENT_CONGESTION_THRESHOLD);
-}
-
-#[test]
 fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(11), mux_limits);

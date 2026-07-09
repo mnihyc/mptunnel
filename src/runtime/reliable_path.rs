@@ -119,6 +119,11 @@ impl ReliablePathStream {
         self.output.has_repair_output_for_frame(frame)
     }
 
+    pub(super) fn has_live_owner_tail_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        self.output
+            .has_live_owner_tail_repair_output_for_frame(frame)
+    }
+
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
         self.output.has_failed_owner_repair_output_for_frame(frame)
     }
@@ -339,39 +344,21 @@ impl FixedReliablePathOutput {
             return;
         }
         let mut model = self.model.lock().expect("fixed reliable path model lock");
-        let acked_offsets = model
-            .flights
-            .iter()
-            .filter_map(|(offset, path_flights)| {
-                path_flights
-                    .iter()
-                    .any(|flight| {
-                        ranges
-                            .iter()
-                            .any(|range| range.start <= *offset && range.end >= flight.end)
-                    })
-                    .then_some(*offset)
-            })
-            .collect::<Vec<_>>();
-        if acked_offsets.is_empty() {
+        let released = release_carrier_path_flight_ranges(&mut model.flights, ranges);
+        if released.is_empty() {
             return;
         }
         let now = Instant::now();
         let mut sample_bytes = 0_u64;
         let mut sample_start = now;
         let mut released_proven_flights = 0_u32;
-        for offset in acked_offsets {
-            if let Some(path_flights) = model.flights.remove(&offset) {
-                let path_proving = carrier_path_flights_have_unambiguous_owner_ack(&path_flights);
-                for flight in path_flights {
-                    model.bytes_in_flight =
-                        model.bytes_in_flight.saturating_sub(flight.bytes as u64);
-                    if path_proving && flight.kind.is_ordering_owner() {
-                        sample_bytes = sample_bytes.saturating_add(flight.bytes as u64);
-                        sample_start = sample_start.min(flight.sent_at);
-                        released_proven_flights = released_proven_flights.saturating_add(1);
-                    }
-                }
+        for (_, release) in released {
+            let flight = release.flight;
+            model.bytes_in_flight = model.bytes_in_flight.saturating_sub(flight.bytes as u64);
+            if release.path_proving {
+                sample_bytes = sample_bytes.saturating_add(flight.bytes as u64);
+                sample_start = sample_start.min(flight.sent_at);
+                released_proven_flights = released_proven_flights.saturating_add(1);
             }
         }
         if let Some(sample) =
@@ -586,6 +573,13 @@ impl ReliablePathStreamOutput {
         match self {
             Self::Fixed(_) => true,
             Self::Switchable(binding) => binding.has_repair_output_for_frame(frame),
+        }
+    }
+
+    pub(super) fn has_live_owner_tail_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_live_owner_tail_repair_output_for_frame(frame),
         }
     }
 
@@ -1005,6 +999,19 @@ impl ResponseStreamBinding {
             .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
+    pub(super) fn has_live_owner_tail_repair_output_for_frame(&self, frame: &Frame) -> bool {
+        let owner_keys = self.owner_flight_keys_overlapping_frame(frame);
+        if owner_keys.is_empty() {
+            return false;
+        }
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .any(|entry| !owner_keys.contains(&entry.key))
+    }
+
     pub(super) fn has_recent_live_repair_flight_overlap(
         &self,
         frame: &Frame,
@@ -1093,20 +1100,9 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let acked_offsets = flights
-            .iter()
-            .filter_map(|(offset, path_flights)| {
-                path_flights
-                    .iter()
-                    .any(|flight| {
-                        ranges
-                            .iter()
-                            .any(|range| range.start <= *offset && range.end >= flight.end)
-                    })
-                    .then_some(*offset)
-            })
-            .collect::<Vec<_>>();
-        if acked_offsets.is_empty() {
+        let released = release_carrier_path_flight_ranges(&mut flights, ranges);
+        if released.is_empty() {
+            drop(flights);
             let ordering_update = self
                 .ack_ordering
                 .lock()
@@ -1116,21 +1112,6 @@ impl ResponseStreamBinding {
                 self.notify_update();
             }
             return;
-        }
-        let mut released = Vec::new();
-        for offset in acked_offsets {
-            if let Some(path_flights) = flights.remove(&offset) {
-                let path_proving = carrier_path_flights_have_unambiguous_owner_ack(&path_flights);
-                released.extend(path_flights.into_iter().map(|flight| {
-                    (
-                        offset,
-                        CarrierPathReleasedFlight {
-                            flight,
-                            path_proving: path_proving && flight.kind.is_ordering_owner(),
-                        },
-                    )
-                }));
-            }
         }
         drop(flights);
 
@@ -1431,6 +1412,29 @@ impl ResponseStreamBinding {
         keys
     }
 
+    pub(super) fn owner_flight_keys_overlapping_frame(&self, frame: &Frame) -> Vec<CarrierPathKey> {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return Vec::new();
+        };
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        let mut keys = Vec::new();
+        for (_, path_flights) in flights.range(..end) {
+            for flight in path_flights {
+                if flight.end <= start
+                    || !flight.kind.is_ordering_owner()
+                    || keys.contains(&flight.key)
+                {
+                    continue;
+                }
+                keys.push(flight.key);
+            }
+        }
+        keys
+    }
+
     pub(super) fn lower_flights_before_offset(&self, offset: u64) -> Vec<CarrierPathFlightDebt> {
         let mut debts = BTreeMap::<u64, CarrierPathFlightDebt>::new();
         {
@@ -1628,11 +1632,136 @@ fn response_stream_live_role_update(
     }
 }
 
-fn carrier_path_flights_have_unambiguous_owner_ack(flights: &[CarrierPathFlight]) -> bool {
-    matches!(
-        flights,
-        [flight] if flight.kind.is_ordering_owner()
-    )
+fn release_carrier_path_flight_ranges(
+    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
+    ranges: &[OffsetRange],
+) -> Vec<(u64, CarrierPathReleasedFlight)> {
+    if ranges.is_empty() || flights.is_empty() {
+        return Vec::new();
+    }
+
+    let original_flights = std::mem::take(flights)
+        .into_iter()
+        .flat_map(|(start, path_flights)| {
+            path_flights.into_iter().map(move |flight| (start, flight))
+        })
+        .collect::<Vec<_>>();
+    let ambiguous_intervals = carrier_path_ambiguous_flight_intervals(&original_flights);
+    let mut released = Vec::new();
+    for (start, flight) in original_flights.iter().copied() {
+        let split = split_carrier_flight_interval_by_ack(start, flight.end, ranges);
+        for (acked_start, acked_end) in split.acked {
+            let bytes = carrier_flight_interval_bytes(acked_start, acked_end);
+            if bytes == 0 {
+                continue;
+            }
+            released.push((
+                acked_start,
+                CarrierPathReleasedFlight {
+                    flight: CarrierPathFlight {
+                        end: acked_end,
+                        bytes,
+                        ..flight
+                    },
+                    path_proving: flight.kind.is_ordering_owner()
+                        && !carrier_flight_intervals_overlap(
+                            &ambiguous_intervals,
+                            acked_start,
+                            acked_end,
+                        ),
+                },
+            ));
+        }
+        for (retained_start, retained_end) in split.retained {
+            let bytes = carrier_flight_interval_bytes(retained_start, retained_end);
+            if bytes == 0 {
+                continue;
+            }
+            flights
+                .entry(retained_start)
+                .or_default()
+                .push(CarrierPathFlight {
+                    end: retained_end,
+                    bytes,
+                    ..flight
+                });
+        }
+    }
+    released
+}
+
+fn carrier_path_ambiguous_flight_intervals(
+    flights: &[(u64, CarrierPathFlight)],
+) -> Vec<(u64, u64)> {
+    let mut events = BTreeMap::<u64, i64>::new();
+    for (start, flight) in flights {
+        *events.entry(*start).or_default() += 1;
+        *events.entry(flight.end).or_default() -= 1;
+    }
+    let mut intervals = Vec::new();
+    let mut active = 0_i64;
+    let mut previous = None;
+    for (position, delta) in events {
+        if let Some(previous) = previous
+            && previous < position
+            && active > 1
+        {
+            intervals.push((previous, position));
+        }
+        active += delta;
+        previous = Some(position);
+    }
+    intervals
+}
+
+fn carrier_flight_intervals_overlap(intervals: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let position = intervals.partition_point(|(_, interval_end)| *interval_end <= start);
+    intervals
+        .get(position)
+        .is_some_and(|(interval_start, _)| *interval_start < end)
+}
+
+struct CarrierFlightIntervalSplit {
+    acked: Vec<(u64, u64)>,
+    retained: Vec<(u64, u64)>,
+}
+
+fn split_carrier_flight_interval_by_ack(
+    start: u64,
+    end: u64,
+    ranges: &[OffsetRange],
+) -> CarrierFlightIntervalSplit {
+    let mut acked = Vec::new();
+    let mut retained = Vec::new();
+    let mut cursor = start;
+    for range in ranges {
+        if range.end <= cursor {
+            continue;
+        }
+        if range.start >= end {
+            break;
+        }
+        let ack_start = cursor.max(range.start);
+        if cursor < ack_start {
+            retained.push((cursor, ack_start));
+        }
+        let ack_end = end.min(range.end);
+        if ack_start < ack_end {
+            acked.push((ack_start, ack_end));
+            cursor = ack_end;
+        }
+        if cursor >= end {
+            break;
+        }
+    }
+    if cursor < end {
+        retained.push((cursor, end));
+    }
+    CarrierFlightIntervalSplit { acked, retained }
+}
+
+fn carrier_flight_interval_bytes(start: u64, end: u64) -> usize {
+    usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
 fn product_flights_have_recent_repair_overlap(
@@ -2412,6 +2541,87 @@ mod tests {
             duplicate_entry.delivery_samples, 0,
             "repair duplicate STREAM_ACK must not become response bulk evidence"
         );
+    }
+
+    #[test]
+    fn partial_same_start_response_ack_releases_each_copy_and_retains_owner_suffix() {
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let repair = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                repair.underlay,
+                repair.path_id,
+                repair_commands,
+                FlowLane::Latency,
+                StreamOpenRole::Repair,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached,
+        );
+        binding.record_owner_flight(owner, &stream_data_frame_at(0, 4096));
+        binding.record_repair_flight(repair, &stream_data_frame_at(0, 1024));
+
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 1024,
+        }]);
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            let owner_entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == owner)
+                .expect("owner output exists");
+            let repair_entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == repair)
+                .expect("repair output exists");
+            assert_eq!(owner_entry.bytes_in_flight, 3072);
+            assert_eq!(repair_entry.bytes_in_flight, 0);
+            assert_eq!(
+                owner_entry.delivery_samples, 0,
+                "the duplicated prefix ACK is not path-scoped owner evidence"
+            );
+            assert_eq!(repair_entry.delivery_samples, 0);
+        }
+        let owner_suffix = stream_data_frame_at(1024, 3072);
+        assert_eq!(
+            binding.owner_flight_keys_overlapping_frame(&owner_suffix),
+            vec![owner],
+            "the longer owner flight must survive after its shorter same-start repair copy is released"
+        );
+        assert_eq!(
+            binding.flight_keys_overlapping_frame(&owner_suffix),
+            vec![owner]
+        );
+
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 4096,
+        }]);
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let owner_entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == owner)
+            .expect("owner output exists");
+        let repair_entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == repair)
+            .expect("repair output exists");
+        assert_eq!(owner_entry.bytes_in_flight, 0);
+        assert_eq!(repair_entry.bytes_in_flight, 0);
+        assert_eq!(
+            owner_entry.delivery_samples, 1,
+            "the later owner-only suffix ACK may become path-scoped evidence"
+        );
+        assert_eq!(repair_entry.delivery_samples, 0);
     }
 
     #[test]

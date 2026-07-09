@@ -33,7 +33,7 @@ where
     let mut last_stream_progress_at = Instant::now();
     let mut last_delivery_progress_at = Instant::now();
     let mut last_response_stall_repair_at = Instant::now();
-    let mut response_stall_reannounce_attempts = 0_u32;
+    let mut last_product_stall_attempt_at = None;
     let mut last_receive_hole_repair_at = Instant::now();
     let mut receive_hole_repair_attempts = 0_u32;
     let mut interactive_response_pending = false;
@@ -41,6 +41,8 @@ where
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_frontier = 0_u64;
+    let mut last_send_ack_ranges = Vec::<OffsetRange>::new();
+    let mut last_send_ack_complete = false;
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let mut sender_retry_at: Option<tokio::time::Instant> = None;
     let (validation_open_tx, mut validation_open_rx) = mpsc::channel(
@@ -80,6 +82,21 @@ where
         );
         let relay_demand = demand_update.demand;
         let relay_lane = relay_demand.lane;
+        for failed_key in sender.unreported_missing_owner_keys(
+            &remotes,
+            reliable_relay_stall_timeout(path_snapshot, relay_lane),
+        ) {
+            if sender.enqueue_failed_path_gap_repairs(
+                &mut sender_queue,
+                context,
+                &remotes,
+                &send_stream,
+                failed_key,
+                relay_lane,
+            ) {
+                sender_retry_at = None;
+            }
+        }
         if demand_update.promoted_to_throughput {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -241,8 +258,12 @@ where
             path_snapshot,
             relay_lane,
         );
-        let stall_deadline =
-            reliable_relay_stall_deadline(stall_progress_anchor, path_snapshot, relay_lane);
+        let stall_deadline = reliable_relay_product_stall_deadline(
+            stall_progress_anchor,
+            last_product_stall_attempt_at,
+            path_snapshot,
+            relay_lane,
+        );
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot, relay_lane),
@@ -250,6 +271,7 @@ where
         if sender_retry_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
             sender_retry_at = None;
         }
+        sender.discard_unusable_live_owner_tail_repairs(&mut sender_queue, &remotes);
         let inbound_frame_ready = remotes.has_buffered_frame();
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
             sender_queue.is_empty(),
@@ -416,10 +438,19 @@ where
                 }
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
-                if reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
-                    &remotes,
-                    relay_lane,
-                ) {
+                if reliable_relay_product_stall_preserves_attached_path_set(&remotes) {
+                    if sender.enqueue_live_owner_tail_repair(
+                        &mut sender_queue,
+                        context,
+                        &remotes,
+                        &send_stream,
+                        &last_send_ack_ranges,
+                        last_send_ack_complete,
+                        last_send_ack_frontier,
+                        relay_lane,
+                    ) {
+                        sender_retry_at = None;
+                    }
                     match sender.send_recv_progress(
                         &mut remotes,
                         context,
@@ -441,9 +472,9 @@ where
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
-                        "client_product_stall_keeps_same_underlay_subflow_set",
+                        "client_product_stall_keeps_attached_path_set",
                         format_args!(
-                            "stream_id={} active_underlay={:?} attached_paths={} repair_bytes={} recv_reorder_bytes={} sent_offset={} cause=stable_membership",
+                            "stream_id={} active_underlay={:?} attached_paths={} repair_bytes={} recv_reorder_bytes={} sent_offset={} cause=product_stall_only",
                             stream_id.0,
                             remotes.active_path_underlay(),
                             remotes.path_keys().len(),
@@ -453,6 +484,7 @@ where
                         ),
                     );
                     last_response_stall_repair_at = Instant::now();
+                    last_product_stall_attempt_at = Some(Instant::now());
                     continue;
                 }
                 if reliable_relay_product_stall_should_try_alternate_attach(&remotes) {
@@ -471,8 +503,21 @@ where
                         Ok(attached) if attached > 0 => {
                             sender_retry_at = None;
                             send_stream.update_max_offset(remotes.max_offset());
+                            if sender.enqueue_live_owner_tail_repair(
+                                &mut sender_queue,
+                                context,
+                                &remotes,
+                                &send_stream,
+                                &last_send_ack_ranges,
+                                last_send_ack_complete,
+                                last_send_ack_frontier,
+                                relay_lane,
+                            ) {
+                                sender_retry_at = None;
+                            }
                             last_stream_progress_at = Instant::now();
                             last_response_stall_repair_at = Instant::now();
+                            last_product_stall_attempt_at = Some(Instant::now());
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
                                 "client_product_stall_attached_alternate",
@@ -531,113 +576,62 @@ where
                         );
                         last_response_stall_repair_at = Instant::now();
                         last_stream_progress_at = Instant::now();
+                        last_product_stall_attempt_at = Some(Instant::now());
                         continue;
                     }
                 }
-                if remotes.path_keys().len() <= 1 {
-                    let reannounce_budget = reliable_relay_sole_survivor_reannounce_attempts(
-                        reliable_relay_stall_timeout(path_snapshot, relay_lane),
-                    );
-                    if response_stall_reannounce_attempts < reannounce_budget {
-                        response_stall_reannounce_attempts =
-                            response_stall_reannounce_attempts.saturating_add(1);
-                        match sender
-                            .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
-                            .await
-                        {
-                            Ok(()) => {
-                                send_stream.update_max_offset(remotes.max_offset());
-                                last_stream_progress_at = Instant::now();
-                                last_response_stall_repair_at = Instant::now();
-                                continue;
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "warning: reliable stall sole-survivor reannounce failed: {err}"
-                                );
-                            }
-                        }
-                    } else {
-                        response_stall_reannounce_attempts = 0;
-                    }
-                }
-                let failed_key = remotes.active_path_instance().map(|instance| instance.key);
-                if let Some(instance) = remotes.active_path_instance() {
-                    remotes.fail_path_instance(context, instance).await;
-                }
-                if let Some(failed_key) = failed_key {
-                    recovery_excluded_paths.insert(failed_key);
-                }
-                if !remotes.is_empty() {
-                    match sender
-                        .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
-                        .await
-                    {
-                        Ok(()) => {
-                            send_stream.update_max_offset(remotes.max_offset());
-                            last_stream_progress_at = Instant::now();
-                            last_response_stall_repair_at = Instant::now();
-                            if let Some(failed_key) = failed_key
-                                && sender.enqueue_failed_path_gap_repairs(
-                                    &mut sender_queue,
-                                    context,
-                                    &remotes,
-                                    &send_stream,
-                                    failed_key,
-                                    relay_lane,
-                                )
-                            {
-                                sender_retry_at = None;
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            eprintln!("warning: reliable stall survivor reannounce failed: {err}");
-                        }
-                    }
-                }
-                match attach_reliable_relay_paths_with_recovery_exclusions(
-                    context,
-                    &spec,
-                    relay_lane,
+                match sender.send_recv_progress(
                     &mut remotes,
-                    &send_stream,
-                    !local_open,
-                    ReliableRelayAttachMode::Any,
-                    &mut recovery_excluded_paths,
+                    context,
+                    &recv_stream,
+                    &mut recv_progress,
+                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                 )
                 .await
                 {
-                    Ok(attached) if attached > 0 => {
-                        sender_retry_at = None;
-                        send_stream.update_max_offset(remotes.max_offset());
-                        last_stream_progress_at = Instant::now();
-                        last_response_stall_repair_at = Instant::now();
-                        if let Some(failed_key) = failed_key
-                            && sender.enqueue_failed_path_gap_repairs(
-                                &mut sender_queue,
-                                context,
-                                &remotes,
-                                &send_stream,
-                                failed_key,
-                                relay_lane,
-                            )
-                        {
-                            sender_retry_at = None;
+                    Ok(sent) => {
+                        if sent {
+                            last_recv_progress_sent_at = Instant::now();
                         }
-                        continue;
                     }
-                    Ok(_) => {
-                        last_stream_progress_at = Instant::now();
-                        last_response_stall_repair_at = Instant::now();
+                    Err(err) if reliable_relay_error_is_migratable(&err) => {
+                        sender_retry_at = None;
+                        match attach_reliable_relay_paths_with_recovery_exclusions(
+                            context,
+                            &spec,
+                            relay_lane,
+                            &mut remotes,
+                            &send_stream,
+                            !local_open,
+                            ReliableRelayAttachMode::Any,
+                            &mut recovery_excluded_paths,
+                        )
+                        .await
+                        {
+                            Ok(attached) if attached > 0 => {
+                                send_stream.update_max_offset(remotes.max_offset());
+                            }
+                            Ok(_) => break Err(err),
+                            Err(err) => break Err(err),
+                        }
                     }
-                    Err(err) if remotes.is_empty() => break Err(err),
-                    Err(err) => {
-                        eprintln!("warning: reliable stream stall repair failed: {err}");
-                        last_stream_progress_at = Instant::now();
-                        last_response_stall_repair_at = Instant::now();
-                    }
+                    Err(err) => break Err(err),
                 }
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "client_product_stall_keeps_carrier_membership",
+                    format_args!(
+                        "stream_id={} active_underlay={:?} attached_paths={} repair_bytes={} recv_reorder_bytes={} sent_offset={} cause=product_stall_only",
+                        stream_id.0,
+                        remotes.active_path_underlay(),
+                        remotes.path_keys().len(),
+                        send_stream.repair_bytes(),
+                        recv_stream.reorder_bytes(),
+                        send_stream.next_offset(),
+                    ),
+                );
+                last_response_stall_repair_at = Instant::now();
+                last_product_stall_attempt_at = Some(Instant::now());
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.path_keys().len() > 1
                 && reliable_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
@@ -815,6 +809,9 @@ where
                             let _ = payload_bytes;
                             dispatched_items = dispatched_items.saturating_add(1);
                             last_stream_progress_at = Instant::now();
+                        }
+                        Ok(ClientQueuedDispatch::RepairDeferred) => {
+                            dispatched_items = dispatched_items.saturating_add(1);
                         }
                         Err(RuntimeError::SenderServiceBlocked) => {
                             blocked_by_carrier = true;
@@ -1061,27 +1058,30 @@ where
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         remotes.fail_path_instance(context, instance).await;
                         recovery_excluded_paths.insert(path_key);
-                        if !remotes.is_empty()
-                            && let Err(err) = sender
-                                .reannounce_active_path(context, &mut remotes, &spec, relay_lane)
-                                .await
+                        match recover_reliable_relay_after_path_failure(
+                            &mut sender,
+                            &mut sender_queue,
+                            context,
+                            &spec,
+                            relay_lane,
+                            &mut remotes,
+                            &mut send_stream,
+                            path_key,
+                        )
+                        .await
                         {
-                            eprintln!(
-                                "warning: reliable path-error survivor reannounce failed: {err}"
-                            );
-                        } else if !remotes.is_empty() {
-                            send_stream.update_max_offset(remotes.max_offset());
-                            last_stream_progress_at = Instant::now();
-                            last_response_stall_repair_at = Instant::now();
-                            if sender.enqueue_failed_path_gap_repairs(
-                                &mut sender_queue,
-                                context,
-                                &remotes,
-                                &send_stream,
-                                path_key,
-                                relay_lane,
-                            ) {
-                                sender_retry_at = None;
+                            Ok(Some(repair_queued)) => {
+                                last_stream_progress_at = Instant::now();
+                                last_response_stall_repair_at = Instant::now();
+                                if repair_queued {
+                                    sender_retry_at = None;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: reliable path-error survivor reannounce failed: {err}"
+                                );
                             }
                         }
                         if remotes.is_empty() {
@@ -1099,17 +1099,27 @@ where
                             {
                                 Ok(attached) if attached > 0 => {
                                     sender_retry_at = None;
-                                    send_stream.update_max_offset(remotes.max_offset());
-                                    last_stream_progress_at = Instant::now();
-                                    if sender.enqueue_failed_path_gap_repairs(
+                                    match recover_reliable_relay_after_path_failure(
+                                        &mut sender,
                                         &mut sender_queue,
                                         context,
-                                        &remotes,
-                                        &send_stream,
-                                        path_key,
+                                        &spec,
                                         relay_lane,
-                                    ) {
-                                        sender_retry_at = None;
+                                        &mut remotes,
+                                        &mut send_stream,
+                                        path_key,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(repair_queued)) => {
+                                            last_stream_progress_at = Instant::now();
+                                            last_response_stall_repair_at = Instant::now();
+                                            if repair_queued {
+                                                sender_retry_at = None;
+                                            }
+                                        }
+                                        Ok(None) => break Err(err),
+                                        Err(recovery_err) => break Err(recovery_err),
                                     }
                                     continue;
                                 }
@@ -1235,7 +1245,6 @@ where
                         if delivered_progress {
                             last_delivery_progress_at = Instant::now();
                             receive_hole_repair_attempts = 0;
-                            response_stall_reannounce_attempts = 0;
                         }
                         let mut write_error = None;
                         let delivered = outcome.delivered;
@@ -1397,9 +1406,13 @@ where
                         ranges,
                     } if ack_stream_id == stream_id => {
                         let normalized_ranges = normalized_offset_ranges(&ranges);
-                        let ack_frontier =
-                            stream_ack_contiguous_frontier(complete, &normalized_ranges);
-                        last_send_ack_frontier = last_send_ack_frontier.max(ack_frontier);
+                        update_repair_authoritative_ack_snapshot(
+                            &mut last_send_ack_frontier,
+                            &mut last_send_ack_ranges,
+                            &mut last_send_ack_complete,
+                            complete,
+                            &normalized_ranges,
+                        );
                         #[cfg(feature = "lab-diagnostics")]
                         let previous_repair_bytes = send_stream.repair_bytes();
                         #[cfg(feature = "lab-diagnostics")]
@@ -1411,6 +1424,7 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
                         sender.release_normalized_acked_ranges(context, &normalized_ranges);
+                        sender_queue.release_normalized_acked_repairs(&normalized_ranges);
                         let base_repair_limit = adaptive_reliable_relay_repair_bytes(
                             path_snapshot,
                             relay_lane,
@@ -1776,6 +1790,43 @@ where
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_flush("multipath_stream_close");
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn recover_reliable_relay_after_path_failure(
+    sender: &mut RelaySenderService,
+    sender_queue: &mut ReliableRelaySenderQueue,
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: FlowLane,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &mut ReliableSendStream,
+    failed_key: RelayPathKey,
+) -> Result<Option<bool>, RuntimeError> {
+    if remotes.is_empty() {
+        return Ok(None);
+    }
+
+    if remotes.active_path_instance().is_some() {
+        sender
+            .reannounce_active_path(context, remotes, spec, lane)
+            .await?;
+    } else if let Some(instance) = remotes.repair_path_instance_for_service_recovery() {
+        let _ = sender
+            .reannounce_path_instance_as_active(context, remotes, instance, spec, lane)
+            .await?;
+    }
+
+    send_stream.update_max_offset(remotes.max_offset());
+    let repair_queued = sender.enqueue_failed_path_gap_repairs(
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        failed_key,
+        lane,
+    );
+    Ok(Some(repair_queued))
 }
 
 pub(super) async fn switch_reliable_relay_to_best_path(
@@ -2337,10 +2388,7 @@ pub(super) async fn open_remote_stream_for_relay_path(
                 ingress,
                 lane,
                 key.index,
-                UdpStreamOpenOptions {
-                    wait_for_accept: false,
-                    role,
-                },
+                udp_relay_attachment_open_options(role),
             )
             .await
         }
@@ -2665,31 +2713,16 @@ pub(super) fn reliable_relay_receive_hole_repair_deadline(
     tokio::time::Instant::from_std(anchor + reliable_relay_stall_timeout(path, lane))
 }
 
-pub(super) fn reliable_relay_sole_survivor_reannounce_attempts(stall_timeout: Duration) -> u32 {
-    let _ = stall_timeout;
-    QUIC_PERSISTENT_CONGESTION_THRESHOLD
-}
-
-pub(super) fn reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
+pub(super) fn reliable_relay_product_stall_preserves_attached_path_set(
     remotes: &ReliableRelayRemoteSet,
-    lane: FlowLane,
 ) -> bool {
-    if !relay_lane_is_bulk(lane) || remotes.paths.len() <= 1 {
-        return false;
-    }
-    let Some(first) = remotes.paths.first().map(|path| path.stream.underlay) else {
-        return false;
-    };
-    remotes
-        .paths
-        .iter()
-        .all(|path| path.stream.underlay == first)
+    remotes.accepted_product_path_count() > 1
 }
 
 pub(super) fn reliable_relay_product_stall_should_try_alternate_attach(
     remotes: &ReliableRelayRemoteSet,
 ) -> bool {
-    remotes.path_keys().len() <= 1 && remotes.active_path_underlay().is_some()
+    remotes.accepted_product_path_count() <= 1 && remotes.active_path_underlay().is_some()
 }
 
 pub(super) fn reliable_relay_delivery_path_should_become_active(
@@ -2753,6 +2786,21 @@ pub(super) fn reliable_relay_stall_deadline(
     lane: FlowLane,
 ) -> tokio::time::Instant {
     tokio::time::Instant::from_std(last_progress_at + reliable_relay_stall_timeout(path, lane))
+}
+
+pub(super) fn reliable_relay_product_stall_deadline(
+    last_progress_at: Instant,
+    last_attempt_at: Option<Instant>,
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+) -> tokio::time::Instant {
+    let stall_timeout = reliable_relay_stall_timeout(path, lane);
+    match last_attempt_at.filter(|attempt| *attempt >= last_progress_at) {
+        Some(last_attempt_at) => tokio::time::Instant::from_std(
+            last_attempt_at + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+        ),
+        None => reliable_relay_stall_deadline(last_progress_at, path, lane),
+    }
 }
 
 pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
@@ -2891,45 +2939,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn upload_only_stall_attempt_uses_a_future_retry_deadline() {
+        let started = Instant::now();
+        let stall_timeout = reliable_relay_stall_timeout(None, FlowLane::Throughput);
+        assert_eq!(
+            reliable_relay_product_stall_deadline(started, None, None, FlowLane::Throughput,),
+            tokio::time::Instant::from_std(started + stall_timeout),
+        );
+
+        let last_attempt = started + stall_timeout;
+        assert_eq!(
+            reliable_relay_product_stall_deadline(
+                started,
+                Some(last_attempt),
+                None,
+                FlowLane::Throughput,
+            ),
+            tokio::time::Instant::from_std(
+                last_attempt + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+            ),
+            "a request-side attempt must move the timer forward instead of leaving an expired sleep branch continuously ready",
+        );
+
+        let later_product_progress = last_attempt + Duration::from_secs(1);
+        assert_eq!(
+            reliable_relay_product_stall_deadline(
+                later_product_progress,
+                Some(last_attempt),
+                None,
+                FlowLane::Throughput,
+            ),
+            tokio::time::Instant::from_std(later_product_progress + stall_timeout),
+            "real product progress starts a fresh first-attempt interval",
+        );
+    }
+
     #[tokio::test]
-    async fn product_stall_keeps_stable_same_underlay_bulk_subflow_set() {
+    async fn latency_product_stall_keeps_active_and_cross_underlay_repair_membership() {
         let (commands_a, _receivers_a) = reliable_path_command_channels(1);
         let (commands_b, _receivers_b) = reliable_path_command_channels(1);
         let first = OpenedRemoteStream {
             path_index: 0,
             stream: test_reliable_path_stream(
                 StreamId(1),
-                UnderlayProtocol::Udp,
+                UnderlayProtocol::Tcp,
                 0,
                 commands_a,
-                FlowLane::Throughput,
+                FlowLane::Latency,
             ),
         };
         let second = OpenedRemoteStream {
-            path_index: 1,
+            path_index: 0,
             stream: test_reliable_path_stream(
                 StreamId(1),
                 UnderlayProtocol::Udp,
-                1,
+                0,
                 commands_b,
-                FlowLane::Throughput,
+                FlowLane::Latency,
             ),
         };
         let mut remotes = ReliableRelayRemoteSet::new(first, 4);
-        remotes.attach_for_validation(second);
+        let active = remotes.active_path_instance();
+        let original_keys = remotes.path_keys();
+        remotes.attach_for_repair(second);
 
-        assert!(
-            reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
-                &remotes,
-                FlowLane::Throughput,
-            )
-        );
-        assert!(
-            !reliable_relay_product_stall_keeps_stable_same_underlay_subflow_set(
-                &remotes,
-                FlowLane::Latency,
-            )
-        );
+        assert!(reliable_relay_product_stall_preserves_attached_path_set(
+            &remotes
+        ));
+        assert!(!reliable_relay_product_stall_should_try_alternate_attach(
+            &remotes
+        ));
+        assert_eq!(remotes.active_path_instance(), active);
+        assert_eq!(remotes.path_keys().last(), original_keys.last());
     }
 
     #[tokio::test]

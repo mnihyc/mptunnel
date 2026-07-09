@@ -2718,6 +2718,7 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
             assert_eq!(payload_bytes, quantum);
         }
         ClientQueuedDispatch::Repair { .. } => panic!("expected upload data dispatch"),
+        ClientQueuedDispatch::RepairDeferred => panic!("expected upload data dispatch"),
     }
     assert_eq!(sender_queue.data_bytes(), queued_bytes - quantum);
     assert_eq!(send_stream.next_offset(), quantum as u64);
@@ -2989,6 +2990,153 @@ async fn repair_race_attach_preserves_active_data_path() {
 }
 
 #[tokio::test]
+async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
+    let stream_id = StreamId(154);
+    let limits = MuxLimits::default();
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11154?srtt-ms=20&rate-mbps=100"
+                .parse()
+                .expect("tcp service path"),
+            "udp://127.0.0.1:11155?srtt-ms=30&rate-mbps=100"
+                .parse()
+                .expect("udp repair path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let (active_stream, mut active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let (repair_stream, mut repair_commands, _repair_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 4);
+    remotes.attach_for_repair(repair_stream);
+    remotes.set_lane(FlowLane::Latency);
+
+    let mut sender = RelaySenderService::new(stream_id);
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    for value in [0x41, 0x42, 0x43] {
+        let frame = send_stream
+            .send_data(Bytes::from(vec![value; 64]), StreamFlags::NONE)
+            .expect("seed request OwnerData");
+        sender
+            .send_stream_data(&context, &mut remotes, frame)
+            .await
+            .expect("send request OwnerData on Service");
+        assert!(matches!(
+            recv_reliable_path_command(&mut active_commands).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+    }
+    let later_owner_frame = send_stream
+        .send_data(Bytes::from(vec![0x44; 64]), StreamFlags::NONE)
+        .expect("seed later request OwnerData on the alternate");
+    sender.record_owner_frame_for_test(
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        &later_owner_frame,
+    );
+    let ack_ranges = [OffsetRange { start: 0, end: 128 }];
+    let _ = send_stream.apply_ack(&ack_ranges);
+    sender.release_normalized_acked_ranges(&context, &ack_ranges);
+    sender.age_product_flights_for_test(Duration::from_secs(1));
+    assert_eq!(send_stream.repair_bytes(), 128);
+
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert!(
+        !sender.enqueue_live_owner_tail_repair(
+            &mut sender_queue,
+            &context,
+            &remotes,
+            &send_stream,
+            &[
+                OffsetRange { start: 0, end: 64 },
+                OffsetRange {
+                    start: 128,
+                    end: 192,
+                },
+            ],
+            true,
+            64,
+            FlowLane::Latency,
+        ),
+        "a sparse ACK report must not skip an earlier request hole"
+    );
+    assert!(sender.enqueue_live_owner_tail_repair(
+        &mut sender_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        &ack_ranges,
+        true,
+        128,
+        FlowLane::Latency,
+    ));
+    let spec = ReliableRelayOpenSpec {
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+        ingress: IngressKind::Socks5,
+    };
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            &spec,
+            FlowLane::Latency,
+            &mut remotes,
+            &mut send_stream,
+            &mut sender_queue,
+            true,
+            64,
+        )
+        .await
+        .expect("dispatch request tail repair");
+    assert!(matches!(
+        dispatch,
+        ClientQueuedDispatch::Repair { payload_bytes: 64 }
+    ));
+    assert_eq!(
+        sender.ordered_data_owner_for_test(),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        }),
+        "the current owner may differ from the owner of the lowest unacknowledged range"
+    );
+    assert!(matches!(
+        recv_reliable_path_command(&mut repair_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 128,
+            flags: StreamFlags { fin: false, .. },
+            payload,
+            ..
+        })) if payload.len() == 64
+    ));
+    assert!(try_recv_reliable_path_command(&mut active_commands).is_none());
+    assert_eq!(
+        remotes.active_path_key(),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        })
+    );
+    assert!(
+        !sender.enqueue_live_owner_tail_repair(
+            &mut sender_queue,
+            &context,
+            &remotes,
+            &send_stream,
+            &ack_ranges,
+            true,
+            128,
+            FlowLane::Latency,
+        ),
+        "a dispatched live-tail copy must back off for the persistent-congestion window"
+    );
+}
+
+#[tokio::test]
 async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
     let stream_id = StreamId(47);
     let (active_stream, _active_commands, _active_frames) =
@@ -3046,6 +3194,132 @@ async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
 }
 
 #[tokio::test]
+async fn swallowed_active_control_failure_reports_owner_debt_before_later_data() {
+    let stream_id = StreamId(156);
+    let limits = MuxLimits::default();
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11157?srtt-ms=20&rate-mbps=100"
+                .parse()
+                .expect("tcp service path"),
+            "udp://127.0.0.1:11158?srtt-ms=30&rate-mbps=100"
+                .parse()
+                .expect("udp repair path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let (active_stream, mut active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let (repair_stream, mut repair_commands, _repair_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
+    remotes.attach_for_repair(repair_stream);
+    let failed_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let mut sender = RelaySenderService::new(stream_id);
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let owner_frame = send_stream
+        .send_data(Bytes::from_static(b"unacked-owner"), StreamFlags::NONE)
+        .expect("seed owner data");
+    sender
+        .send_stream_data(&context, &mut remotes, owner_frame)
+        .await
+        .expect("send owner data");
+    assert!(matches!(
+        recv_reliable_path_command(&mut active_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    drop(active_commands);
+
+    sender
+        .send_control_frame(
+            &context,
+            &mut remotes,
+            Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges: Vec::new(),
+            },
+            RelaySendCause::RecvProgress,
+        )
+        .await
+        .expect("control can continue on Repair after Active command failure");
+    assert!(matches!(
+        recv_reliable_path_command(&mut repair_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+    assert_eq!(remotes.active_path_key(), None);
+    assert_eq!(
+        sender.unreported_missing_owner_keys(&remotes, Duration::from_secs(1)),
+        vec![failed_key]
+    );
+
+    let mut optional_queue = ReliableRelaySenderQueue::default();
+    let optional_payload = Bytes::from(vec![0x7a; 64 * 1024]);
+    let mut optional_budget_exhausted = false;
+    for attempt in 0..1024_u64 {
+        if !sender.enqueue_repair_frame_with_priority(
+            &mut optional_queue,
+            Frame::StreamData {
+                stream_id,
+                offset: 1_000_000 + attempt * optional_payload.len() as u64,
+                flags: StreamFlags::NONE,
+                payload: optional_payload.clone(),
+            },
+            RelaySendCause::AckGapRepair,
+            limits,
+            false,
+        ) {
+            optional_budget_exhausted = true;
+            break;
+        }
+    }
+    assert!(optional_budget_exhausted);
+    drop(optional_queue);
+
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert!(sender.enqueue_failed_path_gap_repairs(
+        &mut sender_queue,
+        &context,
+        &remotes,
+        &send_stream,
+        failed_key,
+        FlowLane::Latency,
+    ));
+    assert!(
+        sender
+            .unreported_missing_owner_keys(&remotes, Duration::from_secs(1))
+            .is_empty(),
+        "a queued failed-owner quantum must back off until ACK progress or the PTO retry"
+    );
+    assert_eq!(
+        sender.unreported_missing_owner_keys(&remotes, Duration::ZERO),
+        vec![failed_key],
+        "the missing owner becomes retryable when its failed-owner PTO expires"
+    );
+    let later_frame = send_stream
+        .send_data(Bytes::from_static(b"later-owner"), StreamFlags::NONE)
+        .expect("seed later data");
+    assert!(matches!(
+        sender
+            .send_stream_data(&context, &mut remotes, later_frame)
+            .await,
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(matches!(
+        sender_queue.front().map(|(_, work)| &work.kind),
+        Some(ReliableRelayQueuedWorkKind::Repair {
+            cause: RelaySendCause::PathFailureRepair,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn repair_only_path_can_become_active_after_explicit_reannounce() {
     let stream_id = StreamId(149);
     let (active_stream, _active_commands, _active_frames) =
@@ -3099,6 +3373,125 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
         _ => panic!("expected explicit Active reannounce on repair path"),
     }
     assert_eq!(remotes.active_path_key(), Some(repair_key));
+}
+
+#[tokio::test]
+async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
+    let stream_id = StreamId(155);
+    let limits = MuxLimits::default();
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11155?srtt-ms=20&rate-mbps=100"
+                .parse()
+                .expect("tcp service path"),
+            "udp://127.0.0.1:11156?srtt-ms=30&rate-mbps=100"
+                .parse()
+                .expect("udp repair path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let (active_stream, mut active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let (repair_stream, mut repair_commands, _repair_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
+    remotes.attach_for_repair(repair_stream);
+
+    let failed_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let repair_key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let mut sender = RelaySenderService::new(stream_id);
+    let mut send_stream = ReliableSendStream::new(stream_id, limits);
+    let frame = send_stream
+        .send_data(
+            Bytes::from_static(b"recover-on-survivor"),
+            StreamFlags::NONE,
+        )
+        .expect("seed failed-owner data");
+    sender
+        .send_stream_data(&context, &mut remotes, frame)
+        .await
+        .expect("send OwnerData on Service");
+    assert!(matches!(
+        recv_reliable_path_command(&mut active_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+
+    let failed_instance = remotes
+        .path_instance_for_key(failed_key)
+        .expect("active path instance");
+    assert!(remotes.fail_path_instance(&context, failed_instance).await);
+    assert!(matches!(
+        recv_reliable_path_command(&mut active_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { .. }))
+    ));
+    assert!(matches!(
+        recv_reliable_path_command(&mut active_commands).await,
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+    assert_eq!(remotes.active_path_key(), None);
+
+    let spec = ReliableRelayOpenSpec {
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+        ingress: IngressKind::Socks5,
+    };
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    assert_eq!(
+        recover_reliable_relay_after_path_failure(
+            &mut sender,
+            &mut sender_queue,
+            &context,
+            &spec,
+            FlowLane::Latency,
+            &mut remotes,
+            &mut send_stream,
+            failed_key,
+        )
+        .await
+        .expect("recover on Repair survivor"),
+        Some(true),
+    );
+    assert!(matches!(
+        recv_reliable_path_command(&mut repair_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::OpenStream {
+            role: StreamOpenRole::Active,
+            ..
+        }))
+    ));
+    assert_eq!(remotes.active_path_key(), Some(repair_key));
+
+    let dispatch = sender
+        .dispatch_client_queued_work(
+            &context,
+            &spec,
+            FlowLane::Latency,
+            &mut remotes,
+            &mut send_stream,
+            &mut sender_queue,
+            true,
+            64,
+        )
+        .await
+        .expect("dispatch failed-owner repair after Service reannouncement");
+    assert!(matches!(
+        dispatch,
+        ClientQueuedDispatch::Repair { payload_bytes } if payload_bytes == b"recover-on-survivor".len()
+    ));
+    assert!(matches!(
+        recv_reliable_path_command(&mut repair_commands).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 0,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"recover-on-survivor")
+    ));
 }
 
 #[tokio::test]

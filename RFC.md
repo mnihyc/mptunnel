@@ -350,11 +350,15 @@ up. A new Service owner is chosen by explicit sender-service admission at a
 clear frontier or by a dedicated failover policy after lower ownership has been
 resolved. A survivor is not promoted to Service merely because it is the only
 remaining attached output; it needs explicit frontier-clear Service failover
-admission. Path-scoped sender evidence is preferred, but if no live Service
-owner remains and the ordered frontier is clear, a live liveness-only candidate
-MAY become the bounded startup Service failover path so the stream does not
-stall without an owner. Otherwise, proof/liveness-only survivors remain
-Probe/Standby, and lower-ETA measured contributors are Subflows.
+admission, or explicit bounded tail-repair failover after the stale or unknown
+owner can no longer be used for the unresolved suffix. Path-scoped sender
+evidence is preferred, but if no live Service owner remains and the ordered
+frontier is clear, a live liveness-only candidate MAY become the bounded
+startup Service failover path so the stream does not stall without an owner.
+When the frontier is not clear, that failover candidate needs direction-correct
+bulk-rate evidence and an explicit tail-repair failover signal. Otherwise,
+proof/liveness-only survivors remain Probe/Standby, and lower-ETA measured
+contributors are Subflows.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were
@@ -422,8 +426,14 @@ contiguous owner tail, a cross-underlay alternate MUST wait instead of owning
 later byte ranges. Same-underlay Subflow admission may proceed only after the
 candidate has direction-correct bulk-rate evidence and passes its no-worse
 gates; sharing a carrier family is not enough to create ordered ownership.
-Cross-underlay ownership requires the Service owner to be feedable, failed, or
-explicitly migrated.
+Cross-underlay ownership with unresolved prior Service bytes is allowed only
+when the candidate continues the lower-frontier owner. A live Service owner that
+is merely out of queue/emission credit is backpressure, not failure; later owner
+bytes MUST wait for capacity, ACK progress, repair progress, or an explicit
+frontier-clear migration after the prior owner is gone.
+Before any product ACK establishes a contiguous frontier, all already-sent
+bulk bytes below the next send offset are unresolved Service owner-tail debt for
+alternate owners. This pre-ACK debt is a scheduler guard, not repair evidence.
 ACK-data-only evidence from a tiny or application-limited probe is still not
 bulk-rate evidence and does not grant Service or Subflow owner rights.
 Configured or peer hints alone are not sender evidence and MUST NOT unlock
@@ -487,10 +497,14 @@ before receiving owner bytes.
 When latency-sensitive work is active, the clear-frontier Service feed envelope
 uses the preemptible Service horizon for total owner credit already admitted to
 that Service path, including owner bytes in flight and queued carrier work.
-That cap is feed/backpressure accounting, not reorder accounting. Reorder
-budgets are for additional paths, cross-path lower-byte debt, and explicit
-owner-tail guards; they MUST NOT count same-Service queued carrier work as
-cross-path reorder debt. The point of the latency-pressure cap is different:
+That cap is feed/backpressure accounting, not reorder accounting. A clear-frontier
+Service with path-scoped bulk evidence MAY use a small BBR-style headroom over
+the preemptible horizon so carrier writers do not oscillate between empty and
+blocked during failover recovery; the headroom remains clamped by the product
+Service envelope and does not apply to optional Subflows or lower-owner debt.
+Reorder budgets are for additional paths, cross-path lower-byte debt, and
+explicit owner-tail guards; they MUST NOT count same-Service queued carrier work
+as cross-path reorder debt. The point of the latency-pressure cap is different:
 it bounds how much ordered debt one Service path may preload while realtime or
 latency work needs fast recovery and preemption. Bulk-only Service feed still
 uses the full product Service envelope while the ordered frontier is clear.
@@ -2079,6 +2093,19 @@ sustained volume may move toward a higher-bandwidth carrier; when that demand
 falls away, the flow can shrink back to latency/realtime behavior. If the
 selected carrier fails in a retryable path-level way, the client MAY try the
 next schedulable TCP or QUIC UDP carrier by the same evidence order.
+The previous successful datagram carrier is only a hysteresis hint: it MAY break
+near-ties to avoid avoidable realtime path churn, but it MUST NOT override a
+substantially lower-ETA, lower-loss, or lower-queue candidate once live
+path-scoped evidence says the alternate is safer. This keeps datagram scheduling
+metric-driven without replaying a product datagram ID.
+
+When multiple fresh datagrams are outstanding at the local UDP edge before
+feedback arrives, edge lanes SHOULD reserve different schedulable carriers from
+the same metric-ordered candidate list when alternatives exist. This is
+route-diversity for independent product datagrams, not duplication: each
+`DGRAM_DATA` still has exactly one selected carrier, and a route hint MUST be
+ignored if that carrier is no longer schedulable within the TTL/freshness
+budget.
 
 After a `DGRAM_DATA` frame for a product datagram has been emitted on any
 carrier, the sender MUST NOT resend that same product datagram ID on another

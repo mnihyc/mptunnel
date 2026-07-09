@@ -888,10 +888,13 @@ fn relay_path_within_adaptive_lead_hysteresis(
     best_snapshot: PathSnapshot,
     payload_bytes: usize,
 ) -> bool {
-    let jitter_hysteresis_ms = old_snapshot.jitter_ms.max(best_snapshot.jitter_ms);
-    let queue_hysteresis_bytes = payload_bytes as u64;
-    old_eta_ms <= best_eta_ms + jitter_hysteresis_ms
-        && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
+    path_within_adaptive_lead_hysteresis(
+        old_eta_ms,
+        old_snapshot,
+        best_eta_ms,
+        best_snapshot,
+        payload_bytes,
+    )
 }
 
 struct RelayBulkLeadRequest<'a> {

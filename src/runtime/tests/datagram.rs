@@ -334,15 +334,15 @@ fn udp_association_suppression_prefers_survivor_without_dead_ending() {
 }
 
 #[test]
-fn udp_association_sticks_to_successful_path_until_suppressed() {
+fn udp_association_keeps_successful_path_within_hysteresis_until_suppressed() {
     let steady_path = "udp://127.0.0.1:10031?srtt-ms=20&rate-mbps=100"
         .parse::<PathSpec>()
         .expect("steady path");
-    let lower_eta_path = "udp://127.0.0.1:10032?srtt-ms=5&rate-mbps=100"
+    let peer_path = "udp://127.0.0.1:10032?srtt-ms=20&rate-mbps=100"
         .parse::<PathSpec>()
-        .expect("lower eta path");
+        .expect("peer path");
     let context = ClientPathContext::new(
-        vec![steady_path, lower_eta_path],
+        vec![steady_path, peer_path],
         security(),
         ResourceLimits::default(),
     )
@@ -351,7 +351,7 @@ fn udp_association_sticks_to_successful_path_until_suppressed() {
     let candidates = [
         UdpPathCandidate {
             path_index: 1,
-            eta_ms: 5.0,
+            eta_ms: 20.0,
         },
         UdpPathCandidate {
             path_index: 0,
@@ -369,6 +369,51 @@ fn udp_association_sticks_to_successful_path_until_suppressed() {
     assert_eq!(
         association.select_path_candidate(&candidates, &HashSet::new(), 512, 1000),
         Some(1)
+    );
+}
+
+#[test]
+fn udp_association_last_successful_path_is_only_hysteresis_hint() {
+    let stale_path = "udp://127.0.0.1:10033?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("stale path");
+    let better_path = "udp://127.0.0.1:10034?srtt-ms=20&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("better path");
+    let context = ClientPathContext::new(
+        vec![stale_path, better_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("ctx");
+    let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+
+    context.mark_udp_path_feedback(
+        0,
+        UdpDatagramPathObservation {
+            rtt: Duration::from_millis(180),
+            jitter: Duration::from_millis(5),
+            loss_rate: 0.25,
+            rate_sample: PathRateSample::new(512, Duration::from_millis(180)),
+        },
+    );
+    context.mark_udp_path_feedback(
+        1,
+        UdpDatagramPathObservation {
+            rtt: Duration::from_millis(25),
+            jitter: Duration::from_millis(2),
+            loss_rate: 0.0,
+            rate_sample: PathRateSample::new(512, Duration::from_millis(25)),
+        },
+    );
+
+    association.last_successful_path = Some(0);
+    let candidates = context.ordered_udp_path_candidates_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS);
+
+    assert_eq!(
+        association.select_path_candidate(&candidates, &HashSet::new(), 512, 1000),
+        Some(1),
+        "last successful realtime datagram path is a hysteresis hint, not a sticky override over a substantially better live candidate"
     );
 }
 
@@ -635,6 +680,41 @@ fn udp_edge_lane_startup_uses_tcp_datagram_carriers_too() {
     assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
     assert!(udp_edge_lane_spawn_allowed(1, 0, &context));
     assert!(!udp_edge_lane_spawn_allowed(2, 0, &context));
+}
+
+#[test]
+fn udp_edge_route_hint_avoids_pending_lane_carrier_when_alternative_exists() {
+    let paths = vec![
+        "udp://127.0.0.1:10188?srtt-ms=20&jitter-ms=0&rate-mbps=30"
+            .parse()
+            .expect("first udp path"),
+        "tcp://127.0.0.1:10189?srtt-ms=25&jitter-ms=0&rate-mbps=30"
+            .parse()
+            .expect("tcp path"),
+        "udp://127.0.0.1:10190?srtt-ms=30&jitter-ms=0&rate-mbps=30"
+            .parse()
+            .expect("second udp path"),
+    ];
+    let context =
+        ClientPathContext::new(paths, security(), ResourceLimits::default()).expect("context");
+    let first = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let second = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+
+    assert_eq!(
+        udp_edge_route_hint(
+            &context,
+            512,
+            DEFAULT_SOCKS5_UDP_TTL_MS,
+            std::iter::once(first),
+        ),
+        Some(second)
+    );
 }
 
 #[test]

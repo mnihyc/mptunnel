@@ -1,3 +1,4 @@
+use super::bulk_admission::bulk_service_horizon_payload_bytes;
 use super::*;
 
 pub(super) async fn send_sender_service_attach_control_frames(
@@ -76,20 +77,31 @@ pub(super) fn stream_ack_ranges_expose_authoritative_gap(
 
 pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     lane: FlowLane,
-    ack_complete: bool,
+    _ack_complete: bool,
     ack_frontier: u64,
     next_offset: u64,
 ) -> usize {
     if !relay_lane_is_bulk(lane) || ack_frontier >= next_offset {
         return 0;
     }
-    if !ack_complete && ack_frontier == 0 {
-        return 0;
-    }
     // This is a tail guard, not repair debt. It blocks alternate OwnerData and
     // missing-owner failover while lower Service bytes are unresolved, but it
     // must not make the live Service owner itself inadmissible.
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
+}
+
+pub(super) fn reliable_relay_owner_tail_read_headroom(
+    lane: FlowLane,
+    ordered_owner_debt_bytes: usize,
+    queued_data_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if !relay_lane_is_bulk(lane) {
+        return usize::MAX;
+    }
+    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+    let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
+    horizon.saturating_sub(ordered_owner_debt_bytes.saturating_add(queued_data_bytes))
 }
 
 pub(super) fn stream_ack_contiguous_frontier(_complete: bool, ranges: &[OffsetRange]) -> u64 {
@@ -893,6 +905,22 @@ pub(super) fn reliable_critical_tail_repair_limit_bytes(
         .min(resource_cap)
 }
 
+pub(super) fn reliable_failed_owner_tail_repair_limit_bytes(
+    event_repair_limit: usize,
+    repair_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if repair_debt_bytes == 0 {
+        return 0;
+    }
+    let resource_cap = mux_limits
+        .max_repair_bytes
+        .min(mux_limits.max_path_flight_bytes)
+        .max(1);
+    let recovery_burst = reliable_relay_buffer_len(mux_limits).max(event_repair_limit.max(1));
+    repair_debt_bytes.min(recovery_burst).min(resource_cap)
+}
+
 pub(super) fn reliable_critical_tail_repair_is_over_budget(
     budget_remaining: usize,
     repair_limit: usize,
@@ -1246,7 +1274,8 @@ struct TailRepairEnqueueOutcome {
 
 impl TailRepairEnqueueOutcome {
     fn record_as_repair_attempt(self) -> bool {
-        self.queued > 0 || self.pending
+        let _ = self;
+        true
     }
 }
 
@@ -1279,6 +1308,7 @@ fn enqueue_reliable_tail_repair(
     ));
     let mut repair_limit = 0usize;
     let mut critical_tail_repair = false;
+    let mut critical_tail_fully_covered = false;
     let mut repair_kind = "none";
     let mut repair_frames = Vec::new();
     let mut blocked_frontier_offset = None;
@@ -1286,31 +1316,29 @@ fn enqueue_reliable_tail_repair(
         && last_send_ack_frontier == 0
         && send_stream.next_offset() > 0;
     if last_send_ack_complete || no_ack_frontier_failed_owner_tail {
-        let failover_limit = reliable_critical_tail_repair_limit_bytes(
+        let failed_owner_limit = reliable_failed_owner_tail_repair_limit_bytes(
             base_repair_limit,
             send_stream.repair_bytes(),
             mux_limits,
         );
-        let failover_source_frames = if last_send_ack_ranges.is_empty() {
+        let failed_owner_source_frames = if last_send_ack_ranges.is_empty() {
             send_stream.retransmission_frames_for_ranges(
                 &[OffsetRange {
                     start: 0,
                     end: send_stream.next_offset(),
                 }],
-                failover_limit,
+                failed_owner_limit,
             )
         } else {
             send_stream
-                .retransmission_frames_after_ack_frontier(last_send_ack_ranges, failover_limit)
+                .retransmission_frames_after_ack_frontier(last_send_ack_ranges, failed_owner_limit)
         };
         let (failover_frames, failover_blocked_offset) =
-            prefix_repair_frames_with_failed_owner_output(
-                path_stream,
-                failover_source_frames.clone(),
-            );
+            prefix_repair_frames_with_failed_owner_output(path_stream, failed_owner_source_frames);
         if !failover_frames.is_empty() {
             critical_tail_repair = true;
-            repair_limit = failover_limit;
+            critical_tail_fully_covered = failed_owner_limit >= send_stream.repair_bytes();
+            repair_limit = failed_owner_limit;
             repair_frames = failover_frames;
             blocked_frontier_offset = failover_blocked_offset;
             repair_kind = "tail_failover";
@@ -1318,14 +1346,22 @@ fn enqueue_reliable_tail_repair(
             blocked_frontier_offset = failover_blocked_offset;
         }
         if repair_frames.is_empty() && last_send_ack_complete && last_send_ack_frontier > 0 {
+            let tail_limit = reliable_critical_tail_repair_limit_bytes(
+                base_repair_limit,
+                send_stream.repair_bytes(),
+                mux_limits,
+            );
+            let tail_source_frames = send_stream
+                .retransmission_frames_after_ack_frontier(last_send_ack_ranges, tail_limit);
             let (unknown_owner_frames, unknown_owner_blocked_offset) =
                 prefix_repair_frames_with_unknown_owner_output(
                     path_stream,
-                    failover_source_frames.clone(),
+                    tail_source_frames.clone(),
                 );
             if !unknown_owner_frames.is_empty() {
                 critical_tail_repair = true;
-                repair_limit = failover_limit;
+                critical_tail_fully_covered = tail_limit >= send_stream.repair_bytes();
+                repair_limit = tail_limit;
                 repair_frames = unknown_owner_frames;
                 blocked_frontier_offset = unknown_owner_blocked_offset;
                 repair_kind = "tail_unknown_owner";
@@ -1337,15 +1373,19 @@ fn enqueue_reliable_tail_repair(
             && last_send_ack_complete
             && path_stream.has_multipath_repair_alternative()
         {
+            let tail_limit = reliable_critical_tail_repair_limit_bytes(
+                base_repair_limit,
+                send_stream.repair_bytes(),
+                mux_limits,
+            );
+            let tail_source_frames = send_stream
+                .retransmission_frames_after_ack_frontier(last_send_ack_ranges, tail_limit);
             let (tail_repair_frames, tail_repair_blocked_offset) =
-                prefix_repair_frames_with_available_output(
-                    path_stream,
-                    failover_source_frames,
-                    true,
-                );
+                prefix_repair_frames_with_available_output(path_stream, tail_source_frames, true);
             if !tail_repair_frames.is_empty() {
                 critical_tail_repair = true;
-                repair_limit = failover_limit;
+                critical_tail_fully_covered = tail_limit >= send_stream.repair_bytes();
+                repair_limit = tail_limit;
                 repair_frames = tail_repair_frames;
                 blocked_frontier_offset = tail_repair_blocked_offset;
                 repair_kind = "tail_repair";
@@ -1400,6 +1440,7 @@ fn enqueue_reliable_tail_repair(
         queued: repair_count,
         pending: repair_pending,
         service_tail_failover_allowed: critical_tail_repair
+            && critical_tail_fully_covered
             && last_send_ack_complete
             && last_send_ack_frontier > 0
             && (repair_count > 0 || repair_pending),
@@ -1668,10 +1709,17 @@ where
             response_sender.data_bytes(),
             mux_limits,
         );
+        let owner_tail_read_headroom = reliable_relay_owner_tail_read_headroom(
+            relay_lane,
+            ordered_owner_debt_bytes,
+            response_sender.data_bytes(),
+            mux_limits,
+        );
         let source_read_ceiling = reliable_relay_buffer_len(mux_limits)
             .min(path_stream.max_frame_payload_bytes)
             .min(sender_queue_limit)
-            .min(latency_owner_credit);
+            .min(latency_owner_credit)
+            .min(owner_tail_read_headroom);
         if source_read_ceiling > 0 {
             resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
         }
@@ -1748,6 +1796,7 @@ where
         };
         let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
         let can_read_by_flow = source_read_ceiling > 0
+            && owner_tail_read_headroom > 0
             && response_sender.can_read_product_source(
                 local_open,
                 queued_send_blocked,
@@ -2454,12 +2503,18 @@ where
                         )
                         && response_sender.data_bytes() < sender_dispatch_byte_budget
                     {
-                        let next_read_budget = response_sender.read_budget(
-                            &send_stream,
+                        let owner_tail_read_headroom = reliable_relay_owner_tail_read_headroom(
+                            relay_lane,
+                            ordered_owner_debt_bytes,
+                            response_sender.data_bytes(),
                             mux_limits,
-                            sender_queue_limit,
-                            buf.len(),
                         );
+                        if owner_tail_read_headroom == 0 {
+                            break;
+                        }
+                        let next_read_budget = response_sender
+                            .read_budget(&send_stream, mux_limits, sender_queue_limit, buf.len())
+                            .min(owner_tail_read_headroom);
                         if next_read_budget == 0 {
                             break;
                         }
@@ -2821,9 +2876,66 @@ mod tests {
             "an incomplete ACK chunk can still prove the contiguous prefix for owner-tail guarding"
         );
         assert_eq!(
+            reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, false, 0, 8192,),
+            8192,
+            "before the first contiguous ACK, already-sent bulk bytes are still owner-tail debt for alternate owners"
+        );
+        assert_eq!(
             reliable_relay_ordered_owner_debt_bytes(FlowLane::Latency, true, 1024, 8192,),
             0,
             "latency traffic must not be pinned by bulk owner-tail pressure"
+        );
+    }
+
+    #[test]
+    fn bulk_source_read_headroom_stops_when_service_tail_horizon_is_full() {
+        let mux_limits = MuxLimits::default();
+        let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
+
+        assert_eq!(
+            reliable_relay_owner_tail_read_headroom(
+                FlowLane::Throughput,
+                horizon.saturating_sub(payload),
+                0,
+                mux_limits,
+            ),
+            payload,
+            "bulk Service may read only the remaining owner-tail horizon"
+        );
+        assert_eq!(
+            reliable_relay_owner_tail_read_headroom(
+                FlowLane::Throughput,
+                horizon.saturating_sub(payload),
+                payload,
+                mux_limits,
+            ),
+            0,
+            "queued but not yet dispatched OwnerData counts against the same tail horizon"
+        );
+        assert_eq!(
+            reliable_relay_owner_tail_read_headroom(
+                FlowLane::Throughput,
+                horizon.saturating_add(1),
+                0,
+                mux_limits,
+            ),
+            0,
+            "once the Service tail exceeds the horizon, reads must pause for ACK or repair progress"
+        );
+    }
+
+    #[test]
+    fn latency_source_read_headroom_is_not_pinned_by_bulk_tail_horizon() {
+        assert_eq!(
+            reliable_relay_owner_tail_read_headroom(
+                FlowLane::Latency,
+                usize::MAX / 2,
+                usize::MAX / 2,
+                MuxLimits::default(),
+            ),
+            usize::MAX,
+            "latency lane reads remain governed by their own tiny chunking and must not inherit bulk tail pressure"
         );
     }
 
@@ -3251,6 +3363,10 @@ mod tests {
             "live contiguous owner-tail bytes are neither ACK-gap nor final-tail correctness repair"
         );
         assert!(!outcome.pending);
+        assert!(
+            outcome.record_as_repair_attempt(),
+            "an empty tail-repair scan must still advance the retry timer"
+        );
     }
 
     #[test]
@@ -3343,6 +3459,108 @@ mod tests {
             "a detached owner path turns a persistent contiguous tail into failover repair on the remaining output"
         );
         assert!(!outcome.pending);
+    }
+
+    #[test]
+    fn failed_owner_tail_repair_queues_recovery_burst_not_single_service_quantum() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(121);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(121),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, _failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let unresolved_payload_len = reliable_relay_buffer_len(limits)
+            .saturating_add(BBR_MAX_SEND_QUANTUM_BYTES)
+            .min(limits.max_payload_bytes);
+        let frame = send_stream
+            .prepare_data(
+                Bytes::from(vec![0x52; unresolved_payload_len]),
+                StreamFlags::NONE,
+            )
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(121),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let outcome = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(outcome.queued, 1);
+        assert!(
+            response_sender.bytes() >= reliable_relay_buffer_len(limits),
+            "failed-owner recovery should replay a bounded repair burst, not serialize a detached prefix one 64 KiB service quantum per timer"
+        );
+        assert!(
+            !outcome.service_tail_failover_allowed,
+            "failed-owner recovery remains RepairData-only until ACK progress clears the old owner tail"
+        );
     }
 
     #[test]

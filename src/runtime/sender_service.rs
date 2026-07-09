@@ -768,6 +768,12 @@ fn response_target_unique_owner_admission_with_epoch(
         return (PathAdmission::standby(), None);
     }
     if target.key == service_key {
+        if ordered_owner_debt_bytes > 0
+            && Some(target.key) != ordered_data_owner
+            && !target.has_bulk_rate_evidence
+        {
+            return (PathAdmission::standby(), None);
+        }
         return if target.is_active || target.has_bulk_rate_evidence || liveness_service_failover {
             (PathAdmission::service(), None)
         } else {
@@ -1410,11 +1416,22 @@ fn select_response_sender_data_target_with_service_tail_failover(
     }
 
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
-    let service_tail_failover_owner =
-        (allow_service_tail_failover && lower_owner.is_none() && ordered_owner_debt_bytes > 0)
-            .then_some(ordered_data_owner)
-            .flatten();
-    if service_tail_failover_owner.is_none()
+    let ordered_owner_has_capacity = ordered_data_owner
+        .is_some_and(|owner| capacity_targets.iter().any(|target| target.key == owner));
+    let ordered_owner_is_live = ordered_data_owner.is_some_and(|owner| {
+        targets
+            .iter()
+            .any(|target| target.key == owner && target.is_active)
+    });
+    let service_tail_failover_requested = allow_service_tail_failover
+        && lower_owner.is_none()
+        && ordered_owner_debt_bytes > 0
+        && !ordered_owner_has_capacity
+        && !ordered_owner_is_live;
+    let service_tail_failover_owner = service_tail_failover_requested
+        .then_some(ordered_data_owner)
+        .flatten();
+    if !service_tail_failover_requested
         && response_ordered_owner_missing_under_debt(
             targets,
             lower_flights,
@@ -1494,7 +1511,9 @@ fn select_response_sender_data_target_with_service_tail_failover(
         .filter(|owner| {
             targets.iter().any(|target| target.key == *owner)
                 && (ordered_owner_debt_bytes > 0
-                    || capacity_targets.iter().any(|target| target.key == *owner))
+                    || capacity_targets.iter().any(|target| {
+                        target.key == *owner && (target.is_active || target.has_bulk_rate_evidence)
+                    }))
         });
     if let Some(service_key) = ordered_owner_anchor
         && let Some(service) = targets.iter().find(|target| target.key == service_key)
@@ -1757,10 +1776,13 @@ fn response_target_within_adaptive_lead_hysteresis(
     if old_lead.key == best.key {
         return true;
     }
-    let jitter_hysteresis_ms = old_lead.snapshot.jitter_ms.max(best.snapshot.jitter_ms);
-    let queue_hysteresis_bytes = payload_bytes as u64;
-    old_lead.eta_ms <= best.eta_ms + jitter_hysteresis_ms
-        && old_lead.snapshot.queue_bytes <= best.snapshot.queue_bytes + queue_hysteresis_bytes
+    path_within_adaptive_lead_hysteresis(
+        old_lead.eta_ms,
+        old_lead.snapshot,
+        best.eta_ms,
+        best.snapshot,
+        payload_bytes,
+    )
 }
 
 fn response_target_committed_product_bytes(target: &ResponseSenderPathTarget) -> u64 {
@@ -7353,10 +7375,10 @@ mod tests {
     }
 
     #[test]
-    fn service_tail_failover_elects_measured_survivor_service_after_repair_attempt() {
+    fn service_tail_failover_waits_when_live_service_owner_is_backpressured() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let mut stale_service =
+        let mut service =
             response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let (service_commands, _service_rx) = reliable_path_command_channels(1);
         service_commands
@@ -7370,29 +7392,58 @@ mod tests {
                 FlowLane::Throughput,
             )
             .expect("seed full stale Service data queue");
-        stale_service.commands = service_commands;
+        service.commands = service_commands;
         let survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
         let selected = select_response_sender_data_target_with_service_tail_failover(
-            &[stale_service.clone(), survivor.clone()],
+            &[service.clone(), survivor],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
             &[],
-            Some(stale_service.key),
+            Some(service.key),
+            owner_tail_guard_bytes,
+            None,
+            true,
+        );
+
+        assert!(
+            selected.is_none(),
+            "queue backpressure on a live Service owner is not owner failure; sender must wait for capacity instead of migrating Service and opening a receive hole"
+        );
+    }
+
+    #[test]
+    fn service_tail_failover_keeps_live_service_owner_when_it_has_capacity() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 333.0, 0, 16 * 1024 * 1024, true);
+        service.has_sender_evidence = true;
+        service.has_bulk_rate_evidence = true;
+        service.snapshot.product_progress_rate_bps = Some(1_121_000.0);
+        let survivor = response_target(1, UnderlayProtocol::Tcp, 712.0, 0, 16 * 1024 * 1024, false);
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(58);
+
+        let selected = select_response_sender_data_target_with_service_tail_failover(
+            &[service.clone(), survivor],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
             owner_tail_guard_bytes,
             None,
             true,
         )
-        .expect("persistent Service-tail repair should allow a measured survivor to take Service ownership");
+        .expect("tail failover mode must not suppress a live Service owner with emission credit");
 
-        assert_eq!(selected.target.key, survivor.key);
         assert_eq!(
-            selected.admission.role,
-            PathRuntimeRole::Service,
-            "explicit tail failover elects one new Service; it must not become an optional Subflow hidden behind stale Service debt"
+            selected.target.key, service.key,
+            "failover replaces a missing or full Service owner; it must not eject a live owner and create no_admissible_lead"
         );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
@@ -7435,6 +7486,102 @@ mod tests {
         assert!(
             selected.is_none(),
             "tail failover is not a proof shortcut; an unmeasured survivor remains Probe/Standby until path-scoped bulk evidence exists"
+        );
+    }
+
+    #[test]
+    fn unresolved_tail_failover_requires_bulk_rate_evidence_even_for_active_survivor() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let stale_owner = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(2),
+        };
+        let mut active_validation =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
+        active_validation.has_sender_evidence = true;
+        active_validation.has_bulk_rate_evidence = false;
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
+
+        let selected = select_response_sender_data_target_with_service_tail_failover(
+            &[active_validation],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(stale_owner),
+            owner_tail_guard_bytes,
+            None,
+            true,
+        );
+
+        assert!(
+            selected.is_none(),
+            "unresolved prior Service bytes require a bulk-rate-proven survivor; active validation/liveness alone must not become Service OwnerData"
+        );
+    }
+
+    #[test]
+    fn clear_frontier_stale_owner_hint_does_not_block_liveness_service_failover() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut stale_owner =
+            response_target(2, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
+        stale_owner.has_sender_evidence = true;
+        stale_owner.has_bulk_rate_evidence = false;
+        let mut survivor =
+            response_target(3, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, false);
+        survivor.has_sender_evidence = true;
+        survivor.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[stale_owner.clone(), survivor.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(stale_owner.key),
+            0,
+            None,
+        )
+        .expect("with no active Service and a clear frontier, sender-evidence survivors may elect exactly one liveness Service");
+
+        assert_eq!(
+            selected.target.key, survivor.key,
+            "a stale ordered-owner hint without unresolved bytes must not pin Service ownership to a worse proof-only path"
+        );
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "liveness failover elects one Service owner; it must not admit optional Subflow ownership"
+        );
+    }
+
+    #[test]
+    fn service_tail_failover_elects_measured_survivor_when_owner_is_already_cleared() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
+
+        let selected = select_response_sender_data_target_with_service_tail_failover(
+            std::slice::from_ref(&survivor),
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            owner_tail_guard_bytes,
+            None,
+            true,
+        )
+        .expect("explicit tail repair failover must elect a measured survivor even after the stale owner is cleared");
+
+        assert_eq!(selected.target.key, survivor.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "ownerless failover elects a new Service, not an optional Subflow behind missing-owner debt"
         );
     }
 

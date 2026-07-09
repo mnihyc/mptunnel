@@ -123,6 +123,7 @@ pub(super) struct UdpEdgeRequest<M> {
     pub(super) payload: Bytes,
     pub(super) ttl_ms: u32,
     pub(super) metadata: M,
+    pub(super) route_hint: Option<RelayPathKey>,
 }
 
 pub(super) struct UdpEdgeCompletion<M> {
@@ -135,6 +136,7 @@ pub(super) struct UdpEdgeCompletion<M> {
 pub(super) struct UdpEdgeLane<M> {
     pub(super) lane_id: usize,
     pub(super) pending: usize,
+    pub(super) route_hint: Option<RelayPathKey>,
     pub(super) successful_completions: usize,
     pub(super) requests: mpsc::Sender<UdpEdgeRequest<M>>,
     pub(super) handle: tokio::task::JoinHandle<()>,
@@ -223,6 +225,7 @@ pub(super) fn spawn_udp_edge_lane<M: Send + 'static>(
     UdpEdgeLane {
         lane_id,
         pending: 0,
+        route_hint: None,
         successful_completions: 0,
         requests,
         handle,
@@ -248,9 +251,10 @@ pub(super) async fn run_udp_edge_lane<M: Send + 'static>(
             payload,
             ttl_ms,
             metadata,
+            route_hint,
         } = request;
         let result = association
-            .send_to_fresh_datagram(target.clone(), payload, ttl_ms)
+            .send_to_fresh_datagram_with_route_hint(target.clone(), payload, ttl_ms, route_hint)
             .await;
         if completions
             .send(UdpEdgeCompletion {
@@ -275,7 +279,7 @@ pub(super) fn dispatch_udp_edge_request<M: Send + 'static>(
     next_lane_id: &mut usize,
     context: &ClientPathContext,
     completions: &mpsc::Sender<UdpEdgeCompletion<M>>,
-    request: UdpEdgeRequest<M>,
+    mut request: UdpEdgeRequest<M>,
 ) -> Result<(), UdpEdgeRequest<M>> {
     let lane_limit = udp_edge_lane_limit(context);
     let lane_queue = udp_edge_lane_queue(context);
@@ -297,6 +301,15 @@ pub(super) fn dispatch_udp_edge_request<M: Send + 'static>(
             completions.clone(),
         ));
     }
+    request.route_hint = udp_edge_route_hint(
+        context,
+        request.payload.len(),
+        request.ttl_ms,
+        lanes
+            .iter()
+            .filter(|lane| lane.pending > 0)
+            .filter_map(|lane| lane.route_hint),
+    );
 
     let Some((position, _)) = lanes
         .iter()
@@ -306,8 +319,13 @@ pub(super) fn dispatch_udp_edge_request<M: Send + 'static>(
         return Err(request);
     };
 
+    let lane_was_idle = lanes[position].pending == 0;
+    let route_hint = request.route_hint;
     match lanes[position].requests.try_send(request) {
         Ok(()) => {
+            if lane_was_idle {
+                lanes[position].route_hint = route_hint;
+            }
             lanes[position].pending = lanes[position].pending.saturating_add(1);
             Ok(())
         }
@@ -319,6 +337,24 @@ pub(super) fn dispatch_udp_edge_request<M: Send + 'static>(
     }
 }
 
+pub(super) fn udp_edge_route_hint(
+    context: &ClientPathContext,
+    payload_bytes: usize,
+    ttl_ms: u32,
+    active_routes: impl IntoIterator<Item = RelayPathKey>,
+) -> Option<RelayPathKey> {
+    let candidates = datagram_underlay_candidate_keys(context, payload_bytes, ttl_ms);
+    if candidates.is_empty() {
+        return None;
+    }
+    let active_routes = active_routes.into_iter().collect::<HashSet<_>>();
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| !active_routes.contains(candidate))
+        .or_else(|| candidates.first().copied())
+}
+
 pub(super) fn finish_udp_edge_completion<M>(
     lanes: &mut [UdpEdgeLane<M>],
     completion: &UdpEdgeCompletion<M>,
@@ -328,6 +364,9 @@ pub(super) fn finish_udp_edge_completion<M>(
         .find(|lane| lane.lane_id == completion.lane_id)
     {
         lane.pending = lane.pending.saturating_sub(1);
+        if lane.pending == 0 {
+            lane.route_hint = None;
+        }
         if completion.result.is_ok() {
             lane.successful_completions = lane.successful_completions.saturating_add(1);
         }
@@ -456,6 +495,7 @@ pub(super) async fn handle_tun_udp_flow(
                         payload: Bytes::from(payload),
                         ttl_ms,
                         metadata: key,
+                        route_hint: None,
                     },
                 )
                 .is_err()

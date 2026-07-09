@@ -317,6 +317,7 @@ where
                         payload: datagram.payload,
                         ttl_ms: DEFAULT_SOCKS5_UDP_TTL_MS,
                         metadata: peer,
+                        route_hint: None,
                     },
                 )
                 .is_err()

@@ -98,14 +98,24 @@ impl DatagramClientAssociation {
             .map(|candidate| candidate.key.underlay)
     }
 
-    pub(super) async fn send_to_fresh_datagram(
+    pub(super) async fn send_to_fresh_datagram_with_route_hint(
         &mut self,
         target: TargetAddr,
         payload: Bytes,
         ttl_ms: u32,
+        route_hint: Option<RelayPathKey>,
     ) -> Result<Bytes, RuntimeError> {
         let mut last_retryable_error = None;
-        for candidate in datagram_underlay_candidates(&self.context, payload.len(), ttl_ms) {
+        let mut candidates = datagram_underlay_candidates(&self.context, payload.len(), ttl_ms);
+        if let Some(route_hint) = route_hint
+            && let Some(position) = candidates
+                .iter()
+                .position(|candidate| candidate.key == route_hint)
+        {
+            let hinted = candidates.remove(position);
+            candidates.insert(0, hinted);
+        }
+        for candidate in candidates {
             match candidate.key.underlay {
                 UnderlayProtocol::Tcp => {
                     let result = self
@@ -244,6 +254,17 @@ fn datagram_underlay_candidates(
             .then_with(|| relay_underlay_identity_order(left.key.underlay, right.key.underlay))
     });
     candidates
+}
+
+pub(super) fn datagram_underlay_candidate_keys(
+    context: &ClientPathContext,
+    payload_bytes: usize,
+    ttl_ms: u32,
+) -> Vec<RelayPathKey> {
+    datagram_underlay_candidates(context, payload_bytes, ttl_ms)
+        .into_iter()
+        .map(|candidate| candidate.key)
+        .collect()
 }
 
 pub(super) fn datagram_underlay_error_is_retryable(err: &RuntimeError) -> bool {
@@ -768,6 +789,18 @@ struct UdpAssociationCandidateScore {
     eta_ms: f64,
     opens_new_session: bool,
     rank: usize,
+    snapshot: PathSnapshot,
+}
+
+fn udp_association_candidate_order(
+    left: &UdpAssociationCandidateScore,
+    right: &UdpAssociationCandidateScore,
+) -> std::cmp::Ordering {
+    left.completion_ms
+        .total_cmp(&right.completion_ms)
+        .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
+        .then_with(|| left.opens_new_session.cmp(&right.opens_new_session))
+        .then_with(|| left.rank.cmp(&right.rank))
 }
 
 pub(super) struct UdpDatagramAssociationPath {
@@ -1012,6 +1045,7 @@ impl UdpDatagramClientAssociation {
                 if !model.accepts_or_can_probe(payload_bytes) {
                     return None;
                 }
+                let snapshot = self.context.udp_path_snapshot(candidate.path_index)?;
                 let ready_at = open_ready_at.unwrap_or(now);
                 let ready_delay_ms = ready_at.saturating_duration_since(now).as_secs_f64() * 1000.0;
                 let completion_ms = eta_ms + ready_delay_ms;
@@ -1021,6 +1055,7 @@ impl UdpDatagramClientAssociation {
                     eta_ms,
                     opens_new_session: !has_open_session,
                     rank,
+                    snapshot,
                 })
             })
             .collect::<Vec<_>>();
@@ -1037,11 +1072,23 @@ impl UdpDatagramClientAssociation {
         {
             viable.retain(|candidate| evidenced_paths.contains(&candidate.path_index));
         }
+        let best_candidate = viable
+            .iter()
+            .min_by(|left, right| udp_association_candidate_order(left, right))
+            .copied();
         if let Some(path_index) = self.last_successful_path
+            && let Some(best) = best_candidate
             && let Some(candidate) = viable.iter().find(|candidate| {
                 candidate.path_index == path_index
                     && !self.path_is_temporarily_suppressed(candidate.path_index, now)
             })
+            && path_within_adaptive_lead_hysteresis(
+                candidate.completion_ms,
+                candidate.snapshot,
+                best.completion_ms,
+                best.snapshot,
+                payload_bytes,
+            )
         {
             return Some(candidate.path_index);
         }
@@ -1064,13 +1111,7 @@ impl UdpDatagramClientAssociation {
         }
         viable
             .into_iter()
-            .min_by(|left, right| {
-                left.completion_ms
-                    .total_cmp(&right.completion_ms)
-                    .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                    .then_with(|| left.opens_new_session.cmp(&right.opens_new_session))
-                    .then_with(|| left.rank.cmp(&right.rank))
-            })
+            .min_by(udp_association_candidate_order)
             .map(|candidate| candidate.path_index)
     }
 

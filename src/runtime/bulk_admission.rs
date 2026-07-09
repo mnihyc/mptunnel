@@ -1,6 +1,6 @@
-use super::BBR_DEFAULT_CWND_GAIN;
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
+use super::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
@@ -141,15 +141,20 @@ pub(super) fn bulk_service_horizon_payload_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
+    let service_payload = payload_bytes
+        .max(BBR_MAX_SEND_QUANTUM_BYTES.min(mux_limits.max_reliable_relay_chunk_bytes))
+        .max(1);
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
     let envelope = mux_limits
         .max_path_flight_bytes
         .min(mux_limits.max_reorder_bytes)
         .min(stream_window)
-        .max(payload_bytes)
+        .max(service_payload)
         .max(1);
-    let horizon = ((payload_bytes as f64) * (envelope as f64)).sqrt().round() as usize;
-    horizon.clamp(payload_bytes.max(1), envelope)
+    let horizon = ((service_payload as f64) * (envelope as f64))
+        .sqrt()
+        .round() as usize;
+    horizon.clamp(service_payload, envelope)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -322,7 +327,7 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
         }
         if bulk_active_role_has_latency_pressure(candidate, role) {
             let backlog_limit =
-                bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
+                bulk_latency_pressure_service_feed_window_bytes(payload_bytes, mux_limits);
             return committed.saturating_add(payload_bytes as u64) <= backlog_limit
                 || committed < backlog_limit;
         }
@@ -513,6 +518,22 @@ fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissi
     // active owner back onto a tiny carrier/startup hard gate while the product
     // ordered frontier is clear. QUIC/TCP carriers own packet pacing below
     // this layer.
+}
+
+fn bulk_latency_pressure_service_feed_window_bytes(
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> u64 {
+    let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as f64;
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    let product_envelope = mux_limits
+        .max_path_flight_bytes
+        .min(stream_window)
+        .min(mux_limits.max_reorder_bytes)
+        .max(payload_bytes) as u64;
+    ((service_horizon * BBR_DEFAULT_CWND_GAIN).ceil() as u64)
+        .min(product_envelope)
+        .max(payload_bytes as u64)
 }
 
 fn bulk_active_role_has_latency_pressure(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
@@ -993,6 +1014,39 @@ mod tests {
     }
 
     #[test]
+    fn active_udp_service_under_latency_pressure_keeps_bounded_headroom_after_failover() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 47.643, mbps(71.713));
+        active.pacing_rate_bps = mbps(73.287);
+        active.product_bytes_in_flight = 2_049_152;
+        active.product_queue_bytes = 458_752;
+        active.queue_bytes = 14_600;
+        active.inflight_limit_bytes = 30_570;
+        active.active_latency_sensitive_flows = 1;
+        active.confidence = 1.0;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                398.634,
+                active,
+                398.634,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "latency pressure must keep the Service preemptible, but not suppress a measured active UDP Service with only bounded post-failover feed debt"
+        );
+    }
+
+    #[test]
     fn tiny_app_limited_service_progress_uses_stable_service_horizon() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
@@ -1052,6 +1106,39 @@ mod tests {
             ),
             None,
             "before product progress exists, a clear-frontier Service owner should still get the stable service horizon; sender credit and stream flow control remain the safety gates"
+        );
+    }
+
+    #[test]
+    fn sub_quantum_service_tail_uses_stable_service_horizon_under_latency_pressure() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 1_896;
+        let mut active = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.delivery_rate_bps = mbps(0.351);
+        active.product_progress_rate_bps = Some(mbps(0.351));
+        active.product_bytes_in_flight = 773_728;
+        active.product_queue_bytes = payload as u64;
+        active.session_active_latency_sensitive_flows = 1;
+        active.app_limited = true;
+        active.confidence = 0.0;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                8_870.050,
+                active,
+                8_870.050,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "a tiny tail payload must not shrink the active Service horizon below the normal feed quantum and deadlock stream completion under latency pressure"
         );
     }
 

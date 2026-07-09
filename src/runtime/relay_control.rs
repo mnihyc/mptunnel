@@ -440,8 +440,68 @@ where
                     last_response_stall_repair_at = Instant::now();
                     continue;
                 }
-                if remotes.path_keys().len() <= 1 {
-                    if remotes.active_path_underlay().is_some() {
+                if reliable_relay_product_stall_should_try_alternate_attach(&remotes) {
+                    match attach_reliable_relay_paths(
+                        context,
+                        &spec,
+                        relay_lane,
+                        &mut remotes,
+                        &send_stream,
+                        !local_open,
+                        ReliableRelayAttachMode::Any,
+                    )
+                    .await
+                    {
+                        Ok(attached) if attached > 0 => {
+                            sender_retry_at = None;
+                            send_stream.update_max_offset(remotes.max_offset());
+                            last_stream_progress_at = Instant::now();
+                            last_response_stall_repair_at = Instant::now();
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "client_product_stall_attached_alternate",
+                                format_args!(
+                                    "stream_id={} active_underlay={:?} attached_paths={} repair_bytes={} sent_offset={}",
+                                    stream_id.0,
+                                    remotes.active_path_underlay(),
+                                    remotes.path_keys().len(),
+                                    send_stream.repair_bytes(),
+                                    send_stream.next_offset(),
+                                ),
+                            );
+                            continue;
+                        }
+                        Ok(_) => {
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "client_product_stall_attach_alternate_unavailable",
+                                format_args!(
+                                    "stream_id={} active_underlay={:?} repair_bytes={} sent_offset={} cause=no_candidate",
+                                    stream_id.0,
+                                    remotes.active_path_underlay(),
+                                    send_stream.repair_bytes(),
+                                    send_stream.next_offset(),
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            #[cfg(not(feature = "lab-diagnostics"))]
+                            let _ = &err;
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "client_product_stall_attach_alternate_unavailable",
+                                format_args!(
+                                    "stream_id={} active_underlay={:?} repair_bytes={} sent_offset={} cause=attach_error error={}",
+                                    stream_id.0,
+                                    remotes.active_path_underlay(),
+                                    send_stream.repair_bytes(),
+                                    send_stream.next_offset(),
+                                    err,
+                                ),
+                            );
+                        }
+                    }
+                    if remotes.path_keys().len() <= 1 && remotes.active_path_underlay().is_some() {
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "client_product_stall_keeps_sole_carrier",
@@ -457,6 +517,8 @@ where
                         last_stream_progress_at = Instant::now();
                         continue;
                     }
+                }
+                if remotes.path_keys().len() <= 1 {
                     let reannounce_budget = reliable_relay_sole_survivor_reannounce_attempts(
                         reliable_relay_stall_timeout(path_snapshot, relay_lane),
                     );
@@ -1870,22 +1932,7 @@ fn spawn_reliable_relay_validation_opens(
     let stream_id = remotes.stream_id();
     let payload_bytes =
         reliable_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
-    let mut candidates = context
-        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
-        .into_iter()
-        .chain(context.ordered_reliable_bulk_validation_path_keys(payload_bytes))
-        .collect::<Vec<_>>();
-    let mut unique_candidates = Vec::with_capacity(candidates.len());
-    for candidate in candidates.drain(..) {
-        if !unique_candidates.contains(&candidate) {
-            unique_candidates.push(candidate);
-        }
-    }
-    let candidates = unique_candidates;
-    let candidates = candidates
-        .into_iter()
-        .filter(|key| !remotes.contains_path_key(*key))
-        .collect::<Vec<_>>();
+    let candidates = reliable_relay_validation_open_candidates(context, remotes, payload_bytes);
     let candidates = reliable_relay_validation_probe_candidates(candidates, pending, attempted);
     if candidates.is_empty() {
         return false;
@@ -1973,6 +2020,30 @@ fn spawn_reliable_relay_validation_opens(
         );
     }
     spawned
+}
+
+fn reliable_relay_validation_open_candidates(
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
+    payload_bytes: usize,
+) -> Vec<RelayPathKey> {
+    let mut candidates = context
+        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
+        .into_iter()
+        .chain(context.ordered_reliable_bulk_validation_path_keys(payload_bytes))
+        .collect::<Vec<_>>();
+    let mut unique_candidates = Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        if !unique_candidates.contains(&candidate) {
+            unique_candidates.push(candidate);
+        }
+    }
+    let candidates = unique_candidates;
+    let candidates = candidates
+        .into_iter()
+        .filter(|key| !remotes.contains_path_key(*key))
+        .collect::<Vec<_>>();
+    candidates
 }
 
 fn reliable_relay_validation_probe_candidates(
@@ -2320,9 +2391,7 @@ pub(super) fn reliable_relay_stall_watch_active(
     mux_limits: MuxLimits,
 ) -> bool {
     send_stream.repair_bytes() > 0
-        || (remote_open
-            && interactive_response_pending
-            && reliable_relay_expects_interactive_response(lane))
+        || (remote_open && interactive_response_pending)
         || reliable_relay_response_stall_watch_active(recv_stream, remote_open, lane, mux_limits)
 }
 
@@ -2396,6 +2465,12 @@ pub(super) fn reliable_relay_product_stall_keeps_stable_same_underlay_subflow_se
         .all(|path| path.stream.underlay == first)
 }
 
+pub(super) fn reliable_relay_product_stall_should_try_alternate_attach(
+    remotes: &ReliableRelayRemoteSet,
+) -> bool {
+    remotes.path_keys().len() <= 1 && remotes.active_path_underlay().is_some()
+}
+
 pub(super) fn reliable_relay_delivery_path_should_become_active(
     context: &ClientPathContext,
     current: Option<RelayPathKey>,
@@ -2467,7 +2542,15 @@ pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: Flo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SharedSecret;
     use std::collections::{HashMap, HashSet};
+    use std::net::SocketAddr;
+
+    fn test_security() -> SecurityConfig {
+        SecurityConfig::encrypted(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("test secret"),
+        )
+    }
 
     fn test_reliable_path_stream(
         stream_id: StreamId,
@@ -2547,6 +2630,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_response_stall_watch_survives_lane_promotion() {
+        let send_stream = ReliableSendStream::new(StreamId(1), MuxLimits::default());
+        let recv_stream = ReliableRecvStream::new(StreamId(1), MuxLimits::default());
+
+        assert!(reliable_relay_stall_watch_active(
+            &send_stream,
+            &recv_stream,
+            true,
+            FlowLane::Throughput,
+            true,
+            MuxLimits::default(),
+        ));
+    }
+
     #[tokio::test]
     async fn product_stall_keeps_stable_same_underlay_bulk_subflow_set() {
         let (commands_a, _receivers_a) = reliable_path_command_channels(1);
@@ -2588,6 +2686,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn product_stall_on_sole_carrier_attempts_alternate_attach() {
+        let (commands, _receivers) = reliable_path_command_channels(1);
+        let active = OpenedRemoteStream {
+            path_index: 0,
+            stream: test_reliable_path_stream(
+                StreamId(1),
+                UnderlayProtocol::Tcp,
+                0,
+                commands,
+                FlowLane::Latency,
+            ),
+        };
+        let remotes = ReliableRelayRemoteSet::new(active, 4);
+
+        assert!(reliable_relay_product_stall_should_try_alternate_attach(
+            &remotes
+        ));
+    }
+
     #[test]
     fn validation_probe_candidates_are_one_shot_per_stream_path() {
         let tcp0 = RelayPathKey {
@@ -2614,6 +2732,58 @@ mod tests {
             reliable_relay_validation_probe_candidates(vec![tcp0, udp0], &pending, &attempted)
                 .is_empty(),
             "rebalance cannot turn a closed validation handle into repeated OPEN_STREAM churn"
+        );
+    }
+
+    #[tokio::test]
+    async fn latency_lane_does_not_spawn_standby_validation_probe() {
+        let context = ClientPathContext::new(
+            vec![
+                "udp://127.0.0.1:23001?srtt-ms=30&rate-mbps=100"
+                    .parse()
+                    .expect("active path"),
+                "udp://127.0.0.1:23002?srtt-ms=35&rate-mbps=100"
+                    .parse()
+                    .expect("standby path"),
+            ],
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+        let (commands, _receivers) = reliable_path_command_channels(1);
+        let active = OpenedRemoteStream {
+            path_index: 0,
+            stream: test_reliable_path_stream(
+                StreamId(9),
+                UnderlayProtocol::Udp,
+                0,
+                commands,
+                FlowLane::Latency,
+            ),
+        };
+        let remotes = ReliableRelayRemoteSet::new(active, 4);
+        let send_stream = ReliableSendStream::new(StreamId(9), MuxLimits::default());
+        let spec = ReliableRelayOpenSpec {
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            ingress: IngressKind::Socks5,
+        };
+        let (result_tx, _result_rx) = mpsc::channel(1);
+        let mut pending = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
+        let mut attempted = HashSet::<RelayPathKey>::new();
+
+        assert!(!spawn_reliable_relay_validation_opens(
+            &context,
+            &spec,
+            FlowLane::Latency,
+            &remotes,
+            &send_stream,
+            &mut pending,
+            &mut attempted,
+            &result_tx,
+        ));
+        assert!(
+            pending.is_empty() && attempted.is_empty(),
+            "validation/probe opens are bulk-only; latency response stalls recover through path health and repair, not proactive per-stream standbys"
         );
     }
 }

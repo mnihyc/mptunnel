@@ -742,6 +742,19 @@ pub(super) fn udp_observation_has_datagram_feedback(observation: &ClientPathObse
         || observation.measured_mtu_payload_bytes.is_some()
 }
 
+pub(super) fn path_within_adaptive_lead_hysteresis(
+    old_eta_ms: f64,
+    old_snapshot: PathSnapshot,
+    best_eta_ms: f64,
+    best_snapshot: PathSnapshot,
+    payload_bytes: usize,
+) -> bool {
+    let jitter_hysteresis_ms = old_snapshot.jitter_ms.max(best_snapshot.jitter_ms);
+    let queue_hysteresis_bytes = payload_bytes as u64;
+    old_eta_ms <= best_eta_ms + jitter_hysteresis_ms
+        && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
+}
+
 pub(super) fn path_can_be_auto_discovered(
     path: &PathSpec,
     observation: ClientPathObservation,

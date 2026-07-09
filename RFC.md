@@ -348,17 +348,23 @@ ordered-owner scheduling debt remains. In that state the sender waits, performs
 bounded failover repair, or resumes only after the contiguous frontier catches
 up. A new Service owner is chosen by explicit sender-service admission at a
 clear frontier or by a dedicated failover policy after lower ownership has been
-resolved. A survivor is not promoted to Service merely because it is the only
-remaining attached output; it needs explicit frontier-clear Service failover
-admission after the contiguous frontier is clear. Path-scoped sender evidence
+resolved. If no live or lower-flight owner remains but the stream still has
+pre-ACK tail debt from the disappeared owner, the only non-clear-frontier
+Service failover allowed is a bulk-rate-proven survivor from the same carrier
+family. That failover resumes `OwnerData` service so the product stream does
+not deadlock behind a missing output, but it does not credit any outstanding
+`RepairData` as delivery proof and it does not admit cross-family migration.
+A survivor is not promoted to Service merely because it is the only remaining
+attached output; it needs explicit frontier-clear Service failover admission,
+or the same-family measured failover rule above. Path-scoped sender evidence
 is preferred, but if no live Service owner remains and the ordered frontier is
 clear, a live liveness-only candidate MAY become the bounded startup Service
 failover path so the stream does not stall without an owner. When the frontier
-is not clear, survivors may carry bounded `RepairData` for the explicit
-blocking range, but they MUST NOT receive later `OwnerData` merely because
-repair was queued or pending. Proof/liveness-only survivors remain
-Probe/Standby, and lower-ETA measured contributors are Subflows only when
-ordered-debt and no-worse admission allow it.
+is not clear, proof/liveness-only survivors and cross-family survivors may
+carry bounded `RepairData` for the explicit blocking range, but they MUST NOT
+receive later `OwnerData` merely because repair was queued or pending. Lower-ETA
+measured contributors are Subflows only when ordered-debt and no-worse
+admission allow it.
 
 Path attachment roles are not scheduler ownership. `Active`, `Validation`, and
 `Repair` describe why a carrier stream was opened and which control frames were

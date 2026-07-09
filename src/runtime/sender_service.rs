@@ -988,7 +988,17 @@ fn response_ordered_owner_missing_under_debt(
         return false;
     }
     match ordered_data_owner {
-        Some(owner) => !targets.iter().any(|target| target.key == owner),
+        Some(owner) => {
+            let live_owner = targets.iter().any(|target| target.key == owner);
+            // A missing Service owner with unresolved tail debt normally blocks
+            // later OwnerData. The only non-clear-frontier failover is a
+            // bulk-rate-proven survivor in the same carrier family; RepairData
+            // still never path-proves or transfers ownership.
+            let measured_same_underlay_failover = targets.iter().any(|target| {
+                target.key.underlay == owner.underlay && target.has_bulk_rate_evidence
+            });
+            !live_owner && !measured_same_underlay_failover
+        }
         None => true,
     }
 }
@@ -8161,6 +8171,37 @@ mod tests {
         assert!(
             selected.is_none(),
             "an absent ordered owner with unresolved lower bytes must trigger repair/failover handling, not make another underlay the Service owner for later bytes"
+        );
+    }
+
+    #[test]
+    fn missing_same_underlay_owner_debt_admits_measured_service_failover() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let missing_owner = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let measured_survivor =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            std::slice::from_ref(&measured_survivor),
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(missing_owner),
+            payload_bytes.saturating_mul(2),
+            None,
+        )
+        .expect("a bulk-rate-proven same-underlay survivor should elect Service failover when the previous Service output is gone and no lower-flight owner remains");
+
+        assert_eq!(selected.target.key, measured_survivor.key);
+        assert_eq!(
+            selected.admission.role,
+            PathRuntimeRole::Service,
+            "same-underlay failover resumes Service OwnerData; it is not optional Subflow exploration and does not credit RepairData as proof"
         );
     }
 

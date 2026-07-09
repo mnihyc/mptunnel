@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,10 +8,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mixed_workload_probe import (
     attempt_has_response_budget,
     small_http_response_budget_seconds,
+    write_started_file,
 )
 
 
 class MixedWorkloadProbeTests(unittest.TestCase):
+    def test_started_file_keeps_unix_time_and_adds_monotonic_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "started"
+            write_started_file(path)
+            unix_seconds, monotonic_ms, unix_ms = path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+
+        self.assertGreater(float(unix_seconds), 0)
+        self.assertGreater(int(monotonic_ms), 0)
+        self.assertAlmostEqual(float(unix_seconds) * 1000, int(unix_ms), delta=1)
+
     def test_attempt_requires_full_response_budget_before_workload_deadline(self):
         self.assertTrue(attempt_has_response_budget(7.0, 10.0, 2.5))
         self.assertTrue(attempt_has_response_budget(7.5, 10.0, 2.5))

@@ -79,8 +79,16 @@ Failure and unstable-link rows:
 ```bash
 CASE_FILTER='mptunnel_mixed_multipath_failover_blackhole_fat,mptunnel_mixed_multipath_latency_spike_fat,mptunnel_mixed_multipath_flapping_links' \
 MPTUNNEL_LAB_LOAD_DURATION_SECONDS=30 \
+MPTUNNEL_LAB_FLAP_SEED=20260710 \
 lab/run-perf-diagnostics.sh
 ```
+
+Keep `MPTUNNEL_LAB_FLAP_SEED`, the ordered flap modes, hold bounds, and effective
+netem overrides identical for flapping A/B runs. Confirm the embedded
+`flapping.trace_complete` and schedule digest fields before comparing them; seed
+reuse does not fix netem's packet-level random loss, jitter, or Docker command
+latency, so strict comparisons must also inspect the trace's actual application
+offsets.
 
 Matrix rows:
 

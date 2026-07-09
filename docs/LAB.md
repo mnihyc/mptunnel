@@ -66,7 +66,7 @@ It records:
 - mptunnel SOCKS5 UDP ASSOCIATE probes over each single UDP underlay path.
 - mptunnel SOCKS5 UDP ASSOCIATE probes with all UDP underlay paths configured.
 - mptunnel mixed workload while one path is saturated by background `iperf3` traffic.
-- mptunnel mixed workload while path states randomly flap between normal, spiked, and blackholed profiles.
+- mptunnel mixed workload while a recorded, seed-derived schedule flaps path states between normal, spiked, and blackholed profiles.
 - mptunnel TCP multipath download while the high-bandwidth path is blackholed during transfer.
 - mptunnel mixed-workload ideal comparisons where one selected path is forced to 0% loss.
 - mptunnel controlled matrix download and upload cases over one TCP+UDP path where bandwidth, latency, and loss each toggle between good and poor values.
@@ -111,7 +111,8 @@ Useful environment variables:
 - `MPTUNNEL_LAB_BLACKHOLE_LOSS`: blackhole loss value for failover tests, default `100%`.
 - `MPTUNNEL_LAB_SATURATE_PROTOCOL`: background saturation protocol, `udp` by default or `tcp`.
 - `MPTUNNEL_LAB_SATURATE_LOWLAT_BANDWIDTH`, `MPTUNNEL_LAB_SATURATE_BALANCED_BANDWIDTH`, `MPTUNNEL_LAB_SATURATE_FAT_BANDWIDTH`, `MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH`: bidirectional background `iperf3` rates for saturated-link cases.
-- `MPTUNNEL_LAB_FLAP_MIN_SECONDS`, `MPTUNNEL_LAB_FLAP_MAX_SECONDS`, `MPTUNNEL_LAB_FLAP_MODES`: randomized link-flapping cadence and mode list for unstable-link cases.
+- `MPTUNNEL_LAB_FLAP_MIN_SECONDS`, `MPTUNNEL_LAB_FLAP_MAX_SECONDS`, `MPTUNNEL_LAB_FLAP_MODES`: link-flapping cadence and supported netem mode list for unstable-link cases.
+- `MPTUNNEL_LAB_FLAP_SEED`: optional decimal or text seed for the versioned flapping schedule generator. The same seed, ordered mode list, and hold bounds reproduce the same intended mode/hold sequence. Each hold begins after both client and server netem commands finish so slow control commands cannot compress a configured dwell. If omitted, the lab generates and records a 64-bit seed.
 - `KEEP_LAB=1`: keep containers running after the script exits.
 - `RESULT_FILE`: explicit JSONL output path.
 - `RESULT_ROOT`: output directory for matrix runs.
@@ -120,6 +121,21 @@ Useful environment variables:
 - `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_PERF=1`: build the optimized `lab-diagnostics` binary and emit interval/cumulative per-component timing lines prefixed with `mptunnel_lab_perf`. `MPTUNNEL_LAB_PERF_INTERVAL_MS` controls the flush interval, default `1000`. `MPTUNNEL_LAB_LOG_TAIL_BYTES` and `MPTUNNEL_LAB_LOG_TAIL_LINES` control retained diagnostic log tails.
 
 For a repeatable component/process profiling workflow, use `lab/run-perf-diagnostics.sh` and see `docs/PERF.md`.
+
+The flapping result row embeds its resolved seed, schedule/profile digests,
+probe-relative start anchor, applied event count, worker/restore outcome, and
+trace artifact path under `flapping`. The JSONL trace artifact is authoritative
+for per-side netem command exit codes and monotonic application offsets. Compare
+flapping throughput only when the generator, schedule profile digest, seed,
+applied schedule digest, effective netem overrides, and instrumentation mode
+match. A missing marker, compressed completed dwell, command failure, worker
+timeout, malformed trace, or restore failure marks the experiment row failed.
+The seed controls the impairment schedule, not netem's packet-level
+jitter/loss randomness or Docker command latency, so it does not provide
+packet-for-packet replay. For strict A/B use, compare the actual application
+offsets in addition to the intended schedule digest. The runner rejects
+concurrent executions because the Compose lab shares fixed networks and service
+names.
 
 Matrix case names use `mptunnel_matrix_bw_{good,poor}_lat_{good,poor}_loss_{good,poor}`. The controlled matrix applies those values only to `path_lowlat` and starts one TCP plus one UDP underlay endpoint on that path, so the eight cells isolate bandwidth, latency, and loss without changing topology or path count. The default loss axis is intentionally harsh: `loss_good` is a realistic non-perfect 1% path and `loss_poor` is a severe 15% path. Ideal 0% loss remains available only in separate ideal comparison cases.
 

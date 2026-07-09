@@ -2,6 +2,7 @@
 import argparse
 import ipaddress
 import json
+import os
 import socket
 import struct
 import sys
@@ -160,8 +161,15 @@ def interval_metric_fields(interval_bytes, interval_seconds, prefix):
 def write_started_file(path):
     if not path:
         return
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"{time.time():.9f}\n")
+    unix_ns = time.time_ns()
+    monotonic_ms = time.monotonic_ns() // 1_000_000
+    temporary_path = f"{path}.tmp-{os.getpid()}"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        # Keep the first-line Unix timestamp compatible with existing callers.
+        handle.write(f"{unix_ns / 1_000_000_000:.9f}\n")
+        handle.write(f"{monotonic_ms}\n")
+        handle.write(f"{unix_ns // 1_000_000}\n")
+    os.replace(temporary_path, path)
 
 
 def workload_deadline(started_at, args):

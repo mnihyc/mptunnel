@@ -5,6 +5,13 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 
+lab_lock_file="/tmp/mptunnel-compose-lab.lock"
+exec {lab_lock_fd}>"$lab_lock_file"
+if ! flock -n "$lab_lock_fd"; then
+  echo "another mptunnel Compose lab run holds $lab_lock_file" >&2
+  exit 75
+fi
+
 compose_file="${COMPOSE_FILE:-lab/docker-compose.yml}"
 result_dir="${RESULT_DIR:-lab/results}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -87,8 +94,24 @@ saturate_poor_bandwidth="${MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH:-45M}"
 flap_min_seconds="${MPTUNNEL_LAB_FLAP_MIN_SECONDS:-1}"
 flap_max_seconds="${MPTUNNEL_LAB_FLAP_MAX_SECONDS:-4}"
 flap_modes="${MPTUNNEL_LAB_FLAP_MODES:-apply-lowlat,apply-balanced,apply-fat,apply-poor,spike-lowlat,spike-balanced,spike-fat,spike-poor,blackhole-lowlat,blackhole-balanced,blackhole-fat,blackhole-poor}"
+flap_seed="${MPTUNNEL_LAB_FLAP_SEED:-}"
+flap_seed_source=""
 flapper_pid=""
+flapper_pgid=""
 flapper_stop_file=""
+flapper_done_file=""
+flapper_probe_gate_file=""
+flapper_probe_finished_file=""
+flapper_trace_file=""
+flapper_started_unix_ms=""
+flapper_started_monotonic_ms=""
+flapper_stop_requested_offset_ms=""
+flapper_probe_started_unix_seconds=""
+flapper_worker_exit_code=""
+flapper_restore_exit_code=""
+active_telemetry_case=""
+active_telemetry_pid=""
+case_telemetry_pid=""
 
 scale_lab_netem_value() {
   python3 - "$1" "$2" <<'PY'
@@ -108,6 +131,15 @@ else:
     number = f"{scaled:.6f}".rstrip("0").rstrip(".")
 print(f"{number}{match.group(2)}")
 PY
+}
+
+monotonic_milliseconds() {
+  local uptime_seconds whole_seconds fractional_seconds
+  read -r uptime_seconds _ < /proc/uptime
+  IFS='.' read -r whole_seconds fractional_seconds <<< "$uptime_seconds"
+  fractional_seconds="${fractional_seconds}000"
+  fractional_seconds="${fractional_seconds:0:3}"
+  printf '%d\n' "$((10#$whole_seconds * 1000 + 10#$fractional_seconds))"
 }
 
 balanced_rate_for_mildloss="${MPTUNNEL_LAB_BALANCED_RATE:-200mbit}"
@@ -451,8 +483,8 @@ log_collection_enabled() {
 
 start_case_telemetry() {
   local case_name="$1"
+  case_telemetry_pid=""
   if ! telemetry_enabled; then
-    echo ""
     return 0
   fi
   local telemetry_file stop_file before_file after_file
@@ -471,7 +503,7 @@ start_case_telemetry() {
     --stop-file "$stop_file" \
     --interval "$container_stats_interval" \
     >/dev/null 2>&1 &
-  echo "$!"
+  case_telemetry_pid="$!"
 }
 
 stop_case_telemetry() {
@@ -718,7 +750,8 @@ run_unproxied_download_probe_case() {
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --protocol '${protocol}' --target '${target}' --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
@@ -735,7 +768,8 @@ run_tcp_download_probe_case() {
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
@@ -849,7 +883,8 @@ run_unproxied_upload_probe_case() {
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
@@ -866,7 +901,8 @@ run_tcp_upload_probe_case() {
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
@@ -921,19 +957,93 @@ stop_random_flapping() {
     touch "$flapper_stop_file" >/dev/null 2>&1 || true
   fi
   if [[ -n "$flapper_pid" ]]; then
-    kill "$flapper_pid" >/dev/null 2>&1 || true
-    wait "$flapper_pid" >/dev/null 2>&1 || true
+    if [[ -n "$flapper_started_monotonic_ms" ]]; then
+      flapper_stop_requested_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
+    fi
+    local stop_deadline=$((SECONDS + 10))
+    while [[ ! -f "$flapper_done_file" ]] && (( SECONDS < stop_deadline )); do
+      sleep 0.05
+    done
+    if [[ ! -f "$flapper_done_file" ]]; then
+      kill -TERM -- "-$flapper_pgid" >/dev/null 2>&1 || true
+      sleep 0.1
+      kill -KILL -- "-$flapper_pgid" >/dev/null 2>&1 || true
+      wait "$flapper_pid" >/dev/null 2>&1 || true
+      flapper_worker_exit_code=124
+    elif wait "$flapper_pid" >/dev/null 2>&1; then
+      flapper_worker_exit_code=0
+    else
+      flapper_worker_exit_code=$?
+    fi
   fi
   if [[ -n "$flapper_stop_file" ]]; then
     rm -f "$flapper_stop_file"
   fi
+  if [[ -n "$flapper_done_file" ]]; then
+    rm -f "$flapper_done_file"
+  fi
+  if [[ -n "$flapper_probe_gate_file" ]]; then
+    rm -f "$flapper_probe_gate_file"
+  fi
+  if [[ -n "$flapper_probe_finished_file" ]]; then
+    rm -f "$flapper_probe_finished_file"
+  fi
   flapper_pid=""
+  flapper_pgid=""
   flapper_stop_file=""
-  apply_netem apply >/dev/null 2>&1 || true
+  flapper_done_file=""
+  flapper_probe_gate_file=""
+  flapper_probe_finished_file=""
+  flapper_restore_exit_code=0
+  for service in client server target; do
+    if ! exec_netem "$service" apply >/dev/null 2>&1; then
+      flapper_restore_exit_code=1
+    fi
+  done
+}
+
+flapping_result_metadata() {
+  if [[ -z "$flapper_trace_file" ]]; then
+    printf '{}'
+    return 0
+  fi
+
+  local -a anchor_args=()
+  if [[ -n "$flapper_probe_started_unix_seconds" ]]; then
+    anchor_args+=(--probe-started-unix-seconds "$flapper_probe_started_unix_seconds")
+  fi
+  if [[ -n "$flapper_started_unix_ms" ]]; then
+    anchor_args+=(--schedule-origin-unix-ms "$flapper_started_unix_ms")
+  fi
+  if [[ -n "$flapper_started_monotonic_ms" ]]; then
+    anchor_args+=(--schedule-origin-monotonic-ms "$flapper_started_monotonic_ms")
+  fi
+  if [[ -n "$flapper_stop_requested_offset_ms" ]]; then
+    anchor_args+=(--stop-requested-offset-ms "$flapper_stop_requested_offset_ms")
+  fi
+  if [[ -n "$flapper_worker_exit_code" ]]; then
+    anchor_args+=(--worker-exit-code "$flapper_worker_exit_code")
+  fi
+  if [[ -n "$flapper_restore_exit_code" ]]; then
+    anchor_args+=(--restore-exit-code "$flapper_restore_exit_code")
+  fi
+  python3 "$script_dir/flapping_schedule.py" metadata \
+    --seed "$flap_seed" \
+    --seed-source "$flap_seed_source" \
+    --modes "$flap_modes" \
+    --min-seconds "$flap_min_seconds" \
+    --max-seconds "$flap_max_seconds" \
+    --trace "$flapper_trace_file" \
+    "${anchor_args[@]}"
 }
 
 cleanup() {
   stop_random_flapping
+  if [[ -n "$active_telemetry_case" ]]; then
+    stop_case_telemetry "$active_telemetry_case" "$active_telemetry_pid"
+    active_telemetry_case=""
+    active_telemetry_pid=""
+  fi
   stop_saturation
   stop_baselines
   stop_client
@@ -1016,6 +1126,8 @@ start_saturation_path() {
 }
 
 start_random_flapping() {
+  local probe_gate_file="$1"
+  local probe_finished_file="$2"
   local min_seconds="$flap_min_seconds"
   local max_seconds="$flap_max_seconds"
   if ! [[ "$min_seconds" =~ ^[0-9]+$ && "$max_seconds" =~ ^[0-9]+$ ]]; then
@@ -1029,27 +1141,97 @@ start_random_flapping() {
     max_seconds="$min_seconds"
   fi
 
-  stop_random_flapping
-  flapper_stop_file="${result_dir}/flapper-${timestamp}.stop"
-  rm -f "$flapper_stop_file"
+  if [[ -n "$flapper_pid" || -n "$flapper_stop_file" ]]; then
+    stop_random_flapping
+  fi
+  if [[ -z "$flap_seed" ]]; then
+    flap_seed="$(python3 -c 'import secrets; print(secrets.randbits(64))')"
+    flap_seed_source="generated"
+  elif [[ -z "$flap_seed_source" ]]; then
+    flap_seed_source="configured"
+  fi
+  flapper_stop_file="${result_dir}/flapper-${timestamp}-$$.stop"
+  flapper_done_file="${result_dir}/flapper-${timestamp}-$$.done"
+  flapper_probe_gate_file="$probe_gate_file"
+  flapper_probe_finished_file="$probe_finished_file"
+  flapper_trace_file="${result_dir}/flapper-${timestamp}-$$-trace.jsonl"
+  flapper_stop_requested_offset_ms=""
+  flapper_worker_exit_code=""
+  flapper_restore_exit_code=""
+  flapper_probe_started_unix_seconds=""
+  flapper_started_unix_ms=""
+  flapper_started_monotonic_ms=""
+  rm -f "$flapper_stop_file" "$flapper_done_file" "$flapper_trace_file"
+  python3 "$script_dir/flapping_schedule.py" choose \
+    --seed "$flap_seed" \
+    --modes "$flap_modes" \
+    --min-seconds "$min_seconds" \
+    --max-seconds "$max_seconds" \
+    --index 0 >/dev/null
+  set -m
   (
-    IFS=',' read -r -a modes <<< "$flap_modes"
-    if (( ${#modes[@]} == 0 )); then
+    trap 'touch "$flapper_done_file"' EXIT
+    while [[ ! -f "$flapper_probe_gate_file" && ! -f "$flapper_probe_finished_file" && ! -f "$flapper_stop_file" ]]; do
+      sleep 0.01
+    done
+    if [[ -f "$flapper_stop_file" || -f "$flapper_probe_finished_file" ]]; then
       exit 0
     fi
-    while [[ ! -f "$flapper_stop_file" ]]; do
-      mode="${modes[$((RANDOM % ${#modes[@]}))]}"
-      exec_netem client "$mode" >/dev/null 2>&1 || true
-      exec_netem server "$mode" >/dev/null 2>&1 || true
-      if (( max_seconds == min_seconds )); then
-        sleep_seconds="$min_seconds"
-      else
-        sleep_seconds="$((min_seconds + RANDOM % (max_seconds - min_seconds + 1)))"
+    mapfile -t probe_anchor < "$flapper_probe_gate_file"
+    flapper_probe_started_unix_seconds="${probe_anchor[0]}"
+    flapper_started_monotonic_ms="${probe_anchor[1]}"
+    flapper_started_unix_ms="${probe_anchor[2]}"
+    event_index=0
+    planned_offset_seconds=0
+    while [[ ! -f "$flapper_stop_file" && ! -f "$flapper_probe_finished_file" ]]; do
+      schedule_row="$(python3 "$script_dir/flapping_schedule.py" choose \
+        --seed "$flap_seed" \
+        --modes "$flap_modes" \
+        --min-seconds "$min_seconds" \
+        --max-seconds "$max_seconds" \
+        --index "$event_index")"
+      IFS=$'\t' read -r selected_index mode sleep_seconds <<< "$schedule_row"
+      if [[ -f "$flapper_stop_file" || -f "$flapper_probe_finished_file" ]]; then
+        break
       fi
-      sleep "$sleep_seconds"
+      event_start_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
+      client_apply_start_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
+      if exec_netem client "$mode" >/dev/null 2>&1; then
+        client_command_exit_code=0
+      else
+        client_command_exit_code=$?
+      fi
+      client_apply_end_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
+      server_apply_start_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
+      if exec_netem server "$mode" >/dev/null 2>&1; then
+        server_command_exit_code=0
+      else
+        server_command_exit_code=$?
+      fi
+      server_apply_end_offset_ms="$(($(monotonic_milliseconds) - flapper_started_monotonic_ms))"
+      printf '{"index":%s,"planned_offset_seconds":%s,"mode":"%s","hold_seconds":%s,"event_start_offset_ms":%s,"client_apply_start_offset_ms":%s,"client_apply_end_offset_ms":%s,"client_command_exit_code":%s,"server_apply_start_offset_ms":%s,"server_apply_end_offset_ms":%s,"server_command_exit_code":%s}\n' \
+        "$selected_index" \
+        "$planned_offset_seconds" \
+        "$mode" \
+        "$sleep_seconds" \
+        "$event_start_offset_ms" \
+        "$client_apply_start_offset_ms" \
+        "$client_apply_end_offset_ms" \
+        "$client_command_exit_code" \
+        "$server_apply_start_offset_ms" \
+        "$server_apply_end_offset_ms" \
+        "$server_command_exit_code" >> "$flapper_trace_file"
+      event_index=$((event_index + 1))
+      planned_offset_seconds=$((planned_offset_seconds + sleep_seconds))
+      hold_deadline_ms="$(($(monotonic_milliseconds) + sleep_seconds * 1000))"
+      while [[ ! -f "$flapper_stop_file" && ! -f "$flapper_probe_finished_file" ]] && (( $(monotonic_milliseconds) < hold_deadline_ms )); do
+        sleep 0.05
+      done
     done
   ) &
   flapper_pid="$!"
+  flapper_pgid="$flapper_pid"
+  set +m
 }
 
 should_run_case() {
@@ -1182,7 +1364,8 @@ run_udp_case() {
   shift
   start_client "$case_name" "$@"
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output
   output="$(exec_in client "python3 /workspace/lab/socks5_udp_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:9090 --load-duration '${load_duration_seconds}' --payload-bytes '${udp_payload_bytes}' --timeout-ms '${udp_timeout_ms}'" 2>/dev/null)"
@@ -1219,7 +1402,8 @@ run_baseline_download_probe_case() {
   local err_file="/tmp/mptunnel-baseline-${case_name}.err"
   local output probe_stderr exit_code
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
@@ -1242,7 +1426,8 @@ run_baseline_upload_probe_case() {
   local err_file="/tmp/mptunnel-baseline-upload-${case_name}.err"
   local output probe_stderr exit_code
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
@@ -1399,7 +1584,8 @@ run_mptcp_baseline_case() {
     return 0
   fi
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output exit_code
   output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/mptcp_http.py download --label '${case_name}' --target 172.31.10.30:${baseline_mptcp_port} --path '${large_http_path}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}'" 2>/dev/null)"
@@ -1418,6 +1604,8 @@ append_mixed_probe_result() {
   local case_name="$1"
   local exit_code="$2"
   local output="$3"
+  local flapping_metadata_json="${4:-}"
+  local probe_stderr="${5:-}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -1432,6 +1620,8 @@ append_mixed_probe_result() {
   LOG_TAIL_BYTES="$log_tail_bytes" \
   TELEMETRY="$(case_telemetry_summary "$case_name")" \
   LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+  FLAPPING_METADATA="$flapping_metadata_json" \
+  PROBE_STDERR="$probe_stderr" \
   LAB_SCRIPT_DIR="$script_dir" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -1466,10 +1656,26 @@ if instrumented_run:
         "diagnostic/perf instrumentation is for causal analysis only; "
         "use non-instrumented release rows for throughput comparisons"
     )
+raw_flapping = os.environ.get("FLAPPING_METADATA", "")
+if raw_flapping:
+    try:
+        flapping = json.loads(raw_flapping)
+        if isinstance(flapping, dict) and flapping:
+            sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+            from flapping_schedule import attach_metadata_to_result
+            attach_metadata_to_result(row, flapping)
+    except json.JSONDecodeError as exc:
+        row["probe_status_before_flapping_validation"] = row.get("status")
+        row["status"] = "fail"
+        row["failure_reason"] = "flapping metadata is invalid"
+        row["flapping_metadata_error"] = str(exc)
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:
     log_tail_bytes = 4000
+probe_stderr = os.environ.get("PROBE_STDERR", "")
+if row.get("status") != "ok" and probe_stderr:
+    row["probe_stderr_tail"] = probe_stderr[-log_tail_bytes:]
 if row.get("status") != "ok" or lab_diag or lab_perf:
     for env_name, field in (
         ("CLIENT_LOG", "client_log_tail"),
@@ -1510,7 +1716,8 @@ PY
 record_mixed_probe_case() {
   local case_name="$1"
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output
   output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
@@ -1540,7 +1747,8 @@ run_direct_mixed_case() {
   fi
 
   local telemetry_pid
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   set +e
   local output
   output="$(exec_in client "python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --mode direct --http-target '${target_ip}:8080' --udp-target '${target_ip}:9090' --tcp-echo-target '${target_ip}:10022' --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}'" 2>/dev/null)"
@@ -1585,10 +1793,62 @@ run_mixed_saturated_case() {
 
 run_mixed_flapping_case() {
   local case_name="mptunnel_mixed_multipath_flapping_links"
+  local output exit_code telemetry_pid flapping_metadata_json probe_stderr
+  local output_file="/tmp/mptunnel-mixed-flapping.out"
+  local error_file="/tmp/mptunnel-mixed-flapping.err"
+  local probe_pid_file="/tmp/mptunnel-mixed-flapping.pid"
+  local probe_gate_relative="lab/results/flapper-${timestamp}-$$-probe.started"
+  local probe_finished_relative="lab/results/flapper-${timestamp}-$$-probe.finished"
+  local probe_status_relative="lab/results/flapper-${timestamp}-$$-probe.status"
+  local probe_gate_file="${repo_root}/${probe_gate_relative}"
+  local probe_finished_file="${repo_root}/${probe_finished_relative}"
+  local probe_status_file="${repo_root}/${probe_status_relative}"
+  local probe_gate_container_file="/workspace/${probe_gate_relative}"
+  local probe_finished_container_file="/workspace/${probe_finished_relative}"
+  local probe_status_container_file="/workspace/${probe_status_relative}"
   start_client "$case_name" "$tcp_all $udp_all"
-  start_random_flapping
-  record_mixed_probe_case "$case_name"
+  exec_in client "rm -f '${output_file}' '${error_file}' '${probe_pid_file}'"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  active_telemetry_case="$case_name"
+  active_telemetry_pid="$telemetry_pid"
+  mkdir -p "$(dirname "$probe_gate_file")"
+  rm -f "$probe_gate_file" "$probe_finished_file" "$probe_status_file" "${probe_status_file}.tmp"
+  start_random_flapping "$probe_gate_file" "$probe_finished_file"
+  exec_in client "(set +e; timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${probe_gate_container_file}' > '${output_file}' 2> '${error_file}'; probe_exit=\$?; : > '${probe_finished_container_file}'; printf '%s\n' \"\$probe_exit\" > '${probe_status_container_file}.tmp'; mv '${probe_status_container_file}.tmp' '${probe_status_container_file}') & echo \$! > '${probe_pid_file}'"
+  local gate_deadline=$((SECONDS + 10))
+  while [[ ! -f "$probe_gate_file" && ! -f "$probe_status_file" ]] && (( SECONDS < gate_deadline )); do
+    sleep 0.01
+  done
+  if [[ -f "$probe_gate_file" ]]; then
+    mapfile -t probe_anchor < "$probe_gate_file"
+    flapper_probe_started_unix_seconds="${probe_anchor[0]}"
+    flapper_started_monotonic_ms="${probe_anchor[1]}"
+    flapper_started_unix_ms="${probe_anchor[2]}"
+  elif [[ ! -f "$probe_status_file" ]]; then
+    exec_in client "probe_pid=\$(cat '${probe_pid_file}' 2>/dev/null || true); if [ -n \"\$probe_pid\" ]; then pkill -TERM -P \"\$probe_pid\" >/dev/null 2>&1 || true; kill \"\$probe_pid\" >/dev/null 2>&1 || true; fi; true"
+    : > "$probe_finished_file"
+    printf '124\n' > "$probe_status_file"
+  fi
+  local probe_deadline=$((SECONDS + curl_timeout + 5))
+  while [[ ! -f "$probe_status_file" ]] && (( SECONDS < probe_deadline )); do
+    sleep 0.05
+  done
+  if [[ ! -f "$probe_status_file" ]]; then
+    exec_in client "probe_pid=\$(cat '${probe_pid_file}' 2>/dev/null || true); if [ -n \"\$probe_pid\" ]; then pkill -TERM -P \"\$probe_pid\" >/dev/null 2>&1 || true; kill \"\$probe_pid\" >/dev/null 2>&1 || true; fi; true"
+    : > "$probe_finished_file"
+    printf '124\n' > "$probe_status_file"
+  fi
   stop_random_flapping
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  active_telemetry_case=""
+  active_telemetry_pid=""
+  output="$(exec_in client "cat '${output_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -c '${log_tail_bytes}' '${error_file}' 2>/dev/null || true")"
+  exit_code="$(cat "$probe_status_file" 2>/dev/null || echo 124)"
+  rm -f "$probe_status_file" "${probe_status_file}.tmp"
+  flapping_metadata_json="$(flapping_result_metadata)"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "$flapping_metadata_json" "$probe_stderr"
 }
 
 netem_mode_for_equal_profile() {
@@ -1700,7 +1960,8 @@ run_mixed_failover_case() {
   local started_file="/tmp/mptunnel-mixed.started"
   start_client "$case_name" "$tcp_all $udp_all"
   exec_in client "rm -f /tmp/mptunnel-mixed.out /tmp/mptunnel-mixed.status /tmp/mptunnel-mixed.pid '${started_file}'"
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed.out 2>/tmp/mptunnel-mixed.err; echo \$? >/tmp/mptunnel-mixed.status) & echo \$! >/tmp/mptunnel-mixed.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
@@ -1720,7 +1981,8 @@ run_mixed_latency_spike_case() {
   local started_file="/tmp/mptunnel-mixed-spike.started"
   start_client "$case_name" "$tcp_all $udp_all"
   exec_in client "rm -f /tmp/mptunnel-mixed-spike.out /tmp/mptunnel-mixed-spike.status /tmp/mptunnel-mixed-spike.pid '${started_file}'"
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/mixed_workload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --http-target 172.31.40.30:8080 --udp-target 172.31.40.30:9090 --tcp-echo-target 172.31.40.30:10022 --bulk-path '${large_http_path}' --small-path '${small_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --udp-payload-bytes '${udp_payload_bytes}' --udp-timeout-ms '${udp_timeout_ms}' --tcp-echo-payload-bytes '${tcp_echo_payload_bytes}' --tcp-echo-timeout-ms '${tcp_echo_timeout_ms}' --tcp-echo-interval-ms '${tcp_echo_interval_ms}' --started-file '${started_file}' > /tmp/mptunnel-mixed-spike.out 2>/tmp/mptunnel-mixed-spike.err; echo \$? >/tmp/mptunnel-mixed-spike.status) & echo \$! >/tmp/mptunnel-mixed-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
@@ -1740,7 +2002,8 @@ run_failover_case() {
   local started_file="/tmp/mptunnel-failover.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-failover.out /tmp/mptunnel-failover.status /tmp/mptunnel-failover.pid '${started_file}'"
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
@@ -1766,7 +2029,8 @@ run_upload_failover_case() {
   local started_file="/tmp/mptunnel-upload-failover.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-upload-failover.out /tmp/mptunnel-upload-failover.status /tmp/mptunnel-upload-failover.pid '${started_file}'"
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
@@ -1792,7 +2056,8 @@ run_latency_spike_case() {
   local started_file="/tmp/mptunnel-spike.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-spike.out /tmp/mptunnel-spike.status /tmp/mptunnel-spike.pid '${started_file}'"
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-spike.out 2>/tmp/mptunnel-spike.err; echo \$? >/tmp/mptunnel-spike.status) & echo \$! >/tmp/mptunnel-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
@@ -1818,7 +2083,8 @@ run_upload_latency_spike_case() {
   local started_file="/tmp/mptunnel-upload-spike.started"
   start_client "$case_name" "$tcp_all"
   exec_in client "rm -f /tmp/mptunnel-upload-spike.out /tmp/mptunnel-upload-spike.status /tmp/mptunnel-upload-spike.pid '${started_file}'"
-  telemetry_pid="$(start_case_telemetry "$case_name")"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"

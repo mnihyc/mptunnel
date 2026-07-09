@@ -1440,6 +1440,28 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     if let Some(service_key) = ordered_owner_anchor
         && let Some(service) = targets.iter().find(|target| target.key == service_key)
     {
+        if ordered_owner_debt_bytes > 0 && effective_lower_owner.is_none() {
+            #[cfg(feature = "lab-diagnostics")]
+            for target in &candidate_targets {
+                if target.key != service_key {
+                    lab_response_bulk_output_candidate(
+                        "ordered_owner_tail_debt",
+                        target,
+                        payload_bytes,
+                        mux_limits,
+                        ResponseBulkCandidateDiag {
+                            lead: None,
+                            role: None,
+                            ordering_debt: ordered_owner_debt_bytes as u64,
+                        },
+                    );
+                }
+            }
+            candidate_targets.retain(|target| target.key == service_key);
+            if candidate_targets.is_empty() {
+                return None;
+            }
+        }
         let service_has_capacity = candidate_targets
             .iter()
             .any(|target| target.key == service_key);
@@ -3542,7 +3564,6 @@ mod tests {
         lab_assert_server_sender_service_balanced, lab_diag_test_guard,
         lab_sender_service_counts_for_test,
     };
-    use crate::runtime::bulk_admission::bulk_startup_service_horizon_payload_bytes;
 
     #[test]
     fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
@@ -4612,8 +4633,12 @@ mod tests {
 
         assert_eq!(selected.key, admissible.key);
         assert!(
-            saturated.commands.pending_bytes() >= credit as u64,
-            "test must fill the low-ETA writer pipe enough to exercise byte credit"
+            saturated
+                .commands
+                .pending_bytes()
+                .saturating_add(payload_bytes as u64)
+                > credit as u64,
+            "test must fill the low-ETA writer pipe until the next data frame would exceed byte credit"
         );
     }
 
@@ -4649,7 +4674,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_response_owner_without_product_progress_uses_startup_feedback_credit() {
+    fn active_tcp_response_owner_without_product_progress_uses_stable_service_credit() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
@@ -4665,8 +4690,13 @@ mod tests {
 
         assert_eq!(
             credit,
-            bulk_startup_service_horizon_payload_bytes(payload_bytes, mux_limits),
-            "unproven Service startup uses bounded startup-feedback credit, not a tiny carrier quantum and not the full geometric Service horizon"
+            usize::try_from(bulk_active_service_product_envelope_bytes(
+                active.snapshot,
+                payload_bytes,
+                mux_limits,
+            ))
+            .unwrap(),
+            "unproven active Service startup uses the product envelope, not a tiny carrier quantum"
         );
         assert!(
             credit >= payload_bytes,
@@ -7177,10 +7207,11 @@ mod tests {
             Some(owner.key),
             owner_tail_guard_bytes,
             None,
-        );
-        assert!(
-            selected.is_none(),
-            "an over-budget lower owner should create backpressure, not later-offset Subflow ownership"
+        )
+        .expect("feedable Service owner should remain selected under its own tail guard");
+        assert_eq!(
+            selected.target.key, owner.key,
+            "owner-tail debt must block later-offset Subflow ownership without starving the Service owner"
         );
     }
 
@@ -7229,6 +7260,7 @@ mod tests {
         let owner = response_target(1, UnderlayProtocol::Tcp, 50.0, 4 * 1024 * 1024, 0, true);
         let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
 
+        let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[owner.clone(), alternate],
             FlowLane::Throughput,
@@ -7236,13 +7268,15 @@ mod tests {
             mux_limits,
             &[],
             Some(owner.key),
-            0,
+            owner_tail_guard_bytes,
             None,
         );
 
-        assert!(
-            selected.is_none(),
-            "a cross-underlay alternate must not own later bytes while the current Service owner is backpressured by unresolved contiguous tail"
+        let selected =
+            selected.expect("feedable Service owner should remain selected under tail debt");
+        assert_eq!(
+            selected.target.key, owner.key,
+            "a cross-underlay alternate must not own later bytes while the current Service owner has unresolved contiguous tail"
         );
     }
 

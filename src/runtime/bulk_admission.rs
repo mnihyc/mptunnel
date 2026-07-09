@@ -1,6 +1,6 @@
+use super::BBR_DEFAULT_CWND_GAIN;
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
-use super::{BBR_DEFAULT_CWND_GAIN, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
@@ -150,19 +150,6 @@ pub(super) fn bulk_service_horizon_payload_bytes(
         .max(1);
     let horizon = ((payload_bytes as f64) * (envelope as f64)).sqrt().round() as usize;
     horizon.clamp(payload_bytes.max(1), envelope)
-}
-
-pub(super) fn bulk_startup_service_horizon_payload_bytes(
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
-    let startup_floor = usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES)
-        .unwrap_or(usize::MAX)
-        .max(payload_bytes.saturating_mul(16))
-        .max(payload_bytes)
-        .max(1);
-    startup_floor.min(service_horizon).max(payload_bytes.max(1))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -397,73 +384,12 @@ pub(super) fn bulk_active_service_product_envelope_bytes(
     mux_limits: MuxLimits,
 ) -> u64 {
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
-    let configured = mux_limits
+    let _ = candidate;
+    mux_limits
         .max_path_flight_bytes
         .min(stream_window)
         .min(mux_limits.max_reorder_bytes)
-        .max(payload_bytes) as u64;
-    let startup_feed_limit = (bulk_startup_service_horizon_payload_bytes(payload_bytes, mux_limits)
-        as u64)
-        .min(configured)
-        .max(payload_bytes as u64);
-    let Some(progress_rate_bps) = candidate
-        .product_progress_rate_bps
-        .filter(|rate| rate.is_finite() && *rate > 0.0)
-    else {
-        return startup_feed_limit;
-    };
-    if candidate.app_limited {
-        return bulk_app_limited_service_feedback_horizon_bytes(
-            candidate,
-            progress_rate_bps,
-            payload_bytes,
-            configured,
-            startup_feed_limit,
-        );
-    }
-
-    let progress_bdp =
-        bulk_rate_bdp_bytes(progress_rate_bps, bulk_product_budget_rtt_ms(candidate));
-    let progress_limit = bulk_bbr_inflight_bytes(progress_bdp)
-        .max((payload_bytes as u64).saturating_mul(8))
-        .max(startup_feed_limit);
-    configured.min(progress_limit)
-}
-
-fn bulk_app_limited_service_feedback_horizon_bytes(
-    candidate: PathSnapshot,
-    progress_rate_bps: f64,
-    payload_bytes: usize,
-    configured: u64,
-    startup_feed_limit: u64,
-) -> u64 {
-    let progress_bdp =
-        bulk_rate_bdp_bytes(progress_rate_bps, bulk_product_budget_rtt_ms(candidate));
-    let feedback_horizon = bulk_bbr_inflight_bytes(progress_bdp);
-    let meaningful_floor = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
-        .max((payload_bytes as u64).saturating_mul(8))
-        .max(payload_bytes as u64);
-    if feedback_horizon < meaningful_floor {
-        return startup_feed_limit
-            .min(bulk_tiny_app_limited_service_horizon_bytes(
-                payload_bytes,
-                startup_feed_limit,
-            ))
-            .max(payload_bytes as u64);
-    }
-    startup_feed_limit
-        .min(feedback_horizon.max(meaningful_floor).min(configured))
-        .max(payload_bytes as u64)
-}
-
-fn bulk_tiny_app_limited_service_horizon_bytes(
-    payload_bytes: usize,
-    startup_feed_limit: u64,
-) -> u64 {
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
-        .max((payload_bytes as u64).saturating_mul(16))
-        .min(startup_feed_limit)
-        .max(payload_bytes as u64)
+        .max(payload_bytes) as u64
 }
 
 fn bulk_product_inflight_limit_bytes(
@@ -732,10 +658,6 @@ fn bulk_path_bdp_bytes(candidate: PathSnapshot) -> u64 {
 fn bulk_rate_bdp_bytes(rate_bps: f64, srtt_ms: f64) -> u64 {
     let rate_bps = rate_bps.max(1.0);
     (rate_bps / 8.0 * srtt_ms.max(1.0) / 1000.0).ceil() as u64
-}
-
-fn bulk_product_budget_rtt_ms(candidate: PathSnapshot) -> f64 {
-    candidate.min_rtt_ms.min(candidate.srtt_ms).max(1.0)
 }
 
 fn bulk_bbr_inflight_bytes(bdp_bytes: u64) -> u64 {
@@ -1009,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn app_limited_service_progress_uses_bounded_service_horizon_not_full_envelope() {
+    fn app_limited_service_progress_uses_product_envelope_for_clear_frontier_owner() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1036,13 +958,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "app-limited product progress escapes tiny BDP/cwnd caps, but it must not unlock the full configured envelope before non-app-limited bulk evidence"
+            None,
+            "app-limited product progress must not shrink a clear-frontier Service owner below the product envelope"
         );
     }
 
     #[test]
-    fn app_limited_service_progress_uses_observed_feedback_horizon_before_bulk_rate_proof() {
+    fn app_limited_udp_service_progress_does_not_shrink_below_startup_headroom() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1056,10 +978,8 @@ mod tests {
         active.delivery_rate_bps = observed_rate_bps;
         active.product_progress_rate_bps = Some(observed_rate_bps);
         active.app_limited = true;
-        active.product_bytes_in_flight = bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(
-            observed_rate_bps,
-            bulk_product_budget_rtt_ms(active),
-        ));
+        active.product_bytes_in_flight =
+            bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(observed_rate_bps, active.srtt_ms));
 
         assert_eq!(
             bulk_candidate_admission_suppression(
@@ -1071,13 +991,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "an app-limited Service path with observed progress should be bounded by an ACK-feedback horizon, not the full geometric Service horizon that can create large ordered receive holes"
+            None,
+            "an app-limited active Service path should not be shrunk below startup headroom; optional Subflows and ordering-debt paths own the receive-hole risk"
         );
     }
 
     #[test]
-    fn tiny_app_limited_service_progress_uses_bounded_startup_feedback_horizon() {
+    fn tiny_app_limited_service_progress_uses_stable_service_horizon() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1104,13 +1024,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "tiny app-limited progress is ACK-clock visibility, not bulk-rate proof; it must cap Service preload below the geometric Service horizon to avoid megabyte-scale lower-owner stalls"
+            None,
+            "tiny app-limited progress is not bulk-rate proof, but the clear-frontier Service owner may still use the stable service horizon because it cannot create a cross-path stream hole"
         );
     }
 
     #[test]
-    fn pre_progress_service_startup_uses_bounded_startup_feedback_horizon() {
+    fn pre_progress_service_startup_uses_stable_service_horizon() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1134,8 +1054,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "before product progress exists, Service startup may stay above one quantum but must not preload the full geometric horizon onto a slow lower-owner path"
+            None,
+            "before product progress exists, a clear-frontier Service owner should still get the stable service horizon; sender credit and stream flow control remain the safety gates"
         );
     }
 
@@ -1194,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn active_udp_with_product_progress_debt_is_bdp_capped() {
+    fn active_udp_with_product_progress_debt_uses_product_envelope() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1216,13 +1136,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "active QUIC Service ownership must be bounded by product-progress BDP once real product progress exists; carrier pacing must not inflate product offset flight to the full resource envelope"
+            None,
+            "active QUIC Service ownership is bounded by product resource envelopes; carrier pacing and optional Subflow admission own lower-layer limits"
         );
     }
 
     #[test]
-    fn active_udp_with_latency_pressure_still_uses_service_product_cap() {
+    fn active_udp_with_latency_pressure_does_not_count_owner_flight_as_backlog() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1245,41 +1165,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "latency pressure may shorten Service bursts, but must not switch active QUIC product ownership back to a carrier-pacing-derived backlog limit"
+            None,
+            "latency pressure may bound queued backlog, but already-owned clear-frontier Service flight is not optional Subflow debt"
         );
     }
 
     #[test]
-    fn active_udp_product_progress_cap_uses_queue_resistant_min_rtt() {
-        let mux_limits = MuxLimits {
-            max_path_flight_bytes: 64 * 1024 * 1024,
-            max_reorder_bytes: 64 * 1024 * 1024,
-            ..MuxLimits::default()
-        };
-        let mut candidate =
-            PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 1400.0, mbps(500.0));
-        candidate.min_rtt_ms = 80.0;
-        candidate.product_progress_rate_bps = Some(mbps(85.0));
-        candidate.product_bytes_in_flight = 4 * 1024 * 1024;
-
-        assert_eq!(
-            bulk_candidate_admission_suppression(
-                candidate,
-                10.0,
-                candidate,
-                10.0,
-                64 * 1024,
-                mux_limits,
-                BulkAdmissionRole::ActiveDataPath,
-            ),
-            Some("inflight_limit"),
-            "active QUIC product-progress caps must use queue-resistant RTT; using queue-inflated SRTT grows the product backlog and feeds HOL debt"
-        );
-    }
-
-    #[test]
-    fn active_udp_without_product_progress_uses_startup_envelope_not_full_resource_ceiling() {
+    fn active_udp_without_product_progress_uses_product_envelope() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1299,13 +1191,13 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "active QUIC Service startup must not borrow the full configured product flight resource before product progress exists"
+            None,
+            "active QUIC Service startup may use the product envelope because it is the current ordered owner, not an optional Subflow"
         );
     }
 
     #[test]
-    fn active_tcp_without_product_progress_uses_startup_envelope_not_full_resource_ceiling() {
+    fn active_tcp_without_product_progress_uses_product_envelope() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1325,8 +1217,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit"),
-            "active TCP Service startup must use the same finite owner-credit model as QUIC before product progress exists"
+            None,
+            "active TCP Service startup uses the same carrier-neutral product envelope as QUIC"
         );
     }
 
@@ -1400,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn app_limited_tcp_active_path_uses_bounded_service_horizon() {
+    fn app_limited_tcp_active_path_uses_service_headroom_until_backpressured() {
         let best = candidate(0, 100.0, 50.0, 500.0);
         let mut active = candidate(0, 100.0, 50.0, 0.35);
         active.snapshot.underlay = UnderlayProtocol::Tcp;
@@ -1420,7 +1312,7 @@ mod tests {
                 MuxLimits::default(),
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            Some("inflight_limit")
+            None
         );
     }
 
@@ -1447,6 +1339,139 @@ mod tests {
             ),
             None,
             "latency-first startup state must not shrink an active bulk Service owner to a tiny startup-rate BDP while the ordered frontier is clear"
+        );
+    }
+
+    #[test]
+    fn tcp_active_service_partial_quantum_does_not_shrink_feed_window() {
+        let payload = 45_536;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.product_bytes_in_flight = 686_088;
+        active.product_queue_bytes = payload as u64;
+        active.product_progress_rate_bps = Some(mbps(0.351));
+        active.confidence = 0.1;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                41_548.284,
+                active,
+                41_548.284,
+                payload,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "a partial local read quantum must not reduce the active Service owner feed window below the stable service horizon"
+        );
+    }
+
+    #[test]
+    fn tcp_active_service_startup_uses_stable_service_horizon_before_bulk_samples() {
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.product_bytes_in_flight = 906_488;
+        active.product_queue_bytes = 393_216;
+        active.product_progress_rate_bps = Some(mbps(0.351));
+        active.confidence = 0.1;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                57_439.409,
+                active,
+                57_439.409,
+                payload,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "a clear-frontier Service owner should ramp within the stable service horizon instead of being trapped below a tiny startup feedback window"
+        );
+    }
+
+    #[test]
+    fn tcp_active_service_startup_allows_bbr_headroom_over_service_horizon() {
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
+        active.pacing_rate_bps = mbps(0.351);
+        active.queue_bytes = 262_144;
+        active.product_bytes_in_flight = 1_561_848;
+        active.product_queue_bytes = 393_216;
+        active.product_progress_rate_bps = Some(mbps(0.351));
+        active.confidence = 0.1;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                63_418.447,
+                active,
+                63_418.447,
+                payload,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "active Service feed may use BBR-style headroom above the preemptible service horizon so a healthy path can leave startup"
+        );
+    }
+
+    #[test]
+    fn tcp_active_service_app_limited_progress_does_not_shrink_below_startup_headroom() {
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(9.522));
+        active.pacing_rate_bps = mbps(9.522);
+        active.delivery_rate_bps = mbps(9.522);
+        active.product_progress_rate_bps = Some(mbps(9.522));
+        active.product_bytes_in_flight = 655_360;
+        active.product_queue_bytes = 327_680;
+        active.confidence = 1.0;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                2_203.842,
+                active,
+                2_203.842,
+                payload,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "app-limited progress on the Service owner is ACK-clock visibility, not a reason to shrink the Service feed below startup headroom"
+        );
+    }
+
+    #[test]
+    fn tcp_active_service_clear_frontier_uses_product_envelope_not_modeled_bdp_cap() {
+        let payload = 64 * 1024;
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(25.404));
+        active.pacing_rate_bps = mbps(25.404);
+        active.delivery_rate_bps = mbps(25.404);
+        active.product_progress_rate_bps = Some(mbps(25.404));
+        active.product_bytes_in_flight = 4_128_768;
+        active.product_queue_bytes = 458_752;
+        active.confidence = 1.0;
+        active.app_limited = true;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                active,
+                971.380,
+                active,
+                971.380,
+                payload,
+                MuxLimits::default(),
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "clear-frontier Service owner admission should be bounded by product resource envelopes, not a low modeled BDP cap created by prior starvation"
         );
     }
 

@@ -3804,14 +3804,16 @@ meaningful app-limited ACK-feedback sample MAY raise or cap that Service feed
 below the geometric horizon until stable non-app-limited evidence exists. Only
 non-app-limited bulk evidence can replace that Service/feed horizon with a
 BDP-derived product envelope.
-While there is no lower-frontier owner on another path, same-underlay admission
-is governed by explicit product inflight, live carrier credit, and reorder
-budgets.
-Once stream-ordering debt exists for a non-owner candidate, additional
-same-stream `OwnerData` is suppressed until the lower frontier clears. The
-completion horizon remains the positive-contribution gate for clear-frontier
-same-family admission and for explicit cross-underlay Service migration once
-the migration policy decides the carrier family may change.
+While there is no lower-frontier owner on another path and the Service-owner
+frontier is clear, same-underlay admission is governed by explicit product
+inflight, live carrier credit, and reorder budgets.
+Once any unresolved Service-owner debt exists, additional same-stream
+`OwnerData` by non-owner candidates is suppressed until the lower frontier
+clears. The Service owner may continue only if its own product-feed admission
+passes; otherwise the sender waits or emits bounded `RepairData` for the
+blocking range. The completion horizon remains the positive-contribution gate
+for clear-frontier same-family admission and for explicit cross-underlay Service
+migration once the migration policy decides the carrier family may change.
 
 For same-underlay startup, the reorder/feed budget uses live carrier credit when
 available. If the carrier reports an inflight or congestion-window limit, that

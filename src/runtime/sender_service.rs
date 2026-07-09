@@ -745,7 +745,7 @@ fn response_target_unique_owner_admission_with_epoch(
     lower_owner: Option<CarrierPathKey>,
     ordered_data_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    _ordered_owner_debt_bytes: usize,
+    ordered_owner_debt_bytes: usize,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
@@ -780,6 +780,9 @@ fn response_target_unique_owner_admission_with_epoch(
         };
     }
     if target.is_active {
+        return (PathAdmission::standby(), None);
+    }
+    if ordered_owner_debt_bytes > 0 && Some(target.key) != ordered_data_owner {
         return (PathAdmission::standby(), None);
     }
 
@@ -7442,7 +7445,7 @@ mod tests {
     }
 
     #[test]
-    fn response_small_owner_debt_does_not_pin_bulk_to_current_service_path() {
+    fn response_small_owner_debt_keeps_feedable_service_owner_stable() {
         let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -7456,9 +7459,12 @@ mod tests {
             Some(owner.key),
             64 * 1024,
         )
-        .expect("small normal owner debt should not block better bulk service selection");
+        .expect("feedable Service owner should remain dispatchable under small owner debt");
 
-        assert_eq!(selected.key, lower_eta_alternate.key);
+        assert_eq!(
+            selected.key, owner.key,
+            "unresolved Service-owner debt must not migrate later OwnerData to a lower-ETA alternate"
+        );
     }
 
     #[test]

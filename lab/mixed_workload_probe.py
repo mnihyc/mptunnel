@@ -10,6 +10,15 @@ import time
 
 DEFAULT_INTERVAL_SECONDS = 0.2
 INTERVAL_TRIM_DISCARD_EACH_END = 3
+FLOAT_TIME_EPSILON_SECONDS = 1e-9
+
+
+def attempt_has_response_budget(now, workload_deadline_at, timeout):
+    return now + timeout <= workload_deadline_at + FLOAT_TIME_EPSILON_SECONDS
+
+
+def small_http_response_budget_seconds(args):
+    return min(args.timeout, args.small_response_budget_ms / 1000.0)
 
 
 def parse_host_port(value):
@@ -384,9 +393,12 @@ def small_http_worker(args, started_at, bulk_ready, result):
     bulk_ready.wait(timeout=min(args.timeout, 10.0))
     worker_started = time.monotonic()
     deadline = workload_deadline(started_at, args)
+    response_budget = small_http_response_budget_seconds(args)
     while time.monotonic() < deadline:
-        attempts += 1
         started = time.monotonic()
+        if not attempt_has_response_budget(started, deadline, response_budget):
+            break
+        attempts += 1
         remaining = max(0.1, min(args.timeout, deadline - started))
         try:
             status, body_bytes, _ = http_get(
@@ -580,8 +592,11 @@ def udp_worker(args, started_at, bulk_ready, result):
                 body_len = max(4, args.udp_payload_bytes)
                 index = 0
                 while time.monotonic() < workload_deadline_at:
-                    if time.monotonic() >= safety_deadline:
+                    now = time.monotonic()
+                    if now >= safety_deadline:
                         deadline_hit = True
+                        break
+                    if not attempt_has_response_budget(now, workload_deadline_at, timeout):
                         break
                     payload = struct.pack("!I", index) + bytes([index % 251]) * (
                         body_len - 4
@@ -689,8 +704,11 @@ def udp_worker(args, started_at, bulk_ready, result):
                 body_len = max(4, args.udp_payload_bytes)
                 index = 0
                 while time.monotonic() < workload_deadline_at:
-                    if time.monotonic() >= safety_deadline:
+                    now = time.monotonic()
+                    if now >= safety_deadline:
                         deadline_hit = True
+                        break
+                    if not attempt_has_response_budget(now, workload_deadline_at, timeout):
                         break
                     payload = struct.pack("!I", index) + bytes([index % 251]) * (
                         body_len - 4
@@ -849,6 +867,7 @@ def main():
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
+    parser.add_argument("--small-response-budget-ms", type=int, default=2500)
     parser.add_argument("--small-interval-ms", type=int, default=100)
     parser.add_argument("--udp-payload-bytes", type=int, default=512)
     parser.add_argument("--udp-timeout-ms", type=int, default=2500)

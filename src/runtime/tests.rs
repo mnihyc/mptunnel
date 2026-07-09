@@ -2937,6 +2937,49 @@ fn tcp_path_sessions_are_dedicated_for_latency_sensitive_lanes() {
 }
 
 #[test]
+fn acked_udp_datagram_timeout_suppresses_path_for_next_realtime_packet() {
+    let resources = ResourceLimits::default();
+    let context = ClientPathContext::new(
+        vec![
+            "udp://127.0.0.1:10000?srtt-ms=20&rate-mbps=200"
+                .parse()
+                .expect("path"),
+            "udp://127.0.0.1:10001?srtt-ms=30&rate-mbps=200"
+                .parse()
+                .expect("path"),
+        ],
+        security(),
+        resources,
+    )
+    .expect("context");
+    let association = UdpDatagramClientAssociation::new(context.clone()).expect("association");
+    let payload_bytes = 512;
+    let ttl_ms = 1_000;
+    let candidates = context.ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms);
+    assert_eq!(
+        association.select_path_candidate(&candidates, &HashSet::new(), payload_bytes, ttl_ms),
+        Some(0),
+        "the lower-ETA realtime datagram path starts as the best path"
+    );
+
+    context.mark_udp_path_feedback(
+        0,
+        UdpDatagramPathObservation {
+            rtt: Duration::from_millis(20),
+            jitter: Duration::ZERO,
+            loss_rate: 1.0,
+            rate_sample: None,
+        },
+    );
+
+    assert_eq!(
+        association.select_path_candidate(&candidates, &HashSet::new(), payload_bytes, ttl_ms),
+        Some(1),
+        "an ACKed datagram response timeout is data-plane evidence; the next realtime packet should use the alternate path"
+    );
+}
+
+#[test]
 fn switchable_stream_demand_updates_from_local_sender_metrics() {
     let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));

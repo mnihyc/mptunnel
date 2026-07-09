@@ -1219,6 +1219,7 @@ fn choose_response_sender_target(
         return None;
     }
     let repair = repair_cause.is_some();
+    let path_failure_repair = matches!(repair_cause, Some(RelaySendCause::PathFailureRepair));
     let payload_bytes = reliable_stream_frame_payload_bytes(frame);
     if !repair
         && emit_mode == ResponseCarrierEmitMode::StreamOrdered
@@ -1242,12 +1243,13 @@ fn choose_response_sender_target(
         .filter(|target| {
             let effective_lane = emit_mode.effective_lane(frame, lane);
             response_target_can_enqueue_frame_now(target, frame, lane, emit_mode)
-                && response_target_has_emission_credit(
-                    target,
-                    effective_lane,
-                    payload_bytes,
-                    mux_limits,
-                )
+                && (path_failure_repair
+                    || response_target_has_emission_credit(
+                        target,
+                        effective_lane,
+                        payload_bytes,
+                        mux_limits,
+                    ))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -5637,6 +5639,86 @@ mod tests {
         assert_eq!(
             selected.key, liveness_survivor.key,
             "PathFailureRepair is bounded failover retransmission; it must not require bulk-rate proof because it never path-proves or changes Service ownership"
+        );
+    }
+
+    #[test]
+    fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capacity() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024,
+            max_repair_bytes: 64 * 1024,
+            max_reorder_bytes: 64 * 1024,
+            max_stream_window_bytes: 64 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload_bytes = 8 * 1024;
+        let (commands, _receivers) = reliable_path_command_channels(64);
+        let mut survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024, false);
+        survivor.commands = commands.clone();
+        survivor.has_sender_evidence = true;
+        survivor.has_bulk_rate_evidence = false;
+
+        let credit = response_target_emission_credit_bytes(
+            &survivor,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+        while commands
+            .pending_bytes()
+            .saturating_add(payload_bytes as u64)
+            <= credit as u64
+        {
+            commands
+                .try_enqueue_admitted_frame(
+                    Frame::StreamData {
+                        stream_id: StreamId(72),
+                        offset: commands.pending_bytes(),
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0; payload_bytes]),
+                    },
+                    FlowLane::Throughput,
+                )
+                .expect("prefill survivor data queue without exhausting slots");
+        }
+
+        let repair_frame = Frame::StreamData {
+            stream_id: StreamId(72),
+            offset: 1024,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![7_u8; payload_bytes]),
+        };
+        assert!(
+            survivor
+                .commands
+                .can_enqueue_frame_now(&repair_frame, FlowLane::Throughput),
+            "test setup must leave a real queue slot for failover RepairData"
+        );
+        assert!(
+            !response_target_has_emission_credit(
+                &survivor,
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+            ),
+            "test setup must exceed ordinary owner emission credit"
+        );
+
+        let selected = choose_response_sender_target(
+            &[survivor.clone()],
+            FlowLane::Throughput,
+            &repair_frame,
+            ResponseCarrierEmitMode::Classified,
+            mux_limits,
+            &[],
+            &[],
+            Some(RelaySendCause::PathFailureRepair),
+        )
+        .expect("path-failure RepairData must be admitted while a live queue slot exists");
+
+        assert_eq!(
+            selected.key, survivor.key,
+            "failed-owner repair is bounded correctness traffic and must not be blocked by stale owner emission credit"
         );
     }
 

@@ -625,7 +625,12 @@ on the PTO-derived product stall timeout because the original owner can no
 longer make progress and failover repair is now the correctness path. This
 repair remains duplicate
 product data and MUST NOT create path delivery proof, move the Service owner,
-or reset Subflow admission state.
+or reset Subflow admission state. Because the failed owner can no longer make
+progress, failed-owner repair target admission MUST NOT be blocked by stale
+owner emission-credit debt from the failed path. It still requires a live
+survivor with actual carrier queue capacity, remains capped by the current
+repair quantum and repair resource limits, and is still `RepairData` rather
+than new `OwnerData`.
 
 For scheduling and tail-repair timers, the product ACK frontier is the end of
 the first ACK range only when that range starts at offset 0. It is not the
@@ -4176,7 +4181,14 @@ as unknown-owner correctness repair. Without an ACK frontier, unknown-owner
 repair MUST wait; otherwise a sender can duplicate the entire startup tail and
 inflate overhead. This rule is intentionally narrower than Service failover: it
 sends `RepairData` only, creates no path delivery proof, and does not promote
-the survivor to Service or Subflow ownership.
+the survivor to Service or Subflow ownership. For target admission, this
+unknown-owner correctness repair is classified with failed-owner/path-failure
+repair rather than ordinary ACK-gap repair: it may use a live survivor because
+the missing owner record is itself failover evidence, but the resulting
+`RepairData` still cannot create delivery samples, bulk-rate evidence, Service,
+or Subflow ownership. The same target-admission rule applies: stale owner
+emission-credit debt cannot block this bounded correctness repair, but real
+survivor queue capacity and repair resource limits still apply.
 
 Persistent live-Service-tail repair does not suppress the live Service owner for
 later `OwnerData`, and it does not elect a survivor while the lower suffix is

@@ -1485,6 +1485,7 @@ fn enqueue_reliable_tail_repair(
                 repair_frames = unknown_owner_frames;
                 blocked_frontier_offset = unknown_owner_blocked_offset;
                 repair_kind = "tail_unknown_owner";
+                repair_cause = RelaySendCause::PathFailureRepair;
             } else if blocked_frontier_offset.is_none() {
                 blocked_frontier_offset = unknown_owner_blocked_offset;
             }
@@ -3855,6 +3856,111 @@ mod tests {
             "when retained owner bytes have no live owner and no path-flight record, persistent tail repair must still use a live survivor instead of deadlocking"
         );
         assert!(!outcome.pending);
+    }
+
+    #[tokio::test]
+    async fn unknown_owner_tail_repair_dispatches_as_path_failure_repair() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(120);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let failover_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(120),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands.clone(),
+            FlowLane::Throughput,
+        );
+        let (failover_commands, mut failover_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                failover_key.underlay,
+                failover_key.path_id,
+                failover_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.detach(owner_key, &owner_commands);
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: failover_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(120),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let outcome = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+        assert_eq!(outcome.queued, 1);
+
+        let ordered_owner_debt_bytes = send_stream.repair_bytes();
+        let dispatch = response_sender
+            .dispatch_next_with_ordered_owner_debt(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                limits,
+                ordered_owner_debt_bytes,
+            )
+            .await
+            .expect("unknown-owner tail repair must be failover-dispatchable");
+
+        assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+        assert_eq!(dispatch.selected_path, Some(failover_key));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut failover_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
     }
 
     #[test]

@@ -323,11 +323,8 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
         if bulk_active_role_has_latency_pressure(candidate, role) {
             let backlog_limit =
                 bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
-            let backlog_committed = candidate
-                .product_queue_bytes
-                .saturating_add(candidate.queue_bytes);
-            return backlog_committed.saturating_add(payload_bytes as u64) <= backlog_limit
-                || backlog_committed < backlog_limit;
+            return committed.saturating_add(payload_bytes as u64) <= backlog_limit
+                || committed < backlog_limit;
         }
         return true;
     }
@@ -900,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_service_with_latency_pressure_still_keeps_feed_credit() {
+    fn active_tcp_service_with_latency_pressure_caps_total_owner_credit() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -910,8 +907,7 @@ mod tests {
         let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.369));
         active.pacing_rate_bps = mbps(0.369);
         active.product_progress_rate_bps = Some(mbps(0.369));
-        active.queue_bytes = payload as u64;
-        active.product_bytes_in_flight = 613_248;
+        active.product_bytes_in_flight = 8 * 1024 * 1024;
         active.session_active_latency_sensitive_flows = 1;
         active.app_limited = true;
 
@@ -925,8 +921,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            None,
-            "latency pressure may bound optional Subflows, but must not starve the clear-frontier Service owner at one pending quantum"
+            Some("inflight_limit"),
+            "latency-sensitive mixed work must cap total clear-frontier Service owner credit, not just queued backlog, or stale owner flight becomes read-gap and repair debt"
         );
     }
 
@@ -1142,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn active_udp_with_latency_pressure_does_not_count_owner_flight_as_backlog() {
+    fn active_udp_with_latency_pressure_caps_total_owner_credit() {
         let mux_limits = MuxLimits {
             max_path_flight_bytes: 64 * 1024 * 1024,
             max_reorder_bytes: 64 * 1024 * 1024,
@@ -1165,8 +1161,8 @@ mod tests {
                 mux_limits,
                 BulkAdmissionRole::ActiveDataPath,
             ),
-            None,
-            "latency pressure may bound queued backlog, but already-owned clear-frontier Service flight is not optional Subflow debt"
+            Some("inflight_limit"),
+            "QUIC Service ownership also becomes preemptible under realtime/mixed pressure; carrier cwnd is not the product ceiling, but already-owned product flight must still be bounded"
         );
     }
 

@@ -485,12 +485,27 @@ the Service is the current primary owner and must remain fed while its ordered
 frontier is clear, whereas optional paths must prove positive contribution
 before receiving owner bytes.
 When latency-sensitive work is active, the clear-frontier Service feed envelope
-uses the preemptible Service horizon for queued sender-service bytes. That
-backlog cap is feed/backpressure accounting, not reorder accounting. Reorder
+uses the preemptible Service horizon for total owner credit already admitted to
+that Service path, including owner bytes in flight and queued carrier work.
+That cap is feed/backpressure accounting, not reorder accounting. Reorder
 budgets are for additional paths, cross-path lower-byte debt, and explicit
 owner-tail guards; they MUST NOT count same-Service queued carrier work as
-cross-path reorder debt or make the active Service owner inadmissible because
-an app-limited BDP estimate is smaller than one queued carrier quantum.
+cross-path reorder debt. The point of the latency-pressure cap is different:
+it bounds how much ordered debt one Service path may preload while realtime or
+latency work needs fast recovery and preemption. Bulk-only Service feed still
+uses the full product Service envelope while the ordered frontier is clear.
+The ordered-data owner hint is not a carrier-family preference. If the ordered
+frontier is clear and the hinted Service output cannot enqueue owner bytes at
+all, the sender MAY elect a new Service from validated live outputs by metrics.
+If unresolved owner debt exists, the hint remains authoritative and later
+owner bytes MUST wait for repair or frontier progress instead of migrating
+behind the hole.
+Before a Service output has path-scoped bulk-rate evidence, bulk owner emission
+is capped by the reliable-stream startup product window. This startup cap is
+large enough to obtain meaningful ACK-clock evidence but prevents an app-limited
+or flapping path from preloading the full product envelope. Once the Service has
+bulk-rate evidence, it uses the full Service product envelope while the ordered
+frontier remains clear.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,
@@ -561,10 +576,12 @@ deliberately uses one product stall timeout, not the persistent-congestion
 multiplier used for authoritative ACK-gap repair, because the repair is a
 bounded reinjection of the exact lowest HOL-blocking suffix on a different
 output. If that probe does not produce ACK-frontier progress, repeated tail
-repair backs off to the persistent-congestion multiplier so a live carrier is
-not converted into continuous duplicate traffic. Detached, failed, or
-no-longer-serviceable owners use the same bounded tail-repair mechanism because
-the original owner can no longer make progress. This repair remains duplicate
+repair for a live owner backs off to the persistent-congestion multiplier so a
+live carrier is not converted into continuous duplicate traffic. Detached,
+failed, or no-longer-serviceable owners retry the same bounded repair mechanism
+on the PTO-derived product stall timeout because the original owner can no
+longer make progress and failover repair is now the correctness path. This
+repair remains duplicate
 product data and MUST NOT create path delivery proof, move the Service owner,
 or reset Subflow admission state.
 
@@ -872,7 +889,7 @@ their origin is explicit and they do not become hidden modes.
 | UDP target/datagram path model | UDP/QUIC response deadline derives from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. A product datagram ID is emitted once on the selected carrier and expires on absent target response instead of being replayed on another carrier |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | A clear-frontier Service owner on any carrier is admitted by the carrier-neutral product resource envelope: configured path flight capped by stream window and reorder resource ceiling; app-limited or low-rate product progress may inform ETA but MUST NOT shrink the current Service owner to a tiny BDP, startup-rate, carrier-cwnd, or one-quantum product ceiling; carrier inflight/queue/RTT/loss/pacing shape emission and ETA below that product envelope; optional Subflows, cross-underlay sends, debt-bearing sends, and migrations remain governed by BDP/ETA/reorder/no-worse admission and may be suppressed or demoted | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Bulk admission | A clear-frontier Service owner on any carrier is admitted by the carrier-neutral product resource envelope: configured path flight capped by stream window and reorder resource ceiling; app-limited or low-rate product progress may inform ETA but MUST NOT shrink a bulk-only current Service owner to a tiny BDP, startup-rate, carrier-cwnd, or one-quantum product ceiling. When realtime or latency-sensitive work is active on the same session/path, the Service owner becomes preemptible: total admitted owner credit is capped by the Service horizon until that pressure clears. Carrier inflight/queue/RTT/loss/pacing shape emission and ETA below those product envelopes; optional Subflows, cross-underlay sends, debt-bearing sends, and migrations remain governed by BDP/ETA/reorder/no-worse admission and may be suppressed or demoted | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
 | Validation traffic | Probe/control traffic only; repair data only after explicit gap/failover evidence; no unique future bytes when admitted ordinary path exists | MPTCP reinjection and MPQUIC path validation | Violations create HOL debt | Keep invariant, not heuristic |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -3718,9 +3735,15 @@ if path is the lead path:
     # The current Service owner is the primary ordered-byte owner.  App-limited
     # or low-rate ACK feedback is visibility, not a product-flight ceiling.
     # TCP/QUIC carrier congestion still drains below this envelope.
-    product_inflight_limit = min(configured_path_inflight,
-                                 configured_stream_window,
-                                 configured_receiver_reorder)
+    if latency_sensitive_work_is_active_on_this_session_or_path:
+        product_inflight_limit = service_horizon(chunk,
+                                                 configured_path_inflight,
+                                                 configured_stream_window,
+                                                 configured_receiver_reorder)
+    else:
+        product_inflight_limit = min(configured_path_inflight,
+                                     configured_stream_window,
+                                     configured_receiver_reorder)
     product_inflight_limit = max(product_inflight_limit, chunk.len)
 else if path uses the same underlay family as the lead path:
     product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
@@ -4010,9 +4033,11 @@ PTO-derived tail-stall timer fires. After that stall evidence, it MAY reinject
 the lowest blocked suffix as bounded critical `RepairData` on an alternate
 output that did not own the range. It MUST NOT retransmit the live contiguous
 owner tail on the same/only carrier merely because the product ACK frontier is
-stalled, and if the first alternate repair does not advance the ACK frontier it
-MUST wait for the persistent repair delay before repeating. A known final offset
-is not sufficient by itself: terminal owner-tail repair may spend bounded
+stalled. If live-owner alternate repair does not advance the ACK frontier it
+MUST wait for the persistent repair delay before repeating; if the prior owner
+has detached or failed, repeated failover repair uses the PTO-derived
+tail-stall timeout instead. A known final offset is not sufficient by itself:
+terminal owner-tail repair may spend bounded
 critical repair only after tail-stall, carrier failure/detach, or equivalent
 final-debt evidence shows the retained tail is no longer making progress. That
 repair remains bounded by repair-cache,

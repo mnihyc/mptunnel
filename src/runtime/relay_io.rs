@@ -136,10 +136,11 @@ pub(super) fn reliable_relay_effective_tail_repair_deadline(
     failed_owner_tail_repair_ready: bool,
 ) -> tokio::time::Instant {
     if failed_owner_tail_repair_ready {
+        let stall_timeout = reliable_relay_tail_repair_delay(None, lane);
         if last_repair_at <= last_progress_at {
             return tokio::time::Instant::from_std(last_progress_at);
         }
-        return reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, None, lane);
+        return tokio::time::Instant::from_std(last_repair_at + stall_timeout);
     }
     reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, path, lane)
 }
@@ -3071,7 +3072,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_owner_tail_repair_retry_uses_persistent_backoff() {
+    fn failed_owner_tail_repair_retry_uses_single_pto_not_persistent_backoff() {
         let last_progress = Instant::now();
         let last_repair = last_progress + Duration::from_millis(1);
         let slow_stale_owner = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 1.0);
@@ -3083,16 +3084,13 @@ mod tests {
             FlowLane::Throughput,
             true,
         );
-        let expected = reliable_relay_tail_repair_deadline(
-            last_progress,
-            last_repair,
-            None,
-            FlowLane::Throughput,
+        let expected = tokio::time::Instant::from_std(
+            last_repair + reliable_relay_stall_timeout(None, FlowLane::Throughput),
         );
 
         assert_eq!(
             deadline, expected,
-            "failed-owner repair may fire immediately once, then retries use default persistent backoff rather than a stale owner path"
+            "failed-owner repair may fire immediately once, then retries one bounded repair quantum per PTO; persistent backoff is for live owner congestion recovery, not detached-owner failover"
         );
     }
 

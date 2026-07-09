@@ -1435,8 +1435,11 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     } else {
         proven_targets
     };
-    let ordered_owner_anchor =
-        ordered_data_owner.filter(|owner| targets.iter().any(|target| target.key == *owner));
+    let ordered_owner_anchor = ordered_data_owner.filter(|owner| {
+        targets.iter().any(|target| target.key == *owner)
+            && (ordered_owner_debt_bytes > 0
+                || capacity_targets.iter().any(|target| target.key == *owner))
+    });
     if let Some(service_key) = ordered_owner_anchor
         && let Some(service) = targets.iter().find(|target| target.key == service_key)
     {
@@ -1756,6 +1759,9 @@ fn response_target_emission_credit_bytes(
 ) -> usize {
     if relay_lane_is_bulk(lane) {
         if target.is_active {
+            if !target.has_bulk_rate_evidence {
+                return response_service_startup_emission_credit_bytes(payload_bytes, mux_limits);
+            }
             return usize::try_from(bulk_active_service_product_envelope_bytes(
                 target.snapshot,
                 payload_bytes,
@@ -1777,6 +1783,23 @@ fn response_target_emission_credit_bytes(
         ))
         .max(payload_bytes)
         .max(1)
+}
+
+fn response_service_startup_emission_credit_bytes(
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let product_envelope = mux_limits
+        .max_path_flight_bytes
+        .min(mux_limits.max_reorder_bytes)
+        .min(usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX))
+        .max(payload_bytes)
+        .max(1);
+    let startup = usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES)
+        .unwrap_or(usize::MAX)
+        .max(payload_bytes)
+        .max(1);
+    product_envelope.min(startup).max(payload_bytes).max(1)
 }
 
 fn response_quic_carrier_feed_credit_bytes(
@@ -4674,7 +4697,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_response_owner_without_product_progress_uses_stable_service_credit() {
+    fn active_tcp_response_owner_without_bulk_evidence_uses_startup_credit_not_full_envelope() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
@@ -4690,13 +4713,8 @@ mod tests {
 
         assert_eq!(
             credit,
-            usize::try_from(bulk_active_service_product_envelope_bytes(
-                active.snapshot,
-                payload_bytes,
-                mux_limits,
-            ))
-            .unwrap(),
-            "unproven active Service startup uses the product envelope, not a tiny carrier quantum"
+            usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES).unwrap(),
+            "unproven active Service startup must be bounded until path-scoped bulk-rate evidence exists"
         );
         assert!(
             credit >= payload_bytes,
@@ -5150,6 +5168,57 @@ mod tests {
             PathRuntimeRole::Service,
             "the elected failover path becomes the new Service owner"
         );
+    }
+
+    #[test]
+    fn clear_frontier_stale_owner_without_lane_capacity_elects_liveness_service_failover() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut stale_owner =
+            response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let (owner_commands, _owner_rx) = reliable_path_command_channels(1);
+        owner_commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(99),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("seed full owner data queue");
+        stale_owner.commands = owner_commands;
+        let mut failover = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        failover.has_sender_evidence = true;
+        failover.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[stale_owner.clone(), failover.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(stale_owner.key),
+            0,
+            None,
+        );
+
+        let selected = selected.expect(
+            "when the ordered frontier is clear and the old Service cannot enqueue, a validated survivor must become Service failover",
+        );
+        assert_eq!(
+            selected.target.key, failover.key,
+            "clear-frontier failover is metric-first and must not be trapped by the stale owner's carrier family"
+        );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
@@ -6776,7 +6845,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_owner_outside_dispatchable_set_still_anchors_service_role() {
+    fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_path() {
         let (service_commands, _service_receivers) = reliable_path_command_channels(1);
         let mut service_snapshot =
             PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 500_000_000.0);
@@ -6819,13 +6888,13 @@ mod tests {
             0,
             None,
         )
-        .expect("bulk-rate-proven alternate should remain eligible as a Subflow");
+        .expect("bulk-rate-proven alternate should become Service when the prior clear-frontier owner is not dispatchable");
 
         assert_eq!(selected.target.key, lower_eta_subflow.key);
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "a dispatchable alternate must not become Service merely because the current ordered owner is temporarily not dispatchable"
+            PathRuntimeRole::Service,
+            "a clear-frontier owner hint is not a permanent Service anchor when that output cannot enqueue owner bytes"
         );
     }
 

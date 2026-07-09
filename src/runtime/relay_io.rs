@@ -791,6 +791,21 @@ pub(super) fn pending_stream_fin_ready(
     pending_final_offset.is_some_and(|final_offset| recv_stream.next_offset() >= final_offset)
 }
 
+pub(super) fn stream_terminal_fin_replay_required(
+    fin_sent: bool,
+    fin_replayed: bool,
+    sender_queue_empty: bool,
+    repair_bytes: usize,
+    ack_frontier: u64,
+    final_offset: u64,
+) -> bool {
+    fin_sent
+        && !fin_replayed
+        && sender_queue_empty
+        && repair_bytes == 0
+        && ack_frontier >= final_offset
+}
+
 pub(super) fn adaptive_reliable_relay_chunk_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
@@ -982,37 +997,6 @@ fn reliable_failed_owner_tail_repair_ready(
     let (unknown_owner_frames, _) =
         prefix_repair_frames_with_unknown_owner_output(path_stream, source_frames);
     !unknown_owner_frames.is_empty()
-}
-
-fn reliable_live_owner_no_ack_tail_repair_ready(
-    path_stream: &ReliablePathStream,
-    send_stream: &ReliableSendStream,
-    last_send_ack_ranges: &[OffsetRange],
-    last_send_ack_frontier: u64,
-    mux_limits: MuxLimits,
-) -> bool {
-    if !last_send_ack_ranges.is_empty()
-        || last_send_ack_frontier != 0
-        || send_stream.repair_bytes() == 0
-        || send_stream.next_offset() == 0
-    {
-        return false;
-    }
-    let probe_limit =
-        reliable_critical_tail_repair_limit_bytes(1, send_stream.repair_bytes(), mux_limits);
-    if probe_limit == 0 {
-        return false;
-    }
-    let source_frames = send_stream.retransmission_frames_for_ranges(
-        &[OffsetRange {
-            start: 0,
-            end: send_stream.next_offset(),
-        }],
-        probe_limit,
-    );
-    let (repair_frames, _) =
-        prefix_repair_frames_with_distinct_owner_output(path_stream, source_frames);
-    !repair_frames.is_empty()
 }
 
 fn reliable_final_tail_repair_ready(
@@ -1308,23 +1292,6 @@ fn prefix_repair_frames_with_available_output_classified(
     (accepted, None, false)
 }
 
-pub(super) fn prefix_repair_frames_with_distinct_owner_output(
-    path_stream: &ReliablePathStream,
-    repair_frames: Vec<Frame>,
-) -> (Vec<Frame>, Option<u64>) {
-    let mut accepted = Vec::with_capacity(repair_frames.len());
-    for frame in repair_frames {
-        if !path_stream.has_distinct_owner_repair_output_for_frame(&frame) {
-            return (
-                accepted,
-                reliable_stream_frame_extent(&frame).map(|(offset, _, _)| offset),
-            );
-        }
-        accepted.push(frame);
-    }
-    (accepted, None)
-}
-
 pub(super) fn prefix_repair_frames_with_failed_owner_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
@@ -1437,37 +1404,6 @@ fn enqueue_reliable_tail_repair(
             repair_cause = RelaySendCause::PathFailureRepair;
         } else if blocked_frontier_offset.is_none() {
             blocked_frontier_offset = failover_blocked_offset;
-        }
-        if repair_frames.is_empty()
-            && no_ack_frontier_failed_owner_tail
-            && path_stream.has_multipath_repair_alternative()
-        {
-            let live_owner_probe_limit = reliable_critical_tail_repair_limit_bytes(
-                base_repair_limit,
-                send_stream.repair_bytes(),
-                mux_limits,
-            );
-            let live_owner_source_frames = send_stream.retransmission_frames_for_ranges(
-                &[OffsetRange {
-                    start: 0,
-                    end: send_stream.next_offset(),
-                }],
-                live_owner_probe_limit,
-            );
-            let (live_owner_frames, live_owner_blocked_offset) =
-                prefix_repair_frames_with_distinct_owner_output(
-                    path_stream,
-                    live_owner_source_frames,
-                );
-            if !live_owner_frames.is_empty() {
-                critical_tail_repair = true;
-                repair_limit = live_owner_probe_limit;
-                repair_frames = live_owner_frames;
-                blocked_frontier_offset = live_owner_blocked_offset;
-                repair_kind = "tail_live_owner_no_ack";
-            } else if blocked_frontier_offset.is_none() {
-                blocked_frontier_offset = live_owner_blocked_offset;
-            }
         }
         if repair_frames.is_empty() && last_send_ack_complete && last_send_ack_frontier > 0 {
             let tail_limit = reliable_critical_tail_repair_limit_bytes(
@@ -1698,6 +1634,7 @@ where
     let mut remote_open = true;
     let mut stats = PathDeliveryStats::default();
     let mut close_sent = false;
+    let mut terminal_fin_replayed = false;
     let mut pending_local_fin = false;
     let mut pending_remote_fin_offset = None;
     let mut recv_progress = ReliableRecvProgress::default();
@@ -1724,6 +1661,31 @@ where
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
 
     let result = loop {
+        if stream_terminal_fin_replay_required(
+            close_sent,
+            terminal_fin_replayed,
+            response_sender.is_empty(),
+            send_stream.repair_bytes(),
+            last_send_ack_frontier,
+            send_stream.next_offset(),
+        ) {
+            response_sender.enqueue_final_control_frame(Frame::StreamFin {
+                stream_id,
+                final_offset: send_stream.next_offset(),
+            });
+            response_sender_retry_at = None;
+            terminal_fin_replayed = true;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "terminal_fin_replay",
+                format_args!(
+                    "stream_id={} final_offset={} ack_frontier={} repair_bytes=0 role=server",
+                    stream_id.0,
+                    send_stream.next_offset(),
+                    last_send_ack_frontier,
+                ),
+            );
+        }
         if !local_open
             && !remote_open
             && send_stream.repair_bytes() == 0
@@ -1794,18 +1756,9 @@ where
                 last_send_ack_frontier,
                 mux_limits,
             );
-        let live_owner_no_ack_tail_repair_ready = has_tail_repair_alternative
-            && !failed_owner_tail_repair_ready
-            && reliable_live_owner_no_ack_tail_repair_ready(
-                &path_stream,
-                &send_stream,
-                &last_send_ack_ranges,
-                last_send_ack_frontier,
-                mux_limits,
-            );
         let live_owner_tail_repair_candidate = has_tail_repair_alternative
             && last_send_ack_frontier < send_stream.next_offset()
-            && (last_send_ack_complete || live_owner_no_ack_tail_repair_ready);
+            && last_send_ack_complete;
         let tail_repair_active = relay_lane_is_bulk(relay_lane)
             && send_stream.repair_bytes() > 0
             && stream_tail_timer_repair_allowed(
@@ -2812,6 +2765,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_fin_replay_requires_sent_fin_and_completed_owner_bytes() {
+        assert!(!stream_terminal_fin_replay_required(
+            false, false, true, 0, 64, 64,
+        ));
+        assert!(!stream_terminal_fin_replay_required(
+            true, true, true, 0, 64, 64,
+        ));
+        assert!(!stream_terminal_fin_replay_required(
+            true, false, false, 0, 64, 64,
+        ));
+        assert!(!stream_terminal_fin_replay_required(
+            true, false, true, 1, 64, 64,
+        ));
+        assert!(!stream_terminal_fin_replay_required(
+            true, false, true, 0, 63, 64,
+        ));
+        assert!(stream_terminal_fin_replay_required(
+            true, false, true, 0, 64, 64,
+        ));
+    }
+
+    #[test]
     fn duplicate_stream_data_below_final_frontier_is_already_delivered() {
         let mut recv_stream = ReliableRecvStream::new(StreamId(1), MuxLimits::default());
         recv_stream
@@ -2934,13 +2909,16 @@ mod tests {
     }
 
     #[test]
-    fn tail_timer_repair_allows_failed_owner_failover_without_second_live_alternative() {
+    fn tail_timer_repair_allows_only_authoritative_or_failed_owner_repair() {
         assert!(
             stream_tail_timer_repair_allowed(false, true),
             "after the owner output is gone, the remaining output is the failover path even though it is no longer a second live alternative"
         );
         assert!(!stream_tail_timer_repair_allowed(false, false));
-        assert!(stream_tail_timer_repair_allowed(true, false));
+        assert!(
+            stream_tail_timer_repair_allowed(true, false),
+            "authoritative ACK-frontier tail repair may use a live alternate"
+        );
     }
 
     #[test]
@@ -3980,7 +3958,7 @@ mod tests {
     }
 
     #[test]
-    fn live_owner_no_ack_frontier_tail_repair_uses_distinct_alternate() {
+    fn live_owner_no_ack_frontier_tail_repair_waits_for_authoritative_gap() {
         let limits = MuxLimits::default();
         let stream_id = StreamId(121);
         let owner_key = CarrierPathKey {
@@ -4057,14 +4035,14 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.queued, 1,
-            "a known live OwnerData range with no ACK frontier may be reinjected on a distinct alternate after stall evidence"
+            outcome.queued, 0,
+            "no ACK frontier is not an authoritative product gap; live-owner recovery must wait for ACK progress, failed-owner evidence, or terminal-tail repair"
         );
         assert!(!outcome.pending);
     }
 
     #[test]
-    fn live_owner_no_ack_frontier_tail_repair_is_single_probe_not_prefix_burst() {
+    fn live_owner_no_ack_frontier_tail_repair_does_not_probe_prefix() {
         let limits = MuxLimits::default();
         let stream_id = StreamId(122);
         let owner_key = CarrierPathKey {
@@ -4147,13 +4125,11 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.queued, 1,
-            "live-owner no-frontier recovery is a TLP-style probe, not a replay of the whole outstanding prefix"
+            outcome.queued, 0,
+            "no-frontier live-owner data may still be in carrier recovery and must not become product RepairData"
         );
-        assert!(
-            response_sender.bytes() <= reliable_bulk_carrier_feed_quantum_bytes(limits),
-            "live-owner no-frontier repair must stay within one bounded service quantum"
-        );
+        assert!(!outcome.pending);
+        assert_eq!(response_sender.bytes(), 0);
     }
 
     #[test]

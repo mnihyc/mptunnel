@@ -567,6 +567,16 @@ encode these meanings with existing frame types, but the ledgers MUST preserve
 the distinction; a `STREAM_DATA` frame used for repair does not become
 `OwnerData` merely because its wire frame type is `STREAM_DATA`.
 
+Terminal FIN reliability is `Control`, not repair or path proof. `STREAM_FIN`
+is idempotent for a stream ID and final offset, and a sender MAY replay it once
+after it has already sent FIN, has no queued owner or repair work for the
+stream, and the peer's contiguous ACK frontier covers every owner byte up to
+the final offset. This replay MUST NOT create product offsets, change Service
+ownership, credit path delivery evidence, or consume duplicate/repair proof
+budget. Its purpose is only to close the terminal-control gap that can occur
+when final-tail `RepairData` completes on a survivor after the original
+ordered-control FIN was lost with an older carrier.
+
 Connection-level ACK/control frames update product-stream state, so their
 return path is part of the product ACK clock. When the current Service path is
 live and has control capacity, receive-progress `Control` such as `STREAM_ACK`
@@ -610,13 +620,11 @@ offset, the unacknowledged suffix is not repairable merely because it is
 unacknowledged. A live TCP or QUIC carrier owns its own packet recovery, and
 same-output product retransmission cannot overtake the missing bytes. A live
 owner tail with no complete ACK frontier is normal in-flight data before stall
-evidence, not immediate repair debt. If no complete ACK frontier exists but the
-flight ledger identifies the owner for the lowest unacknowledged range, that
-range has remained blocked for one PTO-derived product stall timeout, and a
-different live output can carry it, the sender MAY reinject only that lowest
-known-owner range as bounded `RepairData`, capped to one service repair quantum
-for that stall event. Unknown-owner no-frontier startup
-tails MUST wait instead of duplicating the whole repair cache. If a complete ACK
+evidence, not immediate repair debt. If no complete ACK frontier exists while
+the recorded owner is still live, the sender MUST wait for ACK progress, carrier
+failure evidence, or a terminal-tail condition instead of converting live-owner
+bytes into product `RepairData`. Unknown-owner no-frontier startup
+tails likewise MUST wait instead of duplicating the whole repair cache. If a complete ACK
 frontier exists, the frontier remains blocked for one PTO-derived product stall
 timeout, and a different live output can carry the lowest blocked range, that
 suffix becomes tail correctness repair: it may be retransmitted as `RepairData`

@@ -110,11 +110,6 @@ impl ReliablePathStream {
         self.output.has_repair_output_for_frame(frame)
     }
 
-    pub(super) fn has_distinct_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
-        self.output
-            .has_distinct_owner_repair_output_for_frame(frame)
-    }
-
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
         self.output.has_failed_owner_repair_output_for_frame(frame)
     }
@@ -557,13 +552,6 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn has_distinct_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
-        match self {
-            Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.has_distinct_owner_repair_output_for_frame(frame),
-        }
-    }
-
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
         match self {
             Self::Fixed(_) => false,
@@ -967,21 +955,6 @@ impl ResponseStreamBinding {
 
     pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
         let avoid_keys = self.flight_keys_overlapping_frame(frame);
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        outputs
-            .entries
-            .iter()
-            .any(|entry| !avoid_keys.contains(&entry.key))
-    }
-
-    pub(super) fn has_distinct_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
-        let avoid_keys = self.flight_keys_overlapping_frame(frame);
-        if avoid_keys.is_empty() {
-            return false;
-        }
         let outputs = self
             .outputs
             .lock()

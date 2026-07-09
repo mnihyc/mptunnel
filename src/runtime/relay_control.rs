@@ -22,6 +22,8 @@ where
     let mut local_open = true;
     let mut remote_open = true;
     let mut pending_local_fin = false;
+    let mut local_fin_sent = false;
+    let mut terminal_fin_replayed = false;
     let mut pending_remote_fin_offset = None;
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
@@ -38,6 +40,7 @@ where
     let mut recv_progress = ReliableRecvProgress::default();
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
+    let mut last_send_ack_frontier = 0_u64;
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let mut sender_retry_at: Option<tokio::time::Instant> = None;
     let (validation_open_tx, mut validation_open_rx) = mpsc::channel(
@@ -290,6 +293,14 @@ where
             can_read_by_flow && prospective_read_budget > 0 && !inbound_frame_ready;
         let can_send_pending_fin =
             reliable_relay_can_send_pending_fin(pending_local_fin, sender_queue.is_empty());
+        let terminal_fin_replay_ready = stream_terminal_fin_replay_required(
+            local_fin_sent,
+            terminal_fin_replayed,
+            sender_queue.is_empty(),
+            send_stream.repair_bytes(),
+            last_send_ack_frontier,
+            send_stream.next_offset(),
+        );
         #[cfg(feature = "lab-diagnostics")]
         {
             if local_open && !can_read_local {
@@ -677,6 +688,8 @@ where
                 {
                     Ok(_) => {
                         pending_local_fin = false;
+                        local_fin_sent = true;
+                        terminal_fin_replayed = false;
                         last_stream_progress_at = Instant::now();
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
@@ -694,6 +707,60 @@ where
                             Ok(attached) if attached > 0 => {
                                 sender_retry_at = None;
                                 pending_local_fin = false;
+                                local_fin_sent = true;
+                                terminal_fin_replayed = false;
+                                last_stream_progress_at = Instant::now();
+                            }
+                            Ok(_) => break Err(err),
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+            _ = std::future::ready(()), if terminal_fin_replay_ready => {
+                match sender
+                    .send_control_frame(
+                        context,
+                        &mut remotes,
+                        Frame::StreamFin {
+                            stream_id,
+                            final_offset: send_stream.next_offset(),
+                        },
+                        RelaySendCause::StreamFin,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        terminal_fin_replayed = true;
+                        last_stream_progress_at = Instant::now();
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "terminal_fin_replay",
+                            format_args!(
+                                "stream_id={} final_offset={} ack_frontier={} repair_bytes=0 role=client",
+                                stream_id.0,
+                                send_stream.next_offset(),
+                                last_send_ack_frontier,
+                            ),
+                        );
+                    }
+                    Err(err) if reliable_relay_error_is_migratable(&err) => {
+                        match attach_reliable_relay_paths(
+                            context,
+                            &spec,
+                            relay_lane,
+                            &mut remotes,
+                            &send_stream,
+                            true,
+                            ReliableRelayAttachMode::Any,
+                        )
+                        .await
+                        {
+                            Ok(attached) if attached > 0 => {
+                                sender_retry_at = None;
+                                local_fin_sent = true;
+                                terminal_fin_replayed = true;
                                 last_stream_progress_at = Instant::now();
                             }
                             Ok(_) => break Err(err),
@@ -1295,6 +1362,9 @@ where
                         ranges,
                     } if ack_stream_id == stream_id => {
                         let normalized_ranges = normalized_offset_ranges(&ranges);
+                        let ack_frontier =
+                            stream_ack_contiguous_frontier(complete, &normalized_ranges);
+                        last_send_ack_frontier = last_send_ack_frontier.max(ack_frontier);
                         #[cfg(feature = "lab-diagnostics")]
                         let previous_repair_bytes = send_stream.repair_bytes();
                         #[cfg(feature = "lab-diagnostics")]
@@ -1450,6 +1520,8 @@ where
                             {
                                 Ok(_) => {
                                     pending_local_fin = false;
+                                    local_fin_sent = true;
+                                    terminal_fin_replayed = false;
                                     last_stream_progress_at = Instant::now();
                                 }
                                 Err(err) if reliable_relay_error_is_migratable(&err) => {
@@ -1467,6 +1539,8 @@ where
                                         Ok(attached) if attached > 0 => {
                                             sender_retry_at = None;
                                             pending_local_fin = false;
+                                            local_fin_sent = true;
+                                            terminal_fin_replayed = false;
                                             last_stream_progress_at = Instant::now();
                                         }
                                         Ok(_) => break Err(err),
@@ -1545,6 +1619,9 @@ where
                             .await
                         {
                             Ok(true) => {
+                                pending_local_fin = false;
+                                local_fin_sent = true;
+                                terminal_fin_replayed = false;
                                 last_stream_progress_at = Instant::now();
                                 last_response_stall_repair_at = Instant::now();
                             }

@@ -3046,6 +3046,62 @@ async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
 }
 
 #[tokio::test]
+async fn repair_only_path_can_become_active_after_explicit_reannounce() {
+    let stream_id = StreamId(149);
+    let (active_stream, _active_commands, _active_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 4);
+    let (repair_stream, mut repair_commands, _repair_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    remotes.attach_for_repair(repair_stream);
+    let repair_key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let repair_instance = remotes
+        .path_instance_for_key(repair_key)
+        .expect("repair instance");
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11149".parse().expect("tcp path"),
+            "udp://127.0.0.1:11150".parse().expect("udp path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let spec = ReliableRelayOpenSpec {
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+        ingress: IngressKind::Socks5,
+    };
+    let mut sender = RelaySenderService::new(stream_id);
+
+    assert!(
+        sender
+            .reannounce_path_instance_as_active(
+                &context,
+                &mut remotes,
+                repair_instance,
+                &spec,
+                FlowLane::Latency,
+            )
+            .await
+            .expect("active reannounce"),
+        "explicit Active reannounce should move future ownership to the repaired path"
+    );
+    match recv_reliable_path_command(&mut repair_commands)
+        .await
+        .expect("repair path command")
+    {
+        ReliablePathCommand::SendFrame(Frame::OpenStream { role, .. }) => {
+            assert_eq!(role, StreamOpenRole::Active);
+        }
+        _ => panic!("expected explicit Active reannounce on repair path"),
+    }
+    assert_eq!(remotes.active_path_key(), Some(repair_key));
+}
+
+#[tokio::test]
 async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
     let stream_id = StreamId(146);
     let (active_stream, mut active_commands, _active_frames) =
@@ -3425,14 +3481,21 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
     let (slow_active, mut slow_commands, _slow_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 1);
     let mut remotes = ReliableRelayRemoteSet::new(slow_active, 4);
-    let (fast_repair, mut fast_commands, _fast_frames) =
+    let (fast_validation, mut fast_commands, _fast_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
-    remotes.attach_for_repair(fast_repair);
+    remotes.attach_for_validation(fast_validation);
+    match recv_reliable_path_command(&mut fast_commands)
+        .await
+        .expect("validation proof command")
+    {
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {}
+        _ => panic!("expected validation proof command"),
+    }
     let fast_instance = remotes
         .paths
         .iter()
         .find(|path| path.path_index == 0)
-        .expect("fast repair path")
+        .expect("fast validation path")
         .instance();
 
     assert!(
@@ -3473,13 +3536,38 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
         FlowLane::Throughput,
         64 * 1024,
     ));
-    assert!(remotes.promote_path_instance_to_active(fast_instance));
+    let spec = ReliableRelayOpenSpec {
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+        ingress: IngressKind::Socks5,
+    };
+    let mut sender = RelaySenderService::new(stream_id);
+    assert!(
+        sender
+            .reannounce_path_instance_as_active(
+                &context,
+                &mut remotes,
+                fast_instance,
+                &spec,
+                FlowLane::Throughput,
+            )
+            .await
+            .expect("active reannounce"),
+        "measured validation path must become Service through explicit Active reannounce"
+    );
+    match recv_reliable_path_command(&mut fast_commands)
+        .await
+        .expect("active reannounce command")
+    {
+        ReliablePathCommand::SendFrame(Frame::OpenStream { role, .. }) => {
+            assert_eq!(role, StreamOpenRole::Active);
+        }
+        _ => panic!("expected explicit Active reannounce on validation path"),
+    }
     assert_eq!(
         remotes.active_path_index_for(UnderlayProtocol::Udp),
         Some(0)
     );
 
-    let mut sender = RelaySenderService::new(stream_id);
     send_relay_stream_frame_for_test(
         &mut sender,
         &context,

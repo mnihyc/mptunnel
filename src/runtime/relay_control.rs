@@ -1279,7 +1279,7 @@ where
                         lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
                         if delivered_progress {
                             interactive_response_pending = false;
-                            if delivered_payload_bytes > 0
+                            let should_activate_delivery_path = delivered_payload_bytes > 0
                                 && reliable_relay_delivery_path_should_become_active(
                                     context,
                                     remotes.active_path_key(),
@@ -1290,21 +1290,41 @@ where
                                         relay_lane,
                                         context.mux_limits,
                                     ),
-                                ) && remotes.promote_path_instance_to_active(instance)
-                            {
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "client_relay_active_path_promoted",
-                                    format_args!(
-                                        "stream_id={} path_underlay={:?} path_index={} lane={:?} delivered_bytes={} cause=delivery_evidence",
-                                        stream_id.0,
-                                        path_key.underlay,
-                                        path_key.index,
-                                        relay_lane,
-                                        delivered_payload_bytes,
-                                    ),
                                 );
-                                last_stream_progress_at = Instant::now();
+                            if should_activate_delivery_path {
+                                match sender
+                                    .reannounce_path_instance_as_active(
+                                        context,
+                                        &mut remotes,
+                                        instance,
+                                        &spec,
+                                        relay_lane,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        send_stream.update_max_offset(remotes.max_offset());
+                                        #[cfg(feature = "lab-diagnostics")]
+                                        lab_diagnostic(
+                                            "client_relay_active_path_promoted",
+                                            format_args!(
+                                                "stream_id={} path_underlay={:?} path_index={} lane={:?} delivered_bytes={} cause=delivery_evidence",
+                                                stream_id.0,
+                                                path_key.underlay,
+                                                path_key.index,
+                                                relay_lane,
+                                                delivered_payload_bytes,
+                                            ),
+                                        );
+                                        last_stream_progress_at = Instant::now();
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        eprintln!(
+                                            "warning: reliable delivery active reannounce failed: {err}"
+                                        );
+                                    }
+                                }
                             }
                         }
                         match sender.send_recv_progress(

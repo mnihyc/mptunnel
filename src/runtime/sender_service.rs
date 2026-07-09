@@ -3635,6 +3635,48 @@ impl RelaySenderService {
         }
     }
 
+    pub(super) async fn reannounce_path_instance_as_active(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        instance: RelayPathInstance,
+        spec: &ReliableRelayOpenSpec,
+        lane: FlowLane,
+    ) -> Result<bool, RuntimeError> {
+        let Some(position) = remotes
+            .paths
+            .iter()
+            .position(|path| path.instance() == instance)
+        else {
+            return Ok(false);
+        };
+        if remotes.paths[position].placement == RelayPathPlacement::Active
+            && position + 1 == remotes.paths.len()
+        {
+            return Ok(false);
+        }
+        let frame = Frame::OpenStream {
+            stream_id: remotes.stream_id(),
+            target: spec.target.clone(),
+            ingress: spec.ingress,
+            outbound: OutboundPolicy::Direct,
+            demand: stream_demand_hint_for_lane(lane),
+            role: StreamOpenRole::Active,
+        };
+        let emit_result = {
+            let path = &mut remotes.paths[position];
+            path.stream.lane = lane;
+            emit_relay_path_frame(&path.stream, frame, FlowLane::Control).await
+        };
+        match emit_result {
+            Ok(()) => Ok(remotes.activate_path_instance_after_service_open(instance)),
+            Err(err) => {
+                remotes.fail_path_instance(context, instance).await;
+                Err(err)
+            }
+        }
+    }
+
     pub(super) async fn send_attach_control_to_instance(
         &mut self,
         remotes: &mut ReliableRelayRemoteSet,

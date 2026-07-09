@@ -279,7 +279,10 @@ impl ReliableRelayRemoteSet {
         Some(path)
     }
 
-    pub(super) fn promote_path_instance_to_active(&mut self, instance: RelayPathInstance) -> bool {
+    pub(super) fn activate_path_instance_after_service_open(
+        &mut self,
+        instance: RelayPathInstance,
+    ) -> bool {
         let Some(position) = self
             .paths
             .iter()

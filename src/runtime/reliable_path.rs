@@ -650,7 +650,6 @@ pub(super) struct ResponseStreamBinding {
 pub(super) enum ResponseStreamAttachOutcome {
     Attached,
     RejectedDuplicateLiveOutput,
-    RejectedRepairToActiveOutput,
 }
 
 impl ResponseStreamBinding {
@@ -756,16 +755,10 @@ impl ResponseStreamBinding {
             let entry = &mut outputs.entries[position];
             if !entry.commands.is_closed() {
                 let same_channel = entry.commands.same_channel(&commands);
-                let updated_role = if same_channel {
-                    response_stream_live_role_update(entry.role, role)
-                } else {
-                    None
-                };
                 #[cfg(feature = "lab-diagnostics")]
-                let attach_result = match (same_channel, updated_role) {
-                    (true, Some(_)) => "same_channel_role_update",
-                    (true, None) => "rejected_repair_to_active",
-                    (false, _) => "duplicate_live",
+                let attach_result = match same_channel {
+                    true => "same_channel_role_update",
+                    false => "duplicate_live",
                 };
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -782,10 +775,7 @@ impl ResponseStreamBinding {
                     ),
                 );
                 if same_channel {
-                    let Some(updated_role) = updated_role else {
-                        return ResponseStreamAttachOutcome::RejectedRepairToActiveOutput;
-                    };
-                    entry.role = updated_role;
+                    entry.role = response_stream_live_role_update(entry.role, role);
                     let attached_keys = outputs
                         .entries
                         .iter()
@@ -1629,13 +1619,12 @@ impl ResponseStreamBinding {
 fn response_stream_live_role_update(
     current: StreamOpenRole,
     requested: StreamOpenRole,
-) -> Option<StreamOpenRole> {
+) -> StreamOpenRole {
     match (current, requested) {
-        (StreamOpenRole::Repair, StreamOpenRole::Active) => None,
-        (StreamOpenRole::Active, _) => Some(StreamOpenRole::Active),
-        (_, StreamOpenRole::Active) => Some(StreamOpenRole::Active),
-        (StreamOpenRole::Repair, _) | (_, StreamOpenRole::Repair) => Some(StreamOpenRole::Repair),
-        _ => Some(current),
+        (StreamOpenRole::Active, _) => StreamOpenRole::Active,
+        (_, StreamOpenRole::Active) => StreamOpenRole::Active,
+        (StreamOpenRole::Repair, _) | (_, StreamOpenRole::Repair) => StreamOpenRole::Repair,
+        _ => current,
     }
 }
 
@@ -1888,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn response_repair_output_does_not_silently_convert_to_active() {
+    fn response_repair_output_requires_explicit_active_reannounce() {
         let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
         let repair = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -1917,8 +1906,8 @@ mod tests {
                 StreamOpenRole::Active,
                 reliable_relay_buffer_len(MuxLimits::default()),
             ),
-            ResponseStreamAttachOutcome::RejectedRepairToActiveOutput,
-            "RepairData ownership must not become ordinary OwnerData through a same-channel role update"
+            ResponseStreamAttachOutcome::Attached,
+            "explicit Active reannounce may promote future work without changing old repair-flight semantics"
         );
 
         let outputs = binding.outputs.lock().expect("test response outputs lock");
@@ -1927,7 +1916,7 @@ mod tests {
             .iter()
             .find(|entry| entry.key == repair)
             .expect("repair output remains attached");
-        assert_eq!(repair_entry.role, StreamOpenRole::Repair);
+        assert_eq!(repair_entry.role, StreamOpenRole::Active);
         drop(outputs);
         assert_eq!(binding.ordered_data_owner(), Some(active));
     }

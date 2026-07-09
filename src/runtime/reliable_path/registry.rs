@@ -152,15 +152,11 @@ impl ServerReliableStreamRegistry {
             if matches!(
                 attach_outcome,
                 ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
-                    | ResponseStreamAttachOutcome::RejectedRepairToActiveOutput
             ) {
                 #[cfg(feature = "lab-diagnostics")]
                 let result = match attach_outcome {
                     ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput => {
                         "rejected_duplicate_live_output"
-                    }
-                    ResponseStreamAttachOutcome::RejectedRepairToActiveOutput => {
-                        "rejected_repair_to_active_output"
                     }
                     ResponseStreamAttachOutcome::Attached => "attached",
                 };

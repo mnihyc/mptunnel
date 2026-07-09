@@ -102,6 +102,10 @@ impl ReliablePathStream {
         self.output.release_normalized_acked_ranges(ranges);
     }
 
+    pub(super) fn has_live_repair_flight_overlap(&self, frame: &Frame) -> bool {
+        self.output.has_live_repair_flight_overlap(frame)
+    }
+
     pub(super) fn has_multipath_repair_alternative(&self) -> bool {
         self.output.has_multipath_repair_alternative()
     }
@@ -387,6 +391,14 @@ impl FixedReliablePathOutput {
             .delivery_samples
             .saturating_add(released_proven_flights);
     }
+
+    fn has_repair_flight_overlap(&self, frame: &Frame) -> bool {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return false;
+        };
+        let model = self.model.lock().expect("fixed reliable path model lock");
+        product_flights_have_repair_overlap(&model.flights, start, end, |_| true)
+    }
 }
 
 impl ReliablePathStreamOutput {
@@ -535,6 +547,13 @@ impl ReliablePathStreamOutput {
         match self {
             Self::Fixed(fixed) => fixed.release_normalized_acked_ranges(ranges),
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
+        }
+    }
+
+    pub(super) fn has_live_repair_flight_overlap(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(fixed) => fixed.has_repair_flight_overlap(frame),
+            Self::Switchable(binding) => binding.has_live_repair_flight_overlap(frame),
         }
     }
 
@@ -963,6 +982,25 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .any(|entry| !avoid_keys.contains(&entry.key))
+    }
+
+    pub(super) fn has_live_repair_flight_overlap(&self, frame: &Frame) -> bool {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return false;
+        };
+        let live_keys = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        product_flights_have_repair_overlap(&flights, start, end, |key| live_keys.contains(&key))
     }
 
     pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
@@ -1539,6 +1577,28 @@ fn carrier_path_flights_have_unambiguous_owner_ack(flights: &[CarrierPathFlight]
         flights,
         [flight] if flight.kind.is_ordering_owner()
     )
+}
+
+fn product_flights_have_repair_overlap(
+    flights: &BTreeMap<u64, Vec<CarrierPathFlight>>,
+    start: u64,
+    end: u64,
+    mut live: impl FnMut(CarrierPathKey) -> bool,
+) -> bool {
+    if start >= end {
+        return false;
+    }
+    for (&offset, path_flights) in flights.range(..end) {
+        for flight in path_flights {
+            if offset >= end || flight.end <= start {
+                continue;
+            }
+            if flight.kind == CarrierWorkKind::RepairData && live(flight.key) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn response_live_ordered_data_owner(

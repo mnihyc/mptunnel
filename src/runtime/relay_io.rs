@@ -1493,7 +1493,9 @@ fn enqueue_reliable_tail_repair(
     let mut repair_count = 0usize;
     let mut repair_pending = false;
     for frame in repair_frames {
-        if response_sender.has_queued_repair_overlap(&frame) {
+        if response_sender.has_queued_repair_overlap(&frame)
+            || path_stream.has_live_repair_flight_overlap(&frame)
+        {
             repair_pending = true;
             continue;
         }
@@ -2164,7 +2166,9 @@ where
                             ),
                         );
                         for frame in repair_frames {
-                            let queued = if critical_tail_repair {
+                            let queued = if path_stream.has_live_repair_flight_overlap(&frame) {
+                                false
+                            } else if critical_tail_repair {
                                 if repair_kind == "fin_tail" {
                                     response_sender
                                         .enqueue_critical_tail_repair_frame(frame)
@@ -2380,9 +2384,13 @@ where
                     let _ = same_output_frontier_retransmit;
                     let mut repair_count = 0usize;
                     for frame in repair_frames {
-                        let queued = response_sender
-                            .enqueue_critical_tail_repair_frame(frame)
-                            .is_some();
+                        let queued = if path_stream.has_live_repair_flight_overlap(&frame) {
+                            false
+                        } else {
+                            response_sender
+                                .enqueue_critical_tail_repair_frame(frame)
+                                .is_some()
+                        };
                         if queued {
                             repair_count = repair_count.saturating_add(1);
                         }
@@ -4340,8 +4348,109 @@ mod tests {
         assert_eq!(response_sender.bytes(), queued_bytes_after_first);
     }
 
-    #[tokio::test]
-    async fn persistent_tail_repair_dispatches_frontier_when_all_outputs_have_stale_copy() {
+    #[test]
+    fn tail_repair_treats_live_inflight_repair_as_pending() {
+        let limits = MuxLimits::default();
+        let stream_id = StreamId(127);
+        let owner_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let repair_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(127),
+            owner_key.underlay,
+            owner_key.path_id,
+            owner_commands,
+            FlowLane::Throughput,
+        );
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                repair_key.underlay,
+                repair_key.path_id,
+                repair_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: owner_key.underlay,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+        let frame = send_stream
+            .prepare_data(Bytes::from(vec![0x49; 4096]), StreamFlags::NONE)
+            .expect("prepare owner data");
+        send_stream
+            .commit_prepared_data(&frame)
+            .expect("commit owner data");
+        binding.record_owner_flight(owner_key, &frame);
+        let ack_ranges = [OffsetRange {
+            start: 0,
+            end: 1024,
+        }];
+        let _ = send_stream.apply_ack(&ack_ranges);
+        let inflight_repair = send_stream
+            .retransmission_frames_after_ack_frontier(&ack_ranges, 1024)
+            .into_iter()
+            .next()
+            .expect("expected frontier repair frame");
+        binding.record_repair_flight(repair_key, &inflight_repair);
+
+        let mut response_sender = ServerResponseSenderService::new_with_performance(
+            SessionId(127),
+            stream_id,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+        );
+        response_sender.record_owner_progress(1024);
+
+        let outcome = enqueue_reliable_tail_repair(
+            &mut response_sender,
+            &path_stream,
+            stream_id,
+            &send_stream,
+            &ack_ranges,
+            true,
+            None,
+            FlowLane::Throughput,
+            limits,
+            MppPerformanceConfig {
+                extra_traffic_hint_percent: 5,
+            },
+            path_stream.max_frame_payload_bytes,
+            1024,
+        );
+
+        assert_eq!(
+            outcome.queued, 0,
+            "live in-flight RepairData for the same range must not be stacked"
+        );
+        assert!(
+            outcome.pending,
+            "live in-flight RepairData should keep the tail repair timer backed off"
+        );
+        assert_eq!(response_sender.bytes(), 0);
+    }
+
+    #[test]
+    fn persistent_tail_repair_waits_when_live_repair_copy_is_in_flight() {
         let limits = MuxLimits::default();
         let stream_id = StreamId(105);
         let owner_key = CarrierPathKey {
@@ -4352,7 +4461,7 @@ mod tests {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(1),
         };
-        let (owner_commands, mut owner_receivers) = reliable_path_command_channels(8);
+        let (owner_commands, _owner_receivers) = reliable_path_command_channels(8);
         let binding = ResponseStreamBinding::new(
             SessionId(105),
             owner_key.underlay,
@@ -4360,7 +4469,7 @@ mod tests {
             owner_commands,
             FlowLane::Throughput,
         );
-        let (repair_commands, mut repair_receivers) = reliable_path_command_channels(8);
+        let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
         assert_eq!(
             binding.attach(
                 repair_key.underlay,
@@ -4426,33 +4535,14 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.queued, 1,
-            "persistent tail repair must retry the lowest blocked frontier range once when every live output only has stale overlapping flight"
+            outcome.queued, 0,
+            "persistent tail repair must not stack another copy while a live RepairData flight already covers the frontier range"
         );
-        assert!(!outcome.pending);
-        response_sender
-            .dispatch_next_with_ordered_owner_debt(
-                &path_stream,
-                &mut send_stream,
-                FlowLane::Throughput,
-                limits,
-                0,
-            )
-            .await
-            .expect("stale-copy tail recovery must dispatch instead of pinning the queue front");
-
-        let command = try_recv_reliable_path_command(&mut owner_receivers)
-            .or_else(|| try_recv_reliable_path_command(&mut repair_receivers))
-            .expect("expected stale-copy tail repair frame");
-        match command {
-            ReliablePathCommand::SendFrame(Frame::StreamData {
-                offset, payload, ..
-            }) => {
-                assert_eq!(offset, 1024);
-                assert!(!payload.is_empty());
-            }
-            _ => panic!("expected stale-copy tail repair STREAM_DATA"),
-        }
+        assert!(
+            outcome.pending,
+            "live in-flight RepairData should back off the tail repair timer"
+        );
+        assert_eq!(response_sender.bytes(), 0);
     }
 
     #[tokio::test]

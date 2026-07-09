@@ -568,12 +568,13 @@ the distinction; a `STREAM_DATA` frame used for repair does not become
 `OwnerData` merely because its wire frame type is `STREAM_DATA`.
 Critical completion repair remains `RepairData`; it does not become a
 repeatable owner stream. While a repair frame for a product byte range is still
-queued in the sender service, later tail/FIN/output-update events for the same
-range MUST be treated as already pending and MUST NOT enqueue another copy,
-debit extra-traffic accounting again, or increase sender-service queued bytes.
-Only ACK progress, carrier dispatch completion followed by a new repair
-deadline, or a materially different missing range can create a new bounded
-repair attempt.
+queued in the sender service or already in live carrier flight, later
+tail/FIN/output-update events for the same range MUST be treated as already
+pending and MUST NOT enqueue another copy, debit extra-traffic accounting
+again, or increase sender-service queued bytes. ACK progress, detaching the
+output that owns the only repair copy, a repair deadline that declares the
+previous attempt stale, or a materially different missing range may create a
+new bounded repair attempt.
 
 Terminal FIN reliability is `Control`, not repair or path proof. `STREAM_FIN`
 is idempotent for a stream ID and final offset, and a sender MAY replay it once
@@ -3673,13 +3674,13 @@ output. This is the MPTCP reinjection rule applied only after loss, failure, or
 explicit repair evidence exists, with the QUIC-style recovery constraint that a
 repair action is small, ACK-clocked, and never a replay of unrelated cached bytes. A
 sender MUST NOT enqueue another `RepairData` copy for a byte range that is
-already pending in the sender-service queue; the already queued copy is treated
-as the current repair attempt and the repair timer backs off until ACK,
-capacity, detach/failover, or the next repair deadline changes the decision.
-Repair already in carrier flight is controlled by the same repair cadence and
-normal target selection; an implementation MUST NOT use a late global
-in-flight-overlap skip that prevents an eligible cleaner repair output from
-being selected.
+already pending in the sender-service queue or in live carrier flight; that
+copy is treated as the current repair attempt and the repair timer backs off
+until ACK, capacity, detach/failover, staleness timeout, or the next materially
+different repair range changes the decision. Repair already in carrier flight
+on a detached or failed output does not block failover repair on a live
+survivor; repair already in flight on a live output does block duplicate
+spending for the same range.
 sender MUST NOT substitute a later range merely because the frontier range is
 already in flight. A sender MUST NOT duplicate every lower outstanding byte
 merely because a faster active path is available. Speculative reinjection outside

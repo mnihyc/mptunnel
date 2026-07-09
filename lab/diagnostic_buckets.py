@@ -273,11 +273,13 @@ def score_buckets(
             min(5, max(1, missing * 5 // max(enqueue_count, 1))),
             f"server enqueue/dispatch gap {enqueue_count}/{dispatch_count}",
         )
-    if metrics["server_sender_dispatch_max_ms"] and metrics["server_sender_dispatch_max_ms"] > 250:
+    if metrics["server_sender_dispatch_p95_ms"] and metrics["server_sender_dispatch_p95_ms"] > 250:
         add(
             "sender_starvation",
             3,
-            f"server sender dispatch max delay {metrics['server_sender_dispatch_max_ms']} ms",
+            "server sender dispatch p95 delay "
+            f"{metrics['server_sender_dispatch_p95_ms']} ms "
+            f"(max {metrics['server_sender_dispatch_max_ms']} ms)",
         )
     if metrics["server_sender_conformance_delta"]:
         add(
@@ -363,8 +365,14 @@ def score_buckets(
 def dominant_bucket(
     row: dict[str, Any], metrics: dict[str, Any], scores: collections.Counter[str]
 ) -> str:
-    if row.get("status") == "ok" and not scores:
-        return "none"
+    if row.get("status") == "ok":
+        actionable_scores = sum(
+            score
+            for bucket, score in scores.items()
+            if bucket not in {"carrier_teardown", "lab_noise"}
+        )
+        if actionable_scores == 0:
+            return "none"
     if not scores:
         return "lab_noise"
     return max(BUCKETS, key=lambda bucket: (scores.get(bucket, 0), -BUCKETS.index(bucket)))

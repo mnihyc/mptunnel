@@ -2059,6 +2059,23 @@ fn reliable_relay_validation_open_candidates(
         .into_iter()
         .filter(|key| !remotes.contains_path_key(*key))
         .collect::<Vec<_>>();
+    prefer_active_family_validation_open_candidate(candidates, remotes.active_path_underlay())
+}
+
+fn prefer_active_family_validation_open_candidate(
+    mut candidates: Vec<RelayPathKey>,
+    active_underlay: Option<UnderlayProtocol>,
+) -> Vec<RelayPathKey> {
+    let Some(active_underlay) = active_underlay else {
+        return candidates;
+    };
+    if let Some(position) = candidates
+        .iter()
+        .position(|candidate| candidate.underlay == active_underlay)
+    {
+        let candidate = candidates.remove(position);
+        candidates.insert(0, candidate);
+    }
     candidates
 }
 
@@ -2776,6 +2793,60 @@ mod tests {
             reliable_relay_validation_probe_candidates(vec![tcp0, udp0], &pending, &attempted)
                 .is_empty(),
             "rebalance cannot turn a closed validation handle into repeated OPEN_STREAM churn"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_open_candidates_prefer_active_family_survivor_before_cross_family_probe() {
+        let context = ClientPathContext::new(
+            vec![
+                "tcp://127.0.0.1:23101?srtt-ms=80&rate-mbps=80"
+                    .parse()
+                    .expect("active tcp path"),
+                "tcp://127.0.0.1:23102?srtt-ms=220&rate-mbps=80"
+                    .parse()
+                    .expect("same-family tcp survivor"),
+                "udp://127.0.0.1:23103?srtt-ms=30&rate-mbps=400"
+                    .parse()
+                    .expect("lower-eta cross-family udp probe"),
+            ],
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+        let (commands, _receivers) = reliable_path_command_channels(1);
+        let active = OpenedRemoteStream {
+            path_index: 0,
+            stream: test_reliable_path_stream(
+                StreamId(11),
+                UnderlayProtocol::Tcp,
+                0,
+                commands,
+                FlowLane::Throughput,
+            ),
+        };
+        let remotes = ReliableRelayRemoteSet::new(active, 4);
+
+        let candidates = reliable_relay_validation_open_candidates(
+            &context,
+            &remotes,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+
+        assert_eq!(
+            candidates.first().copied(),
+            Some(RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            }),
+            "validation should first make a same-family survivor available for Service failover before spending the one-shot open on cross-family probes"
+        );
+        assert!(
+            candidates.contains(&RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            }),
+            "cross-family validation remains eligible as fallback/probe, but not before the Service-family survivor"
         );
     }
 

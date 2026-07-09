@@ -638,7 +638,12 @@ progress, failed-owner repair target admission MUST NOT be blocked by stale
 owner emission-credit debt from the failed path. It still requires a live
 survivor with actual carrier queue capacity, remains capped by the current
 repair quantum and repair resource limits, and is still `RepairData` rather
-than new `OwnerData`.
+than new `OwnerData`. When a same-family sender-evidenced survivor exists for
+the failed owner, failed-owner repair SHOULD use that survivor before
+cross-family live repair fallback. This target-ordering rule follows the
+Service failover envelope; it does not path-prove the repair carrier, does not
+move Service ownership, and does not prevent cross-family repair when no
+same-family survivor can carry the blocking range.
 
 For scheduling and tail-repair timers, the product ACK frontier is the end of
 the first ACK range only when that range starts at offset 0. It is not the
@@ -3054,6 +3059,12 @@ after the first successful validation attachment. Later passes may attach the
 next metric-ordered candidate after the previous result is known. This preserves
 carrier-diverse validation without turning one bulk stream into a cross-product
 of simultaneous stream opens, proofs, duplicate bytes, and repair obligations.
+When a Service path is already active, the first validation candidate SHOULD be
+a same-family survivor if one is available. This is not a TCP or UDP preference:
+it keeps a repair/failover-capable sibling ready for the current Service family
+before spending the one-shot validation open on cross-family probes. The
+cross-family candidates remain eligible as later probes and as live repair
+fallback when no same-family survivor can carry the blocking range.
 For a given product stream and carrier path, validation/probe attachment is a
 one-shot path-manager attempt. A path that has already been attempted for that
 stream MUST NOT be reopened by prevalidation or rebalance simply because the

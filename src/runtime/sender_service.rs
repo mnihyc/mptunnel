@@ -1142,6 +1142,30 @@ fn choose_lowest_eta_response_target(
         .cloned()
 }
 
+fn choose_same_family_sender_evidenced_response_target(
+    targets: &[ResponseSenderPathTarget],
+    avoid_keys: &[CarrierPathKey],
+) -> Option<ResponseSenderPathTarget> {
+    if avoid_keys.is_empty() {
+        return None;
+    }
+    targets
+        .iter()
+        .filter(|target| {
+            !avoid_keys.contains(&target.key)
+                && target.has_sender_evidence
+                && avoid_keys
+                    .iter()
+                    .any(|avoid_key| avoid_key.underlay == target.key.underlay)
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .cloned()
+}
+
 fn response_target_has_ack_gap_repair_evidence(target: &ResponseSenderPathTarget) -> bool {
     target.is_active || target.has_bulk_rate_evidence
 }
@@ -1180,6 +1204,12 @@ fn choose_response_repair_target(
         .filter(|target| response_target_can_receive_repair(target, cause))
         .cloned()
         .collect::<Vec<_>>();
+    if cause == RelaySendCause::PathFailureRepair
+        && let Some(same_family_survivor) =
+            choose_same_family_sender_evidenced_response_target(&repair_targets, avoid_keys)
+    {
+        return Some(same_family_survivor);
+    }
     let distinct = choose_lowest_eta_response_target(&repair_targets, avoid_keys, true);
     if distinct.is_some() || cause == RelaySendCause::AckGapRepair {
         return distinct;
@@ -5685,6 +5715,66 @@ mod tests {
         assert_eq!(
             selected.key, liveness_survivor.key,
             "PathFailureRepair is bounded failover retransmission; it must not require bulk-rate proof because it never path-proves or changes Service ownership"
+        );
+    }
+
+    #[test]
+    fn path_failure_repair_prefers_same_family_survivor_before_cross_family_low_eta() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let original_owner = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            20.0,
+            0,
+            4 * payload_bytes as u64,
+            true,
+        );
+        let mut same_family_survivor = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            50.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        same_family_survivor.has_sender_evidence = true;
+        same_family_survivor.has_bulk_rate_evidence = false;
+        let mut cross_family_low_eta = response_target(
+            2,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        cross_family_low_eta.has_sender_evidence = true;
+        cross_family_low_eta.has_bulk_rate_evidence = false;
+
+        let selected = choose_response_sender_target(
+            &[
+                original_owner.clone(),
+                same_family_survivor.clone(),
+                cross_family_low_eta,
+            ],
+            FlowLane::Throughput,
+            &Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from(vec![0; payload_bytes]),
+            },
+            ResponseCarrierEmitMode::Classified,
+            mux_limits,
+            &[],
+            &[original_owner.key],
+            Some(RelaySendCause::PathFailureRepair),
+        )
+        .expect("path-failure repair should remain dispatchable on a live survivor");
+
+        assert_eq!(
+            selected.key, same_family_survivor.key,
+            "failed-owner RepairData should follow the same-family failover survivor before trying cross-family low-ETA repair"
         );
     }
 

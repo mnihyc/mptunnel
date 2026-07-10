@@ -790,10 +790,6 @@ impl PathDeliveryStats {
     }
 }
 
-fn reliable_relay_bulk_service_migration_sample_bytes(payload_bytes: usize) -> usize {
-    payload_bytes.max(BBR_MAX_SEND_QUANTUM_BYTES)
-}
-
 #[derive(Debug)]
 pub(super) struct RecentIdCache<T>
 where
@@ -1928,32 +1924,6 @@ impl ClientPathContext {
         }
     }
 
-    pub(super) fn relay_path_has_bulk_service_migration_evidence(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        payload_bytes: usize,
-    ) -> bool {
-        let required_bytes =
-            reliable_relay_bulk_service_migration_sample_bytes(payload_bytes) as u64;
-        let health = self.health.lock().expect("client path health lock");
-        let Some(record) = (match underlay {
-            UnderlayProtocol::Tcp => health.tcp.get(index),
-            UnderlayProtocol::Udp => health.udp.get(index),
-        }) else {
-            return false;
-        };
-        let product_samples = record
-            .delivery_samples
-            .saturating_sub(record.datagram_feedback_samples);
-        let product_evidence =
-            product_samples > 0 && record.product_delivery_sample_bytes >= required_bytes;
-        let carrier_evidence = record.carrier_delivery_samples > 0
-            && !record.carrier_app_limited
-            && record.carrier_delivery_sample_bytes >= required_bytes;
-        product_evidence || carrier_evidence
-    }
-
     #[cfg(test)]
     pub(super) fn mark_relay_path_proof_observation(
         &self,
@@ -1969,21 +1939,6 @@ impl ClientPathContext {
         if let Some(current) = records.get_mut(index) {
             current.mark_path_proof_success(observation.elapsed);
         }
-    }
-
-    pub(super) fn relay_path_has_delivery_sample(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-    ) -> bool {
-        let health = self.health.lock().expect("client path health lock");
-        let observation = match underlay {
-            UnderlayProtocol::Tcp => health.tcp.get(index),
-            UnderlayProtocol::Udp => health.udp.get(index),
-        };
-        observation.is_some_and(|record| {
-            record.delivery_samples > 0 || record.carrier_delivery_samples > 0
-        })
     }
 
     pub(super) fn mark_tcp_path_delivery(&self, index: usize, stats: PathDeliveryStats) {

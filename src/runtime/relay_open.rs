@@ -21,6 +21,7 @@ pub(super) struct ReliableRelayRemotePath {
     pub(super) path_index: usize,
     pub(super) instance_id: u64,
     pub(super) placement: RelayPathPlacement,
+    pub(super) load_reserved: bool,
     pub(super) stream: ReliablePathStreamHandle,
 }
 
@@ -109,6 +110,14 @@ impl ReliableRelayRemoteSet {
     pub(super) fn path_keys(&self) -> Vec<RelayPathKey> {
         self.paths
             .iter()
+            .map(ReliableRelayRemotePath::key)
+            .collect()
+    }
+
+    pub(super) fn load_reserved_path_keys(&self) -> Vec<RelayPathKey> {
+        self.paths
+            .iter()
+            .filter(|path| path.load_reserved)
             .map(ReliableRelayRemotePath::key)
             .collect()
     }
@@ -218,6 +227,7 @@ impl ReliableRelayRemoteSet {
             path_index,
             instance_id,
             placement,
+            load_reserved: placement == RelayPathPlacement::Active,
             stream,
         };
         if placement == RelayPathPlacement::Validation {
@@ -274,7 +284,13 @@ impl ReliableRelayRemoteSet {
             return false;
         };
         context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
-        context.release_relay_path_load(path.stream.underlay, path.path_index, path.stream.lane);
+        if path.load_reserved {
+            context.release_relay_path_load(
+                path.stream.underlay,
+                path.path_index,
+                path.stream.lane,
+            );
+        }
         path.stream.send_detach().await;
         path.stream.close().await;
         true
@@ -322,6 +338,30 @@ impl ReliableRelayRemoteSet {
         true
     }
 
+    pub(super) fn reserve_path_instance_load_if_needed(
+        &mut self,
+        context: &ClientPathContext,
+        instance: RelayPathInstance,
+        lane: FlowLane,
+    ) -> bool {
+        let Some(path) = self
+            .paths
+            .iter_mut()
+            .find(|path| path.instance() == instance)
+        else {
+            return false;
+        };
+        if path.load_reserved {
+            return false;
+        }
+        match path.stream.underlay {
+            UnderlayProtocol::Tcp => context.reserve_tcp_path_load(path.path_index, lane),
+            UnderlayProtocol::Udp => context.reserve_udp_stream_path_load(path.path_index, lane),
+        }
+        path.load_reserved = true;
+        true
+    }
+
     fn active_path_position(&self) -> Option<usize> {
         self.paths
             .iter()
@@ -356,6 +396,7 @@ pub(super) struct ReliableRelayOpenSpec {
 pub(super) enum ReliableRelayAttachMode {
     Any,
     BulkStriping,
+    RecoveryRepair,
 }
 
 #[derive(Debug, Clone, Copy)]

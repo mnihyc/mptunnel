@@ -1256,6 +1256,7 @@ mod tests {
             path_index: index,
             instance_id: index as u64 + 1,
             placement,
+            load_reserved: placement == RelayPathPlacement::Active,
             stream: ReliablePathStreamHandle {
                 stream_id: StreamId(7),
                 max_offset: u64::MAX,

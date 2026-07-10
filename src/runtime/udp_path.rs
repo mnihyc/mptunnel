@@ -332,6 +332,7 @@ impl QuicPathMetricTracker {
             .saturating_add(congestion.pending_bytes)
             .max(bytes_in_flight);
 
+        let confidence_sample_floor = QUIC_INITIAL_WINDOW_PACKETS as u64;
         if product_newly_acked_bytes > 0 && !congestion.app_limited {
             let sample_elapsed = elapsed.max(QUIC_TIMER_GRANULARITY);
             let sample_rate =
@@ -345,28 +346,52 @@ impl QuicPathMetricTracker {
                 && self.delivery_sample_count == 0;
             app_limited = sample_is_app_limited;
             if !sample_is_app_limited {
-                let current_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+                let estimated_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+                let current_rate = if self.delivery_sample_count < confidence_sample_floor {
+                    estimated_rate.max(fallback_rate)
+                } else {
+                    estimated_rate
+                };
                 let bounded_sample = sample_rate.min(current_rate * BBR_DEFAULT_CWND_GAIN);
-                self.delivery_sample_count = self
+                let previous_sample_count = self.delivery_sample_count;
+                let candidate_sample_count = self
                     .delivery_sample_count
                     .saturating_add(congestion.delivery_sample_count.max(1));
-                self.delivery_sample_bytes = self
+                let next_sample_bytes = self
                     .delivery_sample_bytes
                     .saturating_add(product_newly_acked_bytes);
+                let confidence_has_byte_volume =
+                    next_sample_bytes >= delivery_evidence_floor.max(PATH_OPEN_SCORE_BYTES as u64);
+                let next_sample_count = if previous_sample_count < confidence_sample_floor
+                    && candidate_sample_count >= confidence_sample_floor
+                    && !confidence_has_byte_volume
+                {
+                    confidence_sample_floor.saturating_sub(1)
+                } else {
+                    candidate_sample_count
+                };
+                let establishes_measured_rate = previous_sample_count < confidence_sample_floor
+                    && next_sample_count >= confidence_sample_floor;
+                self.delivery_sample_count = next_sample_count;
+                self.delivery_sample_bytes = next_sample_bytes;
                 self.last_delivery_sample_at = Some(now);
                 self.delivery_rate_bps = Some(match self.delivery_rate_bps {
+                    Some(_) | None if establishes_measured_rate => bounded_sample,
                     Some(previous) if bounded_sample > previous => {
                         previous.mul_add(0.25, bounded_sample * 0.75)
                     }
                     Some(previous) => previous,
-                    None => bounded_sample.max(fallback_rate),
+                    None => bounded_sample,
                 });
-            } else if self.delivery_rate_bps.is_none() {
-                self.delivery_rate_bps = Some(fallback_rate);
             }
         }
 
-        let delivery_rate_bps = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+        let estimated_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+        let delivery_rate_bps = if self.delivery_sample_count < confidence_sample_floor {
+            estimated_rate.max(fallback_rate)
+        } else {
+            estimated_rate
+        };
         let pacing_rate_bps = usable_pacing_rate
             .unwrap_or(delivery_rate_bps)
             .max(delivery_rate_bps);
@@ -2728,6 +2753,16 @@ mod tests {
         assert!(app_limited.last_delivery_sample_at.is_none());
         assert_eq!(app_limited.delivery_rate_bps.round() as u64, 500_000_000);
         assert!(app_limited.app_limited);
+
+        let mut changed_pacing = congestion;
+        changed_pacing.pacing_rate_bps = Some(750_000_000);
+        let refreshed_prior = tracker.quic.observe(stats, changed_pacing, 2);
+        assert_eq!(refreshed_prior.delivery_sample_count, 0);
+        assert_eq!(
+            refreshed_prior.delivery_rate_bps.round() as u64,
+            750_000_000,
+            "a rejected app-limited ACK must not freeze the live pacing prior in the measured-rate slot"
+        );
     }
 
     #[test]
@@ -2758,6 +2793,186 @@ mod tests {
             startup.delivery_rate_bps.round() as u64,
             "a single underfed validation quantum must not replace the startup/pacing fallback with a tiny rate"
         );
+    }
+
+    #[test]
+    fn quic_first_confident_sample_replaces_optimistic_startup_prior() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_congestion(PATH_OPEN_SCORE_BYTES as u64, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
+        stats.path.current_mtu = 1400;
+        let startup = tracker.quic.observe(stats, congestion, 2);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
+        stats.frame_rx.acks = 1;
+        let first_quantum = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, PATH_OPEN_SCORE_BYTES as u64),
+                PATH_OPEN_SCORE_BYTES as u64,
+                1,
+            ),
+            2,
+        );
+        assert_eq!(first_quantum.delivery_sample_count, 1);
+        assert_eq!(first_quantum.delivery_rate_bps, startup.delivery_rate_bps);
+
+        let measured_bytes = 2 * 1024 * 1024_u64;
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(200));
+        stats.frame_rx.acks += 9;
+        let confident = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(
+                    congestion,
+                    PATH_OPEN_SCORE_BYTES as u64 + measured_bytes,
+                ),
+                measured_bytes,
+                9,
+            ),
+            2,
+        );
+
+        assert_eq!(
+            confident.delivery_sample_count,
+            QUIC_INITIAL_WINDOW_PACKETS as u64
+        );
+        assert!(confident.delivery_rate_bps < startup.delivery_rate_bps);
+        let expected_rate = measured_bytes as f64 * 8.0 / 0.2;
+        assert!(
+            confident.delivery_rate_bps >= expected_rate * 0.95
+                && confident.delivery_rate_bps <= expected_rate,
+            "the first confident rate must replace, not maximize against, the unmeasured pacing prior: expected~{expected_rate} actual={}",
+            confident.delivery_rate_bps,
+        );
+    }
+
+    #[test]
+    fn quic_confidence_boundary_discards_inflated_preconfidence_sample() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let congestion = quic_congestion(PATH_OPEN_SCORE_BYTES as u64, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
+        stats.path.current_mtu = 1400;
+        let startup = tracker.quic.observe(stats, congestion, 2);
+
+        let fast_sample_bytes = 64 * 1024_u64;
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1));
+        stats.frame_rx.acks = 1;
+        let preconfidence = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(congestion, fast_sample_bytes),
+                fast_sample_bytes,
+                1,
+            ),
+            2,
+        );
+        assert_eq!(preconfidence.delivery_sample_count, 1);
+        assert!(
+            preconfidence.delivery_rate_bps > startup.delivery_rate_bps,
+            "the setup must retain an inflated provisional sample before confidence"
+        );
+
+        let measured_bytes = 2 * 1024 * 1024_u64;
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(200));
+        stats.frame_rx.acks += 9;
+        let confident = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(
+                    congestion,
+                    fast_sample_bytes.saturating_add(measured_bytes),
+                ),
+                measured_bytes,
+                9,
+            ),
+            2,
+        );
+
+        let expected_rate = measured_bytes as f64 * 8.0 / 0.2;
+        assert_eq!(
+            confident.delivery_sample_count,
+            QUIC_INITIAL_WINDOW_PACKETS as u64
+        );
+        assert!(
+            confident.delivery_rate_bps >= expected_rate * 0.95
+                && confident.delivery_rate_bps <= expected_rate,
+            "confidence graduation must use the establishing sample, not retain a faster preconfidence outlier: expected~{expected_rate} actual={}",
+            confident.delivery_rate_bps,
+        );
+    }
+
+    #[test]
+    fn quic_confidence_requires_ack_samples_and_current_flight_volume() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let startup_cwnd = PATH_OPEN_SCORE_BYTES as u64;
+        let startup_congestion = quic_congestion(startup_cwnd, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(50);
+        stats.path.cwnd = startup_cwnd;
+        stats.path.current_mtu = 1400;
+        let startup = tracker.quic.observe(stats, startup_congestion, 2);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
+        let first = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(startup_congestion, startup_cwnd),
+                startup_cwnd,
+                1,
+            ),
+            2,
+        );
+        assert_eq!(first.delivery_sample_count, 1);
+
+        let grown_cwnd = 4 * 1024 * 1024_u64;
+        let tiny_followup = 9 * 1024_u64;
+        let grown_congestion = quic_congestion(grown_cwnd, Some(500_000_000));
+        stats.path.cwnd = grown_cwnd;
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
+        let count_only = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(
+                    grown_congestion,
+                    startup_cwnd.saturating_add(tiny_followup),
+                ),
+                tiny_followup,
+                9,
+            ),
+            2,
+        );
+        assert_eq!(
+            count_only.delivery_sample_count,
+            QUIC_INITIAL_WINDOW_PACKETS.saturating_sub(1) as u64,
+            "sample count alone cannot graduate below the current carrier flight evidence floor"
+        );
+        assert_eq!(count_only.delivery_rate_bps, startup.delivery_rate_bps);
+
+        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
+        let byte_confident = tracker.quic.observe(
+            stats,
+            with_acked_bytes(
+                with_product_data_written(
+                    grown_congestion,
+                    startup_cwnd
+                        .saturating_add(tiny_followup)
+                        .saturating_add(grown_cwnd),
+                ),
+                grown_cwnd,
+                1,
+            ),
+            2,
+        );
+        assert_eq!(
+            byte_confident.delivery_sample_count,
+            QUIC_INITIAL_WINDOW_PACKETS as u64
+        );
+        assert!(byte_confident.delivery_rate_bps < startup.delivery_rate_bps);
     }
 
     #[test]

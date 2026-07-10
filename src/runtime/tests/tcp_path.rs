@@ -2555,6 +2555,32 @@ fn throughput_repair_bytes_use_repair_attachment_role() {
     ));
 }
 
+#[test]
+fn response_recovery_after_request_fin_preserves_active_role() {
+    let send_stream = ReliableSendStream::new(StreamId(153), MuxLimits::default());
+
+    assert_eq!(
+        reliable_relay_attach_role(
+            FlowLane::Throughput,
+            &send_stream,
+            true,
+            ReliableRelayAttachMode::RecoveryRepair,
+        ),
+        StreamOpenRole::Repair,
+        "response-side timer recovery remains Repair after the request FIN"
+    );
+    assert_eq!(
+        reliable_relay_attach_role(
+            FlowLane::Throughput,
+            &send_stream,
+            true,
+            ReliableRelayAttachMode::Any,
+        ),
+        StreamOpenRole::Active,
+        "generic Any mode remains available for explicit Active failover"
+    );
+}
+
 fn opened_relay_stream_for_test(
     stream_id: StreamId,
     underlay: UnderlayProtocol,
@@ -3351,6 +3377,19 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
         ingress: IngressKind::Socks5,
     };
     let mut sender = RelaySenderService::new(stream_id);
+    assert!(
+        !remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == repair_instance)
+            .expect("repair path")
+            .load_reserved,
+        "a passive Repair attachment must not reserve an ordinary flow share"
+    );
+    assert_eq!(
+        context.health.lock().expect("client path health lock").udp[0].active_flows,
+        0
+    );
 
     assert!(
         sender
@@ -3375,6 +3414,36 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
         _ => panic!("expected explicit Active reannounce on repair path"),
     }
     assert_eq!(remotes.active_path_key(), Some(repair_key));
+    assert!(
+        remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == repair_instance)
+            .expect("promoted path")
+            .load_reserved
+    );
+    {
+        let health = context.health.lock().expect("client path health lock");
+        assert_eq!(health.udp[0].active_flows, 1);
+        assert_eq!(health.udp[0].active_latency_sensitive_flows, 1);
+    }
+    assert!(
+        !sender
+            .reannounce_path_instance_as_active(
+                &context,
+                &mut remotes,
+                repair_instance,
+                &spec,
+                FlowLane::Latency,
+            )
+            .await
+            .expect("repeated active reannounce"),
+        "the already-current Active path must not be promoted twice"
+    );
+    assert_eq!(
+        context.health.lock().expect("client path health lock").udp[0].active_flows,
+        1
+    );
 }
 
 #[tokio::test]
@@ -3858,7 +3927,7 @@ async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
 }
 
 #[tokio::test]
-async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
+async fn measured_bulk_alternate_requires_explicit_service_migration() {
     let stream_id = StreamId(47);
     let context = ClientPathContext::new(
         vec![
@@ -3924,13 +3993,26 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
         0,
         PathRateSample::new(512 * 1024, Duration::from_millis(50)).expect("rate sample"),
     );
-    assert!(reliable_relay_delivery_path_should_become_active(
-        &context,
-        remotes.active_path_key(),
-        fast_instance.key,
-        FlowLane::Throughput,
-        64 * 1024,
-    ));
+    assert!(
+        !reliable_relay_delivery_path_should_become_active(
+            &context,
+            remotes.active_path_key(),
+            fast_instance.key,
+            FlowLane::Throughput,
+            64 * 1024,
+        ),
+        "bulk-rate graduation makes the path a measured Subflow; delivery alone must not migrate Service"
+    );
+    assert!(
+        reliable_relay_delivery_path_should_become_active(
+            &context,
+            remotes.active_path_key(),
+            fast_instance.key,
+            FlowLane::Latency,
+            64 * 1024,
+        ),
+        "interactive delivery may still move Service to a lower-ETA path"
+    );
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
         ingress: IngressKind::Socks5,
@@ -3947,7 +4029,7 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
             )
             .await
             .expect("active reannounce"),
-        "measured validation path must become Service through explicit Active reannounce"
+        "an explicit migration decision must still be able to reannounce Active Service"
     );
     match recv_reliable_path_command(&mut fast_commands)
         .await
@@ -4009,7 +4091,7 @@ async fn measured_alternate_path_promotes_only_when_scheduler_score_improves() {
 }
 
 #[tokio::test]
-async fn cross_underlay_bulk_promotion_requires_bulk_sized_delivery_sample() {
+async fn cross_underlay_bulk_delivery_never_implicitly_migrates_service() {
     let context = ClientPathContext::new(
         vec![
             "tcp://127.0.0.1:11020?srtt-ms=80&rate-mbps=80"
@@ -4058,14 +4140,14 @@ async fn cross_underlay_bulk_promotion_requires_bulk_sized_delivery_sample() {
     );
 
     assert!(
-        reliable_relay_delivery_path_should_become_active(
+        !reliable_relay_delivery_path_should_become_active(
             &context,
             Some(current),
             delivered,
             FlowLane::Throughput,
             BBR_MAX_SEND_QUANTUM_BYTES,
         ),
-        "bulk-sized product evidence may explicitly migrate Service ownership when the metric model prefers it"
+        "bulk-sized cross-family delivery may prove a measured path, but explicit frontier-safe policy owns Service migration"
     );
 }
 

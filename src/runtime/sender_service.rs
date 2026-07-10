@@ -797,9 +797,12 @@ fn response_bulk_admission_role(
     lower_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
 ) -> BulkAdmissionRole {
-    if lower_owner == Some(candidate) || (candidate == service_key && ordering_debt == 0) {
+    if candidate == service_key && ordering_debt == 0 {
         BulkAdmissionRole::ActiveDataPath
     } else if let Some(owner) = lower_owner {
+        // Continuing the existing lower-flight carrier does not introduce a
+        // new carrier-family transition, even when Service uses another
+        // underlay family. Runtime ownership still remains Subflow below.
         bulk_additional_admission_role(owner.underlay, candidate.underlay)
     } else {
         bulk_additional_admission_role(service_key.underlay, candidate.underlay)
@@ -812,8 +815,7 @@ fn response_service_anchor_key(
     ordered_data_owner: Option<CarrierPathKey>,
     fallback: CarrierPathKey,
 ) -> CarrierPathKey {
-    lower_owner
-        .or(ordered_data_owner)
+    ordered_data_owner
         .or_else(|| {
             candidates
                 .iter()
@@ -821,6 +823,7 @@ fn response_service_anchor_key(
                 .find(|candidate| candidate.is_active)
                 .map(|candidate| candidate.key)
         })
+        .or(lower_owner)
         .unwrap_or(fallback)
 }
 
@@ -945,7 +948,7 @@ fn response_target_unique_owner_admission(
 // Decides whether one candidate may own the next unique product byte range.
 //
 // The important split is:
-// * Service: the current active/lower-frontier owner, kept fed while healthy.
+// * Service: the current active owner, kept fed while healthy.
 // * Subflow: an additional path admitted after path-scoped bulk-rate evidence,
 //   or the one same-family Validation path consuming a bounded startup sample.
 //
@@ -971,7 +974,8 @@ fn response_target_unique_owner_admission_with_epoch(
     let service_key =
         response_service_anchor_key(candidates, lower_owner, ordered_data_owner, lead.key);
     let liveness_service_failover = allow_liveness_service_failover && target.key == service_key;
-    if lower_owner == Some(target.key) {
+    let continues_lower_frontier = lower_owner == Some(target.key);
+    if continues_lower_frontier && (target.key == service_key || target.is_active) {
         if ordering_debt > 0 {
             return (PathAdmission::standby(), None);
         }
@@ -981,7 +985,16 @@ fn response_target_unique_owner_admission_with_epoch(
             (PathAdmission::probe_only(), None)
         };
     }
-    if lower_owner.is_some() {
+    if continues_lower_frontier
+        && target.key != service_key
+        && (!target.has_bulk_rate_evidence || target.is_active)
+    {
+        // An authoritative ACK hole suspends startup sampling. Only an already
+        // measured Subflow may continue its own lower frontier without changing
+        // Service role, regardless of carrier family.
+        return (PathAdmission::standby(), None);
+    }
+    if lower_owner.is_some() && !continues_lower_frontier {
         return (PathAdmission::standby(), None);
     }
     if target.key == service_key {
@@ -1021,6 +1034,7 @@ fn response_target_unique_owner_admission_with_epoch(
             )
         });
     if ordered_tail_debt > 0
+        && !continues_lower_frontier
         && !response_target_is_measured_same_underlay_subflow_candidate(service_key, target)
         && !startup_owner_allowed
     {
@@ -1233,12 +1247,23 @@ fn response_active_lead_suppression(
 
 fn choose_response_admissible_lead(
     candidate_targets: &[&ResponseSenderPathTarget],
+    service_baseline: Option<&ResponseSenderPathTarget>,
     mux_limits: MuxLimits,
     payload_bytes: usize,
     lower_flights: &[CarrierPathFlightDebt],
     allow_liveness_service_failover: bool,
 ) -> Option<ResponseBulkLead> {
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    if let Some(active) = service_baseline {
+        // Service is the no-worse completion baseline even while its output is
+        // temporarily backpressured. Candidate admission remains independent.
+        return Some(ResponseBulkLead {
+            key: active.key,
+            snapshot: active.snapshot,
+            eta_ms: active.eta_ms,
+        });
+    }
+
     if let Some(owner) = lower_owner {
         let owner_target = candidate_targets
             .iter()
@@ -1260,19 +1285,6 @@ fn choose_response_admissible_lead(
                 eta_ms: owner_target.eta_ms,
             });
         }
-    }
-
-    if let Some(active) = candidate_targets
-        .iter()
-        .copied()
-        .find(|target| target.is_active)
-        && response_active_lead_suppression(active, mux_limits, payload_bytes, 0).is_none()
-    {
-        return Some(ResponseBulkLead {
-            key: active.key,
-            snapshot: active.snapshot,
-            eta_ms: active.eta_ms,
-        });
     }
 
     let admissible = candidate_targets
@@ -1474,6 +1486,7 @@ fn choose_response_sender_target(
     if targets.is_empty() {
         return None;
     }
+    let active_service_baseline = targets.iter().find(|target| target.is_active);
     let repair = repair_cause.is_some();
     let path_failure_repair = matches!(repair_cause, Some(RelaySendCause::PathFailureRepair));
     let payload_bytes = reliable_stream_frame_payload_bytes(frame);
@@ -1536,6 +1549,7 @@ fn choose_response_sender_target(
             .or_else(|| choose_lowest_eta_response_target(targets, avoid_keys, false));
     }
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    let service_baseline = lower_owner.and(active_service_baseline);
     let proven_targets = targets
         .iter()
         .filter(|target| target.is_active || target.has_sender_evidence)
@@ -1547,6 +1561,7 @@ fn choose_response_sender_target(
     };
     let lead = choose_response_admissible_lead(
         &candidate_targets,
+        service_baseline,
         mux_limits,
         payload_bytes,
         lower_flights,
@@ -1822,6 +1837,24 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
                     target.key == *owner && (target.is_active || target.has_bulk_rate_evidence)
                 }))
     });
+    let live_service_anchor = ordered_data_owner
+        .filter(|owner| targets.iter().any(|target| target.key == *owner))
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| target.is_active)
+                .map(|target| target.key)
+        });
+    let service_anchor = if effective_lower_owner.is_some() {
+        live_service_anchor
+    } else {
+        ordered_owner_anchor
+    };
+    if effective_lower_owner.is_some() && service_anchor.is_none() {
+        // A surviving lower-flight owner cannot infer Service authority from a
+        // missing anchor. Repair or ACK progress must clear the frontier first.
+        return None;
+    }
     if let Some(service_key) = ordered_owner_anchor
         && let Some(service) = targets.iter().find(|target| target.key == service_key)
     {
@@ -1976,11 +2009,14 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
         mixed_safe_targets
     };
     let allow_liveness_service_failover = effective_lower_owner.is_none()
-        && ordered_owner_anchor.is_none()
+        && service_anchor.is_none()
         && (ordered_owner_debt_bytes == 0 || missing_owner_same_underlay_failover)
         && !candidate_targets.iter().any(|target| target.is_active);
+    let service_baseline = service_anchor
+        .and_then(|service_key| targets.iter().find(|target| target.key == service_key));
     let Some(lead) = choose_response_admissible_lead(
         &candidate_targets,
+        service_baseline,
         mux_limits,
         payload_bytes,
         lower_flights,
@@ -2005,7 +2041,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
     let service_key = response_service_anchor_key(
         &candidate_targets,
         effective_lower_owner,
-        ordered_owner_anchor,
+        service_anchor,
         lead.key,
     );
     let admitted = candidate_targets
@@ -2016,7 +2052,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
             let effective_ordering_debt =
                 ordering_debt.max(response_ordered_owner_tail_debt_for_candidate(
                     target.key,
-                    ordered_owner_anchor,
+                    service_anchor,
                     ordered_owner_debt_bytes,
                 ));
             let (admission, subflow_set_commit) = response_target_unique_owner_admission_with_epoch(
@@ -2024,7 +2060,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
                 &candidate_targets,
                 lead,
                 effective_lower_owner,
-                ordered_owner_anchor,
+                service_anchor,
                 ordering_debt,
                 ordered_owner_debt_bytes,
                 payload_bytes,
@@ -2119,16 +2155,10 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
         lab_response_bulk_output_selected("startup_sample", &startup, payload_bytes);
         return Some(startup);
     }
-    if let Some(backlog_target) =
-        response_feedable_service_owner_target_before_app_limited_subflows(&admitted)
-    {
+    if let Some(service_target) = response_feedable_service_owner_target(&admitted) {
         #[cfg(feature = "lab-diagnostics")]
-        lab_response_bulk_output_selected(
-            "app_limited_backlog_balance",
-            &backlog_target,
-            payload_bytes,
-        );
-        return Some(backlog_target);
+        lab_response_bulk_output_selected("service_first", &service_target, payload_bytes);
+        return Some(service_target);
     }
     let best = admitted.iter().min_by(|left, right| {
         left.target
@@ -2195,10 +2225,10 @@ fn response_target_committed_product_bytes(target: &ResponseSenderPathTarget) ->
         .saturating_add(target.snapshot.queue_bytes)
 }
 
-fn response_feedable_service_owner_target_before_app_limited_subflows(
+fn response_feedable_service_owner_target(
     admitted: &[ResponseSelectedDataTarget],
 ) -> Option<ResponseSelectedDataTarget> {
-    let service = admitted
+    admitted
         .iter()
         .filter(|selected| selected.admission.role == PathRuntimeRole::Service)
         .min_by(|left, right| {
@@ -2207,34 +2237,7 @@ fn response_feedable_service_owner_target_before_app_limited_subflows(
                 .then_with(|| left.target.eta_ms.total_cmp(&right.target.eta_ms))
                 .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
         })
-        .cloned()?;
-    if admitted.iter().any(|selected| {
-        selected.admission.role == PathRuntimeRole::Subflow && !selected.target.snapshot.app_limited
-    }) {
-        return None;
-    }
-    let least_committed_proven_subflow = admitted
-        .iter()
-        .filter(|selected| {
-            selected.admission.role == PathRuntimeRole::Subflow
-                && selected.target.has_bulk_rate_evidence
-        })
-        .min_by(|left, right| {
-            response_target_committed_product_bytes(&left.target)
-                .cmp(&response_target_committed_product_bytes(&right.target))
-                .then_with(|| left.target.eta_ms.total_cmp(&right.target.eta_ms))
-                .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
-        });
-    match least_committed_proven_subflow {
-        None => Some(service),
-        Some(subflow)
-            if response_target_committed_product_bytes(&subflow.target)
-                < response_target_committed_product_bytes(&service.target) =>
-        {
-            Some(subflow.clone())
-        }
-        Some(_) => Some(service),
-    }
+        .cloned()
 }
 
 fn response_target_has_emission_credit(
@@ -4114,7 +4117,13 @@ impl RelaySenderService {
             emit_relay_path_frame(&path.stream, frame, FlowLane::Control).await
         };
         match emit_result {
-            Ok(()) => Ok(remotes.activate_path_instance_after_service_open(instance)),
+            Ok(()) => {
+                let activated = remotes.activate_path_instance_after_service_open(instance);
+                if activated {
+                    remotes.reserve_path_instance_load_if_needed(context, instance, lane);
+                }
+                Ok(activated)
+            }
             Err(err) => {
                 remotes.fail_path_instance(context, instance).await;
                 Err(err)
@@ -6268,7 +6277,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_udp_bulk_path_beats_poor_udp_active_path() {
+    fn measured_udp_bulk_path_remains_overflow_behind_feedable_udp_service() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_udp = response_target(
@@ -6289,7 +6298,7 @@ mod tests {
         );
 
         let selected = choose_response_sender_data_target(
-            &[active_udp, measured_udp.clone()],
+            &[active_udp.clone(), measured_udp],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
@@ -6299,11 +6308,11 @@ mod tests {
                 path_id: PathId(0),
             }),
         )
-        .expect("measured same-family UDP path should be eligible for ordinary bulk");
+        .expect("the feedable UDP Service should remain eligible for ordinary bulk");
 
         assert_eq!(
-            selected.key, measured_udp.key,
-            "within one carrier family, live metrics must override active-path stickiness"
+            selected.key, active_udp.key,
+            "a measured same-family Subflow is additive overflow and must not displace feedable Service"
         );
     }
 
@@ -7226,6 +7235,10 @@ mod tests {
             true,
         );
         active.has_bulk_rate_evidence = true;
+        let service_envelope =
+            bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits);
+        active.snapshot.product_queue_bytes = service_envelope;
+        active.snapshot.queue_bytes = payload_bytes as u64;
         let mut bulk_rate_subflow = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
         bulk_rate_subflow.has_sender_evidence = true;
         bulk_rate_subflow.has_bulk_rate_evidence = true;
@@ -8132,26 +8145,26 @@ mod tests {
         let dispatch = sender
             .dispatch_next(&stream, &mut send_stream, FlowLane::Throughput, mux_limits)
             .await
-            .expect("normal repair-cache retention must not block measured Subflow OwnerData");
+            .expect("normal repair-cache retention must not block Service OwnerData");
 
-        assert_eq!(dispatch.selected_path, Some(alternate_key));
+        assert_eq!(dispatch.selected_path, Some(active_key));
         assert_eq!(
             binding.ordered_data_owner(),
             Some(active_key),
-            "Subflow OwnerData must not rewrite the Service owner hint"
-        );
-        assert!(
-            try_recv_reliable_path_command(&mut active_rx).is_none(),
-            "normal repair-cache retention alone is not authoritative owner debt"
+            "normal repair-cache retention must not rewrite the Service owner hint"
         );
         assert!(matches!(
-            recv_reliable_path_command(&mut alternate_rx).await,
+            recv_reliable_path_command(&mut active_rx).await,
             Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
         ));
+        assert!(
+            try_recv_reliable_path_command(&mut alternate_rx).is_none(),
+            "retained repair-cache bytes are not authoritative debt and must not displace feedable Service"
+        );
     }
 
     #[tokio::test]
-    async fn response_owner_tail_guard_admits_measured_same_underlay_subflow_without_handoff() {
+    async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backpressured() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let active_key = CarrierPathKey {
@@ -8162,7 +8175,8 @@ mod tests {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
         };
-        let (active_commands, mut active_rx) = reliable_path_command_channels(8);
+        let (active_commands, mut active_rx) = reliable_path_command_channels(1);
+        let active_commands_for_backpressure = active_commands.clone();
         let binding = ResponseStreamBinding::new_with_limits(
             SessionId(82),
             UnderlayProtocol::Udp,
@@ -8266,6 +8280,17 @@ mod tests {
         }
         assert!(send_stream.repair_bytes() > owner_tail_guard_bytes);
         while let Some(_setup_command) = try_recv_reliable_path_command(&mut alternate_rx) {}
+        active_commands_for_backpressure
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(7),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("seed full Service data queue");
 
         let mut sender = ServerResponseSenderService::new(SessionId(82), StreamId(7));
         sender.enqueue_data_for_lane(Bytes::from(vec![2_u8; payload_bytes]), FlowLane::Throughput);
@@ -8288,10 +8313,12 @@ mod tests {
             try_recv_reliable_path_command(&mut alternate_rx),
             Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
         ));
-        assert!(
-            try_recv_reliable_path_command(&mut active_rx).is_none(),
-            "Subflow OwnerData must not rewrite or feed through the Service channel"
-        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut active_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
+                if payload == Bytes::from_static(b"queued")
+        ));
+        assert!(try_recv_reliable_path_command(&mut active_rx).is_none());
     }
 
     #[tokio::test]
@@ -8557,7 +8584,7 @@ mod tests {
     }
 
     #[test]
-    fn response_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
+    fn response_clear_frontier_keeps_feedable_service_ahead_of_lower_eta_subflow() {
         let lead = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -8570,13 +8597,13 @@ mod tests {
             &[],
             Some(lead.key),
         )
-        .expect("lower ETA path should be selected");
+        .expect("feedable Service should remain selected");
 
-        assert_eq!(selected.key, lower_eta_alternate.key);
+        assert_eq!(selected.key, lead.key);
     }
 
     #[test]
-    fn lower_eta_same_family_path_is_subflow_not_service_owner() {
+    fn feedable_service_precedes_lower_eta_same_family_subflow() {
         let service = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let lower_eta_subflow =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -8591,13 +8618,222 @@ mod tests {
             0,
             None,
         )
-        .expect("lower ETA same-family path should be eligible as a Subflow");
+        .expect("feedable Service should remain selected ahead of admitted overflow");
 
-        assert_eq!(selected.target.key, lower_eta_subflow.key);
+        assert_eq!(selected.target.key, service.key);
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "non-active same-family OwnerData must not rewrite the Service owner solely because it has the lowest ETA"
+            PathRuntimeRole::Service,
+            "a lower-ETA Subflow remains eligible overflow and does not displace feedable Service"
+        );
+    }
+
+    #[test]
+    fn same_family_lower_frontier_owner_remains_subflow() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let service = response_target(1, underlay, 50.0, 0, 16 * 1024 * 1024, true);
+            let lower_owner = response_target(0, underlay, 5.0, 0, 16 * 1024 * 1024, false);
+            let lower_flights = [CarrierPathFlightDebt {
+                key: lower_owner.key,
+                bytes: payload_bytes as u64,
+            }];
+
+            let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[service.clone(), lower_owner.clone()],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &lower_flights,
+                Some(service.key),
+                payload_bytes.saturating_mul(2),
+                None,
+            )
+            .expect("measured lower-frontier owner should remain dispatchable as a Subflow");
+
+            assert_eq!(selected.target.key, lower_owner.key, "{underlay:?}");
+            assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+            assert_eq!(
+                selected.subflow_set_commit.map(|commit| commit.service),
+                Some(service.key),
+                "{underlay:?} lower-frontier continuation must retain the Service anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_family_lower_frontier_owner_remains_subflow() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let lower_owner =
+            response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = [CarrierPathFlightDebt {
+            key: lower_owner.key,
+            bytes: payload_bytes as u64,
+        }];
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), lower_owner.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower_flights,
+            Some(service.key),
+            payload_bytes.saturating_mul(2),
+            None,
+        )
+        .expect("measured cross-family lower-frontier owner should remain dispatchable");
+
+        assert_eq!(selected.target.key, lower_owner.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        assert_eq!(
+            selected.subflow_set_commit.map(|commit| commit.service),
+            Some(service.key),
+            "cross-family continuation must not commit an implicit Service migration"
+        );
+    }
+
+    #[test]
+    fn authoritative_lower_frontier_suspends_unmeasured_startup_sampling() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let service = response_target(1, underlay, 50.0, 0, 16 * 1024 * 1024, true);
+            let mut proof_only = response_target(0, underlay, 5.0, 0, 16 * 1024 * 1024, false);
+            proof_only.has_bulk_rate_evidence = false;
+            let lower_flights = [CarrierPathFlightDebt {
+                key: proof_only.key,
+                bytes: payload_bytes as u64,
+            }];
+
+            let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[service.clone(), proof_only],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &lower_flights,
+                Some(service.key),
+                payload_bytes.saturating_mul(2),
+                None,
+            );
+
+            assert!(
+                selected.is_none(),
+                "{underlay:?} sender evidence alone must not extend an ACK hole"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_measured_lower_frontier_cannot_borrow_service_admission() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let service = response_target(1, underlay, 5.0, 0, 16 * 1024 * 1024, true);
+            let mut slow_lower_owner =
+                response_target(0, underlay, 500.0, 0, 16 * 1024 * 1024, false);
+            slow_lower_owner.snapshot.delivery_rate_bps = 20_000_000.0;
+            slow_lower_owner.snapshot.pacing_rate_bps = 20_000_000.0;
+            slow_lower_owner.snapshot.product_progress_rate_bps = Some(20_000_000.0);
+            let lower_flights = [CarrierPathFlightDebt {
+                key: slow_lower_owner.key,
+                bytes: payload_bytes as u64,
+            }];
+
+            let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[service.clone(), slow_lower_owner],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &lower_flights,
+                Some(service.key),
+                payload_bytes.saturating_mul(2),
+                None,
+            );
+
+            assert!(
+                selected.is_none(),
+                "{underlay:?} lower ownership is not permission to borrow Service admission"
+            );
+        }
+    }
+
+    #[test]
+    fn backpressured_service_remains_lower_frontier_completion_baseline() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(1, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
+        let (service_commands, _service_receivers) = reliable_path_command_channels(1);
+        service_commands
+            .try_enqueue_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(901),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("test setup should fill the Service data queue");
+        service.commands = service_commands;
+        let lower_owner =
+            response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = [CarrierPathFlightDebt {
+            key: lower_owner.key,
+            bytes: payload_bytes as u64,
+        }];
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), lower_owner.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower_flights,
+            Some(service.key),
+            payload_bytes.saturating_mul(2),
+            None,
+        )
+        .expect("measured lower-frontier Subflow should be evaluated against queued Service");
+
+        assert_eq!(selected.target.key, lower_owner.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        assert_eq!(
+            selected.subflow_set_commit.map(|commit| commit.service),
+            Some(service.key)
+        );
+    }
+
+    #[test]
+    fn detached_service_with_lower_frontier_waits_for_repair_or_ack_clear() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let lower_owner =
+            response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let lower_flights = [CarrierPathFlightDebt {
+            key: lower_owner.key,
+            bytes: payload_bytes as u64,
+        }];
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            std::slice::from_ref(&lower_owner),
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &lower_flights,
+            None,
+            payload_bytes.saturating_mul(2),
+            None,
+        );
+
+        assert!(
+            selected.is_none(),
+            "a lower-hole owner cannot infer Service authority after the anchor detaches"
         );
     }
 
@@ -8726,11 +8962,15 @@ mod tests {
         subflow.has_bulk_rate_evidence = true;
         let candidates = [&service, &subflow];
 
-        let lead =
-            choose_response_admissible_lead(&candidates, mux_limits, payload_bytes, &[], false)
-                .expect(
-                    "active Service must remain a lead candidate when optional Subflow is blocked",
-                );
+        let lead = choose_response_admissible_lead(
+            &candidates,
+            Some(&service),
+            mux_limits,
+            payload_bytes,
+            &[],
+            false,
+        )
+        .expect("active Service must remain a lead candidate when optional Subflow is blocked");
 
         assert_eq!(
             lead.key, service.key,
@@ -8747,9 +8987,15 @@ mod tests {
             response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
         let candidates = [&service, &measured_subflow];
 
-        let lead =
-            choose_response_admissible_lead(&candidates, mux_limits, payload_bytes, &[], false)
-                .expect("active Service should remain the lead anchor");
+        let lead = choose_response_admissible_lead(
+            &candidates,
+            Some(&service),
+            mux_limits,
+            payload_bytes,
+            &[],
+            false,
+        )
+        .expect("active Service should remain the lead anchor");
 
         assert_eq!(
             lead.key, service.key,
@@ -8770,7 +9016,7 @@ mod tests {
         let mut measured_subflow =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         measured_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
-        measured_subflow.snapshot.app_limited = true;
+        measured_subflow.snapshot.app_limited = false;
         measured_subflow.has_sender_evidence = true;
         measured_subflow.has_bulk_rate_evidence = true;
 
@@ -8794,7 +9040,38 @@ mod tests {
     }
 
     #[test]
-    fn app_limited_selection_uses_the_least_committed_proven_subflow() {
+    fn unproven_service_bootstraps_before_app_limited_proven_subflow() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_queue_bytes = (2 * payload_bytes) as u64;
+        service.snapshot.app_limited = true;
+        service.has_bulk_rate_evidence = false;
+
+        let mut proven_subflow =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        proven_subflow.snapshot.app_limited = true;
+        proven_subflow.has_bulk_rate_evidence = true;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), proven_subflow],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("the unproven live Service remains feedable");
+
+        assert_eq!(selected.target.key, service.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn feedable_service_precedes_less_committed_app_limited_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut service =
@@ -8813,7 +9090,7 @@ mod tests {
         overloaded.has_bulk_rate_evidence = true;
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[service, underloaded.clone(), overloaded],
+            &[service.clone(), underloaded, overloaded],
             FlowLane::Throughput,
             payload_bytes,
             mux_limits,
@@ -8825,9 +9102,10 @@ mod tests {
             0,
             None,
         )
-        .expect("one app-limited measured Subflow has less committed work than Service");
+        .expect("feedable Service remains selected despite more committed work");
 
-        assert_eq!(selected.target.key, underloaded.key);
+        assert_eq!(selected.target.key, service.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
@@ -9161,7 +9439,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_same_underlay_subflow_can_admit_under_bounded_service_tail_debt() {
+    fn feedable_service_precedes_measured_subflow_under_bounded_tail_debt() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut service =
@@ -9184,17 +9462,13 @@ mod tests {
             payload_bytes.saturating_mul(2),
             None,
         )
-        .expect("measured same-underlay Subflow should be admitted by no-worse gates");
+        .expect("feedable Service should remain selected under bounded tail debt");
 
-        assert_eq!(selected.target.key, measured_subflow.key);
+        assert_eq!(selected.target.key, service.key);
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "bounded Service-tail debt is not an absolute ban on measured same-underlay Subflow OwnerData"
-        );
-        assert!(
-            selected.subflow_set_commit.is_some(),
-            "Subflow OwnerData must pass through the Subflow admission ledger"
+            PathRuntimeRole::Service,
+            "measured Subflow remains overflow while Service has capacity"
         );
     }
 
@@ -9486,9 +9760,10 @@ mod tests {
         };
         let payload_bytes = 64 * 1024usize;
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
-        owner.snapshot.product_progress_rate_bps = Some(10_000_000.0);
-        owner.snapshot.product_bytes_in_flight = 8 * 1024 * 1024;
-        owner.snapshot.pacing_rate_bps = 2_000_000_000.0;
+        let service_envelope =
+            bulk_active_service_product_envelope_bytes(owner.snapshot, payload_bytes, mux_limits);
+        owner.snapshot.product_queue_bytes = service_envelope;
+        owner.snapshot.queue_bytes = payload_bytes as u64;
         let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
@@ -9617,7 +9892,7 @@ mod tests {
     }
 
     #[test]
-    fn response_small_owner_debt_admits_measured_same_underlay_subflow() {
+    fn response_small_owner_debt_keeps_feedable_service_ahead_of_measured_subflow() {
         let owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let lower_eta_alternate =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -9632,16 +9907,16 @@ mod tests {
             64 * 1024,
             None,
         )
-        .expect("measured same-underlay Subflow should pass bounded tail-debt admission");
+        .expect("feedable Service should pass bounded tail-debt admission");
 
         assert_eq!(
-            selected.target.key, lower_eta_alternate.key,
-            "small Service-tail debt is accounted as ordering risk, not an absolute same-underlay Subflow ban"
+            selected.target.key, owner.key,
+            "small Service-tail debt must not displace a feedable Service with optional same-underlay work"
         );
         assert_eq!(
             selected.admission.role,
-            PathRuntimeRole::Subflow,
-            "lower-ETA same-underlay work remains Subflow OwnerData instead of migrating Service"
+            PathRuntimeRole::Service,
+            "the lower-ETA same-underlay path remains Subflow overflow"
         );
     }
 

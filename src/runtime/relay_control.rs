@@ -113,7 +113,7 @@ where
                     send_stream.repair_bytes(),
                 ),
             );
-            for key in remotes.path_keys() {
+            for key in remotes.load_reserved_path_keys() {
                 context.change_relay_path_lane_load(
                     key.underlay,
                     key.index,
@@ -362,7 +362,7 @@ where
                     &mut remotes,
                     &send_stream,
                     !local_open,
-                    ReliableRelayAttachMode::Any,
+                    ReliableRelayAttachMode::RecoveryRepair,
                     &mut recovery_excluded_paths,
                 )
                 .await
@@ -422,7 +422,7 @@ where
                                     &mut remotes,
                                     &send_stream,
                                     !local_open,
-                                    ReliableRelayAttachMode::Any,
+                                    ReliableRelayAttachMode::RecoveryRepair,
                                     &mut recovery_excluded_paths,
                                 )
                                 .await
@@ -543,7 +543,7 @@ where
                         &mut remotes,
                         &send_stream,
                         !local_open,
-                        ReliableRelayAttachMode::Any,
+                        ReliableRelayAttachMode::RecoveryRepair,
                         &mut recovery_excluded_paths,
                     )
                     .await
@@ -955,11 +955,7 @@ where
             }
             validation_open = validation_open_rx.recv(), if !pending_validation_opens.is_empty() => {
                 let Some(validation_open) = validation_open else {
-                    cancel_pending_validation_opens(
-                        context,
-                        stream_id,
-                        &mut pending_validation_opens,
-                    );
+                    cancel_pending_validation_opens(stream_id, &mut pending_validation_opens);
                     continue;
                 };
                 pending_validation_opens.remove(&validation_open.key);
@@ -1834,12 +1830,12 @@ where
         &mut last_stream_progress_at,
     )
     .await;
-    cancel_pending_validation_opens(context, stream_id, &mut pending_validation_opens);
+    cancel_pending_validation_opens(stream_id, &mut pending_validation_opens);
 
     let remaining_paths = remotes
         .paths
         .iter()
-        .map(|path| (path.key(), path.stream.lane))
+        .map(|path| (path.key(), path.stream.lane, path.load_reserved))
         .collect::<Vec<_>>();
     if result.is_ok() {
         for (key, stats) in path_stats {
@@ -1875,11 +1871,13 @@ where
         );
     }
     sender.release_all(context);
-    for (key, lane) in remaining_paths {
+    for (key, lane, load_reserved) in remaining_paths {
         if relay_error_is_tcp_path_failure(&result) {
             context.mark_relay_path_failure(key.underlay, key.index);
         }
-        context.release_relay_path_load(key.underlay, key.index, lane);
+        if load_reserved {
+            context.release_relay_path_load(key.underlay, key.index, lane);
+        }
     }
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_flush("multipath_stream_close");
@@ -2064,12 +2062,8 @@ async fn handle_validation_open_result(
                 );
                 true
             } else {
+                #[cfg(feature = "lab-diagnostics")]
                 let lane = opened.stream.lane;
-                context.release_relay_path_load(
-                    validation_open.key.underlay,
-                    validation_open.key.index,
-                    lane,
-                );
                 opened.stream.close().await;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -2147,15 +2141,15 @@ async fn drain_completed_validation_opens(
 }
 
 fn cancel_pending_validation_opens(
-    context: &ClientPathContext,
     stream_id: StreamId,
     pending: &mut HashMap<RelayPathKey, RelayValidationOpenTask>,
 ) {
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
     for (key, task) in pending.drain() {
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = key;
         task.handle.abort();
-        context.release_relay_path_load(key.underlay, key.index, task.lane);
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
             "relay_validation_open_cancelled",
@@ -2177,6 +2171,7 @@ struct RelayValidationOpenResult {
 }
 
 struct RelayValidationOpenTask {
+    #[cfg(feature = "lab-diagnostics")]
     lane: FlowLane,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -2208,12 +2203,8 @@ fn spawn_reliable_relay_validation_opens(
     let mut spawned = false;
     for key in candidates {
         match key.underlay {
-            UnderlayProtocol::Tcp if context.tcp_paths.get(key.index).is_some() => {
-                context.reserve_tcp_path_load(key.index, lane);
-            }
-            UnderlayProtocol::Udp if context.udp_paths.get(key.index).is_some() => {
-                context.reserve_udp_stream_path_load(key.index, lane);
-            }
+            UnderlayProtocol::Tcp if context.tcp_paths.get(key.index).is_some() => {}
+            UnderlayProtocol::Udp if context.udp_paths.get(key.index).is_some() => {}
             _ => continue,
         }
         attempted.insert(key);
@@ -2264,15 +2255,14 @@ fn spawn_reliable_relay_validation_opens(
                     .await
                 }
             };
-            if result.is_err() {
-                context.release_relay_path_load(key.underlay, key.index, lane);
-            }
             let message = RelayValidationOpenResult { key, result };
             if let Err(err) = result_tx.send(message).await {
                 let RelayValidationOpenResult { key, result } = err.0;
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = key;
                 if let Ok(opened) = result {
+                    #[cfg(feature = "lab-diagnostics")]
                     let lane = opened.stream.lane;
-                    context.release_relay_path_load(key.underlay, key.index, lane);
                     opened.stream.close().await;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
@@ -2285,7 +2275,14 @@ fn spawn_reliable_relay_validation_opens(
                 }
             }
         });
-        pending.insert(key, RelayValidationOpenTask { lane, handle });
+        pending.insert(
+            key,
+            RelayValidationOpenTask {
+                #[cfg(feature = "lab-diagnostics")]
+                lane,
+                handle,
+            },
+        );
         spawned = true;
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
@@ -2416,6 +2413,12 @@ async fn attach_relay_path_candidates(
                 };
                 match attach_control_result {
                     Ok(()) => {
+                        if request.role != StreamOpenRole::Active {
+                            // Path choice temporarily reserves a share while the
+                            // open is in flight. Passive attachments keep only
+                            // their actual queue/inflight debt after attachment.
+                            context.release_relay_path_load(key.underlay, key.index, request.lane);
+                        }
                         match request.role {
                             StreamOpenRole::Active => remotes.attach(opened),
                             StreamOpenRole::Repair => remotes.attach_for_repair(opened),
@@ -2543,7 +2546,7 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
     recovery_excluded_paths: &mut HashSet<RelayPathKey>,
 ) -> Result<usize, RuntimeError> {
     let payload_bytes = match mode {
-        ReliableRelayAttachMode::Any => {
+        ReliableRelayAttachMode::Any | ReliableRelayAttachMode::RecoveryRepair => {
             reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits)
         }
         ReliableRelayAttachMode::BulkStriping => {
@@ -2577,14 +2580,8 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
             Err(err) => return Err(err),
         }
     }
-    let role = if matches!(mode, ReliableRelayAttachMode::BulkStriping) {
-        StreamOpenRole::Validation
-    } else if reliable_relay_should_race_repair(lane, send_stream, resend_fin, mode) {
-        StreamOpenRole::Repair
-    } else {
-        StreamOpenRole::Active
-    };
-    if matches!(mode, ReliableRelayAttachMode::Any) && role == StreamOpenRole::Repair {
+    let role = reliable_relay_attach_role(lane, send_stream, resend_fin, mode);
+    if role == StreamOpenRole::Repair {
         let result = attach_relay_path_candidates(
             context,
             remotes,
@@ -2629,6 +2626,24 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
     )
     .await?;
     Ok(result.attached)
+}
+
+pub(super) fn reliable_relay_attach_role(
+    lane: FlowLane,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+) -> StreamOpenRole {
+    match mode {
+        ReliableRelayAttachMode::BulkStriping => StreamOpenRole::Validation,
+        ReliableRelayAttachMode::RecoveryRepair => StreamOpenRole::Repair,
+        ReliableRelayAttachMode::Any
+            if reliable_relay_should_race_repair(lane, send_stream, resend_fin, mode) =>
+        {
+            StreamOpenRole::Repair
+        }
+        ReliableRelayAttachMode::Any => StreamOpenRole::Active,
+    }
 }
 
 pub(super) fn reliable_relay_active_path_candidates(
@@ -2829,18 +2844,10 @@ pub(super) fn reliable_relay_delivery_path_should_become_active(
     if current == Some(delivered) {
         return false;
     }
-    if relay_lane_is_bulk(lane)
-        && !context.relay_path_has_delivery_sample(delivered.underlay, delivered.index)
-    {
-        return false;
-    }
-    if relay_lane_is_bulk(lane)
-        && !context.relay_path_has_bulk_service_migration_evidence(
-            delivered.underlay,
-            delivered.index,
-            payload_bytes,
-        )
-    {
+    // Measured bulk delivery admits a Subflow; it does not implicitly rewrite
+    // per-stream Service placement. Explicit stall/failure recovery owns bulk
+    // Active reannouncement.
+    if relay_lane_is_bulk(lane) {
         return false;
     }
     let Some(delivered_eta) = context.reliable_relay_path_eta_ms(delivered, lane, payload_bytes)

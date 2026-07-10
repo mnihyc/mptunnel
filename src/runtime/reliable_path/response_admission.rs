@@ -266,6 +266,62 @@ impl ResponseStreamOutputs {
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, snapshot)| snapshot)
     }
+
+    pub(super) fn relay_read_snapshot(
+        &self,
+        stored_service_key: Option<CarrierPathKey>,
+        may_have_mixed_owner_underlays: bool,
+        session_id: SessionId,
+        lane_tracker: &ServerPathLaneTracker,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> ResponseRelayReadSnapshot {
+        let service_key = response_live_ordered_data_owner(stored_service_key, &self.entries);
+        let send_path = self.read_backpressure_snapshot(
+            service_key,
+            session_id,
+            lane_tracker,
+            lane,
+            payload_bytes,
+            mux_limits,
+        );
+        let source_service = service_key.and_then(|key| {
+            self.entries
+                .iter()
+                .find(|entry| {
+                    entry.key == key
+                        && entry.role != StreamOpenRole::Repair
+                        && !entry.commands.is_closed()
+                })
+                .map(|entry| {
+                    // Source staging needs exact identity, local pressure, and
+                    // proof only. Avoid rebuilding an unused full path model
+                    // while the response outputs lock is held.
+                    let active_latency_sensitive_flows = send_path
+                        .filter(|path| path.id == key.path_id && path.underlay == key.underlay)
+                        .map(|path| path.active_latency_sensitive_flows)
+                        .unwrap_or_else(|| {
+                            lane_tracker
+                                .snapshot(session_id, key)
+                                .active_latency_sensitive_flows
+                        });
+                    ResponseSourceServiceSnapshot {
+                        key,
+                        active_latency_sensitive_flows,
+                        has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_with_limits(
+                            entry, mux_limits,
+                        ),
+                    }
+                })
+        });
+        ResponseRelayReadSnapshot {
+            send_path,
+            source_service,
+            independent_source_staging: may_have_mixed_owner_underlays
+                && response_outputs_have_live_mixed_owner_underlays(&self.entries),
+        }
+    }
 }
 
 pub(super) fn server_bulk_output_snapshot(
@@ -597,6 +653,7 @@ pub(in crate::runtime) fn record_server_sender_decision(
     frame: &Frame,
     lane: FlowLane,
     reason: &'static str,
+    bulk_rate_evidence: Option<bool>,
 ) {
     #[cfg(feature = "lab-diagnostics")]
     lab_sender_service_decision(
@@ -606,6 +663,7 @@ pub(in crate::runtime) fn record_server_sender_decision(
         reason,
         sender_service_frame_kind(frame),
         reliable_stream_frame_payload_bytes(frame),
+        bulk_rate_evidence,
         format_args!(
             "path_underlay={:?} path_id={} lane={:?} pacing_bytes={}",
             key.underlay,
@@ -615,7 +673,15 @@ pub(in crate::runtime) fn record_server_sender_decision(
         ),
     );
     #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = (session_id, stream_id, key, frame, lane, reason);
+    let _ = (
+        session_id,
+        stream_id,
+        key,
+        frame,
+        lane,
+        reason,
+        bulk_rate_evidence,
+    );
 }
 
 #[cfg(feature = "lab-diagnostics")]

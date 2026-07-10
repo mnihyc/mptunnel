@@ -1,6 +1,9 @@
+#[cfg(test)]
+use super::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
 use super::bulk_admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_active_service_product_envelope_bytes,
     bulk_additional_admission_role, bulk_candidate_admission_suppression_with_ordering_debt,
+    bulk_latency_pressure_service_feed_window_bytes, bulk_service_horizon_payload_bytes,
 };
 use super::*;
 
@@ -781,7 +784,7 @@ struct ResponseDataEmitOutcome {
 
 #[derive(Clone, Copy)]
 struct ResponseSubflowAdmissionCommit {
-    subflow_generation: u64,
+    planner_generation: u64,
     lane_generation: u64,
     service: CarrierPathKey,
     startup_owner_credit_bytes: usize,
@@ -892,7 +895,7 @@ fn response_target_is_startup_same_underlay_subflow_candidate(
         .min(mux_limits.max_reorder_bytes as u64)
         .min(mux_limits.max_stream_window_bytes)
         .max(payload_bytes as u64);
-    let candidate_committed = response_target_committed_product_bytes(target);
+    let candidate_committed = response_target_assigned_product_bytes(target);
     let projected_ordering_debt = ordered_tail_debt
         .saturating_add(candidate_committed)
         .saturating_add(payload_bytes as u64);
@@ -1106,7 +1109,7 @@ fn response_target_unique_owner_admission_with_epoch(
     let admission = epoch.admit_subflow_owner(input);
     let commit = (admission.decision == PathAdmissionDecision::AdmitSubflow).then_some(
         ResponseSubflowAdmissionCommit {
-            subflow_generation: 0,
+            planner_generation: 0,
             lane_generation: 0,
             service: service_key,
             startup_owner_credit_bytes,
@@ -1737,10 +1740,10 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
     }
     let mut capacity_targets = Vec::new();
     for target in targets {
-        if !target.commands.can_enqueue_lane_now(lane) {
+        if target.attachment_role == StreamOpenRole::Repair {
             #[cfg(feature = "lab-diagnostics")]
             lab_response_bulk_output_candidate(
-                "no_lane_capacity",
+                "repair_attachment_owner_excluded",
                 target,
                 payload_bytes,
                 mux_limits,
@@ -1752,10 +1755,10 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
             );
             continue;
         }
-        if !response_target_has_emission_credit(target, lane, payload_bytes, mux_limits) {
+        if !target.commands.can_enqueue_lane_now(lane) {
             #[cfg(feature = "lab-diagnostics")]
             lab_response_bulk_output_candidate(
-                "no_emission_credit",
+                "no_lane_capacity",
                 target,
                 payload_bytes,
                 mux_limits,
@@ -1923,6 +1926,12 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
             .iter()
             .any(|target| target.key == service_key);
         let service_is_backpressured = !service_has_capacity
+            || !response_service_has_assigned_owner_credit(
+                service,
+                lane,
+                payload_bytes,
+                mux_limits,
+            )
             || response_active_lead_suppression(service, mux_limits, payload_bytes, 0).is_some();
         if service_is_backpressured {
             #[cfg(feature = "lab-diagnostics")]
@@ -2112,6 +2121,45 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
                 effective_lower_owner,
                 effective_ordering_debt,
             );
+            if admission.role == PathRuntimeRole::Service
+                && !response_service_has_assigned_owner_credit(
+                    target,
+                    lane,
+                    payload_bytes,
+                    mux_limits,
+                )
+            {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_response_bulk_output_candidate(
+                    "assigned_owner_credit",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: Some(lead),
+                        role: Some(role),
+                        ordering_debt: effective_ordering_debt,
+                    },
+                );
+                return None;
+            }
+            if admission.role == PathRuntimeRole::Subflow
+                && !response_target_has_emission_credit(target, lane, payload_bytes, mux_limits)
+            {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_response_bulk_output_candidate(
+                    "no_emission_credit",
+                    target,
+                    payload_bytes,
+                    mux_limits,
+                    ResponseBulkCandidateDiag {
+                        lead: Some(lead),
+                        role: Some(role),
+                        ordering_debt: effective_ordering_debt,
+                    },
+                );
+                return None;
+            }
             let suppression =
                 bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
                     best_snapshot: lead.snapshot,
@@ -2230,12 +2278,13 @@ fn response_target_within_adaptive_lead_hysteresis(
     )
 }
 
-fn response_target_committed_product_bytes(target: &ResponseSenderPathTarget) -> u64 {
-    target
-        .snapshot
-        .product_bytes_in_flight
-        .saturating_add(target.snapshot.product_queue_bytes)
-        .saturating_add(target.snapshot.queue_bytes)
+fn response_target_assigned_product_bytes(target: &ResponseSenderPathTarget) -> u64 {
+    target.snapshot.product_bytes_in_flight.saturating_add(
+        target
+            .snapshot
+            .queue_bytes
+            .max(target.commands.pending_bytes()),
+    )
 }
 
 fn response_feedable_service_owner_target(
@@ -2245,8 +2294,8 @@ fn response_feedable_service_owner_target(
         .iter()
         .filter(|selected| selected.admission.role == PathRuntimeRole::Service)
         .min_by(|left, right| {
-            response_target_committed_product_bytes(&left.target)
-                .cmp(&response_target_committed_product_bytes(&right.target))
+            response_target_assigned_product_bytes(&left.target)
+                .cmp(&response_target_assigned_product_bytes(&right.target))
                 .then_with(|| left.target.eta_ms.total_cmp(&right.target.eta_ms))
                 .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
         })
@@ -2270,6 +2319,57 @@ fn response_target_has_emission_credit(
         <= credit as u64
 }
 
+fn response_service_has_assigned_owner_credit(
+    target: &ResponseSenderPathTarget,
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> bool {
+    if !relay_lane_is_bulk(lane) {
+        return true;
+    }
+    let credit = response_service_emission_credit_bytes(target, payload_bytes, mux_limits);
+    // Product flight owns the offset range from carrier enqueue until
+    // STREAM_ACK, including frames still pending in the carrier pipe. Retain
+    // an independent queue-pressure fallback for incomplete/synthetic
+    // snapshots, but use a union-style maximum so those views cannot charge
+    // the same assigned OwnerData twice against hard Service credit.
+    let assigned = target.snapshot.product_bytes_in_flight.max(
+        target
+            .snapshot
+            .queue_bytes
+            .max(target.commands.pending_bytes()),
+    );
+    assigned.saturating_add(payload_bytes as u64) <= credit as u64
+}
+
+fn response_service_emission_credit_bytes(
+    target: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if !target.has_bulk_rate_evidence {
+        return response_service_startup_emission_credit_bytes(payload_bytes, mux_limits);
+    }
+    if target.snapshot.active_latency_sensitive_flows > 0 {
+        return usize::try_from(bulk_latency_pressure_service_feed_window_bytes(
+            payload_bytes,
+            mux_limits,
+        ))
+        .unwrap_or(usize::MAX)
+        .max(payload_bytes)
+        .max(1);
+    }
+    usize::try_from(bulk_active_service_product_envelope_bytes(
+        target.snapshot,
+        payload_bytes,
+        mux_limits,
+    ))
+    .unwrap_or(usize::MAX)
+    .max(payload_bytes)
+    .max(1)
+}
+
 fn response_target_emission_credit_bytes(
     target: &ResponseSenderPathTarget,
     lane: FlowLane,
@@ -2278,17 +2378,7 @@ fn response_target_emission_credit_bytes(
 ) -> usize {
     if relay_lane_is_bulk(lane) {
         if target.is_active {
-            if !target.has_bulk_rate_evidence {
-                return response_service_startup_emission_credit_bytes(payload_bytes, mux_limits);
-            }
-            return usize::try_from(bulk_active_service_product_envelope_bytes(
-                target.snapshot,
-                payload_bytes,
-                mux_limits,
-            ))
-            .unwrap_or(usize::MAX)
-            .max(payload_bytes)
-            .max(1);
+            return response_service_emission_credit_bytes(target, payload_bytes, mux_limits);
         }
         if target.key.underlay == UnderlayProtocol::Udp {
             return response_quic_carrier_feed_credit_bytes(target, payload_bytes, mux_limits);
@@ -2308,17 +2398,7 @@ fn response_service_startup_emission_credit_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    let product_envelope = mux_limits
-        .max_path_flight_bytes
-        .min(mux_limits.max_reorder_bytes)
-        .min(usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX))
-        .max(payload_bytes)
-        .max(1);
-    let startup = usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES)
-        .unwrap_or(usize::MAX)
-        .max(payload_bytes)
-        .max(1);
-    product_envelope.min(startup).max(payload_bytes).max(1)
+    bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
 }
 
 fn response_quic_carrier_feed_credit_bytes(
@@ -2385,7 +2465,7 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
             }
         }
         ReliablePathStreamOutput::Switchable(binding) => {
-            let (subflow_generation, subflow_set) = binding.subflow_state_snapshot();
+            let (planner_generation, subflow_set) = binding.subflow_state_snapshot();
             let (lane_generation, active_response_flows) =
                 binding.lane_generation_and_active_response_flows();
             let lower_flights = binding.lower_flights_before_offset(next_offset);
@@ -2405,7 +2485,7 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
                 return Err(RuntimeError::SenderServiceBlocked);
             };
             if let Some(commit) = selected.subflow_set_commit.as_mut() {
-                commit.subflow_generation = subflow_generation;
+                commit.planner_generation = planner_generation;
                 commit.lane_generation = lane_generation;
             }
             let target = selected.target;
@@ -2439,19 +2519,38 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
 
 fn response_dispatch_payload_bytes(
     path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
     relay_lane: FlowLane,
     mux_limits: MuxLimits,
     queued_payload_bytes: usize,
-) -> usize {
+) -> Option<usize> {
+    let requires_repair_capacity_preflight = matches!(
+        &path_stream.output,
+        ReliablePathStreamOutput::Switchable(binding)
+            if binding.may_have_mixed_owner_underlays()
+    );
+    let repair_credit = if requires_repair_capacity_preflight {
+        mux_limits
+            .max_repair_bytes
+            .saturating_sub(send_stream.repair_bytes())
+    } else {
+        usize::MAX
+    };
+    if repair_credit == 0 {
+        return None;
+    }
     let snapshot = path_stream.send_path_snapshot(relay_lane, queued_payload_bytes);
-    adaptive_reliable_relay_chunk_bytes_with_frame_limit(
-        snapshot,
-        relay_lane,
-        mux_limits,
-        path_stream.max_frame_payload_bytes,
+    Some(
+        adaptive_reliable_relay_chunk_bytes_with_frame_limit(
+            snapshot,
+            relay_lane,
+            mux_limits,
+            path_stream.max_frame_payload_bytes,
+        )
+        .min(queued_payload_bytes)
+        .min(repair_credit)
+        .max(1),
     )
-    .min(queued_payload_bytes)
-    .max(1)
 }
 
 fn response_repair_carrier_lane(frame: &Frame) -> FlowLane {
@@ -2541,52 +2640,27 @@ async fn emit_planned_response_data_frame(
             role,
             subflow_set_commit,
         } => {
-            let mut committed_subflow = None;
-            if let Some(commit) = subflow_set_commit {
-                let admission = binding.commit_subflow_owner_admission_for_generation(
-                    commit.subflow_generation,
-                    commit.lane_generation,
-                    commit.service,
-                    commit.startup_owner_credit_bytes,
-                    commit.optional_overhead_budget_bytes,
-                    commit.max_read_gap_budget,
-                    commit.input,
-                );
-                if admission.decision != PathAdmissionDecision::AdmitSubflow {
-                    return Err(RuntimeError::SenderServiceBlocked);
-                }
-                committed_subflow = Some(commit);
-            }
-            match send_sender_service_frame_to_carrier(
-                &target.commands,
-                frame.clone(),
-                lane,
-                ResponseCarrierEmitMode::StreamOrdered,
-            )
-            .await
+            let subflow_request =
+                subflow_set_commit.map(|commit| ResponseSubflowAdmissionRequest {
+                    expected_planner_generation: commit.planner_generation,
+                    expected_lane_generation: commit.lane_generation,
+                    service: commit.service,
+                    startup_owner_credit_bytes: commit.startup_owner_credit_bytes,
+                    optional_overhead_budget_bytes: commit.optional_overhead_budget_bytes,
+                    max_read_gap_budget: commit.max_read_gap_budget,
+                    input: commit.input,
+                });
+            match binding.try_enqueue_owner_frame_for_target(&target, &frame, lane, subflow_request)
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(RuntimeError::SenderServiceBlocked) => {
-                    if let Some(commit) = committed_subflow {
-                        binding.rollback_subflow_owner_admission_for_generation(
-                            commit.subflow_generation,
-                            commit.input,
-                        );
-                    }
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
                 Err(_) => {
-                    if let Some(commit) = committed_subflow {
-                        binding.rollback_subflow_owner_admission_for_generation(
-                            commit.subflow_generation,
-                            commit.input,
-                        );
-                    }
                     binding.detach(target.key, &target.commands);
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
             }
-            binding.record_owner_flight_for_target(&target, &frame);
             if role == PathRuntimeRole::Service {
                 let _ = binding.commit_ordered_data_owner_for_target(&target);
             }
@@ -2605,6 +2679,7 @@ async fn emit_planned_response_data_frame(
                 &frame,
                 lane,
                 decision_reason,
+                Some(target.has_bulk_rate_evidence),
             );
             Ok(ResponseDataEmitOutcome {
                 selected_path: Some(target.key),
@@ -2678,20 +2753,23 @@ async fn emit_response_frame_from_sender_service(
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
-                match send_sender_service_frame_to_carrier(
-                    &target.commands,
-                    frame.clone(),
-                    lane,
-                    emit_mode,
-                )
-                .await
-                {
-                    Ok(()) => {
+                let send_result = if matches!(frame, Frame::StreamData { .. }) && !repair {
+                    binding.try_enqueue_owner_frame_for_target(&target, &frame, lane, None)
+                } else {
+                    send_sender_service_frame_to_carrier(
+                        &target.commands,
+                        frame.clone(),
+                        lane,
+                        emit_mode,
+                    )
+                    .await
+                    .map(|()| None)
+                };
+                match send_result {
+                    Ok(_) => {
                         if matches!(frame, Frame::StreamData { .. }) {
                             if repair {
                                 binding.record_repair_flight_for_target(&target, &frame);
-                            } else {
-                                binding.record_owner_flight_for_target(&target, &frame);
                             }
                             if !repair {
                                 let _ = binding.commit_ordered_data_owner_for_target(&target);
@@ -2704,6 +2782,7 @@ async fn emit_response_frame_from_sender_service(
                             &frame,
                             lane,
                             reason,
+                            Some(target.has_bulk_rate_evidence),
                         );
                         return Ok(Some(target.key));
                     }
@@ -2893,21 +2972,23 @@ impl ServerResponseSenderService {
                 };
                 response_frame_has_carrier_credit(path_stream, frame, carrier_lane, emit_mode, None)
             }
-            ReliableRelayQueuedWorkKind::Data(payload) => {
+            ReliableRelayQueuedWorkKind::Data(payload) => response_dispatch_payload_bytes(
+                path_stream,
+                send_stream,
+                queued.data_lane.unwrap_or(relay_lane),
+                mux_limits,
+                payload.len(),
+            )
+            .is_some_and(|payload_bytes| {
                 plan_response_data_dispatch_with_ordered_debt_impl(
                     path_stream,
                     queued.data_lane.unwrap_or(relay_lane),
                     send_stream.next_offset(),
-                    response_dispatch_payload_bytes(
-                        path_stream,
-                        queued.data_lane.unwrap_or(relay_lane),
-                        mux_limits,
-                        payload.len(),
-                    ),
+                    payload_bytes,
                     ordered_owner_debt_bytes,
                 )
                 .is_ok()
-            }
+            }),
             ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
                 response_frame_has_carrier_credit(
                     path_stream,
@@ -3076,10 +3157,12 @@ impl ServerResponseSenderService {
                 let data_lane = queued.data_lane.unwrap_or(relay_lane);
                 let dispatch_payload_bytes = response_dispatch_payload_bytes(
                     path_stream,
+                    send_stream,
                     data_lane,
                     mux_limits,
                     payload.len(),
-                );
+                )
+                .ok_or(RuntimeError::SenderServiceBlocked)?;
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 let planned = plan_response_data_dispatch_with_ordered_debt_impl(
                     path_stream,
@@ -3243,6 +3326,7 @@ impl ServerResponseSenderService {
                     dispatch_lane_name,
                     "stream_data",
                     payload_bytes,
+                    None,
                     format_args!(
                         "path_underlay={:?} path_id=none lane={:?} pacing_bytes={} degenerate_single_path=true",
                         path_stream.underlay, send_lane, pacing_bytes,
@@ -3260,6 +3344,7 @@ impl ServerResponseSenderService {
                     dispatch_lane_name,
                     "stream_data",
                     payload_bytes,
+                    None,
                     format_args!(
                         "path_underlay={:?} path_id={} lane={:?} pacing_bytes={} fixed_output=true",
                         selected_path.underlay, selected_path.path_id.0, send_lane, pacing_bytes,
@@ -4440,6 +4525,7 @@ impl RelaySenderService {
             "primary",
             sender_service_frame_kind(frame),
             payload_bytes,
+            None,
             format_args!(
                 "cause={} path_underlay={:?} path_index={} pacing_bytes={} repair={}",
                 cause.as_str(),
@@ -5526,6 +5612,290 @@ mod tests {
     }
 
     #[test]
+    fn mixed_response_dispatch_payload_is_bounded_by_remaining_repair_capacity() {
+        let stream_id = StreamId(98);
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 4096,
+            max_repair_bytes: 4096,
+            max_path_flight_bytes: 4096,
+            max_reliable_relay_chunk_bytes: 4096,
+            ..MuxLimits::default()
+        };
+        let (commands, _active_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(98),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (validation_commands, _validation_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Udp,
+                PathId(1),
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                4096,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: 4096,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        send_stream
+            .send_data(Bytes::from(vec![0x5a; 3072]), StreamFlags::NONE)
+            .expect("seed retained OwnerData");
+
+        assert_eq!(
+            response_dispatch_payload_bytes(
+                &path_stream,
+                &send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+                4096,
+            ),
+            Some(1024),
+        );
+        send_stream
+            .send_data(Bytes::from(vec![0x5a; 1024]), StreamFlags::NONE)
+            .expect("fill repair cache");
+        assert_eq!(
+            response_dispatch_payload_bytes(
+                &path_stream,
+                &send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+                4096,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn coupled_response_dispatch_keeps_the_authoritative_send_stream_check() {
+        let stream_id = StreamId(97);
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 4096,
+            max_repair_bytes: 4096,
+            max_path_flight_bytes: 4096,
+            max_reliable_relay_chunk_bytes: 4096,
+            ..MuxLimits::default()
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(97),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: 4096,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        send_stream
+            .send_data(Bytes::from(vec![0x5a; 4096]), StreamFlags::NONE)
+            .expect("fill repair cache");
+
+        assert_eq!(
+            response_dispatch_payload_bytes(
+                &path_stream,
+                &send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+                4096,
+            ),
+            Some(4096),
+            "coupled paths retain the existing send-stream repair-capacity boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn formerly_mixed_response_retains_repair_preflight_after_family_detach() {
+        let stream_id = StreamId(96);
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 4096,
+            max_repair_bytes: 4096,
+            max_path_flight_bytes: 4096,
+            max_reliable_relay_chunk_bytes: 4096,
+            ..MuxLimits::default()
+        };
+        let (commands, _active_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(96),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let udp_key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                udp_key.underlay,
+                udp_key.path_id,
+                udp_commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                4096,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(binding.has_live_mixed_owner_underlays());
+        binding.detach(udp_key, &udp_commands);
+        assert!(!binding.has_live_mixed_owner_underlays());
+        assert!(binding.may_have_mixed_owner_underlays());
+
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: 4096,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        send_stream
+            .send_data(Bytes::from(vec![0x5a; 3072]), StreamFlags::NONE)
+            .expect("seed retained OwnerData");
+        let mut sender = ServerResponseSenderService::new(SessionId(96), stream_id);
+        sender.enqueue_data_for_lane(Bytes::from(vec![0x33; 4096]), FlowLane::Throughput);
+
+        let first = sender
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+            )
+            .await
+            .expect("formerly mixed raw bytes dispatch within remaining repair capacity");
+        assert_eq!(first.payload_bytes, 1024);
+        assert_eq!(send_stream.repair_bytes(), 4096);
+        assert_eq!(sender.data_bytes(), 3072);
+        assert!(matches!(
+            sender
+                .dispatch_next(
+                    &path_stream,
+                    &mut send_stream,
+                    FlowLane::Throughput,
+                    mux_limits,
+                )
+                .await,
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert_eq!(sender.data_bytes(), 3072);
+    }
+
+    #[tokio::test]
+    async fn mixed_response_dispatch_waits_retryably_when_repair_cache_is_full() {
+        let stream_id = StreamId(99);
+        let mux_limits = MuxLimits {
+            max_payload_bytes: 4096,
+            max_repair_bytes: 4096,
+            max_path_flight_bytes: 4096,
+            max_reliable_relay_chunk_bytes: 4096,
+            ..MuxLimits::default()
+        };
+        let (commands, _active_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(99),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (validation_commands, _validation_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Udp,
+                PathId(1),
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                4096,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let (_frame_tx, frame_rx) = mpsc::channel(1);
+        let path_stream = ReliablePathStream {
+            stream_id,
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: 4096,
+            output: ReliablePathStreamOutput::Switchable(binding),
+            frames: frame_rx,
+        };
+        let mut send_stream =
+            ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
+        send_stream
+            .send_data(Bytes::from(vec![0x5a; 4096]), StreamFlags::NONE)
+            .expect("fill repair cache");
+        let blocked_offset = send_stream.next_offset();
+        let mut sender = ServerResponseSenderService::new(SessionId(99), stream_id);
+        sender.enqueue_data_for_lane(Bytes::from_static(b"next"), FlowLane::Throughput);
+
+        assert!(matches!(
+            sender
+                .dispatch_next(
+                    &path_stream,
+                    &mut send_stream,
+                    FlowLane::Throughput,
+                    mux_limits,
+                )
+                .await,
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert_eq!(send_stream.next_offset(), blocked_offset);
+        assert_eq!(sender.data_bytes(), 4, "blocked raw bytes remain queued");
+
+        send_stream.apply_ack(&[OffsetRange {
+            start: 0,
+            end: blocked_offset,
+        }]);
+        sender
+            .dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+            )
+            .await
+            .expect("ACK release restores dispatch capacity");
+        assert_eq!(sender.data_bytes(), 0);
+    }
+
+    #[test]
     fn response_repair_extra_budget_accumulates_until_useful_attempt() {
         let mux_limits = MuxLimits::default();
         let stream_id = StreamId(92);
@@ -6095,13 +6465,9 @@ mod tests {
 
         assert_eq!(
             credit,
-            usize::try_from(bulk_active_service_product_envelope_bytes(
-                active.snapshot,
-                payload_bytes,
-                mux_limits,
-            ))
-            .unwrap(),
-            "active response owner must be fed by the product envelope, not current carrier cwnd"
+            bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits)
+                as usize,
+            "active response owner must use the product envelope, not current carrier cwnd"
         );
         assert!(
             credit > payload_bytes,
@@ -6126,12 +6492,23 @@ mod tests {
 
         assert_eq!(
             credit,
-            usize::try_from(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES).unwrap(),
+            bulk_service_horizon_payload_bytes(payload_bytes, mux_limits),
             "unproven active Service startup must be bounded until path-scoped bulk-rate evidence exists"
         );
         assert!(
             credit >= payload_bytes,
             "startup Service credit must still admit at least one bulk quantum"
+        );
+
+        active.snapshot.product_bytes_in_flight = credit as u64;
+        assert!(
+            !response_service_has_assigned_owner_credit(
+                &active,
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+            ),
+            "startup credit bounds cumulative assigned flight, not only the draining writer queue"
         );
     }
 
@@ -6160,13 +6537,12 @@ mod tests {
 
         assert_eq!(
             quic_credit,
-            usize::try_from(bulk_active_service_product_envelope_bytes(
+            bulk_active_service_product_envelope_bytes(
                 loaded_quic.snapshot,
                 payload_bytes,
                 mux_limits,
-            ))
-            .unwrap(),
-            "active QUIC Service feed credit must follow the product Service envelope, not live carrier debt"
+            ) as usize,
+            "active QUIC Service feed credit must follow the product envelope, not live carrier debt"
         );
         assert!(
             quic_credit > outdated_bdp_credit,
@@ -6188,13 +6564,12 @@ mod tests {
 
         assert_eq!(
             tcp_credit,
-            usize::try_from(bulk_active_service_product_envelope_bytes(
+            bulk_active_service_product_envelope_bytes(
                 loaded_tcp.snapshot,
                 payload_bytes,
                 mux_limits,
-            ))
-            .unwrap(),
-            "active TCP owners use the same carrier-neutral product Service envelope as active QUIC owners"
+            ) as usize,
+            "active TCP owners use the same carrier-neutral product envelope as active QUIC owners"
         );
 
         let mut subflow_quic =
@@ -6374,7 +6749,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tcp_response_owner_uses_product_feed_envelope() {
+    fn active_tcp_response_owner_uses_product_envelope() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut target = response_target(
@@ -6394,13 +6769,9 @@ mod tests {
                 payload_bytes,
                 mux_limits
             ),
-            usize::try_from(bulk_active_service_product_envelope_bytes(
-                target.snapshot,
-                payload_bytes,
-                mux_limits,
-            ))
-            .unwrap(),
-            "active TCP and QUIC owners should use the same product Service envelope; transport pacing belongs below the sender service"
+            bulk_active_service_product_envelope_bytes(target.snapshot, payload_bytes, mux_limits)
+                as usize,
+            "active TCP and QUIC owners should use the same product envelope; transport pacing belongs below the sender service"
         );
     }
 
@@ -6524,6 +6895,238 @@ mod tests {
             selected.admission.role,
             PathRuntimeRole::Service,
             "failover owner bytes are Service OwnerData, not optional Subflow exploration"
+        );
+    }
+
+    #[test]
+    fn repair_attachment_cannot_suppress_liveness_service_failover() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut repair = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            1.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        repair.attachment_role = StreamOpenRole::Repair;
+        let mut validation = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            50.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        validation.has_sender_evidence = false;
+        validation.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[repair, validation.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            0,
+            None,
+        )
+        .expect("Repair output must not hide an eligible liveness Service survivor");
+
+        assert_eq!(selected.target.key, validation.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn unproven_liveness_service_failover_respects_startup_assigned_credit() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let startup_credit =
+            response_service_startup_emission_credit_bytes(payload_bytes, mux_limits);
+        let mut failover = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        failover.has_bulk_rate_evidence = false;
+        failover.snapshot.product_bytes_in_flight =
+            startup_credit.saturating_sub(payload_bytes) as u64;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[failover.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            0,
+            None,
+        )
+        .expect("a prospective Service with startup credit remaining stays feedable");
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+
+        failover.snapshot.product_bytes_in_flight = startup_credit as u64;
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[failover],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                None,
+                0,
+                None,
+            )
+            .is_none(),
+            "newly elected unproven Service must not exceed the cumulative startup horizon before becoming active"
+        );
+    }
+
+    #[test]
+    fn prospective_service_uses_service_credit_instead_of_optional_pipe_credit() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let (commands, _receivers) = reliable_path_command_channels(128);
+        let mut failover = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            payload_bytes as u64,
+            false,
+        );
+        failover.commands = commands;
+        failover.has_bulk_rate_evidence = false;
+        failover.snapshot.delivery_rate_bps = 1.0;
+        failover.snapshot.pacing_rate_bps = 1.0;
+        let optional_credit = response_target_emission_credit_bytes(
+            &failover,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+        let service_credit =
+            response_service_emission_credit_bytes(&failover, payload_bytes, mux_limits);
+        assert!(
+            optional_credit < service_credit,
+            "fixture requires optional-path credit below prospective Service credit"
+        );
+        while failover
+            .commands
+            .pending_bytes()
+            .saturating_add(payload_bytes as u64)
+            <= optional_credit as u64
+        {
+            failover
+                .commands
+                .try_enqueue_admitted_frame(
+                    Frame::StreamData {
+                        stream_id: StreamId(74),
+                        offset: failover.commands.pending_bytes(),
+                        flags: StreamFlags::NONE,
+                        payload: Bytes::from(vec![0; payload_bytes]),
+                    },
+                    FlowLane::Throughput,
+                )
+                .expect("prefill prospective Service without exhausting queue slots");
+        }
+        assert!(
+            failover.commands.can_enqueue_lane_now(FlowLane::Throughput),
+            "fixture must retain a real writer queue slot"
+        );
+        assert!(
+            !response_target_has_emission_credit(
+                &failover,
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+            ),
+            "fixture must exceed the optional-path pipe credit"
+        );
+        assert!(
+            response_service_has_assigned_owner_credit(
+                &failover,
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+            ),
+            "the same assigned queue remains inside prospective Service credit"
+        );
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[failover],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            0,
+            None,
+        )
+        .expect("pre-role optional-path credit must not suppress Service failover");
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn mature_liveness_service_failover_uses_product_envelope() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut failover = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            4 * payload_bytes as u64,
+            false,
+        );
+        let mature_credit =
+            response_service_emission_credit_bytes(&failover, payload_bytes, mux_limits);
+        let full_envelope = usize::try_from(bulk_active_service_product_envelope_bytes(
+            failover.snapshot,
+            payload_bytes,
+            mux_limits,
+        ))
+        .unwrap();
+        assert!(
+            mature_credit
+                > response_service_startup_emission_credit_bytes(payload_bytes, mux_limits),
+            "fixture requires a mature product envelope larger than startup credit"
+        );
+        assert_eq!(mature_credit, full_envelope);
+        failover.snapshot.product_bytes_in_flight =
+            mature_credit.saturating_sub(payload_bytes) as u64;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[failover.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            None,
+            0,
+            None,
+        )
+        .expect("bulk-rate-proven prospective Service may use the product envelope");
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+
+        failover.snapshot.product_bytes_in_flight = mature_credit as u64;
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[failover],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                None,
+                0,
+                None,
+            )
+            .is_none(),
+            "mature Service failover must stop at the product envelope"
         );
     }
 
@@ -7254,7 +7857,7 @@ mod tests {
         active.has_bulk_rate_evidence = true;
         let service_envelope =
             bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits);
-        active.snapshot.product_queue_bytes = service_envelope;
+        active.snapshot.product_bytes_in_flight = service_envelope;
         active.snapshot.queue_bytes = payload_bytes as u64;
         let mut bulk_rate_subflow = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
         bulk_rate_subflow.has_sender_evidence = true;
@@ -7419,6 +8022,167 @@ mod tests {
                 underlay: UnderlayProtocol::Tcp,
                 path_id: PathId(0),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let active = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let validation = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (active_commands, _active_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(77),
+            active.underlay,
+            active.path_id,
+            active_commands.clone(),
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (validation_commands, mut validation_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        while try_recv_reliable_path_command(&mut validation_rx).is_some() {}
+        binding.detach(active, &active_commands);
+        assert_eq!(binding.ordered_data_owner(), None);
+
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(77),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+            .expect("liveness survivor may become the frontier-clear Service");
+        assert_eq!(plan.primary_key(), Some(validation));
+        assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
+        assert_eq!(
+            binding.attach(
+                validation.underlay,
+                validation.path_id,
+                validation_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Repair,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::RoleChanged
+        );
+        let frame = Frame::StreamData {
+            stream_id: StreamId(77),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x77; payload_bytes]),
+        };
+
+        assert!(matches!(
+            emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput).await,
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert!(
+            try_recv_reliable_path_command(&mut validation_rx).is_none(),
+            "a stale Service plan must not enqueue STREAM_DATA on a Repair attachment"
+        );
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == validation)
+            .expect("Repair output remains attached");
+        assert_eq!(target.attachment_role, StreamOpenRole::Repair);
+        assert_eq!(target.snapshot.product_bytes_in_flight, 0);
+        assert_eq!(target.commands.pending_bytes(), 0);
+        assert_eq!(binding.ordered_data_owner(), None);
+    }
+
+    #[tokio::test]
+    async fn passive_attach_preserves_one_bounded_exact_service_plan() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (service_commands, mut service_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(109),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(109),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: service.underlay,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+            .expect("live Service has a bounded owner plan");
+        assert_eq!(plan.primary_key(), Some(service));
+        assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
+        let planner_generation = binding.subflow_state_snapshot().0;
+
+        let repair = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let (repair_commands, mut repair_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                repair.underlay,
+                repair.path_id,
+                repair_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Repair,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert_ne!(binding.subflow_state_snapshot().0, planner_generation);
+
+        let frame = Frame::StreamData {
+            stream_id: StreamId(109),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x6d; payload_bytes]),
+        };
+        let outcome =
+            emit_planned_response_data_frame(&stream, plan, frame.clone(), FlowLane::Throughput)
+                .await
+                .expect("passive growth does not revoke the exact live Service quantum");
+        assert_eq!(outcome.selected_path, Some(service));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut service_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert!(try_recv_reliable_path_command(&mut repair_rx).is_none());
+        assert_eq!(
+            binding.owner_flight_keys_overlapping_frame(&frame),
+            vec![service]
         );
     }
 
@@ -7979,9 +8743,9 @@ mod tests {
             .into_iter()
             .find(|target| target.key == candidate)
             .expect("candidate output is attached");
-        let (subflow_generation, _) = binding.subflow_state_snapshot();
+        let (planner_generation, _) = binding.subflow_state_snapshot();
         let commit = ResponseSubflowAdmissionCommit {
-            subflow_generation,
+            planner_generation,
             lane_generation: binding.lane_generation(),
             service,
             startup_owner_credit_bytes: payload_bytes,
@@ -8051,6 +8815,150 @@ mod tests {
         .await
         .expect("the rolled-back startup quantum remains admissible");
         assert_eq!(emitted.selected_path, Some(candidate));
+    }
+
+    #[tokio::test]
+    async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let unrelated = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(2),
+        };
+        let (service_commands, _service_rx) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(90),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("candidate output is attached");
+        let (stale_planner_generation, _) = binding.subflow_state_snapshot();
+        let lane_generation = binding.lane_generation();
+        let input = SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+        let stale_commit = ResponseSubflowAdmissionCommit {
+            planner_generation: stale_planner_generation,
+            lane_generation,
+            service,
+            startup_owner_credit_bytes: payload_bytes,
+            optional_overhead_budget_bytes: 0,
+            max_read_gap_budget: Duration::ZERO,
+            input,
+        };
+        let (unrelated_commands, _unrelated_rx) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                unrelated.underlay,
+                unrelated.path_id,
+                unrelated_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let (fresh_planner_generation, _) = binding.subflow_state_snapshot();
+        assert_ne!(fresh_planner_generation, stale_planner_generation);
+
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(90),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: service.underlay,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let frame = Frame::StreamData {
+            stream_id: StreamId(90),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x55; payload_bytes]),
+        };
+        let stale = emit_planned_response_data_frame(
+            &stream,
+            ResponseDataDispatchPlan {
+                primary: ResponseDataDispatchTarget::Switchable {
+                    binding: binding.clone(),
+                    target: target.clone(),
+                    role: PathRuntimeRole::Subflow,
+                    subflow_set_commit: Some(stale_commit),
+                },
+            },
+            frame.clone(),
+            FlowLane::Throughput,
+        )
+        .await;
+        assert!(matches!(stale, Err(RuntimeError::SenderServiceBlocked)));
+        assert!(
+            try_recv_reliable_path_command(&mut candidate_rx).is_none(),
+            "planner invalidation must fence both reservation and owner enqueue"
+        );
+
+        let fresh = emit_planned_response_data_frame(
+            &stream,
+            ResponseDataDispatchPlan {
+                primary: ResponseDataDispatchTarget::Switchable {
+                    binding,
+                    target,
+                    role: PathRuntimeRole::Subflow,
+                    subflow_set_commit: Some(ResponseSubflowAdmissionCommit {
+                        planner_generation: fresh_planner_generation,
+                        ..stale_commit
+                    }),
+                },
+            },
+            frame,
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("fresh generation may reserve and enqueue the startup quantum");
+        assert_eq!(fresh.selected_path, Some(candidate));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
     }
 
     #[tokio::test]
@@ -8477,25 +9385,29 @@ mod tests {
 
     #[test]
     fn single_response_carrier_uses_sliding_window_not_multipath_ordering_debt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let assigned_bytes = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
+            .saturating_sub(payload_bytes);
         let mut target = response_target(
             0,
             UnderlayProtocol::Tcp,
             5.0,
-            8 * 1024 * 1024,
+            assigned_bytes as u64,
             16 * 1024 * 1024,
             true,
         );
         target.snapshot.product_progress_rate_bps = Some(10_000_000_000.0);
         let lower_flights = vec![CarrierPathFlightDebt {
             key: target.key,
-            bytes: 8 * 1024 * 1024,
+            bytes: assigned_bytes as u64,
         }];
 
         let selected = choose_response_sender_data_target(
             std::slice::from_ref(&target),
             FlowLane::Throughput,
-            64 * 1024,
-            MuxLimits::default(),
+            payload_bytes,
+            mux_limits,
             &lower_flights,
             Some(target.key),
         )
@@ -9215,7 +10127,7 @@ mod tests {
             response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
         let service_envelope =
             bulk_active_service_product_envelope_bytes(service.snapshot, payload_bytes, mux_limits);
-        service.snapshot.product_queue_bytes = service_envelope;
+        service.snapshot.product_bytes_in_flight = service_envelope;
         service.snapshot.queue_bytes = payload_bytes as u64;
         let measured_subflow =
             response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -9297,6 +10209,7 @@ mod tests {
             response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
         startup_subflow.has_sender_evidence = true;
         startup_subflow.has_bulk_rate_evidence = false;
+        startup_subflow.snapshot.product_queue_bytes = mux_limits.max_path_flight_bytes as u64;
 
         let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[service.clone(), startup_subflow.clone()],
@@ -9852,7 +10765,7 @@ mod tests {
         let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
         let service_envelope =
             bulk_active_service_product_envelope_bytes(owner.snapshot, payload_bytes, mux_limits);
-        owner.snapshot.product_queue_bytes = service_envelope;
+        owner.snapshot.product_bytes_in_flight = service_envelope;
         owner.snapshot.queue_bytes = payload_bytes as u64;
         let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
@@ -9917,7 +10830,16 @@ mod tests {
     fn cross_underlay_alternate_waits_when_service_owner_is_backpressured() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let owner = response_target(1, UnderlayProtocol::Tcp, 50.0, 4 * 1024 * 1024, 0, true);
+        let assigned_bytes = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
+            .saturating_sub(payload_bytes);
+        let owner = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            50.0,
+            assigned_bytes as u64,
+            0,
+            true,
+        );
         let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
 
         let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
@@ -10090,6 +11012,65 @@ mod tests {
             selected.admission.role,
             PathRuntimeRole::Service,
             "same-underlay failover resumes Service OwnerData; it is not optional Subflow exploration and does not credit RepairData as proof"
+        );
+    }
+
+    #[test]
+    fn missing_same_underlay_service_failover_respects_path_latency_window() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let missing_owner = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let mut measured_survivor = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        measured_survivor.snapshot.delivery_rate_bps = 10_000_000_000.0;
+        measured_survivor.snapshot.pacing_rate_bps = 10_000_000_000.0;
+        measured_survivor.snapshot.active_latency_sensitive_flows = 1;
+        let latency_credit = usize::try_from(bulk_latency_pressure_service_feed_window_bytes(
+            payload_bytes,
+            mux_limits,
+        ))
+        .unwrap();
+        measured_survivor.snapshot.product_bytes_in_flight =
+            latency_credit.saturating_sub(payload_bytes) as u64;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            std::slice::from_ref(&measured_survivor),
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(missing_owner),
+            payload_bytes.saturating_mul(2),
+            None,
+        )
+        .expect(
+            "mature same-underlay Service failover may consume remaining latency-window credit",
+        );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+
+        measured_survivor.snapshot.product_bytes_in_flight = latency_credit as u64;
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_and_epoch(
+                &[measured_survivor],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                Some(missing_owner),
+                payload_bytes.saturating_mul(2),
+                None,
+            )
+            .is_none(),
+            "runtime Service failover must stop at the same path-local latency window even when its bulk role is AdditionalSameUnderlay"
         );
     }
 

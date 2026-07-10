@@ -337,10 +337,7 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
     if bulk_active_lead_has_contiguous_frontier(candidate, role, check.stream_ordering_debt_bytes) {
         let inflight_limit =
             bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits);
-        let committed = candidate
-            .product_bytes_in_flight
-            .saturating_add(candidate.product_queue_bytes)
-            .saturating_add(candidate.queue_bytes);
+        let committed = bulk_assigned_service_debt_bytes(candidate);
         if committed.saturating_add(payload_bytes as u64) > inflight_limit
             && committed >= inflight_limit
         {
@@ -511,13 +508,11 @@ fn bulk_reorder_absorption_ms(
 }
 
 fn bulk_scheduler_inflight_debt_bytes(candidate: PathSnapshot, role: BulkAdmissionRole) -> u64 {
-    if bulk_uses_product_only_active_gate(candidate, role) {
-        return candidate
-            .product_bytes_in_flight
-            .saturating_add(candidate.queue_bytes);
-    }
-    if role == BulkAdmissionRole::ActiveDataPath {
-        return bulk_product_reorder_debt_bytes(candidate).saturating_add(candidate.queue_bytes);
+    if matches!(
+        role,
+        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
+    ) {
+        return bulk_assigned_service_debt_bytes(candidate);
     }
     if candidate.underlay == UnderlayProtocol::Udp
         && matches!(role, BulkAdmissionRole::AdditionalCrossUnderlay)
@@ -527,6 +522,13 @@ fn bulk_scheduler_inflight_debt_bytes(candidate: PathSnapshot, role: BulkAdmissi
             .saturating_add(candidate.bytes_in_flight);
     }
     bulk_product_reorder_debt_bytes(candidate)
+}
+
+fn bulk_assigned_service_debt_bytes(candidate: PathSnapshot) -> u64 {
+    // Product flight owns accepted OwnerData from carrier enqueue through
+    // STREAM_ACK, so the carrier queue is an overlapping pressure view rather
+    // than additional product debt.
+    candidate.product_bytes_in_flight.max(candidate.queue_bytes)
 }
 
 fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
@@ -541,7 +543,7 @@ fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissi
     // this layer.
 }
 
-fn bulk_latency_pressure_service_feed_window_bytes(
+pub(super) fn bulk_latency_pressure_service_feed_window_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -882,6 +884,56 @@ mod tests {
                 BulkAdmissionRole::ActiveDataPath,
             ),
             Some("inflight_limit")
+        );
+    }
+
+    #[test]
+    fn active_service_unions_overlapping_product_flight_and_command_queue() {
+        let payload = 64 * 1024;
+        let envelope = 512 * 1024;
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: envelope,
+            max_reorder_bytes: envelope,
+            max_stream_window_bytes: envelope as u64,
+            ..MuxLimits::default()
+        };
+        let best = candidate(0, 10.0, 20.0, 500.0);
+        let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, mbps(500.0));
+        active.product_bytes_in_flight = (envelope - payload) as u64;
+        active.queue_bytes = (envelope - payload) as u64;
+
+        assert_eq!(
+            bulk_assigned_service_debt_bytes(active),
+            (envelope - payload) as u64
+        );
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                best.snapshot,
+                best.eta_ms,
+                active,
+                10.0,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "carrier-pending OwnerData is already represented in product flight"
+        );
+
+        active.product_bytes_in_flight = 0;
+        active.queue_bytes = envelope as u64;
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                best.snapshot,
+                best.eta_ms,
+                active,
+                10.0,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            Some("inflight_limit"),
+            "queue pressure remains an authoritative fallback when product flight is absent"
         );
     }
 
@@ -1234,6 +1286,33 @@ mod tests {
             ),
             None,
             "active service owner should be fed through the product service envelope when the ordered frontier is clear"
+        );
+    }
+
+    #[test]
+    fn raw_sender_queue_does_not_consume_active_service_owner_envelope() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 512 * 1024,
+            max_reorder_bytes: 512 * 1024,
+            max_stream_window_bytes: 512 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload = 64 * 1024;
+        let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, mbps(500.0));
+        candidate.product_queue_bytes = 512 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression(
+                candidate,
+                10.0,
+                candidate,
+                10.0,
+                payload,
+                mux_limits,
+                BulkAdmissionRole::ActiveDataPath,
+            ),
+            None,
+            "raw staged bytes have no offset or path owner and must not block their own dispatch"
         );
     }
 
@@ -1607,6 +1686,7 @@ mod tests {
         active.snapshot.confidence = 1.0;
         active.snapshot.inflight_limit_bytes = MuxLimits::default().max_path_flight_bytes as u64;
         active.snapshot.bytes_in_flight = 1024 * 1024;
+        active.snapshot.product_bytes_in_flight = 1024 * 1024;
 
         assert_eq!(
             bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {

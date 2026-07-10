@@ -334,10 +334,12 @@ selected from session paths, path-model evidence, queue state, and
 ECF/BLEST/no-worse admission. ACK progress updates delivery metrics, ordering
 frontier, and later admission inputs, but it MUST NOT recreate validation
 credit or reinterpret probe evidence as owner evidence. The epoch remains
-valid while its Service, owner-credit envelope, overhead budget, read-gap budget,
-and live carrier membership still match the admission envelope. It is recreated
-on material envelope change, detach/failover, or carrier-membership change, not
-on ordinary ACK progress. Product byte ownership still belongs to the per-range
+valid while its Service, owner-credit envelope, overhead budget, and read-gap
+budget still match the admission envelope. It is recreated on material envelope
+change, detach/failover, active attachment, output replacement, or role change,
+not on ordinary ACK progress or passive Validation/Repair membership growth.
+Passive growth invalidates the planner revision without refilling the preserved
+epoch. Product byte ownership still belongs to the per-range
 flight ledger, not to the subflow set itself. The Service path is the live
 ordered-owner anchor for that stream direction. The per-range lower-frontier
 owner may be that Service or a distinct admitted Subflow; owning the lower range
@@ -517,17 +519,18 @@ Similarly, latency-first startup state and live latency-sensitive flow counters
 may affect sender-service fairness and preemption, but they MUST NOT reduce a
 clear-frontier bulk Service owner to a tiny startup-rate or carrier-cwnd
 product admission ceiling. While bulk demand exists and the ordered frontier is
-clear, the Service owner is fed through the product Service envelope; lower
+clear, the Service owner is fed through the product Service feed window; lower
 carrier congestion and pacing remain the carrier engine's responsibility.
-Before path-scoped product progress exists, and while the ordered frontier is
-still contiguous, the Service owner uses the preemptible Service horizon rather
-than the full product envelope. This horizon is a product-tail guard, not a
-carrier cwnd or startup-rate ceiling: it is large enough to obtain ACK-clock
-visibility, but small enough to keep a flapping first owner from preloading a
-large unresolved tail. App-limited product progress is ACK-clock visibility,
-not bulk-rate proof; it may inform ETA and diagnostics, but by itself it MUST
-NOT unlock the bulk-only Service reservoir or initialize a tiny startup-rate,
-BDP-derived, or carrier-cwnd product ceiling for the current Service owner.
+Before mature path-scoped bulk evidence exists, and while the ordered frontier
+is still contiguous, the Service owner uses the preemptible Service horizon
+rather than the configured product Service envelope. This horizon is a product-
+tail guard, not a carrier cwnd or startup-rate ceiling: it is large enough to
+obtain useful delivery evidence, but small enough to keep a flapping first owner
+from preloading a large unresolved tail. App-limited product progress is
+visibility, not bulk-rate proof; it may inform ETA and diagnostics, but by itself
+it MUST NOT unlock the full product Service envelope or initialize a tiny
+startup-rate, BDP-derived, or carrier-cwnd product ceiling for the current
+Service owner.
 The safety boundary for a contiguous Service owner is product flow control,
 sender-service queue pressure, repair-cache ownership, product progress, and
 carrier-command backpressure. BDP-derived completion and reorder gates are for
@@ -537,39 +540,72 @@ the Service is the current primary owner and must remain fed while its ordered
 frontier is clear, whereas optional paths must prove positive contribution
 before receiving owner bytes.
 When latency-sensitive work is active on the same Service path, the
-clear-frontier Service feed envelope uses the preemptible Service horizon for
-total owner credit already admitted to that Service path, including owner bytes
-in flight and queued carrier work.
-That cap is feed/backpressure accounting, not reorder accounting. A clear-frontier
-Service with path-scoped bulk evidence MAY use a small BBR-style headroom over
-the preemptible horizon so carrier writers do not oscillate between empty and
-blocked during failover recovery; the headroom remains clamped by the product
-Service envelope and does not apply to optional Subflows or lower-owner debt.
+clear-frontier Service feed envelope uses a bounded preemptible window with
+BBR-style headroom over the Service horizon for total owner credit already
+admitted to that Service path, including owner bytes in flight and queued
+carrier work. Raw bytes in the sender-service staging queue are not admitted
+owner credit because they have no offset or path owner.
+Because product flight retains accepted OwnerData from carrier enqueue through
+`STREAM_ACK`, its carrier-queue view overlaps rather than adds to that flight.
+Hard Service debt is the maximum of assigned product flight and carrier queue;
+the queue remains an authoritative fallback when the product-flight view is
+absent.
+That cap is feed/backpressure accounting, not reorder accounting. Without
+same-path latency pressure, a clear-frontier Service with mature path-scoped
+bulk evidence MAY use the configured product Service envelope. The product/
+repair envelope remains a hard correctness and memory ceiling, not a carrier
+congestion-window claim. This envelope does not apply to optional Subflows or
+lower-owner debt.
 Reorder budgets are for additional paths, cross-path lower-byte debt, and
 explicit owner-tail guards; they MUST NOT count same-Service queued carrier work
 as cross-path reorder debt. The point of the latency-pressure cap is different:
 it bounds how much ordered debt one Service path may preload while realtime or
-latency work needs fast recovery and preemption. Bulk-only Service feed uses a
-Service reservoir with BBR-style headroom over the preemptible horizon only
-after that Service path has mature path-scoped product progress, represented by
-product progress plus full delivery confidence. The reservoir remains clamped
-by the product Service envelope while the ordered frontier is clear. That
-reservoir is ordinary `OwnerData`, not optional traffic, and it MUST NOT admit
-Subflows, repairs, probes, or duplicates.
+latency work needs fast recovery and preemption. The resulting Service envelope
+is ordinary `OwnerData`, not optional traffic, and it MUST NOT admit Subflows,
+repairs, probes, or duplicates.
 The ordered-data owner hint is not a carrier-family preference. If the ordered
 frontier is clear and the hinted Service output cannot enqueue owner bytes at
 all, the sender MAY elect a new Service from validated live outputs by metrics.
 If unresolved owner debt exists, the hint remains authoritative and later
 owner bytes MUST wait for repair or frontier progress instead of migrating
 behind the hole.
-Before a Service output has path-scoped product progress, bulk owner feed is
+Before a Service output has mature path-scoped bulk evidence, bulk owner feed is
 capped by the preemptible Service horizon. This startup cap is large enough to
-obtain meaningful ACK-clock evidence but prevents an app-limited or flapping
-path from preloading the full product envelope. Once the Service has product
-progress with full delivery confidence, a bulk-only Service with no same-path
-latency pressure may use the Service reservoir while the ordered frontier
-remains clear. Bulk-rate evidence is still required before optional Subflows
-are treated as mature contributors.
+obtain meaningful delivery evidence but prevents an app-limited or flapping path
+from preloading the full product Service envelope. Once the Service has mature
+evidence, a bulk-only Service may use that envelope while the ordered frontier
+remains clear. Same-path latency pressure narrows it to the BBR-headroom feed
+reservoir. Bulk-rate evidence is still required before optional Subflows are
+treated as mature contributors.
+
+Switchable response outputs enforce these owner envelopes when raw bytes are
+converted into offset-bearing `STREAM_DATA` at sender-service dispatch. Before
+conversion, a stream with only one live owner-capable underlay family
+conservatively reserves the staging limit against assigned owner tail plus raw
+queued bytes. The limit is the Service horizon before mature evidence or under
+same-path latency pressure and the bounded feed reservoir after mature evidence
+without that pressure. This preserves the carrier-specific TCP-only and QUIC-
+only backpressure behavior even though the response binding is switchable.
+Both maturity and same-path latency pressure MUST come from the exact live
+Service output. Full-confidence product progress or mature evidence on an
+alternate, Validation, Subflow, Repair, or closed output MUST NOT unlock or
+resize the Service source-staging reservoir.
+This exact-Service proof rule applies to switchable server response source
+staging. Fixed request-side outputs retain their path-local product-progress
+graduation because they do not defer carrier ownership until sender-service
+dispatch.
+
+When live owner-capable outputs span both TCP and UDP, the unassigned raw queue
+MAY instead use a separate bounded reservoir with the same horizon/feed limits.
+Its headroom subtracts raw queued bytes only; it neither spends assigned owner-
+tail credit nor borrows the full product or repair envelope. This mixed-family
+exception exists so the sender-service planner can convert staged bytes only
+after choosing the carrier family. Repair-only or closed outputs do not enable
+it, and loss of live family diversity immediately returns source staging to the
+coupled policy. Neither staging policy is path evidence or optional-owner
+admission. Raw bytes staged while family diversity was live MUST retain
+remaining-repair-capacity prefix limiting after topology contraction; losing a
+family MUST NOT turn repair-cache backpressure into a fatal stream error.
 
 The scheduler and algorithms own policy decisions only. They consume sender
 queue snapshots, path-model snapshots, stream-ordering debt, flow demand,
@@ -1017,7 +1053,7 @@ their origin is explicit and they do not become hidden modes.
 | Datagram target/path model | TCP- and QUIC-carried datagram response deadlines derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold; pacing floor is one observed datagram payload per PTO | QUIC PTO plus UDP application congestion-control guidance; TCP RTO/PTO-style path evidence for TCP-carried datagrams | TCP-underlay datagrams can still HOL-block | Removed fixed 50ms/1s/250ms/8*SRTT/64Kbps clamps. A datagram attempt that has received product feedback expires on absent target response; a pre-feedback path timeout may try one remaining schedulable carrier within TTL as path failover, not reliable replay |
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
-| Bulk admission | A clear-frontier Service owner on any carrier is admitted by product ownership state, not by a carrier-cwnd product ceiling. Before path-scoped product progress exists, Service owner tail feed is capped by the preemptible Service horizon. After product progress exists with full delivery confidence and no same-path latency pressure is active, the bulk-only source feed reservoir is BBR-style headroom over that horizon, clamped by the product envelope, so ACK bunching and flaps do not empty an ACK-clocked Service pipe. App-limited or low-rate product progress may inform ETA but MUST NOT unlock that reservoir or shrink a bulk-only current Service owner to a tiny BDP, startup-rate, carrier-cwnd, or one-quantum product ceiling. When realtime or latency-sensitive work is active on the same Service path, the Service owner becomes preemptible: total admitted owner credit is capped by the Service horizon until that pressure clears. Latency work on another path keeps its own priority and flow-control protection but MUST NOT shrink an unrelated Service owner's feed reservoir. Carrier inflight/queue/RTT/loss/pacing shape emission and ETA below those product envelopes; optional Subflows, cross-underlay sends, debt-bearing sends, and migrations remain governed by BDP/ETA/reorder/no-worse admission and may be suppressed or demoted | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
+| Bulk admission | A clear-frontier Service owner on any carrier is admitted by product ownership state, not by a carrier-cwnd product ceiling. Before mature path-scoped bulk evidence exists, Service owner tail feed is capped by its startup/preemptible horizon. After mature evidence exists without same-path latency pressure, the Service may use the configured product envelope; that envelope remains a hard resource ceiling, not a carrier congestion-window claim. Same-path latency pressure narrows assigned owner credit back to the feed reservoir. Raw sender-service staging remains queue-, credit-, and memory-bounded and is not owner debt. With only one live owner-capable underlay family, source headroom reserves the horizon/feed limit against assigned owner tail plus raw queue bytes. Only while live owner-capable outputs span TCP and UDP may raw staging use an independent horizon/feed reservoir that subtracts raw queue bytes alone; Repair-only or closed outputs do not enable this mixed-family exception. App-limited or low-rate product progress may inform ETA but MUST NOT initialize a tiny BDP-derived or carrier-cwnd product ceiling. Latency work on another path keeps its own priority and flow-control protection but MUST NOT shrink an unrelated Service owner's product envelope. Carrier inflight/queue/RTT/loss/pacing shape emission and ETA below those product windows; optional Subflows, cross-underlay sends, debt-bearing sends, and migrations remain governed by BDP/ETA/reorder/no-worse admission and may be suppressed or demoted | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
 | Validation traffic | Probe/control traffic by default; repair data only after explicit gap/failover evidence; the sole unique-future-byte exception is the bounded same-underlay startup Subflow sample epoch after local sender evidence and at least two active direction-relevant reliable response flows | MPTCP reinjection, MPTCP subflow startup, MPQUIC path validation, and MPQUIC's local scheduling guidance | Unbounded, cross-family, or unmeasured one-flow Validation OwnerData creates HOL debt; proof-only validation can permanently underfeed useful capacity | Keep the exception explicit, cumulative, one-candidate, bulk-only, generation-fenced, and suppressed by single-flow state, latency/realtime pressure, or authoritative lower debt |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
@@ -3100,16 +3136,22 @@ backpressure below the product frame.
 For reliable bulk streams, the sender service also performs admission before it
 pulls another source byte range into a `STREAM_DATA` frame when the next offset
 and candidate service quantum are known. Read loops may stage raw bytes only up
-to the sender-service queue, stream-credit, and repair-cache budgets. They MUST
+to the sender-service queue, stream-credit, and memory budgets. Repair-cache
+capacity is enforced when dispatch assigns offsets and ownership. Read loops MUST
 NOT pre-create later-offset frames because doing so would assign product
 ownership before path admission and repair priority are known. If the
-path-flight ledger shows that
-lower offsets are outstanding on other paths and no attached path can safely
-advance the ordered frontier, the sender pauses the source read and continues
-servicing control, ACK, repair, latency, and carrier events. It MUST NOT create
-new later-offset `STREAM_DATA` merely to keep an active path busy, because doing
-so moves the fairness boundary behind hidden path queues and expands receiver
-ordering debt before ECF/BLEST admission can reject it.
+path-flight ledger shows that lower offsets are outstanding on other paths and
+no attached path can safely advance the ordered frontier, the sender pauses
+conversion and dispatch of later raw bytes and continues servicing control,
+ACK, repair, latency, and carrier events. Bounded raw source staging MAY
+continue within the Service horizon/feed reservoir and the harder sender-queue,
+stream-credit, and memory limits because it does not assign an offset or owner.
+That raw reservoir is independent from assigned owner tail only for a response
+with live owner-capable TCP and UDP outputs; single-family responses retain the
+coupled staging reservation defined above. The sender MUST NOT create new later-offset
+`STREAM_DATA` merely to keep an active path busy, because doing so moves the
+fairness boundary behind hidden path queues and expands receiver ordering debt
+before ECF/BLEST admission can reject it.
 
 If any gate fails, the service either chooses another eligible path, keeps the
 work queued, reduces send pace, marks a path suspect, or drops expired
@@ -3150,9 +3192,22 @@ Service path may carry ordinary data. A path with any role may carry a specific
 repair frame when it is the best survivor and
 avoids the path that likely lost the original bytes.
 
+Attaching a previously absent passive Validation or Repair output MUST advance
+the planner generation so a pre-attach optional-owner or Subflow plan cannot
+commit afterward, but it MUST preserve the existing subflow-set epoch identity,
+Service, startup candidate, cumulative startup spend, and measured members.
+Passive membership growth MUST NOT reset, refill, or transfer startup-sample
+credit. A pre-attach Service plan carries no optional-owner spend and MAY still
+linearize one bounded preemptible quantum when enqueue atomically revalidates the
+exact live output key, channel, incarnation, and non-Repair role; the next
+quantum uses a fresh plan. Active attachment, output replacement, role change,
+detach/failure, explicit Service change, and envelope change remain semantic
+reset conditions.
+
 Same-stream bulk striping is allowed for TCP, UDP, and mixed TCP+UDP reliable
-streams only when the candidate passes the same admission rule used for the
-lead path. This is intentionally stricter than "all attached paths may send."
+streams only when the candidate passes the same role-aware admission framework
+and no-worse model used for Service and Subflow decisions. This is intentionally
+stricter than "all attached paths may send."
 TCP hides packet-level loss and delivery timing, while UDP exposes packet
 numbers, ACK ranges, pacing, and loss state; the path model therefore uses the
 best available sender evidence for each underlay and refuses candidates whose
@@ -3428,8 +3483,9 @@ but sender-side evidence decides sustained ordinary promotion. The receiver
 applies the same rule when it observes incoming stream data: ordered progress on
 a validation or repair path may refresh liveness and may feed delivery sampling,
 but the path becomes a unique ordered-data candidate only after that sampling
-has created real delivery evidence and ETA scoring says it should displace the
-current lead path. This prevents a high-RTT, high-loss, or reordered path from
+has created real delivery evidence and the no-worse ETA gates admit measured
+Subflow overflow or an explicit frontier-safe Service migration. Evidence and
+ETA alone do not displace a feedable Service. This prevents a high-RTT, high-loss, or reordered path from
 winning ordinary bulk service because it delivered a small probe before its
 long-term behavior was known.
 
@@ -3577,12 +3633,20 @@ authoritative debt, or newly active latency/realtime pressure suspends further
 sampling without transferring ownership; if those conditions fully clear, only
 the same candidate's remaining non-refilling credit may resume. A detach,
 failure, role change, output replacement, or Service change resets the
-subflow-set generation rather than preserving stale credit. Every planned
-Subflow send carries both the subflow-set generation and lane-pressure
-generation captured before target, owner, debt, and pressure snapshots are
-read. The commit MUST fail if either changed, and the per-session pressure
+planner generation and epoch identity rather than preserving stale credit.
+Planner generation and epoch identity are distinct tokens: planner-only
+invalidation rejects an obsolete path choice without changing the ledger that
+owns already reserved credit. Every planned Subflow send carries the planner
+generation and lane-pressure generation captured before target, owner, debt,
+and pressure snapshots are read. The commit MUST fail if either changed, and
+the per-session pressure
 generation check is serialized with the Subflow-set mutation so a concurrent
 realtime registration cannot enter between validation and admission.
+Changing any admission-envelope field (Service, startup-credit cap,
+optional-overhead cap, or maximum read-gap budget) MUST atomically create a new
+epoch identity and advance planner generation before admitting the replacement
+epoch. This makes same-generation competing commits stale and prevents an old
+refund from mutating the replacement ledger.
 Lane changes, output attach/detach membership, and their per-session tracker
 updates are serialized in `lane -> outputs -> tracker` order. No observer may
 publish a new binding lane while the tracker still accounts the old lane, and a
@@ -3594,9 +3658,12 @@ loads before releasing its session reference; the last reference/load/flow
 release removes the generation entry.
 Startup credit represents emitted `OwnerData`, not a planning attempt. If a
 shared carrier queue loses its last slot after planning and the nonblocking
-enqueue fails, the sender MUST roll back that exact generation's committed
-owner and optional-overhead bytes before retrying. A queue-full race MUST NOT
-consume the finite startup epoch without transmitting its sample.
+enqueue fails, the sender MUST roll back the committed owner and
+optional-overhead bytes using the epoch identity returned by reservation.
+That refund MUST remain valid across planner-only passive-attachment
+invalidation, while a semantic reset or envelope replacement MUST reject a
+refund carrying the former epoch identity. A queue-full race MUST NOT consume
+the finite startup epoch without transmitting its sample.
 
 An output replacement also invalidates cached sender metrics and outstanding
 old-output flights as evidence. Flight recording and ACK release are serialized
@@ -3780,14 +3847,14 @@ if startup_sample_epoch_selects(stream, path):
     live_service_suffix_debt(stream)
         + candidate_product_debt(path) + chunk.len
         <= same_underlay_reorder_budget(path, chunk)
-    # Do not compare an underfed startup rate with the measured lead ETA.
-else if path is comparison_lead and stream_ordering_debt(path, chunk) == 0:
-    product_queue_debt(path) + stream_ordering_debt(path, chunk) + chunk
-        <= lead_product_queue_envelope(path, chunk)
-else if path is comparison_lead:
+    # Do not compare an underfed startup rate with the measured anchor ETA.
+else if path is service_path and stream_ordering_debt(path, chunk) == 0:
+    assigned_service_debt(path) + stream_ordering_debt(path, chunk) + chunk
+        <= service_owner_envelope(path, chunk)
+else if path is service_path:
     stream_ordering_debt(path, chunk) + chunk
         <= same_underlay_reorder_budget(path, chunk)
-else if path uses the same underlay family as comparison_lead:
+else if path uses the same underlay family as service_path:
     product_reorder_debt(path) + stream_ordering_debt(path, chunk) + chunk
         <= same_underlay_reorder_budget(path, chunk)
 else:
@@ -3887,16 +3954,25 @@ candidate chunk. `product_reorder_debt` is the stream-level byte ownership that
 has not yet been released by `STREAM_ACK`. These are deliberately different
 ledgers. QUIC and BBR gate packet emission and pacing on carrier debt, while
 MPTCP-style sequence repair and receive-window protection reason about product
-byte ownership. `product_queue_debt` is the lead path's bounded,
-preemptible product work already admitted to the transport.
+byte ownership. `assigned_service_debt` is the overlap-safe maximum of the lead
+path's unreleased offset-bearing product flight and carrier work already
+assigned to that path; the two views of the same bytes MUST NOT be summed.
+Raw sender-service staging is shared, unassigned backlog: it may affect ETA and
+memory pressure, but it is not path debt. A single-family response still couples
+that staging reservoir to assigned owner tail so TCP-only and QUIC-only streams
+retain their carrier-specific backpressure. A response with live owner-capable
+TCP and UDP outputs may use an independent bounded raw reservoir because carrier
+family is not selected until dispatch. Neither case expands raw staging to the
+full sender/repair envelope.
 
 The active service output with a clear ordered frontier MUST NOT be gated by a
 second product-layer copy of the carrier congestion window. QUIC already owns
 packet pacing, congestion response, stream flow control, and sender backpressure
 below the active owner; TCP already owns kernel write pressure, congestion
 response, and packet pacing below its writer. The product scheduler gates this
-case with the product queue and stream-ordering envelope so the service owner
-remains fed without creating unbounded response backlog. This applies even when
+case with assigned product flight, carrier queue, and the stream-ordering
+envelope so the service owner remains fed without creating unbounded response
+backlog. This applies even when
 other validation or subflow set outputs are attached: optional outputs do not reduce
 the service owner's product feed budget. Additional paths, validation paths, and
 cross-underlay candidates still use carrier debt as an admission gate because
@@ -3921,17 +3997,14 @@ credible carrier evidence. The product-progress rate remains a backlog and
 diagnostic signal only; it MUST NOT be treated as UDP/QUIC packet delivery or
 congestion evidence.
 
-The sender-service admission model also applies session-level lane pressure.
-When a session has active latency-sensitive or realtime flows, an active bulk
-lead MUST NOT use the large throughput BDP envelope to accumulate hidden command
-backlog behind path queues. Its product admission envelope is reduced to the
-preemptible service horizon for the next quantum, while carrier pacing and
-stream flow control continue to govern final emission. This rule is independent
-of whether the latency-sensitive flow is attached to the same underlay path as
-the bulk flow; otherwise dedicated latency paths can hide user-visible pressure
-from the bulk scheduler and the path command queue becomes an unintended product
-queue. When the session has only throughput/background flows, the model-based
-BDP envelope remains available so file-download aggregation is not penalized.
+The sender-service admission model also applies path-local lane pressure. When a
+Service path has active latency-sensitive or realtime flows, an active bulk lead
+MUST NOT use the large throughput envelope to accumulate hidden command backlog
+behind that path's queue. Its product admission envelope is reduced to the
+bounded latency-pressure Service window, while carrier pacing and stream flow
+control continue to govern final emission. Latency work on a different dedicated
+path retains its own priority and flow-control protection without shrinking an
+unrelated bulk Service path.
 
 Bulk admission also includes lane-protection debt. When another flow on the
 same session path is currently using a control, latency, or realtime lane and
@@ -4003,11 +4076,12 @@ a proven alternate path in the same sender direction, the sender MUST NOT keep
 admitting later ordinary unique bytes to that stale owner merely because it
 owns the lower offset. It also MUST NOT move those later unique bytes to the
 alternate path while the lower frontier is still unresolved. Instead, it pauses
-ordinary source reads for that stream and continues servicing carrier ACKs,
-product ACKs, control frames, flow-control updates, explicit gap repair,
-path proof, and path events. Ordinary data resumes when ACK progress,
-repair delivery, detach/failover, or updated path evidence produces a
-serviceable lower-frontier owner or advances the contiguous frontier. This
+ordinary owner assignment and dispatch for that stream and continues servicing
+carrier ACKs, product ACKs, control frames, flow-control updates, explicit gap
+repair, path proof, and path events. Bounded unassigned source staging may
+continue. Ordinary data resumes when ACK progress, repair delivery,
+detach/failover, or updated path evidence produces a serviceable lower-frontier
+owner or advances the contiguous frontier. This
 rule closes the MPTCP-style failure mode where a slow or failed subflow owns
 early data and all later high-rate data either blocks behind it or deepens the
 receive hole.
@@ -4023,8 +4097,9 @@ turning one lost or delayed lower byte into tens of MiB of undeliverable later
 offsets while still avoiding carrier starvation.
 
 Lead-path admission and lead-path repair are intentionally separate decisions.
-The lead path may keep a larger product queue than additional paths so that a
-QUIC carrier stream or TCP writer is not starved by slow product ACKs. A sender
+The lead path may keep a larger assigned product flight and carrier queue than
+additional paths so that a QUIC carrier stream or TCP writer is not starved by
+slow product ACKs. A sender
 MUST NOT treat ordinary queued response bytes blocked by
 unresolved lower-frontier debt as loss evidence by itself. In that condition it
 continues servicing carrier ACKs, product ACKs, control frames, flow-control
@@ -4103,18 +4178,23 @@ repair; it does not change stream semantics. The receiver still accepts the
 data by stream offset and discards duplicates after the corresponding range is
 ACKed or delivered.
 
-For the lead path, `lead_product_queue_envelope` is the preemptible product
-repair and flow-control envelope, not the UDP carrier cwnd. This larger
-envelope applies only while the lead path owns the lower outstanding stream
-frontier. If the lead candidate would send after lower offsets already owned by
-another path, it is no longer simply feeding its own contiguous frontier; it
-must fit within the same-underlay reorder budget before ordinary bulk can
-continue there. This prevents the lead role from becoming a loophole that
-admits tens of MiB of ordered receive hole. The configured path inflight value
-is the resource ceiling for the product queue; it is not a congestion-control
-claim and it does not permit non-preemptible giant frames. Additional
-cross-underlay paths use the stricter reorder budget because they can create
-head-of-line debt behind data already committed on another path.
+For the lead path, `service_owner_envelope` is the preemptible product repair
+and flow-control envelope, not the UDP carrier cwnd. Before path-scoped mature
+bulk-rate evidence exists, it is the Service startup horizon. After that
+evidence exists, it is the configured product envelope. Same-path latency
+pressure narrows it back to the feed reservoir. The configured product/repair
+envelope remains a hard resource ceiling, not a carrier congestion-window
+claim. This envelope applies only while the lead path owns the lower
+outstanding stream frontier, including the first quantum of a newly elected
+Service failover. If the lead candidate would send after lower offsets already
+owned by another path, it is no longer simply feeding its own contiguous
+frontier; it must fit within the same-underlay reorder budget before ordinary
+bulk can continue there. This prevents the lead role from becoming a loophole
+that admits tens of MiB of ordered receive hole. The configured path inflight
+value is the resource ceiling for assigned product work; it is not a
+congestion-control claim and it does not permit non-preemptible giant frames.
+Additional cross-underlay paths use the stricter reorder budget because they
+can create head-of-line debt behind data already committed on another path.
 
 Here, `chunk` is the next preemptible scheduler quantum or bounded validation
 proof quantum for the stream. It is not the read-buffer ceiling and it is not
@@ -4130,27 +4210,27 @@ case where all-path bulk performs below the best single path is a scheduler
 admission failure unless the result is explained by external non-repeatable
 environment noise and confirmed by rerun.
 
-The lead data path and additional striping paths have different risk. The lead
-path is a scheduling role selected per bulk quantum from the current ETA model;
-it is not simply the path that was attached most recently or used for the
-previous frame. The lead path is still gated by product flight and carrier
-backpressure, but it is not rejected by a completion-horizon comparison against
-another path that may itself fail admission. It does not consume a cross-path
-reorder budget merely by continuing a stream on the path that currently defines
-the receiver's contiguous frontier. Additional paths, including validation
-duplicates and same-stream striping candidates, are admitted against the smaller
-confidence-scaled reorder budget and the completion-horizon gate. They MUST NOT
-borrow the full product inflight envelope. This distinction preserves
-single-path throughput while preventing a speculative or heterogeneous extra
-path from creating tens of MiB of ordered-stream head-of-line debt.
+The Service owner and optional striping paths have different risk. The current
+ETA model selects a comparison anchor for no-worse and completion-horizon tests;
+that anchor is not by itself a dispatch role and does not migrate Service. After
+any bounded startup-sampling spend, a feedable Service receives the next ordinary
+bulk quantum. It is gated by assigned product flight and carrier backpressure,
+but it is not rejected merely because an optional path has a lower raw ETA. A
+Service that continues its own contiguous frontier does not consume cross-path
+reorder budget. Additional paths, including Validation candidates and measured
+Subflows, are admitted against their BDP/reorder budget and the completion-
+horizon gate. They MUST NOT borrow the full Service product envelope. This
+distinction preserves single-path throughput while preventing a speculative or
+heterogeneous extra path from creating tens of MiB of ordered-stream head-of-
+line debt.
 
-The older attached active path remains a lifecycle and failover concept, but it
-does not grant ordinary bulk scheduling privilege. If diagnostics show that a
-path with lower ETA and delivery evidence exists, that path becomes the lead for
-the next quantum and the stale attached path is evaluated as an additional
-candidate. This prevents active-path stickiness after a path switch, which
-diagnostics showed can otherwise alternate between a fast UDP path and a
-high-RTT or low-rate TCP path while growing tens of MiB of receive hole.
+An attached Active path is a lifecycle concept unless it is the current Service
+or authoritative lower-frontier owner; attachment alone grants no ordinary bulk
+privilege. A lower-ETA measured Subflow may carry admitted overflow when Service
+cannot accept the next quantum, but that send does not migrate Service. Service
+moves only through explicit frontier-safe migration, reattachment, or failover.
+This avoids both stale Active stickiness and frame-by-frame alternation between
+a fast path and a high-RTT or low-rate path.
 
 Data-plane repair progress releases product repair state, but it is not
 path-scoped delivery proof when the repaired byte range was duplicated. When a
@@ -4195,14 +4275,16 @@ ordinary PTO before sending repair.
 For TCP, the configured path inflight limit is a product-queue resource ceiling
 because kernel TCP still owns congestion control inside that stream. For UDP,
 QUIC owns carrier congestion control and packet pacing; mptunnel owns only the
-product work admitted to the QUIC stream. In both cases, lead and same-underlay
-product admission is derived from live BDP, path inflight evidence when it is
-smaller, the next quantum size, and the configured resource ceiling. The
-configured ceiling MUST NOT become the lead path's scheduling target merely
-because the path is attached or active. Actual network emission remains gated by
-the QUIC sender or kernel TCP. This matches QUIC and BBR practice: the stream
-scheduler may have ready data, while the packet sender paces and gates network
-flight.
+product work admitted to the QUIC stream. In both cases, an unproven Service is
+bounded by its startup horizon; a mature clear-frontier Service may use the
+configured product envelope, narrowed to its feed reservoir by same-path latency
+pressure. Optional same-underlay admission is instead derived from live BDP,
+path inflight evidence when it is smaller, the next quantum size, and the
+configured resource ceiling. The configured envelope is permission for bounded
+ready Service data, not a queue-fill target and not a carrier congestion-window
+claim. Actual network emission remains gated by the QUIC sender or kernel TCP.
+This matches QUIC and BBR practice: the stream scheduler may have ready data,
+while the packet sender paces and gates network flight.
 Cross-underlay ordinary striping is stricter: it also accounts for confidence and
 receiver reorder budget because TCP and UDP expose different loss, pacing, and
 head-of-line behavior.
@@ -4297,27 +4379,37 @@ fixed millisecond slack:
 ```
 eta_rate = max(path.pacing_rate, path.delivery_rate)
 eta_bdp = eta_rate * path.srtt
-product_budget_rate = path.product_progress_rate if known else none
-product_budget_bdp = product_budget_rate * path.srtt
-service_path = stream.live_service_owner
-lead_path = min_eta_candidate_that_is_eligible_and_admissible_for_ordinary_bulk()
+service_path = stream.live_service_owner or explicit_frontier_safe_failover_service()
+comparison_anchor = persistent_service_anchor_under_authoritative_debt()
+                    or min_eta_candidate_eligible_for_no_worse_comparison()
 startup_sampling = session.active_direction_relevant_reliable_response_flows >= 2
                    and startup_sample_epoch_selects(stream, path, chunk)
-if path is the lead path:
+if path is the service_path and stream_ordering_debt(path, chunk) == 0:
     # The current Service owner is the primary ordered-byte owner.  App-limited
     # or low-rate ACK feedback is visibility, not a product-flight ceiling.
     # TCP/QUIC carrier congestion still drains below this envelope.
-    if latency_sensitive_work_is_active_on_this_session_or_path:
+    if not path.has_bulk_rate_evidence:
         product_inflight_limit = service_horizon(chunk,
                                                  configured_path_inflight,
                                                  configured_stream_window,
                                                  configured_receiver_reorder)
     else:
-        product_inflight_limit = min(configured_path_inflight,
-                                     configured_stream_window,
-                                     configured_receiver_reorder)
+        feed_reservoir = min(
+            bounded_bbr_headroom_window(service_horizon(chunk,
+                                                        configured_path_inflight,
+                                                        configured_stream_window,
+                                                        configured_receiver_reorder)),
+            configured_path_inflight,
+            configured_stream_window,
+            configured_receiver_reorder)
+        if latency_sensitive_work_is_active_on_this_path:
+            product_inflight_limit = feed_reservoir
+        else:
+            product_inflight_limit = min(configured_path_inflight,
+                                         configured_stream_window,
+                                         configured_receiver_reorder)
     product_inflight_limit = max(product_inflight_limit, chunk.len)
-else if path uses the same underlay family as the lead path:
+else if path uses the same underlay family as the service_path:
     product_inflight_limit = min(path.carrier_inflight_limit if known else infinity,
                                  2 * eta_bdp,
                                  configured_path_inflight)
@@ -4345,40 +4437,47 @@ if path != service_path and ordering_debt.bytes > 0:
     else if not (path has bulk_rate_evidence
                  and path.underlay_family == service_path.underlay_family):
         suppress additional OwnerData for this bulk quantum
-if path is the lead path and stream_ordering_debt(path, chunk) == 0:
+if path is the service_path and stream_ordering_debt(path, chunk) == 0:
     admission_reorder_budget = product_inflight_limit
-else if path is the lead path:
+else if path is the service_path:
     admission_reorder_budget = base_reorder_budget
-else if path uses the same underlay family as the lead path:
+else if path uses the same underlay family as the service_path:
     admission_reorder_budget = base_reorder_budget
 else:
     admission_reorder_budget = effective_reorder_budget
 
-best_rate = max(best_path.pacing_rate, best_path.delivery_rate)
+best_rate = max(comparison_anchor.pacing_rate, comparison_anchor.delivery_rate)
 best_chunk_tx = chunk.len / best_rate
 candidate_debt = path.queue_bytes + path.bytes_in_flight + chunk.len
 candidate_debt += stream_ordering_debt(path, chunk)
 reorder_absorption = max(0, effective_reorder_budget - candidate_debt)
                      / best_rate
-completion_horizon = eta_best + best_chunk_tx + reorder_absorption
-if path is an additional data path and not startup_sampling
+completion_horizon = eta_comparison_anchor + best_chunk_tx + reorder_absorption
+if path is an optional data path and not startup_sampling
    and eta_path > completion_horizon:
     suppress additional OwnerData for this bulk quantum
-if path is the previously attached active path but not the lead path
+if path is attached Active but is neither Service nor the lower-frontier owner
    and not startup_sampling
    and stream_ordering_debt(path, chunk) > 0
-   and eta_path > eta_best
+   and eta_path > eta_comparison_anchor
    and eta_path > completion_horizon:
     suppress stale active path for this bulk quantum
+
+selected_path = startup_sampling_candidate if one was admitted
+                else feedable service_path if admitted
+                else best_admitted_optional_path_by_eta()
+successful optional emission does not change service_path
 ```
 
 Admission gains are internal model-control coefficients, not operator-visible
 traffic modes. In production v1 they apply to additional same-family ordinary
 striping and explicit Service migration/failover decisions. Cross-underlay TCP+QUIC
 `OwnerData` is not admitted as concurrent later-offset striping or implicit
-clear-frontier Service reselection. Lead and same-underlay product queues use a
-BDP/inflight-derived envelope capped by the configured resource ceiling, while
-carrier controllers still enforce network flight. This follows BBR's separation
+clear-frontier Service reselection. Mature clear-frontier Service product
+flight/queues use the configured product envelope, with the startup horizon and
+same-path latency-pressure narrowing defined above. Optional same-underlay paths
+use BDP/inflight-derived admission capped by the configured resource ceiling,
+while carrier controllers still enforce network flight. This follows BBR's separation
 between ready application data and paced network inflight, while preserving the
 ECF/BLEST rule that heterogeneous paths must not create avoidable head-of-line
 blocking.
@@ -4406,8 +4505,9 @@ However, an app-limited sample also does not prove that the path can safely hold
 the path's bulk capacity. It therefore MUST NOT initialize a tiny BDP-derived
 bulk model or make another path Service. For the current clear-frontier Service
 owner, the app-limited sample also MUST NOT shrink product admission below the
-carrier-neutral product envelope. Non-app-limited bulk evidence is required for
-ordinary Subflow capacity claims and for migration ranking; it is not required
+stable startup/preemptible Service horizon. Mature bulk evidence is required to
+unlock the full carrier-neutral product envelope. Non-app-limited bulk evidence
+is required for ordinary Subflow capacity claims and for migration ranking; it is not required
 just to keep the current Service path fed or to spend the explicitly bounded
 startup-sample epoch.
 While there is no lower-frontier owner on another path and the Service-owner
@@ -4463,13 +4563,17 @@ current reorder budget.
 
 The configured path inflight value is a product-queue resource ceiling, not a
 carrier congestion window and not an active-path scheduling target. A conforming
-sender derives lead, same-underlay, and cross-underlay product inflight from the
-live BDP model, path inflight evidence when present, and the next chunk size,
-then caps that result by the configured path inflight ceiling. Control, ACKs,
-repair, and latency frames must still interleave with any admitted bulk work.
-The configured ceiling MUST be applied as an upper bound over the adaptive
-product-flight model. It MUST NOT be implemented as a floor that expands a
-smaller ACK-clocked or carrier-derived sender queue to the configured maximum.
+sender bounds an unproven Service by its startup horizon and permits a mature
+clear-frontier Service to use the configured product envelope, narrowed under
+same-path latency pressure. It derives optional same-underlay and cross-underlay
+product admission from the live BDP model, path inflight evidence when present,
+and the next chunk size, then caps that result by the configured path inflight
+ceiling. Control, ACKs, repair, and latency frames must still interleave with any
+admitted bulk work. The configured ceiling MUST remain an upper bound for
+optional or unknown-path admission; it MUST NOT be used as a floor that expands
+a smaller ACK-clocked or carrier-derived optional queue. The mature
+clear-frontier Service envelope is the deliberate product-readiness exception,
+not an expansion of carrier network flight.
 Tail guards and authoritative lower-flight debt MUST NOT bypass the active
 Service product-flight admission check. A live contiguous Service tail acts as
 a family/evidence filter for alternate owners but MUST NOT make the current
@@ -4480,10 +4584,11 @@ debt-expanding cross-family candidates remain Probe, Standby, or RepairOnly
 until the guard/debt clears. The surviving measured OwnerData candidates are
 ranked by the normal no-worse admission checks: ETA, inflight, ordering debt,
 read-gap/reorder budget, queue, and completion horizon. The selected startup
-candidate uses its narrower epoch checks instead. A sender MUST NOT hard-pin new OwnerData
-to the current owner merely because that owner owns older bytes; doing so turns
-ordering debt into receive-hole growth and sender starvation instead of an
-ECF/BLEST-style completion decision. A measured Subflow admitted at a clear frontier still
+candidate uses its narrower epoch checks instead. A sender MUST NOT pin new
+OwnerData to a stale lifecycle Active output or raw lowest-ETA candidate merely
+because it carried earlier bytes. An authoritative lower-frontier owner is the
+exception: it alone continues that frontier until admission, repair, or ACK
+progress resolves the debt. A measured Subflow admitted at a clear frontier still
 MUST NOT change the Service owner hint merely because it carried the next range.
 If that Subflow later owns an authoritative lower ACK hole, it still uses its
 Subflow role and admission envelope while continuing the lower frontier; the
@@ -4525,12 +4630,12 @@ unknown paths from being trusted as production bulk lanes while still allowing
 aggressive proof traffic when the model predicts it will not increase
 completion time.
 
-Confidence scaling does not shrink the lead path's basic product Service
+Confidence scaling does not shrink the Service path's basic product
 horizon below `product_inflight_limit`; otherwise a single path would bootstrap
 too slowly and bulk throughput would regress. It also does not
 shrink same-underlay aggregation below the unscaled BDP reorder budget, because
 that turns a healthy pure-UDP or pure-TCP multipath transfer into a permanent
-probe. The unscaled lead/same-underlay rule MUST NOT be applied to
+probe. The Service/same-underlay rule MUST NOT be applied to
 cross-underlay additional paths, because that would convert a resource ceiling
 into mixed-carrier reorder permission and reintroduce the all-path
 below-best-single-path failure mode.
@@ -4560,11 +4665,12 @@ BDP/reorder admission gate applies again.
 
 Per-stream striping admission MUST NOT be confused with independent-flow
 fairness. A path excluded from a stream's striping subflow set does not become an ordinary data
-path simply because it is attached. If the previously attached active path is
-no longer the best admitted path, the sender MAY explicitly move ordinary bulk
-data to the better lead candidate and let delivery evidence decide whether it
-should remain in the subflow set. It MUST NOT silently convert a Repair path into an
-ordinary data path. This rule follows the MPTCP lesson that subflow scheduling
+path simply because it is attached. A previously attached Active output has no
+ordinary-data privilege unless it is the current Service or authoritative lower-
+frontier owner. A measured Subflow may carry admitted overflow without becoming
+Service; moving ordinary bulk ownership requires an explicit frontier-safe
+Service migration or failover decision. The sender MUST NOT silently convert a
+Repair path into an ordinary data path. This rule follows the MPTCP lesson that subflow scheduling
 and connection-level sequence correctness are separate decisions: a scheduler
 may use multiple subflows, but it must not move every independent flow to the
 same subflow just because that subflow has the best immediate ETA before flow
@@ -5195,7 +5301,17 @@ score(path, lane, payload_bytes):
 select_bulk_data_path(stream, frame, paths):
     if frame is repair:
         return best_survivor_avoiding_original_path()
-    candidates = current Service plus bulk-rate-proven measured Subflows
+    prospective_Service = none
+    if stream.current_Service is absent
+       and stream has no live lower_frontier_owner:
+        if stream.ordered_owner_debt == 0:
+            prospective_Service = best_live_attached_output(excluding Repair)
+        else if stream.ordered_owner is missing:
+            prospective_Service = best_sender_evidenced_output_on_same_underlay(
+                                      stream.ordered_owner)
+    candidates = current Service or prospective_Service
+                 plus bulk-rate-proven measured Subflows,
+                 excluding Repair attachments
     if session.active_direction_relevant_reliable_response_flows >= 2
        and stream has an active startup-sampling candidate:
         candidates += that one Validation candidate
@@ -5203,6 +5319,8 @@ select_bulk_data_path(stream, frame, paths):
     for path in candidates:
         role = startup_sample_subflow
                if path is stream.startup_sample_epoch.candidate
+               else lead_data_path
+               if path is stream.current_Service or prospective_Service
                else ordinary_data_role(path)
         if bulk_admit(stream, path, frame, role):
             admitted += path
@@ -5214,6 +5332,9 @@ select_bulk_data_path(stream, frame, paths):
         return stream.lower_frontier_owner
     if stream.current_Service is in admitted:
         return stream.current_Service
+    if prospective_Service is in admitted:
+        return prospective_Service as Service
+        # Commit Service ownership only after carrier enqueue succeeds.
     return best_admitted_overflow_Subflow(admitted)
 
 assign_independent_bulk_flow(flow, paths):
@@ -5266,7 +5387,7 @@ lane_protection_debt(path, lane):
 
 admission_reorder_budget(stream, path, chunk, role, ordering_debt):
     if role == lead_data_path and ordering_debt == 0:
-        return product_queue_envelope(path, chunk, role)
+        return service_owner_envelope(path, chunk)
     if role == lead_data_path:
         return base_reorder_budget(path, chunk)
     if role == startup_sample_subflow:
@@ -5275,7 +5396,19 @@ admission_reorder_budget(stream, path, chunk, role, ordering_debt):
         return base_reorder_budget(path, chunk)
     return effective_reorder_budget(path, chunk)
 
-product_queue_envelope(path, chunk, role):
+service_owner_envelope(path, chunk):
+    horizon = throughput_service_horizon(chunk.len)
+    envelope = min(configured_stream_window,
+                   configured_path_inflight,
+                   configured_receiver_reorder)
+    if not path.has_bulk_rate_evidence:
+        return horizon
+    reservoir = min(bounded_bbr_headroom_window(horizon), envelope)
+    if latency_sensitive_work_is_active_on_this_path:
+        return reservoir
+    return envelope
+
+optional_product_queue_envelope(path, chunk, role):
     bdp_limit = max(2 * path_bdp(path), chunk.len)
     if path.carrier_inflight_limit is known:
         modeled = min(path.carrier_inflight_limit, bdp_limit)
@@ -5286,7 +5419,7 @@ product_queue_envelope(path, chunk, role):
 
 scheduler_inflight_debt(path, role):
     if role == lead_data_path:
-        return path.product_bytes_in_flight + path.queue_bytes
+        return max(path.product_bytes_in_flight, path.queue_bytes)
     if path.underlay == UDP and role == additional_cross_underlay:
         return path.carrier_queue_bytes + path.carrier_bytes_in_flight
     return path.product_bytes_in_flight
@@ -5327,13 +5460,17 @@ bulk_admit(stream, path, chunk, role):
            startup_product_envelope(stream, chunk):
             return false
         return carrier_and_resource_envelopes_allow(path, chunk)
-    if role == additional_cross_underlay:
+    if role == lead_data_path:
+        if scheduler_inflight_debt(path, role) + chunk.len >
+           service_owner_envelope(path, chunk):
+            return false
+    else if role == additional_cross_underlay:
         if scheduler_inflight_debt(path, role) + chunk.len >
            carrier_validation_queue_limit(path, chunk):
             return false
     else:
         if scheduler_inflight_debt(path, role) + chunk.len >
-           product_queue_envelope(path, chunk, role):
+           optional_product_queue_envelope(path, chunk, role):
             return false
     ordering_debt = stream_ordering_debt(stream, path, chunk)
     if product_reorder_debt(path) + ordering_debt + chunk.len >

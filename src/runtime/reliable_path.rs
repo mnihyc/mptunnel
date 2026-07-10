@@ -1,8 +1,18 @@
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
+const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
+const RESPONSE_OWNER_MIXED_SEEN: u8 = RESPONSE_OWNER_TCP_SEEN | RESPONSE_OWNER_UDP_SEEN;
+
+fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8 {
+    match underlay {
+        UnderlayProtocol::Tcp => RESPONSE_OWNER_TCP_SEEN,
+        UnderlayProtocol::Udp => RESPONSE_OWNER_UDP_SEEN,
+    }
+}
 
 mod registry;
 mod response_admission;
@@ -634,8 +644,40 @@ pub(super) async fn wait_for_carrier_capacity_notifies(notifies: Vec<Arc<Notify>
 /// TCP/QUIC packet recovery.
 #[derive(Default)]
 struct ResponseSubflowSetState {
-    generation: u64,
+    planner_generation: u64,
+    epoch_generation: u64,
     set: Option<FlowSubflowSet>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseSubflowAdmissionReservation {
+    pub(super) admission: PathAdmission,
+    pub(super) epoch_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseSubflowAdmissionRequest {
+    pub(super) expected_planner_generation: u64,
+    pub(super) expected_lane_generation: u64,
+    pub(super) service: CarrierPathKey,
+    pub(super) startup_owner_credit_bytes: usize,
+    pub(super) optional_overhead_budget_bytes: usize,
+    pub(super) max_read_gap_budget: Duration,
+    pub(super) input: SubflowAdmissionInput,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseSourceServiceSnapshot {
+    pub(super) key: CarrierPathKey,
+    pub(super) active_latency_sensitive_flows: u32,
+    pub(super) has_bulk_rate_evidence: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseRelayReadSnapshot {
+    pub(super) send_path: Option<PathSnapshot>,
+    pub(super) source_service: Option<ResponseSourceServiceSnapshot>,
+    pub(super) independent_source_staging: bool,
 }
 
 pub(super) struct ResponseStreamBinding {
@@ -645,6 +687,7 @@ pub(super) struct ResponseStreamBinding {
     lane_tracker: Arc<ServerPathLaneTracker>,
     response_flow_registration: ServerResponseFlowRegistration,
     next_output_incarnation: AtomicU64,
+    owner_underlay_history: AtomicU8,
     outputs: Mutex<ResponseStreamOutputs>,
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
@@ -763,6 +806,7 @@ impl ResponseStreamBinding {
             lane_tracker,
             response_flow_registration,
             next_output_incarnation: AtomicU64::new(2),
+            owner_underlay_history: AtomicU8::new(response_owner_underlay_seen_bit(underlay)),
             outputs: Mutex::new(ResponseStreamOutputs {
                 entries: vec![ResponseStreamOutputEntry {
                     key,
@@ -959,9 +1003,13 @@ impl ResponseStreamBinding {
                         self.sync_response_flow_activity(&outputs);
                     }
                     if role_changed {
-                        // Publish the new output role and Subflow generation at
-                        // one outputs-lock linearization point.
+                        // Publish the new output role and reset both Subflow
+                        // identities at one outputs-lock linearization point.
                         self.reset_subflow_set();
+                    }
+                    if updated_role != StreamOpenRole::Repair {
+                        self.owner_underlay_history
+                            .fetch_or(response_owner_underlay_seen_bit(underlay), Ordering::AcqRel);
                     }
                     drop(outputs);
                     drop(current_lane);
@@ -1084,8 +1132,17 @@ impl ResponseStreamBinding {
             self.sync_response_flow_activity(&outputs);
         }
         // A planner may snapshot the old generation before blocking on outputs,
-        // but it cannot observe new membership before this reset completes.
-        self.reset_subflow_set();
+        // but it cannot observe new membership before this invalidation completes.
+        // Passive growth does not recreate cumulative startup sampling credit.
+        if replaced_closed || role == StreamOpenRole::Active {
+            self.reset_subflow_set();
+        } else {
+            self.invalidate_subflow_plan();
+        }
+        if role != StreamOpenRole::Repair {
+            self.owner_underlay_history
+                .fetch_or(response_owner_underlay_seen_bit(underlay), Ordering::AcqRel);
+        }
         drop(outputs);
         drop(current_lane);
         if role == StreamOpenRole::Validation {
@@ -1112,14 +1169,26 @@ impl ResponseStreamBinding {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
-        let stored_active_key = self.ordered_data_owner();
+        self.relay_read_snapshot(lane, payload_bytes).send_path
+    }
+
+    pub(super) fn relay_read_snapshot(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> ResponseRelayReadSnapshot {
+        let may_have_mixed_owner_underlays = self.may_have_mixed_owner_underlays();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
-        outputs.read_backpressure_snapshot(
-            active_key,
+        let stored_service_key = *self
+            .ordered_data_owner
+            .lock()
+            .expect("server reliable stream ordered data owner lock");
+        outputs.relay_read_snapshot(
+            stored_service_key,
+            may_have_mixed_owner_underlays,
             self.session_id,
             &self.lane_tracker,
             lane,
@@ -1149,6 +1218,23 @@ impl ResponseStreamBinding {
                 self.mux_limits,
             )
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_live_mixed_owner_underlays(&self) -> bool {
+        if !self.may_have_mixed_owner_underlays() {
+            return false;
+        }
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        response_outputs_have_live_mixed_owner_underlays(&outputs.entries)
+    }
+
+    pub(super) fn may_have_mixed_owner_underlays(&self) -> bool {
+        self.owner_underlay_history.load(Ordering::Acquire) & RESPONSE_OWNER_MIXED_SEEN
+            == RESPONSE_OWNER_MIXED_SEEN
     }
 
     fn set_sender_queue_bytes(&self, bytes: usize) {
@@ -1472,8 +1558,8 @@ impl ResponseStreamBinding {
         drop(outputs);
         if changed || ordering_update.changed {
             // ACK progress updates path evidence and ordering, but Subflow
-            // admission credit is epoch state. Recreate it only when membership
-            // or the admission envelope changes.
+            // admission credit is epoch state. Recreate it only on a semantic
+            // reset or admission-envelope change, not passive membership growth.
             self.notify_update();
         }
     }
@@ -1545,7 +1631,7 @@ impl ResponseStreamBinding {
 
     fn subflow_set_for(
         current: Option<FlowSubflowSet>,
-        generation: u64,
+        epoch_generation: u64,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
@@ -1562,7 +1648,7 @@ impl ResponseStreamBinding {
             })
             .unwrap_or_else(|| {
                 FlowSubflowSet::new(
-                    generation,
+                    epoch_generation,
                     service,
                     startup_owner_credit_bytes,
                     optional_overhead_budget_bytes,
@@ -1585,7 +1671,7 @@ impl ResponseStreamBinding {
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
-        (state.generation, state.set.clone())
+        (state.planner_generation, state.set.clone())
     }
 
     #[cfg(test)]
@@ -1611,12 +1697,12 @@ impl ResponseStreamBinding {
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
-        let generation = state.generation;
+        let epoch_generation = state.epoch_generation;
         let current = state.set.clone();
         drop(state);
         let mut epoch = Self::subflow_set_for(
             current,
-            generation,
+            epoch_generation,
             service,
             startup_owner_credit_bytes,
             optional_overhead_budget_bytes,
@@ -1635,7 +1721,7 @@ impl ResponseStreamBinding {
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
         let (generation, _) = self.subflow_state_snapshot();
-        self.commit_subflow_owner_admission_for_generation(
+        self.commit_subflow_owner_admission_for_planner_generation(
             generation,
             self.lane_generation(),
             service,
@@ -1646,9 +1732,10 @@ impl ResponseStreamBinding {
         )
     }
 
-    pub(super) fn commit_subflow_owner_admission_for_generation(
+    #[cfg(test)]
+    pub(super) fn commit_subflow_owner_admission_for_planner_generation(
         &self,
-        expected_generation: u64,
+        expected_planner_generation: u64,
         expected_lane_generation: u64,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
@@ -1656,41 +1743,105 @@ impl ResponseStreamBinding {
         max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
-        self.lane_tracker
-            .with_matching_generation(self.session_id, expected_lane_generation, || {
-                let mut state = self
-                    .subflow_set
-                    .lock()
-                    .expect("server reliable stream subflow set lock");
-                if state.generation != expected_generation {
-                    return PathAdmission::standby();
-                }
-                let current = state.set.take();
-                let mut epoch = Self::subflow_set_for(
-                    current,
-                    state.generation,
-                    service,
-                    startup_owner_credit_bytes,
-                    optional_overhead_budget_bytes,
-                    max_read_gap_budget,
-                );
-                let admission = epoch.admit_subflow_owner(input);
-                state.set = epoch.has_members().then_some(epoch);
-                admission
-            })
-            .unwrap_or_else(PathAdmission::standby)
+        self.reserve_subflow_owner_admission_for_planner_generation(
+            expected_planner_generation,
+            expected_lane_generation,
+            service,
+            startup_owner_credit_bytes,
+            optional_overhead_budget_bytes,
+            max_read_gap_budget,
+            input,
+        )
+        .admission
     }
 
-    pub(super) fn rollback_subflow_owner_admission_for_generation(
+    #[cfg(test)]
+    pub(super) fn reserve_subflow_owner_admission_for_planner_generation(
         &self,
-        expected_generation: u64,
+        expected_planner_generation: u64,
+        expected_lane_generation: u64,
+        service: CarrierPathKey,
+        startup_owner_credit_bytes: usize,
+        optional_overhead_budget_bytes: usize,
+        max_read_gap_budget: Duration,
+        input: SubflowAdmissionInput,
+    ) -> ResponseSubflowAdmissionReservation {
+        let request = ResponseSubflowAdmissionRequest {
+            expected_planner_generation,
+            expected_lane_generation,
+            service,
+            startup_owner_credit_bytes,
+            optional_overhead_budget_bytes,
+            max_read_gap_budget,
+            input,
+        };
+        let standby = || ResponseSubflowAdmissionReservation {
+            admission: PathAdmission::standby(),
+            epoch_generation: None,
+        };
+        self.lane_tracker
+            .with_matching_generation(self.session_id, expected_lane_generation, || {
+                self.reserve_subflow_owner_admission_for_request(request)
+            })
+            .unwrap_or_else(standby)
+    }
+
+    fn reserve_subflow_owner_admission_for_request(
+        &self,
+        request: ResponseSubflowAdmissionRequest,
+    ) -> ResponseSubflowAdmissionReservation {
+        let standby = || ResponseSubflowAdmissionReservation {
+            admission: PathAdmission::standby(),
+            epoch_generation: None,
+        };
+        let mut state = self
+            .subflow_set
+            .lock()
+            .expect("server reliable stream subflow set lock");
+        if state.planner_generation != request.expected_planner_generation {
+            return standby();
+        }
+        let envelope_changed = state.set.as_ref().is_some_and(|epoch| {
+            !epoch.matches_envelope(
+                request.service,
+                request.startup_owner_credit_bytes,
+                request.optional_overhead_budget_bytes,
+                request.max_read_gap_budget,
+            )
+        });
+        if envelope_changed {
+            state.planner_generation = state.planner_generation.wrapping_add(1);
+            state.epoch_generation = state.epoch_generation.wrapping_add(1);
+            state.set = None;
+        }
+        let current = state.set.take();
+        let mut epoch = Self::subflow_set_for(
+            current,
+            state.epoch_generation,
+            request.service,
+            request.startup_owner_credit_bytes,
+            request.optional_overhead_budget_bytes,
+            request.max_read_gap_budget,
+        );
+        let admission = epoch.admit_subflow_owner(request.input);
+        state.set = epoch.has_members().then_some(epoch);
+        ResponseSubflowAdmissionReservation {
+            epoch_generation: (admission.decision == PathAdmissionDecision::AdmitSubflow)
+                .then_some(state.epoch_generation),
+            admission,
+        }
+    }
+
+    pub(super) fn rollback_subflow_owner_admission_for_epoch(
+        &self,
+        expected_epoch_generation: u64,
         input: SubflowAdmissionInput,
     ) {
         let mut state = self
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
-        if state.generation == expected_generation
+        if state.epoch_generation == expected_epoch_generation
             && let Some(epoch) = state.set.as_mut()
         {
             epoch.rollback_subflow_owner(input);
@@ -1702,8 +1853,17 @@ impl ResponseStreamBinding {
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
-        state.generation = state.generation.wrapping_add(1);
+        state.planner_generation = state.planner_generation.wrapping_add(1);
+        state.epoch_generation = state.epoch_generation.wrapping_add(1);
         state.set = None;
+    }
+
+    fn invalidate_subflow_plan(&self) {
+        let mut state = self
+            .subflow_set
+            .lock()
+            .expect("server reliable stream subflow set lock");
+        state.planner_generation = state.planner_generation.wrapping_add(1);
     }
 
     fn repair_ordered_data_owner_after_output_change(
@@ -1720,6 +1880,7 @@ impl ResponseStreamBinding {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn record_owner_flight_for_target(
         &self,
         target: &ResponseSenderPathTarget,
@@ -1733,6 +1894,115 @@ impl ResponseStreamBinding {
             frame,
             CarrierWorkKind::OwnerData,
         )
+    }
+
+    pub(super) fn try_enqueue_owner_frame_for_target(
+        &self,
+        target: &ResponseSenderPathTarget,
+        frame: &Frame,
+        lane: FlowLane,
+        subflow_request: Option<ResponseSubflowAdmissionRequest>,
+    ) -> Result<Option<u64>, RuntimeError> {
+        self.try_enqueue_owner_frame_for_target_inner(target, frame, lane, subflow_request, || {})
+    }
+
+    fn try_enqueue_owner_frame_for_target_inner(
+        &self,
+        target: &ResponseSenderPathTarget,
+        frame: &Frame,
+        lane: FlowLane,
+        subflow_request: Option<ResponseSubflowAdmissionRequest>,
+        after_subflow_reservation: impl FnOnce(),
+    ) -> Result<Option<u64>, RuntimeError> {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let target_matches = |entry: &ResponseStreamOutputEntry| {
+            entry.key == target.key
+                && entry.incarnation == target.incarnation
+                && entry.commands.same_channel(&target.commands)
+                && entry.role == target.attachment_role
+                && entry.role != StreamOpenRole::Repair
+        };
+        let target_index = outputs
+            .entries
+            .last()
+            .filter(|entry| target_matches(entry))
+            .map(|_| outputs.entries.len() - 1)
+            .or_else(|| outputs.entries.iter().position(target_matches));
+        let Some(target_index) = target_index else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
+        if let Some(request) = subflow_request {
+            return self
+                .lane_tracker
+                .with_matching_generation(self.session_id, request.expected_lane_generation, || {
+                    let reservation = self.reserve_subflow_owner_admission_for_request(request);
+                    if reservation.admission.decision != PathAdmissionDecision::AdmitSubflow {
+                        return Err(RuntimeError::SenderServiceBlocked);
+                    }
+                    after_subflow_reservation();
+                    if let Err(err) = target
+                        .commands
+                        .try_enqueue_stream_ordered_frame(frame.clone(), lane)
+                    {
+                        if let Some(epoch_generation) = reservation.epoch_generation {
+                            self.rollback_subflow_owner_admission_for_epoch(
+                                epoch_generation,
+                                request.input,
+                            );
+                        }
+                        return Err(err);
+                    }
+                    self.record_validated_owner_flight_with_outputs(
+                        &mut outputs,
+                        target_index,
+                        frame,
+                    );
+                    Ok(reservation.epoch_generation)
+                })
+                .unwrap_or(Err(RuntimeError::SenderServiceBlocked));
+        }
+        target
+            .commands
+            .try_enqueue_stream_ordered_frame(frame.clone(), lane)?;
+        self.record_validated_owner_flight_with_outputs(&mut outputs, target_index, frame);
+        Ok(None)
+    }
+
+    fn record_validated_owner_flight_with_outputs(
+        &self,
+        outputs: &mut ResponseStreamOutputs,
+        target_index: usize,
+        frame: &Frame,
+    ) {
+        let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
+            return;
+        };
+        let (key, output_incarnation) = {
+            let entry = outputs
+                .entries
+                .get_mut(target_index)
+                .expect("validated response output index");
+            debug_assert_ne!(entry.role, StreamOpenRole::Repair);
+            entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
+            (entry.key, entry.incarnation)
+        };
+        self.flights
+            .lock()
+            .expect("server reliable stream flight lock")
+            .entry(offset)
+            .or_default()
+            .push(CarrierPathFlight {
+                key,
+                output_incarnation,
+                end,
+                bytes,
+                sent_at: Instant::now(),
+                kind: CarrierWorkKind::OwnerData,
+                evidence_eligible: true,
+            });
     }
 
     pub(super) fn record_repair_flight_for_target(
@@ -1817,14 +2087,36 @@ impl ResponseStreamBinding {
         frame: &Frame,
         kind: CarrierWorkKind,
     ) {
-        debug_assert!(kind.carries_product_offsets());
-        let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
-            return;
-        };
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        self.record_product_flight_with_outputs(
+            &mut outputs,
+            key,
+            output_incarnation,
+            planned_role,
+            planned_commands,
+            frame,
+            kind,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_product_flight_with_outputs(
+        &self,
+        outputs: &mut ResponseStreamOutputs,
+        key: CarrierPathKey,
+        output_incarnation: u64,
+        planned_role: StreamOpenRole,
+        planned_commands: &ReliablePathCommandSender,
+        frame: &Frame,
+        kind: CarrierWorkKind,
+    ) {
+        debug_assert!(kind.carries_product_offsets());
+        let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
+            return;
+        };
         let (recorded_incarnation, evidence_eligible) = if let Some(entry) = outputs
             .entries
             .iter_mut()
@@ -1854,7 +2146,6 @@ impl ResponseStreamBinding {
                 kind,
                 evidence_eligible,
             });
-        drop(outputs);
     }
 
     fn invalidate_path_flight_evidence(&self, key: CarrierPathKey, output_incarnation: u64) {
@@ -2334,6 +2625,21 @@ fn response_live_ordered_data_owner(
     stored.filter(|key| entries.iter().any(|entry| entry.key == *key))
 }
 
+fn response_outputs_have_live_mixed_owner_underlays(entries: &[ResponseStreamOutputEntry]) -> bool {
+    let mut first_underlay = None;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.role != StreamOpenRole::Repair && !entry.commands.is_closed())
+    {
+        match first_underlay {
+            Some(underlay) if underlay != entry.key.underlay => return true,
+            Some(_) => {}
+            None => first_underlay = Some(entry.key.underlay),
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Stable identity for one live carrier path inside a session.
 ///
@@ -2686,7 +2992,10 @@ impl Drop for ServerRealtimeFlowRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
+    use crate::runtime::relay_io::reliable_relay_source_staging_owner_tail_headroom;
     use bytes::Bytes;
+    use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
 
     fn binding_for_underlay(
@@ -2774,6 +3083,280 @@ mod tests {
     }
 
     #[test]
+    fn independent_source_staging_requires_live_mixed_owner_underlays() {
+        let (active_commands, active_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(42),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            active_commands,
+            FlowLane::Throughput,
+        );
+        let mut receivers = vec![active_receivers];
+        assert!(!binding.has_live_mixed_owner_underlays());
+        assert!(
+            !binding
+                .relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+                .independent_source_staging
+        );
+        assert_eq!(
+            binding.owner_underlay_history.load(Ordering::Acquire),
+            RESPONSE_OWNER_TCP_SEEN
+        );
+
+        for (path_id, underlay, role, expected, expected_history) in [
+            (
+                1,
+                UnderlayProtocol::Tcp,
+                StreamOpenRole::Validation,
+                false,
+                RESPONSE_OWNER_TCP_SEEN,
+            ),
+            (
+                2,
+                UnderlayProtocol::Udp,
+                StreamOpenRole::Repair,
+                false,
+                RESPONSE_OWNER_TCP_SEEN,
+            ),
+            (
+                3,
+                UnderlayProtocol::Udp,
+                StreamOpenRole::Validation,
+                true,
+                RESPONSE_OWNER_MIXED_SEEN,
+            ),
+        ] {
+            let (commands, output_receivers) = reliable_path_command_channels(8);
+            assert_eq!(
+                binding.attach(
+                    underlay,
+                    PathId(path_id),
+                    commands,
+                    FlowLane::Throughput,
+                    role,
+                    reliable_relay_buffer_len(MuxLimits::default()),
+                ),
+                ResponseStreamAttachOutcome::Attached,
+            );
+            assert_eq!(
+                binding.has_live_mixed_owner_underlays(),
+                expected,
+                "only a live owner-capable cross-underlay output enables independent raw staging",
+            );
+            assert_eq!(
+                binding
+                    .relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+                    .independent_source_staging,
+                expected,
+                "the composite relay snapshot must use the same live-family policy",
+            );
+            assert_eq!(
+                binding.owner_underlay_history.load(Ordering::Acquire),
+                expected_history,
+                "Repair-only attachments must retain the single-family fast path",
+            );
+            receivers.push(output_receivers);
+        }
+    }
+
+    #[test]
+    fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
+        let session_id = SessionId(42);
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let alternate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+        let alternate_commands_for_detach = alternate_commands.clone();
+        assert_eq!(
+            binding.attach(
+                alternate.underlay,
+                alternate.path_id,
+                alternate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached,
+        );
+        let (latency_commands, _latency_receivers) = reliable_path_command_channels(8);
+        let _alternate_latency_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            alternate.underlay,
+            alternate.path_id,
+            latency_commands,
+            FlowLane::Latency,
+            MuxLimits::default(),
+            lane_tracker,
+        );
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let service_entry = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == service)
+                .expect("ordered Service output");
+            service_entry.delivery_rate_bps = Some(1_000_000.0);
+            service_entry.srtt_ms = Some(500.0);
+            service_entry.delivery_samples = 1;
+        }
+        binding.update_path_metrics(
+            alternate,
+            PathMetrics {
+                path_id: alternate.path_id,
+                underlay: alternate.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 5_000,
+                srtt_us: 5_000,
+                rttvar_us: 500,
+                jitter_us: 500,
+                delivery_rate_bps: 1_000_000_000,
+                pacing_rate_bps: 1_000_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                data_sample_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+
+        let before = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
+        assert!(before.send_path.is_some_and(|path| {
+            path.id == alternate.path_id && path.underlay == alternate.underlay
+        }));
+        assert_eq!(
+            before
+                .send_path
+                .expect("faster alternate send path")
+                .active_latency_sensitive_flows,
+            1
+        );
+        let source = before
+            .source_service
+            .expect("live ordered Service snapshot");
+        assert_eq!(source.key, service);
+        assert!(!source.has_bulk_rate_evidence);
+        assert!(before.independent_source_staging);
+
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let service_entry = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == service)
+                .expect("ordered Service output");
+            service_entry.product_progress_rate_bps = Some(1_000_000.0);
+            service_entry.owner_data_acked_bytes =
+                response_subflow_startup_sample_limit_bytes(binding.mux_limits());
+        }
+        let after = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
+        let source = after.source_service.expect("live ordered Service snapshot");
+        assert!(source.has_bulk_rate_evidence);
+        assert_eq!(source.active_latency_sensitive_flows, 0);
+        assert_eq!(
+            reliable_relay_source_staging_owner_tail_headroom(
+                after.independent_source_staging,
+                FlowLane::Throughput,
+                true,
+                source.active_latency_sensitive_flows > 0,
+                source.has_bulk_rate_evidence,
+                0,
+                0,
+                MuxLimits::default(),
+            ),
+            bulk_service_feed_reservoir_payload_bytes(
+                reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()),
+                MuxLimits::default(),
+            ),
+            "alternate-path latency pressure must not narrow exact-Service source staging"
+        );
+        let service_target = binding
+            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .find(|target| target.key == service)
+            .expect("ordered Service sender target");
+        assert_eq!(
+            source.has_bulk_rate_evidence, service_target.has_bulk_rate_evidence,
+            "source staging and sender admission must consume the same Service proof"
+        );
+
+        binding.detach(alternate, &alternate_commands_for_detach);
+        assert!(
+            !binding
+                .relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+                .independent_source_staging,
+            "mixed-family source staging must end when the alternate family detaches"
+        );
+    }
+
+    #[test]
+    fn udp_product_confidence_does_not_mature_response_source_staging() {
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(42),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+        );
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let service_entry = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == service)
+                .expect("ordered Service output");
+            service_entry.product_progress_rate_bps = Some(100_000_000.0);
+            service_entry.delivery_rate_bps = Some(100_000_000.0);
+            service_entry.srtt_ms = Some(20.0);
+            service_entry.delivery_samples = u32::MAX;
+            service_entry.owner_data_acked_bytes = u64::MAX;
+        }
+
+        let read = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
+        let source = read.source_service.expect("live ordered Service snapshot");
+        assert_eq!(source.key, service);
+        let send_path = read.send_path.expect("single live Service send snapshot");
+        assert_eq!(send_path.confidence, 1.0);
+        assert!(send_path.product_progress_rate_bps.is_some());
+        assert!(
+            !source.has_bulk_rate_evidence,
+            "UDP source staging requires local carrier ACK-derived bulk evidence"
+        );
+    }
+
+    #[test]
     fn response_repair_output_requires_explicit_active_reannounce() {
         let (binding, active) = binding_for_underlay(UnderlayProtocol::Tcp);
         let repair = CarrierPathKey {
@@ -2792,6 +3375,29 @@ mod tests {
                 reliable_relay_buffer_len(MuxLimits::default()),
             ),
             ResponseStreamAttachOutcome::Attached
+        );
+        assert_eq!(
+            binding.owner_underlay_history.load(Ordering::Acquire),
+            RESPONSE_OWNER_TCP_SEEN,
+            "Repair attachment must not disable the single-family fast path"
+        );
+
+        assert_eq!(
+            binding.attach(
+                repair.underlay,
+                repair.path_id,
+                repair_commands.clone(),
+                FlowLane::Latency,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached,
+            "same-channel Validation cannot weaken an existing Repair role"
+        );
+        assert_eq!(
+            binding.owner_underlay_history.load(Ordering::Acquire),
+            RESPONSE_OWNER_TCP_SEEN,
+            "an ineffective Validation request must not poison family history"
         );
 
         assert_eq!(
@@ -2816,6 +3422,10 @@ mod tests {
         assert_eq!(repair_entry.role, StreamOpenRole::Active);
         drop(outputs);
         assert_eq!(binding.ordered_data_owner(), Some(active));
+        assert_eq!(
+            binding.owner_underlay_history.load(Ordering::Acquire),
+            RESPONSE_OWNER_MIXED_SEEN
+        );
     }
 
     #[test]
@@ -3729,7 +4339,7 @@ mod tests {
     }
 
     #[test]
-    fn response_subflow_set_resets_when_output_membership_changes() {
+    fn response_subflow_epoch_survives_passive_growth_but_resets_on_detach() {
         let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
         let optional = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -3785,12 +4395,12 @@ mod tests {
             ResponseStreamAttachOutcome::Attached
         );
         assert!(
-            binding.subflow_set_snapshot().is_none(),
-            "adding passive output membership invalidates the current Subflow set"
+            binding.subflow_set_snapshot().is_some(),
+            "passive output growth must preserve the current Subflow epoch"
         );
         assert_eq!(
             binding
-                .commit_subflow_owner_admission_for_generation(
+                .commit_subflow_owner_admission_for_planner_generation(
                     stale_generation,
                     stale_lane_generation,
                     service,
@@ -3815,8 +4425,550 @@ mod tests {
 
         assert!(
             binding.subflow_set_snapshot().is_none(),
-            "carrier output membership changes invalidate the Subflow set"
+            "carrier output detach resets the Subflow set"
         );
+    }
+
+    #[test]
+    fn passive_cross_family_attach_does_not_refill_or_transfer_startup_epoch() {
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            candidate.underlay,
+            candidate.path_id,
+            candidate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+
+        let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let startup_credit = quantum * 4;
+        let input = SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: quantum,
+            optional_overhead_bytes: 0,
+        };
+        for _ in 0..4 {
+            assert_eq!(
+                binding
+                    .commit_subflow_owner_admission(
+                        service,
+                        startup_credit,
+                        0,
+                        Duration::ZERO,
+                        input,
+                    )
+                    .decision,
+                PathAdmissionDecision::AdmitSubflow
+            );
+        }
+        assert_eq!(
+            binding
+                .preview_subflow_owner_admission(
+                    service,
+                    startup_credit,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        owner_bytes: 1,
+                        ..input
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::ProbeOnly,
+            "the initial candidate has spent the cumulative startup cap"
+        );
+
+        let (stale_generation, _) = binding.subflow_state_snapshot();
+        let stale_lane_generation = binding.lane_generation();
+        let added = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let (added_commands, _added_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                added.underlay,
+                added.path_id,
+                added_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let (current_generation, epoch) = binding.subflow_state_snapshot();
+        assert_ne!(current_generation, stale_generation);
+        let epoch = epoch.expect("passive attachment preserves startup epoch");
+        assert_eq!(epoch.members().len(), 1);
+        assert_eq!(epoch.members()[0].key, candidate);
+        assert_eq!(epoch.members()[0].owner_sent_bytes, startup_credit as u64);
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission_for_planner_generation(
+                    stale_generation,
+                    stale_lane_generation,
+                    service,
+                    startup_credit,
+                    0,
+                    Duration::ZERO,
+                    input,
+                )
+                .decision,
+            PathAdmissionDecision::Standby,
+            "a plan made before passive growth must not commit afterward"
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    startup_credit,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        owner_bytes: 1,
+                        ..input
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::ProbeOnly,
+            "passive growth must not refill the selected candidate's startup credit"
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    startup_credit,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        key: added,
+                        owner_bytes: 1,
+                        ..input
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::ProbeOnly,
+            "passive growth must not transfer startup ownership to the new output"
+        );
+    }
+
+    #[test]
+    fn passive_attach_after_reservation_preserves_unemitted_credit_rollback() {
+        for passive_role in [StreamOpenRole::Validation, StreamOpenRole::Repair] {
+            let (binding, service) = binding_for_underlay(UnderlayProtocol::Tcp);
+            let candidate = CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(1),
+            };
+            let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            );
+            let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+            let optional_bytes = 1024;
+            let input = SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                read_gap: Duration::ZERO,
+                owner_bytes: quantum,
+                optional_overhead_bytes: optional_bytes,
+            };
+            let (planner_generation, _) = binding.subflow_state_snapshot();
+            let reservation = binding.reserve_subflow_owner_admission_for_planner_generation(
+                planner_generation,
+                binding.lane_generation(),
+                service,
+                quantum,
+                optional_bytes,
+                Duration::ZERO,
+                input,
+            );
+            assert_eq!(
+                reservation.admission.decision,
+                PathAdmissionDecision::AdmitSubflow
+            );
+            let epoch_generation = reservation
+                .epoch_generation
+                .expect("admitted Subflow reservation has an epoch token");
+
+            let passive = CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: PathId(0),
+            };
+            let (passive_commands, _passive_receivers) = reliable_path_command_channels(8);
+            assert_eq!(
+                binding.attach(
+                    passive.underlay,
+                    passive.path_id,
+                    passive_commands,
+                    FlowLane::Throughput,
+                    passive_role,
+                    reliable_relay_buffer_len(MuxLimits::default()),
+                ),
+                ResponseStreamAttachOutcome::Attached
+            );
+            binding.rollback_subflow_owner_admission_for_epoch(epoch_generation, input);
+
+            assert_eq!(
+                binding
+                    .commit_subflow_owner_admission(
+                        service,
+                        quantum,
+                        optional_bytes,
+                        Duration::ZERO,
+                        input,
+                    )
+                    .decision,
+                PathAdmissionDecision::AdmitSubflow,
+                "{passive_role:?} planner invalidation must not block refund of unemitted bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let unrelated = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(2),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(91),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+        let (unrelated_commands, mut unrelated_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                unrelated.underlay,
+                unrelated.path_id,
+                unrelated_commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut unrelated_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("candidate output is attached");
+        let (planner_generation, _) = binding.subflow_state_snapshot();
+        let request = ResponseSubflowAdmissionRequest {
+            expected_planner_generation: planner_generation,
+            expected_lane_generation: binding.lane_generation(),
+            service,
+            startup_owner_credit_bytes: payload_bytes,
+            optional_overhead_budget_bytes: 0,
+            max_read_gap_budget: Duration::ZERO,
+            input: SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                read_gap: Duration::ZERO,
+                owner_bytes: payload_bytes,
+                optional_overhead_bytes: 0,
+            },
+        };
+        let frame = stream_data_frame(payload_bytes);
+        let frame_for_sender = frame.clone();
+        let binding_for_sender = binding.clone();
+        let (reserved_tx, reserved_rx) = std_mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std_mpsc::sync_channel(0);
+        let sender = std::thread::spawn(move || {
+            binding_for_sender.try_enqueue_owner_frame_for_target_inner(
+                &target,
+                &frame_for_sender,
+                FlowLane::Throughput,
+                Some(request),
+                || {
+                    reserved_tx
+                        .send(())
+                        .expect("reservation observer remains live");
+                    resume_rx.recv().expect("reservation test resumes enqueue");
+                },
+            )
+        });
+        reserved_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Subflow reservation reaches the pre-enqueue barrier");
+
+        let outputs_locked_across_reservation = matches!(
+            binding.outputs.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let binding_for_detach = binding.clone();
+        let (detach_started_tx, detach_started_rx) = std_mpsc::sync_channel(0);
+        let (detach_done_tx, detach_done_rx) = std_mpsc::channel();
+        let detacher = std::thread::spawn(move || {
+            detach_started_tx
+                .send(())
+                .expect("detach observer remains live");
+            binding_for_detach.detach(unrelated, &unrelated_commands);
+            detach_done_tx
+                .send(())
+                .expect("detach completion observer remains live");
+        });
+        detach_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detach attempt starts while enqueue is paused");
+        let generation_while_paused = binding.subflow_state_snapshot().0;
+        let detach_completed_while_paused = detach_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+
+        resume_tx
+            .send(())
+            .expect("paused reservation remains ready to enqueue");
+        let reservation_epoch = sender
+            .join()
+            .expect("sender thread does not panic")
+            .expect("generation-fenced reservation enqueues");
+        detacher.join().expect("detach thread does not panic");
+
+        assert!(
+            outputs_locked_across_reservation,
+            "outputs must remain locked from Subflow reservation through owner enqueue"
+        );
+        assert_eq!(generation_while_paused, planner_generation);
+        assert!(
+            !detach_completed_while_paused,
+            "topology reset must not linearize between reservation and enqueue"
+        );
+        assert!(reservation_epoch.is_some());
+        assert_ne!(binding.subflow_state_snapshot().0, planner_generation);
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert_eq!(
+            binding.owner_flight_keys_overlapping_frame(&frame),
+            vec![candidate],
+            "owner flight must be recorded before the topology reset"
+        );
+    }
+
+    #[test]
+    fn full_reset_rejects_stale_epoch_rollback() {
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let input = SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: quantum,
+            optional_overhead_bytes: 0,
+        };
+        let (planner_generation, _) = binding.subflow_state_snapshot();
+        let reservation = binding.reserve_subflow_owner_admission_for_planner_generation(
+            planner_generation,
+            binding.lane_generation(),
+            service,
+            quantum,
+            0,
+            Duration::ZERO,
+            input,
+        );
+        let stale_epoch_generation = reservation
+            .epoch_generation
+            .expect("initial reservation has an epoch token");
+
+        binding.reset_subflow_set();
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(service, quantum, 0, Duration::ZERO, input,)
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        binding.rollback_subflow_owner_admission_for_epoch(stale_epoch_generation, input);
+
+        assert_eq!(
+            binding
+                .preview_subflow_owner_admission(
+                    service,
+                    quantum,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        owner_bytes: 1,
+                        ..input
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::ProbeOnly,
+            "a stale refund must not debit a replacement epoch"
+        );
+    }
+
+    #[test]
+    fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
+        let base_service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let changed_service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(4),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let base_credit = quantum * 2;
+        let base_overhead = 1024;
+        let base_gap = Duration::from_millis(10);
+        let variants = [
+            (changed_service, base_credit, base_overhead, base_gap),
+            (base_service, quantum, base_overhead, base_gap),
+            (base_service, base_credit, base_overhead * 2, base_gap),
+            (
+                base_service,
+                base_credit,
+                base_overhead,
+                Duration::from_millis(20),
+            ),
+        ];
+
+        for (service, credit, overhead, max_gap) in variants {
+            let (binding, _) = binding_for_underlay(UnderlayProtocol::Tcp);
+            let input = SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                read_gap: Duration::ZERO,
+                owner_bytes: quantum,
+                optional_overhead_bytes: 0,
+            };
+            let (initial_planner_generation, _) = binding.subflow_state_snapshot();
+            let initial = binding.reserve_subflow_owner_admission_for_planner_generation(
+                initial_planner_generation,
+                binding.lane_generation(),
+                base_service,
+                base_credit,
+                base_overhead,
+                base_gap,
+                input,
+            );
+            let stale_epoch_generation = initial
+                .epoch_generation
+                .expect("base envelope reservation has an epoch token");
+            let (stale_planner_generation, _) = binding.subflow_state_snapshot();
+
+            let replacement = binding.reserve_subflow_owner_admission_for_planner_generation(
+                stale_planner_generation,
+                binding.lane_generation(),
+                service,
+                credit,
+                overhead,
+                max_gap,
+                input,
+            );
+            assert_eq!(
+                replacement.admission.decision,
+                PathAdmissionDecision::AdmitSubflow
+            );
+            assert_ne!(
+                replacement.epoch_generation,
+                Some(stale_epoch_generation),
+                "each envelope field owns a new epoch identity"
+            );
+            let (current_planner_generation, _) = binding.subflow_state_snapshot();
+            assert_ne!(current_planner_generation, stale_planner_generation);
+            assert_eq!(
+                binding
+                    .commit_subflow_owner_admission_for_planner_generation(
+                        stale_planner_generation,
+                        binding.lane_generation(),
+                        service,
+                        credit,
+                        overhead,
+                        max_gap,
+                        input,
+                    )
+                    .decision,
+                PathAdmissionDecision::Standby,
+                "a competing plan for the replaced envelope must be stale"
+            );
+
+            binding.rollback_subflow_owner_admission_for_epoch(stale_epoch_generation, input);
+            let epoch = binding
+                .subflow_set_snapshot()
+                .expect("replacement epoch remains present");
+            assert_eq!(epoch.members().len(), 1);
+            assert_eq!(epoch.members()[0].owner_sent_bytes, quantum as u64);
+        }
     }
 
     #[test]
@@ -3859,7 +5011,7 @@ mod tests {
         binding.reset_subflow_set();
         assert_eq!(
             binding
-                .commit_subflow_owner_admission_for_generation(
+                .commit_subflow_owner_admission_for_planner_generation(
                     stale_generation,
                     stale_lane_generation,
                     service,
@@ -3884,7 +5036,7 @@ mod tests {
         );
         assert_eq!(
             binding
-                .commit_subflow_owner_admission_for_generation(
+                .commit_subflow_owner_admission_for_planner_generation(
                     current_generation,
                     pre_pressure_lane_generation,
                     service,
@@ -3938,7 +5090,7 @@ mod tests {
             MuxLimits::default(),
             lane_tracker.clone(),
         );
-        let (subflow_generation, _) = binding.subflow_state_snapshot();
+        let (planner_generation, _) = binding.subflow_state_snapshot();
         let (multi_flow_generation, active_response_flows) =
             binding.lane_generation_and_active_response_flows();
         assert_eq!(active_response_flows, 2);
@@ -3947,8 +5099,8 @@ mod tests {
         assert_eq!(lane_tracker.session_snapshot(session_id).active_flows, 1);
         assert_eq!(binding.lane_generation_and_active_response_flows().1, 1);
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
-        let admission = binding.commit_subflow_owner_admission_for_generation(
-            subflow_generation,
+        let admission = binding.commit_subflow_owner_admission_for_planner_generation(
+            planner_generation,
             multi_flow_generation,
             service,
             payload_bytes * 4,
@@ -3996,7 +5148,7 @@ mod tests {
             MuxLimits::default(),
             lane_tracker.clone(),
         );
-        let (subflow_generation, _) = binding.subflow_state_snapshot();
+        let (planner_generation, _) = binding.subflow_state_snapshot();
         let lane_generation = binding.lane_generation();
 
         let realtime = ServerRealtimeFlowRegistration::new(lane_tracker.clone(), other_session_id);
@@ -4011,8 +5163,8 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
         assert_eq!(
             binding
-                .commit_subflow_owner_admission_for_generation(
-                    subflow_generation,
+                .commit_subflow_owner_admission_for_planner_generation(
+                    planner_generation,
                     lane_generation,
                     service,
                     payload_bytes * 4,

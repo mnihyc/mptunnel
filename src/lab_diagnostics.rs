@@ -101,6 +101,7 @@ pub(crate) fn lab_sender_service_decision(
     decision_kind: &'static str,
     frame_kind: &'static str,
     payload_bytes: usize,
+    bulk_rate_evidence: Option<bool>,
     fields: fmt::Arguments<'_>,
 ) {
     let emit_decision = lab_diagnostic_event_enabled("sender_service_decision");
@@ -108,6 +109,7 @@ pub(crate) fn lab_sender_service_decision(
     if !emit_decision && !track_conformance {
         return;
     }
+    let mut conformance_progress = None;
     if track_conformance
         && role == "server"
         && matches!(
@@ -119,16 +121,20 @@ pub(crate) fn lab_sender_service_decision(
     {
         let counts = LAB_SENDER_SERVICE_COUNTS.get_or_init(Default::default);
         let mut counts = counts.lock().expect("lab sender-service counts lock");
-        counts
-            .entry((session_id, stream_id))
-            .or_default()
-            .sender_service_stream_data_decisions += 1;
+        let counts = counts.entry((session_id, stream_id)).or_default();
+        counts.record_sender_service_decision(decision_kind, payload_bytes, bulk_rate_evidence);
+        if counts.sender_service_stream_data_decisions % 8192 == 0 {
+            conformance_progress = Some((session_id, *counts));
+        }
+    }
+    if let Some((session_id, counts)) = conformance_progress {
+        lab_emit_sender_service_counts("progress", session_id, stream_id, counts);
     }
     if emit_decision {
         lab_diagnostic(
             "sender_service_decision",
             format_args!(
-                "role={} session_id={} stream_id={} decision_kind={} frame_kind={} payload_bytes={} {}",
+                "role={} session_id={} stream_id={} decision_kind={} frame_kind={} payload_bytes={} bulk_rate_evidence={} {}",
                 role,
                 session_id
                     .map(|value| value.to_string())
@@ -137,6 +143,9 @@ pub(crate) fn lab_sender_service_decision(
                 decision_kind,
                 frame_kind,
                 payload_bytes,
+                bulk_rate_evidence
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
                 fields,
             ),
         );
@@ -155,19 +164,37 @@ pub(crate) fn lab_assert_server_sender_service_balanced(session_id: u64, stream_
         };
         counts
     };
+    lab_emit_sender_service_counts("final", session_id, stream_id, counts);
+    assert_eq!(
+        counts.response_stream_data_frames, counts.sender_service_stream_data_decisions,
+        "server response STREAM_DATA bypassed sender-service decisions for session {session_id} stream {stream_id}",
+    );
+}
+
+fn lab_emit_sender_service_counts(
+    phase: &str,
+    session_id: u64,
+    stream_id: u64,
+    counts: LabSenderServiceCounts,
+) {
     lab_diagnostic(
         "sender_service_conformance",
         format_args!(
-            "session_id={} stream_id={} server_response_stream_data_frames={} server_sender_service_stream_data_decisions={}",
+            "phase={} session_id={} stream_id={} server_response_stream_data_frames={} server_sender_service_stream_data_decisions={} service_decisions={} service_payload_bytes={} service_unproven_decisions={} service_unproven_payload_bytes={} service_mature_decisions={} service_mature_payload_bytes={} subflow_decisions={} subflow_payload_bytes={}",
+            phase,
             session_id,
             stream_id,
             counts.response_stream_data_frames,
             counts.sender_service_stream_data_decisions,
+            counts.service_decisions,
+            counts.service_payload_bytes,
+            counts.service_unproven_decisions,
+            counts.service_unproven_payload_bytes,
+            counts.service_mature_decisions,
+            counts.service_mature_payload_bytes,
+            counts.subflow_decisions,
+            counts.subflow_payload_bytes,
         ),
-    );
-    assert_eq!(
-        counts.response_stream_data_frames, counts.sender_service_stream_data_decisions,
-        "server response STREAM_DATA bypassed sender-service decisions for session {session_id} stream {stream_id}",
     );
 }
 
@@ -289,6 +316,55 @@ pub(crate) fn lab_sender_service_counts_for_test(session_id: u64, stream_id: u64
 struct LabSenderServiceCounts {
     response_stream_data_frames: u64,
     sender_service_stream_data_decisions: u64,
+    service_decisions: u64,
+    service_payload_bytes: u64,
+    service_unproven_decisions: u64,
+    service_unproven_payload_bytes: u64,
+    service_mature_decisions: u64,
+    service_mature_payload_bytes: u64,
+    subflow_decisions: u64,
+    subflow_payload_bytes: u64,
+}
+
+impl LabSenderServiceCounts {
+    fn record_sender_service_decision(
+        &mut self,
+        decision_kind: &str,
+        payload_bytes: usize,
+        bulk_rate_evidence: Option<bool>,
+    ) {
+        self.sender_service_stream_data_decisions += 1;
+        match decision_kind {
+            "data_service" => {
+                self.service_decisions += 1;
+                self.service_payload_bytes = self
+                    .service_payload_bytes
+                    .saturating_add(payload_bytes as u64);
+                match bulk_rate_evidence {
+                    Some(true) => {
+                        self.service_mature_decisions += 1;
+                        self.service_mature_payload_bytes = self
+                            .service_mature_payload_bytes
+                            .saturating_add(payload_bytes as u64);
+                    }
+                    Some(false) => {
+                        self.service_unproven_decisions += 1;
+                        self.service_unproven_payload_bytes = self
+                            .service_unproven_payload_bytes
+                            .saturating_add(payload_bytes as u64);
+                    }
+                    None => {}
+                }
+            }
+            "data_subflow" => {
+                self.subflow_decisions += 1;
+                self.subflow_payload_bytes = self
+                    .subflow_payload_bytes
+                    .saturating_add(payload_bytes as u64);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(all(test, feature = "lab-diagnostics"))]
@@ -354,6 +430,7 @@ mod tests {
             "data_service",
             "stream_data",
             1024,
+            Some(true),
             format_args!("path_underlay=Tcp path_id=0"),
         );
         assert_eq!(lab_sender_service_counts_for_test(17, 19), (0, 0));
@@ -370,6 +447,7 @@ mod tests {
             "data_service",
             "stream_data",
             1024,
+            Some(true),
             format_args!("path_underlay=Tcp path_id=0"),
         );
         assert_eq!(lab_sender_service_counts_for_test(17, 19), (1, 1));
@@ -388,12 +466,25 @@ mod tests {
                 decision_kind,
                 "stream_data",
                 1024,
+                Some(index == 0),
                 format_args!("path_underlay=Tcp path_id={index}"),
             );
             lab_server_response_stream_data(7, 9, (index as u64) * 1024, 1024);
         }
 
         assert_eq!(lab_sender_service_counts_for_test(7, 9), (2, 2));
+        let counts = LAB_SENDER_SERVICE_COUNTS
+            .get()
+            .expect("sender-service counts")
+            .lock()
+            .expect("lab sender-service counts lock")
+            .get(&(7, 9))
+            .copied()
+            .expect("stream counts");
+        assert_eq!(counts.service_decisions, 1);
+        assert_eq!(counts.service_payload_bytes, 1024);
+        assert_eq!(counts.subflow_decisions, 1);
+        assert_eq!(counts.subflow_payload_bytes, 1024);
         lab_assert_server_sender_service_balanced(7, 9);
     }
 

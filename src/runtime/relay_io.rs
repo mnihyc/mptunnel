@@ -114,9 +114,12 @@ pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
 }
 
-pub(super) fn reliable_relay_owner_tail_read_headroom(
+pub(super) fn reliable_relay_source_staging_owner_tail_headroom(
+    independent_source_staging: bool,
     lane: FlowLane,
-    service_path: Option<PathSnapshot>,
+    service_is_live: bool,
+    service_has_latency_pressure: bool,
+    service_has_feed_evidence: bool,
     ordered_owner_debt_bytes: usize,
     queued_data_bytes: usize,
     mux_limits: MuxLimits,
@@ -125,22 +128,20 @@ pub(super) fn reliable_relay_owner_tail_read_headroom(
         return usize::MAX;
     }
     let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let has_latency_pressure = reliable_relay_owner_tail_has_latency_pressure(service_path);
-    let has_feed_reservoir = reliable_relay_owner_tail_has_feed_reservoir(service_path);
-    let feed_limit = if has_latency_pressure || !has_feed_reservoir {
+    let has_feed_reservoir = service_is_live && service_has_feed_evidence;
+    let feed_limit = if service_has_latency_pressure || !has_feed_reservoir {
         bulk_service_horizon_payload_bytes(payload, mux_limits)
     } else {
         bulk_service_feed_reservoir_payload_bytes(payload, mux_limits)
     };
-    feed_limit.saturating_sub(ordered_owner_debt_bytes.saturating_add(queued_data_bytes))
-}
-
-fn reliable_relay_owner_tail_has_latency_pressure(path: Option<PathSnapshot>) -> bool {
-    path.is_some_and(|path| path.active_latency_sensitive_flows > 0)
-}
-
-fn reliable_relay_owner_tail_has_feed_reservoir(path: Option<PathSnapshot>) -> bool {
-    path.is_some_and(|path| path.product_progress_rate_bps.is_some() && path.confidence >= 1.0)
+    let staged_debt = if independent_source_staging {
+        // Raw bytes on a mixed-family switchable response have no offset or
+        // path owner, but still consume sender-service queue capacity.
+        queued_data_bytes
+    } else {
+        ordered_owner_debt_bytes.saturating_add(queued_data_bytes)
+    };
+    feed_limit.saturating_sub(staged_debt)
 }
 
 pub(super) fn stream_ack_contiguous_frontier(_complete: bool, ranges: &[OffsetRange]) -> u64 {
@@ -1744,6 +1745,8 @@ where
     let mut last_sender_dispatch_item_budget = 1usize;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
+    #[cfg(feature = "lab-diagnostics")]
+    let mut reported_former_source_staging_block = false;
 
     let result = loop {
         if stream_terminal_fin_replay_required(
@@ -1814,11 +1817,44 @@ where
             );
         }
         response_sender.publish_queue_bytes(&path_stream);
-        let send_path_snapshot = path_stream.send_path_snapshot(
-            relay_lane,
-            relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
-                .min(path_stream.max_frame_payload_bytes),
-        );
+        let payload_hint = relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
+            .min(path_stream.max_frame_payload_bytes);
+        let (
+            send_path_snapshot,
+            source_service_is_live,
+            source_service_has_latency_pressure,
+            source_staging_has_feed_evidence,
+            independent_source_staging,
+        ) = match &path_stream.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                let read = binding.relay_read_snapshot(relay_lane, payload_hint);
+                let source_service = read.source_service;
+                let source_service_key = source_service.map(|service| service.key);
+                (
+                    read.send_path,
+                    source_service_key.is_some(),
+                    source_service
+                        .is_some_and(|service| service.active_latency_sensitive_flows > 0),
+                    source_service.is_some_and(|service| service.has_bulk_rate_evidence),
+                    read.independent_source_staging,
+                )
+            }
+            ReliablePathStreamOutput::Fixed(_) => {
+                let path = path_stream.send_path_snapshot(relay_lane, payload_hint);
+                // Fixed request-side output retains its path-local progress
+                // graduation. Switchable response Service staging uses the
+                // canonical carrier-specific bulk predicate above.
+                (
+                    path,
+                    path.is_some(),
+                    path.is_some_and(|snapshot| snapshot.active_latency_sensitive_flows > 0),
+                    path.is_some_and(|snapshot| {
+                        snapshot.product_progress_rate_bps.is_some() && snapshot.confidence >= 1.0
+                    }),
+                    false,
+                )
+            }
+        };
         let tail_repair_path_snapshot = path_stream.tail_repair_snapshot(
             last_send_ack_frontier,
             relay_lane,
@@ -1881,18 +1917,56 @@ where
             response_sender.data_bytes(),
             mux_limits,
         );
-        let owner_tail_read_headroom = reliable_relay_owner_tail_read_headroom(
+        let owner_tail_read_headroom = reliable_relay_source_staging_owner_tail_headroom(
+            independent_source_staging,
             relay_lane,
-            send_path_snapshot,
+            source_service_is_live,
+            source_service_has_latency_pressure,
+            source_staging_has_feed_evidence,
             ordered_owner_debt_bytes,
             response_sender.data_bytes(),
             mux_limits,
         );
+        // Mixed-family response bytes have neither offsets nor owners while
+        // staged here; ordered-owner and path admission remain dispatch gates.
         let source_read_ceiling = reliable_relay_buffer_len(mux_limits)
             .min(path_stream.max_frame_payload_bytes)
             .min(sender_queue_limit)
             .min(latency_owner_credit)
             .min(owner_tail_read_headroom);
+        #[cfg(feature = "lab-diagnostics")]
+        if independent_source_staging && !reported_former_source_staging_block {
+            let former_owner_tail_read_headroom = reliable_relay_source_staging_owner_tail_headroom(
+                false,
+                relay_lane,
+                source_service_is_live,
+                source_service_has_latency_pressure,
+                source_staging_has_feed_evidence,
+                ordered_owner_debt_bytes,
+                response_sender.data_bytes(),
+                mux_limits,
+            );
+            if former_owner_tail_read_headroom == 0 && source_read_ceiling > 0 {
+                lab_diagnostic(
+                    "server_source_staging_policy",
+                    format_args!(
+                        "session_id={} stream_id={} lane={:?} former_policy_blocked=true actual_headroom={} source_read_ceiling={} assigned_owner_tail_bytes={} raw_queue_bytes={} sender_queue_limit={} repair_bytes={} next_offset={} ack_frontier={}",
+                        session_id.0,
+                        stream_id.0,
+                        relay_lane,
+                        owner_tail_read_headroom,
+                        source_read_ceiling,
+                        ordered_owner_debt_bytes,
+                        response_sender.data_bytes(),
+                        sender_queue_limit,
+                        send_stream.repair_bytes(),
+                        send_stream.next_offset(),
+                        last_send_ack_frontier,
+                    ),
+                );
+                reported_former_source_staging_block = true;
+            }
+        }
         if source_read_ceiling > 0 {
             resize_reliable_relay_buffer(&mut buf, source_read_ceiling);
         }
@@ -2707,13 +2781,17 @@ where
                         )
                         && response_sender.data_bytes() < sender_dispatch_byte_budget
                     {
-                        let owner_tail_read_headroom = reliable_relay_owner_tail_read_headroom(
-                            relay_lane,
-                            send_path_snapshot,
-                            ordered_owner_debt_bytes,
-                            response_sender.data_bytes(),
-                            mux_limits,
-                        );
+                        let owner_tail_read_headroom =
+                            reliable_relay_source_staging_owner_tail_headroom(
+                                independent_source_staging,
+                                relay_lane,
+                                source_service_is_live,
+                                source_service_has_latency_pressure,
+                                source_staging_has_feed_evidence,
+                                ordered_owner_debt_bytes,
+                                response_sender.data_bytes(),
+                                mux_limits,
+                            );
                         if owner_tail_read_headroom == 0 {
                             break;
                         }
@@ -3116,145 +3194,148 @@ mod tests {
     }
 
     #[test]
-    fn bulk_source_read_headroom_uses_reservoir_without_latency_pressure() {
+    fn coupled_source_staging_keeps_the_existing_owner_tail_reservoir() {
         let mux_limits = MuxLimits::default();
         let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
         let reservoir = bulk_service_feed_reservoir_payload_bytes(payload, mux_limits);
-        let mut service_path =
-            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_000_000.0);
-        service_path.product_progress_rate_bps = Some(1_000_000.0);
-        service_path.confidence = 1.0;
 
         assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
+            reliable_relay_source_staging_owner_tail_headroom(
+                false,
                 FlowLane::Throughput,
-                Some(service_path),
+                true,
+                false,
+                true,
                 horizon,
                 0,
                 mux_limits,
             ),
             reservoir.saturating_sub(horizon),
-            "bulk-only Service feed must keep a reservoir beyond the preemptible latency horizon"
         );
     }
 
     #[test]
-    fn bulk_source_read_headroom_uses_horizon_before_service_product_progress() {
+    fn coupled_source_staging_keeps_the_latency_pressure_horizon() {
         let mux_limits = MuxLimits::default();
         let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-        let service_path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_000_000.0);
 
         assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
+            reliable_relay_source_staging_owner_tail_headroom(
+                false,
                 FlowLane::Throughput,
-                Some(service_path),
+                true,
+                true,
+                true,
                 horizon,
                 0,
                 mux_limits,
             ),
             0,
-            "before Service product progress, no latency pressure must not permit a larger unresolved owner tail"
         );
     }
 
     #[test]
-    fn bulk_source_read_headroom_uses_horizon_until_service_progress_is_confident() {
+    fn mixed_underlay_source_staging_is_independent_from_assigned_owner_tail() {
         let mux_limits = MuxLimits::default();
         let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-        let mut service_path =
-            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_000_000.0);
-        service_path.product_progress_rate_bps = Some(1_000_000.0);
-        service_path.confidence = 0.0;
 
         assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
+            reliable_relay_source_staging_owner_tail_headroom(
+                true,
                 FlowLane::Throughput,
-                Some(service_path),
-                horizon,
+                false,
+                false,
+                false,
+                usize::MAX,
                 0,
                 mux_limits,
             ),
+            horizon,
+            "assigned owner tail must not consume the independent raw staging reservoir"
+        );
+        assert_eq!(
+            reliable_relay_source_staging_owner_tail_headroom(
+                true,
+                FlowLane::Throughput,
+                false,
+                false,
+                false,
+                usize::MAX,
+                horizon,
+                mux_limits,
+            ),
             0,
-            "a tiny/app-limited product ACK exposes progress but must not unlock the bulk Service reservoir"
+            "unassigned raw staging remains bounded by its own reservoir"
         );
     }
 
     #[test]
-    fn owner_tail_latency_pressure_is_path_local_not_session_global() {
-        let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_000_000.0);
-        path.session_active_latency_sensitive_flows = 1;
-        assert!(
-            !reliable_relay_owner_tail_has_latency_pressure(Some(path)),
-            "latency work elsewhere in the session must not shrink this Service owner's feed reservoir"
-        );
-
-        path.active_latency_sensitive_flows = 1;
-        assert!(
-            reliable_relay_owner_tail_has_latency_pressure(Some(path)),
-            "latency work sharing the same Service path keeps the preemptible horizon cap"
-        );
-    }
-
-    #[test]
-    fn bulk_source_read_headroom_stops_when_latency_pressure_horizon_is_full() {
+    fn mixed_underlay_source_staging_uses_mature_raw_reservoir() {
         let mux_limits = MuxLimits::default();
         let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-        let mut service_path =
-            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 100.0, 1_000_000.0);
-        service_path.product_progress_rate_bps = Some(1_000_000.0);
-        service_path.active_latency_sensitive_flows = 1;
+        let reservoir = bulk_service_feed_reservoir_payload_bytes(payload, mux_limits);
 
         assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
+            reliable_relay_source_staging_owner_tail_headroom(
+                true,
                 FlowLane::Throughput,
-                Some(service_path),
+                true,
+                false,
+                true,
+                usize::MAX,
+                horizon,
+                mux_limits,
+            ),
+            reservoir.saturating_sub(horizon),
+            "mature raw staging may use the feed reservoir without borrowing owner-tail credit"
+        );
+    }
+
+    #[test]
+    fn mixed_underlay_source_staging_returns_to_horizon_under_latency_pressure() {
+        let mux_limits = MuxLimits::default();
+        let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
+
+        assert_eq!(
+            reliable_relay_source_staging_owner_tail_headroom(
+                true,
+                FlowLane::Throughput,
+                true,
+                true,
+                true,
+                usize::MAX,
                 horizon.saturating_sub(payload),
-                0,
                 mux_limits,
             ),
             payload,
-            "bulk Service may read only the remaining owner-tail horizon"
-        );
-        assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
-                FlowLane::Throughput,
-                Some(service_path),
-                horizon.saturating_sub(payload),
-                payload,
-                mux_limits,
-            ),
-            0,
-            "queued but not yet dispatched OwnerData counts against the same tail horizon"
-        );
-        assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
-                FlowLane::Throughput,
-                Some(service_path),
-                horizon.saturating_add(1),
-                0,
-                mux_limits,
-            ),
-            0,
-            "once the Service tail exceeds the horizon, reads must pause for ACK or repair progress"
+            "path-local latency pressure narrows independent raw staging back to the Service horizon"
         );
     }
 
     #[test]
-    fn latency_source_read_headroom_is_not_pinned_by_bulk_tail_horizon() {
+    fn full_confidence_progress_does_not_unlock_source_staging_without_bulk_evidence() {
+        let mux_limits = MuxLimits::default();
+        let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
+
         assert_eq!(
-            reliable_relay_owner_tail_read_headroom(
-                FlowLane::Latency,
-                None,
-                usize::MAX / 2,
-                usize::MAX / 2,
-                MuxLimits::default(),
+            reliable_relay_source_staging_owner_tail_headroom(
+                true,
+                FlowLane::Throughput,
+                true,
+                false,
+                false,
+                usize::MAX,
+                0,
+                mux_limits,
             ),
-            usize::MAX,
-            "latency lane reads remain governed by their own tiny chunking and must not inherit bulk tail pressure"
+            horizon,
+            "product progress is not the carrier-specific bulk proof required to unlock the Service reservoir"
         );
     }
 

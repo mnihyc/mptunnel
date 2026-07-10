@@ -5,6 +5,13 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 
+flag_enabled() {
+  case "${1,,}" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 lab_lock_file="/tmp/mptunnel-compose-lab.lock"
 exec {lab_lock_fd}>"$lab_lock_file"
 if ! flock -n "$lab_lock_fd"; then
@@ -39,11 +46,9 @@ failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
-case "$lab_diagnostics" in
-  1|true|TRUE|yes|YES)
-    export MPTUNNEL_LAB_DIAG="${MPTUNNEL_LAB_DIAG:-1}"
-    ;;
-esac
+if flag_enabled "$lab_diagnostics"; then
+  export MPTUNNEL_LAB_DIAG="${MPTUNNEL_LAB_DIAG:-1}"
+fi
 lab_perf="${MPTUNNEL_LAB_PERF:-0}"
 lab_perf_samples="${MPTUNNEL_LAB_PERF_SAMPLES:-0}"
 lab_perf_interval_ms="${MPTUNNEL_LAB_PERF_INTERVAL_MS:-1000}"
@@ -53,7 +58,7 @@ fail_on_bad_status="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}"
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
 case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
   auto)
-    if [[ "${MPTUNNEL_LAB_DIAG:-0}" == "1" || "$lab_perf" == "1" ]]; then
+    if flag_enabled "${MPTUNNEL_LAB_DIAG:-0}" || flag_enabled "$lab_perf"; then
       collect_logs="1"
     else
       collect_logs="0"
@@ -63,16 +68,13 @@ case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
     collect_logs="${MPTUNNEL_LAB_COLLECT_LOGS}"
     ;;
 esac
-case "$lab_perf" in
-  1|true|TRUE|yes|YES)
-    log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-16000}"
-    log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-240}"
-    ;;
-  *)
-    log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-4000}"
-    log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
-    ;;
-esac
+if flag_enabled "$lab_perf"; then
+  log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-16000}"
+  log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-240}"
+else
+  log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-4000}"
+  log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
+fi
 case_filter="${CASE_FILTER:-}"
 client_start_settle_seconds="${CLIENT_START_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
 client_stop_settle_seconds="${CLIENT_STOP_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
@@ -213,7 +215,7 @@ exec_netem() {
 }
 
 build_mptunnel_binary() {
-  if [[ "$lab_diagnostics" == "1" ]]; then
+  if flag_enabled "$lab_diagnostics"; then
     cargo build --release --bin mptunnel --features lab-diagnostics
   else
     cargo build --release --bin mptunnel
@@ -317,8 +319,9 @@ probe_config_toml() {
 
 mptunnel_lab_env_prefix() {
   local role="$1"
-  printf 'MPTUNNEL_LAB_DIAG=%q MPTUNNEL_LAB_PERF=%q MPTUNNEL_LAB_PERF_SAMPLES=%q MPTUNNEL_LAB_ROLE=%q MPTUNNEL_LAB_PERF_INTERVAL_MS=%q ' \
+  printf 'MPTUNNEL_LAB_DIAG=%q MPTUNNEL_LAB_DIAG_EVENTS=%q MPTUNNEL_LAB_PERF=%q MPTUNNEL_LAB_PERF_SAMPLES=%q MPTUNNEL_LAB_ROLE=%q MPTUNNEL_LAB_PERF_INTERVAL_MS=%q ' \
     "${MPTUNNEL_LAB_DIAG:-0}" \
+    "${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
     "$lab_perf" \
     "$lab_perf_samples" \
     "$role" \
@@ -581,10 +584,20 @@ append_row_with_telemetry() {
   local case_name="$1"
   local row_json="$2"
   local protocol="${3:-}"
+  local mptunnel_row="${4:-0}"
   local telemetry_json log_artifacts_json
   telemetry_json="$(case_telemetry_summary "$case_name")"
   log_artifacts_json="$(case_log_artifacts_summary "$case_name")"
-  ROW="$row_json" PROTOCOL="$protocol" TELEMETRY="$telemetry_json" LOG_ARTIFACTS="$log_artifacts_json" LAB_SCRIPT_DIR="$script_dir" python3 - "$case_name" <<'PY' >> "$result_file"
+  ROW="$row_json" \
+    PROTOCOL="$protocol" \
+    MPTUNNEL_ROW="$mptunnel_row" \
+    LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+    LAB_DIAG_EVENTS="${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
+    LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+    TELEMETRY="$telemetry_json" \
+    LOG_ARTIFACTS="$log_artifacts_json" \
+    LAB_SCRIPT_DIR="$script_dir" \
+    python3 - "$case_name" <<'PY' >> "$result_file"
 import json
 import os
 import sys
@@ -601,6 +614,15 @@ row.setdefault("case", case)
 protocol = os.environ.get("PROTOCOL", "")
 if protocol:
     row["protocol"] = protocol
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import enrich_instrumentation_for_scope
+enrich_instrumentation_for_scope(
+    row,
+    os.environ.get("MPTUNNEL_ROW", ""),
+    os.environ.get("LAB_DIAG", ""),
+    os.environ.get("LAB_PERF", ""),
+    os.environ.get("LAB_DIAG_EVENTS", ""),
+)
 try:
     telemetry = json.loads(os.environ.get("TELEMETRY", "{}"))
 except json.JSONDecodeError:
@@ -652,6 +674,8 @@ append_download_probe_result() {
   local exit_code="$2"
   local output="$3"
   local probe_stderr="$4"
+  local mptunnel_row="${5:-1}"
+  local fallback_protocol="${6:-tcp}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -663,7 +687,10 @@ append_download_probe_result() {
   CLIENT_LOG="$client_log" \
 	  SERVER_LOG="$server_log" \
 	  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+	  LAB_DIAG_EVENTS="${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
 	  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+	  MPTUNNEL_ROW="$mptunnel_row" \
+	  FALLBACK_PROTOCOL="$fallback_protocol" \
 	  LOG_TAIL_BYTES="$log_tail_bytes" \
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
@@ -686,21 +713,19 @@ if not row:
         exit_code = 124
     row = {
         "case": case,
-        "protocol": "tcp",
+        "protocol": os.environ.get("FALLBACK_PROTOCOL", "tcp"),
         "status": "fail",
         "exit_code": exit_code,
     }
-lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
-lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
-instrumented_run = lab_diag or lab_perf
-row["lab_diagnostics_enabled"] = lab_diag
-row["lab_perf_enabled"] = lab_perf
-row["performance_comparable"] = not instrumented_run
-if instrumented_run:
-    row["performance_comparable_reason"] = (
-        "diagnostic/perf instrumentation is for causal analysis only; "
-        "use non-instrumented release rows for throughput comparisons"
-    )
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import enrich_instrumentation_for_scope
+lab_diag, lab_perf = enrich_instrumentation_for_scope(
+    row,
+    os.environ.get("MPTUNNEL_ROW", ""),
+    os.environ.get("LAB_DIAG", ""),
+    os.environ.get("LAB_PERF", ""),
+    os.environ.get("LAB_DIAG_EVENTS", ""),
+)
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:
@@ -747,6 +772,7 @@ run_unproxied_download_probe_case() {
   local case_name="$1"
   local protocol="$2"
   local target="$3"
+  local mptunnel_row="${4:-0}"
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
   local telemetry_pid
@@ -760,7 +786,7 @@ run_unproxied_download_probe_case() {
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" "$mptunnel_row" "$protocol"
 }
 
 run_tcp_download_probe_case() {
@@ -786,6 +812,8 @@ append_upload_probe_result() {
   local exit_code="$2"
   local output="$3"
   local probe_stderr="$4"
+  local mptunnel_row="${5:-1}"
+  local fallback_protocol="${6:-tcp-upload}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -797,7 +825,10 @@ append_upload_probe_result() {
   CLIENT_LOG="$client_log" \
 	  SERVER_LOG="$server_log" \
 	  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+	  LAB_DIAG_EVENTS="${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
 	  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+	  MPTUNNEL_ROW="$mptunnel_row" \
+	  FALLBACK_PROTOCOL="$fallback_protocol" \
 	  LOG_TAIL_BYTES="$log_tail_bytes" \
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
@@ -820,21 +851,19 @@ if not row:
         exit_code = 124
     row = {
         "case": case,
-        "protocol": "tcp-upload",
+        "protocol": os.environ.get("FALLBACK_PROTOCOL", "tcp-upload"),
         "status": "fail",
         "exit_code": exit_code,
     }
-lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
-lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
-instrumented_run = lab_diag or lab_perf
-row["lab_diagnostics_enabled"] = lab_diag
-row["lab_perf_enabled"] = lab_perf
-row["performance_comparable"] = not instrumented_run
-if instrumented_run:
-    row["performance_comparable_reason"] = (
-        "diagnostic/perf instrumentation is for causal analysis only; "
-        "use non-instrumented release rows for throughput comparisons"
-    )
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import enrich_instrumentation_for_scope
+lab_diag, lab_perf = enrich_instrumentation_for_scope(
+    row,
+    os.environ.get("MPTUNNEL_ROW", ""),
+    os.environ.get("LAB_DIAG", ""),
+    os.environ.get("LAB_PERF", ""),
+    os.environ.get("LAB_DIAG_EVENTS", ""),
+)
 try:
     log_tail_bytes = int(os.environ.get("LOG_TAIL_BYTES", "4000"))
 except ValueError:
@@ -880,6 +909,8 @@ PY
 run_unproxied_upload_probe_case() {
   local case_name="$1"
   local target="$2"
+  local mptunnel_row="${3:-0}"
+  local protocol="${4:-tcp-upload}"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
   local telemetry_pid
@@ -893,7 +924,7 @@ run_unproxied_upload_probe_case() {
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" "$mptunnel_row" "$protocol"
 }
 
 run_tcp_upload_probe_case() {
@@ -1349,14 +1380,14 @@ run_tun_download_case() {
   local case_name="$1"
   shift
   start_tun_client "$case_name" "$@"
-  run_unproxied_download_probe_case "$case_name" "tun" "172.31.40.30:8080"
+  run_unproxied_download_probe_case "$case_name" "tun" "172.31.40.30:8080" 1
 }
 
 run_tun_upload_case() {
   local case_name="$1"
   shift
   start_tun_client "$case_name" "$@"
-  run_unproxied_upload_probe_case "$case_name" "172.31.40.30:${tcp_upload_target_port}"
+  run_unproxied_upload_probe_case "$case_name" "172.31.40.30:${tcp_upload_target_port}" 1 "tun-upload"
 }
 
 run_udp_case() {
@@ -1373,9 +1404,9 @@ run_udp_case() {
   stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
   if [[ "$exit_code" == "0" ]]; then
-    append_row_with_telemetry "$case_name" "$output"
+    append_row_with_telemetry "$case_name" "$output" "" 1
   else
-    append_row_with_telemetry "$case_name" "{\"case\":\"$case_name\",\"protocol\":\"udp\",\"status\":\"fail\",\"exit_code\":$exit_code}"
+    append_row_with_telemetry "$case_name" "{\"case\":\"$case_name\",\"protocol\":\"udp\",\"status\":\"fail\",\"exit_code\":$exit_code}" "" 1
   fi
 }
 
@@ -1414,7 +1445,7 @@ run_baseline_download_probe_case() {
   if [[ -n "$output" ]]; then
     append_row_with_telemetry "$case_name" "$output" "$protocol"
   else
-    append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr"
+    append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr" 0 "$protocol"
   fi
 }
 
@@ -1435,7 +1466,7 @@ run_baseline_upload_probe_case() {
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 0 "${protocol}-upload"
 }
 
 ensure_baseline_tool() {
@@ -1606,6 +1637,7 @@ append_mixed_probe_result() {
   local output="$3"
   local flapping_metadata_json="${4:-}"
   local probe_stderr="${5:-}"
+  local mptunnel_row="${6:-1}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -1616,7 +1648,9 @@ append_mixed_probe_result() {
   CLIENT_LOG="$client_log" \
   SERVER_LOG="$server_log" \
   LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
+  LAB_DIAG_EVENTS="${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
   LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
+  MPTUNNEL_ROW="$mptunnel_row" \
   LOG_TAIL_BYTES="$log_tail_bytes" \
   TELEMETRY="$(case_telemetry_summary "$case_name")" \
   LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
@@ -1645,17 +1679,15 @@ if not row:
         "status": "fail",
         "exit_code": exit_code,
     }
-lab_diag = os.environ.get("LAB_DIAG", "").lower() in ("1", "true", "yes")
-lab_perf = os.environ.get("LAB_PERF", "").lower() in ("1", "true", "yes")
-instrumented_run = lab_diag or lab_perf
-row["lab_diagnostics_enabled"] = lab_diag
-row["lab_perf_enabled"] = lab_perf
-row["performance_comparable"] = not instrumented_run
-if instrumented_run:
-    row["performance_comparable_reason"] = (
-        "diagnostic/perf instrumentation is for causal analysis only; "
-        "use non-instrumented release rows for throughput comparisons"
-    )
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import enrich_instrumentation_for_scope
+lab_diag, lab_perf = enrich_instrumentation_for_scope(
+    row,
+    os.environ.get("MPTUNNEL_ROW", ""),
+    os.environ.get("LAB_DIAG", ""),
+    os.environ.get("LAB_PERF", ""),
+    os.environ.get("LAB_DIAG_EVENTS", ""),
+)
 raw_flapping = os.environ.get("FLAPPING_METADATA", "")
 if raw_flapping:
     try:
@@ -1724,7 +1756,7 @@ record_mixed_probe_case() {
   local exit_code="$?"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
-  append_mixed_probe_result "$case_name" "$exit_code" "$output"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "" "" 1
 }
 
 run_direct_mixed_case() {
@@ -1755,7 +1787,7 @@ run_direct_mixed_case() {
   local exit_code="$?"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
-  append_mixed_probe_result "$case_name" "$exit_code" "$output"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "" "" 0
 }
 
 run_direct_unconstrained_download_case() {
@@ -1848,7 +1880,7 @@ run_mixed_flapping_case() {
   exit_code="$(cat "$probe_status_file" 2>/dev/null || echo 124)"
   rm -f "$probe_status_file" "${probe_status_file}.tmp"
   flapping_metadata_json="$(flapping_result_metadata)"
-  append_mixed_probe_result "$case_name" "$exit_code" "$output" "$flapping_metadata_json" "$probe_stderr"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "$flapping_metadata_json" "$probe_stderr" 1
 }
 
 netem_mode_for_equal_profile() {
@@ -1970,7 +2002,7 @@ run_mixed_failover_case() {
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-mixed.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-mixed.status 2>/dev/null || echo 124")"
-  append_mixed_probe_result "$case_name" "$exit_code" "$output"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "" "" 1
   apply_netem apply
 }
 
@@ -1991,7 +2023,7 @@ run_mixed_latency_spike_case() {
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-mixed-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-mixed-spike.status 2>/dev/null || echo 124")"
-  append_mixed_probe_result "$case_name" "$exit_code" "$output"
+  append_mixed_probe_result "$case_name" "$exit_code" "$output" "" "" 1
   apply_netem apply
 }
 
@@ -2013,7 +2045,7 @@ run_failover_case() {
   output="$(exec_in client "cat /tmp/mptunnel-failover.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-failover.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output"
+    append_row_with_telemetry "$case_name" "$output" "" 1
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-failover.err 2>/dev/null | tail -c 4000 || true")"
@@ -2040,7 +2072,7 @@ run_upload_failover_case() {
   output="$(exec_in client "cat /tmp/mptunnel-upload-failover.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-upload-failover.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output"
+    append_row_with_telemetry "$case_name" "$output" "" 1
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-failover.err 2>/dev/null | tail -c 4000 || true")"
@@ -2067,7 +2099,7 @@ run_latency_spike_case() {
   output="$(exec_in client "cat /tmp/mptunnel-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-spike.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output"
+    append_row_with_telemetry "$case_name" "$output" "" 1
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-spike.err 2>/dev/null | tail -c 4000 || true")"
@@ -2094,7 +2126,7 @@ run_upload_latency_spike_case() {
   output="$(exec_in client "cat /tmp/mptunnel-upload-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-upload-spike.status 2>/dev/null || echo 124")"
   if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output"
+    append_row_with_telemetry "$case_name" "$output" "" 1
   else
     local probe_stderr
     probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-spike.err 2>/dev/null | tail -c 4000 || true")"

@@ -515,6 +515,9 @@ fn log_bulk_relay_candidate_decision(
     selected: bool,
     reason: &'static str,
 ) {
+    if !lab_diagnostic_event_enabled("scheduler_decision") {
+        return;
+    }
     let lead_underlay = diagnostics
         .lead_key
         .map(|key| format!("{:?}", key.underlay))

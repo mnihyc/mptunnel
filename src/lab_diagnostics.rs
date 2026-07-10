@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn lab_diagnostic(event: &str, fields: fmt::Arguments<'_>) {
-    if !env_flag("MPTUNNEL_LAB_DIAG") {
+    if !lab_diagnostic_event_enabled(event) {
         return;
     }
     let stamp = lab_stamp();
@@ -19,30 +19,79 @@ pub(crate) fn lab_diagnostic(event: &str, fields: fmt::Arguments<'_>) {
     );
 }
 
+pub(crate) fn lab_diagnostic_event_enabled(event: &str) -> bool {
+    if !lab_diagnostics_requested() {
+        return false;
+    }
+    lab_diagnostic_event_filter().is_none_or(|filter| filter.contains(event))
+}
+
+#[cfg(not(test))]
+fn lab_diagnostics_requested() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("MPTUNNEL_LAB_DIAG"))
+}
+
+#[cfg(test)]
+fn lab_diagnostics_requested() -> bool {
+    env_flag("MPTUNNEL_LAB_DIAG")
+}
+
+#[cfg(not(test))]
+fn lab_diagnostic_event_filter() -> Option<&'static HashSet<String>> {
+    static FILTER: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            parse_lab_diagnostic_event_filter(
+                std::env::var("MPTUNNEL_LAB_DIAG_EVENTS").ok().as_deref(),
+            )
+        })
+        .as_ref()
+}
+
+#[cfg(test)]
+fn lab_diagnostic_event_filter() -> Option<HashSet<String>> {
+    parse_lab_diagnostic_event_filter(std::env::var("MPTUNNEL_LAB_DIAG_EVENTS").ok().as_deref())
+}
+
+fn parse_lab_diagnostic_event_filter(value: Option<&str>) -> Option<HashSet<String>> {
+    let events = value?
+        .split(',')
+        .map(str::trim)
+        .filter(|event| !event.is_empty())
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    (!events.is_empty() && !events.contains("*")).then_some(events)
+}
+
 pub(crate) fn lab_server_response_stream_data(
     session_id: u64,
     stream_id: u64,
     offset: u64,
     payload_bytes: usize,
 ) {
-    if !env_flag("MPTUNNEL_LAB_DIAG") {
+    let emit_frame = lab_diagnostic_event_enabled("server_response_stream_data_frame");
+    let track_conformance = lab_diagnostic_event_enabled("sender_service_conformance");
+    if !emit_frame && !track_conformance {
         return;
     }
-    let counts = LAB_SENDER_SERVICE_COUNTS.get_or_init(Default::default);
-    {
+    if track_conformance {
+        let counts = LAB_SENDER_SERVICE_COUNTS.get_or_init(Default::default);
         let mut counts = counts.lock().expect("lab sender-service counts lock");
         counts
             .entry((session_id, stream_id))
             .or_default()
             .response_stream_data_frames += 1;
     }
-    lab_diagnostic(
-        "server_response_stream_data_frame",
-        format_args!(
-            "session_id={} stream_id={} offset={} payload_bytes={}",
-            session_id, stream_id, offset, payload_bytes,
-        ),
-    );
+    if emit_frame {
+        lab_diagnostic(
+            "server_response_stream_data_frame",
+            format_args!(
+                "session_id={} stream_id={} offset={} payload_bytes={}",
+                session_id, stream_id, offset, payload_bytes,
+            ),
+        );
+    }
 }
 
 pub(crate) fn lab_sender_service_decision(
@@ -54,10 +103,13 @@ pub(crate) fn lab_sender_service_decision(
     payload_bytes: usize,
     fields: fmt::Arguments<'_>,
 ) {
-    if !env_flag("MPTUNNEL_LAB_DIAG") {
+    let emit_decision = lab_diagnostic_event_enabled("sender_service_decision");
+    let track_conformance = lab_diagnostic_event_enabled("sender_service_conformance");
+    if !emit_decision && !track_conformance {
         return;
     }
-    if role == "server"
+    if track_conformance
+        && role == "server"
         && matches!(
             decision_kind,
             "primary" | "data" | "data_service" | "data_subflow"
@@ -72,25 +124,27 @@ pub(crate) fn lab_sender_service_decision(
             .or_default()
             .sender_service_stream_data_decisions += 1;
     }
-    lab_diagnostic(
-        "sender_service_decision",
-        format_args!(
-            "role={} session_id={} stream_id={} decision_kind={} frame_kind={} payload_bytes={} {}",
-            role,
-            session_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            stream_id,
-            decision_kind,
-            frame_kind,
-            payload_bytes,
-            fields,
-        ),
-    );
+    if emit_decision {
+        lab_diagnostic(
+            "sender_service_decision",
+            format_args!(
+                "role={} session_id={} stream_id={} decision_kind={} frame_kind={} payload_bytes={} {}",
+                role,
+                session_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                stream_id,
+                decision_kind,
+                frame_kind,
+                payload_bytes,
+                fields,
+            ),
+        );
+    }
 }
 
 pub(crate) fn lab_assert_server_sender_service_balanced(session_id: u64, stream_id: u64) {
-    if !env_flag("MPTUNNEL_LAB_DIAG") {
+    if !lab_diagnostic_event_enabled("sender_service_conformance") {
         return;
     }
     let counts = LAB_SENDER_SERVICE_COUNTS.get_or_init(Default::default);
@@ -169,6 +223,7 @@ static LAB_DIAG_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(all(test, feature = "lab-diagnostics"))]
 pub(crate) struct LabDiagTestGuard {
     previous: Option<std::ffi::OsString>,
+    previous_events: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -178,10 +233,12 @@ pub(crate) fn lab_diag_test_guard() -> LabDiagTestGuard {
         .lock()
         .expect("lab diagnostics test lock");
     let previous = std::env::var_os("MPTUNNEL_LAB_DIAG");
+    let previous_events = std::env::var_os("MPTUNNEL_LAB_DIAG_EVENTS");
     // SAFETY: tests that use this helper hold LAB_DIAG_TEST_LOCK, so they do
     // not concurrently mutate or inspect the process diagnostic flag.
     unsafe {
         std::env::set_var("MPTUNNEL_LAB_DIAG", "1");
+        std::env::remove_var("MPTUNNEL_LAB_DIAG_EVENTS");
     }
     if let Some(counts) = LAB_SENDER_SERVICE_COUNTS.get() {
         counts
@@ -191,6 +248,7 @@ pub(crate) fn lab_diag_test_guard() -> LabDiagTestGuard {
     }
     LabDiagTestGuard {
         previous,
+        previous_events,
         _lock: lock,
     }
 }
@@ -204,6 +262,10 @@ impl Drop for LabDiagTestGuard {
             match &self.previous {
                 Some(value) => std::env::set_var("MPTUNNEL_LAB_DIAG", value),
                 None => std::env::remove_var("MPTUNNEL_LAB_DIAG"),
+            }
+            match &self.previous_events {
+                Some(value) => std::env::set_var("MPTUNNEL_LAB_DIAG_EVENTS", value),
+                None => std::env::remove_var("MPTUNNEL_LAB_DIAG_EVENTS"),
             }
         }
     }
@@ -233,6 +295,86 @@ struct LabSenderServiceCounts {
 mod tests {
     use super::*;
     use std::panic::{self, AssertUnwindSafe};
+
+    #[test]
+    fn diagnostic_event_filter_accepts_exact_names_and_wildcard() {
+        let exact = parse_lab_diagnostic_event_filter(Some("stream_open, path_timeout"))
+            .expect("exact filter");
+        assert!(exact.contains("stream_open"));
+        assert!(exact.contains("path_timeout"));
+        assert!(!exact.contains("stream"));
+        assert!(parse_lab_diagnostic_event_filter(None).is_none());
+        assert!(parse_lab_diagnostic_event_filter(Some("")).is_none());
+        assert!(parse_lab_diagnostic_event_filter(Some("*")).is_none());
+    }
+
+    #[test]
+    fn diagnostic_flags_are_ascii_case_insensitive() {
+        for enabled in ["1", "true", "TRUE", "True", "yes", "YES", "YeS"] {
+            assert!(env_flag_value(enabled), "{enabled}");
+        }
+        for disabled in ["", "0", "false", "no", "on"] {
+            assert!(!env_flag_value(disabled), "{disabled}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_event_filter_obeys_master_switch_and_exact_selection() {
+        let _guard = lab_diag_test_guard();
+        // SAFETY: the guard serializes diagnostic environment mutation in tests.
+        unsafe {
+            std::env::set_var("MPTUNNEL_LAB_DIAG_EVENTS", "stream_open, path_timeout");
+        }
+        assert!(lab_diagnostic_event_enabled("stream_open"));
+        assert!(lab_diagnostic_event_enabled("path_timeout"));
+        assert!(!lab_diagnostic_event_enabled("stream"));
+
+        // SAFETY: the guard serializes diagnostic environment mutation in tests.
+        unsafe {
+            std::env::set_var("MPTUNNEL_LAB_DIAG", "0");
+        }
+        assert!(!lab_diagnostic_event_enabled("stream_open"));
+    }
+
+    #[test]
+    fn conformance_tracking_is_opt_in_under_an_exact_filter() {
+        let _guard = lab_diag_test_guard();
+        // SAFETY: the guard serializes diagnostic environment mutation in tests.
+        unsafe {
+            std::env::set_var(
+                "MPTUNNEL_LAB_DIAG_EVENTS",
+                "server_response_stream_data_frame,sender_service_decision",
+            );
+        }
+        lab_server_response_stream_data(17, 19, 0, 1024);
+        lab_sender_service_decision(
+            "server",
+            Some(17),
+            19,
+            "data_service",
+            "stream_data",
+            1024,
+            format_args!("path_underlay=Tcp path_id=0"),
+        );
+        assert_eq!(lab_sender_service_counts_for_test(17, 19), (0, 0));
+
+        // SAFETY: the guard serializes diagnostic environment mutation in tests.
+        unsafe {
+            std::env::set_var("MPTUNNEL_LAB_DIAG_EVENTS", "sender_service_conformance");
+        }
+        lab_server_response_stream_data(17, 19, 1024, 1024);
+        lab_sender_service_decision(
+            "server",
+            Some(17),
+            19,
+            "data_service",
+            "stream_data",
+            1024,
+            format_args!("path_underlay=Tcp path_id=0"),
+        );
+        assert_eq!(lab_sender_service_counts_for_test(17, 19), (1, 1));
+        lab_assert_server_sender_service_balanced(17, 19);
+    }
 
     #[test]
     fn data_service_decision_counts_as_server_owner_data() {
@@ -441,6 +583,10 @@ fn bytes_per_second(bytes: u128, duration: Duration) -> u128 {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .map(|value| env_flag_value(&value))
         .unwrap_or(false)
+}
+
+fn env_flag_value(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
 }

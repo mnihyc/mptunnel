@@ -650,6 +650,9 @@ fn lab_response_bulk_output_candidate(
     mux_limits: MuxLimits,
     diag: ResponseBulkCandidateDiag,
 ) {
+    if !lab_diagnostic_event_enabled("server_bulk_output_candidate") {
+        return;
+    }
     let (lead_underlay, lead_path_id, lead_eta_ms) = diag
         .lead
         .map(|lead| {
@@ -702,6 +705,9 @@ fn lab_response_bulk_output_selected(
     selected: &ResponseSelectedDataTarget,
     payload_bytes: usize,
 ) {
+    if !lab_diagnostic_event_enabled("server_bulk_output_selected") {
+        return;
+    }
     lab_diagnostic(
         "server_bulk_output_selected",
         format_args!(
@@ -3260,27 +3266,29 @@ impl ServerResponseSenderService {
                     ),
                 );
             }
-            let (selected_underlay, selected_path_id) = selected_path
-                .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
-                .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
-            lab_diagnostic(
-                "server_sender_dispatch",
-                format_args!(
-                    "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} work_lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
-                    self.session_id.0,
-                    self.stream_id.0,
-                    enqueue_id,
-                    offset,
-                    payload_bytes,
-                    send_lane,
-                    queued_lane,
-                    queue_delay_ms,
-                    self.queue.bytes(),
-                    selected_underlay,
-                    selected_path_id,
-                    pacing_bytes,
-                ),
-            );
+            if lab_diagnostic_event_enabled("server_sender_dispatch") {
+                let (selected_underlay, selected_path_id) = selected_path
+                    .map(|path| (format!("{:?}", path.underlay), path.path_id.0.to_string()))
+                    .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
+                lab_diagnostic(
+                    "server_sender_dispatch",
+                    format_args!(
+                        "session_id={} stream_id={} enqueue_id={} offset={} payload_bytes={} lane={:?} work_lane={:?} queue_delay_ms={} sender_queue_bytes_after={} selected_path_underlay={} selected_path_id={} pacing_bytes={}",
+                        self.session_id.0,
+                        self.stream_id.0,
+                        enqueue_id,
+                        offset,
+                        payload_bytes,
+                        send_lane,
+                        queued_lane,
+                        queue_delay_ms,
+                        self.queue.bytes(),
+                        selected_underlay,
+                        selected_path_id,
+                        pacing_bytes,
+                    ),
+                );
+            }
         }
         #[cfg(not(feature = "lab-diagnostics"))]
         let _ = (

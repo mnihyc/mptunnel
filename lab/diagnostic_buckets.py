@@ -53,6 +53,17 @@ CONTROL_FRAME_KINDS = {
 }
 
 
+def diagnostic_event_available(row: dict[str, Any], event: str) -> bool:
+    """Return whether a zero count for an event is meaningful for this row."""
+    if row.get("lab_diagnostics_enabled") is False:
+        return False
+    selected = row.get("lab_diagnostic_events")
+    if not isinstance(selected, list) or not selected or "*" in selected:
+        # Legacy diagnostic rows did not record an event list and were full traces.
+        return True
+    return event in selected
+
+
 def analyze_row(
     row: dict[str, Any],
     log_artifacts: dict[str, Any] | None = None,
@@ -61,9 +72,24 @@ def analyze_row(
     log_artifacts = log_artifacts or row.get("log_artifacts") or {}
     telemetry = telemetry or row.get("container_telemetry") or {}
     logs = read_log_artifacts(log_artifacts)
-    for field in ("client_log_tail", "server_log_tail", "probe_stderr_tail"):
+    artifact_lines = {
+        service: collections.Counter(log_content_lines(text)) for service, text in logs
+    }
+    for field, service in (
+        ("client_log_tail", "client"),
+        ("server_log_tail", "server"),
+        ("probe_stderr_tail", "probe_stderr"),
+    ):
         if row.get(field):
-            logs.append((field, str(row[field])))
+            remaining = artifact_lines.get(service, collections.Counter()).copy()
+            delta = []
+            for line in log_content_lines(str(row[field])):
+                if remaining[line] > 0:
+                    remaining[line] -= 1
+                else:
+                    delta.append(line)
+            if delta:
+                logs.append((field, "\n".join(delta)))
 
     metrics = collect_metrics(row, logs, telemetry)
     scores, reasons = score_buckets(row, metrics)
@@ -74,6 +100,14 @@ def analyze_row(
         "reasons": reasons[:16],
         "metrics": metrics,
     }
+
+
+def log_content_lines(text: str) -> list[str]:
+    return [
+        line
+        for line in text.splitlines()
+        if not (line.startswith("== ") and line.endswith(" =="))
+    ]
 
 
 def read_log_artifacts(log_artifacts: dict[str, Any]) -> list[tuple[str, str]]:
@@ -109,6 +143,9 @@ def collect_metrics(
     dispatch_count = 0
     server_response_frames = 0
     sender_decisions = 0
+    conformance_summary_count = 0
+    conformance_summary_frames = 0
+    conformance_summary_decisions = 0
     max_receive_hole_bytes = 0
     max_stream_ordering_debt = 0
     max_command_pending_bytes = 0
@@ -117,6 +154,24 @@ def collect_metrics(
     reliable_open_successes = 0
     datagram_timeouts = 0
     teardown_hits: collections.Counter[str] = collections.Counter()
+    event_observation = {
+        event: diagnostic_event_available(row, event)
+        for event in (
+            "path_command_queue_send",
+            "receive_hole",
+            "reliable_stream_open_success",
+            "reliable_stream_open_timeout",
+            "sender_service_decision",
+            "sender_service_conformance",
+            "server_bulk_output_candidate",
+            "server_bulk_output_selected",
+            "server_response_stream_data_frame",
+            "server_sender_dispatch",
+            "server_sender_enqueue",
+            "stream_ack_received",
+            "udp_datagram_response_timeout",
+        )
+    }
 
     for _, text in logs:
         lower_text = text.lower()
@@ -149,6 +204,14 @@ def collect_metrics(
                 in {"primary", "data", "data_service", "data_subflow"}
             ):
                 sender_decisions += 1
+            elif event == "sender_service_conformance":
+                conformance_summary_count += 1
+                conformance_summary_frames += int_field(
+                    parsed, "server_response_stream_data_frames"
+                )
+                conformance_summary_decisions += int_field(
+                    parsed, "server_sender_service_stream_data_decisions"
+                )
             elif event == "receive_hole":
                 max_receive_hole_bytes = max(
                     max_receive_hole_bytes, int_field(parsed, "reorder_bytes")
@@ -199,20 +262,68 @@ def collect_metrics(
     repair_debt_has_hole_evidence = (
         events.get("receive_hole", 0) > 0 and max_receive_hole_bytes > 256 * 1024
     )
+    enqueue_observed = event_observation["server_sender_enqueue"]
+    dispatch_observed = event_observation["server_sender_dispatch"]
+    receive_hole_observed = event_observation["receive_hole"]
+    candidate_observed = event_observation["server_bulk_output_candidate"]
+    selected_observed = event_observation["server_bulk_output_selected"]
+    ack_observed = event_observation["stream_ack_received"]
+    path_queue_observed = event_observation["path_command_queue_send"]
+    raw_conformance_observed = (
+        event_observation["server_response_stream_data_frame"]
+        and event_observation["sender_service_decision"]
+    )
+    if raw_conformance_observed:
+        conformance_frames = server_response_frames
+        conformance_decisions = sender_decisions
+        conformance_observed = True
+    elif conformance_summary_count:
+        conformance_frames = conformance_summary_frames
+        conformance_decisions = conformance_summary_decisions
+        conformance_observed = True
+    elif event_observation["sender_service_conformance"]:
+        conformance_frames = 0
+        conformance_decisions = 0
+        conformance_observed = True
+    else:
+        conformance_frames = None
+        conformance_decisions = None
+        conformance_observed = False
     return {
         "event_counts": dict(events.most_common(32)),
-        "server_sender_enqueue_count": enqueue_count,
-        "server_sender_dispatch_count": dispatch_count,
-        "server_response_stream_data_frames": server_response_frames,
-        "server_sender_service_stream_data_decisions": sender_decisions,
-        "server_sender_conformance_delta": server_response_frames - sender_decisions,
-        "server_sender_dispatch_p95_ms": percentile(dispatch_queue_delays, 0.95),
-        "server_sender_dispatch_max_ms": max_or_none(dispatch_queue_delays),
-        "server_sender_queue_max_bytes": max_server_sender_queue_bytes,
-        "path_queue_control_p95_ms": percentile(control_waits, 0.95),
-        "path_queue_control_max_ms": max_or_none(control_waits),
-        "path_queue_data_p95_ms": percentile(data_waits, 0.95),
-        "path_queue_data_max_ms": max_or_none(data_waits),
+        "event_observation": event_observation,
+        "server_sender_enqueue_count": enqueue_count if enqueue_observed else None,
+        "server_sender_dispatch_count": dispatch_count if dispatch_observed else None,
+        "server_response_stream_data_frames": (
+            conformance_frames if conformance_observed else None
+        ),
+        "server_sender_service_stream_data_decisions": (
+            conformance_decisions if conformance_observed else None
+        ),
+        "server_sender_conformance_delta": (
+            conformance_frames - conformance_decisions if conformance_observed else None
+        ),
+        "server_sender_dispatch_p95_ms": (
+            percentile(dispatch_queue_delays, 0.95) if dispatch_observed else None
+        ),
+        "server_sender_dispatch_max_ms": (
+            max_or_none(dispatch_queue_delays) if dispatch_observed else None
+        ),
+        "server_sender_queue_max_bytes": (
+            max_server_sender_queue_bytes if enqueue_observed else None
+        ),
+        "path_queue_control_p95_ms": (
+            percentile(control_waits, 0.95) if path_queue_observed else None
+        ),
+        "path_queue_control_max_ms": (
+            max_or_none(control_waits) if path_queue_observed else None
+        ),
+        "path_queue_data_p95_ms": (
+            percentile(data_waits, 0.95) if path_queue_observed else None
+        ),
+        "path_queue_data_max_ms": (
+            max_or_none(data_waits) if path_queue_observed else None
+        ),
         "path_queue_waits_by_kind": {
             kind: {
                 "count": len(values),
@@ -220,21 +331,51 @@ def collect_metrics(
                 "max_ms": max_or_none(values),
             }
             for kind, values in sorted(path_queue_waits.items())
-        },
-        "receive_hole_events": events.get("receive_hole", 0),
-        "receive_hole_max_bytes": max_receive_hole_bytes,
-        "receive_hole_max_ratio": ratio(max_receive_hole_bytes, result_bytes),
-        "receive_hole_significant": receive_hole_significant,
-        "stream_ordering_debt_max_bytes": max_stream_ordering_debt,
-        "command_pending_max_bytes": max_command_pending_bytes,
-        "repair_bytes_after_max": max_or_none(repair_bytes_after),
-        "repair_debt_has_hole_evidence": repair_debt_has_hole_evidence,
-        "stream_ack_released_bytes_total": sum(stream_ack_released_bytes),
-        "candidate_reasons": dict(candidate_reasons.most_common(16)),
-        "selected_underlays": dict(selected_underlays),
-        "reliable_stream_open_timeouts": reliable_open_timeouts,
-        "reliable_stream_open_successes": reliable_open_successes,
-        "udp_datagram_timeouts": datagram_timeouts,
+        }
+        if path_queue_observed
+        else None,
+        "receive_hole_events": (
+            events.get("receive_hole", 0) if receive_hole_observed else None
+        ),
+        "receive_hole_max_bytes": max_receive_hole_bytes if receive_hole_observed else None,
+        "receive_hole_max_ratio": (
+            ratio(max_receive_hole_bytes, result_bytes) if receive_hole_observed else None
+        ),
+        "receive_hole_significant": (
+            receive_hole_significant if receive_hole_observed else None
+        ),
+        "stream_ordering_debt_max_bytes": (
+            max_stream_ordering_debt if candidate_observed else None
+        ),
+        "command_pending_max_bytes": max_command_pending_bytes if candidate_observed else None,
+        "repair_bytes_after_max": max_or_none(repair_bytes_after) if ack_observed else None,
+        "repair_debt_has_hole_evidence": (
+            repair_debt_has_hole_evidence
+            if ack_observed and receive_hole_observed
+            else None
+        ),
+        "stream_ack_released_bytes_total": (
+            sum(stream_ack_released_bytes) if ack_observed else None
+        ),
+        "candidate_reasons": (
+            dict(candidate_reasons.most_common(16)) if candidate_observed else None
+        ),
+        "selected_underlays": dict(selected_underlays) if selected_observed else None,
+        "reliable_stream_open_timeouts": (
+            reliable_open_timeouts
+            if event_observation["reliable_stream_open_timeout"]
+            else None
+        ),
+        "reliable_stream_open_successes": (
+            reliable_open_successes
+            if event_observation["reliable_stream_open_success"]
+            else None
+        ),
+        "udp_datagram_timeouts": (
+            datagram_timeouts
+            if event_observation["udp_datagram_response_timeout"]
+            else None
+        ),
         "teardown_hits": dict(teardown_hits.most_common(16)),
         "container_telemetry_available": bool(telemetry),
         "server_avg_tx_mbps": service_metric(telemetry, "server", "avg_tx_mbps"),
@@ -264,15 +405,16 @@ def score_buckets(
 
     enqueue_count = metrics["server_sender_enqueue_count"]
     dispatch_count = metrics["server_sender_dispatch_count"]
-    if enqueue_count and dispatch_count == 0:
-        add("sender_starvation", 8, "server enqueued response bytes but dispatched none")
-    elif enqueue_count > dispatch_count:
-        missing = enqueue_count - dispatch_count
-        add(
-            "sender_starvation",
-            min(5, max(1, missing * 5 // max(enqueue_count, 1))),
-            f"server enqueue/dispatch gap {enqueue_count}/{dispatch_count}",
-        )
+    if enqueue_count is not None and dispatch_count is not None:
+        if enqueue_count and dispatch_count == 0:
+            add("sender_starvation", 8, "server enqueued response bytes but dispatched none")
+        elif enqueue_count > dispatch_count:
+            missing = enqueue_count - dispatch_count
+            add(
+                "sender_starvation",
+                min(5, max(1, missing * 5 // max(enqueue_count, 1))),
+                f"server enqueue/dispatch gap {enqueue_count}/{dispatch_count}",
+            )
     if metrics["server_sender_dispatch_p95_ms"] and metrics["server_sender_dispatch_p95_ms"] > 250:
         add(
             "sender_starvation",
@@ -302,14 +444,14 @@ def score_buckets(
             5,
             f"receive-hole max is {metrics['receive_hole_max_ratio']:.3f} of delivered bytes",
         )
-    if metrics["receive_hole_max_bytes"] > 4 * 1024 * 1024:
+    if (metrics["receive_hole_max_bytes"] or 0) > 4 * 1024 * 1024:
         add(
             "harmful_admission",
             3,
             f"receive-hole max {metrics['receive_hole_max_bytes']} bytes",
         )
-    if metrics["stream_ordering_debt_max_bytes"] > 0 and (
-        metrics["receive_hole_significant"] or metrics["receive_hole_events"] > 100
+    if (metrics["stream_ordering_debt_max_bytes"] or 0) > 0 and (
+        metrics["receive_hole_significant"] or (metrics["receive_hole_events"] or 0) > 100
     ):
         add(
             "harmful_admission",
@@ -317,7 +459,7 @@ def score_buckets(
             f"stream ordering debt reached {metrics['stream_ordering_debt_max_bytes']} bytes",
         )
     if (
-        len(metrics["selected_underlays"]) > 1
+        len(metrics["selected_underlays"] or {}) > 1
         and metrics["receive_hole_events"]
         and (metrics["receive_hole_significant"] or metrics["receive_hole_events"] > 100)
     ):

@@ -26,6 +26,19 @@ def mean(values):
     return float(statistics.mean(clean))
 
 
+def complete_median(records, field, divisor=1.0):
+    """Return a median only when every accepted row provides the metric."""
+    if not records:
+        return None
+    values = []
+    for record in records:
+        value = record.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        values.append(value / divisor)
+    return median(values)
+
+
 def collect_files(paths):
     files = []
     for path_text in paths:
@@ -46,7 +59,7 @@ def load_records(files):
                 if not line:
                     continue
                 record = json.loads(line)
-                if "case" not in record:
+                if "case" not in record or "status" not in record:
                     continue
                 record["_source"] = str(path)
                 record["_line"] = line_number
@@ -84,15 +97,14 @@ def tcp_rows(by_case):
                     [record.get("recovery_gap_s") for record in ok if isinstance(record.get("recovery_gap_s"), (int, float))],
                     default=None,
                 ),
-                "median_overhead_pct": median(
-                    [record.get("traffic_overhead_pct_approx") for record in ok]
+                "median_client_probe_gap_pct": complete_median(
+                    ok, "client_vs_probe_payload_excess_pct_approx"
                 ),
-                "median_tunnel_mib": median(
-                    [
-                        record.get("tunnel_traffic_bytes_approx") / (1024 * 1024)
-                        for record in ok
-                        if isinstance(record.get("tunnel_traffic_bytes_approx"), (int, float))
-                    ]
+                "median_client_target_balance_pct": complete_median(
+                    ok, "client_target_endpoint_balance_pct_approx"
+                ),
+                "median_client_edge_mib": complete_median(
+                    ok, "client_edge_traffic_bytes_approx", 1024 * 1024
                 ),
             }
         )
@@ -104,6 +116,9 @@ def udp_rows(by_case):
     for case, records in by_case.items():
         if not any(record.get("protocol") == "udp" for record in records):
             continue
+        accepted = [
+            record for record in records if record.get("status") in ("ok", "loss")
+        ]
         rows.append(
             {
                 "case": case,
@@ -116,12 +131,11 @@ def udp_rows(by_case):
                 "avg_loss_rate": mean([record.get("loss_rate") for record in records]),
                 "median_p50_ms": median([record.get("p50_ms") for record in records]),
                 "median_p95_ms": median([record.get("p95_ms") for record in records]),
-                "median_overhead_pct": median(
-                    [
-                        record.get("traffic_overhead_pct_approx")
-                        for record in records
-                        if record.get("status") in ("ok", "loss")
-                    ]
+                "median_client_probe_gap_pct": complete_median(
+                    accepted, "client_vs_probe_payload_excess_pct_approx"
+                ),
+                "median_client_target_balance_pct": complete_median(
+                    accepted, "client_target_endpoint_balance_pct_approx"
                 ),
             }
         )
@@ -168,15 +182,14 @@ def upload_rows(by_case):
                     ],
                     default=None,
                 ),
-                "median_overhead_pct": median(
-                    [record.get("traffic_overhead_pct_approx") for record in accepted]
+                "median_client_probe_gap_pct": complete_median(
+                    accepted, "client_vs_probe_payload_excess_pct_approx"
                 ),
-                "median_tunnel_mib": median(
-                    [
-                        record.get("tunnel_traffic_bytes_approx") / (1024 * 1024)
-                        for record in accepted
-                        if isinstance(record.get("tunnel_traffic_bytes_approx"), (int, float))
-                    ]
+                "median_client_target_balance_pct": complete_median(
+                    accepted, "client_target_endpoint_balance_pct_approx"
+                ),
+                "median_client_edge_mib": complete_median(
+                    accepted, "client_edge_traffic_bytes_approx", 1024 * 1024
                 ),
             }
         )
@@ -189,6 +202,9 @@ def mixed_rows(by_case):
         if not any(record.get("protocol") == "mixed" for record in records):
             continue
         ok = [record for record in records if record.get("status") == "ok"]
+        accepted = [
+            record for record in records if record.get("status") in ("ok", "loss")
+        ]
         rows.append(
             {
                 "case": case,
@@ -199,12 +215,12 @@ def mixed_rows(by_case):
                     1 for record in records if record.get("status") not in ("ok", "loss")
                 ),
                 "bulk_median_goodput": median(
-                    [record.get("bulk_goodput_mbps") for record in ok]
+                    [record.get("bulk_goodput_mbps") for record in accepted]
                 ),
                 "bulk_max_gap": max(
                     [
                         record.get("bulk_recovery_gap_s")
-                        for record in ok
+                        for record in accepted
                         if isinstance(record.get("bulk_recovery_gap_s"), (int, float))
                     ],
                     default=None,
@@ -245,15 +261,14 @@ def mixed_rows(by_case):
                     ],
                     default=None,
                 ),
-                "median_overhead_pct": median(
-                    [record.get("traffic_overhead_pct_approx") for record in ok]
+                "median_client_probe_gap_pct": complete_median(
+                    accepted, "client_vs_probe_payload_excess_pct_approx"
                 ),
-                "median_tunnel_mib": median(
-                    [
-                        record.get("tunnel_traffic_bytes_approx") / (1024 * 1024)
-                        for record in ok
-                        if isinstance(record.get("tunnel_traffic_bytes_approx"), (int, float))
-                    ]
+                "median_client_target_balance_pct": complete_median(
+                    accepted, "client_target_endpoint_balance_pct_approx"
+                ),
+                "median_client_edge_mib": complete_median(
+                    accepted, "client_edge_traffic_bytes_approx", 1024 * 1024
                 ),
             }
         )
@@ -426,12 +441,12 @@ def render_markdown(records):
         "",
         "## TCP Downloads",
         "",
-        "| case | runs | ok | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s | overhead % approx | tunnel MiB approx |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| case | runs | ok | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s | client/probe gap % approx | client/target balance % approx | client edge MiB approx |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in tcp_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} | {median_overhead_pct} | {median_tunnel_mib} |".format(
+            "| {case} | {runs} | {ok} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} | {median_client_probe_gap_pct} | {median_client_target_balance_pct} | {median_client_edge_mib} |".format(
                 case=row["case"],
                 runs=row["runs"],
                 ok=row["ok"],
@@ -441,8 +456,13 @@ def render_markdown(records):
                 median_time=fmt_float(row["median_time"]),
                 median_recovery_gap=fmt_float(row["median_recovery_gap"]),
                 max_recovery_gap=fmt_float(row["max_recovery_gap"]),
-                median_overhead_pct=fmt_float(row["median_overhead_pct"]),
-                median_tunnel_mib=fmt_float(row["median_tunnel_mib"]),
+                median_client_probe_gap_pct=fmt_float(
+                    row["median_client_probe_gap_pct"]
+                ),
+                median_client_target_balance_pct=fmt_float(
+                    row["median_client_target_balance_pct"]
+                ),
+                median_client_edge_mib=fmt_float(row["median_client_edge_mib"]),
             )
         )
 
@@ -451,13 +471,13 @@ def render_markdown(records):
             "",
             "## UDP Probes",
             "",
-            "| case | runs | ok | loss | fail | median received | median count | avg loss | median p50 ms | median p95 ms | overhead % approx |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| case | runs | ok | loss | fail | median received | median count | avg loss | median p50 ms | median p95 ms | client/probe gap % approx | client/target balance % approx |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in udp_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {loss} | {fail} | {received} | {count} | {avg_loss_rate} | {median_p50_ms} | {median_p95_ms} | {median_overhead_pct} |".format(
+            "| {case} | {runs} | {ok} | {loss} | {fail} | {received} | {count} | {avg_loss_rate} | {median_p50_ms} | {median_p95_ms} | {median_client_probe_gap_pct} | {median_client_target_balance_pct} |".format(
                 case=row["case"],
                 runs=row["runs"],
                 ok=row["ok"],
@@ -468,7 +488,12 @@ def render_markdown(records):
                 avg_loss_rate=fmt_float(row["avg_loss_rate"], 3),
                 median_p50_ms=fmt_float(row["median_p50_ms"]),
                 median_p95_ms=fmt_float(row["median_p95_ms"]),
-                median_overhead_pct=fmt_float(row["median_overhead_pct"]),
+                median_client_probe_gap_pct=fmt_float(
+                    row["median_client_probe_gap_pct"]
+                ),
+                median_client_target_balance_pct=fmt_float(
+                    row["median_client_target_balance_pct"]
+                ),
             )
         )
 
@@ -477,13 +502,13 @@ def render_markdown(records):
             "",
             "## TCP Uploads",
             "",
-            "| case | runs | ok | loss | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s | overhead % approx | tunnel MiB approx |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| case | runs | ok | loss | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s | client/probe gap % approx | client/target balance % approx | client edge MiB approx |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in upload_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {loss} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} | {median_overhead_pct} | {median_tunnel_mib} |".format(
+            "| {case} | {runs} | {ok} | {loss} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} | {median_client_probe_gap_pct} | {median_client_target_balance_pct} | {median_client_edge_mib} |".format(
                 case=row["case"],
                 runs=row["runs"],
                 ok=row["ok"],
@@ -494,8 +519,13 @@ def render_markdown(records):
                 median_time=fmt_float(row["median_time"]),
                 median_recovery_gap=fmt_float(row["median_recovery_gap"]),
                 max_recovery_gap=fmt_float(row["max_recovery_gap"]),
-                median_overhead_pct=fmt_float(row["median_overhead_pct"]),
-                median_tunnel_mib=fmt_float(row["median_tunnel_mib"]),
+                median_client_probe_gap_pct=fmt_float(
+                    row["median_client_probe_gap_pct"]
+                ),
+                median_client_target_balance_pct=fmt_float(
+                    row["median_client_target_balance_pct"]
+                ),
+                median_client_edge_mib=fmt_float(row["median_client_edge_mib"]),
             )
         )
 
@@ -504,13 +534,13 @@ def render_markdown(records):
             "",
             "## Mixed Workloads",
             "",
-            "| case | runs | ok | loss | fail | median bulk Mbps | max bulk recovery gap s | median small p95 ms | max small ms | median interactive ok | median interactive count | median interactive p95 ms | max interactive failover gap s | avg UDP loss | median UDP p95 ms | max UDP ms | overhead % approx | tunnel MiB approx |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| case | runs | ok | loss | fail | median bulk Mbps | max bulk recovery gap s | median small p95 ms | max small ms | median interactive ok | median interactive count | median interactive p95 ms | max interactive failover gap s | avg UDP loss | median UDP p95 ms | max UDP ms | client/probe gap % approx | client/target balance % approx | client edge MiB approx |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in mixed_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {loss} | {fail} | {bulk_median_goodput} | {bulk_max_gap} | {small_p95} | {small_max} | {interactive_ok} | {interactive_count} | {interactive_p95} | {interactive_gap} | {udp_loss} | {udp_p95} | {udp_max} | {median_overhead_pct} | {median_tunnel_mib} |".format(
+            "| {case} | {runs} | {ok} | {loss} | {fail} | {bulk_median_goodput} | {bulk_max_gap} | {small_p95} | {small_max} | {interactive_ok} | {interactive_count} | {interactive_p95} | {interactive_gap} | {udp_loss} | {udp_p95} | {udp_max} | {median_client_probe_gap_pct} | {median_client_target_balance_pct} | {median_client_edge_mib} |".format(
                 case=row["case"],
                 runs=row["runs"],
                 ok=row["ok"],
@@ -527,8 +557,13 @@ def render_markdown(records):
                 udp_loss=fmt_float(row["udp_loss"], 3),
                 udp_p95=fmt_float(row["udp_p95"]),
                 udp_max=fmt_float(row["udp_max"]),
-                median_overhead_pct=fmt_float(row["median_overhead_pct"]),
-                median_tunnel_mib=fmt_float(row["median_tunnel_mib"]),
+                median_client_probe_gap_pct=fmt_float(
+                    row["median_client_probe_gap_pct"]
+                ),
+                median_client_target_balance_pct=fmt_float(
+                    row["median_client_target_balance_pct"]
+                ),
+                median_client_edge_mib=fmt_float(row["median_client_edge_mib"]),
             )
         )
 

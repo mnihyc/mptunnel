@@ -78,6 +78,31 @@ Download cases use a sparse 1 GiB HTTP object by default and run for a fixed dur
 
 The HTTP, upload, and mixed cases record wall time, goodput Mbps, startup timing, max transfer gap, recovery gap, and one-second interval goodput samples during sustained load windows. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
 
+### Evidence cohorts
+
+Keep these result families separate when comparing changes:
+
+- TCP-only, UDP reliable-stream-only, reliable mixed-carrier, and composite mixed-workload cases exercise different product paths. Do not pool their ratios.
+- Shaped one-flow and shaped two-flow cases have different offered capacity and contention. Compare each only with the same topology and netem profile.
+- Blackhole, latency-spike, and scheduled-flapping rows are separate fault cohorts. Match the impairment settings, timing, and, for flapping, schedule evidence before comparing them.
+- `unconstrained` means Docker paths with netem cleared. It is still a local container experiment, not a real-Internet measurement.
+- The shaped real-profile cases emulate Internet conditions. They are not evidence from the public Internet.
+- Real-Internet results require a separately recorded endpoint inventory, route/path context, time window, and reproducible runner. When those inputs are unavailable, record the cohort as not run rather than treating an emulated case as a substitute.
+
+### Traffic accounting
+
+Container telemetry takes case-boundary snapshots of aggregate non-loopback counters. The probe, client edge, and target edge observe different delivery points. Fixed-duration downloads normally stop with a partial final request, so the target may have emitted bytes that the probe has not consumed when the after-snapshot is taken. Endpoint snapshots are sequential, not atomic, and can include additional timing skew. The periodic sampler checks its stop marker between service operations and during its sleep, but an in-flight Docker command remains bounded by that command's timeout.
+
+New rows use traffic metric version 3 and retain several distinct quantities:
+
+- `client_edge_traffic_bytes_approx` and `target_edge_traffic_bytes_approx` are aggregate non-loopback rx+tx deltas at the two container edges.
+- `client_vs_probe_payload_excess_*_approx` and `target_vs_probe_payload_excess_*_approx` are signed edge-counter differences relative to probe-visible payload.
+- `client_target_endpoint_balance_*_approx` is the signed client-edge counter minus the target-edge counter. All three ratios and percentages use probe payload as a common denominator, so the unrounded ratios preserve the byte identity; independently rounded displayed percentages can differ by `0.001` percentage point.
+- `traffic_accounting_identity_residual_bytes_approx` checks the byte identity `client-probe = (target-probe) + (client-target)` and should be zero. This identity is algebraic, not causal.
+- `traffic_expansion_estimate_available` and `traffic_expansion_exact_available` are false. Aggregate bidirectional counters cannot separate simultaneous upload/download in-flight bytes, sequential snapshot skew, unrelated interface traffic, or packets lost before an observation point. Expansion requires direction-split, per-interface sender accounting over finite transfers whose endpoint delivery windows are drained.
+
+The legacy `traffic_overhead_*_approx` and `tunnel_traffic_bytes_approx` fields remain in JSONL rows for schema compatibility. They are respectively a nonnegative client/probe delivery-window gap and an alias for aggregate client-edge traffic; both also appear on direct controls and must not be interpreted as tunnel expansion. The Markdown summarizer uses only version-3 names and renders a diagnostic median only when every accepted row in that case supplies it.
+
 ## Controls
 
 Useful environment variables:
@@ -171,5 +196,7 @@ For release decisions, compare at least:
 - Sustained interval goodput, first-body time, max read gap, UDP p95, and SSH-like echo success gap during the same fixed-duration window.
 - Clean-lab aggregate goodput against the manual ~1 Gbps target.
 - Lab RSS or equivalent process-memory samples against the manual ~256 MiB target.
+
+Traffic-accounting fields are diagnostic context, not a release gate. A separate finite, drained, direction-split sender-observed experiment is required before making transport-expansion claims.
 
 When results are poor, keep them. They are product signals, not harness failures.

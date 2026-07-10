@@ -110,40 +110,114 @@ def application_payload_bytes(row: dict[str, Any]) -> tuple[int | None, str | No
     return None, None
 
 
-def client_tunnel_traffic_bytes(telemetry: dict[str, Any]) -> int | None:
+def service_non_loopback_traffic_bytes(
+    telemetry: dict[str, Any], service: str
+) -> int | None:
     services = telemetry.get("services")
     if not isinstance(services, dict):
         return None
-    client = services.get("client")
-    if not isinstance(client, dict):
+    service_row = services.get(service)
+    if not isinstance(service_row, dict):
         return None
-    rx = _int_number(client.get("delta_rx_bytes"))
-    tx = _int_number(client.get("delta_tx_bytes"))
+    rx = _int_number(service_row.get("delta_rx_bytes"))
+    tx = _int_number(service_row.get("delta_tx_bytes"))
     if rx is None or tx is None:
         return None
     total = rx + tx
     return total if total > 0 else None
 
 
+def client_edge_traffic_bytes(telemetry: dict[str, Any]) -> int | None:
+    return service_non_loopback_traffic_bytes(telemetry, "client")
+
+
 def enrich_traffic_overhead(row: dict[str, Any], telemetry: dict[str, Any]) -> None:
-    """Add approximate traffic overhead fields to a lab result row in place."""
+    """Add case-boundary edge-traffic diagnostics to a lab result row in place."""
 
     app_bytes, app_source = application_payload_bytes(row)
-    tunnel_bytes = client_tunnel_traffic_bytes(telemetry)
-    if app_bytes is None or tunnel_bytes is None or app_bytes <= 0:
+    client_edge_bytes = client_edge_traffic_bytes(telemetry)
+    if app_bytes is None or client_edge_bytes is None or app_bytes <= 0:
         return
 
-    overhead_bytes = max(tunnel_bytes - app_bytes, 0)
+    client_probe_excess_bytes = client_edge_bytes - app_bytes
+    client_probe_excess_ratio = client_probe_excess_bytes / app_bytes
+    overhead_bytes = max(client_probe_excess_bytes, 0)
     overhead_ratio = overhead_bytes / app_bytes
+    row["traffic_metric_version"] = 3
     row["app_payload_bytes"] = app_bytes
     row["app_payload_source"] = app_source
-    row["tunnel_traffic_bytes_approx"] = tunnel_bytes
+    row["traffic_accounting_ratio_reference"] = "probe_payload_bytes"
+    row["client_edge_traffic_bytes_approx"] = client_edge_bytes
+    row["client_vs_probe_payload_excess_bytes_approx"] = client_probe_excess_bytes
+    row["client_vs_probe_payload_excess_ratio_approx"] = round(
+        client_probe_excess_ratio, 6
+    )
+    row["client_vs_probe_payload_excess_pct_approx"] = round(
+        client_probe_excess_ratio * 100.0, 3
+    )
+    row["traffic_accounting_source"] = (
+        "client_container_non_loopback_netdev_case_boundary_delta"
+    )
+    row["traffic_accounting_note"] = (
+        "Signed aggregate case-boundary differences. Sequential snapshots, "
+        "opposite-direction in-flight bytes, endpoint headers/control, and "
+        "unrelated interface traffic can affect them; they are diagnostics, "
+        "not transport-expansion estimates."
+    )
+
+    # Compatibility fields predate metric version 3 and also appear on direct rows.
+    row["tunnel_traffic_bytes_approx"] = client_edge_bytes
     row["traffic_overhead_bytes_approx"] = overhead_bytes
     row["traffic_overhead_ratio_approx"] = round(overhead_ratio, 6)
     row["traffic_overhead_pct_approx"] = round(overhead_ratio * 100.0, 3)
     row["traffic_overhead_source"] = "client_container_non_loopback_netdev_delta_rx_tx"
     row["traffic_overhead_note"] = (
-        "Approximate: uses client container non-loopback rx+tx deltas and "
-        "probe-visible payload bytes; includes tunnel control, retransmission, "
-        "path proof, duplicate/repair traffic, TCP/QUIC/IP headers, and sampling skew."
+        "Legacy client/probe delivery-window gap: uses client container "
+        "non-loopback rx+tx deltas minus probe-visible payload bytes. It mixes "
+        "transport expansion with bidirectional in-flight bytes, endpoint "
+        "headers/control, unrelated traffic, and sequential snapshot skew, so "
+        "it is not independently a transport-overhead measurement."
     )
+    row["traffic_expansion_estimate_available"] = False
+    row["traffic_expansion_exact_available"] = False
+    row["traffic_expansion_unavailable_reasons"] = [
+        "aggregate_bidirectional_counters_do_not_separate_directional_inflight_bytes",
+        "case_boundary_endpoint_snapshots_are_sequential_not_atomic",
+        "aggregate_endpoint_counters_do_not_isolate_transport_wire_traffic",
+        "receiver_counters_can_exclude_packets_dropped_before_observation",
+    ]
+    row["traffic_expansion_unavailable_note"] = (
+        "Expansion requires direction-split, per-interface sender accounting "
+        "over finite transfers whose endpoint delivery windows are drained."
+    )
+
+    target_edge_bytes = service_non_loopback_traffic_bytes(telemetry, "target")
+    if target_edge_bytes is None:
+        return
+
+    row["traffic_accounting_source"] = (
+        "client_and_target_container_non_loopback_netdev_case_boundary_deltas"
+    )
+    target_probe_excess_bytes = target_edge_bytes - app_bytes
+    target_probe_excess_ratio = target_probe_excess_bytes / app_bytes
+    endpoint_balance_bytes = client_edge_bytes - target_edge_bytes
+    endpoint_balance_ratio = endpoint_balance_bytes / app_bytes
+    identity_residual_bytes = client_probe_excess_bytes - (
+        target_probe_excess_bytes + endpoint_balance_bytes
+    )
+    row["target_edge_traffic_bytes_approx"] = target_edge_bytes
+    row["target_vs_probe_payload_excess_bytes_approx"] = target_probe_excess_bytes
+    row["target_vs_probe_payload_excess_ratio_approx"] = round(
+        target_probe_excess_ratio, 6
+    )
+    row["target_vs_probe_payload_excess_pct_approx"] = round(
+        target_probe_excess_ratio * 100.0, 3
+    )
+    row["client_target_endpoint_balance_bytes_approx"] = endpoint_balance_bytes
+    row["client_target_endpoint_balance_ratio_approx"] = round(
+        endpoint_balance_ratio, 6
+    )
+    row["client_target_endpoint_balance_pct_approx"] = round(
+        endpoint_balance_ratio * 100.0, 3
+    )
+    row["traffic_accounting_identity_residual_bytes_approx"] = identity_residual_bytes

@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 
 BYTE_UNITS = {
@@ -25,6 +26,8 @@ BYTE_UNITS = {
     "gib": 1024**3,
     "tib": 1024**4,
 }
+
+STOP_POLL_INTERVAL_SECONDS = 0.05
 
 
 def run(argv: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
@@ -77,14 +80,38 @@ def parse_mem_usage(value: str | None) -> tuple[int | None, int | None]:
     return usage, limit
 
 
-def compose_container_ids(compose_file: str, services: list[str]) -> dict[str, str]:
+def compose_container_ids(
+    compose_file: str,
+    services: list[str],
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, str]:
     ids: dict[str, str] = {}
     for service in services:
+        if should_stop is not None and should_stop():
+            break
         result = run(["docker", "compose", "-f", compose_file, "ps", "-q", service])
         container_id = result.stdout.strip().splitlines()
         if result.returncode == 0 and container_id:
             ids[service] = container_id[0]
     return ids
+
+
+def stop_requested(stop_file: Path | None) -> bool:
+    return stop_file is not None and stop_file.exists()
+
+
+def wait_for_stop_or_deadline(
+    stop_file: Path | None,
+    deadline_monotonic: float,
+    poll_interval: float = STOP_POLL_INTERVAL_SECONDS,
+) -> bool:
+    """Wait until the sampling deadline, returning early when stop is requested."""
+    while not stop_requested(stop_file):
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(max(poll_interval, 0.001), remaining))
+    return True
 
 
 def docker_stats(container_ids: list[str]) -> dict[str, dict[str, object]]:
@@ -227,12 +254,21 @@ def sample(args: argparse.Namespace) -> int:
     started_at = time.monotonic()
     sample_index: dict[str, int] = defaultdict(int)
 
+    def should_stop() -> bool:
+        return stop_requested(stop_file)
+
     with output.open("a", encoding="utf-8") as handle:
-        while stop_file is None or not stop_file.exists():
+        while not stop_requested(stop_file):
             now_monotonic = time.monotonic()
-            ids = compose_container_ids(args.compose_file, args.services)
+            ids = compose_container_ids(args.compose_file, args.services, should_stop)
+            if should_stop():
+                break
             stats = docker_stats(list(ids.values()))
+            if should_stop():
+                break
             for service, container_id in ids.items():
+                if should_stop():
+                    break
                 sample_index[service] += 1
                 stat = stat_for_container(stats, container_id)
                 mem_usage, mem_limit = parse_mem_usage(str(stat.get("MemUsage", "")))
@@ -256,7 +292,9 @@ def sample(args: argparse.Namespace) -> int:
                     **rates,
                 }
                 print(json.dumps(row, sort_keys=True), file=handle, flush=True)
-            time.sleep(args.interval)
+            next_sample_at = time.monotonic() + max(args.interval, 0.0)
+            if wait_for_stop_or_deadline(stop_file, next_sample_at):
+                break
     return 0
 
 

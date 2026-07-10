@@ -24,6 +24,14 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
 
+    def test_flapper_cannot_be_stopped_by_background_terminal_signals(self):
+        flapper = SCRIPT.split("start_random_flapping() {", 1)[1].split(
+            "\n}\n\nshould_run_case()", 1
+        )[0]
+
+        self.assertIn("trap '' TTOU TTIN TSTP", flapper)
+        self.assertIn(") </dev/null &", flapper)
+
 
 if __name__ == "__main__":
     unittest.main()

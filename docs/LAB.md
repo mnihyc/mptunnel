@@ -39,12 +39,13 @@ The lab starts three containers:
 
 Each container is capped at two CPUs in Docker Compose to approximate a modest VPS instead of an unconstrained host.
 
-It creates four simultaneous client/server path networks plus a server/target network:
+It creates five simultaneous client/server path networks plus a server/target network:
 
 | Network | Client | Server | Target | Profile |
 | --- | --- | --- | --- | --- |
 | `path_lowlat` | `172.31.10.10` | `172.31.10.20` | `172.31.10.30` | 20 ms, 80 Mbps, 1% loss |
 | `path_balanced` | `172.31.15.10` | `172.31.15.20` | `172.31.15.30` | 80 ms, 200 Mbps, 1% loss |
+| `path_mildloss` | `172.31.16.10` | `172.31.16.20` | `172.31.16.30` | 160 ms, 100 Mbps, 0.1% loss |
 | `path_fat` | `172.31.20.10` | `172.31.20.20` | `172.31.20.30` | 180 ms, 500 Mbps, 1% loss |
 | `path_poor` | `172.31.30.10` | `172.31.30.20` | `172.31.30.30` | 420 ms, 50 Mbps, 10% loss, high jitter |
 | `target_net` | none | `172.31.40.20` | `172.31.40.30` | server outbound network |
@@ -68,6 +69,8 @@ It records:
 - mptunnel mixed workload while one path is saturated by background `iperf3` traffic.
 - mptunnel mixed workload while a recorded, seed-derived schedule flaps path states between normal, spiked, and blackholed profiles.
 - mptunnel TCP multipath download while the high-bandwidth path is blackholed during transfer.
+- mptunnel TCP multipath download while the high-bandwidth path is degraded by a latency, jitter, loss, and rate spike during transfer.
+- mptunnel mixed workload while the high-bandwidth path is blackholed or degraded by the same latency-spike profile during transfer.
 - mptunnel mixed-workload ideal comparisons where one selected path is forced to 0% loss.
 - mptunnel controlled matrix download and upload cases over one TCP+UDP path where bandwidth, latency, and loss each toggle between good and poor values.
 
@@ -101,6 +104,7 @@ Useful environment variables:
 - `MPTUNNEL_LAB_USE_PATH_HINTS=1`: optional diagnostic override that adds RTT/rate/capability query hints to path URIs. Unset by default so product launches use endpoint paths only.
 - `MPTUNNEL_LAB_LOWLAT_RATE`, `MPTUNNEL_LAB_LOWLAT_DELAY`, `MPTUNNEL_LAB_LOWLAT_JITTER`, `MPTUNNEL_LAB_LOWLAT_LOSS`: low-latency path netem values. The default loss is `1.00%`.
 - `MPTUNNEL_LAB_BALANCED_RATE`, `MPTUNNEL_LAB_BALANCED_DELAY`, `MPTUNNEL_LAB_BALANCED_JITTER`, `MPTUNNEL_LAB_BALANCED_LOSS`: balanced daily-use path netem values. The default loss is `1.00%`.
+- `MPTUNNEL_LAB_MILDLOSS_RATE`, `MPTUNNEL_LAB_MILDLOSS_DELAY`, `MPTUNNEL_LAB_MILDLOSS_JITTER`, `MPTUNNEL_LAB_MILDLOSS_LOSS`: lower-loss companion path netem values. Defaults are half the balanced rate, twice the balanced delay, balanced jitter, and `0.10%` loss.
 - `MPTUNNEL_LAB_FAT_RATE`, `MPTUNNEL_LAB_FAT_DELAY`, `MPTUNNEL_LAB_FAT_JITTER`, `MPTUNNEL_LAB_FAT_LOSS`: high-bandwidth path netem values. The default loss is `1.00%`.
 - `MPTUNNEL_LAB_POOR_RATE`, `MPTUNNEL_LAB_POOR_DELAY`, `MPTUNNEL_LAB_POOR_JITTER`, `MPTUNNEL_LAB_POOR_LOSS`: poor-Internet path netem values. The default loss is `10.00%`.
 - `MPTUNNEL_LAB_IDEAL_LOSS`: loss value for ideal comparison cases, default `0.00%`.
@@ -109,6 +113,7 @@ Useful environment variables:
 - `MPTUNNEL_LAB_MATRIX_GOOD_JITTER`, `MPTUNNEL_LAB_MATRIX_POOR_JITTER`: controlled matrix jitter values, default `5ms` and `60ms`.
 - `MPTUNNEL_LAB_MATRIX_GOOD_LOSS`, `MPTUNNEL_LAB_MATRIX_POOR_LOSS`: controlled matrix loss values, default `1.00%` and `15.00%`.
 - `MPTUNNEL_LAB_BLACKHOLE_LOSS`: blackhole loss value for failover tests, default `100%`.
+- `MPTUNNEL_LAB_SPIKE_FAT_RATE`, `MPTUNNEL_LAB_SPIKE_FAT_DELAY`, `MPTUNNEL_LAB_SPIKE_FAT_JITTER`, `MPTUNNEL_LAB_SPIKE_FAT_LOSS`: degraded high-bandwidth-path values used by latency-spike cases, default `20mbit`, `900ms`, `250ms`, and `10.00%`.
 - `MPTUNNEL_LAB_SATURATE_PROTOCOL`: background saturation protocol, `udp` by default or `tcp`.
 - `MPTUNNEL_LAB_SATURATE_LOWLAT_BANDWIDTH`, `MPTUNNEL_LAB_SATURATE_BALANCED_BANDWIDTH`, `MPTUNNEL_LAB_SATURATE_FAT_BANDWIDTH`, `MPTUNNEL_LAB_SATURATE_POOR_BANDWIDTH`: bidirectional background `iperf3` rates for saturated-link cases.
 - `MPTUNNEL_LAB_FLAP_MIN_SECONDS`, `MPTUNNEL_LAB_FLAP_MAX_SECONDS`, `MPTUNNEL_LAB_FLAP_MODES`: link-flapping cadence and supported netem mode list for unstable-link cases.

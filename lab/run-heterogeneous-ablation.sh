@@ -1201,6 +1201,9 @@ start_random_flapping() {
     --index 0 >/dev/null
   set -m
   (
+    # Docker Compose may inspect the controlling terminal even with exec -T.
+    # Keep the job-controlled worker runnable while it applies netem modes.
+    trap '' TTOU TTIN TSTP
     trap 'touch "$flapper_done_file"' EXIT
     while [[ ! -f "$flapper_probe_gate_file" && ! -f "$flapper_probe_finished_file" && ! -f "$flapper_stop_file" ]]; do
       sleep 0.01
@@ -1259,7 +1262,7 @@ start_random_flapping() {
         sleep 0.05
       done
     done
-  ) &
+  ) </dev/null &
   flapper_pid="$!"
   flapper_pgid="$flapper_pid"
   set +m

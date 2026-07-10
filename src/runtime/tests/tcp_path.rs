@@ -888,7 +888,7 @@ async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
 
 #[tokio::test]
 async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
-    let registry = ServerReliableStreamRegistry::new(8);
+    let registry = Arc::new(ServerReliableStreamRegistry::new(8));
     let session_id = SessionId(11);
     let stream_id = StreamId(5);
     let (commands, _receivers) = reliable_path_command_channels(4);
@@ -896,6 +896,8 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
         host: "example.com".to_string(),
         port: 443,
     };
+    let first_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(0));
 
     let opened = registry
         .open_or_attach(
@@ -905,8 +907,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
                 target: &target,
                 lane: FlowLane::Latency,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(0),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: first_path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
@@ -946,6 +947,8 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
         .expect("unknown server product stream frame should be dropped");
 
     let (commands, _receivers) = reliable_path_command_channels(4);
+    let second_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(1));
     let opened = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -954,8 +957,7 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
                 target: &target,
                 lane: FlowLane::Latency,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(1),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: second_path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,

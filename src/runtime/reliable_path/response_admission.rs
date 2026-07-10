@@ -8,6 +8,8 @@ use super::*;
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) incarnation: u64,
     pub(super) commands: ReliablePathCommandSender,
     pub(super) role: StreamOpenRole,
     pub(super) bytes_in_flight: u64,
@@ -16,6 +18,11 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) delivery_rate_bps: Option<f64>,
     pub(super) srtt_ms: Option<f64>,
     pub(super) delivery_samples: u32,
+    /// Cumulative uniquely owned product bytes ACKed on this output.
+    ///
+    /// The flight ledger increments this only for unambiguous `OwnerData`;
+    /// duplicated `RepairData` never contributes.
+    pub(super) owner_data_acked_bytes: u64,
     pub(super) last_delivery_at: Option<Instant>,
     pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
     pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
@@ -28,7 +35,9 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) incarnation: u64,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
+    pub(in crate::runtime) attachment_role: StreamOpenRole,
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
@@ -43,10 +52,12 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) key: CarrierPathKey,
+    pub(super) output_incarnation: u64,
     pub(super) end: u64,
     pub(super) bytes: usize,
     pub(super) sent_at: Instant,
     pub(super) kind: CarrierWorkKind,
+    pub(super) evidence_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +75,7 @@ pub(in crate::runtime) struct CarrierPathFlightDebt {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct CarrierPathAckedHole {
     pub(super) key: CarrierPathKey,
+    pub(super) output_incarnation: u64,
     pub(super) end: u64,
     pub(super) bytes: u64,
     pub(super) kind: CarrierWorkKind,
@@ -98,6 +110,7 @@ impl ResponseAckOrderingState {
             let flight = release.flight;
             let hole = CarrierPathAckedHole {
                 key: flight.key,
+                output_incarnation: flight.output_incarnation,
                 end: flight.end,
                 bytes: flight.bytes as u64,
                 kind: flight.kind,
@@ -291,8 +304,9 @@ pub(super) fn server_bulk_output_snapshot(
     let peer_hint_rate_bps = peer_hint_metrics
         .filter(|path_metrics| !path_metrics.metrics.app_limited)
         .map(server_path_metrics_rate_bps);
-    let product_owner_rate_bps = entry
-        .product_progress_rate_bps
+    let product_owner_rate_bps = (entry.key.underlay == UnderlayProtocol::Tcp)
+        .then_some(entry.product_progress_rate_bps)
+        .flatten()
         .filter(|_| entry.delivery_samples > 0);
     let prior_rate_bps = model_rate_bps
         .or(peer_hint_rate_bps)
@@ -513,10 +527,25 @@ fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry)
             || path_metrics.metrics.confidence_ppm > 0)
 }
 
+pub(in crate::runtime) fn response_subflow_startup_sample_limit_bytes(
+    mux_limits: MuxLimits,
+) -> u64 {
+    let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
+        .min(mux_limits.max_repair_bytes as u64)
+        .min(mux_limits.max_reorder_bytes as u64)
+        .min(mux_limits.max_stream_window_bytes)
+        .max(1);
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
+        .saturating_div(2)
+        .max(PATH_OPEN_SCORE_BYTES as u64)
+        .min(configured_envelope)
+}
+
 pub(in crate::runtime) fn server_output_has_sender_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
-    entry.delivery_samples > 0
+    entry.owner_data_acked_bytes > 0
+        || entry.delivery_samples > 0
         || entry.delivery_rate_bps.is_some()
         || matches!(
             entry.local_path_metrics,
@@ -524,25 +553,39 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         )
 }
 
+pub(in crate::runtime) fn server_output_has_product_bulk_rate_evidence(
+    entry: &ResponseStreamOutputEntry,
+    mux_limits: MuxLimits,
+) -> bool {
+    let sample_floor = response_subflow_startup_sample_limit_bytes(mux_limits);
+    let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+    entry.product_progress_rate_bps.is_some()
+        && entry
+            .owner_data_acked_bytes
+            .saturating_add(accounting_slack)
+            >= sample_floor
+}
+
+#[cfg(test)]
 pub(in crate::runtime) fn server_output_has_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
+) -> bool {
+    server_output_has_bulk_rate_evidence_with_limits(entry, MuxLimits::default())
+}
+
+pub(in crate::runtime) fn server_output_has_bulk_rate_evidence_with_limits(
+    entry: &ResponseStreamOutputEntry,
+    mux_limits: MuxLimits,
 ) -> bool {
     let has_local_carrier_bulk = matches!(
         entry.local_path_metrics,
         Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
     );
-    let has_path_scoped_product_bulk =
-        entry.delivery_samples > 0 && entry.product_progress_rate_bps.is_some();
     match entry.key.underlay {
-        UnderlayProtocol::Udp => has_local_carrier_bulk || has_path_scoped_product_bulk,
-        // TCP response output is one encrypted carrier stream. UDP also gets
-        // path-scoped product evidence when the flight ledger proves a unique
-        // OwnerData copy was ACKed; duplicated RepairData ACKs never increment
-        // delivery_samples.
+        UnderlayProtocol::Udp => has_local_carrier_bulk,
         UnderlayProtocol::Tcp => {
-            entry.delivery_samples > 0
-                || entry.delivery_rate_bps.is_some()
-                || has_local_carrier_bulk
+            has_local_carrier_bulk
+                || server_output_has_product_bulk_rate_evidence(entry, mux_limits)
         }
     }
 }
@@ -603,6 +646,8 @@ mod tests {
                 underlay: UnderlayProtocol::Udp,
                 path_id: PathId(0),
             },
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -611,6 +656,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 1,
+            owner_data_acked_bytes: 0,
             last_delivery_at: Some(Instant::now()),
             local_path_metrics: None,
             peer_path_metrics: None,
@@ -627,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_unique_owner_ack_product_rate_counts_as_bulk_rate_evidence() {
+    fn udp_unique_owner_ack_product_rate_does_not_replace_carrier_rate() {
         let (commands, _receivers) = reliable_path_command_channels(8);
         let key = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -636,6 +682,8 @@ mod tests {
         let product_rate = 42_000_000.0;
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -644,6 +692,9 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 1,
+            owner_data_acked_bytes: response_subflow_startup_sample_limit_bytes(
+                MuxLimits::default(),
+            ),
             last_delivery_at: Some(Instant::now()),
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -677,10 +728,7 @@ mod tests {
             peer_path_metrics: None,
         };
 
-        assert!(
-            server_output_has_bulk_rate_evidence(&entry),
-            "a unique OwnerData ACK is path-scoped product delivery evidence for its owner"
-        );
+        assert!(!server_output_has_bulk_rate_evidence(&entry));
         let snapshot = server_bulk_output_snapshot(
             &entry,
             SessionId(78),
@@ -689,11 +737,53 @@ mod tests {
             MuxLimits::default(),
             Instant::now(),
         );
-        assert_eq!(snapshot.delivery_rate_bps, product_rate);
+        assert_eq!(
+            snapshot.delivery_rate_bps,
+            default_path_rate_bps(UnderlayProtocol::Udp),
+            "product STREAM_ACK timing is backlog evidence, not QUIC carrier delivery rate"
+        );
+        assert_eq!(snapshot.product_progress_rate_bps, Some(product_rate));
         assert_eq!(
             snapshot.pacing_rate_bps, 200_000_000.0,
             "local QUIC pacing remains carrier-owned scheduling evidence even when the carrier ACK sample is app-limited"
         );
+    }
+
+    #[test]
+    fn one_owner_quantum_is_sender_evidence_but_not_bulk_rate_proof() {
+        let mux_limits = MuxLimits::default();
+        let sample_floor = response_subflow_startup_sample_limit_bytes(mux_limits);
+        assert!(sample_floor > BBR_MAX_SEND_QUANTUM_BYTES as u64);
+
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let (commands, _receivers) = reliable_path_command_channels(8);
+            let entry = ResponseStreamOutputEntry {
+                key: CarrierPathKey {
+                    underlay,
+                    path_id: PathId(13),
+                },
+                path_instance_id: next_server_carrier_path_instance_id(),
+                incarnation: 1,
+                commands,
+                role: StreamOpenRole::Validation,
+                bytes_in_flight: 0,
+                product_queue_bytes: 0,
+                product_progress_rate_bps: Some(80_000_000.0),
+                delivery_rate_bps: (underlay == UnderlayProtocol::Tcp).then_some(80_000_000.0),
+                srtt_ms: Some(40.0),
+                delivery_samples: 1,
+                owner_data_acked_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+                last_delivery_at: Some(Instant::now()),
+                local_path_metrics: None,
+                peer_path_metrics: None,
+            };
+
+            assert!(server_output_has_sender_evidence(&entry), "{underlay:?}");
+            assert!(
+                !server_output_has_bulk_rate_evidence_with_limits(&entry, mux_limits),
+                "{underlay:?} must not graduate from one application-limited OwnerData quantum"
+            );
+        }
     }
 
     #[test]
@@ -705,6 +795,8 @@ mod tests {
         };
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -713,6 +805,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 0,
+            owner_data_acked_bytes: 0,
             last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -761,6 +854,8 @@ mod tests {
         };
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -769,6 +864,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 0,
+            owner_data_acked_bytes: 0,
             last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -837,6 +933,8 @@ mod tests {
         };
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -845,6 +943,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 0,
+            owner_data_acked_bytes: 0,
             last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -892,6 +991,8 @@ mod tests {
         let sample_floor = 2 * 1024 * 1024;
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -900,6 +1001,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 0,
+            owner_data_acked_bytes: 0,
             last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -966,6 +1068,8 @@ mod tests {
         let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -974,6 +1078,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 0,
+            owner_data_acked_bytes: 0,
             last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -1023,6 +1128,8 @@ mod tests {
         let sample_floor = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
         let entry = ResponseStreamOutputEntry {
             key,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -1031,6 +1138,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 0,
+            owner_data_acked_bytes: 0,
             last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
@@ -1079,6 +1187,8 @@ mod tests {
                 underlay: UnderlayProtocol::Tcp,
                 path_id: PathId(0),
             },
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
             commands,
             role: StreamOpenRole::Active,
             bytes_in_flight: 0,
@@ -1087,6 +1197,9 @@ mod tests {
             delivery_rate_bps: Some(prior_rate / 10.0),
             srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            owner_data_acked_bytes: response_subflow_startup_sample_limit_bytes(
+                MuxLimits::default(),
+            ),
             last_delivery_at: Some(Instant::now()),
             local_path_metrics: None,
             peer_path_metrics: None,

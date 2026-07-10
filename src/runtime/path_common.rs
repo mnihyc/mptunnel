@@ -26,6 +26,7 @@ pub(super) fn flow_lane_from_stream_demand_hint(demand: StreamDemandHint) -> Flo
 pub(super) struct ServerUdpDatagramFlow {
     pub(super) flow_id: DatagramFlowId,
     pub(super) requests: mpsc::Sender<ServerUdpDatagramRequest>,
+    pub(super) _realtime_registration: ServerRealtimeFlowRegistration,
 }
 
 pub(super) struct ServerUdpDatagramRequest {

@@ -1,5 +1,8 @@
 use super::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 mod registry;
 mod response_admission;
@@ -332,10 +335,12 @@ impl FixedReliablePathOutput {
             .or_default()
             .push(CarrierPathFlight {
                 key: self.key,
+                output_incarnation: 0,
                 end,
                 bytes,
                 sent_at: Instant::now(),
                 kind,
+                evidence_eligible: true,
             });
     }
 
@@ -627,22 +632,48 @@ pub(super) async fn wait_for_carrier_capacity_notifies(notifies: Vec<Arc<Notify>
 /// ledger, stream-ACK ordering state, lane tracking, and path-metric hints used
 /// for response scheduling. It does not own the target socket and does not own
 /// TCP/QUIC packet recovery.
+#[derive(Default)]
+struct ResponseSubflowSetState {
+    generation: u64,
+    set: Option<FlowSubflowSet>,
+}
+
 pub(super) struct ResponseStreamBinding {
     session_id: SessionId,
     lane: Mutex<FlowLane>,
     mux_limits: MuxLimits,
     lane_tracker: Arc<ServerPathLaneTracker>,
+    _lane_session_registration: ServerPathLaneSessionRegistration,
+    next_output_incarnation: AtomicU64,
     outputs: Mutex<ResponseStreamOutputs>,
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
-    subflow_set: Mutex<Option<FlowSubflowSet>>,
+    subflow_set: Mutex<ResponseSubflowSetState>,
     version: watch::Sender<u64>,
+}
+
+impl Drop for ResponseStreamBinding {
+    fn drop(&mut self) {
+        let lane = *self
+            .lane
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outputs = self
+            .outputs
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in outputs.entries.drain(..) {
+            self.lane_tracker.detach(self.session_id, entry.key, lane);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseStreamAttachOutcome {
     Attached,
+    RoleChanged,
+    ReplacedClosedOutput,
     RejectedDuplicateLiveOutput,
 }
 
@@ -694,17 +725,45 @@ impl ResponseStreamBinding {
         mux_limits: MuxLimits,
         lane_tracker: Arc<ServerPathLaneTracker>,
     ) -> Arc<Self> {
+        Self::new_with_limits_tracker_and_path_instance(
+            session_id,
+            underlay,
+            path_id,
+            commands,
+            lane,
+            mux_limits,
+            lane_tracker,
+            next_server_carrier_path_instance_id(),
+        )
+    }
+
+    fn new_with_limits_tracker_and_path_instance(
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        commands: ReliablePathCommandSender,
+        lane: FlowLane,
+        mux_limits: MuxLimits,
+        lane_tracker: Arc<ServerPathLaneTracker>,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) -> Arc<Self> {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };
+        let lane_session_registration =
+            ServerPathLaneSessionRegistration::new(lane_tracker.clone(), session_id);
         lane_tracker.attach(session_id, key, lane);
         Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
             lane_tracker,
+            _lane_session_registration: lane_session_registration,
+            next_output_incarnation: AtomicU64::new(2),
             outputs: Mutex::new(ResponseStreamOutputs {
                 entries: vec![ResponseStreamOutputEntry {
                     key,
+                    path_instance_id,
+                    incarnation: 1,
                     commands,
                     role: StreamOpenRole::Active,
                     bytes_in_flight: 0,
@@ -713,6 +772,7 @@ impl ResponseStreamBinding {
                     delivery_rate_bps: None,
                     srtt_ms: None,
                     delivery_samples: 0,
+                    owner_data_acked_bytes: 0,
                     last_delivery_at: None,
                     local_path_metrics: None,
                     peer_path_metrics: None,
@@ -721,11 +781,16 @@ impl ResponseStreamBinding {
             ordered_data_owner: Mutex::new(Some(key)),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
-            subflow_set: Mutex::new(None),
+            subflow_set: Mutex::new(ResponseSubflowSetState::default()),
             version,
         })
     }
 
+    fn allocate_output_incarnation(&self) -> u64 {
+        self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
     pub(super) fn attach(
         &self,
         underlay: UnderlayProtocol,
@@ -733,9 +798,42 @@ impl ResponseStreamBinding {
         commands: ReliablePathCommandSender,
         lane: FlowLane,
         role: StreamOpenRole,
+        max_frame_payload_bytes: usize,
+    ) -> ResponseStreamAttachOutcome {
+        let key = CarrierPathKey { underlay, path_id };
+        let path_instance_id = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .find(|entry| entry.key == key && entry.commands.same_channel(&commands))
+            .map_or_else(next_server_carrier_path_instance_id, |entry| {
+                entry.path_instance_id
+            });
+        self.attach_with_path_instance(
+            underlay,
+            path_id,
+            path_instance_id,
+            commands,
+            lane,
+            role,
+            max_frame_payload_bytes,
+        )
+    }
+
+    fn attach_with_path_instance(
+        &self,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        path_instance_id: ServerCarrierPathInstanceId,
+        commands: ReliablePathCommandSender,
+        lane: FlowLane,
+        role: StreamOpenRole,
         _max_frame_payload_bytes: usize,
     ) -> ResponseStreamAttachOutcome {
-        let previous_lane = *self.lane.lock().expect("server reliable stream lane lock");
+        let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
+        let previous_lane = *current_lane;
         let proof_commands = commands.clone();
         let mut outputs = self
             .outputs
@@ -744,6 +842,8 @@ impl ResponseStreamBinding {
         let key = CarrierPathKey { underlay, path_id };
         let mut was_active = false;
         let mut already_attached = false;
+        let mut replaced_closed = false;
+        let mut replaced_incarnation = None;
         let existing_position = outputs.entries.iter().position(|entry| entry.key == key);
         if let Some(position) = existing_position {
             let entry = &mut outputs.entries[position];
@@ -769,20 +869,35 @@ impl ResponseStreamBinding {
                     ),
                 );
                 if same_channel {
+                    let previous_role = entry.role;
                     entry.role = response_stream_live_role_update(entry.role, role);
+                    let role_changed = entry.role != previous_role;
+                    let role_changed_incarnation = role_changed.then_some(entry.incarnation);
+                    if role_changed {
+                        entry.incarnation = self.allocate_output_incarnation();
+                        entry.bytes_in_flight = 0;
+                        entry.product_progress_rate_bps = None;
+                        entry.delivery_rate_bps = None;
+                        entry.srtt_ms = None;
+                        entry.delivery_samples = 0;
+                        entry.owner_data_acked_bytes = 0;
+                        entry.last_delivery_at = None;
+                        entry.local_path_metrics = None;
+                        entry.peer_path_metrics = None;
+                    }
+                    let updated_role = entry.role;
                     let attached_keys = outputs
                         .entries
                         .iter()
                         .map(|entry| entry.key)
                         .collect::<Vec<_>>();
-                    drop(outputs);
-                    let previous_lane =
-                        *self.lane.lock().expect("server reliable stream lane lock");
-                    {
-                        let mut current_lane =
-                            self.lane.lock().expect("server reliable stream lane lock");
-                        *current_lane = lane;
+                    if let Some(incarnation) = role_changed_incarnation {
+                        self.invalidate_path_flight_evidence(key, incarnation);
                     }
+                    if role_changed && updated_role != StreamOpenRole::Active {
+                        self.clear_ordered_data_owner_if(key);
+                    }
+                    *current_lane = lane;
                     if previous_lane != lane {
                         self.lane_tracker.change_lanes(
                             self.session_id,
@@ -791,8 +906,17 @@ impl ResponseStreamBinding {
                             lane,
                         );
                     }
+                    drop(outputs);
+                    drop(current_lane);
+                    if role_changed {
+                        self.reset_subflow_set();
+                    }
                     self.notify_update();
-                    return ResponseStreamAttachOutcome::Attached;
+                    return if role_changed {
+                        ResponseStreamAttachOutcome::RoleChanged
+                    } else {
+                        ResponseStreamAttachOutcome::Attached
+                    };
                 }
                 return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
             }
@@ -802,8 +926,22 @@ impl ResponseStreamBinding {
             already_attached = true;
             let mut entry = outputs.entries.remove(position);
             if entry.commands.is_closed() {
+                replaced_incarnation = Some(entry.incarnation);
+                entry.path_instance_id = path_instance_id;
+                entry.incarnation = self.allocate_output_incarnation();
                 entry.commands = commands;
                 entry.role = role;
+                entry.bytes_in_flight = 0;
+                entry.product_queue_bytes = 0;
+                entry.product_progress_rate_bps = None;
+                entry.delivery_rate_bps = None;
+                entry.srtt_ms = None;
+                entry.delivery_samples = 0;
+                entry.owner_data_acked_bytes = 0;
+                entry.last_delivery_at = None;
+                entry.local_path_metrics = None;
+                entry.peer_path_metrics = None;
+                replaced_closed = true;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "server_stream_output_attach",
@@ -829,6 +967,8 @@ impl ResponseStreamBinding {
         } else {
             ResponseStreamOutputEntry {
                 key,
+                path_instance_id,
+                incarnation: self.allocate_output_incarnation(),
                 commands,
                 role,
                 bytes_in_flight: 0,
@@ -837,6 +977,7 @@ impl ResponseStreamBinding {
                 delivery_rate_bps: None,
                 srtt_ms: None,
                 delivery_samples: 0,
+                owner_data_acked_bytes: 0,
                 last_delivery_at: None,
                 local_path_metrics: None,
                 peer_path_metrics: None,
@@ -854,11 +995,13 @@ impl ResponseStreamBinding {
             .iter()
             .map(|entry| entry.key)
             .collect::<Vec<_>>();
-        drop(outputs);
-        {
-            let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-            *current_lane = lane;
+        if let Some(incarnation) = replaced_incarnation {
+            self.invalidate_path_flight_evidence(key, incarnation);
         }
+        if replaced_closed && role != StreamOpenRole::Active {
+            self.clear_ordered_data_owner_if(key);
+        }
+        *current_lane = lane;
         if previous_lane != lane {
             self.lane_tracker
                 .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
@@ -866,11 +1009,20 @@ impl ResponseStreamBinding {
         if !already_attached {
             self.lane_tracker.attach(self.session_id, key, lane);
         }
+        drop(outputs);
+        drop(current_lane);
+        if replaced_closed {
+            self.reset_subflow_set();
+        }
         if role == StreamOpenRole::Validation {
             let _ = enqueue_path_proof_frame(&proof_commands, path_id, self.mux_limits);
         }
         self.notify_update();
-        ResponseStreamAttachOutcome::Attached
+        if replaced_closed {
+            ResponseStreamAttachOutcome::ReplacedClosedOutput
+        } else {
+            ResponseStreamAttachOutcome::Attached
+        }
     }
 
     pub(super) fn lane(&self) -> FlowLane {
@@ -955,12 +1107,8 @@ impl ResponseStreamBinding {
     }
 
     pub(super) fn set_lane(&self, lane: FlowLane) {
-        let previous_lane = {
-            let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-            let previous = *current_lane;
-            *current_lane = lane;
-            previous
-        };
+        let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
+        let previous_lane = *current_lane;
         if previous_lane != lane {
             let outputs = self
                 .outputs
@@ -971,10 +1119,12 @@ impl ResponseStreamBinding {
                 .iter()
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>();
-            drop(outputs);
+            *current_lane = lane;
             self.lane_tracker
                 .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
+            drop(outputs);
         }
+        drop(current_lane);
         self.notify_update();
     }
 
@@ -1073,20 +1223,42 @@ impl ResponseStreamBinding {
     }
 
     pub(super) fn detach(&self, key: CarrierPathKey, commands: &ReliablePathCommandSender) {
-        let lane = self.lane();
+        self.detach_matching_output(key, |entry| entry.commands.same_channel(commands));
+    }
+
+    fn detach_path_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) {
+        self.detach_matching_output(key, |entry| entry.path_instance_id == path_instance_id);
+    }
+
+    fn detach_matching_output(
+        &self,
+        key: CarrierPathKey,
+        matches: impl Fn(&ResponseStreamOutputEntry) -> bool,
+    ) {
+        let current_lane = self.lane.lock().expect("server reliable stream lane lock");
+        let lane = *current_lane;
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let before = outputs.entries.len();
+        let removed_incarnation = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == key && matches(entry))
+            .map(|entry| entry.incarnation);
         outputs
             .entries
-            .retain(|entry| entry.key != key || !entry.commands.same_channel(commands));
-        if outputs.entries.len() != before {
-            let live_entries = outputs.entries.clone();
-            drop(outputs);
+            .retain(|entry| entry.key != key || !matches(entry));
+        if let Some(incarnation) = removed_incarnation {
+            self.invalidate_path_flight_evidence(key, incarnation);
             self.lane_tracker.detach(self.session_id, key, lane);
-            self.repair_ordered_data_owner_after_output_change(&live_entries);
+            self.repair_ordered_data_owner_after_output_change(&outputs.entries);
+            drop(outputs);
+            drop(current_lane);
             self.reset_subflow_set();
             self.notify_update();
         }
@@ -1096,6 +1268,10 @@ impl ResponseStreamBinding {
         if ranges.is_empty() {
             return;
         }
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
         let mut flights = self
             .flights
             .lock()
@@ -1103,6 +1279,7 @@ impl ResponseStreamBinding {
         let released = release_carrier_path_flight_ranges(&mut flights, ranges);
         if released.is_empty() {
             drop(flights);
+            drop(outputs);
             let ordering_update = self
                 .ack_ordering
                 .lock()
@@ -1136,24 +1313,21 @@ impl ResponseStreamBinding {
             );
         }
 
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
         let now = Instant::now();
         let mut changed = false;
-        let mut path_samples = HashMap::<CarrierPathKey, (u64, Instant)>::new();
+        let mut path_samples = HashMap::<(CarrierPathKey, u64), (u64, Instant)>::new();
         for (_, release) in released {
             let flight = release.flight;
-            if let Some(entry) = outputs
-                .entries
-                .iter_mut()
-                .find(|entry| entry.key == flight.key)
-            {
+            if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
+                entry.key == flight.key && entry.incarnation == flight.output_incarnation
+            }) {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
                 if release.path_proving {
+                    entry.owner_data_acked_bytes = entry
+                        .owner_data_acked_bytes
+                        .saturating_add(flight.bytes as u64);
                     let sample = path_samples
-                        .entry(flight.key)
+                        .entry((flight.key, flight.output_incarnation))
                         .or_insert((0_u64, flight.sent_at));
                     sample.0 = sample.0.saturating_add(flight.bytes as u64);
                     sample.1 = sample.1.min(flight.sent_at);
@@ -1161,18 +1335,26 @@ impl ResponseStreamBinding {
                 changed = true;
             }
         }
-        for (key, (bytes, first_sent_at)) in path_samples {
-            if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key)
+        for ((key, output_incarnation), (bytes, first_sent_at)) in path_samples {
+            if let Some(entry) = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == key && entry.incarnation == output_incarnation)
                 && let Some(sample) =
                     PathRateSample::new(bytes, now.saturating_duration_since(first_sent_at))
             {
                 let sample_bps = sample.rate_bps();
+                let carrier_app_limited = entry
+                    .local_path_metrics
+                    .is_some_and(|metrics| metrics.metrics.app_limited);
                 entry.product_progress_rate_bps = Some(match entry.product_progress_rate_bps {
+                    Some(previous) if carrier_app_limited => previous.max(sample_bps),
                     Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
                     None => sample_bps,
                 });
                 if entry.key.underlay == UnderlayProtocol::Tcp {
                     entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
+                        Some(previous) if carrier_app_limited => previous.max(sample_bps),
                         Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
                         None => sample_bps,
                     });
@@ -1192,7 +1374,7 @@ impl ResponseStreamBinding {
             if let Some(entry) = outputs
                 .entries
                 .iter_mut()
-                .find(|entry| entry.key == hole.key)
+                .find(|entry| entry.key == hole.key && entry.incarnation == hole.output_incarnation)
             {
                 if hole.end <= ordering_update.contiguous_frontier {
                     entry.delivery_samples = entry.delivery_samples.saturating_add(1);
@@ -1217,6 +1399,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream ordered data owner lock")
     }
 
+    #[cfg(test)]
     pub(super) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
         let mut lead = self
             .ordered_data_owner
@@ -1225,14 +1408,60 @@ impl ResponseStreamBinding {
         if *lead != Some(key) {
             *lead = Some(key);
             drop(lead);
+            self.reset_subflow_set();
             self.notify_update();
+        }
+    }
+
+    pub(super) fn commit_ordered_data_owner_for_target(
+        &self,
+        target: &ResponseSenderPathTarget,
+    ) -> bool {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let target_is_live = outputs.entries.iter().any(|entry| {
+            entry.key == target.key
+                && entry.incarnation == target.incarnation
+                && entry.commands.same_channel(&target.commands)
+                && !entry.commands.is_closed()
+        });
+        if !target_is_live {
+            return false;
+        }
+        let mut lead = self
+            .ordered_data_owner
+            .lock()
+            .expect("server reliable stream ordered data owner lock");
+        let changed = *lead != Some(target.key);
+        if changed {
+            *lead = Some(target.key);
+        }
+        drop(lead);
+        drop(outputs);
+        if changed {
+            self.reset_subflow_set();
+            self.notify_update();
+        }
+        true
+    }
+
+    fn clear_ordered_data_owner_if(&self, key: CarrierPathKey) {
+        let mut lead = self
+            .ordered_data_owner
+            .lock()
+            .expect("server reliable stream ordered data owner lock");
+        if *lead == Some(key) {
+            *lead = None;
         }
     }
 
     fn subflow_set_for(
         current: Option<FlowSubflowSet>,
+        generation: u64,
         service: CarrierPathKey,
-        owner_credit_bytes: usize,
+        startup_owner_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
     ) -> FlowSubflowSet {
@@ -1240,83 +1469,149 @@ impl ResponseStreamBinding {
             .filter(|epoch| {
                 epoch.matches_envelope(
                     service,
-                    owner_credit_bytes,
+                    startup_owner_credit_bytes,
                     optional_overhead_budget_bytes,
                     max_read_gap_budget,
                 )
             })
             .unwrap_or_else(|| {
                 FlowSubflowSet::new(
-                    0,
+                    generation,
                     service,
-                    owner_credit_bytes,
+                    startup_owner_credit_bytes,
                     optional_overhead_budget_bytes,
                     max_read_gap_budget,
                 )
             })
     }
 
+    #[cfg(test)]
     pub(super) fn subflow_set_snapshot(&self) -> Option<FlowSubflowSet> {
         self.subflow_set
             .lock()
             .expect("server reliable stream subflow set lock")
+            .set
             .clone()
+    }
+
+    pub(super) fn subflow_state_snapshot(&self) -> (u64, Option<FlowSubflowSet>) {
+        let state = self
+            .subflow_set
+            .lock()
+            .expect("server reliable stream subflow set lock");
+        (state.generation, state.set.clone())
+    }
+
+    pub(super) fn lane_generation(&self) -> u64 {
+        self.lane_tracker.generation(self.session_id)
     }
 
     #[cfg(test)]
     pub(super) fn preview_subflow_owner_admission(
         &self,
         service: CarrierPathKey,
-        owner_credit_bytes: usize,
+        startup_owner_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
-        let current = self
+        let state = self
             .subflow_set
             .lock()
-            .expect("server reliable stream subflow set lock")
-            .clone();
+            .expect("server reliable stream subflow set lock");
+        let generation = state.generation;
+        let current = state.set.clone();
+        drop(state);
         let mut epoch = Self::subflow_set_for(
             current,
+            generation,
             service,
-            owner_credit_bytes,
+            startup_owner_credit_bytes,
             optional_overhead_budget_bytes,
             max_read_gap_budget,
         );
         epoch.admit_subflow_owner(input)
     }
 
+    #[cfg(test)]
     pub(super) fn commit_subflow_owner_admission(
         &self,
         service: CarrierPathKey,
-        owner_credit_bytes: usize,
+        startup_owner_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
-        let mut guard = self
+        let (generation, _) = self.subflow_state_snapshot();
+        self.commit_subflow_owner_admission_for_generation(
+            generation,
+            self.lane_generation(),
+            service,
+            startup_owner_credit_bytes,
+            optional_overhead_budget_bytes,
+            max_read_gap_budget,
+            input,
+        )
+    }
+
+    pub(super) fn commit_subflow_owner_admission_for_generation(
+        &self,
+        expected_generation: u64,
+        expected_lane_generation: u64,
+        service: CarrierPathKey,
+        startup_owner_credit_bytes: usize,
+        optional_overhead_budget_bytes: usize,
+        max_read_gap_budget: Duration,
+        input: SubflowAdmissionInput,
+    ) -> PathAdmission {
+        self.lane_tracker
+            .with_matching_generation(self.session_id, expected_lane_generation, || {
+                let mut state = self
+                    .subflow_set
+                    .lock()
+                    .expect("server reliable stream subflow set lock");
+                if state.generation != expected_generation {
+                    return PathAdmission::standby();
+                }
+                let current = state.set.take();
+                let mut epoch = Self::subflow_set_for(
+                    current,
+                    state.generation,
+                    service,
+                    startup_owner_credit_bytes,
+                    optional_overhead_budget_bytes,
+                    max_read_gap_budget,
+                );
+                let admission = epoch.admit_subflow_owner(input);
+                state.set = epoch.has_members().then_some(epoch);
+                admission
+            })
+            .unwrap_or_else(PathAdmission::standby)
+    }
+
+    pub(super) fn rollback_subflow_owner_admission_for_generation(
+        &self,
+        expected_generation: u64,
+        input: SubflowAdmissionInput,
+    ) {
+        let mut state = self
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
-        let current = guard.take();
-        let mut epoch = Self::subflow_set_for(
-            current,
-            service,
-            owner_credit_bytes,
-            optional_overhead_budget_bytes,
-            max_read_gap_budget,
-        );
-        let admission = epoch.admit_subflow_owner(input);
-        *guard = epoch.has_members().then_some(epoch);
-        admission
+        if state.generation == expected_generation
+            && let Some(epoch) = state.set.as_mut()
+        {
+            epoch.rollback_subflow_owner(input);
+        }
     }
 
     pub(super) fn reset_subflow_set(&self) {
-        *self
+        let mut state = self
             .subflow_set
             .lock()
-            .expect("server reliable stream subflow set lock") = None;
+            .expect("server reliable stream subflow set lock");
+        state.generation = state.generation.wrapping_add(1);
+        state.set = None;
     }
 
     fn repair_ordered_data_owner_after_output_change(
@@ -1333,12 +1628,60 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
-        self.record_product_flight(key, frame, CarrierWorkKind::OwnerData)
+    pub(super) fn record_owner_flight_for_target(
+        &self,
+        target: &ResponseSenderPathTarget,
+        frame: &Frame,
+    ) {
+        self.record_product_flight(
+            target.key,
+            target.incarnation,
+            target.attachment_role,
+            frame,
+            CarrierWorkKind::OwnerData,
+        )
     }
 
+    pub(super) fn record_repair_flight_for_target(
+        &self,
+        target: &ResponseSenderPathTarget,
+        frame: &Frame,
+    ) {
+        self.record_product_flight(
+            target.key,
+            target.incarnation,
+            target.attachment_role,
+            frame,
+            CarrierWorkKind::RepairData,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
+        let (incarnation, role) = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| (entry.incarnation, entry.role))
+            .expect("test owner output must be attached");
+        self.record_product_flight(key, incarnation, role, frame, CarrierWorkKind::OwnerData)
+    }
+
+    #[cfg(test)]
     pub(super) fn record_repair_flight(&self, key: CarrierPathKey, frame: &Frame) {
-        self.record_product_flight(key, frame, CarrierWorkKind::RepairData)
+        let (incarnation, role) = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| (entry.incarnation, entry.role))
+            .expect("test repair output must be attached");
+        self.record_product_flight(key, incarnation, role, frame, CarrierWorkKind::RepairData)
     }
 
     #[cfg(test)]
@@ -1357,20 +1700,33 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn record_product_flight(&self, key: CarrierPathKey, frame: &Frame, kind: CarrierWorkKind) {
+    fn record_product_flight(
+        &self,
+        key: CarrierPathKey,
+        output_incarnation: u64,
+        planned_role: StreamOpenRole,
+        frame: &Frame,
+        kind: CarrierWorkKind,
+    ) {
         debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let evidence_eligible = if let Some(entry) = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key && entry.incarnation == output_incarnation)
         {
-            let mut outputs = self
-                .outputs
-                .lock()
-                .expect("server reliable stream binding lock");
-            if let Some(entry) = outputs.entries.iter_mut().find(|entry| entry.key == key) {
-                entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
-            }
-        }
+            let role_matches = entry.role == planned_role;
+            entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
+            role_matches && planned_role != StreamOpenRole::Repair
+        } else {
+            false
+        };
         self.flights
             .lock()
             .expect("server reliable stream flight lock")
@@ -1378,11 +1734,28 @@ impl ResponseStreamBinding {
             .or_default()
             .push(CarrierPathFlight {
                 key,
+                output_incarnation,
                 end,
                 bytes,
                 sent_at: Instant::now(),
                 kind,
+                evidence_eligible,
             });
+        drop(outputs);
+    }
+
+    fn invalidate_path_flight_evidence(&self, key: CarrierPathKey, output_incarnation: u64) {
+        let mut flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        for path_flights in flights.values_mut() {
+            for flight in path_flights.iter_mut().filter(|flight| {
+                flight.key == key && flight.output_incarnation == output_incarnation
+            }) {
+                flight.evidence_eligible = false;
+            }
+        }
     }
 
     pub(super) fn lower_flights_before_frame(&self, frame: &Frame) -> Vec<CarrierPathFlightDebt> {
@@ -1498,7 +1871,9 @@ impl ResponseStreamBinding {
                 );
                 ResponseSenderPathTarget {
                     key: entry.key,
+                    incarnation: entry.incarnation,
                     commands: entry.commands.clone(),
+                    attachment_role: entry.role,
                     snapshot,
                     eta_ms: server_bulk_output_eta_ms(
                         entry.key,
@@ -1510,7 +1885,10 @@ impl ResponseStreamBinding {
                     ),
                     is_active: Some(entry.key) == active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
-                    has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(entry),
+                    has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_with_limits(
+                        entry,
+                        self.mux_limits,
+                    ),
                 }
             })
             .collect()
@@ -1525,7 +1903,6 @@ impl ResponseStreamBinding {
     }
 
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
-        let lane = self.lane();
         let outputs = self
             .outputs
             .lock()
@@ -1537,7 +1914,6 @@ impl ResponseStreamBinding {
                 .commands
                 .send_control(ReliablePathCommand::CloseStream(stream_id))
                 .await;
-            self.lane_tracker.detach(self.session_id, entry.key, lane);
         }
         if let Ok(mut lead) = self.ordered_data_owner.lock() {
             *lead = None;
@@ -1556,7 +1932,6 @@ impl ResponseStreamBinding {
                 .commands
                 .send_stream_ordered_close(stream_id, lane)
                 .await;
-            self.lane_tracker.detach(self.session_id, entry.key, lane);
         }
         if let Ok(mut lead) = self.ordered_data_owner.lock() {
             *lead = None;
@@ -1568,9 +1943,30 @@ impl ResponseStreamBinding {
         let _ = self.version.send(current.wrapping_add(1));
     }
 
+    pub(super) fn update_path_metrics_for_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        metrics: PathMetrics,
+        source: ServerPathMetricsSource,
+    ) {
+        self.update_path_metrics_matching(key, Some(path_instance_id), metrics, source);
+    }
+
+    #[cfg(test)]
     pub(super) fn update_path_metrics(
         &self,
         key: CarrierPathKey,
+        metrics: PathMetrics,
+        source: ServerPathMetricsSource,
+    ) {
+        self.update_path_metrics_matching(key, None, metrics, source);
+    }
+
+    fn update_path_metrics_matching(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: Option<ServerCarrierPathInstanceId>,
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
     ) {
@@ -1580,7 +1976,9 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         let mut changed = false;
         for entry in &mut outputs.entries {
-            if entry.key == key {
+            if entry.key == key
+                && path_instance_id.is_none_or(|instance| entry.path_instance_id == instance)
+            {
                 let path_metrics = Some(ServerPathMetricsEntry { metrics, source });
                 match source {
                     ServerPathMetricsSource::LocalSender => {
@@ -1663,7 +2061,8 @@ fn release_carrier_path_flight_ranges(
                         bytes,
                         ..flight
                     },
-                    path_proving: flight.kind.is_ordering_owner()
+                    path_proving: flight.evidence_eligible
+                        && flight.kind.is_ordering_owner()
                         && !carrier_flight_intervals_overlap(
                             &ambiguous_intervals,
                             acked_start,
@@ -1809,6 +2208,13 @@ pub(super) struct CarrierPathKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::runtime) struct ServerCarrierPathInstanceId(u64);
+
+pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> ServerCarrierPathInstanceId {
+    ServerCarrierPathInstanceId(NEXT_SERVER_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ServerPathLoadKey {
     session_id: SessionId,
     path: CarrierPathKey,
@@ -1844,28 +2250,113 @@ impl ServerPathLaneLoad {
 /// The tracker informs scheduling and diagnostics only. It is not a path queue
 /// and cannot reorder product frames after sender-service admission.
 struct ServerPathLaneTracker {
-    loads: Mutex<HashMap<ServerPathLoadKey, ServerPathLaneLoad>>,
+    state: Mutex<ServerPathLaneTrackerState>,
+}
+
+#[derive(Debug, Default)]
+struct ServerPathLaneTrackerState {
+    loads: HashMap<ServerPathLoadKey, ServerPathLaneLoad>,
+    realtime_flows: HashMap<SessionId, u32>,
+    session_references: HashMap<SessionId, u32>,
+    session_generations: HashMap<SessionId, u64>,
+}
+
+impl ServerPathLaneTrackerState {
+    fn bump_generation(&mut self, session_id: SessionId) {
+        let generation = self.session_generations.entry(session_id).or_default();
+        *generation = generation.wrapping_add(1);
+    }
+
+    fn maybe_reclaim_session(&mut self, session_id: SessionId) {
+        let has_references = self
+            .session_references
+            .get(&session_id)
+            .is_some_and(|count| *count > 0);
+        let has_realtime = self
+            .realtime_flows
+            .get(&session_id)
+            .is_some_and(|count| *count > 0);
+        let has_loads = self.loads.keys().any(|key| key.session_id == session_id);
+        if !has_references && !has_realtime && !has_loads {
+            self.session_generations.remove(&session_id);
+        }
+    }
 }
 
 impl ServerPathLaneTracker {
-    fn attach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
-        self.loads
+    fn attach_session(&self, session_id: SessionId) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let references = state.session_references.entry(session_id).or_default();
+        *references = references.saturating_add(1);
+    }
+
+    fn detach_session(&self, session_id: SessionId) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        if let Some(references) = state.session_references.get_mut(&session_id) {
+            *references = references.saturating_sub(1);
+            if *references == 0 {
+                state.session_references.remove(&session_id);
+            }
+        }
+        state.maybe_reclaim_session(session_id);
+    }
+
+    fn generation(&self, session_id: SessionId) -> u64 {
+        self.state
             .lock()
             .expect("server path lane tracker lock")
+            .session_generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn with_matching_generation<R>(
+        &self,
+        session_id: SessionId,
+        expected_generation: u64,
+        apply: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let generation = state
+            .session_generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if generation != expected_generation {
+            return None;
+        }
+        let result = apply();
+        drop(state);
+        Some(result)
+    }
+
+    fn attach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        state
+            .loads
             .entry(ServerPathLoadKey { session_id, path })
             .or_default()
             .add(lane);
+        state.bump_generation(session_id);
     }
 
     fn detach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
-        let mut loads = self.loads.lock().expect("server path lane tracker lock");
+        let mut state = self.state.lock().expect("server path lane tracker lock");
         let key = ServerPathLoadKey { session_id, path };
-        if let Some(load) = loads.get_mut(&key) {
+        let changed = if let Some(load) = state.loads.get_mut(&key) {
             load.remove(lane);
             if load.active_flows == 0 {
-                loads.remove(&key);
+                state.loads.remove(&key);
             }
+            true
+        } else {
+            false
+        };
+        if changed {
+            state.bump_generation(session_id);
         }
+        state.maybe_reclaim_session(session_id);
     }
 
     fn change_lanes(
@@ -1878,31 +2369,62 @@ impl ServerPathLaneTracker {
         if from == to {
             return;
         }
-        let mut loads = self.loads.lock().expect("server path lane tracker lock");
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let mut changed = false;
         for path in paths {
-            if let Some(load) = loads.get_mut(&ServerPathLoadKey {
+            if let Some(load) = state.loads.get_mut(&ServerPathLoadKey {
                 session_id,
                 path: *path,
             }) {
                 load.remove(from);
                 load.add(to);
+                changed = true;
             }
         }
+        if changed {
+            state.bump_generation(session_id);
+        }
+        state.maybe_reclaim_session(session_id);
+    }
+
+    fn attach_realtime_flow(&self, session_id: SessionId) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let count = state.realtime_flows.entry(session_id).or_default();
+        *count = count.saturating_add(1);
+        state.bump_generation(session_id);
+    }
+
+    fn detach_realtime_flow(&self, session_id: SessionId) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let changed = if let Some(count) = state.realtime_flows.get_mut(&session_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.realtime_flows.remove(&session_id);
+            }
+            true
+        } else {
+            false
+        };
+        if changed {
+            state.bump_generation(session_id);
+        }
+        state.maybe_reclaim_session(session_id);
     }
 
     fn snapshot(&self, session_id: SessionId, path: CarrierPathKey) -> ServerPathLaneLoad {
-        self.loads
+        self.state
             .lock()
             .expect("server path lane tracker lock")
+            .loads
             .get(&ServerPathLoadKey { session_id, path })
             .copied()
             .unwrap_or_default()
     }
 
     fn session_snapshot(&self, session_id: SessionId) -> ServerPathLaneLoad {
-        self.loads
-            .lock()
-            .expect("server path lane tracker lock")
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let mut total = state
+            .loads
             .iter()
             .filter(|(key, _)| key.session_id == session_id)
             .fold(ServerPathLaneLoad::default(), |mut total, (_, load)| {
@@ -1911,7 +2433,55 @@ impl ServerPathLaneTracker {
                     .active_latency_sensitive_flows
                     .saturating_add(load.active_latency_sensitive_flows);
                 total
-            })
+            });
+        let realtime_flows = state.realtime_flows.get(&session_id).copied().unwrap_or(0);
+        total.active_flows = total.active_flows.saturating_add(realtime_flows);
+        total.active_latency_sensitive_flows = total
+            .active_latency_sensitive_flows
+            .saturating_add(realtime_flows);
+        total
+    }
+}
+
+struct ServerPathLaneSessionRegistration {
+    lane_tracker: Arc<ServerPathLaneTracker>,
+    session_id: SessionId,
+}
+
+impl ServerPathLaneSessionRegistration {
+    fn new(lane_tracker: Arc<ServerPathLaneTracker>, session_id: SessionId) -> Self {
+        lane_tracker.attach_session(session_id);
+        Self {
+            lane_tracker,
+            session_id,
+        }
+    }
+}
+
+impl Drop for ServerPathLaneSessionRegistration {
+    fn drop(&mut self) {
+        self.lane_tracker.detach_session(self.session_id);
+    }
+}
+
+pub(super) struct ServerRealtimeFlowRegistration {
+    lane_tracker: Arc<ServerPathLaneTracker>,
+    session_id: SessionId,
+}
+
+impl ServerRealtimeFlowRegistration {
+    fn new(lane_tracker: Arc<ServerPathLaneTracker>, session_id: SessionId) -> Self {
+        lane_tracker.attach_realtime_flow(session_id);
+        Self {
+            lane_tracker,
+            session_id,
+        }
+    }
+}
+
+impl Drop for ServerRealtimeFlowRegistration {
+    fn drop(&mut self) {
+        self.lane_tracker.detach_realtime_flow(self.session_id);
     }
 }
 
@@ -2035,7 +2605,7 @@ mod tests {
                 StreamOpenRole::Active,
                 reliable_relay_buffer_len(MuxLimits::default()),
             ),
-            ResponseStreamAttachOutcome::Attached,
+            ResponseStreamAttachOutcome::RoleChanged,
             "explicit Active reannounce may promote future work without changing old repair-flight semantics"
         );
 
@@ -2189,7 +2759,7 @@ mod tests {
                 StreamOpenRole::Active,
                 reliable_relay_buffer_len(MuxLimits::default()),
             ),
-            ResponseStreamAttachOutcome::Attached
+            ResponseStreamAttachOutcome::RoleChanged
         );
 
         let outputs = binding.outputs.lock().expect("test response outputs lock");
@@ -2465,6 +3035,7 @@ mod tests {
         let entry = first_output_entry(&binding);
         assert_eq!(entry.bytes_in_flight, 0);
         assert_eq!(entry.delivery_samples, 1);
+        assert_eq!(entry.owner_data_acked_bytes, MIN_RATE_SAMPLE_BYTES);
         assert!(entry.product_progress_rate_bps.is_some());
         assert!(entry.delivery_rate_bps.is_none());
         assert!(entry.srtt_ms.is_none());
@@ -2485,8 +3056,40 @@ mod tests {
         let entry = first_output_entry(&binding);
         assert_eq!(entry.bytes_in_flight, 0);
         assert_eq!(entry.delivery_samples, 1);
+        assert_eq!(entry.owner_data_acked_bytes, MIN_RATE_SAMPLE_BYTES);
         assert!(entry.delivery_rate_bps.is_some());
         assert!(entry.srtt_ms.is_some());
+    }
+
+    #[test]
+    fn cumulative_unique_owner_acks_graduate_tcp_but_not_udp_without_carrier_evidence() {
+        let sample_bytes = response_subflow_startup_sample_limit_bytes(MuxLimits::default());
+        let frame_bytes = BBR_MAX_SEND_QUANTUM_BYTES as u64;
+        assert_eq!(sample_bytes % frame_bytes, 0);
+
+        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+            let (binding, key) = binding_for_underlay(underlay);
+            for offset in (0..sample_bytes).step_by(BBR_MAX_SEND_QUANTUM_BYTES) {
+                binding.record_owner_flight(
+                    key,
+                    &stream_data_frame_at(offset, BBR_MAX_SEND_QUANTUM_BYTES),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            binding.release_normalized_acked_ranges(&[OffsetRange {
+                start: 0,
+                end: sample_bytes,
+            }]);
+
+            let entry = first_output_entry(&binding);
+            assert_eq!(entry.owner_data_acked_bytes, sample_bytes, "{underlay:?}");
+            assert!(entry.product_progress_rate_bps.is_some(), "{underlay:?}");
+            assert_eq!(
+                server_output_has_bulk_rate_evidence(&entry),
+                underlay == UnderlayProtocol::Tcp,
+                "TCP may use product owner ACKs; QUIC requires local carrier bulk evidence"
+            );
+        }
     }
 
     #[test]
@@ -2541,6 +3144,8 @@ mod tests {
             duplicate_entry.delivery_samples, 0,
             "repair duplicate STREAM_ACK must not become response bulk evidence"
         );
+        assert_eq!(owner_entry.owner_data_acked_bytes, 0);
+        assert_eq!(duplicate_entry.owner_data_acked_bytes, 0);
     }
 
     #[test]
@@ -2588,6 +3193,8 @@ mod tests {
                 "the duplicated prefix ACK is not path-scoped owner evidence"
             );
             assert_eq!(repair_entry.delivery_samples, 0);
+            assert_eq!(owner_entry.owner_data_acked_bytes, 0);
+            assert_eq!(repair_entry.owner_data_acked_bytes, 0);
         }
         let owner_suffix = stream_data_frame_at(1024, 3072);
         assert_eq!(
@@ -2622,6 +3229,8 @@ mod tests {
             "the later owner-only suffix ACK may become path-scoped evidence"
         );
         assert_eq!(repair_entry.delivery_samples, 0);
+        assert_eq!(owner_entry.owner_data_acked_bytes, 3072);
+        assert_eq!(repair_entry.owner_data_acked_bytes, 0);
     }
 
     #[test]
@@ -2965,6 +3574,581 @@ mod tests {
             binding.subflow_set_snapshot().is_none(),
             "carrier output membership changes invalidate the Subflow set"
         );
+    }
+
+    #[test]
+    fn stale_subflow_commit_is_rejected_after_reset_or_realtime_pressure() {
+        let session_id = SessionId(91);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let input = SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        let (stale_generation, _) = binding.subflow_state_snapshot();
+        let stale_lane_generation = binding.lane_generation();
+        binding.reset_subflow_set();
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission_for_generation(
+                    stale_generation,
+                    stale_lane_generation,
+                    service,
+                    payload_bytes * 4,
+                    0,
+                    Duration::ZERO,
+                    input,
+                )
+                .decision,
+            PathAdmissionDecision::Standby,
+            "a reset must invalidate an already-planned startup commit"
+        );
+
+        let (current_generation, _) = binding.subflow_state_snapshot();
+        let pre_pressure_lane_generation = binding.lane_generation();
+        let realtime = ServerRealtimeFlowRegistration::new(lane_tracker.clone(), session_id);
+        assert_eq!(
+            lane_tracker
+                .session_snapshot(session_id)
+                .active_latency_sensitive_flows,
+            1
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission_for_generation(
+                    current_generation,
+                    pre_pressure_lane_generation,
+                    service,
+                    payload_bytes * 4,
+                    0,
+                    Duration::ZERO,
+                    input,
+                )
+                .decision,
+            PathAdmissionDecision::Standby,
+            "new realtime pressure must invalidate an already-planned startup commit"
+        );
+        drop(realtime);
+        assert_eq!(
+            lane_tracker
+                .session_snapshot(session_id)
+                .active_latency_sensitive_flows,
+            0
+        );
+    }
+
+    #[test]
+    fn unrelated_session_churn_does_not_invalidate_subflow_commit() {
+        let session_id = SessionId(93);
+        let other_session_id = SessionId(94);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let (subflow_generation, _) = binding.subflow_state_snapshot();
+        let lane_generation = binding.lane_generation();
+
+        let realtime = ServerRealtimeFlowRegistration::new(lane_tracker.clone(), other_session_id);
+        let other_path = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(9),
+        };
+        lane_tracker.attach(other_session_id, other_path, FlowLane::Latency);
+        lane_tracker.detach(other_session_id, other_path, FlowLane::Latency);
+
+        assert_eq!(binding.lane_generation(), lane_generation);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission_for_generation(
+                    subflow_generation,
+                    lane_generation,
+                    service,
+                    payload_bytes * 4,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        key: candidate,
+                        bulk_rate_proven: false,
+                        startup_owner_allowed: true,
+                        frontier_clear: true,
+                        completion_improves: false,
+                        observed_goodput_non_degrading: true,
+                        read_gap: Duration::ZERO,
+                        owner_bytes: payload_bytes,
+                        optional_overhead_bytes: 0,
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow,
+            "lane and realtime churn in another session must not reject this session's commit"
+        );
+        drop(realtime);
+        assert_eq!(binding.lane_generation(), lane_generation);
+    }
+
+    #[test]
+    fn lane_tracker_reclaims_session_state_when_last_binding_drops() {
+        let session_id = SessionId(95);
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+
+        {
+            let state = lane_tracker
+                .state
+                .lock()
+                .expect("server path lane tracker lock");
+            assert_eq!(state.session_references.get(&session_id), Some(&1));
+            assert!(state.session_generations.contains_key(&session_id));
+            assert!(state.loads.keys().any(|key| key.session_id == session_id));
+        }
+
+        drop(binding);
+
+        let state = lane_tracker
+            .state
+            .lock()
+            .expect("server path lane tracker lock");
+        assert!(!state.session_references.contains_key(&session_id));
+        assert!(!state.session_generations.contains_key(&session_id));
+        assert!(!state.realtime_flows.contains_key(&session_id));
+        assert!(!state.loads.keys().any(|key| key.session_id == session_id));
+    }
+
+    #[tokio::test]
+    async fn close_command_detaches_shared_lane_load_exactly_once() {
+        let session_id = SessionId(96);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let (first_commands, _first_receivers) = reliable_path_command_channels(8);
+        let first_commands_for_detach = first_commands.clone();
+        let first = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            key.underlay,
+            key.path_id,
+            first_commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let second = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            key.underlay,
+            key.path_id,
+            second_commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 2);
+
+        first.close_stream(StreamId(10)).await;
+        assert_eq!(
+            lane_tracker.snapshot(session_id, key).active_flows,
+            2,
+            "enqueuing close does not complete carrier detachment"
+        );
+
+        first.detach(key, &first_commands_for_detach);
+        first.detach(key, &first_commands_for_detach);
+        assert_eq!(
+            lane_tracker.snapshot(session_id, key).active_flows,
+            1,
+            "command handling and repeated cleanup must leave the other stream counted"
+        );
+
+        drop(first);
+        assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 1);
+        drop(second);
+        assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 0);
+    }
+
+    #[test]
+    fn old_flight_ack_does_not_debit_or_prove_replaced_output() {
+        let session_id = SessionId(92);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (old_commands, old_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            session_id,
+            key.underlay,
+            key.path_id,
+            old_commands,
+            FlowLane::Throughput,
+        );
+        let frame = stream_data_frame(BBR_MAX_SEND_QUANTUM_BYTES);
+        binding.record_owner_flight(key, &frame);
+        drop(old_receivers);
+
+        let (new_commands, _new_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                new_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::ReplacedClosedOutput
+        );
+        assert_eq!(
+            binding.ordered_data_owner(),
+            None,
+            "a fresh Validation incarnation must not inherit the closed Service owner"
+        );
+        let replacement = binding
+            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .into_iter()
+            .find(|target| target.key == key)
+            .expect("replacement target remains attached");
+        assert!(!replacement.is_active);
+        let replacement_frame = stream_data_frame_at(
+            BBR_MAX_SEND_QUANTUM_BYTES as u64,
+            BBR_MAX_SEND_QUANTUM_BYTES,
+        );
+        binding.record_owner_flight_for_target(&replacement, &replacement_frame);
+        assert_eq!(
+            first_output_entry(&binding).bytes_in_flight,
+            BBR_MAX_SEND_QUANTUM_BYTES as u64
+        );
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        }]);
+
+        let entry = first_output_entry(&binding);
+        assert_eq!(
+            entry.bytes_in_flight, BBR_MAX_SEND_QUANTUM_BYTES as u64,
+            "an old output ACK must not debit replacement flight accounting"
+        );
+        assert_eq!(entry.owner_data_acked_bytes, 0);
+        assert_eq!(entry.delivery_samples, 0);
+        assert!(entry.product_progress_rate_bps.is_none());
+    }
+
+    #[test]
+    fn late_old_output_record_cannot_account_or_prove_replacement() {
+        let session_id = SessionId(95);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (old_commands, old_receivers) = reliable_path_command_channels(8);
+        let old_commands_for_detach = old_commands.clone();
+        let binding = ResponseStreamBinding::new(
+            session_id,
+            key.underlay,
+            key.path_id,
+            old_commands,
+            FlowLane::Throughput,
+        );
+        let stale_target = binding
+            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .into_iter()
+            .next()
+            .expect("initial target exists");
+        drop(old_receivers);
+        binding.detach(key, &old_commands_for_detach);
+        assert_eq!(binding.ordered_data_owner(), None);
+
+        let (new_commands, _new_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                new_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        let frame = stream_data_frame(BBR_MAX_SEND_QUANTUM_BYTES);
+        binding.record_owner_flight_for_target(&stale_target, &frame);
+        assert!(
+            !binding.commit_ordered_data_owner_for_target(&stale_target),
+            "a stale plan must not restore ownership after detach"
+        );
+        assert_eq!(binding.ordered_data_owner(), None);
+        assert!(
+            binding
+                .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+                .iter()
+                .all(|target| !target.is_active),
+            "a same-key Validation replacement must not inherit stale Service ownership"
+        );
+        assert_eq!(first_output_entry(&binding).bytes_in_flight, 0);
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        }]);
+
+        let entry = first_output_entry(&binding);
+        assert_eq!(entry.bytes_in_flight, 0);
+        assert_eq!(entry.owner_data_acked_bytes, 0);
+        assert_eq!(entry.delivery_samples, 0);
+        assert!(entry.product_progress_rate_bps.is_none());
+    }
+
+    #[test]
+    fn old_acked_hole_cannot_prove_replacement_when_frontier_advances() {
+        let session_id = SessionId(96);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (old_commands, old_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            session_id,
+            key.underlay,
+            key.path_id,
+            old_commands,
+            FlowLane::Throughput,
+        );
+        binding.record_owner_flight(key, &stream_data_frame_at(0, 1024));
+        binding.record_owner_flight(key, &stream_data_frame_at(1024, 1024));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 2048,
+        }]);
+        drop(old_receivers);
+
+        let (new_commands, _new_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                new_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::ReplacedClosedOutput
+        );
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 1024,
+        }]);
+
+        let entry = first_output_entry(&binding);
+        assert_eq!(entry.owner_data_acked_bytes, 0);
+        assert_eq!(entry.delivery_samples, 0);
+        assert!(entry.product_progress_rate_bps.is_none());
+    }
+
+    #[test]
+    fn live_role_change_clears_evidence_and_invalidates_old_flights() {
+        let (binding, _) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let frame = stream_data_frame(BBR_MAX_SEND_QUANTUM_BYTES);
+        binding.record_owner_flight(key, &frame);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Repair,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::RoleChanged
+        );
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("role-changed output remains attached");
+        assert_eq!(entry.role, StreamOpenRole::Repair);
+        assert_eq!(entry.owner_data_acked_bytes, 0);
+        assert_eq!(entry.delivery_samples, 0);
+        assert!(entry.product_progress_rate_bps.is_none());
+    }
+
+    #[test]
+    fn late_record_from_pre_role_change_plan_is_not_path_proving() {
+        let (binding, _) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let stale_target = binding
+            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .into_iter()
+            .find(|target| target.key == key)
+            .expect("validation target is attached");
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Repair,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::RoleChanged
+        );
+
+        let frame = stream_data_frame(BBR_MAX_SEND_QUANTUM_BYTES);
+        binding.record_owner_flight_for_target(&stale_target, &frame);
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("role-changed output remains attached");
+        assert_eq!(entry.bytes_in_flight, 0);
+        assert_eq!(entry.owner_data_acked_bytes, 0);
+        assert_eq!(entry.delivery_samples, 0);
+        assert!(entry.product_progress_rate_bps.is_none());
+    }
+
+    #[test]
+    fn pre_role_change_acked_hole_cannot_restore_delivery_evidence() {
+        let (binding, _) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.record_owner_flight(key, &stream_data_frame_at(0, 1024));
+        binding.record_owner_flight(key, &stream_data_frame_at(1024, 1024));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 1024,
+            end: 2048,
+        }]);
+
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Repair,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::RoleChanged
+        );
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 1024,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("role-changed output remains attached");
+        assert_eq!(entry.owner_data_acked_bytes, 0);
+        assert_eq!(entry.delivery_samples, 0);
+        assert!(entry.product_progress_rate_bps.is_none());
     }
 
     #[test]

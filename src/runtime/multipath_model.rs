@@ -34,10 +34,11 @@ pub(super) enum PathRuntimeRole {
     /// A validated additional path that may carry unique ordered bytes.
     ///
     /// `Subflow` is intentionally the same term used by MPTCP. In mptunnel it
-    /// means an additional path admitted by the no-worse guard after it has
-    /// path-scoped bulk-rate evidence. Liveness, proof, ACK-data visibility,
-    /// and configured hints remain probe/ranking inputs; they do not grant
-    /// ordered-byte ownership.
+    /// means an additional path admitted either by the no-worse guard after it
+    /// has path-scoped bulk-rate evidence, or by one bounded startup sampling
+    /// epoch. Liveness, proof, ACK-data visibility, and configured hints remain
+    /// probe/ranking inputs; only explicit startup admission may temporarily
+    /// grant an unproven path ordered-byte ownership.
     Subflow,
     /// Path-manager/control-plane probing only. A probe cannot own product
     /// offsets and cannot create product delivery proof.
@@ -277,32 +278,41 @@ pub(super) struct SubflowAdmissionInput {
 ///
 /// This object deliberately does not own product offsets. The per-range flight
 /// ledger remains the source of truth for ordering ownership. The set only
-/// remembers whether measured subflows still fit the current no-worse
-/// admission envelope. This mirrors the MPTCP distinction
-/// between connection-level data ownership and per-subflow scheduling.
+/// remembers measured membership and the one unproven candidate currently
+/// consuming a bounded startup sampling budget. This mirrors the MPTCP
+/// distinction between connection-level data ownership and per-subflow
+/// scheduling.
 #[derive(Debug, Clone)]
 pub(super) struct FlowSubflowSet {
     _generation: u64,
     service: CarrierPathKey,
-    owner_credit_bytes: u64,
+    startup_owner_credit_bytes: u64,
+    startup_owner: Option<StartupSubflowOwner>,
     optional_overhead_budget_bytes: u64,
     optional_overhead_spent_bytes: u64,
     max_read_gap_budget: Duration,
     members: Vec<SubflowMember>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StartupSubflowOwner {
+    key: CarrierPathKey,
+    owner_sent_bytes: u64,
+}
+
 impl FlowSubflowSet {
     pub(super) fn new(
         generation: u64,
         service: CarrierPathKey,
-        owner_credit_bytes: usize,
+        startup_owner_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
     ) -> Self {
         Self {
             _generation: generation,
             service,
-            owner_credit_bytes: owner_credit_bytes as u64,
+            startup_owner_credit_bytes: startup_owner_credit_bytes as u64,
+            startup_owner: None,
             optional_overhead_budget_bytes: optional_overhead_budget_bytes as u64,
             optional_overhead_spent_bytes: 0,
             max_read_gap_budget,
@@ -327,12 +337,12 @@ impl FlowSubflowSet {
     pub(super) fn matches_envelope(
         &self,
         service: CarrierPathKey,
-        owner_credit_bytes: usize,
+        startup_owner_credit_bytes: usize,
         optional_overhead_budget_bytes: usize,
         max_read_gap_budget: Duration,
     ) -> bool {
         self.service == service
-            && self.owner_credit_bytes == owner_credit_bytes as u64
+            && self.startup_owner_credit_bytes == startup_owner_credit_bytes as u64
             && self.optional_overhead_budget_bytes == optional_overhead_budget_bytes as u64
             && self.max_read_gap_budget == max_read_gap_budget
     }
@@ -341,6 +351,7 @@ impl FlowSubflowSet {
         if input.key == self.service {
             return PathAdmission::service();
         }
+
         if !self.subflow_owner_allowed(input) {
             if self.probe_allowed(input) {
                 return PathAdmission::probe_only();
@@ -349,6 +360,17 @@ impl FlowSubflowSet {
         }
 
         let role = PathRuntimeRole::Subflow;
+
+        if !input.bulk_rate_proven {
+            let startup = self.startup_owner.get_or_insert(StartupSubflowOwner {
+                key: input.key,
+                owner_sent_bytes: 0,
+            });
+            debug_assert_eq!(startup.key, input.key);
+            startup.owner_sent_bytes = startup
+                .owner_sent_bytes
+                .saturating_add(input.owner_bytes as u64);
+        }
 
         self.optional_overhead_spent_bytes = self
             .optional_overhead_spent_bytes
@@ -377,11 +399,43 @@ impl FlowSubflowSet {
         PathAdmission::subflow_owner(role)
     }
 
+    pub(super) fn rollback_subflow_owner(&mut self, input: SubflowAdmissionInput) {
+        if input.key == self.service {
+            return;
+        }
+        if !input.bulk_rate_proven
+            && let Some(startup) = self
+                .startup_owner
+                .as_mut()
+                .filter(|startup| startup.key == input.key)
+        {
+            startup.owner_sent_bytes = startup
+                .owner_sent_bytes
+                .saturating_sub(input.owner_bytes as u64);
+        }
+        self.optional_overhead_spent_bytes = self
+            .optional_overhead_spent_bytes
+            .saturating_sub(input.optional_overhead_bytes as u64);
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.key == input.key)
+        {
+            member.owner_sent_bytes = member
+                .owner_sent_bytes
+                .saturating_sub(input.owner_bytes as u64);
+            member.optional_overhead_bytes = member
+                .optional_overhead_bytes
+                .saturating_sub(input.optional_overhead_bytes as u64);
+        }
+    }
+
     fn subflow_owner_allowed(&self, input: SubflowAdmissionInput) -> bool {
         let bulk_rate_owner = input.bulk_rate_proven && input.completion_improves;
         let startup_owner = input.startup_owner_allowed
             && !input.bulk_rate_proven
-            && !self.members.iter().any(|member| member.key == input.key);
+            && self.startup_owner_key_available(input.key)
+            && self.startup_owner_credit_available(input.owner_bytes);
 
         (bulk_rate_owner || startup_owner)
             && input.frontier_clear
@@ -391,7 +445,20 @@ impl FlowSubflowSet {
                 .optional_overhead_spent_bytes
                 .saturating_add(input.optional_overhead_bytes as u64)
                 <= self.optional_overhead_budget_bytes
-            && (input.owner_bytes as u64) <= self.owner_credit_bytes
+    }
+
+    fn startup_owner_key_available(&self, key: CarrierPathKey) -> bool {
+        match self.startup_owner {
+            Some(startup) => startup.key == key,
+            None => !self.members.iter().any(|member| member.key == key),
+        }
+    }
+
+    fn startup_owner_credit_available(&self, owner_bytes: usize) -> bool {
+        self.startup_owner
+            .map_or(0, |startup| startup.owner_sent_bytes)
+            .saturating_add(owner_bytes as u64)
+            <= self.startup_owner_credit_bytes
     }
 
     fn probe_allowed(&self, input: SubflowAdmissionInput) -> bool {
@@ -603,10 +670,123 @@ mod tests {
     }
 
     #[test]
-    fn subflow_set_allows_one_explicit_startup_owner_without_bulk_rate() {
+    fn subflow_set_spends_stable_startup_epoch_across_payload_sizes() {
+        let startup_credit_bytes = 160 * 1024;
+        let mut epoch = FlowSubflowSet::new(
+            11,
+            key(0),
+            startup_credit_bytes,
+            0,
+            Duration::from_millis(100),
+        );
+        let mut input = SubflowAdmissionInput {
+            key: key(1),
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: 64 * 1024,
+            optional_overhead_bytes: 0,
+        };
+
+        assert_eq!(
+            epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+
+        input.owner_bytes = 32 * 1024;
+        assert_eq!(
+            epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::AdmitSubflow,
+            "changing frame size must not reset or close the startup epoch"
+        );
+
+        input.owner_bytes = 64 * 1024;
+        assert_eq!(
+            epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        assert_eq!(epoch.members().len(), 1);
+        assert_eq!(
+            epoch.members()[0].owner_sent_bytes,
+            startup_credit_bytes as u64
+        );
+
+        input.owner_bytes = 1;
+        assert_eq!(
+            epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::ProbeOnly,
+            "startup OwnerData must stop at the stable cumulative epoch budget"
+        );
+        assert_eq!(
+            epoch.members()[0].owner_sent_bytes,
+            startup_credit_bytes as u64
+        );
+    }
+
+    #[test]
+    fn subflow_set_samples_only_one_unproven_candidate_per_generation() {
+        let payload_bytes = 32 * 1024;
+        let mut epoch =
+            FlowSubflowSet::new(12, key(0), payload_bytes * 4, 0, Duration::from_millis(100));
+        let startup = SubflowAdmissionInput {
+            key: key(1),
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: payload_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        assert_eq!(
+            epoch.admit_subflow_owner(startup).decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+
+        let competing_startup = SubflowAdmissionInput {
+            key: key(2),
+            ..startup
+        };
+        assert_eq!(
+            epoch.admit_subflow_owner(competing_startup).decision,
+            PathAdmissionDecision::ProbeOnly,
+            "a second unproven candidate must not interleave ordered samples"
+        );
+        assert_eq!(
+            epoch.admit_subflow_owner(startup).decision,
+            PathAdmissionDecision::AdmitSubflow,
+            "the selected startup candidate keeps its epoch across decisions"
+        );
+
+        let measured_but_slower = SubflowAdmissionInput {
+            bulk_rate_proven: true,
+            completion_improves: false,
+            ..startup
+        };
+        assert_eq!(
+            epoch.admit_subflow_owner(measured_but_slower).decision,
+            PathAdmissionDecision::ProbeOnly,
+            "bulk-rate proof does not bypass the measured completion guard"
+        );
+
+        assert_eq!(
+            epoch.admit_subflow_owner(competing_startup).decision,
+            PathAdmissionDecision::ProbeOnly,
+            "graduation must not create a second startup sampler in the same stream generation"
+        );
+        assert_eq!(epoch.members().len(), 1);
+    }
+
+    #[test]
+    fn subflow_set_rollback_restores_unemitted_startup_credit() {
         let payload_bytes = 64 * 1024;
         let mut epoch =
-            FlowSubflowSet::new(11, key(0), payload_bytes, 0, Duration::from_millis(100));
+            FlowSubflowSet::new(13, key(0), payload_bytes, 0, Duration::from_millis(100));
         let input = SubflowAdmissionInput {
             key: key(1),
             bulk_rate_proven: false,
@@ -619,18 +799,17 @@ mod tests {
             optional_overhead_bytes: 0,
         };
 
-        let admitted = epoch.admit_subflow_owner(input);
-        assert_eq!(admitted.decision, PathAdmissionDecision::AdmitSubflow);
-        assert_eq!(admitted.role, PathRuntimeRole::Subflow);
-        assert_eq!(epoch.members().len(), 1);
-
-        let second = epoch.admit_subflow_owner(input);
         assert_eq!(
-            second.decision,
-            PathAdmissionDecision::ProbeOnly,
-            "startup Subflow owner credit is one bounded range until bulk-rate evidence arrives"
+            epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::AdmitSubflow
         );
-        assert_eq!(epoch.members().len(), 1);
+        epoch.rollback_subflow_owner(input);
+        assert_eq!(epoch.members()[0].owner_sent_bytes, 0);
+        assert_eq!(
+            epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::AdmitSubflow,
+            "a queue race that emits no bytes must not consume startup sampling credit"
+        );
     }
 
     #[test]

@@ -63,6 +63,10 @@ pub(super) async fn handle_server_path(
         }
         _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
     };
+    let path_registration =
+        context
+            .reliable_streams
+            .register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
     framed
         .write_frames(&[
             Frame::SessionReady,
@@ -139,8 +143,7 @@ pub(super) async fn handle_server_path(
                                 target: &target,
                                 lane,
                                 attachment: ServerReliablePathAttachment {
-                                    path_id,
-                                    underlay: UnderlayProtocol::Tcp,
+                                    path_registration: path_registration.clone(),
                                     commands: commands_tx.clone(),
                                     max_frame_payload_bytes: reliable_relay_buffer_len(
                                         context.mux_limits,
@@ -249,6 +252,8 @@ pub(super) async fn handle_server_path(
                         }
                         outbound::validate_target(&target)?;
                         context.outbound.ensure_supports(TargetProtocol::Udp)?;
+                        let realtime_registration =
+                            context.reliable_streams.register_realtime_flow(session_id);
                         let outbound_socket = match outbound::connect_udp(
                             &context.outbound,
                             &context.outbound_dns,
@@ -276,7 +281,11 @@ pub(super) async fn handle_server_path(
                             commands_tx.clone(),
                             context.mux_limits,
                         );
-                        datagram_flows.push(ServerUdpDatagramFlow { flow_id, requests });
+                        datagram_flows.push(ServerUdpDatagramFlow {
+                            flow_id,
+                            requests,
+                            _realtime_registration: realtime_registration,
+                        });
                     }
                     Frame::OpenDatagramFlow { flow_id, .. } => {
                         if !server_write_tcp_path_frame(
@@ -498,21 +507,15 @@ pub(super) async fn handle_server_path(
                                 observation,
                             )
                         {
-                            context.reliable_streams.record_local_path_metrics(
-                                session_id,
-                                UnderlayProtocol::Tcp,
-                                path_id,
-                                metrics,
-                            );
+                            context
+                                .reliable_streams
+                                .record_local_path_metrics(&path_registration, metrics);
                         }
                     }
                     Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
-                        context.reliable_streams.record_path_metrics(
-                            session_id,
-                            UnderlayProtocol::Tcp,
-                            path_id,
-                            metrics,
-                        );
+                        context
+                            .reliable_streams
+                            .record_path_metrics(&path_registration, metrics);
                     }
                     Frame::PathDrain {
                         path_id: drain_path_id,

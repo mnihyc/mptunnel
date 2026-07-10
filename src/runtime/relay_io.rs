@@ -4106,8 +4106,6 @@ mod tests {
             ),
             ResponseStreamAttachOutcome::Attached
         );
-        binding.detach(owner_key, &owner_commands);
-
         let (_frame_tx, frame_rx) = mpsc::channel(1);
         let path_stream = ReliablePathStream {
             stream_id,
@@ -4127,6 +4125,7 @@ mod tests {
             .commit_prepared_data(&frame)
             .expect("commit owner data");
         binding.record_owner_flight(owner_key, &frame);
+        binding.detach(owner_key, &owner_commands);
         let ack_ranges = [OffsetRange {
             start: 0,
             end: 1024,
@@ -4198,8 +4197,6 @@ mod tests {
             ),
             ResponseStreamAttachOutcome::Attached
         );
-        binding.detach(owner_key, &owner_commands);
-
         let (_frame_tx, frame_rx) = mpsc::channel(1);
         let path_stream = ReliablePathStream {
             stream_id,
@@ -4225,6 +4222,7 @@ mod tests {
             .commit_prepared_data(&frame)
             .expect("commit owner data");
         binding.record_owner_flight(owner_key, &frame);
+        binding.detach(owner_key, &owner_commands);
         let ack_ranges = [OffsetRange {
             start: 0,
             end: 1024,
@@ -5491,7 +5489,6 @@ mod tests {
             ),
             ResponseStreamAttachOutcome::Attached
         );
-        binding.detach(owner_key, &owner_commands);
 
         let (_frame_tx, frame_rx) = mpsc::channel(1);
         let path_stream = ReliablePathStream {
@@ -5512,6 +5509,7 @@ mod tests {
             .commit_prepared_data(&frame)
             .expect("commit owner data");
         binding.record_owner_flight(owner_key, &frame);
+        binding.detach(owner_key, &owner_commands);
 
         let mut response_sender = ServerResponseSenderService::new_with_performance(
             SessionId(103),
@@ -5682,7 +5680,6 @@ mod tests {
             ),
             ResponseStreamAttachOutcome::Attached
         );
-        binding.detach(owner_key, &owner_commands);
 
         let (_frame_tx, frame_rx) = mpsc::channel(1);
         let path_stream = ReliablePathStream {
@@ -5703,6 +5700,7 @@ mod tests {
             .commit_prepared_data(&frame)
             .expect("commit owner data");
         binding.record_owner_flight(owner_key, &frame);
+        binding.detach(owner_key, &owner_commands);
         let ack_ranges = [OffsetRange {
             start: 0,
             end: 1024,

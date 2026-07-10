@@ -1078,13 +1078,22 @@ async fn handle_server_udp_connection(
 ) -> Result<(), RuntimeError> {
     let (session_id, path_id, capabilities) =
         accept_server_udp_path_handshake(&connection, &context).await?;
-    spawn_server_quic_path_metrics(context.clone(), session_id, path_id, connection.clone());
+    let path_registration =
+        context
+            .reliable_streams
+            .register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+    spawn_server_quic_path_metrics(
+        context.clone(),
+        path_registration.clone(),
+        connection.clone(),
+    );
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
             Err(err) => return Err(err),
         };
         let context = context.clone();
+        let path_registration = path_registration.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_server_udp_bidi_stream(
                 send,
@@ -1092,6 +1101,7 @@ async fn handle_server_udp_connection(
                 context,
                 session_id,
                 path_id,
+                path_registration,
                 capabilities,
             )
             .await
@@ -1104,11 +1114,11 @@ async fn handle_server_udp_connection(
 
 fn spawn_server_quic_path_metrics(
     context: ServerPathContext,
-    session_id: SessionId,
-    path_id: PathId,
+    path_registration: ServerCarrierPathRegistration,
     connection: UdpPathConnection,
 ) {
     tokio::spawn(async move {
+        let path_id = path_registration.path_id();
         let mut tracker = UdpPathMetricTracker::default();
         loop {
             if connection.is_closed() {
@@ -1120,9 +1130,7 @@ fn spawn_server_quic_path_metrics(
             };
             if quic_path_metrics_should_publish_local_sender(metrics) {
                 context.reliable_streams.record_local_path_metrics(
-                    session_id,
-                    UnderlayProtocol::Udp,
-                    path_id,
+                    &path_registration,
                     path_metrics_from_quic_path(path_id, metrics),
                 );
             }
@@ -1267,6 +1275,7 @@ async fn handle_server_udp_bidi_stream(
     context: ServerPathContext,
     session_id: SessionId,
     path_id: PathId,
+    path_registration: ServerCarrierPathRegistration,
     capabilities: PathCapabilities,
 ) -> Result<(), RuntimeError> {
     match udp_path_read_frame(&mut recv, context.codec_limits).await? {
@@ -1285,6 +1294,7 @@ async fn handle_server_udp_bidi_stream(
                 ServerUdpReliableStreamContext {
                     session_id,
                     path_id,
+                    path_registration,
                     capabilities,
                     stream_id,
                     target,
@@ -1302,6 +1312,7 @@ async fn handle_server_udp_bidi_stream(
                 recv,
                 context,
                 ServerUdpDatagramStreamContext {
+                    session_id,
                     flow_id,
                     target,
                     lane: FlowLane::RealtimeDatagram,
@@ -1323,11 +1334,32 @@ async fn handle_server_udp_bidi_stream(
 struct ServerUdpReliableStreamContext {
     session_id: SessionId,
     path_id: PathId,
+    path_registration: ServerCarrierPathRegistration,
     capabilities: PathCapabilities,
     stream_id: StreamId,
     target: TargetAddr,
     lane: FlowLane,
     role: StreamOpenRole,
+}
+
+struct ServerUdpReliableOutputDetachGuard {
+    registry: Arc<ServerReliableStreamRegistry>,
+    session_id: SessionId,
+    stream_id: StreamId,
+    path_id: PathId,
+    commands: ReliablePathCommandSender,
+}
+
+impl Drop for ServerUdpReliableOutputDetachGuard {
+    fn drop(&mut self) {
+        self.registry.detach_path(
+            self.session_id,
+            self.stream_id,
+            UnderlayProtocol::Udp,
+            self.path_id,
+            &self.commands,
+        );
+    }
 }
 
 async fn handle_server_udp_reliable_stream(
@@ -1339,6 +1371,7 @@ async fn handle_server_udp_reliable_stream(
     let ServerUdpReliableStreamContext {
         session_id,
         path_id,
+        path_registration,
         capabilities,
         stream_id,
         target,
@@ -1352,6 +1385,13 @@ async fn handle_server_udp_reliable_stream(
         context.mux_limits,
         context.codec_limits,
     ));
+    let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
+        registry: context.reliable_streams.clone(),
+        session_id,
+        stream_id,
+        path_id,
+        commands: commands_tx.clone(),
+    };
     match context.reliable_streams.open_or_attach(
         ServerReliableStreamOpenRequest {
             session_id,
@@ -1359,8 +1399,7 @@ async fn handle_server_udp_reliable_stream(
             target: &target,
             lane,
             attachment: ServerReliablePathAttachment {
-                path_id,
-                underlay: UnderlayProtocol::Udp,
+                path_registration: path_registration.clone(),
                 commands: commands_tx.clone(),
                 max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
                     context.codec_limits,
@@ -1435,6 +1474,7 @@ async fn handle_server_udp_reliable_stream(
             context,
             session_id,
             path_id,
+            path_registration,
             capabilities,
             stream_id,
             target: duplicate_open_target,
@@ -1451,6 +1491,7 @@ struct ServerUdpReliableStreamLoop {
     context: ServerPathContext,
     session_id: SessionId,
     path_id: PathId,
+    path_registration: ServerCarrierPathRegistration,
     capabilities: PathCapabilities,
     stream_id: StreamId,
     target: TargetAddr,
@@ -1469,6 +1510,7 @@ async fn run_server_udp_reliable_stream_loop(
         context,
         session_id,
         path_id,
+        path_registration,
         capabilities,
         stream_id,
         target,
@@ -1534,9 +1576,7 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Ok(Frame::PathMetrics { metrics })) if metrics.path_id == path_id => {
                         context.reliable_streams.record_path_metrics(
-                            session_id,
-                            UnderlayProtocol::Udp,
-                            path_id,
+                            &path_registration,
                             metrics,
                         );
                     }
@@ -1556,8 +1596,7 @@ async fn run_server_udp_reliable_stream_loop(
                                 target: &target,
                                 lane: updated_lane,
                                 attachment: ServerReliablePathAttachment {
-                                    path_id,
-                                    underlay: UnderlayProtocol::Udp,
+                                    path_registration: path_registration.clone(),
                                     commands: commands_tx.clone(),
                                     max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
                                         context.codec_limits,
@@ -1651,9 +1690,7 @@ async fn run_server_udp_reliable_stream_loop(
                             )
                         {
                             context.reliable_streams.record_local_path_metrics(
-                                session_id,
-                                UnderlayProtocol::Udp,
-                                path_id,
+                                &path_registration,
                                 metrics,
                             );
                         }
@@ -1905,6 +1942,7 @@ async fn drain_server_udp_reliable_commands(
 }
 
 struct ServerUdpDatagramStreamContext {
+    session_id: SessionId,
     flow_id: DatagramFlowId,
     target: TargetAddr,
     lane: FlowLane,
@@ -1933,6 +1971,7 @@ async fn handle_server_udp_datagram_stream(
         &commands_tx,
         &mut send,
         &mut flows,
+        stream_context.session_id,
         stream_context.flow_id,
         stream_context.target,
         stream_context.lane,
@@ -1950,6 +1989,7 @@ async fn handle_server_udp_datagram_stream(
                             &commands_tx,
                             &mut send,
                             &mut flows,
+                            stream_context.session_id,
                             flow_id,
                             target,
                             FlowLane::RealtimeDatagram,
@@ -2182,6 +2222,7 @@ async fn open_server_udp_datagram_flow(
     commands_tx: &ReliablePathCommandSender,
     send: &mut UdpPathSendStream,
     flows: &mut Vec<ServerUdpDatagramFlow>,
+    session_id: SessionId,
     flow_id: DatagramFlowId,
     target: TargetAddr,
     _lane: FlowLane,
@@ -2202,6 +2243,7 @@ async fn open_server_udp_datagram_flow(
     }
     outbound::validate_target(&target)?;
     context.outbound.ensure_supports(TargetProtocol::Udp)?;
+    let realtime_registration = context.reliable_streams.register_realtime_flow(session_id);
     let outbound_socket = match outbound::connect_udp(
         &context.outbound,
         &context.outbound_dns,
@@ -2227,7 +2269,11 @@ async fn open_server_udp_datagram_flow(
         commands_tx.clone(),
         context.mux_limits,
     );
-    flows.push(ServerUdpDatagramFlow { flow_id, requests });
+    flows.push(ServerUdpDatagramFlow {
+        flow_id,
+        requests,
+        _realtime_registration: realtime_registration,
+    });
     Ok(())
 }
 
@@ -2309,6 +2355,71 @@ mod tests {
         assert_eq!(
             udp_stream_open_initial_max_offset(UdpStreamOpenOptions::ACTIVE_WAIT, Some(8192)),
             8192
+        );
+    }
+
+    #[test]
+    fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
+        let registry = Arc::new(ServerReliableStreamRegistry::new(
+            ResourceLimits::default().max_streams,
+        ));
+        let session_id = SessionId(201);
+        let stream_id = StreamId(301);
+        let path_id = PathId(0);
+        let path_registration =
+            registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+        let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let commands_for_guard = commands.clone();
+        let stream = match registry
+            .open_or_attach(
+                ServerReliableStreamOpenRequest {
+                    session_id,
+                    stream_id,
+                    target: &target,
+                    lane: FlowLane::Throughput,
+                    attachment: ServerReliablePathAttachment {
+                        path_registration: path_registration.clone(),
+                        commands,
+                        max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
+                            CodecLimits::default(),
+                            MuxLimits::default(),
+                        ),
+                        role: StreamOpenRole::Active,
+                        initial_metrics: None,
+                    },
+                },
+                MuxLimits::default(),
+                ResourceLimits::default().max_streams,
+            )
+            .expect("open UDP response stream")
+        {
+            ServerReliableStreamOpen::New(stream) => stream,
+            _ => panic!("expected new UDP response stream"),
+        };
+        let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+            panic!("expected switchable response output");
+        };
+        assert_eq!(
+            binding
+                .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+                .len(),
+            1
+        );
+
+        drop(ServerUdpReliableOutputDetachGuard {
+            registry,
+            session_id,
+            stream_id,
+            path_id,
+            commands: commands_for_guard,
+        });
+
+        assert!(
+            binding
+                .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+                .is_empty(),
+            "every server QUIC stream exit must detach its response output"
         );
     }
 

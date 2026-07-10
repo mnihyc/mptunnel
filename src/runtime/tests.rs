@@ -1500,7 +1500,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
             StreamOpenRole::Active,
             reliable_relay_buffer_len(MuxLimits::default()),
         ),
-        ResponseStreamAttachOutcome::Attached
+        ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -1538,6 +1538,160 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
             ..
         })) if payload == Bytes::from_static(b"same-path-closed")
     ));
+}
+
+fn server_test_bulk_path_metrics(path_id: PathId, delivery_rate_bps: u64) -> PathMetrics {
+    PathMetrics {
+        path_id,
+        underlay: UnderlayProtocol::Tcp,
+        direction: PathMetricDirection::ServerToClient,
+        metric_epoch: metric_epoch_now(),
+        metric_age_us: 0,
+        min_rtt_us: 20_000,
+        srtt_us: 20_000,
+        rttvar_us: 1_000,
+        jitter_us: 1_000,
+        delivery_rate_bps,
+        pacing_rate_bps: delivery_rate_bps,
+        loss_ppm: 0,
+        ecn_ppm: 0,
+        loss_observed: false,
+        ecn_observed: false,
+        bytes_in_flight: 0,
+        queue_bytes: 0,
+        inflight_limit_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        inflight_hi_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        confidence_ppm: 1_000_000,
+        app_limited: false,
+        has_ack_derived_data_sample: true,
+        data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        data_sample_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
+    }
+}
+
+#[test]
+fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let session_id = SessionId(14);
+    let stream_id = StreamId(49);
+    let path_id = PathId(0);
+    let old_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+    let (old_commands, old_receivers) = reliable_path_command_channels(8);
+    let stream = match registry
+        .open_or_attach(
+            ServerReliableStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: &target,
+                lane: FlowLane::Throughput,
+                attachment: ServerReliablePathAttachment {
+                    path_registration: old_path_registration.clone(),
+                    commands: old_commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Active,
+                    initial_metrics: None,
+                },
+            },
+            MuxLimits::default(),
+            ResourceLimits::default().max_streams,
+        )
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(stream) => stream,
+        _ => panic!("expected a new response stream"),
+    };
+    let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+        panic!("expected switchable output");
+    };
+    let binding = binding.clone();
+    registry.record_local_path_metrics(
+        &old_path_registration,
+        server_test_bulk_path_metrics(path_id, 200_000_000),
+    );
+    assert!(
+        binding
+            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .first()
+            .is_some_and(|entry| entry.has_bulk_rate_evidence)
+    );
+    drop(old_receivers);
+
+    let new_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+    let (new_commands, _new_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(
+                ServerReliableStreamOpenRequest {
+                    session_id,
+                    stream_id,
+                    target: &target,
+                    lane: FlowLane::Throughput,
+                    attachment: ServerReliablePathAttachment {
+                        path_registration: new_path_registration.clone(),
+                        commands: new_commands,
+                        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                        role: StreamOpenRole::Active,
+                        initial_metrics: None,
+                    },
+                },
+                MuxLimits::default(),
+                ResourceLimits::default().max_streams,
+            )
+            .expect("replace closed response output"),
+        ServerReliableStreamOpen::Existing
+    ));
+    registry.record_local_path_metrics(
+        &old_path_registration,
+        server_test_bulk_path_metrics(path_id, 300_000_000),
+    );
+
+    let targets = binding.sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES);
+    assert_eq!(targets.len(), 1);
+    assert!(
+        !targets[0].has_bulk_rate_evidence,
+        "cached metrics from the closed carrier must not prove its replacement"
+    );
+}
+
+#[test]
+fn carrier_metrics_retire_after_last_publication_lease() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
+    let session_id = SessionId(15);
+    let path_id = PathId(0);
+    let registration = registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+    let sampler_registration = registration.clone();
+
+    registry.record_local_path_metrics(
+        &registration,
+        PathMetrics {
+            underlay: UnderlayProtocol::Udp,
+            ..server_test_bulk_path_metrics(path_id, 200_000_000)
+        },
+    );
+    assert_eq!(registry.management_snapshot().path_metrics.len(), 1);
+
+    drop(registration);
+    assert_eq!(registry.management_snapshot().path_metrics.len(), 1);
+
+    registry.record_local_path_metrics(
+        &sampler_registration,
+        PathMetrics {
+            underlay: UnderlayProtocol::Udp,
+            ..server_test_bulk_path_metrics(path_id, 300_000_000)
+        },
+    );
+    drop(sampler_registration);
+    assert!(
+        registry.management_snapshot().path_metrics.is_empty(),
+        "cached evidence must retire when the last task lease ends"
+    );
 }
 
 #[tokio::test]
@@ -2974,8 +3128,12 @@ fn acked_udp_datagram_timeout_suppresses_path_for_next_realtime_packet() {
 
 #[test]
 fn switchable_stream_demand_updates_from_local_sender_metrics() {
-    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let path_registration =
+        registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(0));
     let (commands, _rx) = reliable_path_command_channels(4);
     let mut stream = match registry
         .open_or_attach(
@@ -2985,8 +3143,7 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
                 target: &target,
                 lane: FlowLane::Latency,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(0),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
@@ -3019,10 +3176,14 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
 
 #[test]
 fn server_registry_ignores_active_duplicate_same_path_input_without_output_replacement() {
-    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let session_id = SessionId(1);
     let stream_id = StreamId(17);
+    let first_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, PathId(0));
     let (first_commands, _first_rx) = reliable_path_command_channels(4);
     let opened = registry
         .open_or_attach(
@@ -3032,8 +3193,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
                 target: &target,
                 lane: FlowLane::Throughput,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(0),
-                    underlay: UnderlayProtocol::Udp,
+                    path_registration: first_path_registration.clone(),
                     commands: first_commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
@@ -3047,6 +3207,8 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
     assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
 
     let (duplicate_commands, _duplicate_rx) = reliable_path_command_channels(4);
+    let duplicate_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, PathId(0));
     let duplicate = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -3055,8 +3217,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
                 target: &target,
                 lane: FlowLane::Throughput,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(0),
-                    underlay: UnderlayProtocol::Udp,
+                    path_registration: duplicate_path_registration.clone(),
                     commands: duplicate_commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
@@ -3077,8 +3238,12 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
 
 #[test]
 fn server_response_output_inherits_open_path_startup_metrics() {
-    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let path_registration =
+        registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(0));
     let (commands, _rx) = reliable_path_command_channels(4);
     let path = "tcp://127.0.0.1:10000?srtt-ms=20&rate-mbps=500"
         .parse::<PathSpec>()
@@ -3096,8 +3261,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
                 target: &target,
                 lane: FlowLane::Throughput,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(0),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
@@ -3169,8 +3333,12 @@ fn server_response_output_inherits_open_path_startup_metrics() {
 
 #[test]
 fn server_reliable_registry_rejects_attach_only_unknown_stream() {
-    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let path_registration =
+        registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(1));
     let (commands, _rx) = reliable_path_command_channels(4);
     let opened = registry
         .open_or_attach(
@@ -3180,8 +3348,7 @@ fn server_reliable_registry_rejects_attach_only_unknown_stream() {
                 target: &target,
                 lane: FlowLane::Throughput,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(1),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Validation,
@@ -3198,11 +3365,15 @@ fn server_reliable_registry_rejects_attach_only_unknown_stream() {
 
 #[test]
 fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
-    let registry = ServerReliableStreamRegistry::new(ResourceLimits::default().max_streams);
+    let registry = Arc::new(ServerReliableStreamRegistry::new(
+        ResourceLimits::default().max_streams,
+    ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _rx) = reliable_path_command_channels(4);
     let session_id = SessionId(1);
     let stream_id = StreamId(100);
+    let first_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(0));
     let opened = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -3211,8 +3382,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
                 target: &target,
                 lane: FlowLane::Throughput,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(0),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: first_path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,
@@ -3227,6 +3397,8 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
     registry.close(session_id, stream_id);
 
     let (commands, _rx) = reliable_path_command_channels(4);
+    let replacement_path_registration =
+        registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(1));
     let reopened = registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
@@ -3235,8 +3407,7 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
                 target: &target,
                 lane: FlowLane::Throughput,
                 attachment: ServerReliablePathAttachment {
-                    path_id: PathId(1),
-                    underlay: UnderlayProtocol::Tcp,
+                    path_registration: replacement_path_registration.clone(),
                     commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
                     role: StreamOpenRole::Active,

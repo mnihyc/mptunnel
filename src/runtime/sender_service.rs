@@ -940,6 +940,7 @@ fn response_target_unique_owner_admission(
         payload_bytes,
         mux_limits,
         None,
+        true,
         false,
     )
     .0
@@ -966,6 +967,7 @@ fn response_target_unique_owner_admission_with_epoch(
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
+    startup_sampling_allowed: bool,
     allow_liveness_service_failover: bool,
 ) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
     if target.attachment_role == StreamOpenRole::Repair {
@@ -1019,20 +1021,21 @@ fn response_target_unique_owner_admission_with_epoch(
         ordered_data_owner,
         ordered_owner_debt_bytes,
     );
-    let startup_owner_allowed = candidates
-        .iter()
-        .copied()
-        .find(|candidate| candidate.key == service_key)
-        .is_some_and(|service| {
-            response_target_is_startup_same_underlay_subflow_candidate(
-                service_key,
-                service,
-                target,
-                ordered_tail_debt,
-                payload_bytes,
-                mux_limits,
-            )
-        });
+    let startup_owner_allowed = startup_sampling_allowed
+        && candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.key == service_key)
+            .is_some_and(|service| {
+                response_target_is_startup_same_underlay_subflow_candidate(
+                    service_key,
+                    service,
+                    target,
+                    ordered_tail_debt,
+                    payload_bytes,
+                    mux_limits,
+                )
+            });
     if ordered_tail_debt > 0
         && !continues_lower_frontier
         && !response_target_is_measured_same_underlay_subflow_candidate(service_key, target)
@@ -1151,6 +1154,7 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         payload_bytes,
         mux_limits,
         subflow_set,
+        true,
         false,
     )
     .0;
@@ -1707,6 +1711,7 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
         ordered_data_owner,
         ordered_owner_debt_bytes,
         subflow_set,
+        true,
     )
 }
 
@@ -1719,6 +1724,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
     ordered_data_owner: Option<CarrierPathKey>,
     ordered_owner_debt_bytes: usize,
     subflow_set: Option<&FlowSubflowSet>,
+    startup_sampling_allowed: bool,
 ) -> Option<ResponseSelectedDataTarget> {
     if targets.is_empty() {
         return None;
@@ -2066,6 +2072,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
                 payload_bytes,
                 mux_limits,
                 subflow_set,
+                startup_sampling_allowed,
                 allow_liveness_service_failover,
             );
             if !matches!(
@@ -2373,7 +2380,8 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
         }
         ReliablePathStreamOutput::Switchable(binding) => {
             let (subflow_generation, subflow_set) = binding.subflow_state_snapshot();
-            let lane_generation = binding.lane_generation();
+            let (lane_generation, active_response_flows) =
+                binding.lane_generation_and_active_response_flows();
             let lower_flights = binding.lower_flights_before_offset(next_offset);
             let targets = binding.sender_path_targets(relay_lane, payload_bytes);
             let ordered_data_owner = binding.ordered_data_owner();
@@ -2386,6 +2394,7 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
                 ordered_data_owner,
                 ordered_owner_debt_bytes,
                 subflow_set.as_ref(),
+                active_response_flows >= 2,
             ) else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
@@ -7718,14 +7727,16 @@ mod tests {
     async fn response_planning_bounds_app_limited_validation_sampling_before_service_resumes() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
         let (active_commands, mut active_rx) = reliable_path_command_channels(8);
-        let binding = ResponseStreamBinding::new_with_limits(
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
             SessionId(88),
             UnderlayProtocol::Udp,
             PathId(0),
             active_commands,
             FlowLane::Throughput,
             mux_limits,
+            lane_tracker.clone(),
         );
         let service = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -7848,6 +7859,23 @@ mod tests {
             output: ReliablePathStreamOutput::Switchable(binding.clone()),
             frames: frames_rx,
         };
+        let single_flow_plan =
+            plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
+                .expect("the one-flow Service should remain dispatchable");
+        assert_eq!(single_flow_plan.primary_key(), Some(service));
+        assert_eq!(single_flow_plan.primary_role(), PathRuntimeRole::Service);
+        drop(single_flow_plan);
+
+        let (second_flow_commands, _second_flow_receivers) = reliable_path_command_channels(8);
+        let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            SessionId(88),
+            UnderlayProtocol::Udp,
+            PathId(2),
+            second_flow_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            lane_tracker,
+        );
         let startup_limit =
             usize::try_from(response_subflow_startup_sample_limit_bytes(mux_limits)).unwrap();
         assert_eq!(startup_limit % payload_bytes, 0);
@@ -9378,6 +9406,54 @@ mod tests {
     }
 
     #[test]
+    fn single_active_flow_keeps_unmeasured_validation_out_of_owner_data() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        let service_key = service.key;
+        let mut validation =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        validation.has_bulk_rate_evidence = false;
+
+        let single_flow = select_response_sender_data_target_with_ordered_debt_inner(
+            &[service.clone(), validation.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service_key),
+            0,
+            None,
+            false,
+        )
+        .expect("the one-flow Service must remain dispatchable");
+        assert_eq!(single_flow.target.key, service.key);
+        assert_eq!(single_flow.admission.role, PathRuntimeRole::Service);
+        assert!(single_flow.subflow_set_commit.is_none());
+
+        let multi_flow = select_response_sender_data_target_with_ordered_debt_inner(
+            &[service, validation.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service_key),
+            0,
+            None,
+            true,
+        )
+        .expect("multi-flow state may spend the existing bounded startup sample");
+        assert_eq!(multi_flow.target.key, validation.key);
+        assert!(
+            multi_flow
+                .subflow_set_commit
+                .is_some_and(|commit| commit.input.startup_owner_allowed)
+        );
+    }
+
+    #[test]
     fn startup_sample_cap_returns_dispatch_to_service() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -9408,6 +9484,7 @@ mod tests {
             payload_bytes,
             mux_limits,
             None,
+            true,
             false,
         );
         let input = commit
@@ -9573,6 +9650,7 @@ mod tests {
             Some(service.key),
             owner_tail_guard_bytes,
             None,
+            true,
         );
 
         let selected =
@@ -9606,6 +9684,7 @@ mod tests {
             Some(service.key),
             owner_tail_guard_bytes,
             None,
+            true,
         )
         .expect("ordered-owner debt must not suppress a live Service owner with emission credit");
 
@@ -9650,6 +9729,7 @@ mod tests {
             Some(stale_service.key),
             owner_tail_guard_bytes,
             None,
+            true,
         );
 
         assert!(
@@ -9681,6 +9761,7 @@ mod tests {
             Some(stale_owner),
             owner_tail_guard_bytes,
             None,
+            true,
         );
 
         assert!(
@@ -9740,6 +9821,7 @@ mod tests {
             None,
             0,
             None,
+            true,
         )
         .expect("frontier-clear ownerless stream may elect a measured survivor as Service");
 

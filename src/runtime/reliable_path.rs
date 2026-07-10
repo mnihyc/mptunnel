@@ -643,7 +643,7 @@ pub(super) struct ResponseStreamBinding {
     lane: Mutex<FlowLane>,
     mux_limits: MuxLimits,
     lane_tracker: Arc<ServerPathLaneTracker>,
-    _lane_session_registration: ServerPathLaneSessionRegistration,
+    response_flow_registration: ServerResponseFlowRegistration,
     next_output_incarnation: AtomicU64,
     outputs: Mutex<ResponseStreamOutputs>,
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
@@ -655,6 +655,7 @@ pub(super) struct ResponseStreamBinding {
 
 impl Drop for ResponseStreamBinding {
     fn drop(&mut self) {
+        self.response_flow_registration.set_active(false);
         let lane = *self
             .lane
             .get_mut()
@@ -718,7 +719,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    fn new_with_limits_and_tracker(
+    pub(super) fn new_with_limits_and_tracker(
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -751,15 +752,16 @@ impl ResponseStreamBinding {
     ) -> Arc<Self> {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };
-        let lane_session_registration =
-            ServerPathLaneSessionRegistration::new(lane_tracker.clone(), session_id);
+        let response_flow_registration =
+            ServerResponseFlowRegistration::new(lane_tracker.clone(), session_id);
         lane_tracker.attach(session_id, key, lane);
+        response_flow_registration.set_active(true);
         Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
             lane_tracker,
-            _lane_session_registration: lane_session_registration,
+            response_flow_registration,
             next_output_incarnation: AtomicU64::new(2),
             outputs: Mutex::new(ResponseStreamOutputs {
                 entries: vec![ResponseStreamOutputEntry {
@@ -790,6 +792,20 @@ impl ResponseStreamBinding {
 
     fn allocate_output_incarnation(&self) -> u64 {
         self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn response_flow_is_active(outputs: &ResponseStreamOutputs) -> bool {
+        outputs
+            .entries
+            .iter()
+            .any(|entry| response_stream_role_reserves_flow_load(entry.role))
+    }
+
+    fn sync_response_flow_activity(&self, outputs: &ResponseStreamOutputs) {
+        // Deactivation calls this before path-load removal; activation calls it
+        // after path-load registration so every visible generation is conservative.
+        self.response_flow_registration
+            .set_active(Self::response_flow_is_active(outputs));
     }
 
     #[cfg(test)]
@@ -841,6 +857,7 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let response_flow_was_active = Self::response_flow_is_active(&outputs);
         let key = CarrierPathKey { underlay, path_id };
         let mut was_active = false;
         let mut previous_load_registered = false;
@@ -906,6 +923,10 @@ impl ResponseStreamBinding {
                         })
                         .map(|entry| entry.key)
                         .collect::<Vec<_>>();
+                    let response_flow_is_active = Self::response_flow_is_active(&outputs);
+                    if response_flow_was_active && !response_flow_is_active {
+                        self.sync_response_flow_activity(&outputs);
+                    }
                     if let Some((previous_incarnation, current_incarnation)) =
                         role_changed_incarnations
                     {
@@ -933,6 +954,9 @@ impl ResponseStreamBinding {
                     }
                     if !previous_load_registered && updated_load_registered {
                         self.lane_tracker.attach(self.session_id, key, lane);
+                    }
+                    if !response_flow_was_active && response_flow_is_active {
+                        self.sync_response_flow_activity(&outputs);
                     }
                     if role_changed {
                         // Publish the new output role and Subflow generation at
@@ -1030,6 +1054,10 @@ impl ResponseStreamBinding {
             })
             .map(|entry| entry.key)
             .collect::<Vec<_>>();
+        let response_flow_is_active = Self::response_flow_is_active(&outputs);
+        if response_flow_was_active && !response_flow_is_active {
+            self.sync_response_flow_activity(&outputs);
+        }
         if let Some(incarnation) = replaced_incarnation {
             self.invalidate_path_flight_evidence(key, incarnation);
         }
@@ -1051,6 +1079,9 @@ impl ResponseStreamBinding {
         }
         if !previous_load_registered && updated_load_registered {
             self.lane_tracker.attach(self.session_id, key, lane);
+        }
+        if !response_flow_was_active && response_flow_is_active {
+            self.sync_response_flow_activity(&outputs);
         }
         // A planner may snapshot the old generation before blocking on outputs,
         // but it cannot observe new membership before this reset completes.
@@ -1289,6 +1320,7 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let response_flow_was_active = Self::response_flow_is_active(&outputs);
         let removed = outputs
             .entries
             .iter()
@@ -1303,6 +1335,9 @@ impl ResponseStreamBinding {
             .entries
             .retain(|entry| entry.key != key || !matches(entry));
         if let Some((incarnation, load_registered)) = removed {
+            if response_flow_was_active && !Self::response_flow_is_active(&outputs) {
+                self.sync_response_flow_activity(&outputs);
+            }
             self.invalidate_path_flight_evidence(key, incarnation);
             if load_registered {
                 self.lane_tracker.detach(self.session_id, key, lane);
@@ -1553,8 +1588,14 @@ impl ResponseStreamBinding {
         (state.generation, state.set.clone())
     }
 
+    #[cfg(test)]
     pub(super) fn lane_generation(&self) -> u64 {
         self.lane_tracker.generation(self.session_id)
+    }
+
+    pub(super) fn lane_generation_and_active_response_flows(&self) -> (u64, u32) {
+        self.lane_tracker
+            .generation_and_active_response_flows(self.session_id)
     }
 
     #[cfg(test)]
@@ -2345,7 +2386,7 @@ impl ServerPathLaneLoad {
 ///
 /// The tracker informs scheduling and diagnostics only. It is not a path queue
 /// and cannot reorder product frames after sender-service admission.
-struct ServerPathLaneTracker {
+pub(super) struct ServerPathLaneTracker {
     state: Mutex<ServerPathLaneTrackerState>,
 }
 
@@ -2353,6 +2394,7 @@ struct ServerPathLaneTracker {
 struct ServerPathLaneTrackerState {
     loads: HashMap<ServerPathLoadKey, ServerPathLaneLoad>,
     realtime_flows: HashMap<SessionId, u32>,
+    active_response_flows: HashMap<SessionId, u32>,
     session_references: HashMap<SessionId, u32>,
     session_generations: HashMap<SessionId, u64>,
 }
@@ -2372,8 +2414,12 @@ impl ServerPathLaneTrackerState {
             .realtime_flows
             .get(&session_id)
             .is_some_and(|count| *count > 0);
+        let has_active_response_flows = self
+            .active_response_flows
+            .get(&session_id)
+            .is_some_and(|count| *count > 0);
         let has_loads = self.loads.keys().any(|key| key.session_id == session_id);
-        if !has_references && !has_realtime && !has_loads {
+        if !has_references && !has_realtime && !has_active_response_flows && !has_loads {
             self.session_generations.remove(&session_id);
         }
     }
@@ -2397,6 +2443,7 @@ impl ServerPathLaneTracker {
         state.maybe_reclaim_session(session_id);
     }
 
+    #[cfg(test)]
     fn generation(&self, session_id: SessionId) -> u64 {
         self.state
             .lock()
@@ -2405,6 +2452,21 @@ impl ServerPathLaneTracker {
             .get(&session_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn generation_and_active_response_flows(&self, session_id: SessionId) -> (u64, u32) {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let generation = state
+            .session_generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let active_response_flows = state
+            .active_response_flows
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        (generation, active_response_flows)
     }
 
     fn with_matching_generation<R>(
@@ -2490,6 +2552,30 @@ impl ServerPathLaneTracker {
         state.bump_generation(session_id);
     }
 
+    fn set_response_flow_active(&self, session_id: SessionId, active: bool) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        if active {
+            let count = state.active_response_flows.entry(session_id).or_default();
+            *count = count.saturating_add(1);
+            state.bump_generation(session_id);
+            return;
+        }
+
+        let changed = if let Some(count) = state.active_response_flows.get_mut(&session_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.active_response_flows.remove(&session_id);
+            }
+            true
+        } else {
+            false
+        };
+        if changed {
+            state.bump_generation(session_id);
+        }
+        state.maybe_reclaim_session(session_id);
+    }
+
     fn detach_realtime_flow(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let changed = if let Some(count) = state.realtime_flows.get_mut(&session_id) {
@@ -2539,23 +2625,39 @@ impl ServerPathLaneTracker {
     }
 }
 
-struct ServerPathLaneSessionRegistration {
+struct ServerResponseFlowRegistration {
     lane_tracker: Arc<ServerPathLaneTracker>,
     session_id: SessionId,
+    active: Mutex<bool>,
 }
 
-impl ServerPathLaneSessionRegistration {
+impl ServerResponseFlowRegistration {
     fn new(lane_tracker: Arc<ServerPathLaneTracker>, session_id: SessionId) -> Self {
         lane_tracker.attach_session(session_id);
         Self {
             lane_tracker,
             session_id,
+            active: Mutex::new(false),
         }
+    }
+
+    fn set_active(&self, active: bool) {
+        let mut current = self
+            .active
+            .lock()
+            .expect("server response flow registration lock");
+        if *current == active {
+            return;
+        }
+        self.lane_tracker
+            .set_response_flow_active(self.session_id, active);
+        *current = active;
     }
 }
 
-impl Drop for ServerPathLaneSessionRegistration {
+impl Drop for ServerResponseFlowRegistration {
     fn drop(&mut self) {
+        self.set_active(false);
         self.lane_tracker.detach_session(self.session_id);
     }
 }
@@ -3805,6 +3907,73 @@ mod tests {
     }
 
     #[test]
+    fn startup_commit_rechecks_multi_flow_lane_generation() {
+        let session_id = SessionId(92);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(2),
+            second_commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let (subflow_generation, _) = binding.subflow_state_snapshot();
+        let (multi_flow_generation, active_response_flows) =
+            binding.lane_generation_and_active_response_flows();
+        assert_eq!(active_response_flows, 2);
+
+        drop(second_flow);
+        assert_eq!(lane_tracker.session_snapshot(session_id).active_flows, 1);
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 1);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let admission = binding.commit_subflow_owner_admission_for_generation(
+            subflow_generation,
+            multi_flow_generation,
+            service,
+            payload_bytes * 4,
+            0,
+            Duration::ZERO,
+            SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                read_gap: Duration::ZERO,
+                owner_bytes: payload_bytes,
+                optional_overhead_bytes: 0,
+            },
+        );
+        assert_eq!(
+            admission.decision,
+            PathAdmissionDecision::Standby,
+            "closing the second active flow must invalidate a planned startup sample before commit"
+        );
+    }
+
+    #[test]
     fn unrelated_session_churn_does_not_invalidate_subflow_commit() {
         let session_id = SessionId(93);
         let other_session_id = SessionId(94);
@@ -3890,6 +4059,7 @@ mod tests {
                 .lock()
                 .expect("server path lane tracker lock");
             assert_eq!(state.session_references.get(&session_id), Some(&1));
+            assert_eq!(state.active_response_flows.get(&session_id), Some(&1));
             assert!(state.session_generations.contains_key(&session_id));
             assert!(state.loads.keys().any(|key| key.session_id == session_id));
         }
@@ -3903,7 +4073,63 @@ mod tests {
         assert!(!state.session_references.contains_key(&session_id));
         assert!(!state.session_generations.contains_key(&session_id));
         assert!(!state.realtime_flows.contains_key(&session_id));
+        assert!(!state.active_response_flows.contains_key(&session_id));
         assert!(!state.loads.keys().any(|key| key.session_id == session_id));
+    }
+
+    #[test]
+    fn active_response_flow_count_is_per_binding_not_per_attachment() {
+        let session_id = SessionId(99);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let alternate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let lane_tracker = Arc::new(ServerPathLaneTracker::default());
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let service_commands_for_detach = service_commands.clone();
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            MuxLimits::default(),
+            lane_tracker.clone(),
+        );
+        let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+        let alternate_commands_for_detach = alternate_commands.clone();
+        assert_eq!(
+            binding.attach(
+                alternate.underlay,
+                alternate.path_id,
+                alternate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert_eq!(lane_tracker.session_snapshot(session_id).active_flows, 2);
+        assert_eq!(
+            binding.lane_generation_and_active_response_flows().1,
+            1,
+            "one response stream must contribute one flow despite two Active attachments"
+        );
+
+        binding.detach(service, &service_commands_for_detach);
+        assert_eq!(lane_tracker.session_snapshot(session_id).active_flows, 1);
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 1);
+        binding.detach(alternate, &alternate_commands_for_detach);
+        assert_eq!(lane_tracker.session_snapshot(session_id).active_flows, 0);
+        assert_eq!(
+            binding.lane_generation_and_active_response_flows().1,
+            0,
+            "a response stream with no Active attachment must not satisfy the gate"
+        );
     }
 
     #[test]
@@ -4062,6 +4288,7 @@ mod tests {
             lane_tracker.clone(),
         );
         assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 1);
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 1);
         drop(active_receivers);
 
         let (validation_commands, validation_receivers) = reliable_path_command_channels(8);
@@ -4077,6 +4304,7 @@ mod tests {
             ResponseStreamAttachOutcome::ReplacedClosedOutput
         );
         assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 0);
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 0);
         drop(validation_receivers);
 
         let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
@@ -4094,6 +4322,7 @@ mod tests {
         let replacement_load = lane_tracker.snapshot(session_id, key);
         assert_eq!(replacement_load.active_flows, 1);
         assert_eq!(replacement_load.active_latency_sensitive_flows, 0);
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 1);
         drop(binding);
         assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 0);
     }

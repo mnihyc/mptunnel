@@ -108,16 +108,18 @@ impl ReliableRelayRequestOutstandingWindow {
     fn record_acked(
         &mut self,
         released_bytes: usize,
-        ack_instance: RelayPathInstance,
+        owner_instance: RelayPathInstance,
         active_instance: Option<RelayPathInstance>,
+        owner_capable: bool,
         lane: FlowLane,
         growth_interval: Duration,
         mux_limits: MuxLimits,
     ) {
         self.record_acked_at(
             released_bytes,
-            ack_instance,
+            owner_instance,
             active_instance,
+            owner_capable,
             lane,
             growth_interval,
             mux_limits,
@@ -128,17 +130,19 @@ impl ReliableRelayRequestOutstandingWindow {
     fn record_acked_at(
         &mut self,
         released_bytes: usize,
-        ack_instance: RelayPathInstance,
+        owner_instance: RelayPathInstance,
         active_instance: Option<RelayPathInstance>,
+        owner_capable: bool,
         lane: FlowLane,
         growth_interval: Duration,
         mux_limits: MuxLimits,
         now: Instant,
     ) {
         if released_bytes == 0
-            || ack_instance.key.underlay != UnderlayProtocol::Tcp
-            || active_instance != Some(ack_instance)
-            || self.active_tcp_instance != Some(ack_instance)
+            || owner_instance.key.underlay != UnderlayProtocol::Tcp
+            || !owner_capable
+            || active_instance.is_none()
+            || self.active_tcp_instance != active_instance
             || !relay_lane_is_bulk(lane)
         {
             return;
@@ -273,25 +277,25 @@ where
         );
         let relay_demand = demand_update.demand;
         let relay_lane = relay_demand.lane;
-        for failed_key in sender.unreported_missing_owner_keys(
+        for failed_instance in sender.unreported_missing_owner_instances(
             &remotes,
             reliable_relay_stall_timeout(path_snapshot, relay_lane),
         ) {
-            if sender.enqueue_failed_path_gap_repairs(
+            if sender.enqueue_failed_path_instance_gap_repairs(
                 &mut sender_queue,
                 context,
                 &remotes,
                 &send_stream,
-                failed_key,
+                failed_instance,
                 relay_lane,
             ) {
                 sender_retry_at = None;
             }
         }
-        if demand_update.promoted_to_throughput {
+        if reliable_relay_lane_changed(demand_update.previous_lane, relay_lane) {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "client_stream_lane_promoted",
+                "client_stream_lane_changed",
                 format_args!(
                     "stream_id={} previous={:?} lane={:?} latency_weight_ppm={} throughput_weight_ppm={} sent_offset={} received_offset={} repair_bytes={}",
                     stream_id.0,
@@ -469,6 +473,10 @@ where
             sender_retry_at = None;
         }
         sender.discard_unusable_live_owner_tail_repairs(&mut sender_queue, &remotes);
+        if sender.discard_stale_persistent_ack_gap_repairs(&mut sender_queue, &remotes) > 0 {
+            ack_gap_repair.release_repair_attempt();
+            sender_retry_at = None;
+        }
         let inbound_frame_ready = remotes.has_buffered_frame();
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
             sender_queue.is_empty(),
@@ -693,17 +701,20 @@ where
                 }
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
-                if reliable_relay_product_stall_preserves_attached_path_set(&remotes) {
-                    if sender.enqueue_live_owner_tail_repair(
-                        &mut sender_queue,
-                        context,
-                        &remotes,
-                        &send_stream,
-                        &last_send_ack_ranges,
-                        last_send_ack_complete,
-                        last_send_ack_frontier,
-                        relay_lane,
-                    ) {
+                let queued_existing_tail_repair = sender.enqueue_live_owner_tail_repair(
+                    &mut sender_queue,
+                    context,
+                    &remotes,
+                    &send_stream,
+                    &last_send_ack_ranges,
+                    last_send_ack_complete,
+                    last_send_ack_frontier,
+                    relay_lane,
+                );
+                if queued_existing_tail_repair
+                    || reliable_relay_product_stall_preserves_attached_path_set(&remotes)
+                {
+                    if queued_existing_tail_repair {
                         sender_retry_at = None;
                     }
                     match sender.send_recv_progress(
@@ -936,7 +947,11 @@ where
                 last_product_stall_attempt_at = Some(Instant::now());
             }
             _ = tokio::time::sleep_until(recv_progress_deadline), if remotes.path_keys().len() > 1
-                && reliable_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
+                && reliable_relay_recv_progress_resend_active(
+                    &recv_stream,
+                    remote_open,
+                    remotes.active_path_underlay(),
+                ) => {
                 match sender.send_recv_progress(
                     &mut remotes,
                     context,
@@ -1117,6 +1132,11 @@ where
                             last_stream_progress_at = Instant::now();
                         }
                         Ok(ClientQueuedDispatch::RepairDeferred) => {
+                            dispatched_items = dispatched_items.saturating_add(1);
+                        }
+                        Ok(ClientQueuedDispatch::PersistentRepairCancelled) => {
+                            ack_gap_repair.release_repair_attempt();
+                            sender_retry_at = None;
                             dispatched_items = dispatched_items.saturating_add(1);
                         }
                         Err(RuntimeError::SenderServiceBlocked) => {
@@ -1368,7 +1388,7 @@ where
                             relay_lane,
                             &mut remotes,
                             &mut send_stream,
-                            path_key,
+                            instance,
                         )
                         .await
                         {
@@ -1409,7 +1429,7 @@ where
                                         relay_lane,
                                         &mut remotes,
                                         &mut send_stream,
-                                        path_key,
+                                        instance,
                                     )
                                     .await
                                     {
@@ -1722,18 +1742,34 @@ where
                         let ack = send_stream.apply_normalized_ack(&normalized_ranges);
                         if ack.released_bytes > 0 {
                             sender.record_owner_progress(ack.released_bytes);
-                            request_outstanding_window.record_acked(
-                                ack.released_bytes,
-                                instance,
-                                remotes.active_path_instance(),
-                                relay_lane,
-                                reliable_relay_request_ack_growth_interval(path_key, context),
-                                context.mux_limits,
-                            );
                         }
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        sender.release_normalized_acked_ranges(context, &normalized_ranges);
+                        let owner_progress = sender
+                            .release_normalized_acked_ranges_with_owner_progress(
+                                context,
+                                &normalized_ranges,
+                            );
+                        let active_instance = remotes.active_path_instance();
+                        let growth_interval = active_instance
+                            .map(|active| {
+                                reliable_relay_request_ack_growth_interval(active.key, context)
+                            })
+                            .unwrap_or_else(|| transport_pto_from_snapshot(None));
+                        for progress in owner_progress {
+                            request_outstanding_window.record_acked(
+                                progress.bytes,
+                                progress.instance,
+                                active_instance,
+                                sender.request_owner_ack_can_grow_window(
+                                    &remotes,
+                                    progress.instance,
+                                ),
+                                relay_lane,
+                                growth_interval,
+                                context.mux_limits,
+                            );
+                        }
                         sender_queue.release_normalized_acked_repairs(&normalized_ranges);
                         let base_repair_limit = adaptive_reliable_relay_repair_bytes(
                             path_snapshot,
@@ -1743,22 +1779,50 @@ where
                         let repair_event_budget =
                             sender.repair_extra_event_budget_remaining(context.mux_limits);
                         let has_multipath_repair_alternative = remotes.path_keys().len() > 1;
+                        let (owner_underlay, owner_timing_path, repair_target) =
+                            sender.ack_gap_repair_path_model(
+                                context,
+                                &remotes,
+                                &send_stream,
+                                &normalized_ranges,
+                                base_repair_limit,
+                                relay_lane,
+                            );
                         let ack_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
                             &normalized_ranges,
-                            remotes.active_path_underlay(),
+                            owner_timing_path
+                                .map(|snapshot| snapshot.underlay)
+                                .or(owner_underlay)
+                                .or(remotes.active_path_underlay()),
                             has_multipath_repair_alternative,
-                            path_snapshot,
+                            owner_timing_path,
                             relay_lane,
                         );
+                        let repair_path = repair_target.map(|(_, snapshot)| snapshot);
                         let repair_limit = if ack_gap_repair_ready {
-                            reliable_critical_tail_repair_limit_bytes(
-                                base_repair_limit,
+                            reliable_persistent_ack_gap_repair_limit_bytes(
+                                repair_path,
+                                repair_path.and(owner_underlay),
+                                relay_lane,
                                 send_stream.repair_bytes(),
                                 context.mux_limits,
                             )
                         } else {
                             base_repair_limit.min(repair_event_budget)
+                        };
+                        let amplified_ack_gap_repair = ack_gap_repair_ready
+                            && repair_limit > base_repair_limit;
+                        let ack_gap_repair_cause = if amplified_ack_gap_repair {
+                            let (target, snapshot) = repair_target
+                                .expect("amplified repair requires a modeled output");
+                            RelaySendCause::persistent_client_ack_gap_repair(
+                                target,
+                                snapshot,
+                                relay_lane,
+                            )
+                        } else {
+                            RelaySendCause::AckGapRepair
                         };
                         let mut repair_frames = stream_ack_gap_repair_frames_normalized(
                             &send_stream,
@@ -1822,8 +1886,11 @@ where
                                 ack_gap_repair_ready,
                             ),
                         );
+                        let mut queued_persistent_ack_gap_repair = false;
                         for frame in repair_frames {
-                            let queued = if critical_tail_repair {
+                            let queued = if sender_queue.has_queued_repair_overlap(&frame) {
+                                false
+                            } else if critical_tail_repair {
                                 if repair_kind == "fin_tail" {
                                     sender.enqueue_critical_tail_repair_frame(
                                         &mut sender_queue,
@@ -1833,7 +1900,7 @@ where
                                     sender.enqueue_critical_repair_frame(
                                         &mut sender_queue,
                                         frame,
-                                        RelaySendCause::AckGapRepair,
+                                        ack_gap_repair_cause,
                                     );
                                     true
                                 }
@@ -1855,8 +1922,13 @@ where
                                 ),
                             );
                             if queued {
+                                queued_persistent_ack_gap_repair |=
+                                    ack_gap_repair_ready && repair_kind == "ack_gap";
                                 sender_retry_at = None;
                             }
+                        }
+                        if queued_persistent_ack_gap_repair {
+                            ack_gap_repair.record_repair_queued();
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
@@ -2104,6 +2176,10 @@ where
     result
 }
 
+fn reliable_relay_lane_changed(previous: FlowLane, current: FlowLane) -> bool {
+    previous != current
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_reliable_relay_after_path_failure(
     sender: &mut RelaySenderService,
@@ -2113,7 +2189,7 @@ pub(super) async fn recover_reliable_relay_after_path_failure(
     lane: FlowLane,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
-    failed_key: RelayPathKey,
+    failed_instance: RelayPathInstance,
 ) -> Result<Option<bool>, RuntimeError> {
     if remotes.is_empty() {
         return Ok(None);
@@ -2130,12 +2206,12 @@ pub(super) async fn recover_reliable_relay_after_path_failure(
     }
 
     send_stream.update_max_offset(remotes.max_offset());
-    let repair_queued = sender.enqueue_failed_path_gap_repairs(
+    let repair_queued = sender.enqueue_failed_path_instance_gap_repairs(
         sender_queue,
         context,
         remotes,
         send_stream,
-        failed_key,
+        failed_instance,
         lane,
     );
     Ok(Some(repair_queued))
@@ -3151,6 +3227,22 @@ mod tests {
     }
 
     #[test]
+    fn relay_lane_accounting_updates_on_promotion_and_demotion() {
+        assert!(reliable_relay_lane_changed(
+            FlowLane::Latency,
+            FlowLane::Throughput,
+        ));
+        assert!(reliable_relay_lane_changed(
+            FlowLane::Throughput,
+            FlowLane::Latency,
+        ));
+        assert!(!reliable_relay_lane_changed(
+            FlowLane::Throughput,
+            FlowLane::Throughput,
+        ));
+    }
+
+    #[test]
     fn tcp_request_outstanding_limit_uses_service_reservoir_then_ack_headroom() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = 64 * 1024;
@@ -3230,6 +3322,7 @@ mod tests {
             2 * 1024 * 1024,
             tcp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             growth_interval,
             mux_limits,
@@ -3242,6 +3335,7 @@ mod tests {
             4 * 1024 * 1024,
             tcp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             growth_interval,
             mux_limits,
@@ -3256,6 +3350,7 @@ mod tests {
             4 * 1024 * 1024,
             tcp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             growth_interval,
             mux_limits,
@@ -3298,6 +3393,7 @@ mod tests {
             2 * 1024 * 1024,
             udp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             Duration::from_secs(1),
             mux_limits,
@@ -3306,12 +3402,13 @@ mod tests {
         assert_eq!(
             window.tcp_limit_bytes,
             4 * 1024 * 1024,
-            "an ACK from another carrier must not expand the active TCP allowance"
+            "UDP-owned progress must not expand the active TCP allowance"
         );
         window.record_acked_at(
             2 * 1024 * 1024,
             tcp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             Duration::from_secs(1),
             mux_limits,
@@ -3365,6 +3462,57 @@ mod tests {
     }
 
     #[test]
+    fn tcp_request_outstanding_limit_counts_live_subflow_owner_progress() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let service = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
+        let subflow = request_test_path_instance(UnderlayProtocol::Tcp, 1, 2);
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(service),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now,
+            ),
+            4 * 1024 * 1024
+        );
+
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            subflow,
+            Some(service),
+            false,
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(
+            window.tcp_limit_bytes,
+            4 * 1024 * 1024,
+            "detached or stale exact instances must not grow the Service epoch"
+        );
+
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            subflow,
+            Some(service),
+            true,
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(
+            window.tcp_limit_bytes,
+            8 * 1024 * 1024,
+            "receiver-confirmed OwnerData on a live same-family subflow must grow stream read-ahead"
+        );
+    }
+
+    #[test]
     fn tcp_request_outstanding_limit_never_exceeds_product_resource_ceiling() {
         let mux_limits = MuxLimits {
             max_stream_window_bytes: 1024 * 1024,
@@ -3383,6 +3531,7 @@ mod tests {
             256 * 1024,
             tcp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             growth_interval,
             mux_limits,
@@ -3402,6 +3551,7 @@ mod tests {
             1024 * 1024,
             tcp,
             Some(tcp),
+            true,
             FlowLane::Throughput,
             growth_interval,
             mux_limits,

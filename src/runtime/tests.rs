@@ -2422,7 +2422,8 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
 
     assert!(!reliable_relay_recv_progress_resend_active(
         &recv_stream,
-        true
+        true,
+        Some(UnderlayProtocol::Udp),
     ));
 
     recv_stream
@@ -2430,11 +2431,33 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
         .expect("out-of-order data");
     assert!(reliable_relay_recv_progress_resend_active(
         &recv_stream,
-        true
+        true,
+        Some(UnderlayProtocol::Udp),
+    ));
+    assert!(reliable_relay_recv_progress_resend_active(
+        &recv_stream,
+        true,
+        Some(UnderlayProtocol::Tcp),
     ));
     assert!(!reliable_relay_recv_progress_resend_active(
         &recv_stream,
-        false
+        false,
+        Some(UnderlayProtocol::Udp),
+    ));
+
+    let mut contiguous = ReliableRecvStream::new(StreamId(22), mux_limits);
+    contiguous
+        .receive_data(0, Bytes::from_static(b"head"), StreamFlags::NONE)
+        .expect("contiguous data");
+    assert!(reliable_relay_recv_progress_resend_active(
+        &contiguous,
+        true,
+        Some(UnderlayProtocol::Udp),
+    ));
+    assert!(!reliable_relay_recv_progress_resend_active(
+        &contiguous,
+        true,
+        Some(UnderlayProtocol::Tcp),
     ));
 
     let low_interval = reliable_stream_recv_progress_interval(Some(low_latency), FlowLane::Latency);

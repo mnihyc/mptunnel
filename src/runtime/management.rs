@@ -624,16 +624,19 @@ fn set_client_path_state(
         }
         PathControlState::Suspect => {
             record.manual_disabled = false;
+            record.invalidate_path_proofs();
             record.state = SchedulerPathState::Suspect;
             record.failed_until = None;
         }
         PathControlState::Failed => {
             record.manual_disabled = false;
+            record.invalidate_path_proofs();
             record.state = SchedulerPathState::Failed;
             record.failed_until = Some(Instant::now() + path_record_failure_cooldown(record));
         }
         PathControlState::Disabled => {
             record.manual_disabled = true;
+            record.invalidate_path_proofs();
             record.state = SchedulerPathState::Failed;
             record.failed_until = None;
             record.relay_bytes_in_flight = 0;

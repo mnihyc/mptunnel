@@ -449,7 +449,7 @@ latency-sensitive or realtime pressure, one same-underlay Validation candidate
 with local sender evidence may instead enter the bounded startup Subflow
 sampling epoch defined in Section 18.1. This applies equally to TCP beside TCP
 and QUIC beside QUIC. The selected candidate may receive repeated preemptible
-unique `OwnerData` quanta only until the epoch's fixed cumulative sample budget
+whole `OwnerData` frames only until the epoch's fixed cumulative sample budget
 is spent. This sampling does not replace the Service anchor; the Service
 remains the owner and resumes normal ordinary feed at the epoch cap unless the
 candidate has graduated to ordinary measured Subflow admission. With exactly
@@ -459,6 +459,22 @@ RepairOnly for unique data; they still carry path proof, control, targeted
 repair, and liveness-failover traffic. Under latency-sensitive or realtime
 pressure, unmeasured candidates likewise remain Probe or Standby and the
 Service remains preemptible.
+Response startup graduation requires the sampled candidate's exact OwnerData
+flight to drain and direction-correct bulk-rate proof to exist. TCP may derive
+that proof from unambiguous product OwnerData ACK timing. QUIC UDP MUST NOT
+graduate from product ACK progress alone; its local carrier ACK controller must
+publish bulk-rate evidence. Graduation preserves the Service anchor and sampled
+membership, invalidates stale planner snapshots, and releases only the
+exclusive unproven-startup slot for a different candidate.
+For a sustained bulk-only request/upload stream, the request sender MAY use the
+same bounded startup Subflow sampling mechanism without a request-flow-count
+gate. The exact live Active attachment remains the request-side Service anchor,
+MUST already have direction-correct bulk-rate evidence, and MUST remain stable
+for the current output incarnation. Only one same-underlay Validation output
+incarnation with fresh local path proof may receive startup `OwnerData` at a
+time. Section 18.1 defines its per-candidate credit, graduation, sequencing, and
+debt guards. This request-side exception does not elect a new Service or weaken
+the response-side two-flow gate.
 When the current Service owner is alive but backpressured by unresolved
 contiguous owner tail, a cross-underlay alternate MUST wait instead of owning
 later byte ranges. An ordinary measured same-underlay Subflow may proceed only
@@ -483,12 +499,15 @@ alternate owners. This pre-ACK debt is a scheduler guard, not repair evidence.
 ACK-data-only evidence from a tiny or application-limited probe is still not
 bulk-rate evidence and does not grant Service owner rights. Configured or peer
 hints alone are not sender evidence and MUST NOT unlock unique-data ownership.
-`Subflow` `OwnerData` requires either bulk-rate evidence or the explicit bounded
-same-underlay startup-sampling epoch after at least two active direction-relevant
-reliable response flows exist, plus sender-service admission proving that the
-candidate fits the active
-product, carrier, and ordering envelopes. The session response-flow count and
-its generation MUST be revalidated before sample enqueue. Only the bounded epoch may
+`Subflow` `OwnerData` requires either bulk-rate evidence or an explicit bounded
+same-underlay startup-sampling epoch, plus sender-service admission proving that
+the candidate fits the active product, carrier, and ordering envelopes. A
+response-side epoch additionally requires at least two active
+direction-relevant reliable response flows; the session response-flow count and
+its generation MUST be revalidated before response sample enqueue. A
+request-side epoch instead requires sustained bulk-only local upload demand and
+the stable request-side Service and fresh Validation-instance evidence defined
+in Section 18.1. Only a bounded epoch may
 bypass a completion-rate comparison polluted by underfeeding; ordinary measured
 Subflows remain subject to the completion horizon. This rule is path-metric and
 capability driven; it is not a TCP-preferred or UDP-preferred policy. Mixed
@@ -550,6 +569,20 @@ This Service rule is deliberately different from optional Subflow admission:
 the Service is the current primary owner and must remain fed while its ordered
 frontier is clear, whereas optional paths must prove positive contribution
 before receiving owner bytes.
+For a mature TCP response with no serialized calibration or latency pressure,
+"remain fed" means soft priority through the derived Service horizon, not
+exclusive use of the entire hard Service envelope. Once the exact live
+Service's union-style assigned debt reaches that horizon, an already-admitted,
+bulk-rate-proven same-TCP Subflow MAY own the next quantum while
+`max(global_ordered_tail, Service_assigned) + quantum` remains within the
+derived Service feed reservoir. The selected Subflow MUST carry a commit for
+the exact current Service epoch and MUST still pass the ordinary completion,
+BDP, emission-credit, lower-frontier, reorder, and resource checks. Its
+`Subflow` role MUST NOT move the Service identity. If no such candidate passes,
+the sender MUST fall back to the live Service. This partitions existing source
+credit; it does not enlarge the feed reservoir or the hard Service envelope.
+It is TCP-response policy only: UDP/QUIC retains its local ACK/congestion/pacing
+controller and Service-first product policy.
 When latency-sensitive work is active on the same Service path, the
 clear-frontier Service feed envelope uses a bounded preemptible window with
 BBR-style headroom over the Service horizon for total owner credit already
@@ -704,9 +737,24 @@ or the gap no longer exposes repair debt. Fresh or speculative repair remains
 charged to the extra-traffic budget so a lossy owner cannot convert the stream
 into unbounded duplicate traffic. A persistent authoritative gap is correctness
 repair: it may exceed the optional extra-traffic budget only after the
-persistent-gap guard fires, and each repair event remains bounded by the current
-repair quantum, outstanding repair debt, and configured repair/path-flight
-resource caps.
+persistent-gap guard fires. If the gap's exact single-copy `OwnerData` owner was
+TCP and the flow is bulk, one event selects a bulk-model-proven output distinct
+from every owner of the repaired range and may repair one modeled service
+flight for that output, normally approximately `2 * BDP`. The event remains
+capped by that selected output's remaining modeled service-flight headroom, the
+outstanding gap debt, repair cache, configured repair/path-flight resources,
+and actual output capacity. Its queued frames remain bound to the selected
+attachment instance or output incarnation; dispatch MUST pause rather than
+silently move the remainder to another output whose envelope was not used to
+size the event. If that identity detaches, is replaced, or cannot drain by the
+persistent-gap retry deadline, the sender cancels the whole remaining queued
+batch. A later authoritative gap replay MUST select and size a fresh output
+instead of inheriting the stale envelope. An unproven output,
+UDP/QUIC owner, ambiguous owner, or
+latency/realtime flow retains the normal single adaptive repair quantum. Thus
+the product-gap
+controller is unified, but it does not overwrite the carrier-specific recovery
+and pacing models.
 
 When ACK ranges are contiguous but stop before the sender's highest owner
 offset, the unacknowledged suffix is not repairable merely because it is
@@ -770,8 +818,10 @@ from budget bypass: critical repair still consumes the extra-traffic budget
 unless the implementation is repairing one of those bounded correctness cases
 and the optional budget is exhausted. That correctness repair is still
 `RepairData`: it does not prove the repair path, does not move the Service
-owner, and each event is bounded by the current repair quantum,
-outstanding repair debt, and configured repair/path-flight resource caps.
+owner, and each event is bounded by outstanding repair debt and configured
+repair/path-flight resources. The exact-TCP-owner bulk persistent-gap exception
+may use one selected distinct output's modeled service flight; every other
+critical repair event retains the normal adaptive repair quantum.
 Critical repair priority is a sender-service/product-queue ordering rule, not a
 carrier control-priority rule. A repair frame that is encoded as `STREAM_DATA`
 MUST use the carrier stream-data queue after target selection so it cannot
@@ -816,8 +866,8 @@ These ownership rules are normative because most bad multipath behavior comes
 from misplaced ownership: path queues trying to be fair schedulers, carrier ACKs
 being treated as product delivery, stream ACKs being treated as carrier-rate
 proof, unbounded validation bytes owning the only copy of ordered data, or
-TCP-named relay buffers governing UDP-backed product streams. The one bounded
-response-flow-diversity startup Subflow epoch is explicit sender-service sampling, not
+TCP-named relay buffers governing UDP-backed product streams. A bounded
+direction-gated startup Subflow epoch is explicit sender-service sampling, not
 validation credit or implicit ownership transfer. The model deliberately follows the
 same separation that makes mature transports understandable: MPTCP maps data
 sequence numbers onto subflows without letting subflows own the application byte
@@ -958,11 +1008,14 @@ hard-coding benchmark pass/fail behavior:
   BBR-style 64 KiB send quantum and the configured read/payload envelope, and no
   smaller than that feed quantum while the live condition cap permits it. QUIC
   or kernel TCP then owns packet pacing and congestion below that product
-  record. Lossy, jittery, or queued paths can still shrink the upper condition
-  cap; high-rate stable paths repeatedly dispatch bounded quanta until the
-  carrier remains fed. Inflight limits and carrier pacing control network
-  pressure; the frame quantum controls scheduling preemption and per-byte
-  processing cost.
+  record. The only calibration-specific exception is a positive exact active
+  TCP response residual smaller than the normal chunk: it may become a smaller
+  frame only when a residual-sized first planning pass returns that exact
+  calibration commit. Service fallback and UDP/QUIC retain the normal quantum.
+  Lossy, jittery, or queued paths can still shrink the upper condition cap;
+  high-rate stable paths repeatedly dispatch bounded quanta until the carrier
+  remains fed. Inflight limits and carrier pacing control network pressure; the
+  frame quantum controls scheduling preemption and per-byte processing cost.
   Receiver-side stream input queues and path command queues follow the same
   rule. Their depth is sized from the relevant byte window divided by the
   actual maximum product-frame payload used by the attachment plus one
@@ -1055,7 +1108,8 @@ their origin is explicit and they do not become hidden modes.
 | DRR lane/flow quanta | Deficit charge equals actual sender-service packet quantum | DRR/fair queuing is common | Fixed byte quanta previously underfed high-rate carriers | Keep adaptive charge based on actual queued frame size |
 | Service frame quantum | Latency/control use small BBR-style quanta; reliable bulk feeds TCP/QUIC with the bounded 64 KiB BBR send quantum under the configured read/payload envelope and live condition cap | BBR send-quantum model applied at the product-record boundary, with TCP/QUIC packet pacing below | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta while control/repair/latency remain preemptive |
 | TCP AEAD record granularity | Send exactly one encoded product frame per independently counted/authenticated `MPTE` version 2 envelope; a writer run may batch consecutive envelopes into one socket write | TLS 1.3's bounded independently authenticated record layer is the mature design precedent; mptunnel retains its own adaptive product-frame quantum rather than copying the TLS record-size limit | Coalescing a 512 KiB writer run into one record makes one lost TCP segment block decryption and product feedback for the whole run; one syscall per small record can waste CPU | Keep strict frame/record identity on emission and bounded multi-envelope socket-write batching; reject non-canonical multi-frame plaintexts |
-| Startup Subflow sample epoch | With at least two active direction-relevant reliable response flows, cumulative `OwnerData` budget = `max(next_quantum, min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2, path_flight_envelope, receiver_reorder_envelope, repair_envelope, stream_window_envelope))`; the current fixed startup window makes the unclamped floor 256 KiB | Multi-quantum startup sampling follows MPTCP subflow probing, QUIC initial-window growth, and BBR send-quantum/app-limited sampling practice; suppressing it for one flow follows the MPTCP best-single-path goal and MPQUIC same-stream maximum-delay warning; the exact flow-count gate and 256 KiB floor are mptunnel policy | One quantum underfeeds useful paths; an ACK-refilled or one-flow epoch creates HOL debt without independent flow-level path diversity; an unbounded epoch can harm mixed or latency-sensitive traffic | Keep one cumulative, non-refilling epoch for one same-underlay Validation candidate per bulk-only response stream; every quantum remains preemptible and carrier/reorder gated; disable the epoch with fewer than two active direction-relevant reliable response flows or under latency-sensitive/realtime pressure; generation-fence the count at commit |
+| Startup Subflow sample epoch | Per candidate, cumulative `OwnerData` budget = `min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2, path_flight_envelope, receiver_reorder_envelope, repair_envelope, stream_window_envelope)`; the current fixed startup window makes the unclamped budget 256 KiB. A product frame is never split to consume remaining credit. After a useful sample exists, a next frame larger than the remaining credit irrevocably seals the request sample at its actual admitted byte count, sends that whole frame on Service, and queues one proof marker behind the sealed sample on the exact reliable carrier stream. Marker ACK time measures conservative receipt goodput using that sealed count. Response sampling additionally requires at least two active direction-relevant reliable response flows. Request/upload sampling instead requires sustained bulk-only Throughput/Background demand, a stable direction-correct bulk-rate-proven Active Service attachment, and fresh proof on the exact same-underlay Validation attachment instance | Multi-quantum startup sampling follows MPTCP subflow probing, QUIC path validation and initial-window growth, and BBR send-quantum/app-limited sampling practice; the response flow-count gate, request sustained-demand gate, ordered receipt marker, and 256 KiB budget are mptunnel policy | One quantum underfeeds useful paths; ACK-refilled or concurrent candidates create unbounded HOL debt; attachment proof mistaken for rate admits an unmeasured path; ambiguous repair ACKs can strand an exhausted sample without a receipt fence; splitting or accepting a later small frame after a near-cap seal changes record identity and reopens ordering debt | Keep one frozen cumulative, non-refilling budget per exact candidate instance and at most one unproven startup owner per stream. Every whole frame and the single marker remain preemptible and carrier/reorder gated. A near-cap seal is final even if smaller frames arrive later. A request candidate may release the startup-owner slot only after exact ordered-receipt or unambiguous ACK-derived bulk-rate graduation and release of its ordering-owner flights; retained sampled membership prevents that instance from receiving fresh startup credit. A response candidate releases the slot after its OwnerData flights drain and canonical bulk proof exists: exact product ACK evidence is sufficient for TCP, while QUIC requires local carrier ACK-derived evidence. Keep the response two-flow and generation fence unchanged, and suppress both directions under latency-sensitive/realtime pressure or authoritative lower debt |
+| TCP response ACK-clock calibration | After response startup graduation, one exact TCP Validation instance receives 2 MiB of cumulative, non-refilling calibration credit. Once the current stage is fully spent, a later ACK window may double the authorized cumulative ceiling up to the path-flight, repair, receiver-reorder, and stream-window resource envelope only when every sampled send precedes the prior ACK and the earliest send follows stage authorization. Strict current-stage windows form a byte/raw-time aggregate with timer granularity applied once; at authorization it enters a rolling five-stage window only with at least half the initial credit in coverage (1 MiB by default, clamped to the initial resource limit). Under-covered evidence may still grow/prove the stage. Retain startup rate before three aggregates, then overwrite with the median. Product-flight and carrier-queue views use union-style admission debt while cumulative spend stays exact. An exact active residual smaller than the normal chunk is emitted only when a residual-sized first plan returns that exact calibration commit; otherwise a second pass gives Service its normal chunk. Service ownership never moves, and a proven identity remains fenced until its calibration flights drain. UDP/QUIC is excluded | TCP lacks QUIC's local packet ACK controller; staged product ACK-clock sampling is mptunnel policy for filling a high-BDP response path without granting the full resource envelope from a hint | A fixed 2 MiB sample underfills high-BDP paths; ACK-refill is unbounded; mixed-stage, small terminal, per-callback timer rounding, or ACK-compressed windows can publish misleading artifacts; double-counted queue debt can make the strict terminal window impossible; max-filtering makes high artifacts permanent; unconditional residual framing fragments ordinary Service work; applying product ACK timing to QUIC corrupts carrier pacing evidence | Keep cumulative spend monotonic and credit growth independent from publication. Aggregate only strictly causal current-stage windows, require representative byte coverage for rate insertion, apply timer granularity once, use union-style debt with exact spend, publish the rolling median after three stage aggregates without max-filtering, use two-pass exact-commit residual planning, fence commit by exact output and generations through flight drain, roll back failed enqueue, retain Service, serialize candidates until exact flights drain, and cap at the configured resource envelope |
 | Inflight target | BDP * BBR cwnd gain, send quantum, and MinPipeCwnd under configured flight envelope; latency/realtime lanes use the smaller preemptive target | BBR inflight model and product lane priority | Too low underfeeds; too high queues | Keep adaptive from live BDP/queue/loss/carrier evidence |
 | Stability/backlog factors | Shrink by loss/jitter/queue/backlog relative to BDP with floor derived from MinPipeCwnd or send quantum divided by BDP | Congestion-sensitive adaptation; floor is no longer a fixed fraction | Over-shrinking can create low-rate loops | Keep adaptive; diagnostics must show shrink reason |
 | Auto bulk classification | EWMA/rate/byte/idle-gap evidence promotes/demotes demand using service quantum, BDP, and PTO; per-stream bulk prevalidation requires an amortized multi-window floor, not merely one initial window and not a full throughput-promotion delay | Product-specific but measurement-based | Late/early promotion affects latency/throughput; too-early prevalidation creates short-flow open/close churn | Keep adaptive; no user-visible mode tag or port rule |
@@ -1067,7 +1121,7 @@ their origin is explicit and they do not become hidden modes.
 | QUIC metric sampler | Active polling uses SRTT/2 with timer granularity; app-limited/idle polling uses PTO; confidence derives from ACK-derived sample count | Carrier app-limited filtering and QUIC RTT/PTO evidence | Stale samples mislead scheduler | Removed fixed 10..250ms sampler clamp; keep evidence provenance |
 | Path/stream queue depth | Byte envelope divided by actual service/frame payload plus priority-headroom slots, where headroom is one slot per non-throughput lane | Resource envelope plus lane model | Fixed slot caps underfeed high-rate carriers | Removed 1024/4096-style caps from data-plane queues |
 | Bulk admission | A clear-frontier Service owner on any carrier is admitted by product ownership state, not by a carrier-cwnd product ceiling. Before mature path-scoped bulk evidence exists, Service owner tail feed is capped by its startup/preemptible horizon. After mature evidence exists without same-path latency pressure, the Service may use the configured product envelope; that envelope remains a hard resource ceiling, not a carrier congestion-window claim. Same-path latency pressure narrows assigned owner credit back to the feed reservoir. Raw sender-service staging remains queue-, credit-, and memory-bounded and is not owner debt. With only one live owner-capable underlay family, source headroom reserves the horizon/feed limit against assigned owner tail plus raw queue bytes. Only while live owner-capable outputs span TCP and UDP may raw staging use an independent horizon/feed reservoir that subtracts raw queue bytes alone; Repair-only or closed outputs do not enable this mixed-family exception. App-limited or low-rate product progress may inform ETA but MUST NOT initialize a tiny BDP-derived or carrier-cwnd product ceiling. Latency work on another path keeps its own priority and flow-control protection but MUST NOT shrink an unrelated Service owner's product envelope. Carrier inflight/queue/RTT/loss/pacing shape emission and ETA below those product windows; optional Subflows, cross-underlay sends, debt-bearing sends, and migrations remain governed by BDP/ETA/reorder/no-worse admission and may be suppressed or demoted | MPTCP/MPQUIC simultaneous-path scheduling plus ECF/BLEST HOL avoidance, with QUIC packet congestion owned below the product stream | Highest-risk throughput governor | Keep dynamic invariant; diagnostics must explain each rejection; do not treat QUIC write-buffer acceptance as delivered capacity |
-| Validation traffic | Probe/control traffic by default; repair data only after explicit gap/failover evidence; the sole unique-future-byte exception is the bounded same-underlay startup Subflow sample epoch after local sender evidence and at least two active direction-relevant reliable response flows | MPTCP reinjection, MPTCP subflow startup, MPQUIC path validation, and MPQUIC's local scheduling guidance | Unbounded, cross-family, or unmeasured one-flow Validation OwnerData creates HOL debt; proof-only validation can permanently underfeed useful capacity | Keep the exception explicit, cumulative, one-candidate, bulk-only, generation-fenced, and suppressed by single-flow state, latency/realtime pressure, or authoritative lower debt |
+| Validation traffic | Probe/control traffic by default; repair data only after explicit gap/failover evidence. Unique future bytes are permitted only through a bounded same-underlay startup Subflow epoch: response-side after local sender evidence and at least two active direction-relevant reliable response flows, or request-side after sustained local bulk demand, stable Service evidence, and fresh proof produced after the exact Validation instance attached. One stream-ordered proof marker follows a sealed request sample | MPTCP reinjection and subflow startup plus MPQUIC path validation and local scheduling guidance | Unbounded or cross-family Validation `OwnerData` creates HOL debt; proof-only validation can permanently underfeed useful capacity, while treating attachment-proof payload rate as capacity can over-admit it | Keep both directional exceptions explicit, cumulative, non-refilling, bulk-only, and limited to one unproven candidate at a time. Preserve response flow-count generation fencing; bind request proof, ordered receipt, sample membership, ACK attribution, and graduation to the attachment instance; suppress either direction under latency/realtime pressure, stale lower-flight/repair debt, or resource-envelope exhaustion |
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
 
@@ -1598,6 +1652,12 @@ least two active direction-relevant reliable response flows, the bounded
 same-underlay startup Subflow epoch may use local sender evidence before
 bulk-rate graduation; peer or configured
 hints alone cannot start that epoch.
+Independently, a sustained bulk-only request/upload sender may use a bounded
+same-underlay startup epoch when its exact Active attachment is the stable,
+direction-correct bulk-rate-proven Service and the candidate is an exact
+Validation attachment instance with successful local path proof produced after
+that instance attached. Neither configured nor peer hints satisfy the request
+proof requirement, and proof-byte rate is not bulk-rate evidence.
 Configured startup rate hints are advisory priors and MUST retain that
 provenance; they MUST NOT be relabeled as local non-application-limited delivery
 evidence.
@@ -1650,6 +1710,11 @@ flows likewise do not enter the reliable-response-flow count, but they remain
 categorical pressure through the separate latency/realtime ledger. The sender
 MUST snapshot the response-flow count and generation together and MUST reject a
 startup-sample commit if that generation changed before enqueue.
+This response-flow ledger is not a request/upload-flow counter. Request-side
+startup admission does not alter or consult it; request commits instead
+revalidate sustained bulk demand, the exact live Active Service instance, the
+exact Validation candidate instance and role, and current path-pressure and
+ordering-debt state.
 
 The headroom is derived from the same path model used for latency inflight
 (`srtt`, delivery or pacing rate, loss, jitter, and queue pressure); it is not
@@ -2029,6 +2094,13 @@ has local delivery samples or ACK-derived carrier data samples. Configured
 hints, successful opens, control
 probes, RTT-only liveness, and single duplicated stream ranges do not satisfy
 this requirement.
+For a sustained bulk-only request/upload, the request sender may use the same
+bounded exception without consulting the response-flow count, but only while
+the exact Active attachment remains its stable, direction-correct
+bulk-rate-proven Service. The selected same-underlay Validation instance MUST
+have a matching path proof produced after that attachment instance opened.
+Other request candidates remain proof-only, and path proof itself neither
+supplies bulk-rate evidence nor promotes the Validation attachment.
 
 Those samples make a bulk Validation path eligible for measured Subflow
 admission; they do not by themselves authorize an Active Service migration.
@@ -2240,12 +2312,17 @@ source-read permission. One stream-local admission window counts undispatched
 unique source bytes and ACK-retained repair bytes together. It retains one
 source-queue reservoir while classifying the flow, starts bulk work at the
 resource-derived Service feed reservoir, and may double only after unique
-`STREAM_ACK` release consumes at least half the current window within that
-active path's PTO. Only an ACK arriving on the same active TCP carrier instance
-is eligible to grow the window. The receiver SHOULD prefer its most recently
-accepted request Active output for ordinary ACKs independently of its response
-OwnerData path; a capacity fallback remains valid release evidence but does not
-grow this clock. The estimator resets on every active TCP carrier handoff and
+`STREAM_ACK` release consumes at least half the current window within the exact
+Active TCP instance's PTO. Growth is attributed from the flight ledger to the
+exact TCP attachment instance that was the single `OwnerData` owner of each
+newly acknowledged range. That owner MUST still be either the live Active TCP
+instance or an exact live graduated same-underlay candidate with usable
+ACK-clock proof. The Active instance supplies only the window epoch and PTO
+clock; the carrier on which the ACK arrived is irrelevant. Repair-only,
+duplicated, ambiguously attributed, or stale-instance ACKs still release product
+flight and repair retention, but MUST NOT grow the request window. The receiver
+MAY send ordinary ACKs on any accepted output with control credit. The
+estimator resets on every Active TCP carrier handoff and
 MUST NOT inherit path-global, opposite-direction, earlier-flow, other-path, or
 superseded-path rate evidence. If the active TCP carrier is lost before
 replacement, the prior bound remains in force during recovery. When a UDP
@@ -2730,6 +2807,18 @@ failed owner, Repair role, or other authoritative lower debt blocks startup
 sampling. Cross-underlay candidates remain strict during startup because TCP
 and QUIC expose different queueing and HOL behavior.
 
+Request/upload bootstrap uses the same bounded sampling mechanism but an
+intentionally different eligibility signal. Once Auto has classified one
+request stream as Throughput or Background and its local source continues to
+offer ordinary data, that stream has sustained request-side bulk demand; it
+does not need a second request stream. The exact live Active attachment MUST
+remain its direction-correct bulk-rate-proven Service. One freshly proven
+same-underlay Validation attachment instance at a time may then receive the
+bounded startup `OwnerData` defined in Section 18.1. Path proof ranks and
+qualifies the current attachment instance for sampling, but its proof-byte rate
+is not capacity evidence. The stable Service, latency-pressure, resource,
+ordering-debt, and graduation rules remain mandatory.
+
 ### 17.3 ETA Scoring
 
 Scheduler scoring estimates completion time from RTT, queue bytes, bytes in
@@ -2838,6 +2927,10 @@ endpoint hints such as initial RTT, jitter, or rate are also advisory priors:
 they may rank the current Service candidate or validation order, but they are
 not delivery evidence and MUST NOT by themselves make an optional path a
 Subflow owner for same-stream reliable bytes.
+The evidence mechanism is symmetric, but bounded startup eligibility is
+direction-specific: response sampling retains the session's two-active-flow
+and generation fence, while a sustained request/upload stream uses its stable
+local Active Service attachment and current Validation attachment evidence.
 
 ### 17.6 Unified Sender Service
 
@@ -3322,10 +3415,15 @@ direction-correct bulk-rate evidence. When the session has at least two active
 direction-relevant reliable response flows, one response-side candidate may
 instead use the bounded same-underlay startup sampling epoch described below. A
 sole active direction-relevant reliable response flow keeps unmeasured
-alternates outside unique-data ownership. Individual
-dispatches consume credit from that set; they do not recreate validation or
-startup-sample credit from scratch, and ordinary ACK progress does not reset
-either credit. ACKs update the per-range flight ledger,
+alternates outside unique-data ownership. A sustained bulk-only request/upload
+stream may use a separate request-side startup epoch without a request-flow
+count when its exact Active attachment remains the stable, bulk-rate-proven
+Service. Individual dispatches consume the selected candidate's cumulative
+credit; they do not recreate that candidate's validation or startup-sample
+credit from scratch, and ordinary ACK progress does not reset either credit.
+After explicit graduation and release of that candidate's ordering-owner
+flights, a different never-sampled attachment instance may receive its own
+finite credit. ACKs update the per-range flight ledger,
 delivery samples, and the next admission calculation; detach, carrier close,
 failover, or a changed Service/envelope resets the subflow set. Additional paths
 attached to the same stream are not automatically ordinary data paths. Their
@@ -3335,8 +3433,9 @@ Service path may carry ordinary data. A path with any role may carry a specific
 repair frame when it is the best survivor and
 avoids the path that likely lost the original bytes.
 
-Attaching a previously absent passive Validation or Repair output MUST advance
-the planner generation so a pre-attach optional-owner or Subflow plan cannot
+On the response-side binding, attaching a previously absent passive Validation
+or Repair output MUST advance the planner generation so a pre-attach
+optional-owner or Subflow plan cannot
 commit afterward, but it MUST preserve the existing subflow-set epoch identity,
 Service, startup candidate, cumulative startup spend, and measured members.
 Passive membership growth MUST NOT reset, refill, or transfer startup-sample
@@ -3345,7 +3444,10 @@ linearize one bounded preemptible quantum when enqueue atomically revalidates th
 exact live output key, channel, incarnation, and non-Repair role; the next
 quantum uses a fresh plan. Active attachment, output replacement, role change,
 detach/failure, explicit Service change, and envelope change remain semantic
-reset conditions.
+response reset conditions. Request-side passive attachment likewise preserves
+the existing `request_subflow_set`; its send path instead revalidates exact
+`RelayPathInstance` values and restores the previous set if carrier enqueue
+fails.
 
 Same-stream bulk striping is allowed for TCP, UDP, and mixed TCP+UDP reliable
 streams only when the candidate passes the same role-aware admission framework
@@ -3367,8 +3469,11 @@ proof and does not itself make the path an ordinary measured bulk subflow.
 Before local sender evidence exists, same-family proof paths MUST NOT receive
 product `OwnerData`. Once that evidence and at least two active
 direction-relevant reliable response flows exist, a single same-family
-Validation candidate on a bulk-only response stream
-may receive only the cumulative startup-sample budget; this bounded exception exists to produce the
+Validation candidate on a bulk-only response stream may receive its cumulative
+startup-sample budget. A sustained request/upload stream may instead select one
+same-family Validation attachment instance after that exact instance has fresh
+local path proof and while its exact Active Service remains stable and
+bulk-rate-proven. Each bounded exception exists to produce the
 direction-correct path evidence that an underfed candidate cannot otherwise
 earn. A path with ACK-data evidence but no bulk-rate evidence otherwise remains
 `Probe`, `Standby`, or `RepairOnly`; ACK-data visibility keeps the path in the
@@ -3410,10 +3515,12 @@ an additional owner path admitted by the same no-worse completion and
 ordering-debt model used for the Service path. There are two explicit Subflow
 owner gates: ordinary measured admission requires direction-correct bulk-rate
 evidence plus no-worse completion, ordering-debt, queue, and overhead guards;
-startup sampling requires at least two active direction-relevant reliable
-response flows plus the one-candidate, same-underlay, bulk-only bounded epoch
-and all of its debt and
-pressure guards. The startup gate is not a second Service-election path.
+startup sampling requires the one-candidate, same-underlay, bulk-only bounded
+epoch and all of its debt and pressure guards. The response branch additionally
+requires at least two active direction-relevant reliable response flows. The
+request branch instead requires sustained local bulk demand, the stable
+bulk-rate-proven Active Service instance, and fresh proof for the exact
+Validation instance. The startup gate is not a second Service-election path.
 `RepairOnly`, `Standby`, and `Failed` outputs cannot receive speculative owner
 bytes. Role transitions are monotonic with evidence and carrier state for the
 current decision; they are not implied by attachment order, carrier family,
@@ -3421,8 +3528,11 @@ configured path order, or temporary queue availability. In particular, `Probe`,
 path-proof-only, and sender-evidence-only paths are not permission to carry an
 unbounded stream of future offsets. In a session with at least two active
 direction-relevant reliable response flows, one sender-evidenced Validation path may use the finite
-startup-sampling epoch, but remains unmeasured at its cap. The only
-unmeasured path that may continue as the Service is explicit frontier-clear
+startup-sampling epoch, but remains unmeasured at its cap. The request-side
+counterpart is the sustained-demand, stable-Service,
+fresh-Validation-instance epoch defined below; it is equally finite and remains
+unmeasured at its cap. The only unmeasured path that may continue as the Service
+is explicit frontier-clear
 Service failover after the previous Service is gone; that
 exception elects one new Service path and remains subject to ordinary Service
 feed/admission limits.
@@ -3484,6 +3594,18 @@ candidate. A later product stream may probe the path again, and explicit
 failover recovery may open a survivor when required for correctness, but normal
 bulk validation MUST NOT create repeated same-stream `OPEN_STREAM` churn.
 
+Request-side startup sampling is sequential even when several Validation
+attachments are already present. The per-flow subflow set records at most one
+unproven `startup_owner` attachment instance. That instance retains exclusive
+use of the startup slot until it has direction-correct bulk-rate evidence and no
+remaining ordering-owner flight, or until detach/failure invalidates the
+current set. Explicit graduation clears the startup slot but retains the
+sampled instance as a subflow-set member, so the same instance cannot consume a
+fresh startup budget. A different never-sampled same-underlay Validation
+instance may then become `startup_owner` and receives its own cumulative,
+non-refilling budget. At no point may two unproven request candidates own unique
+startup ranges concurrently.
+
 Mixed TCP+UDP validation MUST be carrier-diverse without carrier-family
 prejudice. When an admitted validation subflow set contains both TCP and UDP
 underlays, the sender SHOULD attempt the best currently admissible candidate
@@ -3520,13 +3642,15 @@ duplicates the same `STREAM_DATA` on an admitted ordinary path and the
 validation path, sends repair for an already-missing range, or sends
 carrier/control probes that do not create a new application-data dependency.
 After local sender evidence exists, the bounded response-side startup Subflow
-epoch is the sole exception: only when at least two active direction-relevant
+epoch is one exception: only when at least two active direction-relevant
 reliable response flows exist may one same-underlay Validation candidate own a
-limited sequence of unique
-future ranges while the live Service owns only an ordinary contiguous suffix
-and the combined projected debt fits the reorder budget. A session whose active
-direction-relevant reliable response-flow count is one continues using
-carrier/control proof instead of unique future ranges. This
+limited sequence of unique future ranges while the live Service owns only an
+ordinary contiguous suffix and the combined projected debt fits the reorder
+budget. A session whose active direction-relevant reliable response-flow count
+is one continues using carrier/control proof instead of unique future ranges.
+The other exception is the separately gated sustained request/upload epoch
+defined below; it uses the same debt boundary without weakening this response
+flow-count rule. This
 follows QUIC path validation and MPTCP/MPQUIC subflow probing while adapting them
 to a product-layer stream that must avoid unbounded receive-hole debt.
 
@@ -3545,6 +3669,12 @@ admitted ordinary path exists. It MAY satisfy the local-sender-evidence
 prerequisite for the separately bounded same-underlay startup Subflow epoch.
 Unknown, duplicate, or stale proof ACKs are ignored. Proof payloads are bounded
 by the latency/preemptible startup quantum and by the frame payload envelope.
+For request-side startup eligibility, the matching proof exchange MUST have
+completed after the exact Validation attachment instance was created. A proof
+record from an earlier attachment, a successful open without proof, or a proof
+record whose current path state is no longer Active for scheduling is stale.
+Even a fresh proof-byte-rate sample remains proof provenance only and MUST NOT
+initialize `delivery_rate`, `pacing_rate`, bulk-rate confidence, or graduation.
 
 Same-underlay validation is still subject to this rule. A path that uses the
 same underlay family as the lead path may be cheaper and safer to validate than a
@@ -3552,8 +3682,10 @@ cross-underlay path, but it MUST NOT receive the only copy of a new future
 ordered byte range before path-local sender evidence exists. Before then, the
 sender uses duplicate `STREAM_DATA`, repair for an already-missing range, or
 carrier/control proof traffic. After then, only a selected startup-sampling
-candidate in a session with at least two active direction-relevant reliable
-response flows may receive unique owner ranges, under the epoch cap and safety gates.
+candidate may receive unique owner ranges under the epoch cap and safety gates:
+the response candidate requires at least two active direction-relevant reliable
+response flows, while the request candidate requires the sustained-demand,
+stable-Service, and fresh-instance proof predicate.
 Duplicate validation copies MUST be recorded as non-owners of the ordered
 frontier so they can release carrier/product flight on ACK without making the
 validation path the lower-frontier owner for later unique bytes.
@@ -3620,6 +3752,27 @@ bounded startup Service failover path. These are distinct states: Subflow
 sampling never changes Service ownership, while failover explicitly elects a
 new Service. Path-scoped bulk-rate evidence still controls ordinary measured
 Subflow admission and Service migration.
+
+Request-side validation uses the corresponding client-to-server evidence. A
+request stream becomes eligible only after Auto classifies its continuing local
+source as Throughput or Background. Its exact live Active attachment is the
+Service anchor and MUST already have direction-correct bulk-rate evidence. The
+candidate MUST be an attached protocol-role Validation instance on the same
+underlay family, MUST have a successful `PATH_PROOF_ACK` observation newer than
+that instance's attachment time, and MUST not yet have bulk-rate evidence. One
+candidate may then receive bounded unique request `OwnerData` as Subflow work;
+this does not change the Active placement, ordered-data owner hint, or Service
+identity. A request-flow count is not part of this predicate.
+
+Before every request sample commit, the sender MUST revalidate the exact Active
+Service instance, Validation role and instance, current proof observation,
+Throughput/Background lane, carrier enqueue credit, and absence of path- or
+session-scoped latency-sensitive or realtime pressure. It MUST also reject the
+sample if a missing or failed lower owner, an ACK-range hole, queued/active
+repair, or a mature stale lower ordering-owner flight is authoritative for the
+next offset. A normal live Service contiguous suffix may be crossed only while
+the projected suffix, candidate queue/inflight, and next quantum fit the
+path-flight, receiver-reorder, repair-cache, and stream-window envelope.
 Client-supplied `PATH_METRICS` are hints, not final proof of response-direction
 throughput. They are useful to distinguish a plausible
 high-bandwidth path from a poor or high-loss path before bounded proof is sent,
@@ -3684,13 +3837,23 @@ For TCP outputs, product-ledger owner progress is path-scoped bulk-rate evidence
 when the ACKed range had exactly one outstanding flight copy, that copy was
 `OwnerData`, and the release handler records a product progress rate for that
 owner. TCP needs this fallback because the kernel carrier does not expose QUIC's
-packet ACK controller. For QUIC outputs, the same product ACK is attribution and
-backlog progress only: it MUST NOT set carrier bulk-rate evidence or replace the
-QUIC delivery-rate model. A range with an OwnerData copy plus any
-repair/duplicate copy is ambiguous, so its ACK never increments owner delivery
-samples or creates product-owner progress for a path. ACK-data seen alone does
-not set bulk-rate evidence, rewrite the ordinary lead, or authorize ordinary
-measured ownership.
+packet ACK controller. The first usable exact-owner window is measured from its
+earliest send to the ACK that completes the evidence floor. Later windows use
+ACK-to-ACK time only when every byte counted in the later window was already in
+flight at the previous ACK; bytes first sent after that ACK make the interval
+application-limited and produce no rate sample. Request-side calibration may
+replace the exact instance's provisional startup/receipt rate from its first
+usable calibration window. Response-side TCP calibration instead uses the
+stage-authorizing robust publication rule below; an ordinary strict window that
+did not authorize a fully spent stage MUST NOT replace the startup rate. A
+replacement attachment starts fresh and MUST NOT inherit a replacement rate or
+its clock. For QUIC outputs, the same product ACK is attribution and backlog
+progress only: it MUST NOT set carrier bulk-rate evidence or replace the QUIC
+delivery-rate model. A range with an OwnerData copy plus any repair/duplicate
+copy is ambiguous, so its ACK never increments owner delivery samples, creates
+product-owner progress for a path, grows the TCP request window, or advances
+ACK-clock calibration. ACK-data seen alone does not set bulk-rate evidence,
+rewrite the ordinary lead, or authorize ordinary measured ownership.
 
 Attached but unproven Validation paths use
 `PATH_PROOF_DATA`/`PATH_PROOF_ACK` and control traffic for bootstrap. A response
@@ -3732,10 +3895,32 @@ pressure generation or reject its Subflow commit.
 This keeps sampling debt out of mixed and flapping workloads whose recovery and
 latency bounds take precedence over aggregation discovery.
 
-The selected candidate is stable for the epoch; per-quantum ETA changes MUST NOT
-switch the sample among candidates or create a second startup sampler for the
-response stream. TCP beside TCP and QUIC beside QUIC use the
-same rule. Repair-role and cross-underlay outputs are never startup-sampling
+Separately, a request sender may start a unique-`OwnerData` sampling epoch only
+when all of the following are true:
+
+* Auto has classified the request stream as Throughput or Background, the local
+  source continues to offer ordinary request data, and the stream, path set, and
+  session have no active latency-sensitive or realtime pressure;
+* the exact request-side Active attachment instance is live, remains the Service
+  and ordered-data anchor, and has direction-correct bulk-rate evidence;
+* the candidate is an exact attached Validation instance, uses the same
+  underlay family as Service, has a successful local path-proof observation
+  produced after that attachment time, and does not yet have bulk-rate evidence;
+* the per-flow subflow set has no other unproven `startup_owner`, and this exact
+  candidate instance is not already retained as a sampled member; and
+* no authoritative lower-flight debt, repair-authoritative ACK hole, missing- or
+  failed-owner debt, mature stale lower ordering-owner flight, or queued/active
+  repair range lies below the next offset.
+
+No number of other request streams is required. These conditions are
+revalidated for every request quantum; a Service instance change, candidate
+role/incarnation change, stale proof, demand demotion, or newly active pressure
+rejects the planned sample without changing Service.
+
+The selected candidate is stable while it owns the startup slot; per-frame
+ETA changes MUST NOT switch the sample among candidates or create a second
+startup sampler for the stream. TCP beside TCP and QUIC beside QUIC use the same
+rule. Repair-role and cross-underlay outputs are never startup-sampling
 candidates. The only lower debt the candidate may cross is an ordinary
 contiguous unacknowledged suffix uniquely owned by the live Service. The sender
 counts that suffix plus the candidate's queued, in-flight, and next-quantum
@@ -3744,41 +3929,54 @@ product envelope: the configured path-flight, receiver-reorder, repair-cache,
 and stream-window envelopes clamped by the actual next quantum. An unmeasured
 path's tiny prior-rate BDP MUST NOT replace this finite startup envelope.
 
-The epoch's cumulative unique-owner budget is:
+Each selected candidate's cumulative unique-owner budget is:
 
 ```
 startup_sample_budget =
-    max(next_quantum.len,
-        min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
-            path_flight_envelope,
-            receiver_reorder_envelope,
-            repair_envelope,
-            stream_window_envelope))
+    min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
+        path_flight_envelope,
+        receiver_reorder_envelope,
+        repair_envelope,
+        stream_window_envelope)
 ```
 
 The current 512 KiB startup product window therefore yields a 256 KiB
-unclamped sample floor. Each dispatch is still one preemptible service quantum
-and MUST separately pass carrier emission credit, queue, path-flight, flow
-control, repair-cache, and projected reorder checks. ACK release does not
-replenish `startup_sample_budget`: cumulative admitted unique OwnerData, not
-current inflight, spends the epoch. The sampling candidate may temporarily win
-these bounded dispatches even when an application-limited or underfed rate would
+unclamped sample budget. Each dispatch is still one whole preemptible product
+frame and MUST separately pass carrier emission credit, queue, path-flight,
+flow control, repair-cache, and projected reorder checks. A frame MUST NOT be
+split merely to consume the remaining startup credit. ACK release does not
+replenish `startup_sample_budget`: cumulative admitted unique `OwnerData`, not
+current inflight, spends that candidate's budget. The sampling candidate may
+temporarily win these bounded dispatches even when an application-limited or underfed rate would
 lose the ordinary completion-horizon comparison. That bypass applies only to
 the active startup epoch; it does not waive any debt, resource, pressure,
 capability, or carrier-family guard.
 
 Service ownership remains unchanged throughout sampling. Control, repair,
-latency, and realtime work can preempt every sample quantum. At the cumulative
-cap, the candidate receives no more startup `OwnerData`, the Service resumes
-normal ordinary feed, and a capped evidence record remains only to attribute
+latency, and realtime work can preempt every sample frame. Exact budget
+exhaustion seals the sample. If at least the useful minimum rate sample has been
+admitted and the next whole frame exceeds the remaining credit, the sender MUST
+instead seal the sample irrevocably at the actual admitted byte count and route
+that next frame through ordinary Service admission. The oversized frame is not
+part of the sample, and a smaller later frame MUST NOT reopen or extend it. Once
+sealed, the candidate receives no more startup `OwnerData`, the Service resumes
+normal ordinary feed, and a sealed evidence record remains only to attribute
 ACKs for already-admitted sample ranges. The epoch MUST NOT restart or refill on
-an ACK, timer, queue wakeup, or app-limited metric refresh. Bulk-demand demotion,
+an ACK, timer, queue wakeup, smaller later frame, or app-limited metric refresh. Bulk-demand demotion,
 authoritative debt, or newly active latency/realtime pressure suspends further
 sampling without transferring ownership; if those conditions fully clear, only
 the same candidate's remaining non-refilling credit may resume. A detach,
-failure, role change, output replacement, or Service change resets the
-planner generation and epoch identity rather than preserving stale credit.
-Planner generation and epoch identity are distinct tokens: planner-only
+failure, role change, output replacement, or Service change invalidates the
+active candidate rather than preserving stale credit. On the response side this
+resets planner generation and epoch identity; on the request side it discards
+the incompatible `request_subflow_set`.
+For request-side sequential sampling, explicit graduation after all
+ordering-owner flights for the candidate have released clears the
+`startup_owner` slot while retaining that instance's sampled membership. Only a
+different never-sampled Validation attachment instance may then receive its own
+budget; the graduated instance cannot regain startup credit in the same set.
+
+For response-side sampling, planner generation and epoch identity are distinct tokens: planner-only
 invalidation rejects an obsolete path choice without changing the ledger that
 owns already reserved credit. Every planned Subflow send carries the planner
 generation and lane-pressure generation captured before target, owner, debt,
@@ -3800,7 +3998,7 @@ It is retained only while the session has a response binding, attached path
 load, or realtime flow. Binding destruction removes any remaining attached
 loads before releasing its session reference; the last reference/load/flow
 release removes the generation entry.
-Startup credit represents emitted `OwnerData`, not a planning attempt. If a
+Response startup credit represents emitted `OwnerData`, not a planning attempt. If a
 shared carrier queue loses its last slot after planning and the nonblocking
 enqueue fails, the sender MUST roll back the committed owner and
 optional-overhead bytes using the epoch identity returned by reservation.
@@ -3808,6 +4006,10 @@ That refund MUST remain valid across planner-only passive-attachment
 invalidation, while a semantic reset or envelope replacement MUST reject a
 refund carrying the former epoch identity. A queue-full race MUST NOT consume
 the finite startup epoch without transmitting its sample.
+The request sender provides the same externally visible rollback by restoring
+the previous `request_subflow_set` when carrier enqueue fails. It MUST NOT retain
+a candidate reservation or spend per-instance credit for a request frame that
+did not enter the carrier queue.
 
 An output replacement also invalidates cached sender metrics and outstanding
 old-output flights as evidence. Flight recording and ACK release are serialized
@@ -3835,20 +4037,114 @@ incarnation clears any same-key Service owner before that output is exposed;
 only an explicitly Active replacement may preserve same-key Service
 continuity.
 
-A TCP candidate graduates when cumulative ACKed bytes from unambiguous,
-single-copy, candidate-owned startup `OwnerData` satisfy the path-scoped product
-evidence floor, including the existing packet-scale accounting slack. A QUIC
-candidate graduates only from direction-correct, non-application-limited local
-carrier ACK evidence satisfying the carrier sample floor; product `STREAM_ACK`
-timing does not substitute for QUIC packet delivery evidence. An ACK covering
-duplicated or ambiguously attributed data, any `RepairData` ACK, proof/control
-traffic, and peer metrics MUST NOT spend the TCP product evidence floor or
-graduate either candidate. After graduation, subsequent Subflow owner bytes use
-ordinary measured ECF/BLEST admission with the retained valid rate even if the
-latest carrier poll is application-limited. If graduation does not occur by the
-cap, the candidate remains Probe or Standby for new sends while later qualifying
-evidence for already-admitted sample ranges may still graduate it. It receives
-no additional startup credit.
+A request candidate queues exactly one `PATH_PROOF_DATA` receipt marker behind
+its sealed startup sample on the same reliable carrier stream. The marker
+MUST use the stream-ordered carrier queue, not the priority/control queue, so its
+validated ACK proves that the peer parsed all earlier sample bytes on that exact
+attachment. The rate sample uses the sealed `OwnerData` byte count divided by
+the interval from first sample enqueue to marker-ACK completion; a later
+scheduler poll MUST NOT extend that interval. This is ordered carrier-stream
+receipt evidence, not a claim that connection-wide QUIC packet ACK counters are
+per-stream. A TCP candidate may alternatively graduate from cumulative ACKed
+bytes from unambiguous, single-copy, candidate-owned startup `OwnerData`.
+Product `STREAM_ACK` timing alone does not prove a QUIC candidate. An ACK
+covering duplicated or ambiguously attributed data and any `RepairData` ACK
+MUST NOT spend the unambiguous TCP evidence floor, but the ordered receipt marker
+prevents such ambiguity from permanently stranding an exhausted epoch.
+
+Graduation in either carrier family additionally waits until no exact
+ordering-owner flight remains for the candidate. Attachment-liveness proof
+payload rate, arbitrary proof/control traffic, peer metrics, and unrelated
+connection-wide carrier ACKs MUST NOT graduate it. A graduated TCP request
+candidate then receives a bounded chance to replace its conservative startup
+rate with an ACK-clocked rate before ordinary ETA ranking can starve it. At most
+one exact live graduated Validation instance on the Service underlay family may
+own calibration `OwnerData` at a time. Its cumulative, non-refilling calibration
+limit is one service horizon, 2 MiB with the default envelopes, capped by path
+flight, repair, reorder, and stream-window resources. Sustained bulk demand,
+fresh proof, stable exact Active Service, usable carrier bulk evidence, absence
+of latency/realtime pressure, repair debt, foreign lower owners, and mature
+stale tails are revalidated for every whole frame. Failed carrier enqueue rolls
+back the reservation. The first usable non-application-limited ACK-to-ACK sample
+ends calibration and replaces the provisional rate. Exhaustion, ACK release,
+timer wakeup, and smaller later frames never refill its credit; an exhausted
+candidate blocks the next calibration candidate only while its exact
+ordering-owner flights remain. After those flights drain, a different eligible
+exact graduated Validation instance may calibrate. Subsequent Subflow owner
+bytes use ordinary measured ECF/BLEST admission with the retained valid rate
+even if the latest carrier poll is application-limited. If graduation does not
+occur by the startup seal, the candidate remains Probe or Standby for new sends
+while later qualifying evidence for already-admitted sample ranges may still
+graduate it. It receives no additional startup credit.
+
+A graduated TCP response candidate uses a separate staged exact-instance
+ACK-clock calibration. At most one exact live graduated response Validation
+instance may own calibration `OwnerData` at a time, and the response Service
+owner MUST remain unchanged. The initial authorized cumulative credit is one
+service horizon, 2 MiB with the default envelopes. Spent bytes never decrease
+or refill. Once cumulative spend reaches the current authorized ceiling, that
+ceiling may double only after a strictly causal later ACK-to-ACK sample whose
+latest sampled send precedes the prior ACK and whose earliest sampled send is
+not earlier than the current stage's authorization time. Bytes sent after the
+prior ACK make the interval application-limited; bytes retained from before
+stage authorization make it the wrong stage. Neither case authorizes growth.
+Each doubling is capped by the configured path-flight, repair,
+receiver-reorder, and stream-window resource ceiling; peer hints and
+wrong-direction metrics MUST NOT raise it. Failed enqueue rolls back only the
+unemitted reservation. Exact path key, output incarnation, Service key,
+planner generation, lane-pressure generation, and response-flow generation are
+revalidated at commit.
+
+An exact active TCP response calibration may have positive credit smaller than
+the normal response source chunk. The sender handles that residual with
+two-pass planning. The first pass plans only the exact remaining calibration
+bytes. It may emit that smaller product frame only when the returned dispatch
+plan contains the ACK-clock calibration commit for that same exact path and
+output incarnation. If the first pass selects Service, selects another target,
+or cannot produce that exact commit, its result is discarded and the second
+pass replans the normal chunk; Service MUST NOT inherit the calibration-sized
+fragment. The residual is not rounded up to a minimum quantum. An exhausted,
+proven, retired, stale, or UDP/QUIC calibration produces no TCP residual pass.
+UDP/QUIC response work retains normal product-frame sizing and its carrier-local
+controller.
+
+Stage-credit growth and response-rate publication are separate decisions. A
+stage-authorizing sample may grow credit immediately without waiting for a
+publishable rate. Every strict ACK-to-ACK window whose earliest send follows
+the current stage authorization accumulates its bytes and raw elapsed time for that
+stage. When a fully spent stage is authorized, its aggregate rate is eligible
+for the exact instance's rolling five-stage window only if aggregate bytes
+reach `min(initial_credit, max(MIN_RATE_SAMPLE_BYTES,
+ceil(initial_credit / 2)))`, 1 MiB under the default 2 MiB initial credit.
+An under-covered stage still grows or proves, but resets without inserting a
+rate; prior-stage, mixed-causal, retired, or stale-incarnation evidence MUST NOT
+carry into the next aggregate. Before three qualifying stage aggregates exist,
+the candidate retains its provisional startup/receipt rate. At three aggregates
+and thereafter, the median of the available rolling window MUST
+overwrite both product-progress and delivery rate, including when the median is
+lower than the prior value. A max filter or upward-only EWMA is forbidden here:
+ACK-compressed sub-millisecond bursts can be orders of magnitude above sustained
+path capacity. Each later accepted stage aggregate evicts the oldest after five
+and republishes the new median. Ordinary strict ACK windows contribute only to
+their current stage aggregate and never publish independently. ACK release never
+restores spent credit; an exhausted stage without a qualifying causal window
+does not grow, and the serial slot advances only after that candidate's exact
+ordering-owner flights drain. Lab diagnostic selection and sample events MUST
+include a binding-local `binding_instance_id` in addition to session, path, and
+incarnation so concurrent response streams cannot be conflated. UDP/QUIC
+response candidates never enter this product-ACK calibration; their bulk
+delivery-rate evidence remains owned by the local QUIC carrier ACK controller.
+
+The accumulator MUST apply timer granularity once to the completed stage
+aggregate. Repeated per-window clamping makes the result depend on ACK callback
+partitioning. The global ordered tail already includes the candidate's product
+flight, and product flight already includes frames pending in the carrier
+command pipe. Planner and authoritative commit headroom MUST combine these as
+overlapping views rather than adding them. Exact
+`spent_bytes + payload` remains the calibration-credit authority. A calibration
+identity that has become proven MUST remain excluded from generic owner
+selection while it is still the exact active calibration; its existing flights
+drain before the fence clears or another candidate advances.
 
 The production SafeBestPath guard separates live in-flight tail state from
 authoritative repair debt. A contiguous unacknowledged `OwnerData` suffix below
@@ -3882,12 +4178,14 @@ itself repair debt.
 
 Proof-only and unmeasured candidates remain `Probe`, `Standby`, or `RepairOnly`
 until authoritative ordered-owner debt clears or explicit loss/failure/final-tail
-evidence converts the affected range into `RepairData`. A sender-evidenced
-Validation candidate is still unmeasured, but may use the bounded startup epoch
-only with at least two active direction-relevant reliable response flows, only
-across the live Service's
-non-authoritative contiguous suffix, and only in bulk-only,
-no-latency-pressure state.
+evidence converts the affected range into `RepairData`. A response-side
+sender-evidenced Validation candidate is still unmeasured, but may use the
+bounded startup epoch only with at least two active direction-relevant reliable
+response flows. A request-side freshly proven Validation instance is likewise
+unmeasured, but may use its bounded per-candidate epoch only under sustained
+bulk demand with the exact stable bulk-rate-proven Service. Either direction may
+cross only the live Service's non-authoritative contiguous suffix and only in
+bulk-only, no-latency-pressure state.
 A mixed-family path is owner-eligible under a tail guard only when it is
 bulk-rate-proven and already owns the lower outstanding range. The surviving
 OwnerData candidates still pass the normal
@@ -3979,15 +4277,23 @@ else:
     comparison_lead = min_eta_candidate_that_is_eligible_and_admissible_for_ordinary_bulk()
 if startup_sample_epoch_selects(stream, path):
     assert stream/session/path are bulk-only
-    assert session.active_direction_relevant_reliable_response_flows >= 2
-    assert session.session_load_generation is unchanged at commit
+    if stream.sender_direction == response:
+        assert session.active_direction_relevant_reliable_response_flows >= 2
+        assert session.session_load_generation is unchanged at commit
+    else:
+        assert stream.sender_direction == request
+        assert stream.lane in {Throughput, Background}
+        assert stream.local_source_has_continuing_data
+        assert service_path is the exact live Active attachment instance
+        assert service_path.has_bulk_rate_evidence
+        assert path.proof_observation_at >= path.attachment_time
     assert no latency-sensitive or realtime pressure
     assert path.role == Validation
     assert path.underlay_family == service_path.underlay_family
     assert path.has_local_sender_evidence and not path.has_bulk_rate_evidence
     assert no authoritative_lower_flight_or_repair_debt(stream)
     assert lower_debt_is_only_live_service_contiguous_suffix(stream)
-    epoch.cumulative_owner_bytes + chunk.len <= epoch.sample_budget
+    epoch.candidate.cumulative_owner_bytes + chunk.len <= epoch.candidate.sample_budget
     live_service_suffix_debt(stream)
         + candidate_product_debt(path) + chunk.len
         <= same_underlay_reorder_budget(path, chunk)
@@ -3996,8 +4302,13 @@ else if path is service_path and stream_ordering_debt(path, chunk) == 0:
     assigned_service_debt(path) + stream_ordering_debt(path, chunk) + chunk
         <= service_owner_envelope(path, chunk)
 else if path is service_path:
-    stream_ordering_debt(path, chunk) + chunk
-        <= same_underlay_reorder_budget(path, chunk)
+    if latency_sensitive_work_is_active_on_this_path:
+        stream_ordering_debt(path, chunk) + chunk
+            <= min(same_underlay_reorder_budget(path, chunk),
+                   throughput_service_horizon(chunk.len))
+    else:
+        stream_ordering_debt(path, chunk) + chunk
+            <= same_underlay_reorder_budget(path, chunk)
 else if path uses the same underlay family as service_path:
     product_reorder_debt(path) + stream_ordering_debt(path, chunk) + chunk
         <= same_underlay_reorder_budget(path, chunk)
@@ -4017,11 +4328,12 @@ therefore a bulk-rate-proven same-underlay path that wants ordinary unique
 ordinary bulk subflow set. A same-underlay path that has only proof,
 low-confidence sender samples, or app-limited evidence is not rejected by this
 measured completion-gain rule; it remains governed by probe admission or, when
-all eligibility guards hold and at least two active direction-relevant reliable
-response flows exist, the cumulative same-underlay startup Subflow epoch. That
-epoch may span repeated TCP
-or QUIC owner quanta, but only for its one stable candidate, and it ends at the
-256 KiB resource-clamped cap. Reorder budget
+all eligibility guards hold, the cumulative same-underlay startup Subflow
+epoch. The response branch additionally requires at least two active
+direction-relevant reliable response flows; the request branch requires its
+sustained-demand, stable-Service, and fresh-instance predicate. An epoch may
+span repeated TCP or QUIC owner quanta, but only for its one stable candidate,
+and it ends at that candidate's 256 KiB resource-clamped cap. Reorder budget
 is a safety envelope for already-admitted work; it MUST NOT be used as extra
 time slack to put unique ordered bytes onto a high-latency path that loses the
 ECF/BLEST next-quantum comparison.
@@ -4056,9 +4368,10 @@ lower-frontier owner exists, that owner is the only path eligible to continue
 ordinary unique data until it becomes admissible, is repaired, or ACK progress
 removes the ordering debt. It retains its existing Service or Subflow role while
 doing so. At a clear frontier, an admitted startup-sampling candidate may spend
-its bounded epoch first only while the session still has at least two active
-direction-relevant reliable response flows in the captured session load
-generation; otherwise a feedable Service
+its bounded epoch first only while its directional predicate remains true: the
+captured response-flow count and generation for response, or sustained request
+demand with the exact stable Service and freshly proven Validation instances
+for request. Otherwise a feedable Service
 receives the next ordinary quantum. A measured Subflow receives clear-frontier overflow only when Service
 is absent from the admitted set because of capacity, detach, failure, or another
 explicit admission guard. This Service-first rule is not permanent pinning:
@@ -4083,6 +4396,10 @@ bounded service quantum so independent uploads converge toward fair sharing.
 Additional paths still carry control, ACK, realtime, latency, duplicate
 validation, and explicit gap-targeted repair; they become ordinary data paths
 only through the same flow-level lead admission rule.
+The request-side startup exception may select one freshly proven same-underlay
+Validation attachment instance before ordinary measured admission, but records
+that work as bounded Subflow `OwnerData`; it does not change the Active
+attachment or Service owner.
 
 Path-scoped `STREAM_DETACH` is explicit product-control work. An implementation
 MUST NOT hide `STREAM_DETACH` creation inside a generic local carrier close
@@ -4230,15 +4547,20 @@ rule closes the MPTCP-style failure mode where a slow or failed subflow owns
 early data and all later high-rate data either blocks behind it or deepens the
 receive hole.
 
-The lower-frontier owner is also bounded by the preemptible bulk service
-horizon while `stream_ordering_debt` is nonzero. Owning the oldest unresolved
-byte does not grant the full path reorder envelope for additional unique data.
-The sender may keep the owner fed enough for ACK-clocked progress, but once the
-owner's unresolved ordering debt exceeds the service horizon it pauses ordinary
-unique bytes until ACK progress, repair, detach/failover, or updated path
-evidence changes the frontier. This prevents a TCP or QUIC UDP writer from
-turning one lost or delayed lower byte into tens of MiB of undeliverable later
-offsets while still avoiding carrier starvation.
+Owning the oldest unresolved byte does not grant an unbounded path envelope.
+For a bulk lower-frontier owner without local latency pressure, the additional
+ordinary unique-data budget is adaptive: at least the next whole frame, normally
+approximately `2 * path_BDP` from the live delivery/pacing rate and SRTT, and
+always capped by the configured receiver-reorder envelope and the normal path,
+repair, queue, and stream-window resources. This budget keeps an ACK-clocked
+TCP or QUIC UDP owner fed across a high-BDP path instead of collapsing it to a
+fixed service horizon whenever any lower debt exists. If that exact path has
+latency-sensitive pressure, the lower-frontier budget remains the smaller
+preemptible bulk service horizon, capped by the same reorder envelope. Once the
+applicable budget is exhausted, the sender pauses ordinary unique bytes until
+ACK progress, repair, detach/failover, or updated path evidence changes the
+frontier. TCP and QUIC share this product-ordering rule while retaining their
+separate carrier congestion, pacing, and ACK clocks.
 
 Lead-path admission and lead-path repair are intentionally separate decisions.
 The lead path may keep a larger assigned product flight and carrier queue than
@@ -4506,8 +4828,9 @@ If additional same-stream paths are not admitted but the lead data path is
 within its product-flight budget, ordinary bulk remains on the lead path. A
 sender MUST NOT fall through to a repair or validation attachment merely because
 the round-robin cursor points there after a previous send. Repair and validation
-placements carry repair or proof traffic only unless ECF/BLEST admission has
-explicitly selected them for the current bulk quantum.
+placements carry repair or proof traffic only unless ordinary measured
+ECF/BLEST admission or the explicit bounded startup epoch has selected them for
+the current bulk quantum.
 
 Each `STREAM_DATA` chunk has an offset, so data can be sent over different
 underlay paths without changing stream correctness.
@@ -4526,8 +4849,15 @@ eta_bdp = eta_rate * path.srtt
 service_path = stream.live_service_owner or explicit_frontier_safe_failover_service()
 comparison_anchor = persistent_service_anchor_under_authoritative_debt()
                     or min_eta_candidate_eligible_for_no_worse_comparison()
-startup_sampling = session.active_direction_relevant_reliable_response_flows >= 2
-                   and startup_sample_epoch_selects(stream, path, chunk)
+startup_sampling = startup_sample_epoch_selects(stream, path, chunk)
+                   and ((stream.sender_direction == response
+                         and session.active_direction_relevant_reliable_response_flows >= 2)
+                        or (stream.sender_direction == request
+                            and stream.lane in {Throughput, Background}
+                            and service_path is exact live Active attachment instance
+                            and service_path.has_bulk_rate_evidence
+                            and path is exact same-underlay Validation attachment instance
+                            and path.proof_observation_at >= path.attachment_time))
 if path is the service_path and stream_ordering_debt(path, chunk) == 0:
     # The current Service owner is the primary ordered-byte owner.  App-limited
     # or low-rate ACK feedback is visibility, not a product-flight ceiling.
@@ -4575,7 +4905,7 @@ if path != service_path and ordering_debt.bytes > 0:
         assert ordering_debt is live_service_contiguous_suffix
         assert no latency_sensitive_or_realtime_pressure
         assert path.underlay_family == service_path.underlay_family
-        assert epoch.cumulative_owner_bytes + chunk.len <= epoch.sample_budget
+        assert epoch.candidate.cumulative_owner_bytes + chunk.len <= epoch.candidate.sample_budget
         ordering_debt.bytes + candidate_product_debt(path) + chunk.len
             <= base_reorder_budget
     else if not (path has bulk_rate_evidence
@@ -4584,7 +4914,10 @@ if path != service_path and ordering_debt.bytes > 0:
 if path is the service_path and stream_ordering_debt(path, chunk) == 0:
     admission_reorder_budget = product_inflight_limit
 else if path is the service_path:
-    admission_reorder_budget = base_reorder_budget
+    admission_reorder_budget = min(base_reorder_budget,
+                                   throughput_service_horizon(chunk.len))
+                               if latency_sensitive_work_is_active_on_this_path
+                               else base_reorder_budget
 else if path uses the same underlay family as the service_path:
     admission_reorder_budget = base_reorder_budget
 else:
@@ -4660,7 +4993,9 @@ inflight, live carrier credit, and reorder budgets. Admission makes a measured
 Subflow eligible for overflow; it does not displace a feedable Service for the
 next ordinary quantum. With exactly one active direction-relevant reliable
 response flow, an unmeasured candidate cannot use unique `OwnerData` to create
-that evidence.
+that evidence. This response-only exclusion does not disable one sustained
+request/upload stream that satisfies the separate stable-Service and
+fresh-instance gate.
 Once an authoritative lower-flight owner exists, additional same-stream
 `OwnerData` by other candidates is suppressed until that lower frontier clears.
 Contiguous Service-tail debt without an authoritative lower-flight owner is a
@@ -4682,15 +5017,30 @@ ordinary debt-bearing same-family admission and for explicit cross-underlay
 Service migration once the migration policy decides the carrier family may
 change.
 
-For same-underlay startup, every quantum requires a generation-stable session
-count of at least two active direction-relevant reliable response flows and uses
-live carrier credit when available. If the carrier reports an inflight or congestion-window limit, that carrier
+For request/upload, the one selected freshly proven same-underlay Validation
+instance may spend its own startup budget under the same projected-tail and
+candidate-debt envelope. This request exception is disabled on bulk-demand
+demotion, an Active Service key or instance change, loss of Service bulk-rate
+evidence, stale or pre-attachment proof, Validation role or instance change,
+latency/realtime pressure, or authoritative lower debt. It never depends on the
+response-flow count and never changes Service.
+
+For response-side same-underlay startup, every whole frame requires a
+generation-stable session count of at least two active direction-relevant
+reliable response flows. For request-side startup, every whole frame instead
+revalidates sustained Throughput/Background demand and the exact stable Service,
+Validation instance, and post-attachment proof. Both use live carrier credit
+when available. If the carrier reports an inflight or congestion-window limit, that carrier
 limit shapes ETA and emission pacing, but it does not replace the cumulative
-sample budget. Startup Subflow owner credit is capped at
-`max(next_quantum, min(256 KiB, path flight, receiver reorder, repair, stream
-window))` for the entire epoch, and the projected ordering debt must fit the
+sample budget. Each candidate's Startup Subflow owner credit is capped at
+`min(256 KiB, path flight, receiver reorder, repair, stream window)` for the
+entire epoch, and the projected ordering debt must fit the
 same startup product envelope on every dispatch. ACKs release flight but do not
-refill the cumulative cap. The sender MUST NOT replace this cap with a tiny
+refill the cumulative cap. Product frames are not split to fit the cap. After a
+useful request sample exists, a later whole frame larger than the remaining
+credit seals the sample permanently at the actual admitted count, stays on
+Service, and causes its one ordered receipt marker to follow the sealed sample.
+Smaller later frames cannot reopen it. The sender MUST NOT replace this cap with a tiny
 product-rate BDP derived from the default path-open score or from one
 app-limited sample. This follows MPQUIC's per-path congestion-state model: QUIC
 decides packet pacing and packet flight, while mptunnel bounds the amount of
@@ -4743,8 +5093,10 @@ it only supplies the measured baseline for evaluating Subflow candidates. An
 ordinary Subflow may receive OwnerData only when it already has path-scoped
 bulk-rate evidence and its no-worse gates pass. The bounded startup epoch is not
 an implicit Service relabel: its candidate stays Validation and Service ownership
-does not move. The startup candidate is absent from unique-data admission when
-fewer than two direction-relevant reliable response flows are active. If neither
+does not move. A response startup candidate is absent from unique-data admission
+when fewer than two direction-relevant reliable response flows are active. A
+request startup candidate is absent when its sustained-demand, stable-Service,
+fresh-instance, pressure, or debt predicate fails. If neither
 an ordinary candidate nor
 the one startup candidate passes its respective gates, the sender waits; it MUST NOT bypass Service
 admission by relabeling another path as Service.
@@ -4758,9 +5110,37 @@ proof circular and prevents post-proof ping-pong from recreating receive holes.
 Measured Subflows retain their admitted overflow role when Service cannot accept
 the next quantum; this is not periodic OwnerData retention or keepalive
 sampling.
-At the startup cap without graduation, Service feed resumes and the candidate
-stays Probe or Standby for new sends while ACK attribution for already-admitted
-sample ranges remains live.
+At exact startup-cap exhaustion or an irrevocable near-cap seal without
+graduation, Service feed resumes and the candidate stays Probe or Standby for
+new sends while ACK attribution and its one ordered receipt marker remain live.
+For request-side sampling, only explicit graduation after its ordering-owner
+flights release frees the startup slot for a different never-sampled instance;
+cap exhaustion or sealing alone does not rotate through candidates or refill
+credit. After graduation, one exact same-underlay TCP candidate at a time may
+spend its separate, non-refilling service-horizon ACK-clock calibration budget;
+an exhausted calibration candidate blocks the next only until its exact flights
+drain. A
+failed, detached, replaced, or role-changed candidate invalidates the epoch; an
+attached Validation instance that still owns ledger ranges remains visible to
+live-tail repair even after that policy epoch resets.
+For response-side sampling, the current startup key likewise remains exclusive
+until its OwnerData flight drains and canonical bulk proof exists. TCP may use
+unambiguous OwnerData ACK rate; QUIC requires local carrier ACK-derived bulk
+metrics. Graduation retains the measured member and Service key, increments the
+planner generation, and preserves the Service owner. Before another unproven
+response candidate may consume a separate startup sample, one graduated TCP
+candidate at a time may use staged exact-instance ACK-clock calibration. Its
+2 MiB initial cumulative credit never refills; after full stage spend, a
+strictly causal later ACK window whose earliest send follows stage authorization
+may double the authorized cumulative ceiling up to the resource envelope.
+Growth does not wait for rate-publication readiness. Strict windows form one
+byte/raw-time aggregate per stage; only aggregates covering at least half the
+initial credit, 1 MiB by default and resource-clamped, enter the rolling
+five-stage rate estimator. Startup rate remains before three aggregates, then
+the median overwrites the old rate without max-filtering. UDP/QUIC candidates
+skip this product-ACK calibration and continue to use local carrier ACK-derived
+evidence. The serial slot and ordinary proven ownership advance only after the
+TCP calibration candidate's exact flights drain.
 When no live path snapshot exists yet, startup product flight is derived from
 the normal startup path model and lane gain, then capped by the same ceiling.
 Unknown-path startup MUST NOT jump directly to the configured maximum merely
@@ -4880,6 +5260,33 @@ carrier failure still requires carrier close/error evidence, persistent
 data-plane stall evidence, or an explicit failover decision. This prevents the
 MPTCP/MPQUIC anti-pattern where normal multipath reordering is mistaken for a
 dead subflow and creates repeated detach/reopen churn.
+
+Receive-progress replay is transport-specific above the shared product ACK
+format. Once a UDP/QUIC reliable stream has established any receive progress,
+its PTO-derived progress timer MAY resend the current bounded
+`STREAM_ACK`/`STREAM_MAX_DATA` snapshot while the peer remains open; QUIC packet
+recovery does not guarantee that the peer observed this product-ordering state.
+A TCP reliable stream MUST enable periodic progress replay only when a live
+multipath repair alternative exists, and MUST send it only while receiver
+reorder debt remains. Contiguous TCP progress without reorder debt relies on the
+ordinary ACK cadence and idle heartbeat/liveness system. This split preserves
+one product-level recovery protocol without pretending TCP and QUIC have the
+same carrier ACK or congestion behavior.
+
+A complete product ACK whose same first missing offset persists for the
+PTO-derived persistent-gap interval may trigger one gap-repair event only when a
+distinct live repair output exists. The flight ledger determines the exact
+single-copy `OwnerData` owner of the lowest repaired range; the carrier that
+delivered the ACK does not. For a bulk range exactly owned by TCP, the sender
+selects one output distinct from all owners of that range and may repair one
+modeled service flight using the selected output's live rate and RTT, normally
+approximately `2 * BDP`. Outstanding gap debt, repair-cache capacity,
+configured path-flight resources, queue credit, and the selected
+output's capacity cap the event. If the owner is UDP/QUIC, ownership is
+ambiguous, or the lane is latency/realtime, the event remains one ordinary
+adaptive repair quantum. Repeated repair of the same gap is rate-limited by the
+same persistent interval and never creates Service, Subflow, or rate evidence
+for the repair output.
 
 Owner backpressure is a sender wait state, but it is not automatically a
 product-source starvation signal. The backpressure condition for scheduling is
@@ -5362,6 +5769,16 @@ on_stream_ack(stream_id, complete, ranges):
     release_repair_cache_entries_covered_by(ranges)
     release_path_inflight_entries_covered_by(ranges)
     do_not_lower_delivery_rate_from_feedback_only_release_timing()
+    for range in uniquely_proven_owner_ranges:
+        if range.owner.underlay == TCP
+           and exact_live_owner_may_grow_request_window(range.owner):
+            record_request_window_ack_progress(
+                owner=range.owner,
+                bytes=range.byte_count,
+                epoch=stream.exact_live_Active_TCP_instance,
+                interval=stream.exact_live_Active_TCP_instance.PTO)
+    # ACK-carrier identity is irrelevant. Repair, ambiguous, duplicated, and
+    # stale-owner releases never enter uniquely_proven_owner_ranges above.
     epoch = stream.startup_sample_epoch
     if epoch exists:
         if epoch.candidate.underlay == TCP:
@@ -5369,43 +5786,74 @@ on_stream_ack(stream_id, complete, ranges):
                 if range.owner == epoch.candidate:
                     epoch.unambiguous_acked_owner_bytes += range.byte_count
             if epoch.unambiguous_acked_owner_bytes >= tcp_product_evidence_floor(epoch):
-                graduate_candidate_to_measured_subflow_without_changing_service(epoch)
+                mark_candidate_bulk_rate_proven_without_changing_service(epoch)
         else:
             # Product STREAM_ACK timing is not QUIC packet delivery evidence.
             do_not_credit_quic_bulk_rate_evidence_from_product_ack(ranges)
-            # QUIC graduation occurs only in the local carrier-ACK path after
-            # direction-correct, non-app-limited samples satisfy its floor.
+    # Exact cap exhaustion seals at the cap. After a useful sample, a whole
+    # next frame that exceeds remaining credit seals at actual admitted bytes;
+    # that whole next frame stays on Service and smaller frames cannot reopen it.
+    if epoch exists and epoch.request_side
+       and epoch.sample_is_irrevocably_sealed
+       and not epoch.receipt_marker_enqueued:
+        epoch.receipt_marker =
+            enqueue_stream_ordered_path_proof(epoch.exact_candidate_instance)
+    if epoch.receipt_marker has matching validated ACK:
+        sample_elapsed = epoch.receipt_marker.ack_completed_at
+                         - epoch.first_owner_enqueue_at
+        mark_candidate_bulk_rate_proven_without_changing_service(
+            bytes=epoch.sealed_owner_bytes,
+            elapsed=sample_elapsed,
+            provenance=ExactOrderedCarrierStreamReceipt)
     # RepairData and ambiguous/duplicated ACKs are absent from
     # uniquely_proven_owner_ranges and never credit the startup epoch.
+    if epoch exists and epoch.candidate.has_exact_bulk_rate_evidence
+       and no_ordering_owner_flight_remains(epoch.candidate):
+        clear_startup_owner_but_retain_sampled_membership(epoch)
+        # A different never-sampled candidate may now receive its own budget.
     if ack_frontier_advanced_after_tail_repair:
         record_repair_ack_progress_diagnostic_only()
         do_not_mark_repair_path_as_sender_evidence()
         do_not_promote_repair_path_to_active_lifecycle_slot()
-    if active_path_uses_reliable_udp_carrier:
-        if not complete:
-            clear_product_gap_repair_tracker()
-            do_not_schedule_product_repair_from_ack_gap()
-        else if no_multipath_repair_alternative:
-            clear_product_gap_repair_tracker()
-            do_not_schedule_product_repair_from_ack_gap()
-        else:
-            hole = first_unacked_gap_below_largest_acked(ranges)
-            if hole is none:
-                clear_product_gap_repair_tracker()
-            else if hole.start != tracked_first_missing_offset:
-                remember_possible_receive_hole(hole.start)
-            else if hole_start_has_persisted_for_progress_interval(hole.start):
-                holes = unacked_chunks_covered_by_persistent_hole(hole)
-                schedule_repair(holes)
-                rate_limit_repeated_repair_for(hole.start)
-            else:
-                remember_possible_receive_hole(hole.start)
-    else if complete:
-        repair_budget = min(base_repair_budget, sender_extra_traffic_remaining())
-        holes = unacked_chunks_below_largest_acked_not_covered_by(ranges)
-        schedule_repair(holes, repair_budget)
-    else:
+    if not complete:
+        clear_product_gap_repair_tracker()
         do_not_infer_holes_from_omitted_ranges()
+    else if no_multipath_repair_alternative:
+        clear_product_gap_repair_tracker()
+        do_not_schedule_product_repair_from_ack_gap()
+    else:
+        hole = first_unacked_gap_below_largest_acked(ranges)
+        if hole is none:
+            clear_product_gap_repair_tracker()
+        else if hole.start != tracked_first_missing_offset:
+            remember_possible_receive_hole(hole.start)
+        else if hole_start_has_persisted_for_progress_interval(hole.start):
+            holes = unacked_chunks_covered_by_persistent_hole(hole)
+            owner = exact_single_copy_OwnerData_owner(holes.lowest_range)
+            target = select_one_live_output_distinct_from_all_range_owners(holes)
+            if target does not exist:
+                do_not_repair_on_same_or_already_owning_output()
+            else if owner exists and owner.underlay == TCP
+                    and stream.lane is bulk
+                    and target.has_bulk_model_evidence:
+                # modeled_service_flight is approximately 2 * target BDP,
+                # bounded by the selected output's remaining live service
+                # headroom and resource envelope. The scheduled batch remains
+                # bound to this target incarnation during dispatch; detach,
+                # replacement, or repair-timeout cancels the queued remainder
+                # before a later gap replay replans it.
+                repair_limit = min(modeled_service_flight(target),
+                                   holes.byte_count,
+                                   repair_cache_remaining,
+                                   configured_path_flight_remaining,
+                                   target.capacity_remaining)
+            else:
+                repair_limit = ordinary_adaptive_repair_quantum(target)
+            if target exists:
+                schedule_repair(holes, target, repair_limit)
+                rate_limit_repeated_repair_for(hole.start)
+        else:
+            remember_possible_receive_hole(hole.start)
 
 on_tail_stall_repair(stream_id, last_complete_ack_ranges):
     repair_budget = critical_repair_budget(base_repair_budget)
@@ -5471,6 +5919,29 @@ score(path, lane, payload_bytes):
 ### B.4 Bulk Assignment and Striping Admission
 
 ```
+startup_sample_allowed(stream, candidate):
+    if stream.sender_direction == response:
+        direction_allowed =
+            stream.session.active_direction_relevant_reliable_response_flows >= 2
+            and stream.session_load_generation_is_stable
+    else if stream.sender_direction == request:
+        direction_allowed =
+            stream.lane in {Throughput, Background}
+            and stream.local_source_has_continuing_data
+            and stream.service_path is exact live Active attachment instance
+            and stream.service_path.has_bulk_rate_evidence
+            and candidate is exact attached Validation instance
+            and candidate.proof_observation_at >= candidate.attachment_time
+    else:
+        return false
+    return direction_allowed
+       and stream.is_bulk_only
+       and stream.session_has_no_latency_sensitive_or_realtime_work
+       and candidate.role == Validation
+       and candidate.underlay_family == stream.service_path.underlay_family
+       and not candidate.has_bulk_rate_evidence
+       and no_authoritative_lower_debt(stream)
+
 select_bulk_data_path(stream, frame, paths):
     if frame is repair:
         return best_survivor_avoiding_original_path()
@@ -5485,8 +5956,8 @@ select_bulk_data_path(stream, frame, paths):
     candidates = current Service or prospective_Service
                  plus bulk-rate-proven measured Subflows,
                  excluding Repair attachments
-    if session.active_direction_relevant_reliable_response_flows >= 2
-       and stream has an active startup-sampling candidate:
+    if stream has an active startup-sampling candidate
+       and startup_sample_allowed(stream, that candidate):
         candidates += that one Validation candidate
     admitted = []
     for path in candidates:
@@ -5562,6 +6033,9 @@ admission_reorder_budget(stream, path, chunk, role, ordering_debt):
     if role == lead_data_path and ordering_debt == 0:
         return service_owner_envelope(path, chunk)
     if role == lead_data_path:
+        if latency_sensitive_work_is_active_on_this_path:
+            return min(base_reorder_budget(path, chunk),
+                       throughput_service_horizon(chunk.len))
         return base_reorder_budget(path, chunk)
     if role == startup_sample_subflow:
         return startup_product_envelope(stream, chunk)
@@ -5611,8 +6085,7 @@ bulk_admit(stream, path, chunk, role):
             return false
         if not active_startup_epoch_selects(path, chunk):
             return false
-        if not stream.is_bulk_only
-           or stream.session.active_direction_relevant_reliable_response_flows < 2
+        if not startup_sample_allowed(stream, path)
            or not stream.session_has_no_latency_sensitive_or_realtime_work
            or not stream.service_path.is_bulk_only
            or not path.is_bulk_only_eligible:
@@ -5627,7 +6100,7 @@ bulk_admit(stream, path, chunk, role):
             return false
         if has_authoritative_lower_flight_or_repair_debt(stream):
             return false
-        if epoch.cumulative_owner_bytes + chunk.len > epoch.sample_budget:
+        if epoch.candidate.cumulative_owner_bytes + chunk.len > epoch.candidate.sample_budget:
             return false
         if projected_reorder_debt(stream, path, chunk) >
            startup_product_envelope(stream, chunk):
@@ -5672,14 +6145,22 @@ on_validation_open_result(stream, path, result):
 
 on_PATH_PROOF_ACK(path, proof):
     if proof matches a pending proof on that path:
-        sample = byte_counted_delivery_sample(proof.payload_bytes, proof.rtt)
-        record_sender_evidence(path, sample)
+        record_path_proof_observation(path,
+                                      proof.payload_bytes,
+                                      proof.rtt,
+                                      current_attachment_instance,
+                                      now())
+        mark_liveness_and_local_sender_evidence(path)
+        do_not_record_bulk_delivery_or_pacing_rate_from_path_proof()
 
 on_ordered_delivery(stream, path, delivered_bytes):
     account_delivered_bytes(path, delivered_bytes)
     if stream.demand is bulk:
         if path.has_bulk_rate_evidence:
             mark_path_eligible_for_measured_subflow_admission(path)
+            if path is stream.subflow_set.startup_owner
+               and no_ordering_owner_flight_remains(path):
+                clear_startup_owner_but_retain_sampled_membership(stream, path)
         return  # Delivery or graduation never moves the Service owner implicitly.
     if explicit_service_migration_policy_allows(stream, path):
         promote_path_to_active_service(path)
@@ -5698,7 +6179,9 @@ send_product_frame_over_quic(frame, lane):
 on_quic_sender_metrics(path, metrics):
     path_model.update_carrier_evidence(metrics)
     if metrics are direction_correct_non_app_limited_bulk_rate_evidence:
-        graduate_matching_startup_candidate_without_changing_service(path)
+        mark_matching_startup_candidate_bulk_rate_proven_without_changing_service(path)
+        if no_ordering_owner_flight_remains(path):
+            clear_startup_owner_but_retain_sampled_membership(path)
     notify_sender_service_capacity_if_credit_released()
 
 on_quic_connection_closed(path, reason):
@@ -5720,10 +6203,10 @@ receive_product_frame_from_quic():
         notify_sender_service_capacity()
 ```
 
-### B.7 QUIC Stall and Product Repair
+### B.7 Carrier Stall and Product Repair
 
 ```
-on_quic_or_product_stall(path, stream):
+on_carrier_or_product_stall(path, stream):
     if quic_reports_connection_closed_or_path_failed(path):
         mark_path_suspect_for_new_bulk()
     if repair_authoritative_ack_gap_stalls_while_survivor_exists(stream):
@@ -5733,6 +6216,19 @@ on_quic_or_product_stall(path, stream):
     if active_stall_budget_exceeded(path, stream):
         detach_active_work_to_survivor_path()
         cool_failed_active_path_for_data_scheduling()
+
+on_receive_progress_timer(path, stream):
+    if path.underlay == UDP
+       and stream.peer_is_open
+       and (stream.next_receive_offset > 0 or stream.reorder_debt > 0):
+        replay_bounded_STREAM_ACK_and_MAX_DATA_snapshot()
+    else if path.underlay == TCP
+            and stream.peer_is_open
+            and stream.has_live_multipath_repair_alternative
+            and stream.reorder_debt > 0:
+        replay_bounded_STREAM_ACK_and_MAX_DATA_snapshot()
+    else:
+        do_not_use_idle_TCP_heartbeat_as_product_progress()
 
 initial_active_open(path, stream, alternative_exists):
     pto = candidate_pto(path)
@@ -5756,13 +6252,13 @@ recovery_open(path, stream):
 ### B.8 Unified Sender Loop
 
 ```
-startup_sample_budget(stream, next_quantum):
+startup_sample_budget(stream):
     envelope_budget = min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
                           stream.path_flight_envelope,
                           stream.receiver_reorder_envelope,
                           stream.repair_envelope,
                           stream.flow_control_window)
-    return max(next_quantum.len, envelope_budget)
+    return envelope_budget
 
 startup_product_envelope(stream, next_quantum):
     configured = min(stream.path_flight_envelope,
@@ -5791,6 +6287,38 @@ may_start_response_subflow_sample(stream, candidate, next_quantum):
        and projected_reorder_debt(stream, candidate, next_quantum)
            <= startup_product_envelope(stream, next_quantum)
 
+may_start_request_subflow_sample(stream, candidate, next_quantum):
+    return candidate exists
+       and stream.is_request
+       and stream.lane in {Throughput, Background}
+       and stream.local_source_has_continuing_data
+       and stream.is_bulk_only
+       and stream.session_has_no_latency_sensitive_or_realtime_work
+       and stream.service_path is exact live Active attachment instance
+       and stream.service_path.has_bulk_rate_evidence
+       and candidate is exact attached Validation instance
+       and candidate.underlay_family == stream.service_path.underlay_family
+       and candidate.proof_observation_at >= candidate.attachment_time
+       and not candidate.has_bulk_rate_evidence
+       and not stream.subflow_set.has_different_startup_owner
+       and not stream.subflow_set.contains_sampled_instance(candidate)
+       and not has_latency_sensitive_or_realtime_pressure(stream, candidate)
+       and no_authoritative_lower_debt(stream)
+       and no_mature_stale_lower_ordering_owner_flight(stream)
+       and lower_debt_is_empty_or_live_service_contiguous_suffix(stream)
+       and projected_reorder_debt(stream, candidate, next_quantum)
+           <= startup_product_envelope(stream, next_quantum)
+
+plan_response_source_chunk(stream, normal_chunk):
+    residual = exact_active_TCP_response_calibration_remaining_credit(stream)
+    if residual exists and 0 < residual < normal_chunk.len:
+        short_plan = plan_response_owner_path(stream, normal_chunk.prefix(residual))
+        if short_plan carries exact_active_TCP_calibration_commit(stream):
+            return normal_chunk.prefix(residual), short_plan
+        # A non-calibration first pass is not permission to fragment Service.
+        discard(short_plan)
+    return normal_chunk, plan_response_owner_path(stream, normal_chunk)
+
 select_response_owner_path(stream, work):
     epoch = stream.startup_sample_epoch
     if epoch exists:
@@ -5806,20 +6334,117 @@ select_response_owner_path(stream, work):
            or epoch.candidate is detached/failed/not Validation:
             suspend_epoch_sampling_without_refilling_or_owner_transfer(epoch)
             return select_path_by_eta_and_lane(work)
-        sample = split_quantum_to_remaining_epoch_credit(work, epoch)
-        if sample is nonempty
-           and projected_reorder_debt(stream, epoch.candidate, sample)
-               <= startup_product_envelope(stream, sample)
-           and carrier_and_resource_envelopes_allow(epoch.candidate, sample):
-            limit_next_quantum_to(sample.len)
+        remaining = epoch.candidate.sample_budget
+                    - epoch.candidate.cumulative_owner_bytes
+        if work.payload.len <= remaining
+           and projected_reorder_debt(stream, epoch.candidate, work)
+               <= startup_product_envelope(stream, work)
+           and carrier_and_resource_envelopes_allow(epoch.candidate, work):
             return epoch.candidate
-        if epoch.cumulative_owner_bytes >= epoch.sample_budget:
+        if epoch.candidate.cumulative_owner_bytes >= epoch.candidate.sample_budget:
             close_epoch_sampling_and_resume_service_without_owner_transfer(epoch)
+        return stream.service_path if service_admission_allows(work) else no_path
+    calibration = exact_live_graduated_TCP_response_calibration_candidate(stream)
+    if calibration exists:
+        assert stream.service_path did not change
+        if calibration.spent_bytes + work.payload.len
+               <= calibration.authorized_cumulative_ceiling
+           and response_calibration_pressure_debt_and_resource_guards_allow(
+                   stream, calibration, work):
+            reserve_exact_nonrefilling_calibration_credit_with_enqueue_rollback(
+                calibration, work)
+            return calibration as ack_clock_calibration_subflow
+        # Exhaustion does not refill credit or move Service. A strictly causal
+        # later ACK window may double the cumulative ceiling, bounded by the
+        # configured resource envelope; otherwise this stage is terminal.
         return stream.service_path if service_admission_allows(work) else no_path
     candidate = best_same_underlay_validation_candidate_with_sender_evidence(stream)
     if may_start_response_subflow_sample(stream, candidate, work):
         begin_epoch(candidate, startup_sample_budget(stream, work))
         return select_response_owner_path(stream, work)
+    return select_path_by_eta_and_lane(work)
+
+on_exact_TCP_response_owner_ACK(calibration, sample):
+    if sample.is_later_ACK_window
+       and sample.latest_sampled_send_at <= sample.previous_ACK_at
+       and sample.earliest_sampled_send_at >= calibration.stage_authorized_at:
+        calibration.stage_rate_bytes += sample.bytes
+        calibration.stage_rate_elapsed += sample.raw_ACK_to_ACK_elapsed
+        if calibration.spent_bytes >= calibration.authorized_cumulative_ceiling:
+            # Credit authorization is independent from publication readiness.
+            coverage_floor = min(
+                calibration.initial_credit,
+                max(MIN_RATE_SAMPLE_BYTES,
+                    ceil(calibration.initial_credit / 2)))
+            if calibration.stage_rate_bytes >= coverage_floor:
+                aggregate_rate = 8 * calibration.stage_rate_bytes
+                    / max(calibration.stage_rate_elapsed, TIMER_GRANULARITY)
+                append_to_rolling_last_five_stage_rates(
+                    calibration, aggregate_rate)
+                if calibration.stage_rate_count >= 3:
+                    calibrated = median(calibration.rolling_stage_rates)
+                    overwrite_product_progress_and_delivery_rate(
+                        calibration, calibrated)
+                else:
+                    retain_provisional_startup_rate(calibration)
+            reset_current_stage_rate_evidence(calibration)
+            if calibration.authorized_cumulative_ceiling
+                   < calibration.path_flight_repair_reorder_stream_window_ceiling:
+                calibration.authorized_cumulative_ceiling = min(
+                    2 * calibration.authorized_cumulative_ceiling,
+                    calibration.path_flight_repair_reorder_stream_window_ceiling)
+                calibration.stage_authorized_at = sample.acked_at
+            else:
+                calibration.proven = true
+    # ACK release never decreases cumulative spent credit. UDP/QUIC product
+    # ACKs never enter this calibration; their local carrier ACK controller
+    # remains authoritative.
+
+select_request_owner_path(stream, work):
+    set = stream.request_subflow_set
+    candidate = set.startup_owner
+    if candidate exists and candidate.has_bulk_rate_evidence
+       and no_ordering_owner_flight_remains(candidate):
+        clear_startup_owner_but_retain_sampled_membership(set, candidate)
+        candidate = none
+    if candidate exists:
+        if may_start_request_subflow_sample(stream, candidate, work):
+            remaining = candidate.sample_budget - candidate.cumulative_owner_bytes
+            if work.payload.len <= remaining
+               and carrier_and_resource_envelopes_allow(candidate, work):
+                return candidate as startup_sample_subflow
+            if candidate.cumulative_owner_bytes >= useful_rate_sample_bytes
+               and work.payload.len > remaining:
+                irrevocably_seal_sample_at_actual_admitted_bytes(candidate)
+                enqueue_one_ordered_receipt_marker_behind_sealed_sample(candidate)
+                # The whole frame remains ordinary Service work; do not split it.
+                return stream.service_path if service_admission_allows(work) else no_path
+        # Cap, pressure, debt, or stale state never rotates or refills credit.
+        return stream.service_path if service_admission_allows(work) else no_path
+    candidate = best_never_sampled_same_underlay_validation_instance_with_fresh_proof(stream)
+    if may_start_request_subflow_sample(stream, candidate, work):
+        assign_startup_owner(candidate,
+                             startup_sample_budget(stream, work),
+                             retain_membership_after_graduation=true)
+        return select_request_owner_path(stream, work)
+    calibration = exact_live_same_underlay_graduated_TCP_calibration_candidate(stream)
+    if calibration exists:
+        limit = min(throughput_service_horizon(work.payload.len),
+                    configured_path_flight,
+                    configured_repair,
+                    configured_receiver_reorder,
+                    configured_stream_window)
+        if calibration.spent_bytes + work.payload.len <= limit
+           and stable_Active_Service_and_fresh_Validation_proof(stream, calibration)
+           and no_latency_pressure_repair_debt_foreign_owner_or_stale_tail(stream)
+           and carrier_and_resource_envelopes_allow(calibration, work):
+            reserve_nonrefilling_calibration_credit_with_enqueue_rollback(calibration, work)
+            return calibration as ack_clock_calibration_subflow
+        if calibration.spent_bytes + work.payload.len > limit
+           and exact_ordering_owner_flight_remains(calibration):
+            return stream.service_path if service_admission_allows(work) else no_path
+        # A spent calibration tombstone does not block the next eligible exact
+        # Validation instance after all of its flights drain.
     return select_path_by_eta_and_lane(work)
 
 sender_tick():
@@ -5847,15 +6472,17 @@ sender_tick():
                 continue
             path = select_response_owner_path(flow, work)
                    if flow is a response stream
+                   else select_request_owner_path(flow, work)
+                   if flow is a reliable request stream
                    else select_path_by_eta_and_lane(work)
-            work = flow.peek_next_quantum()  # Selection may split to epoch credit.
+            work = flow.peek_next_quantum()  # Product frame identity is stable.
             if no_path(path):
                 record_blocked(flow, "no-eligible-path")
                 continue
-            epoch = flow.startup_sample_epoch
+            startup = active_startup_owner(flow)
             bulk_role = startup_sample_subflow
-                        if epoch exists and path == epoch.candidate
-                           and epoch.sampling_is_open
+                        if startup exists and path == startup.path
+                           and startup.sampling_is_open
                         else ordinary_data_role(path, best_path)
             if work.is_throughput_data()
                and not bulk_admit(flow, path, work, bulk_role):
@@ -5869,9 +6496,9 @@ sender_tick():
             retain_repair_state_if_reliable(frame)
             record_path_flight_if_stream_data(path, frame)
             emit_to_carrier(path, frame)
-            if epoch exists and frame is unique OwnerData
-               and path == epoch.candidate and epoch.sampling_is_open:
-                epoch.cumulative_owner_bytes += frame.payload.len
+            if startup exists and frame is unique OwnerData
+               and path == startup.path and startup.sampling_is_open:
+                startup.cumulative_owner_bytes += frame.payload.len
             charge_sender_queue_and_carrier_state(path, frame)
             record_scheduler_decision(flow, lane, path, frame)
 

@@ -1,6 +1,9 @@
 use super::super::bulk_admission::bulk_service_horizon_payload_bytes;
 use super::*;
 
+const RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW: usize = 5;
+const RESPONSE_ACK_CLOCK_MIN_ROBUST_RATE_SAMPLES: usize = 3;
+
 /// One carrier output attached to a response stream.
 ///
 /// It owns carrier command access and sender-evidence fields for this stream on
@@ -30,6 +33,226 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
     pub(super) entries: Vec<ResponseStreamOutputEntry>,
+    pub(super) ack_clock_calibrations:
+        HashMap<(CarrierPathKey, u64), ResponseAckClockCalibrationState>,
+    pub(super) active_ack_clock_calibration: Option<(CarrierPathKey, u64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ResponseAckClockRateEvidence {
+    pending_bytes: u64,
+    pending_first_sent_at: Instant,
+    pending_last_sent_at: Instant,
+    previous_window_acked_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) enum ResponseAckClockRateEvidenceUpdate {
+    Pending,
+    Proven {
+        sample: Option<PathRateSample>,
+        first_window: bool,
+        earliest_sent_at: Instant,
+        previous_window_acked_at: Option<Instant>,
+        latest_sent_at: Instant,
+    },
+}
+
+impl ResponseAckClockRateEvidence {
+    pub(super) fn new(first_sent_at: Instant) -> Self {
+        Self {
+            pending_bytes: 0,
+            pending_first_sent_at: first_sent_at,
+            pending_last_sent_at: first_sent_at,
+            previous_window_acked_at: None,
+        }
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        bytes: u64,
+        first_sent_at: Instant,
+        last_sent_at: Instant,
+        acked_at: Instant,
+    ) -> ResponseAckClockRateEvidenceUpdate {
+        if self.pending_bytes == 0 {
+            self.pending_first_sent_at = first_sent_at;
+            self.pending_last_sent_at = last_sent_at;
+        } else {
+            self.pending_first_sent_at = self.pending_first_sent_at.min(first_sent_at);
+            self.pending_last_sent_at = self.pending_last_sent_at.max(last_sent_at);
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        if self.pending_bytes < PATH_OPEN_SCORE_BYTES as u64 {
+            return ResponseAckClockRateEvidenceUpdate::Pending;
+        }
+
+        let sample_bytes = self.pending_bytes;
+        let previous_window_acked_at = self.previous_window_acked_at;
+        let first_window = previous_window_acked_at.is_none();
+        let sample_started_at = previous_window_acked_at.unwrap_or(self.pending_first_sent_at);
+        let earliest_sent_at = self.pending_first_sent_at;
+        let latest_sent_at = self.pending_last_sent_at;
+        let ack_clocked = first_window || self.pending_last_sent_at <= sample_started_at;
+        self.pending_bytes = 0;
+        self.previous_window_acked_at = Some(acked_at);
+        let sample = ack_clocked
+            .then(|| {
+                PathRateSample::new(
+                    sample_bytes,
+                    acked_at.saturating_duration_since(sample_started_at),
+                )
+            })
+            .flatten();
+        ResponseAckClockRateEvidenceUpdate::Proven {
+            sample,
+            first_window,
+            earliest_sent_at,
+            previous_window_acked_at,
+            latest_sent_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ResponseAckClockCalibrationState {
+    pub(super) spent_bytes: u64,
+    pub(super) credit_limit_bytes: u64,
+    pub(super) max_limit_bytes: u64,
+    pub(super) rate_evidence: Option<ResponseAckClockRateEvidence>,
+    pub(super) calibrated_rate_bps: Option<f64>,
+    stage_rate_samples_bps: [f64; RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW],
+    stage_rate_sample_count: u8,
+    stage_rate_sample_cursor: u8,
+    pub(super) stage_rate_coverage_floor_bytes: u64,
+    pub(super) stage_rate_evidence_bytes: u64,
+    pub(super) stage_rate_evidence_elapsed: Duration,
+    pub(super) stage_authorized_at: Instant,
+    pub(super) retired: bool,
+    pub(super) proven: bool,
+}
+
+impl ResponseAckClockCalibrationState {
+    pub(super) fn new(initial_limit_bytes: u64, max_limit_bytes: u64) -> Self {
+        let initial_limit_bytes = initial_limit_bytes.min(max_limit_bytes);
+        let max_limit_bytes = if initial_limit_bytes == 0 {
+            0
+        } else {
+            max_limit_bytes.max(initial_limit_bytes)
+        };
+        let stage_rate_coverage_floor_bytes = if initial_limit_bytes == 0 {
+            0
+        } else {
+            initial_limit_bytes
+                .div_ceil(2)
+                .max(MIN_RATE_SAMPLE_BYTES)
+                .min(initial_limit_bytes)
+        };
+        Self {
+            spent_bytes: 0,
+            credit_limit_bytes: initial_limit_bytes,
+            max_limit_bytes,
+            rate_evidence: None,
+            calibrated_rate_bps: None,
+            stage_rate_samples_bps: [0.0; RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW],
+            stage_rate_sample_count: 0,
+            stage_rate_sample_cursor: 0,
+            stage_rate_coverage_floor_bytes,
+            stage_rate_evidence_bytes: 0,
+            stage_rate_evidence_elapsed: Duration::ZERO,
+            stage_authorized_at: Instant::now(),
+            retired: false,
+            proven: false,
+        }
+    }
+
+    pub(super) fn record_ack_clock_sample(
+        &mut self,
+        sample: PathRateSample,
+        earliest_sent_at: Instant,
+        acked_at: Instant,
+    ) -> bool {
+        if self.retired {
+            return false;
+        }
+        if self.spent_bytes < self.credit_limit_bytes || earliest_sent_at < self.stage_authorized_at
+        {
+            if earliest_sent_at >= self.stage_authorized_at {
+                self.stage_rate_evidence_bytes = self
+                    .stage_rate_evidence_bytes
+                    .saturating_add(sample.bytes());
+                self.stage_rate_evidence_elapsed = self
+                    .stage_rate_evidence_elapsed
+                    .saturating_add(sample.elapsed());
+            }
+            return false;
+        }
+        self.stage_rate_evidence_bytes = self
+            .stage_rate_evidence_bytes
+            .saturating_add(sample.bytes());
+        self.stage_rate_evidence_elapsed = self
+            .stage_rate_evidence_elapsed
+            .saturating_add(sample.elapsed());
+        if self.stage_rate_evidence_bytes >= self.stage_rate_coverage_floor_bytes {
+            let aggregate_rate_bps = self.stage_rate_evidence_bytes as f64 * 8.0
+                / self
+                    .stage_rate_evidence_elapsed
+                    .max(QUIC_TIMER_GRANULARITY)
+                    .as_secs_f64();
+            self.record_stage_rate_sample(aggregate_rate_bps);
+        }
+        self.reset_stage_rate_evidence();
+        if self.credit_limit_bytes < self.max_limit_bytes {
+            self.credit_limit_bytes = self
+                .credit_limit_bytes
+                .saturating_mul(2)
+                .min(self.max_limit_bytes);
+            self.stage_authorized_at = acked_at;
+            true
+        } else {
+            self.proven = true;
+            false
+        }
+    }
+
+    fn record_stage_rate_sample(&mut self, sample_bps: f64) {
+        if !sample_bps.is_finite() || sample_bps <= 0.0 {
+            return;
+        }
+        let cursor =
+            usize::from(self.stage_rate_sample_cursor) % RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW;
+        self.stage_rate_samples_bps[cursor] = sample_bps;
+        self.stage_rate_sample_cursor = ((cursor + 1) % RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW) as u8;
+        self.stage_rate_sample_count = self
+            .stage_rate_sample_count
+            .saturating_add(1)
+            .min(RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW as u8);
+
+        let sample_count = usize::from(self.stage_rate_sample_count);
+        if sample_count < RESPONSE_ACK_CLOCK_MIN_ROBUST_RATE_SAMPLES {
+            return;
+        }
+        let mut ordered = self.stage_rate_samples_bps;
+        ordered[..sample_count].sort_by(f64::total_cmp);
+        self.calibrated_rate_bps = Some(if sample_count % 2 == 0 {
+            let upper = sample_count / 2;
+            (ordered[upper - 1] + ordered[upper]) / 2.0
+        } else {
+            ordered[sample_count / 2]
+        });
+    }
+
+    fn reset_stage_rate_evidence(&mut self) {
+        self.stage_rate_evidence_bytes = 0;
+        self.stage_rate_evidence_elapsed = Duration::ZERO;
+    }
+
+    pub(super) fn retire(&mut self) {
+        self.reset_stage_rate_evidence();
+        self.credit_limit_bytes = self.spent_bytes;
+        self.max_limit_bytes = self.spent_bytes;
+        self.retired = true;
+    }
 }
 
 #[derive(Clone)]
@@ -44,6 +267,12 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) is_request_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
+    pub(in crate::runtime) ack_clock_calibration_eligible: bool,
+    pub(in crate::runtime) ack_clock_calibration_proven: bool,
+    pub(in crate::runtime) ack_clock_calibration_spent_bytes: u64,
+    pub(in crate::runtime) ack_clock_calibration_credit_limit_bytes: u64,
+    pub(in crate::runtime) ack_clock_calibration_max_limit_bytes: u64,
+    pub(in crate::runtime) ack_clock_calibration_active: bool,
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -207,6 +436,17 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(super) source: ServerPathMetricsSource,
 }
 
+fn server_output_local_path_metrics(
+    entry: &ResponseStreamOutputEntry,
+) -> Option<ServerPathMetricsEntry> {
+    entry.local_path_metrics.filter(|path_metrics| {
+        path_metrics.source == ServerPathMetricsSource::LocalSender
+            && path_metrics.metrics.direction == PathMetricDirection::ServerToClient
+            && path_metrics.metrics.underlay == entry.key.underlay
+            && path_metrics.metrics.path_id == entry.key.path_id
+    })
+}
+
 impl ResponseStreamOutputs {
     pub(super) fn snapshot_for_key(
         &self,
@@ -333,7 +573,7 @@ pub(super) fn server_bulk_output_snapshot(
     mux_limits: MuxLimits,
     now: Instant,
 ) -> PathSnapshot {
-    let local_carrier_metrics = entry.local_path_metrics;
+    let local_carrier_metrics = server_output_local_path_metrics(entry);
     let peer_hint_metrics = (entry.delivery_samples == 0)
         .then_some(entry.peer_path_metrics)
         .flatten();
@@ -508,7 +748,7 @@ fn confidence_sample_denominator() -> f64 {
 fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) -> f64 {
     let delivery_confidence =
         (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
-    let metric_confidence = match entry.local_path_metrics {
+    let metric_confidence = match server_output_local_path_metrics(entry) {
         Some(ServerPathMetricsEntry {
             source: ServerPathMetricsSource::LocalSender,
             metrics,
@@ -584,7 +824,7 @@ fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry)
             || path_metrics.metrics.confidence_ppm > 0)
 }
 
-pub(in crate::runtime) fn response_subflow_startup_sample_limit_bytes(
+pub(in crate::runtime) fn reliable_subflow_startup_sample_limit_bytes(
     mux_limits: MuxLimits,
 ) -> u64 {
     let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
@@ -605,7 +845,7 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         || entry.delivery_samples > 0
         || entry.delivery_rate_bps.is_some()
         || matches!(
-            entry.local_path_metrics,
+            server_output_local_path_metrics(entry),
             Some(path_metrics) if server_path_metrics_has_sender_evidence(path_metrics)
         )
 }
@@ -614,7 +854,7 @@ pub(in crate::runtime) fn server_output_has_product_bulk_rate_evidence(
     entry: &ResponseStreamOutputEntry,
     mux_limits: MuxLimits,
 ) -> bool {
-    let sample_floor = response_subflow_startup_sample_limit_bytes(mux_limits);
+    let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
     let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
     entry.product_progress_rate_bps.is_some()
         && entry
@@ -635,7 +875,7 @@ pub(in crate::runtime) fn server_output_has_bulk_rate_evidence_with_limits(
     mux_limits: MuxLimits,
 ) -> bool {
     let has_local_carrier_bulk = matches!(
-        entry.local_path_metrics,
+        server_output_local_path_metrics(entry),
         Some(path_metrics) if server_path_metrics_has_bulk_rate_evidence(path_metrics)
     );
     match entry.key.underlay {
@@ -705,6 +945,449 @@ pub(super) fn sender_service_frame_kind(frame: &Frame) -> &'static str {
 mod tests {
     use super::*;
 
+    fn ack_clock_rate_sample(bytes: u64, rate_bps: f64) -> PathRateSample {
+        PathRateSample::new(
+            bytes,
+            Duration::from_secs_f64(bytes as f64 * 8.0 / rate_bps),
+        )
+        .expect("valid ACK-clock rate sample")
+    }
+
+    fn assert_rate_close(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("calibrated rate");
+        let relative_error = (actual - expected).abs() / expected.max(1.0);
+        assert!(
+            relative_error < 1e-6,
+            "expected {expected} bps, got {actual} bps"
+        );
+    }
+
+    #[test]
+    fn response_ack_clock_requires_a_later_window_already_in_flight() {
+        let started_at = Instant::now();
+        let first_acked_at = started_at + Duration::from_millis(100);
+        let mut evidence = ResponseAckClockRateEvidence::new(started_at);
+        assert!(matches!(
+            evidence.observe(
+                PATH_OPEN_SCORE_BYTES as u64,
+                started_at,
+                started_at,
+                first_acked_at,
+            ),
+            ResponseAckClockRateEvidenceUpdate::Proven {
+                sample: Some(_),
+                first_window: true,
+                ..
+            }
+        ));
+
+        let second_acked_at = first_acked_at + Duration::from_millis(20);
+        let second = evidence.observe(
+            PATH_OPEN_SCORE_BYTES as u64,
+            first_acked_at - Duration::from_millis(10),
+            first_acked_at - Duration::from_millis(10),
+            second_acked_at,
+        );
+        let ResponseAckClockRateEvidenceUpdate::Proven {
+            sample: Some(sample),
+            first_window: false,
+            ..
+        } = second
+        else {
+            panic!("a later window already in flight at the previous ACK is ACK-clocked");
+        };
+        assert_eq!(
+            sample.rate_bps(),
+            PathRateSample::new(PATH_OPEN_SCORE_BYTES as u64, Duration::from_millis(20),)
+                .expect("non-zero sample")
+                .rate_bps()
+        );
+
+        let mut app_limited = ResponseAckClockRateEvidence::new(started_at);
+        let _ = app_limited.observe(
+            PATH_OPEN_SCORE_BYTES as u64,
+            started_at,
+            started_at,
+            first_acked_at,
+        );
+        assert!(
+            matches!(
+                app_limited.observe(
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    first_acked_at - Duration::from_millis(1),
+                    first_acked_at + Duration::from_millis(1),
+                    first_acked_at + Duration::from_millis(40),
+                ),
+                ResponseAckClockRateEvidenceUpdate::Proven {
+                    sample: None,
+                    first_window: false,
+                    ..
+                }
+            ),
+            "one pre-ACK send cannot make a mostly post-ACK window causal"
+        );
+    }
+
+    #[test]
+    fn response_ack_clock_credit_requires_fresh_evidence_for_each_stage() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, 4 * initial);
+        let first_stage_at = calibration.stage_authorized_at;
+        let first_growth_at = first_stage_at + Duration::from_millis(100);
+
+        calibration.spent_bytes = initial;
+        let sample =
+            ack_clock_rate_sample(calibration.stage_rate_coverage_floor_bytes, 10_000_000.0);
+        assert!(calibration.record_ack_clock_sample(
+            sample,
+            first_stage_at + Duration::from_millis(1),
+            first_growth_at,
+        ));
+        assert_eq!(calibration.credit_limit_bytes, 2 * initial);
+        assert_eq!(calibration.calibrated_rate_bps, None);
+
+        calibration.spent_bytes = 2 * initial;
+        let stale_sample =
+            ack_clock_rate_sample(calibration.stage_rate_coverage_floor_bytes, 20_000_000.0);
+        assert!(
+            !calibration.record_ack_clock_sample(
+                stale_sample,
+                first_stage_at + Duration::from_millis(2),
+                first_growth_at + Duration::from_millis(10),
+            ),
+            "residual ACKs from the prior stage cannot pre-authorize another stage"
+        );
+        assert_eq!(calibration.credit_limit_bytes, 2 * initial);
+        let second_growth_at = first_growth_at + Duration::from_millis(20);
+        let second_sample =
+            ack_clock_rate_sample(calibration.stage_rate_coverage_floor_bytes, 15_000_000.0);
+        assert!(calibration.record_ack_clock_sample(
+            second_sample,
+            first_growth_at + Duration::from_millis(1),
+            second_growth_at,
+        ));
+        assert_eq!(calibration.credit_limit_bytes, 4 * initial);
+        assert_eq!(calibration.calibrated_rate_bps, None);
+
+        calibration.spent_bytes = 4 * initial;
+        assert!(!calibration.proven);
+        let final_sample =
+            ack_clock_rate_sample(calibration.stage_rate_coverage_floor_bytes, 18_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            final_sample,
+            second_growth_at + Duration::from_millis(1),
+            second_growth_at + Duration::from_millis(20),
+        ));
+        assert!(calibration.proven);
+        assert_rate_close(calibration.calibrated_rate_bps, 15_000_000.0);
+    }
+
+    #[test]
+    fn response_ack_clock_stage_rate_floor_respects_initial_resource_limit() {
+        let zero = ResponseAckClockCalibrationState::new(0, 64 * 1024);
+        assert_eq!(zero.credit_limit_bytes, 0);
+        assert_eq!(zero.max_limit_bytes, 0);
+        assert_eq!(zero.stage_rate_coverage_floor_bytes, 0);
+
+        let exact_floor =
+            ResponseAckClockCalibrationState::new(MIN_RATE_SAMPLE_BYTES, MIN_RATE_SAMPLE_BYTES);
+        assert_eq!(
+            exact_floor.stage_rate_coverage_floor_bytes,
+            MIN_RATE_SAMPLE_BYTES
+        );
+
+        let odd_initial = 2 * MIN_RATE_SAMPLE_BYTES + 1;
+        let odd = ResponseAckClockCalibrationState::new(odd_initial, odd_initial);
+        assert_eq!(odd.stage_rate_coverage_floor_bytes, odd_initial.div_ceil(2));
+
+        let default = ResponseAckClockCalibrationState::new(2 * 1024 * 1024, 64 * 1024 * 1024);
+        assert_eq!(default.stage_rate_coverage_floor_bytes, 1024 * 1024);
+
+        let clamped = ResponseAckClockCalibrationState::new(4 * 1024 * 1024, 1024 * 1024);
+        assert_eq!(clamped.credit_limit_bytes, 1024 * 1024);
+        assert_eq!(clamped.max_limit_bytes, 1024 * 1024);
+        assert_eq!(clamped.stage_rate_coverage_floor_bytes, 512 * 1024);
+    }
+
+    #[test]
+    fn response_ack_clock_stage_rate_aggregates_prefull_windows_and_terminal_tail() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, 2 * initial);
+        let stage_authorized_at = calibration.stage_authorized_at;
+        assert_eq!(calibration.stage_rate_coverage_floor_bytes, 1024 * 1024);
+
+        calibration.spent_bytes = initial - 64 * 1024;
+        let first = ack_clock_rate_sample(512 * 1024, 80_000_000.0);
+        let second = ack_clock_rate_sample(512 * 1024, 40_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            first,
+            stage_authorized_at + Duration::from_millis(1),
+            stage_authorized_at + Duration::from_millis(20),
+        ));
+        assert!(!calibration.record_ack_clock_sample(
+            second,
+            stage_authorized_at + Duration::from_millis(2),
+            stage_authorized_at + Duration::from_millis(40),
+        ));
+
+        calibration.spent_bytes = initial;
+        let tail = ack_clock_rate_sample(64 * 1024, 4_000_000_000.0);
+        assert!(calibration.record_ack_clock_sample(
+            tail,
+            stage_authorized_at + Duration::from_millis(3),
+            stage_authorized_at + Duration::from_millis(50),
+        ));
+
+        let aggregate_bytes = first.bytes() + second.bytes() + tail.bytes();
+        let aggregate_elapsed = first
+            .elapsed()
+            .saturating_add(second.elapsed())
+            .saturating_add(tail.elapsed());
+        let expected_rate = aggregate_bytes as f64 * 8.0 / aggregate_elapsed.as_secs_f64();
+        assert_eq!(calibration.stage_rate_sample_count, 1);
+        assert_rate_close(Some(calibration.stage_rate_samples_bps[0]), expected_rate);
+        assert!(calibration.stage_rate_samples_bps[0] < 100_000_000.0);
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+        assert_eq!(calibration.stage_rate_evidence_elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn response_ack_clock_stage_rate_is_invariant_to_submillisecond_ack_partitioning() {
+        let initial = 2 * 1024 * 1024;
+        let mut partitioned = ResponseAckClockCalibrationState::new(initial, 2 * initial);
+        let partitioned_stage_at = partitioned.stage_authorized_at;
+        partitioned.spent_bytes = initial - 1;
+        for index in 0..3 {
+            let sample = PathRateSample::new(256 * 1024, Duration::from_micros(250))
+                .expect("partitioned rate sample");
+            assert!(!partitioned.record_ack_clock_sample(
+                sample,
+                partitioned_stage_at + Duration::from_millis(index + 1),
+                partitioned_stage_at + Duration::from_millis(index + 2),
+            ));
+        }
+        partitioned.spent_bytes = initial;
+        let final_partition = PathRateSample::new(256 * 1024, Duration::from_micros(250))
+            .expect("final partitioned rate sample");
+        assert!(partitioned.record_ack_clock_sample(
+            final_partition,
+            partitioned_stage_at + Duration::from_millis(4),
+            partitioned_stage_at + Duration::from_millis(5),
+        ));
+
+        let mut combined = ResponseAckClockCalibrationState::new(initial, 2 * initial);
+        let combined_stage_at = combined.stage_authorized_at;
+        combined.spent_bytes = initial;
+        let combined_sample = PathRateSample::new(1024 * 1024, Duration::from_millis(1))
+            .expect("combined rate sample");
+        assert!(combined.record_ack_clock_sample(
+            combined_sample,
+            combined_stage_at + Duration::from_millis(1),
+            combined_stage_at + Duration::from_millis(2),
+        ));
+
+        assert_rate_close(
+            Some(partitioned.stage_rate_samples_bps[0]),
+            combined.stage_rate_samples_bps[0],
+        );
+        assert_rate_close(Some(partitioned.stage_rate_samples_bps[0]), 8_388_608_000.0);
+    }
+
+    #[test]
+    fn response_ack_clock_low_coverage_still_proves_without_publishing_rate() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, initial);
+        let stage_authorized_at = calibration.stage_authorized_at;
+        calibration.spent_bytes = initial;
+
+        let tail = ack_clock_rate_sample(64 * 1024, 1_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            tail,
+            stage_authorized_at + Duration::from_millis(1),
+            stage_authorized_at + Duration::from_millis(100),
+        ));
+
+        assert!(calibration.proven);
+        assert_eq!(calibration.stage_rate_sample_count, 0);
+        assert_eq!(calibration.calibrated_rate_bps, None);
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+        assert_eq!(calibration.stage_rate_evidence_elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn response_ack_clock_low_coverage_stage_cannot_contaminate_next_publication() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, 2 * initial);
+        let first_stage_at = calibration.stage_authorized_at;
+        calibration.spent_bytes = initial;
+
+        let uncovered = ack_clock_rate_sample(64 * 1024, 1_000_000.0);
+        let second_stage_at = first_stage_at + Duration::from_millis(100);
+        assert!(calibration.record_ack_clock_sample(
+            uncovered,
+            first_stage_at + Duration::from_millis(1),
+            second_stage_at,
+        ));
+        assert_eq!(calibration.stage_rate_sample_count, 0);
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+
+        calibration.spent_bytes = calibration.credit_limit_bytes - 64 * 1024;
+        let covered = ack_clock_rate_sample(1024 * 1024, 40_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            covered,
+            second_stage_at + Duration::from_millis(1),
+            second_stage_at + Duration::from_millis(40),
+        ));
+        calibration.spent_bytes = calibration.credit_limit_bytes;
+        let terminal = ack_clock_rate_sample(64 * 1024, 40_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            terminal,
+            second_stage_at + Duration::from_millis(2),
+            second_stage_at + Duration::from_millis(60),
+        ));
+
+        assert!(calibration.proven);
+        assert_eq!(calibration.stage_rate_sample_count, 1);
+        assert_rate_close(Some(calibration.stage_rate_samples_bps[0]), 40_000_000.0);
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+        assert_eq!(calibration.stage_rate_evidence_elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn response_ack_clock_stage_transition_drops_low_coverage_and_rejects_stale_windows() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, 2 * initial);
+        let first_stage_at = calibration.stage_authorized_at;
+        calibration.spent_bytes = initial - 64 * 1024;
+        let partial = ack_clock_rate_sample(512 * 1024, 20_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            partial,
+            first_stage_at + Duration::from_millis(1),
+            first_stage_at + Duration::from_millis(20),
+        ));
+
+        calibration.spent_bytes = initial;
+        let first_growth_at = first_stage_at + Duration::from_millis(100);
+        let tail = ack_clock_rate_sample(64 * 1024, 20_000_000.0);
+        assert!(calibration.record_ack_clock_sample(
+            tail,
+            first_stage_at + Duration::from_millis(2),
+            first_growth_at,
+        ));
+        assert_eq!(calibration.stage_rate_sample_count, 0);
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+
+        calibration.spent_bytes = calibration.credit_limit_bytes;
+        let stale = ack_clock_rate_sample(1024 * 1024, 20_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            stale,
+            first_stage_at + Duration::from_millis(3),
+            first_growth_at + Duration::from_millis(20),
+        ));
+        assert_eq!(calibration.credit_limit_bytes, 2 * initial);
+        assert!(!calibration.proven);
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+
+        calibration.spent_bytes = initial;
+        let fresh_partial = ack_clock_rate_sample(512 * 1024, 20_000_000.0);
+        assert!(!calibration.record_ack_clock_sample(
+            fresh_partial,
+            first_growth_at + Duration::from_millis(1),
+            first_growth_at + Duration::from_millis(40),
+        ));
+        assert_eq!(calibration.stage_rate_evidence_bytes, 512 * 1024);
+        calibration.retire();
+        assert_eq!(calibration.stage_rate_evidence_bytes, 0);
+        assert_eq!(calibration.stage_rate_evidence_elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn response_ack_clock_rate_uses_stage_median_instead_of_compressed_ack_peak() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, 32 * initial);
+        let stage_samples = [
+            65_000_000.0,
+            51_000_000.0,
+            73_000_000.0,
+            1_740_000_000.0,
+            150_000_000.0,
+        ];
+
+        for sample_bps in stage_samples {
+            calibration.spent_bytes = calibration.credit_limit_bytes;
+            let stage_authorized_at = calibration.stage_authorized_at;
+            let sample =
+                ack_clock_rate_sample(calibration.stage_rate_coverage_floor_bytes, sample_bps);
+            assert!(calibration.record_ack_clock_sample(
+                sample,
+                stage_authorized_at + Duration::from_millis(1),
+                stage_authorized_at + Duration::from_millis(10),
+            ));
+        }
+
+        assert_eq!(calibration.credit_limit_bytes, 32 * initial);
+        assert_rate_close(calibration.calibrated_rate_bps, 73_000_000.0);
+    }
+
+    #[test]
+    fn response_ack_clock_stage_median_matches_v17_stable_path_samples() {
+        let initial = 2 * 1024 * 1024;
+        let mut calibration = ResponseAckClockCalibrationState::new(initial, 32 * initial);
+        for sample_bps in [
+            61_220_000.0,
+            16_150_000.0,
+            104_389_000.0,
+            100_043_000.0,
+            93_317_000.0,
+            103_199_000.0,
+        ] {
+            calibration.spent_bytes = calibration.credit_limit_bytes;
+            let stage_authorized_at = calibration.stage_authorized_at;
+            let sample =
+                ack_clock_rate_sample(calibration.stage_rate_coverage_floor_bytes, sample_bps);
+            let _ = calibration.record_ack_clock_sample(
+                sample,
+                stage_authorized_at + Duration::from_millis(1),
+                stage_authorized_at + Duration::from_millis(10),
+            );
+        }
+        assert_rate_close(calibration.calibrated_rate_bps, 100_043_000.0);
+    }
+
+    #[test]
+    fn response_ack_clock_stage_ring_is_not_a_monotonic_peak_filter() {
+        let mut calibration = ResponseAckClockCalibrationState::new(1, 1);
+        for sample_bps in [10.0, 20.0, 30.0, 40.0, 50.0] {
+            calibration.record_stage_rate_sample(sample_bps);
+        }
+        assert_eq!(calibration.calibrated_rate_bps, Some(30.0));
+        calibration.record_stage_rate_sample(100.0);
+        assert_eq!(calibration.calibrated_rate_bps, Some(40.0));
+        for sample_bps in [5.0, 1.0, 2.0] {
+            calibration.record_stage_rate_sample(sample_bps);
+        }
+        assert_eq!(calibration.calibrated_rate_bps, Some(5.0));
+    }
+
+    #[test]
+    fn retired_response_ack_clock_state_cannot_publish_later_generic_acks() {
+        let mut calibration = ResponseAckClockCalibrationState::new(1024, 4096);
+        calibration.spent_bytes = 1024;
+        calibration.retire();
+        let stage_authorized_at = calibration.stage_authorized_at;
+        let sample = ack_clock_rate_sample(MIN_RATE_SAMPLE_BYTES, 7_000_000_000.0);
+
+        assert!(!calibration.record_ack_clock_sample(
+            sample,
+            stage_authorized_at + Duration::from_millis(1),
+            stage_authorized_at + Duration::from_millis(10),
+        ));
+        assert_eq!(calibration.calibrated_rate_bps, None);
+        assert!(!calibration.proven);
+        assert_eq!(calibration.credit_limit_bytes, calibration.spent_bytes);
+        assert_eq!(calibration.max_limit_bytes, calibration.spent_bytes);
+    }
+
     #[test]
     fn udp_product_ack_without_unique_owner_rate_is_sender_evidence_not_bulk_rate() {
         let (commands, _receivers) = reliable_path_command_channels(8);
@@ -759,7 +1442,7 @@ mod tests {
             delivery_rate_bps: None,
             srtt_ms: None,
             delivery_samples: 1,
-            owner_data_acked_bytes: response_subflow_startup_sample_limit_bytes(
+            owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(
                 MuxLimits::default(),
             ),
             last_delivery_at: Some(Instant::now()),
@@ -819,7 +1502,7 @@ mod tests {
     #[test]
     fn one_owner_quantum_is_sender_evidence_but_not_bulk_rate_proof() {
         let mux_limits = MuxLimits::default();
-        let sample_floor = response_subflow_startup_sample_limit_bytes(mux_limits);
+        let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
         assert!(sample_floor > BBR_MAX_SEND_QUANTUM_BYTES as u64);
 
         for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
@@ -849,6 +1532,98 @@ mod tests {
             assert!(
                 !server_output_has_bulk_rate_evidence_with_limits(&entry, mux_limits),
                 "{underlay:?} must not graduate from one application-limited OwnerData quantum"
+            );
+        }
+    }
+
+    #[test]
+    fn local_carrier_bulk_evidence_requires_response_direction_and_exact_path_identity() {
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(21),
+        };
+        let metrics = PathMetrics {
+            path_id: key.path_id,
+            underlay: key.underlay,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 20_000,
+            srtt_us: 20_000,
+            rttvar_us: 1_000,
+            jitter_us: 1_000,
+            delivery_rate_bps: 200_000_000,
+            pacing_rate_bps: 200_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
+            queue_bytes: 0,
+            inflight_limit_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+            inflight_hi_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+            confidence_ppm: 1_000_000,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 32,
+            data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+        };
+        let entry_with_metrics = |metrics| {
+            let (commands, _receivers) = reliable_path_command_channels(8);
+            ResponseStreamOutputEntry {
+                key,
+                path_instance_id: next_server_carrier_path_instance_id(),
+                incarnation: 1,
+                commands,
+                role: StreamOpenRole::Validation,
+                bytes_in_flight: 0,
+                product_queue_bytes: 0,
+                product_progress_rate_bps: None,
+                delivery_rate_bps: None,
+                srtt_ms: None,
+                delivery_samples: 0,
+                owner_data_acked_bytes: 0,
+                last_delivery_at: None,
+                local_path_metrics: Some(ServerPathMetricsEntry {
+                    source: ServerPathMetricsSource::LocalSender,
+                    metrics,
+                }),
+                peer_path_metrics: None,
+            }
+        };
+
+        assert!(server_output_has_bulk_rate_evidence(&entry_with_metrics(
+            metrics
+        )));
+        for invalid in [
+            PathMetrics {
+                direction: PathMetricDirection::ClientToServer,
+                ..metrics
+            },
+            PathMetrics {
+                underlay: UnderlayProtocol::Tcp,
+                ..metrics
+            },
+            PathMetrics {
+                path_id: PathId(key.path_id.0 + 1),
+                ..metrics
+            },
+        ] {
+            let entry = entry_with_metrics(invalid);
+            assert!(!server_output_has_sender_evidence(&entry));
+            assert!(!server_output_has_bulk_rate_evidence(&entry));
+            let snapshot = server_bulk_output_snapshot(
+                &entry,
+                SessionId(79),
+                FlowLane::Throughput,
+                &ServerPathLaneTracker::default(),
+                MuxLimits::default(),
+                Instant::now(),
+            );
+            assert_eq!(
+                snapshot.delivery_rate_bps,
+                default_path_rate_bps(key.underlay),
+                "foreign carrier metrics must not influence the response path model"
             );
         }
     }
@@ -1264,7 +2039,7 @@ mod tests {
             delivery_rate_bps: Some(prior_rate / 10.0),
             srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-            owner_data_acked_bytes: response_subflow_startup_sample_limit_bytes(
+            owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(
                 MuxLimits::default(),
             ),
             last_delivery_at: Some(Instant::now()),

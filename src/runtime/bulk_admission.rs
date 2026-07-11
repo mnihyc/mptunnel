@@ -1,6 +1,6 @@
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
-use super::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
+use super::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
@@ -149,6 +149,28 @@ pub(super) fn bulk_service_horizon_payload_bytes(
         .sqrt()
         .round() as usize;
     horizon.clamp(service_payload, envelope)
+}
+
+pub(super) fn reliable_ack_clock_calibration_limit_bytes(mux_limits: MuxLimits) -> u64 {
+    let resource_ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
+    if resource_ceiling == 0 {
+        return 0;
+    }
+    let service_horizon =
+        bulk_service_horizon_payload_bytes(BBR_MAX_SEND_QUANTUM_BYTES, mux_limits) as u64;
+    service_horizon.min(resource_ceiling)
+}
+
+pub(super) fn reliable_ack_clock_calibration_ceiling_bytes(mux_limits: MuxLimits) -> u64 {
+    let resource_ceiling = (mux_limits.max_path_flight_bytes as u64)
+        .min(mux_limits.max_repair_bytes as u64)
+        .min(mux_limits.max_reorder_bytes as u64)
+        .min(mux_limits.max_stream_window_bytes);
+    if resource_ceiling < PATH_OPEN_SCORE_BYTES as u64 {
+        0
+    } else {
+        resource_ceiling
+    }
 }
 
 pub(super) fn bulk_service_product_envelope_payload_bytes(
@@ -638,7 +660,9 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
         }
         BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
             let reorder_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
-            if stream_ordering_debt_bytes > 0 {
+            if stream_ordering_debt_bytes > 0
+                && bulk_active_role_has_latency_pressure(candidate, role)
+            {
                 let service_horizon =
                     bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
                 return reorder_budget.min(service_horizon.max(payload_bytes as u64));
@@ -1749,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn active_lower_frontier_owner_uses_service_horizon_when_debt_exists() {
+    fn active_lower_frontier_owner_uses_adaptive_reorder_budget_without_latency_pressure() {
         let active = candidate(0, 100.0, 170.0, 500.0);
         let payload = 64 * 1024;
         let mux_limits = MuxLimits::default();
@@ -1766,7 +1790,32 @@ mod tests {
                 role: BulkAdmissionRole::ActiveDataPath,
                 stream_ordering_debt_bytes: service_horizon.saturating_add(payload as u64),
             },),
-            Some("reorder_budget")
+            None,
+            "bulk-only lower-frontier progress should use the adaptive BDP budget instead of stalling at the geometric Service horizon"
+        );
+    }
+
+    #[test]
+    fn latency_pressured_lower_frontier_owner_keeps_preemptible_service_horizon() {
+        let mut active = candidate(0, 100.0, 170.0, 500.0);
+        active.snapshot.active_latency_sensitive_flows = 1;
+        let payload = 64 * 1024;
+        let mux_limits = MuxLimits::default();
+        let service_horizon = bulk_service_horizon_payload_bytes(payload, mux_limits) as u64;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: active.snapshot,
+                best_eta_ms: active.eta_ms,
+                candidate_snapshot: active.snapshot,
+                candidate_eta_ms: active.eta_ms,
+                payload_bytes: payload,
+                mux_limits,
+                role: BulkAdmissionRole::ActiveDataPath,
+                stream_ordering_debt_bytes: service_horizon.saturating_add(payload as u64),
+            },),
+            Some("reorder_budget"),
+            "latency pressure must retain the bounded preemptible Service horizon"
         );
     }
 
@@ -2217,5 +2266,34 @@ mod tests {
 
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].key.index, 0);
+    }
+
+    #[test]
+    fn ack_clock_calibration_never_raises_a_configured_resource_ceiling() {
+        let below_sample_floor = MuxLimits {
+            max_path_flight_bytes: PATH_OPEN_SCORE_BYTES - 1,
+            ..MuxLimits::default()
+        };
+        assert_eq!(
+            reliable_ack_clock_calibration_ceiling_bytes(below_sample_floor),
+            0
+        );
+        assert_eq!(
+            reliable_ack_clock_calibration_limit_bytes(below_sample_floor),
+            0
+        );
+
+        let exact_sample_floor = MuxLimits {
+            max_path_flight_bytes: PATH_OPEN_SCORE_BYTES,
+            ..MuxLimits::default()
+        };
+        assert_eq!(
+            reliable_ack_clock_calibration_ceiling_bytes(exact_sample_floor),
+            PATH_OPEN_SCORE_BYTES as u64
+        );
+        assert_eq!(
+            reliable_ack_clock_calibration_limit_bytes(exact_sample_floor),
+            PATH_OPEN_SCORE_BYTES as u64
+        );
     }
 }

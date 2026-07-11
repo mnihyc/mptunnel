@@ -5,8 +5,10 @@ static NEXT_PATH_PROOF_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PathProofObservation {
+    pub(super) proof_id: u64,
     pub(super) bytes: u64,
     pub(super) elapsed: Duration,
+    pub(super) sent_at: Instant,
 }
 
 #[derive(Default)]
@@ -37,6 +39,17 @@ impl PathProofTracker {
                 sent_at: Instant::now(),
             },
         );
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_proof_tracker",
+            format_args!(
+                "phase=sent path_id={} proof_id={} payload_bytes={} pending={}",
+                path_id.0,
+                proof_id,
+                bytes,
+                self.pending.len(),
+            ),
+        );
     }
 
     pub(super) fn acknowledge(
@@ -45,22 +58,52 @@ impl PathProofTracker {
         proof_id: u64,
         payload_bytes: u32,
     ) -> Option<PathProofObservation> {
-        let pending = self.pending.remove(&(path_id, proof_id))?;
+        let Some(pending) = self.pending.remove(&(path_id, proof_id)) else {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "path_proof_tracker",
+                format_args!(
+                    "phase=ack_miss path_id={} proof_id={} payload_bytes={} pending={}",
+                    path_id.0,
+                    proof_id,
+                    payload_bytes,
+                    self.pending.len(),
+                ),
+            );
+            return None;
+        };
         let bytes = pending.bytes.min(payload_bytes);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_proof_tracker",
+            format_args!(
+                "phase=ack path_id={} proof_id={} payload_bytes={} acknowledged_bytes={} elapsed_us={} pending={}",
+                path_id.0,
+                proof_id,
+                payload_bytes,
+                bytes,
+                pending.sent_at.elapsed().as_micros(),
+                self.pending.len(),
+            ),
+        );
         (bytes > 0).then_some(PathProofObservation {
+            proof_id,
             bytes: u64::from(bytes),
             elapsed: pending.sent_at.elapsed(),
+            sent_at: pending.sent_at,
         })
     }
 }
 
-pub(super) fn path_proof_data_frame(path_id: PathId, mux_limits: MuxLimits) -> Frame {
+fn allocated_path_proof_data_frame(path_id: PathId, mux_limits: MuxLimits) -> (u64, Frame) {
     let payload_bytes = path_proof_payload_bytes(mux_limits);
-    Frame::PathProofData {
+    let proof_id = NEXT_PATH_PROOF_ID.fetch_add(1, Ordering::Relaxed);
+    let frame = Frame::PathProofData {
         path_id,
-        proof_id: NEXT_PATH_PROOF_ID.fetch_add(1, Ordering::Relaxed),
+        proof_id,
         payload: Bytes::from(vec![0u8; payload_bytes]),
-    }
+    };
+    (proof_id, frame)
 }
 
 pub(super) fn path_proof_ack_frame(path_id: PathId, proof_id: u64, payload_len: usize) -> Frame {
@@ -75,11 +118,21 @@ pub(super) fn enqueue_path_proof_frame(
     commands: &ReliablePathCommandSender,
     path_id: PathId,
     mux_limits: MuxLimits,
-) -> Result<(), RuntimeError> {
-    commands.try_enqueue_admitted_frame(
-        path_proof_data_frame(path_id, mux_limits),
-        FlowLane::Control,
-    )
+) -> Result<u64, RuntimeError> {
+    let (proof_id, frame) = allocated_path_proof_data_frame(path_id, mux_limits);
+    commands.try_enqueue_admitted_frame(frame, FlowLane::Control)?;
+    Ok(proof_id)
+}
+
+pub(super) fn enqueue_stream_ordered_path_proof_frame(
+    commands: &ReliablePathCommandSender,
+    path_id: PathId,
+    mux_limits: MuxLimits,
+    lane: FlowLane,
+) -> Result<u64, RuntimeError> {
+    let (proof_id, frame) = allocated_path_proof_data_frame(path_id, mux_limits);
+    commands.try_enqueue_stream_ordered_frame(frame, lane)?;
+    Ok(proof_id)
 }
 
 pub(super) fn path_proof_metrics(

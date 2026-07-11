@@ -181,6 +181,7 @@ fn reliable_flow_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
 pub(super) struct ReliableRelayFlowDecision {
     pub(super) demand: FlowDemand,
     pub(super) previous_lane: FlowLane,
+    #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
     pub(super) promoted_to_throughput: bool,
     pub(super) rebalance_due: bool,
     pub(super) prevalidate_bulk: bool,

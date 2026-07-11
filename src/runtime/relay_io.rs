@@ -370,8 +370,21 @@ impl ReliableAckGapRepairProgress {
         }) {
             return false;
         }
-        self.last_repair_at = Some(now);
         true
+    }
+
+    pub(super) fn record_repair_queued(&mut self) {
+        self.record_repair_queued_at(Instant::now());
+    }
+
+    fn record_repair_queued_at(&mut self, now: Instant) {
+        if self.first_gap_start.is_some() {
+            self.last_repair_at = Some(now);
+        }
+    }
+
+    pub(super) fn release_repair_attempt(&mut self) {
+        self.last_repair_at = None;
     }
 
     fn clear(&mut self) {
@@ -635,8 +648,23 @@ pub(super) fn enqueue_tcp_recv_progress(
 pub(super) fn reliable_relay_recv_progress_resend_active(
     recv_stream: &ReliableRecvStream,
     remote_open: bool,
+    active_underlay: Option<UnderlayProtocol>,
 ) -> bool {
-    remote_open && (recv_stream.next_offset() > 0 || recv_stream.reorder_bytes() > 0)
+    remote_open
+        && match active_underlay {
+            Some(UnderlayProtocol::Udp) => {
+                recv_stream.next_offset() > 0 || recv_stream.reorder_bytes() > 0
+            }
+            Some(UnderlayProtocol::Tcp) => recv_stream.reorder_bytes() > 0,
+            None => false,
+        }
+}
+
+fn reliable_relay_recv_progress_timer_enabled(
+    initial_underlay: UnderlayProtocol,
+    has_multipath_repair_alternative: bool,
+) -> bool {
+    initial_underlay == UnderlayProtocol::Udp || has_multipath_repair_alternative
 }
 
 pub(super) fn reliable_stream_recv_progress_interval(
@@ -984,6 +1012,37 @@ pub(super) fn reliable_critical_tail_repair_limit_bytes(
     repair_debt_bytes
         .min(event_repair_limit.max(1))
         .min(resource_cap)
+}
+
+pub(super) fn reliable_persistent_ack_gap_repair_limit_bytes(
+    path: Option<PathSnapshot>,
+    owner_underlay: Option<UnderlayProtocol>,
+    lane: FlowLane,
+    repair_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let event_limit = adaptive_reliable_relay_repair_bytes(path, lane, mux_limits);
+    let event_limit = if owner_underlay == Some(UnderlayProtocol::Tcp) && relay_lane_is_bulk(lane) {
+        // A complete ACK with the same cross-carrier hole for three PTOs is
+        // stronger evidence than ordinary packet loss. Repair one modeled
+        // service flight so a dead TCP owner cannot advance a 64 MiB product
+        // frontier one 64 KiB quantum per proof interval.
+        let service_flight = adaptive_reliable_relay_inflight_bytes(path, lane, mux_limits);
+        let existing_service_debt = path.map_or(0, |snapshot| {
+            snapshot
+                .product_bytes_in_flight
+                .max(snapshot.product_queue_bytes)
+                .max(snapshot.queue_bytes)
+                .min(usize::MAX as u64) as usize
+        });
+        service_flight.saturating_sub(existing_service_debt)
+    } else {
+        event_limit
+    };
+    if event_limit == 0 {
+        return 0;
+    }
+    reliable_critical_tail_repair_limit_bytes(event_limit, repair_debt_bytes, mux_limits)
 }
 
 pub(super) fn reliable_critical_tail_repair_is_over_budget(
@@ -1861,9 +1920,14 @@ where
             relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
                 .min(path_stream.max_frame_payload_bytes),
         );
+        let request_active_path_snapshot = path_stream.request_active_path_snapshot(relay_lane);
+        let request_active_underlay = request_active_path_snapshot
+            .map(|snapshot| snapshot.underlay)
+            .or_else(|| path_stream.request_active_underlay())
+            .unwrap_or(path_stream.underlay);
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at
-                + reliable_stream_recv_progress_interval(send_path_snapshot, relay_lane),
+                + reliable_stream_recv_progress_interval(request_active_path_snapshot, relay_lane),
         );
         let has_tail_repair_alternative = path_stream.has_multipath_repair_alternative();
         let failed_owner_tail_repair_candidate = path_stream.can_attempt_failed_owner_tail_repair()
@@ -2013,6 +2077,10 @@ where
         }
         let now = tokio::time::Instant::now();
         response_sender.discard_unusable_live_owner_tail_repairs(&path_stream);
+        if response_sender.discard_stale_persistent_ack_gap_repairs(&path_stream) > 0 {
+            ack_gap_repair.release_repair_attempt();
+            response_sender_retry_at = None;
+        }
         if response_sender_retry_at.is_some_and(|deadline| deadline <= now) {
             response_sender_retry_at = None;
         }
@@ -2219,28 +2287,59 @@ where
                             last_send_ack_progress_at = Instant::now();
                             last_tail_repair_at = last_send_ack_progress_at;
                         }
-                        let base_repair_limit =
-                            adaptive_reliable_relay_repair_bytes(None, relay_lane, mux_limits);
+                        let base_repair_limit = adaptive_reliable_relay_repair_bytes(
+                            send_path_snapshot,
+                            relay_lane,
+                            mux_limits,
+                        );
                         let repair_event_budget =
                             response_sender.repair_extra_event_budget_remaining(mux_limits);
                         let has_multipath_repair_alternative =
                             path_stream.has_multipath_repair_alternative();
+                        let repair_owner_underlay = path_stream
+                            .tail_repair_owner_underlay(last_send_ack_frontier);
                         let ack_gap_repair_ready = ack_gap_repair.repair_ready(
                             complete,
                             &normalized_ranges,
-                            Some(path_stream.underlay),
+                            repair_owner_underlay,
                             has_multipath_repair_alternative,
-                            None,
+                            tail_repair_path_snapshot,
                             relay_lane,
                         );
+                        let repair_target = ack_gap_repair_ready
+                            .then(|| {
+                                response_sender.ack_gap_repair_path_snapshot(
+                                    &path_stream,
+                                    &send_stream,
+                                    &normalized_ranges,
+                                    base_repair_limit,
+                                )
+                            })
+                            .flatten();
+                        let repair_path = repair_target.map(|(_, snapshot)| snapshot);
                         let repair_limit = if ack_gap_repair_ready {
-                            reliable_critical_tail_repair_limit_bytes(
-                                base_repair_limit,
+                            reliable_persistent_ack_gap_repair_limit_bytes(
+                                repair_path,
+                                repair_path.and(repair_owner_underlay),
+                                relay_lane,
                                 send_stream.repair_bytes(),
                                 mux_limits,
                             )
                         } else {
                             base_repair_limit.min(repair_event_budget)
+                        };
+                        let amplified_ack_gap_repair = ack_gap_repair_ready
+                            && repair_limit > base_repair_limit;
+                        let ack_gap_repair_cause = if amplified_ack_gap_repair {
+                            let (target, snapshot) = repair_target
+                                .expect("amplified repair requires a modeled output");
+                            RelaySendCause::persistent_server_ack_gap_repair(
+                                target,
+                                snapshot,
+                                relay_lane,
+                            )
+                        } else {
+                            RelaySendCause::AckGapRepair
                         };
                         let mut repair_frames = stream_ack_gap_repair_frames_normalized(
                             &send_stream,
@@ -2333,11 +2432,13 @@ where
                                 performance.extra_traffic_hint_percent,
                             ),
                         );
+                        let mut queued_persistent_ack_gap_repair = false;
                         for frame in repair_frames {
                             let queued = if path_stream.has_recent_live_repair_flight_overlap(
                                 &frame,
                                 live_repair_retry_after,
-                            ) {
+                            ) || response_sender.has_queued_repair_overlap(&frame)
+                            {
                                 false
                             } else if critical_tail_repair {
                                 if repair_kind == "fin_tail" {
@@ -2345,7 +2446,10 @@ where
                                         .enqueue_critical_tail_repair_frame(frame)
                                         .is_some()
                                 } else {
-                                    response_sender.enqueue_critical_repair_frame(frame);
+                                    response_sender.enqueue_critical_repair_frame_with_cause(
+                                        frame,
+                                        ack_gap_repair_cause,
+                                    );
                                     true
                                 }
                             } else {
@@ -2363,6 +2467,13 @@ where
                                     stream_id.0, repair_kind, queued,
                                 ),
                             );
+                            if queued {
+                                queued_persistent_ack_gap_repair |=
+                                    ack_gap_repair_ready && repair_kind == "ack_gap";
+                            }
+                        }
+                        if queued_persistent_ack_gap_repair {
+                            ack_gap_repair.record_repair_queued();
                         }
                         #[cfg(not(feature = "lab-diagnostics"))]
                         let _ = ack;
@@ -2636,8 +2747,15 @@ where
                 response_sender_retry_at = None;
                 continue;
             }
-            _ = tokio::time::sleep_until(recv_progress_deadline), if path_stream.underlay == UnderlayProtocol::Udp
-                && reliable_relay_recv_progress_resend_active(&recv_stream, remote_open) => {
+            _ = tokio::time::sleep_until(recv_progress_deadline), if reliable_relay_recv_progress_timer_enabled(
+                    request_active_underlay,
+                    multipath_repair_alternative_available,
+                )
+                && reliable_relay_recv_progress_resend_active(
+                    &recv_stream,
+                    remote_open,
+                    Some(request_active_underlay),
+                ) => {
                 if enqueue_tcp_recv_progress(
                     &mut response_sender,
                     &recv_stream,
@@ -2870,7 +2988,13 @@ where
 
     let mut result = result;
     if result.is_ok() && pending_local_fin && !close_sent {
-        while result.is_ok() && !response_sender.is_empty() {
+        while result.is_ok() {
+            if response_sender.discard_stale_persistent_ack_gap_repairs(&path_stream) > 0 {
+                ack_gap_repair.release_repair_attempt();
+            }
+            if response_sender.is_empty() {
+                break;
+            }
             let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                 last_relay_lane,
                 &send_stream,
@@ -2892,7 +3016,14 @@ where
             .await
             {
                 Ok(true) => {
-                    wait_for_carrier_capacity_notifies(path_stream.capacity_notifies()).await;
+                    if let Some(deadline) = response_sender.persistent_ack_gap_repair_deadline() {
+                        tokio::select! {
+                            _ = wait_for_carrier_capacity_notifies(path_stream.capacity_notifies()) => {}
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                        }
+                    } else {
+                        wait_for_carrier_capacity_notifies(path_stream.capacity_notifies()).await;
+                    }
                 }
                 Ok(false) if response_sender.queued_send_ready() => {}
                 Ok(false) => break,
@@ -4031,6 +4162,96 @@ mod tests {
             repair_limit, base_limit,
             "persistent ACK-gap repair may bypass optional budget, but one event repairs only one bounded quantum"
         );
+    }
+
+    #[test]
+    fn persistent_tcp_bulk_ack_gap_repair_uses_one_service_flight() {
+        let limits = MuxLimits::default();
+        let tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+        let repair_debt = limits.max_repair_bytes;
+        let base_limit =
+            adaptive_reliable_relay_repair_bytes(Some(tcp), FlowLane::Throughput, limits);
+        let service_flight =
+            adaptive_reliable_relay_inflight_bytes(Some(tcp), FlowLane::Throughput, limits);
+        let repair_limit = reliable_persistent_ack_gap_repair_limit_bytes(
+            Some(tcp),
+            Some(UnderlayProtocol::Tcp),
+            FlowLane::Throughput,
+            repair_debt,
+            limits,
+        );
+
+        assert_eq!(
+            repair_limit,
+            reliable_critical_tail_repair_limit_bytes(
+                service_flight.max(base_limit),
+                repair_debt,
+                limits,
+            )
+        );
+        assert!(
+            repair_limit > base_limit,
+            "a proven bulk TCP owner failure must not refill a large ordered hole one 64 KiB quantum per three-PTO interval"
+        );
+    }
+
+    #[test]
+    fn persistent_tcp_bulk_ack_gap_repair_uses_remaining_service_headroom() {
+        let limits = MuxLimits::default();
+        let mut tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+        let service_flight =
+            adaptive_reliable_relay_inflight_bytes(Some(tcp), FlowLane::Throughput, limits);
+        let remaining = 32 * 1024;
+        tcp.product_bytes_in_flight = service_flight.saturating_sub(remaining) as u64;
+
+        assert_eq!(
+            reliable_persistent_ack_gap_repair_limit_bytes(
+                Some(tcp),
+                Some(UnderlayProtocol::Tcp),
+                FlowLane::Throughput,
+                limits.max_repair_bytes,
+                limits,
+            ),
+            remaining,
+            "a persistent repair event may fill only the selected output's remaining modeled service flight"
+        );
+
+        tcp.queue_bytes = service_flight as u64;
+        assert_eq!(
+            reliable_persistent_ack_gap_repair_limit_bytes(
+                Some(tcp),
+                Some(UnderlayProtocol::Tcp),
+                FlowLane::Throughput,
+                limits.max_repair_bytes,
+                limits,
+            ),
+            0,
+            "overlapping product/carrier queue debt at the service target blocks another amplified batch"
+        );
+    }
+
+    #[test]
+    fn persistent_ack_gap_repair_keeps_udp_and_latency_event_bounded() {
+        let limits = MuxLimits::default();
+        let repair_debt = limits.max_repair_bytes;
+        for (underlay, lane) in [
+            (UnderlayProtocol::Udp, FlowLane::Throughput),
+            (UnderlayProtocol::Tcp, FlowLane::Latency),
+        ] {
+            let path = PathSnapshot::new(PathId(1), underlay, 500.0, 400_000_000.0);
+            let base_limit = adaptive_reliable_relay_repair_bytes(Some(path), lane, limits);
+            assert_eq!(
+                reliable_persistent_ack_gap_repair_limit_bytes(
+                    Some(path),
+                    Some(underlay),
+                    lane,
+                    repair_debt,
+                    limits,
+                ),
+                reliable_critical_tail_repair_limit_bytes(base_limit, repair_debt, limits,),
+                "UDP/QUIC loss recovery and latency traffic retain one bounded product-repair event"
+            );
+        }
     }
 
     #[test]
@@ -6264,13 +6485,25 @@ mod tests {
             ),
             "a growing ACK horizon with the same missing frontier is one persistent hole"
         );
+        assert!(
+            progress.repair_ready_at(
+                true,
+                &grown,
+                Some(UnderlayProtocol::Udp),
+                true,
+                repair_delay,
+                now + repair_delay + Duration::from_millis(1),
+            ),
+            "a ready gap is not throttled until at least one repair frame actually queues"
+        );
+        progress.record_repair_queued_at(now + repair_delay + Duration::from_millis(1));
         assert!(!progress.repair_ready_at(
             true,
             &grown,
             Some(UnderlayProtocol::Udp),
             true,
             repair_delay,
-            now + repair_delay + Duration::from_millis(1),
+            now + repair_delay + Duration::from_millis(2),
         ));
     }
 
@@ -6371,6 +6604,7 @@ mod tests {
                 ),
                 "{underlay:?} product repair should wait for a persistent ordered-stream gap",
             );
+            progress.record_repair_queued_at(now + repair_delay);
             assert!(!progress.repair_ready_at(
                 true,
                 &ranges,
@@ -6379,6 +6613,64 @@ mod tests {
                 repair_delay,
                 now + repair_delay + Duration::from_millis(1),
             ));
+            progress.release_repair_attempt();
+            assert!(
+                progress.repair_ready_at(
+                    true,
+                    &ranges,
+                    Some(underlay),
+                    true,
+                    repair_delay,
+                    now + repair_delay + Duration::from_millis(1),
+                ),
+                "cancelling a queued batch makes the already-persistent gap immediately replannable",
+            );
         }
+    }
+
+    #[test]
+    fn tcp_multipath_progress_timer_keeps_persistent_gap_repair_live() {
+        assert!(reliable_relay_recv_progress_timer_enabled(
+            UnderlayProtocol::Udp,
+            false,
+        ));
+        assert!(reliable_relay_recv_progress_timer_enabled(
+            UnderlayProtocol::Tcp,
+            true,
+        ));
+        assert!(!reliable_relay_recv_progress_timer_enabled(
+            UnderlayProtocol::Tcp,
+            false,
+        ));
+
+        let ranges = [
+            OffsetRange {
+                start: 0,
+                end: 64 * 1024,
+            },
+            OffsetRange {
+                start: 128 * 1024,
+                end: 192 * 1024,
+            },
+        ];
+        let now = Instant::now();
+        let repair_delay = reliable_ack_gap_repair_delay(None, FlowLane::Throughput);
+        let mut progress = ReliableAckGapRepairProgress::default();
+        assert!(!progress.repair_ready_at(
+            true,
+            &ranges,
+            Some(UnderlayProtocol::Tcp),
+            true,
+            repair_delay,
+            now,
+        ));
+        assert!(progress.repair_ready_at(
+            true,
+            &ranges,
+            Some(UnderlayProtocol::Tcp),
+            true,
+            repair_delay,
+            now + repair_delay,
+        ));
     }
 }

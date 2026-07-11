@@ -5,7 +5,6 @@ use super::ingress_runtime::*;
 use super::management::*;
 use super::path_commands::*;
 use super::path_model::*;
-#[cfg(test)]
 use super::path_proof::PathProofObservation;
 use super::prelude::*;
 use super::relay_control::*;
@@ -348,6 +347,18 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) carrier_app_limited: bool,
     pub(super) carrier_ack_derived_data_seen: bool,
     pub(super) path_proof_success: bool,
+    path_proof_generation: u64,
+    path_proof_valid_after: Instant,
+    successful_path_proofs: HashMap<u64, SuccessfulPathProof>,
+    successful_path_proof_order: VecDeque<u64>,
+    successful_path_proof_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SuccessfulPathProof {
+    proof_id: u64,
+    sent_at: Instant,
+    acked_at: Instant,
 }
 
 impl Default for ClientPathHealthRecord {
@@ -382,6 +393,20 @@ impl Default for ClientPathHealthRecord {
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
             path_proof_success: false,
+            path_proof_generation: 0,
+            path_proof_valid_after: Instant::now(),
+            successful_path_proofs: HashMap::new(),
+            successful_path_proof_order: VecDeque::new(),
+            successful_path_proof_limit: 1,
+        }
+    }
+}
+
+impl ClientPathHealthRecord {
+    fn with_path_proof_limit(limit: usize) -> Self {
+        Self {
+            successful_path_proof_limit: limit.max(1),
+            ..Self::default()
         }
     }
 }
@@ -559,9 +584,38 @@ impl ClientPathHealthRecord {
         });
     }
 
-    pub(super) fn mark_path_proof_success(&mut self, elapsed: Duration) {
-        self.mark_success(elapsed);
+    pub(super) fn mark_path_proof_success(&mut self, observation: PathProofObservation) {
+        if self.manual_disabled || observation.sent_at < self.path_proof_valid_after {
+            return;
+        }
+        self.mark_success(observation.elapsed);
         self.path_proof_success = true;
+        let proof = SuccessfulPathProof {
+            proof_id: observation.proof_id,
+            sent_at: observation.sent_at,
+            acked_at: Instant::now(),
+        };
+        if self
+            .successful_path_proofs
+            .insert(observation.proof_id, proof)
+            .is_none()
+        {
+            self.successful_path_proof_order
+                .push_back(observation.proof_id);
+        }
+        while self.successful_path_proofs.len() > self.successful_path_proof_limit {
+            if let Some(proof_id) = self.successful_path_proof_order.pop_front() {
+                self.successful_path_proofs.remove(&proof_id);
+            }
+        }
+    }
+
+    pub(super) fn invalidate_path_proofs(&mut self) {
+        self.path_proof_success = false;
+        self.successful_path_proofs.clear();
+        self.successful_path_proof_order.clear();
+        self.path_proof_generation = self.path_proof_generation.wrapping_add(1);
+        self.path_proof_valid_after = Instant::now();
     }
 
     pub(super) fn mark_liveness_success(&mut self) {
@@ -642,6 +696,21 @@ impl ClientPathHealthRecord {
         self.mark_delivery(sample);
     }
 
+    pub(super) fn mark_product_delivery_replacing_rate(&mut self, sample: PathRateSample) {
+        if self.manual_disabled {
+            return;
+        }
+        self.product_delivery_sample_bytes = self
+            .product_delivery_sample_bytes
+            .saturating_add(sample.bytes);
+        self.state = SchedulerPathState::Active;
+        self.consecutive_failures = 0;
+        self.failed_until = None;
+        self.delivery_samples = self.delivery_samples.saturating_add(1);
+        self.last_delivery_at = Some(Instant::now());
+        self.measured_rate_bps = Some(sample.rate_bps());
+    }
+
     pub(super) fn mark_udp_datagram_feedback(&mut self, observation: UdpDatagramPathObservation) {
         self.mark_success(observation.rtt);
         if let Some(sample) = observation.rate_sample {
@@ -696,6 +765,7 @@ impl ClientPathHealthRecord {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
+        self.invalidate_path_proofs();
         if self.consecutive_failures == 1 || !has_schedulable_alternative {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
@@ -713,6 +783,7 @@ impl ClientPathHealthRecord {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
+        self.invalidate_path_proofs();
         if has_schedulable_alternative {
             self.state = SchedulerPathState::Failed;
             self.failed_until = Some(now + path_record_failure_cooldown(self));
@@ -742,14 +813,19 @@ impl PathRateSample {
         if bytes < MIN_RATE_SAMPLE_BYTES {
             return None;
         }
-        Some(Self {
-            bytes,
-            elapsed: elapsed.max(QUIC_TIMER_GRANULARITY),
-        })
+        Some(Self { bytes, elapsed })
     }
 
     pub(super) fn rate_bps(self) -> f64 {
-        self.bytes as f64 * 8.0 / self.elapsed.as_secs_f64()
+        self.bytes as f64 * 8.0 / self.elapsed.max(QUIC_TIMER_GRANULARITY).as_secs_f64()
+    }
+
+    pub(super) fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    pub(super) fn elapsed(self) -> Duration {
+        self.elapsed
     }
 }
 
@@ -927,9 +1003,16 @@ impl ClientPathContext {
             .into_iter()
             .map(|(_, _, security)| security)
             .collect::<Vec<_>>();
+        let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
         let health = Arc::new(Mutex::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default(); tcp_paths.len()],
-            udp: vec![ClientPathHealthRecord::default(); udp_paths.len()],
+            tcp: vec![
+                ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
+                tcp_paths.len()
+            ],
+            udp: vec![
+                ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
+                udp_paths.len()
+            ],
         }));
         let codec_limits = resources.into();
         let mux_limits = resources.into();
@@ -1852,6 +1935,73 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn relay_path_has_fresh_proof(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        proof_id: u64,
+        attached_at: Instant,
+    ) -> bool {
+        self.relay_path_fresh_proof_acked_at(underlay, index, proof_id, attached_at)
+            .is_some()
+    }
+
+    pub(super) fn relay_path_proof_generation(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> Option<u64> {
+        let health = self.health.lock().expect("client path health lock");
+        match underlay {
+            UnderlayProtocol::Tcp => health.tcp.get(index),
+            UnderlayProtocol::Udp => health.udp.get(index),
+        }
+        .map(|record| record.path_proof_generation)
+    }
+
+    pub(super) fn relay_path_fresh_proof_acked_at(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        proof_id: u64,
+        attached_at: Instant,
+    ) -> Option<Instant> {
+        let mut health = self.health.lock().expect("client path health lock");
+        let record = match underlay {
+            UnderlayProtocol::Tcp => health.tcp.get_mut(index),
+            UnderlayProtocol::Udp => health.udp.get_mut(index),
+        };
+        record.and_then(|record| {
+            let observation = record.observe(Instant::now());
+            (observation.state == SchedulerPathState::Active && !observation.manual_disabled)
+                .then(|| {
+                    record
+                        .successful_path_proofs
+                        .get(&proof_id)
+                        .filter(|proof| proof.proof_id == proof_id && proof.sent_at >= attached_at)
+                        .map(|proof| proof.acked_at)
+                })
+                .flatten()
+        })
+    }
+
+    pub(super) fn reliable_relay_has_latency_pressure(&self) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        let tcp_pressure = health.tcp.iter_mut().any(|record| {
+            record
+                .observe(Instant::now())
+                .active_latency_sensitive_flows
+                > 0
+        });
+        tcp_pressure
+            || health.udp.iter_mut().any(|record| {
+                record
+                    .observe(Instant::now())
+                    .active_latency_sensitive_flows
+                    > 0
+            })
+    }
+
     pub(super) fn release_relay_path_inflight(
         &self,
         underlay: UnderlayProtocol,
@@ -1924,6 +2074,27 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn mark_relay_path_ack_clock_rate_sample(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        sample: PathRateSample,
+        replace_startup_rate: bool,
+    ) {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(current) = records.get_mut(index) {
+            if replace_startup_rate {
+                current.mark_product_delivery_replacing_rate(sample);
+            } else {
+                current.mark_product_delivery(sample);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn mark_relay_path_proof_observation(
         &self,
@@ -1937,7 +2108,7 @@ impl ClientPathContext {
             UnderlayProtocol::Udp => &mut health.udp,
         };
         if let Some(current) = records.get_mut(index) {
-            current.mark_path_proof_success(observation.elapsed);
+            current.mark_path_proof_success(observation);
         }
     }
 

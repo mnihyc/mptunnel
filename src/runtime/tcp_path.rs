@@ -1131,7 +1131,7 @@ async fn handle_client_tcp_path_frame(
                     .tcp
                     .get_mut(runtime.path_index)
             {
-                record.mark_path_proof_success(observation.elapsed);
+                record.mark_path_proof_success(observation);
             }
             Ok(())
         }

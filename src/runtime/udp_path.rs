@@ -851,7 +851,7 @@ async fn run_client_udp_stream(
                                 .udp
                                 .get_mut(path_index)
                         {
-                            record.mark_path_proof_success(observation.elapsed);
+                            record.mark_path_proof_success(observation);
                         }
                     }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }

@@ -1,8 +1,13 @@
+use super::bulk_admission::{
+    reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
+};
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "lab-diagnostics")]
+static NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
 const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
 const RESPONSE_OWNER_MIXED_SEEN: u8 = RESPONSE_OWNER_TCP_SEEN | RESPONSE_OWNER_UDP_SEEN;
@@ -94,6 +99,22 @@ impl ReliablePathStream {
             .or_else(|| self.send_path_snapshot(lane, payload_bytes))
     }
 
+    pub(super) fn tail_repair_owner_underlay(&self, ack_frontier: u64) -> Option<UnderlayProtocol> {
+        self.output.tail_repair_owner_underlay(ack_frontier)
+    }
+
+    pub(super) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+        self.output.request_active_underlay()
+    }
+
+    pub(super) fn request_active_path_snapshot(&self, lane: FlowLane) -> Option<PathSnapshot> {
+        self.output.request_active_path_snapshot(lane)
+    }
+
+    pub(super) fn has_output_incarnation(&self, key: CarrierPathKey, incarnation: u64) -> bool {
+        self.output.has_output_incarnation(key, incarnation)
+    }
+
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
         self.output.set_sender_queue_bytes(bytes);
     }
@@ -172,8 +193,15 @@ impl ReliablePathStreamHandle {
         self.output.send_stream_detach(self.stream_id).await;
     }
 
-    pub(super) fn enqueue_path_proof(&self) -> Result<(), RuntimeError> {
+    pub(super) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
         self.output.enqueue_path_proof()
+    }
+
+    pub(super) fn enqueue_stream_ordered_path_proof(
+        &self,
+        lane: FlowLane,
+    ) -> Result<Option<u64>, RuntimeError> {
+        self.output.enqueue_stream_ordered_path_proof(lane)
     }
 
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
@@ -275,8 +303,17 @@ impl FixedReliablePathOutput {
         &self.commands
     }
 
-    fn enqueue_path_proof(&self) -> Result<(), RuntimeError> {
+    fn enqueue_path_proof(&self) -> Result<u64, RuntimeError> {
         enqueue_path_proof_frame(&self.commands, self.key.path_id, self.mux_limits)
+    }
+
+    fn enqueue_stream_ordered_path_proof(&self, lane: FlowLane) -> Result<u64, RuntimeError> {
+        enqueue_stream_ordered_path_proof_frame(
+            &self.commands,
+            self.key.path_id,
+            self.mux_limits,
+            lane,
+        )
     }
 
     fn send_path_snapshot(&self) -> PathSnapshot {
@@ -445,10 +482,20 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    fn enqueue_path_proof(&self) -> Result<(), RuntimeError> {
+    fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
         match self {
-            Self::Fixed(fixed) => fixed.enqueue_path_proof(),
-            Self::Switchable(_) => Ok(()),
+            Self::Fixed(fixed) => fixed.enqueue_path_proof().map(Some),
+            Self::Switchable(_) => Ok(None),
+        }
+    }
+
+    fn enqueue_stream_ordered_path_proof(
+        &self,
+        lane: FlowLane,
+    ) -> Result<Option<u64>, RuntimeError> {
+        match self {
+            Self::Fixed(fixed) => fixed.enqueue_stream_ordered_path_proof(lane).map(Some),
+            Self::Switchable(_) => Ok(None),
         }
     }
 
@@ -534,6 +581,37 @@ impl ReliablePathStreamOutput {
                 Some(fixed.send_path_snapshot())
             }
             Self::Switchable(binding) => binding.tail_repair_snapshot(ack_frontier, lane),
+        }
+    }
+
+    pub(super) fn tail_repair_owner_underlay(&self, ack_frontier: u64) -> Option<UnderlayProtocol> {
+        match self {
+            Self::Fixed(fixed) => Some(fixed.key().underlay),
+            Self::Switchable(binding) => binding.tail_repair_owner_underlay(ack_frontier),
+        }
+    }
+
+    pub(super) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+        match self {
+            Self::Fixed(fixed) => Some(fixed.key().underlay),
+            Self::Switchable(binding) => binding.request_active_underlay(),
+        }
+    }
+
+    pub(super) fn request_active_path_snapshot(&self, lane: FlowLane) -> Option<PathSnapshot> {
+        match self {
+            Self::Fixed(fixed) => {
+                let _ = lane;
+                Some(fixed.send_path_snapshot())
+            }
+            Self::Switchable(binding) => binding.request_active_path_snapshot(lane),
+        }
+    }
+
+    pub(super) fn has_output_incarnation(&self, key: CarrierPathKey, incarnation: u64) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_output_incarnation(key, incarnation),
         }
     }
 
@@ -667,6 +745,15 @@ pub(super) struct ResponseSubflowAdmissionRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseAckClockCalibrationRequest {
+    pub(super) expected_planner_generation: u64,
+    pub(super) expected_lane_generation: u64,
+    pub(super) service: CarrierPathKey,
+    pub(super) service_incarnation: u64,
+    pub(super) limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct ResponseSourceServiceSnapshot {
     pub(super) key: CarrierPathKey,
     pub(super) active_latency_sensitive_flows: u32,
@@ -682,6 +769,8 @@ pub(super) struct ResponseRelayReadSnapshot {
 
 pub(super) struct ResponseStreamBinding {
     session_id: SessionId,
+    #[cfg(feature = "lab-diagnostics")]
+    binding_instance_id: u64,
     lane: Mutex<FlowLane>,
     mux_limits: MuxLimits,
     lane_tracker: Arc<ServerPathLaneTracker>,
@@ -802,6 +891,9 @@ impl ResponseStreamBinding {
         response_flow_registration.set_active(true);
         Arc::new(Self {
             session_id,
+            #[cfg(feature = "lab-diagnostics")]
+            binding_instance_id: NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID
+                .fetch_add(1, Ordering::AcqRel),
             lane: Mutex::new(lane),
             mux_limits,
             lane_tracker,
@@ -826,6 +918,8 @@ impl ResponseStreamBinding {
                     local_path_metrics: None,
                     peer_path_metrics: None,
                 }],
+                ack_clock_calibrations: HashMap::new(),
+                active_ack_clock_calibration: None,
             }),
             request_active_owner: Mutex::new(Some(key)),
             ordered_data_owner: Mutex::new(Some(key)),
@@ -976,6 +1070,13 @@ impl ResponseStreamBinding {
                     if let Some((previous_incarnation, current_incarnation)) =
                         role_changed_incarnations
                     {
+                        outputs
+                            .ack_clock_calibrations
+                            .remove(&(key, previous_incarnation));
+                        if outputs.active_ack_clock_calibration == Some((key, previous_incarnation))
+                        {
+                            outputs.active_ack_clock_calibration = None;
+                        }
                         self.rebind_path_flights_after_live_role_change(
                             key,
                             previous_incarnation,
@@ -1007,7 +1108,7 @@ impl ResponseStreamBinding {
                     if role_changed {
                         // Publish the new output role and reset both Subflow
                         // identities at one outputs-lock linearization point.
-                        self.reset_subflow_set();
+                        self.reset_subflow_set_with_outputs(&mut outputs);
                     }
                     if updated_role != StreamOpenRole::Repair {
                         self.owner_underlay_history
@@ -1112,6 +1213,10 @@ impl ResponseStreamBinding {
             self.sync_response_flow_activity(&outputs);
         }
         if let Some(incarnation) = replaced_incarnation {
+            outputs.ack_clock_calibrations.remove(&(key, incarnation));
+            if outputs.active_ack_clock_calibration == Some((key, incarnation)) {
+                outputs.active_ack_clock_calibration = None;
+            }
             self.invalidate_path_flight_evidence(key, incarnation);
         }
         if replaced_closed && role != StreamOpenRole::Active {
@@ -1140,7 +1245,7 @@ impl ResponseStreamBinding {
         // but it cannot observe new membership before this invalidation completes.
         // Passive growth does not recreate cumulative startup sampling credit.
         if replaced_closed || role == StreamOpenRole::Active {
-            self.reset_subflow_set();
+            self.reset_subflow_set_with_outputs(&mut outputs);
         } else {
             self.invalidate_subflow_plan();
         }
@@ -1228,6 +1333,12 @@ impl ResponseStreamBinding {
                 self.mux_limits,
             )
         })
+    }
+
+    pub(super) fn tail_repair_owner_underlay(&self, ack_frontier: u64) -> Option<UnderlayProtocol> {
+        self.blocking_owner_key_at_or_after(ack_frontier)
+            .or_else(|| self.ordered_data_owner())
+            .map(|key| key.underlay)
     }
 
     #[cfg(test)]
@@ -1435,11 +1546,15 @@ impl ResponseStreamBinding {
                 self.sync_response_flow_activity(&outputs);
             }
             self.invalidate_path_flight_evidence(key, incarnation);
+            outputs.ack_clock_calibrations.remove(&(key, incarnation));
+            if outputs.active_ack_clock_calibration == Some((key, incarnation)) {
+                outputs.active_ack_clock_calibration = None;
+            }
             if load_registered {
                 self.lane_tracker.detach(self.session_id, key, lane);
             }
             self.repair_ordered_data_owner_after_output_change(&outputs.entries);
-            self.reset_subflow_set();
+            self.reset_subflow_set_with_outputs(&mut outputs);
             self.clear_request_active_owner_if(key);
             drop(outputs);
             drop(current_lane);
@@ -1473,6 +1588,15 @@ impl ResponseStreamBinding {
             }
             return;
         }
+        let active_calibration_has_owner_flights = outputs
+            .active_ack_clock_calibration
+            .is_some_and(|(active_key, active_incarnation)| {
+                flights.values().flatten().any(|flight| {
+                    flight.key == active_key
+                        && flight.output_incarnation == active_incarnation
+                        && flight.kind.is_ordering_owner()
+                })
+            });
         drop(flights);
 
         let ordering_update = {
@@ -1498,7 +1622,7 @@ impl ResponseStreamBinding {
 
         let now = Instant::now();
         let mut changed = false;
-        let mut path_samples = HashMap::<(CarrierPathKey, u64), (u64, Instant)>::new();
+        let mut path_samples = HashMap::<(CarrierPathKey, u64), (u64, Instant, Instant)>::new();
         for (_, release) in released {
             let flight = release.flight;
             if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
@@ -1511,43 +1635,248 @@ impl ResponseStreamBinding {
                         .saturating_add(flight.bytes as u64);
                     let sample = path_samples
                         .entry((flight.key, flight.output_incarnation))
-                        .or_insert((0_u64, flight.sent_at));
+                        .or_insert((0_u64, flight.sent_at, flight.sent_at));
                     sample.0 = sample.0.saturating_add(flight.bytes as u64);
                     sample.1 = sample.1.min(flight.sent_at);
+                    sample.2 = sample.2.max(flight.sent_at);
                 }
                 changed = true;
             }
         }
-        for ((key, output_incarnation), (bytes, first_sent_at)) in path_samples {
+        for ((key, output_incarnation), (bytes, first_sent_at, last_sent_at)) in path_samples {
+            let identity = (key, output_incarnation);
+            let ack_clock_update = if outputs.active_ack_clock_calibration == Some(identity) {
+                outputs
+                    .ack_clock_calibrations
+                    .get_mut(&identity)
+                    .filter(|calibration| {
+                        calibration.spent_bytes > 0 && !calibration.proven && !calibration.retired
+                    })
+                    .map(|calibration| {
+                        calibration
+                            .rate_evidence
+                            .get_or_insert_with(|| ResponseAckClockRateEvidence::new(first_sent_at))
+                            .observe(bytes, first_sent_at, last_sent_at, now)
+                    })
+            } else {
+                None
+            };
+            let strict_ack_clock_sample = match ack_clock_update {
+                Some(ResponseAckClockRateEvidenceUpdate::Proven {
+                    sample: Some(sample),
+                    first_window: false,
+                    earliest_sent_at,
+                    previous_window_acked_at: Some(previous_ack_at),
+                    latest_sent_at,
+                }) => Some((sample, earliest_sent_at, previous_ack_at, latest_sent_at)),
+                _ => None,
+            };
+            let calibration_update = strict_ack_clock_sample.and_then(
+                |(sample, earliest_sent_at, previous_ack_at, latest_sent_at)| {
+                    outputs
+                        .ack_clock_calibrations
+                        .get_mut(&identity)
+                        .map(|calibration| {
+                            let sample_bps = sample.rate_bps();
+                            let previous_credit = calibration.credit_limit_bytes;
+                            let stage_authorized_at = calibration.stage_authorized_at;
+                            let stage_evidence_eligible = earliest_sent_at >= stage_authorized_at;
+                            let stage_evidence_bytes = if stage_evidence_eligible {
+                                calibration
+                                    .stage_rate_evidence_bytes
+                                    .saturating_add(sample.bytes())
+                            } else {
+                                calibration.stage_rate_evidence_bytes
+                            };
+                            let stage_evidence_elapsed = if stage_evidence_eligible {
+                                calibration
+                                    .stage_rate_evidence_elapsed
+                                    .saturating_add(sample.elapsed())
+                            } else {
+                                calibration.stage_rate_evidence_elapsed
+                            };
+                            let stage_rate_accepted = calibration.spent_bytes
+                                >= calibration.credit_limit_bytes
+                                && stage_evidence_eligible;
+                            let stage_rate_sample_accepted = stage_rate_accepted
+                                && stage_evidence_bytes
+                                    >= calibration.stage_rate_coverage_floor_bytes;
+                            let aggregate_rate_bps = stage_rate_sample_accepted
+                                .then(|| {
+                                    stage_evidence_bytes as f64 * 8.0
+                                        / stage_evidence_elapsed
+                                            .max(QUIC_TIMER_GRANULARITY)
+                                            .as_secs_f64()
+                                })
+                                .unwrap_or(0.0);
+                            let credit_grew =
+                                calibration.record_ack_clock_sample(sample, earliest_sent_at, now);
+                            debug_assert_eq!(
+                                credit_grew,
+                                calibration.credit_limit_bytes > previous_credit
+                            );
+                            (
+                                sample_bps,
+                                *calibration,
+                                credit_grew,
+                                stage_rate_accepted,
+                                stage_rate_sample_accepted,
+                                sample.bytes(),
+                                sample.elapsed(),
+                                stage_evidence_bytes,
+                                stage_evidence_elapsed,
+                                calibration.stage_rate_coverage_floor_bytes,
+                                aggregate_rate_bps,
+                                stage_authorized_at,
+                                earliest_sent_at,
+                                previous_ack_at,
+                                latest_sent_at,
+                            )
+                        })
+                },
+            );
+            let calibration_snapshot = outputs.ack_clock_calibrations.get(&identity).copied();
             if let Some(entry) = outputs
                 .entries
                 .iter_mut()
                 .find(|entry| entry.key == key && entry.incarnation == output_incarnation)
-                && let Some(sample) =
-                    PathRateSample::new(bytes, now.saturating_duration_since(first_sent_at))
             {
-                let sample_bps = sample.rate_bps();
-                let carrier_app_limited = entry
-                    .local_path_metrics
-                    .is_some_and(|metrics| metrics.metrics.app_limited);
-                entry.product_progress_rate_bps = Some(match entry.product_progress_rate_bps {
-                    Some(previous) if carrier_app_limited => previous.max(sample_bps),
-                    Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-                    None => sample_bps,
-                });
-                if entry.key.underlay == UnderlayProtocol::Tcp {
-                    entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
-                        Some(previous) if carrier_app_limited => previous.max(sample_bps),
-                        Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-                        None => sample_bps,
-                    });
-                    let sample_rtt_ms =
-                        now.saturating_duration_since(first_sent_at).as_secs_f64() * 1000.0;
-                    entry.srtt_ms = Some(match entry.srtt_ms {
-                        Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
-                        None => sample_rtt_ms,
-                    });
+                if let Some(sample) =
+                    PathRateSample::new(bytes, now.saturating_duration_since(first_sent_at))
+                {
+                    let sample_bps = sample.rate_bps();
+                    let carrier_app_limited = entry
+                        .local_path_metrics
+                        .is_some_and(|metrics| metrics.metrics.app_limited);
+                    let has_tcp_ack_clock_calibration = entry.key.underlay == UnderlayProtocol::Tcp
+                        && calibration_snapshot.is_some();
+                    if !has_tcp_ack_clock_calibration {
+                        entry.product_progress_rate_bps =
+                            Some(match entry.product_progress_rate_bps {
+                                Some(previous) if carrier_app_limited => previous.max(sample_bps),
+                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                                None => sample_bps,
+                            });
+                        if entry.key.underlay == UnderlayProtocol::Tcp {
+                            entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
+                                Some(previous) if carrier_app_limited => previous.max(sample_bps),
+                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                                None => sample_bps,
+                            });
+                        }
+                    }
+                    if entry.key.underlay == UnderlayProtocol::Tcp {
+                        let sample_rtt_ms =
+                            now.saturating_duration_since(first_sent_at).as_secs_f64() * 1000.0;
+                        entry.srtt_ms = Some(match entry.srtt_ms {
+                            Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
+                            None => sample_rtt_ms,
+                        });
+                    }
                 }
+                if entry.key.underlay == UnderlayProtocol::Tcp
+                    && let Some(calibrated_rate_bps) =
+                        calibration_snapshot.and_then(|calibration| calibration.calibrated_rate_bps)
+                {
+                    entry.product_progress_rate_bps = Some(calibrated_rate_bps);
+                    entry.delivery_rate_bps = Some(calibrated_rate_bps);
+                }
+            }
+            if let Some((
+                sample_bps,
+                calibration,
+                credit_grew,
+                stage_rate_accepted,
+                stage_rate_sample_accepted,
+                sample_bytes,
+                sample_elapsed,
+                stage_evidence_bytes,
+                stage_evidence_elapsed,
+                stage_rate_coverage_floor_bytes,
+                aggregate_rate_bps,
+                stage_authorized_at,
+                earliest_sent_at,
+                previous_ack_at,
+                latest_sent_at,
+            )) = calibration_update
+            {
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = (
+                    sample_bps,
+                    calibration,
+                    credit_grew,
+                    stage_rate_accepted,
+                    stage_rate_sample_accepted,
+                    sample_bytes,
+                    sample_elapsed,
+                    stage_evidence_bytes,
+                    stage_evidence_elapsed,
+                    stage_rate_coverage_floor_bytes,
+                    aggregate_rate_bps,
+                    stage_authorized_at,
+                    earliest_sent_at,
+                    previous_ack_at,
+                    latest_sent_at,
+                );
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "response_ack_clock_calibration",
+                    format_args!(
+                        "phase=ack_clock_sample session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} rate_bps={} sample_bytes={} sample_elapsed_us={} calibrated_rate_bps={} calibrated_rate_ready={} stage_rate_accepted={} stage_rate_sample_accepted={} stage_evidence_bytes={} stage_evidence_elapsed_us={} stage_rate_coverage_floor_bytes={} aggregate_rate_bps={} spent_bytes={} credit_limit_bytes={} max_limit_bytes={} credit_grew={} proven={} stage_authorized_age_us={} earliest_sent_age_us={} previous_ack_age_us={} latest_sent_age_us={} stage_provenance_slack_us={} causal_slack_us={}",
+                        self.session_id.0,
+                        self.binding_instance_id,
+                        key.underlay,
+                        key.path_id.0,
+                        output_incarnation,
+                        sample_bps,
+                        sample_bytes,
+                        sample_elapsed.as_micros(),
+                        calibration.calibrated_rate_bps.unwrap_or(0.0),
+                        calibration.calibrated_rate_bps.is_some(),
+                        stage_rate_accepted,
+                        stage_rate_sample_accepted,
+                        stage_evidence_bytes,
+                        stage_evidence_elapsed.as_micros(),
+                        stage_rate_coverage_floor_bytes,
+                        aggregate_rate_bps,
+                        calibration.spent_bytes,
+                        calibration.credit_limit_bytes,
+                        calibration.max_limit_bytes,
+                        credit_grew,
+                        calibration.proven,
+                        now.saturating_duration_since(stage_authorized_at)
+                            .as_micros(),
+                        now.saturating_duration_since(earliest_sent_at).as_micros(),
+                        now.saturating_duration_since(previous_ack_at).as_micros(),
+                        now.saturating_duration_since(latest_sent_at).as_micros(),
+                        earliest_sent_at
+                            .saturating_duration_since(stage_authorized_at)
+                            .as_micros(),
+                        previous_ack_at
+                            .saturating_duration_since(latest_sent_at)
+                            .as_micros(),
+                    ),
+                );
+            }
+        }
+        if !active_calibration_has_owner_flights
+            && let Some(identity) = outputs.active_ack_clock_calibration
+        {
+            let clear_active = match outputs.ack_clock_calibrations.get_mut(&identity) {
+                None => true,
+                Some(calibration) if calibration.proven => true,
+                Some(calibration) if calibration.spent_bytes >= calibration.max_limit_bytes => {
+                    calibration.retire();
+                    true
+                }
+                Some(calibration) if calibration.spent_bytes >= calibration.credit_limit_bytes => {
+                    calibration.retire();
+                    true
+                }
+                Some(_) => false,
+            };
+            if clear_active {
+                outputs.active_ack_clock_calibration = None;
             }
         }
         for hole in ordering_update.newly_contiguous {
@@ -1568,6 +1897,7 @@ impl ResponseStreamBinding {
         }
         drop(outputs);
         if changed || ordering_update.changed {
+            self.graduate_bulk_proven_response_startup_owner();
             // ACK progress updates path evidence and ordering, but Subflow
             // admission credit is epoch state. Recreate it only on a semantic
             // reset or admission-envelope change, not passive membership growth.
@@ -1590,6 +1920,45 @@ impl ResponseStreamBinding {
             .expect("server reliable stream request active owner lock")
     }
 
+    pub(super) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+        self.request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock")
+            .map(|key| key.underlay)
+    }
+
+    pub(super) fn request_active_path_snapshot(&self, lane: FlowLane) -> Option<PathSnapshot> {
+        // Attach and detach take these locks in this order before changing the
+        // request-side Active identity. Keep the identity and its metrics in a
+        // single coherent snapshot without reversing that order.
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let active_key = *self
+            .request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock");
+        active_key.and_then(|key| {
+            outputs.snapshot_for_key(
+                key,
+                self.session_id,
+                &self.lane_tracker,
+                lane,
+                self.mux_limits,
+            )
+        })
+    }
+
+    pub(super) fn has_output_incarnation(&self, key: CarrierPathKey, incarnation: u64) -> bool {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .any(|entry| entry.key == key && entry.incarnation == incarnation)
+    }
+
     fn set_request_active_owner(&self, key: CarrierPathKey) {
         *self
             .request_active_owner
@@ -1609,14 +1978,19 @@ impl ResponseStreamBinding {
 
     #[cfg(test)]
     pub(super) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
         let mut lead = self
             .ordered_data_owner
             .lock()
             .expect("server reliable stream ordered data owner lock");
         if *lead != Some(key) {
             *lead = Some(key);
-            self.reset_subflow_set();
+            self.reset_subflow_set_with_outputs(&mut outputs);
             drop(lead);
+            drop(outputs);
             self.notify_update();
         }
     }
@@ -1625,7 +1999,7 @@ impl ResponseStreamBinding {
         &self,
         target: &ResponseSenderPathTarget,
     ) -> bool {
-        let outputs = self
+        let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
@@ -1645,7 +2019,13 @@ impl ResponseStreamBinding {
         let changed = *lead != Some(target.key);
         if changed {
             *lead = Some(target.key);
-            self.reset_subflow_set();
+            outputs
+                .ack_clock_calibrations
+                .remove(&(target.key, target.incarnation));
+            if outputs.active_ack_clock_calibration == Some((target.key, target.incarnation)) {
+                outputs.active_ack_clock_calibration = None;
+            }
+            self.reset_subflow_set_with_outputs(&mut outputs);
         }
         drop(lead);
         drop(outputs);
@@ -1884,7 +2264,80 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn reset_subflow_set(&self) {
+    fn graduate_bulk_proven_response_startup_owner(&self) -> bool {
+        let Some(owner) = self
+            .subflow_set
+            .lock()
+            .expect("server reliable stream subflow set lock")
+            .set
+            .as_ref()
+            .and_then(FlowSubflowSet::startup_owner_key)
+        else {
+            return false;
+        };
+
+        // Owner enqueue holds the outputs lock from Subflow reservation through
+        // flight recording. Keep it here so the no-flight proof and graduation
+        // are one transition with respect to new response OwnerData.
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let owner_position = outputs.entries.iter().position(|entry| {
+            entry.key == owner
+                && entry.role == StreamOpenRole::Validation
+                && !entry.commands.is_closed()
+                && server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits)
+        });
+        let Some(owner_position) = owner_position else {
+            return false;
+        };
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        if flights
+            .values()
+            .flatten()
+            .any(|flight| flight.key == owner && flight.kind.is_ordering_owner())
+        {
+            return false;
+        }
+
+        let mut state = self
+            .subflow_set
+            .lock()
+            .expect("server reliable stream subflow set lock");
+        let graduated = state
+            .set
+            .as_mut()
+            .is_some_and(|epoch| epoch.graduate_startup_owner(owner));
+        if graduated {
+            let owner_identity = (
+                outputs.entries[owner_position].key,
+                outputs.entries[owner_position].incarnation,
+            );
+            if owner_identity.0.underlay == UnderlayProtocol::Tcp {
+                let initial_limit = reliable_ack_clock_calibration_limit_bytes(self.mux_limits);
+                let max_limit = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
+                if initial_limit > 0 && max_limit >= initial_limit {
+                    outputs
+                        .ack_clock_calibrations
+                        .entry(owner_identity)
+                        .or_insert_with(|| {
+                            ResponseAckClockCalibrationState::new(initial_limit, max_limit)
+                        });
+                }
+            }
+            // Preserve the epoch and its measured members, but invalidate any
+            // planner snapshot that still treats this output as the exclusive
+            // unproven startup owner.
+            state.planner_generation = state.planner_generation.wrapping_add(1);
+        }
+        graduated
+    }
+
+    fn reset_subflow_set_state(&self) {
         let mut state = self
             .subflow_set
             .lock()
@@ -1892,6 +2345,48 @@ impl ResponseStreamBinding {
         state.planner_generation = state.planner_generation.wrapping_add(1);
         state.epoch_generation = state.epoch_generation.wrapping_add(1);
         state.set = None;
+    }
+
+    fn reset_subflow_set_with_outputs(&self, outputs: &mut ResponseStreamOutputs) {
+        let active_calibration_has_owner_flights = outputs
+            .active_ack_clock_calibration
+            .is_some_and(|(active_key, active_incarnation)| {
+                outputs
+                    .ack_clock_calibrations
+                    .contains_key(&(active_key, active_incarnation))
+                    && outputs.entries.iter().any(|entry| {
+                        entry.key == active_key && entry.incarnation == active_incarnation
+                    })
+                    && self
+                        .flights
+                        .lock()
+                        .expect("server reliable stream flight lock")
+                        .values()
+                        .flatten()
+                        .any(|flight| {
+                            flight.key == active_key
+                                && flight.output_incarnation == active_incarnation
+                                && flight.kind.is_ordering_owner()
+                        })
+            });
+        for calibration in outputs.ack_clock_calibrations.values_mut() {
+            if !calibration.proven {
+                calibration.retire();
+            }
+        }
+        if !active_calibration_has_owner_flights {
+            outputs.active_ack_clock_calibration = None;
+        }
+        self.reset_subflow_set_state();
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_subflow_set(&self) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        self.reset_subflow_set_with_outputs(&mut outputs);
     }
 
     fn invalidate_subflow_plan(&self) {
@@ -1938,8 +2433,16 @@ impl ResponseStreamBinding {
         frame: &Frame,
         lane: FlowLane,
         subflow_request: Option<ResponseSubflowAdmissionRequest>,
+        calibration_request: Option<ResponseAckClockCalibrationRequest>,
     ) -> Result<Option<u64>, RuntimeError> {
-        self.try_enqueue_owner_frame_for_target_inner(target, frame, lane, subflow_request, || {})
+        self.try_enqueue_owner_frame_for_target_inner(
+            target,
+            frame,
+            lane,
+            subflow_request,
+            calibration_request,
+            || {},
+        )
     }
 
     fn try_enqueue_owner_frame_for_target_inner(
@@ -1948,6 +2451,7 @@ impl ResponseStreamBinding {
         frame: &Frame,
         lane: FlowLane,
         subflow_request: Option<ResponseSubflowAdmissionRequest>,
+        calibration_request: Option<ResponseAckClockCalibrationRequest>,
         after_subflow_reservation: impl FnOnce(),
     ) -> Result<Option<u64>, RuntimeError> {
         let mut outputs = self
@@ -1970,6 +2474,142 @@ impl ResponseStreamBinding {
         let Some(target_index) = target_index else {
             return Err(RuntimeError::SenderServiceBlocked);
         };
+        if subflow_request.is_some() && calibration_request.is_some() {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        if let Some(request) = calibration_request {
+            let Some((_, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
+                return Err(RuntimeError::SenderServiceBlocked);
+            };
+            let calibration_ceiling = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
+            let calibration_limit = request.limit_bytes.min(calibration_ceiling);
+            return self
+                .lane_tracker
+                .with_matching_generation_and_min_active_response_flows(
+                    self.session_id,
+                    request.expected_lane_generation,
+                    2,
+                    || {
+                    {
+                        let state = self
+                            .subflow_set
+                            .lock()
+                            .expect("server reliable stream subflow set lock");
+                        if state.planner_generation != request.expected_planner_generation
+                            || state.set.as_ref().is_none_or(|epoch| {
+                                epoch.service_key() != request.service
+                                    || epoch.startup_owner_key().is_some()
+                            })
+                        {
+                            return Err(RuntimeError::SenderServiceBlocked);
+                        }
+                    }
+                    let service_is_exact_and_proven = outputs.entries.iter().any(|entry| {
+                        entry.key == request.service
+                            && entry.incarnation == request.service_incarnation
+                            && entry.role != StreamOpenRole::Repair
+                            && !entry.commands.is_closed()
+                            && entry.key.underlay == UnderlayProtocol::Tcp
+                            && server_output_has_bulk_rate_evidence_with_limits(
+                                entry,
+                                self.mux_limits,
+                            )
+                    });
+                    let target_entry = &outputs.entries[target_index];
+                    let identity = (target_entry.key, target_entry.incarnation);
+                    let target_is_tcp_validation = target_entry.role == StreamOpenRole::Validation
+                        && target_entry.key.underlay == UnderlayProtocol::Tcp
+                        && target_entry.key.underlay == request.service.underlay
+                        && !target_entry.commands.is_closed();
+                    // The product-flight ledger already includes frames that
+                    // remain pending in the carrier command pipe.
+                    let target_has_calibration_headroom = target_entry
+                        .bytes_in_flight
+                        .max(target_entry.commands.pending_bytes())
+                        .saturating_add(payload_bytes as u64)
+                        <= calibration_limit;
+                    let active_matches = outputs
+                        .active_ack_clock_calibration
+                        .is_none_or(|active| active == identity);
+                    let calibration_is_available = outputs
+                        .ack_clock_calibrations
+                        .get(&identity)
+                        .is_some_and(|calibration| {
+                            !calibration.proven
+                                && request.limit_bytes == calibration.credit_limit_bytes
+                                && calibration.credit_limit_bytes <= calibration.max_limit_bytes
+                                && calibration.max_limit_bytes <= calibration_ceiling
+                                && calibration
+                                    .spent_bytes
+                                    .saturating_add(payload_bytes as u64)
+                                    <= calibration_limit
+                        });
+                    if !service_is_exact_and_proven
+                        || !target_is_tcp_validation
+                        || !target_has_calibration_headroom
+                        || !active_matches
+                        || !calibration_is_available
+                    {
+                        return Err(RuntimeError::SenderServiceBlocked);
+                    }
+
+                    let previous_active = outputs.active_ack_clock_calibration;
+                    let previous_calibration = *outputs
+                        .ack_clock_calibrations
+                        .get(&identity)
+                        .expect("validated response calibration identity");
+                    let reserved_calibration = {
+                        let calibration = outputs
+                        .ack_clock_calibrations
+                        .get_mut(&identity)
+                        .expect("validated response calibration identity");
+                        calibration.spent_bytes = calibration
+                            .spent_bytes
+                            .saturating_add(payload_bytes as u64);
+                        *calibration
+                    };
+                    #[cfg(not(feature = "lab-diagnostics"))]
+                    let _ = reserved_calibration;
+                    outputs.active_ack_clock_calibration = Some(identity);
+                    if let Err(err) = target
+                        .commands
+                        .try_enqueue_stream_ordered_frame(frame.clone(), lane)
+                    {
+                        *outputs
+                            .ack_clock_calibrations
+                            .get_mut(&identity)
+                            .expect("reserved response calibration identity") =
+                            previous_calibration;
+                        outputs.active_ack_clock_calibration = previous_active;
+                        return Err(err);
+                    }
+                    self.record_validated_owner_flight_with_outputs(
+                        &mut outputs,
+                        target_index,
+                        frame,
+                    );
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "response_ack_clock_calibration",
+                        format_args!(
+                            "phase=selected session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} payload_bytes={} spent_bytes={} credit_limit_bytes={} max_limit_bytes={} proven={}",
+                            self.session_id.0,
+                            self.binding_instance_id,
+                            identity.0.underlay,
+                            identity.0.path_id.0,
+                            identity.1,
+                            payload_bytes,
+                            reserved_calibration.spent_bytes,
+                            reserved_calibration.credit_limit_bytes,
+                            reserved_calibration.max_limit_bytes,
+                            reserved_calibration.proven,
+                        ),
+                    );
+                    Ok(None)
+                    },
+                )
+                .unwrap_or(Err(RuntimeError::SenderServiceBlocked));
+        }
         if let Some(request) = subflow_request {
             return self
                 .lane_tracker
@@ -2041,19 +2681,38 @@ impl ResponseStreamBinding {
             });
     }
 
-    pub(super) fn record_repair_flight_for_target(
+    pub(super) fn try_enqueue_repair_frame_for_target(
         &self,
         target: &ResponseSenderPathTarget,
         frame: &Frame,
-    ) {
-        self.record_product_flight(
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let target_matches = outputs.entries.iter().any(|entry| {
+            entry.key == target.key
+                && entry.incarnation == target.incarnation
+                && entry.commands.same_channel(&target.commands)
+                && entry.role == target.attachment_role
+        });
+        if !target_matches {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        target
+            .commands
+            .try_enqueue_admitted_frame(frame.clone(), lane)?;
+        self.record_product_flight_with_outputs(
+            &mut outputs,
             target.key,
             target.incarnation,
             target.attachment_role,
             &target.commands,
             frame,
             CarrierWorkKind::RepairData,
-        )
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2114,6 +2773,7 @@ impl ResponseStreamBinding {
         }
     }
 
+    #[cfg(test)]
     fn record_product_flight(
         &self,
         key: CarrierPathKey,
@@ -2325,6 +2985,11 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .map(|entry| {
+                let calibration_identity = (entry.key, entry.incarnation);
+                let calibration = outputs
+                    .ack_clock_calibrations
+                    .get(&calibration_identity)
+                    .copied();
                 let snapshot = server_bulk_output_snapshot(
                     entry,
                     self.session_id,
@@ -2354,6 +3019,17 @@ impl ResponseStreamBinding {
                         entry,
                         self.mux_limits,
                     ),
+                    ack_clock_calibration_eligible: calibration.is_some(),
+                    ack_clock_calibration_proven: calibration
+                        .is_some_and(|calibration| calibration.proven),
+                    ack_clock_calibration_spent_bytes: calibration
+                        .map_or(0, |calibration| calibration.spent_bytes),
+                    ack_clock_calibration_credit_limit_bytes: calibration
+                        .map_or(0, |calibration| calibration.credit_limit_bytes),
+                    ack_clock_calibration_max_limit_bytes: calibration
+                        .map_or(0, |calibration| calibration.max_limit_bytes),
+                    ack_clock_calibration_active: outputs.active_ack_clock_calibration
+                        == Some(calibration_identity),
                 }
             })
             .collect()
@@ -2361,6 +3037,72 @@ impl ResponseStreamBinding {
 
     pub(super) fn mux_limits(&self) -> MuxLimits {
         self.mux_limits
+    }
+
+    pub(super) fn active_tcp_ack_clock_calibration_remaining_bytes(&self) -> Option<usize> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let identity = outputs.active_ack_clock_calibration?;
+        if identity.0.underlay != UnderlayProtocol::Tcp {
+            return None;
+        }
+        let calibration = outputs.ack_clock_calibrations.get(&identity)?;
+        if calibration.proven || calibration.retired {
+            return None;
+        }
+        let remaining = calibration
+            .credit_limit_bytes
+            .saturating_sub(calibration.spent_bytes);
+        (remaining > 0).then(|| usize::try_from(remaining).unwrap_or(usize::MAX))
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_output_bulk_proven_for_test(&self, key: CarrierPathKey) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let entry = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .expect("test bulk-proven output");
+        entry.product_progress_rate_bps = Some(100_000_000.0);
+        entry.delivery_rate_bps = Some(100_000_000.0);
+        entry.delivery_samples = 1;
+        entry.owner_data_acked_bytes = reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
+        entry.last_delivery_at = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_tcp_ack_clock_calibration_for_test(
+        &self,
+        key: CarrierPathKey,
+        spent_bytes: u64,
+        credit_limit_bytes: u64,
+        max_limit_bytes: u64,
+        active: bool,
+    ) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("test calibration output");
+        assert_eq!(entry.key.underlay, UnderlayProtocol::Tcp);
+        let identity = (entry.key, entry.incarnation);
+        let mut calibration =
+            ResponseAckClockCalibrationState::new(credit_limit_bytes, max_limit_bytes);
+        calibration.spent_bytes = spent_bytes;
+        outputs.ack_clock_calibrations.insert(identity, calibration);
+        if active {
+            outputs.active_ack_clock_calibration = Some(identity);
+        }
     }
 
     pub(super) fn session_id(&self) -> SessionId {
@@ -2458,6 +3200,7 @@ impl ResponseStreamBinding {
         }
         drop(outputs);
         if changed {
+            self.graduate_bulk_proven_response_startup_owner();
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_response_path_metrics_attached",
@@ -2836,6 +3579,34 @@ impl ServerPathLaneTracker {
         Some(result)
     }
 
+    fn with_matching_generation_and_min_active_response_flows<R>(
+        &self,
+        session_id: SessionId,
+        expected_generation: u64,
+        minimum_active_response_flows: u32,
+        apply: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let generation = state
+            .session_generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let active_response_flows = state
+            .active_response_flows
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if generation != expected_generation
+            || active_response_flows < minimum_active_response_flows
+        {
+            return None;
+        }
+        let result = apply();
+        drop(state);
+        Some(result)
+    }
+
     fn attach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         state
@@ -3034,7 +3805,9 @@ impl Drop for ServerRealtimeFlowRegistration {
 mod tests {
     use super::*;
     use crate::runtime::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
-    use crate::runtime::relay_io::reliable_relay_source_staging_owner_tail_headroom;
+    use crate::runtime::relay_io::{
+        reliable_relay_source_staging_owner_tail_headroom, reliable_stream_recv_progress_interval,
+    };
     use bytes::Bytes;
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
@@ -3070,6 +3843,19 @@ mod tests {
         }
     }
 
+    fn test_ack_clock_rate_sample(bytes: u64, rate_bps: f64) -> PathRateSample {
+        PathRateSample::new(
+            bytes,
+            Duration::from_secs_f64(bytes as f64 * 8.0 / rate_bps),
+        )
+        .expect("valid ACK-clock rate sample")
+    }
+
+    fn assert_test_rate_close(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("calibrated rate");
+        assert!((actual - expected).abs() / expected.max(1.0) < 1e-6);
+    }
+
     fn first_output_entry(binding: &ResponseStreamBinding) -> ResponseStreamOutputEntry {
         binding
             .outputs
@@ -3079,6 +3865,150 @@ mod tests {
             .first()
             .expect("test response binding has output")
             .clone()
+    }
+
+    fn mark_test_response_output_bulk_proven(
+        entry: &mut ResponseStreamOutputEntry,
+        mux_limits: MuxLimits,
+    ) {
+        entry.product_progress_rate_bps = Some(100_000_000.0);
+        entry.delivery_rate_bps = Some(100_000_000.0);
+        entry.delivery_samples = 1;
+        entry.owner_data_acked_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+        entry.last_delivery_at = Some(Instant::now());
+    }
+
+    #[test]
+    fn fixed_stream_ordered_path_proof_follows_earlier_stream_data() {
+        let mux_limits = MuxLimits::default();
+        let path_id = PathId(3);
+        let (commands, mut receivers) = reliable_path_command_channels(4);
+        commands
+            .try_enqueue_admitted_frame(stream_data_frame(32), FlowLane::Throughput)
+            .expect("queue earlier stream data");
+        let stream = ReliablePathStreamHandle {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                path_id,
+                commands,
+                mux_limits,
+            ),
+        };
+
+        let proof_id = stream
+            .enqueue_stream_ordered_path_proof(FlowLane::Throughput)
+            .expect("queue stream-ordered path proof")
+            .expect("fixed output has a carrier path");
+
+        assert!(
+            try_recv_reliable_path_priority_command(&mut receivers).is_none(),
+            "stream-ordered proof must not enter the priority queue"
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        let proof_frame = match try_recv_reliable_path_command(&mut receivers) {
+            Some(ReliablePathCommand::SendFrame(frame)) => {
+                let Frame::PathProofData {
+                    path_id: queued_path_id,
+                    proof_id: queued_proof_id,
+                    payload,
+                } = &frame
+                else {
+                    panic!("stream-ordered proof must follow earlier product data");
+                };
+                assert_eq!(*queued_path_id, path_id);
+                assert_eq!(*queued_proof_id, proof_id);
+                assert!(!payload.is_empty());
+                frame
+            }
+            _ => panic!("stream-ordered proof must follow earlier product data"),
+        };
+        let payload_len = match &proof_frame {
+            Frame::PathProofData { payload, .. } => payload.len(),
+            _ => unreachable!("matched path proof frame above"),
+        };
+        let mut tracker = PathProofTracker::default();
+        tracker.record_sent_frame(&proof_frame);
+        let observation = tracker
+            .acknowledge(
+                path_id,
+                proof_id,
+                u32::try_from(payload_len).expect("test proof payload length fits u32"),
+            )
+            .expect("consumed ordered proof is tracked for acknowledgement");
+        assert_eq!(observation.proof_id, proof_id);
+        assert_eq!(observation.bytes, payload_len as u64);
+    }
+
+    #[test]
+    fn fixed_priority_path_proof_preserves_attachment_liveness_ordering() {
+        let mux_limits = MuxLimits::default();
+        let path_id = PathId(4);
+        let (commands, mut receivers) = reliable_path_command_channels(4);
+        commands
+            .try_enqueue_admitted_frame(stream_data_frame(32), FlowLane::Throughput)
+            .expect("queue earlier stream data");
+        let stream = ReliablePathStreamHandle {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                path_id,
+                commands,
+                mux_limits,
+            ),
+        };
+
+        let proof_id = stream
+            .enqueue_path_proof()
+            .expect("queue priority path proof")
+            .expect("fixed output has a carrier path");
+
+        match try_recv_reliable_path_priority_command(&mut receivers) {
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
+                path_id: queued_path_id,
+                proof_id: queued_proof_id,
+                ..
+            })) => {
+                assert_eq!(queued_path_id, path_id);
+                assert_eq!(queued_proof_id, proof_id);
+            }
+            _ => panic!("attachment-liveness proof must retain priority ordering"),
+        }
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+    }
+
+    #[test]
+    fn switchable_stream_ordered_path_proof_keeps_no_fixed_carrier_semantics() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let stream = ReliablePathStreamHandle {
+            stream_id: StreamId(7),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: key.underlay,
+            max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding),
+        };
+
+        assert_eq!(
+            stream
+                .enqueue_stream_ordered_path_proof(FlowLane::Throughput)
+                .expect("switchable output is a successful no-op"),
+            None
+        );
     }
 
     #[test]
@@ -3315,7 +4245,7 @@ mod tests {
                 .expect("ordered Service output");
             service_entry.product_progress_rate_bps = Some(1_000_000.0);
             service_entry.owner_data_acked_bytes =
-                response_subflow_startup_sample_limit_bytes(binding.mux_limits());
+                reliable_subflow_startup_sample_limit_bytes(binding.mux_limits());
         }
         let after = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
         let source = after.source_service.expect("live ordered Service snapshot");
@@ -3405,6 +4335,10 @@ mod tests {
             path_id: PathId(1),
         };
         let (repair_commands, _repair_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.request_active_underlay(),
+            Some(UnderlayProtocol::Tcp)
+        );
 
         assert_eq!(
             binding.attach(
@@ -3454,13 +4388,20 @@ mod tests {
             "explicit Active reannounce may promote future work without changing old repair-flight semantics"
         );
 
-        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let mut outputs = binding.outputs.lock().expect("test response outputs lock");
         let repair_entry = outputs
             .entries
-            .iter()
+            .iter_mut()
             .find(|entry| entry.key == repair)
             .expect("repair output remains attached");
         assert_eq!(repair_entry.role, StreamOpenRole::Active);
+        repair_entry.srtt_ms = Some(40.0);
+        outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == active)
+            .expect("response Service output remains attached")
+            .srtt_ms = Some(500.0);
         drop(outputs);
         assert_eq!(binding.ordered_data_owner(), Some(active));
         assert_eq!(
@@ -3469,9 +4410,79 @@ mod tests {
             "request Active reannounce must not depend on the response data owner"
         );
         assert_eq!(
+            binding.request_active_underlay(),
+            Some(UnderlayProtocol::Udp),
+            "server receive-progress policy follows the current request Active family"
+        );
+        let request_active_snapshot = binding
+            .request_active_path_snapshot(FlowLane::Throughput)
+            .expect("request Active output remains attached");
+        let response_service_snapshot = binding
+            .send_path_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .expect("response Service output remains attached");
+        assert_eq!(request_active_snapshot.id, repair.path_id);
+        assert_eq!(request_active_snapshot.underlay, UnderlayProtocol::Udp);
+        assert_eq!(response_service_snapshot.id, active.path_id);
+        assert_eq!(response_service_snapshot.underlay, UnderlayProtocol::Tcp);
+        assert!(
+            reliable_stream_recv_progress_interval(
+                Some(request_active_snapshot),
+                FlowLane::Throughput,
+            ) < reliable_stream_recv_progress_interval(
+                Some(response_service_snapshot),
+                FlowLane::Throughput,
+            ),
+            "receive-progress cadence must follow the request Active PTO rather than the response Service PTO"
+        );
+        assert_eq!(
             binding.owner_underlay_history.load(Ordering::Acquire),
             RESPONSE_OWNER_MIXED_SEEN
         );
+    }
+
+    #[test]
+    fn response_repair_enqueue_rejects_detached_output_incarnation() {
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(6),
+        };
+        let (commands, mut receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(42),
+            key.underlay,
+            key.path_id,
+            commands.clone(),
+            FlowLane::Throughput,
+        );
+        let stale_target = binding
+            .sender_path_targets(FlowLane::Throughput, 64)
+            .into_iter()
+            .next()
+            .expect("initial response output");
+        binding.detach(key, &commands);
+        let (replacement_commands, mut replacement_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                key.underlay,
+                key.path_id,
+                replacement_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(MuxLimits::default()),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+
+        assert!(matches!(
+            binding.try_enqueue_repair_frame_for_target(
+                &stale_target,
+                &stream_data_frame(64),
+                FlowLane::Throughput,
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+        assert!(try_recv_reliable_path_command(&mut replacement_receivers).is_none());
     }
 
     #[test]
@@ -3916,8 +4927,310 @@ mod tests {
     }
 
     #[test]
+    fn tcp_response_single_stage_ack_clock_sample_preserves_startup_rate() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let window_bytes = PATH_OPEN_SCORE_BYTES;
+        let identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs.entries.first_mut().expect("TCP output");
+            entry.product_progress_rate_bps = Some(1.0);
+            entry.delivery_rate_bps = Some(1.0);
+            let identity = (entry.key, entry.incarnation);
+            let mut calibration = ResponseAckClockCalibrationState::new(
+                (2 * window_bytes) as u64,
+                (2 * window_bytes) as u64,
+            );
+            calibration.spent_bytes = (2 * window_bytes) as u64;
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            outputs.active_ack_clock_calibration = Some(identity);
+            identity
+        };
+        binding.record_owner_flight(key, &stream_data_frame_at(0, window_bytes));
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(window_bytes as u64, window_bytes),
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: window_bytes as u64,
+        }]);
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            assert!(
+                !outputs
+                    .ack_clock_calibrations
+                    .get(&identity)
+                    .expect("calibration state")
+                    .proven,
+                "the first send-to-ACK window remains provisional"
+            );
+            assert_eq!(outputs.active_ack_clock_calibration, Some(identity));
+        }
+
+        std::thread::sleep(Duration::from_millis(2));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: window_bytes as u64,
+            end: (2 * window_bytes) as u64,
+        }]);
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs.entries.first().expect("TCP output");
+        assert!(
+            outputs
+                .ack_clock_calibrations
+                .get(&identity)
+                .expect("calibration state")
+                .proven,
+            "the later window was already in flight at the previous ACK"
+        );
+        assert_eq!(entry.delivery_rate_bps, Some(1.0));
+        assert_eq!(entry.product_progress_rate_bps, Some(1.0));
+        assert_eq!(
+            outputs
+                .ack_clock_calibrations
+                .get(&identity)
+                .expect("calibration state")
+                .calibrated_rate_bps,
+            None,
+            "one compressed stage sample cannot replace the startup rate"
+        );
+        assert_eq!(outputs.active_ack_clock_calibration, None);
+    }
+
+    #[test]
+    fn tcp_response_robust_calibration_replaces_poisoned_rate_and_keeps_rtt_updates() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs.entries.first_mut().expect("TCP output");
+            entry.product_progress_rate_bps = Some(7_000_000_000.0);
+            entry.delivery_rate_bps = Some(7_000_000_000.0);
+            entry.srtt_ms = Some(10.0);
+            let identity = (entry.key, entry.incarnation);
+            let initial = PATH_OPEN_SCORE_BYTES as u64;
+            let mut calibration = ResponseAckClockCalibrationState::new(initial, 4 * initial);
+            for sample_bps in [90_000_000.0, 7_000_000_000.0, 110_000_000.0] {
+                calibration.spent_bytes = calibration.credit_limit_bytes;
+                let stage_authorized_at = calibration.stage_authorized_at;
+                let sample = test_ack_clock_rate_sample(
+                    calibration.stage_rate_coverage_floor_bytes,
+                    sample_bps,
+                );
+                let _ = calibration.record_ack_clock_sample(
+                    sample,
+                    stage_authorized_at + Duration::from_millis(1),
+                    stage_authorized_at + Duration::from_millis(10),
+                );
+            }
+            assert_test_rate_close(calibration.calibrated_rate_bps, 110_000_000.0);
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            identity
+        };
+        let sample_bytes = 4096;
+        binding.record_owner_flight(key, &stream_data_frame_at(0, sample_bytes));
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: sample_bytes as u64,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| (entry.key, entry.incarnation) == identity)
+            .expect("TCP output");
+        assert_test_rate_close(entry.product_progress_rate_bps, 110_000_000.0);
+        assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
+        assert_eq!(entry.srtt_ms, Some(10.0));
+        drop(outputs);
+
+        let rtt_sample_bytes = PATH_OPEN_SCORE_BYTES;
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(sample_bytes as u64, rtt_sample_bytes),
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: sample_bytes as u64,
+            end: sample_bytes as u64 + rtt_sample_bytes as u64,
+        }]);
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| (entry.key, entry.incarnation) == identity)
+            .expect("TCP output");
+        assert_test_rate_close(entry.product_progress_rate_bps, 110_000_000.0);
+        assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
+        assert!(
+            entry
+                .srtt_ms
+                .is_some_and(|srtt_ms| (srtt_ms - 10.0).abs() > f64::EPSILON),
+            "RTT observation remains independent from robust rate calibration"
+        );
+    }
+
+    #[test]
+    fn tcp_response_active_calibration_remainder_honors_state_boundaries() {
+        let (binding, _key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let stage_limit = (2 * 1024 * 1024) as u64;
+        let residual = 4032_u64;
+        let identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs.entries.first().expect("TCP output");
+            let identity = (entry.key, entry.incarnation);
+            let mut calibration =
+                ResponseAckClockCalibrationState::new(stage_limit, 4 * stage_limit);
+            calibration.spent_bytes = stage_limit - residual;
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            outputs.active_ack_clock_calibration = Some(identity);
+            identity
+        };
+
+        assert_eq!(
+            binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            Some(residual as usize),
+        );
+
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .ack_clock_calibrations
+                .get_mut(&identity)
+                .expect("calibration state")
+                .spent_bytes = stage_limit;
+        }
+        assert_eq!(
+            binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            None,
+            "an exhausted stage returns to Service while it awaits ACK evidence",
+        );
+
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let calibration = outputs
+                .ack_clock_calibrations
+                .get_mut(&identity)
+                .expect("calibration state");
+            calibration.spent_bytes = stage_limit - 1;
+        }
+        assert_eq!(
+            binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            Some(1),
+            "a one-byte residual must not be expanded to a minimum quantum",
+        );
+
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs
+                .ack_clock_calibrations
+                .get_mut(&identity)
+                .expect("calibration state")
+                .proven = true;
+        }
+        assert_eq!(
+            binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            None
+        );
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let calibration = outputs
+                .ack_clock_calibrations
+                .get_mut(&identity)
+                .expect("calibration state");
+            calibration.proven = false;
+            calibration.retired = true;
+        }
+        assert_eq!(
+            binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            None
+        );
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs.active_ack_clock_calibration = Some((
+                CarrierPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    path_id: PathId(99),
+                },
+                99,
+            ));
+        }
+        assert_eq!(
+            binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            None
+        );
+
+        let (udp_binding, _udp_key) = binding_for_underlay(UnderlayProtocol::Udp);
+        {
+            let mut outputs = udp_binding
+                .outputs
+                .lock()
+                .expect("test response outputs lock");
+            let entry = outputs.entries.first().expect("UDP output");
+            let identity = (entry.key, entry.incarnation);
+            outputs.ack_clock_calibrations.insert(
+                identity,
+                ResponseAckClockCalibrationState::new(stage_limit, 4 * stage_limit),
+            );
+            outputs.active_ack_clock_calibration = Some(identity);
+        }
+        assert_eq!(
+            udp_binding.active_tcp_ack_clock_calibration_remaining_bytes(),
+            None,
+            "QUIC/UDP product frames stay under the carrier-local controller",
+        );
+    }
+
+    #[test]
+    fn tcp_response_mixed_pre_and_post_ack_window_does_not_advance_calibration() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let window_bytes = PATH_OPEN_SCORE_BYTES;
+        let identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs.entries.first().expect("TCP output");
+            let identity = (entry.key, entry.incarnation);
+            let mut calibration = ResponseAckClockCalibrationState::new(
+                (2 * window_bytes) as u64,
+                (2 * window_bytes) as u64,
+            );
+            calibration.spent_bytes = (2 * window_bytes) as u64;
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            outputs.active_ack_clock_calibration = Some(identity);
+            identity
+        };
+        binding.record_owner_flight(key, &stream_data_frame_at(0, window_bytes));
+        binding.record_owner_flight(key, &stream_data_frame_at(window_bytes as u64, 1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: window_bytes as u64,
+        }]);
+
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(window_bytes as u64 + 1, window_bytes.saturating_sub(1)),
+        );
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: window_bytes as u64,
+            end: (2 * window_bytes) as u64,
+        }]);
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let calibration = outputs
+            .ack_clock_calibrations
+            .get(&identity)
+            .expect("calibration state");
+        assert_eq!(calibration.calibrated_rate_bps, None);
+        assert!(!calibration.proven);
+        assert_eq!(
+            outputs.active_ack_clock_calibration, None,
+            "a terminal stage without causal evidence retires after exact flights drain"
+        );
+    }
+
+    #[test]
     fn cumulative_unique_owner_acks_graduate_tcp_but_not_udp_without_carrier_evidence() {
-        let sample_bytes = response_subflow_startup_sample_limit_bytes(MuxLimits::default());
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(MuxLimits::default());
         let frame_bytes = BBR_MAX_SEND_QUANTUM_BYTES as u64;
         assert_eq!(sample_bytes % frame_bytes, 0);
 
@@ -3947,8 +5260,358 @@ mod tests {
     }
 
     #[test]
+    fn tcp_response_startup_ack_graduates_epoch_and_admits_next_candidate() {
+        let limits = MuxLimits::default();
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(limits) as usize;
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let first = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let second = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(2),
+        };
+        let (first_commands, _first_receivers) = reliable_path_command_channels(8);
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                first.underlay,
+                first.path_id,
+                first_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert_eq!(
+            binding.attach(
+                second.underlay,
+                second.path_id,
+                second_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let startup_input = |key| SubflowAdmissionInput {
+            key,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: sample_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input(first),
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input(second),
+                )
+                .decision,
+            PathAdmissionDecision::ProbeOnly,
+            "only one unproven response candidate may own startup bytes"
+        );
+        let generation_before_ack = binding.subflow_state_snapshot().0;
+        binding.record_owner_flight(first, &stream_data_frame(sample_bytes));
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: sample_bytes as u64,
+        }]);
+
+        let (generation_after_ack, epoch) = binding.subflow_state_snapshot();
+        assert_ne!(generation_after_ack, generation_before_ack);
+        assert_eq!(
+            epoch.as_ref().and_then(FlowSubflowSet::startup_owner_key),
+            None,
+            "exact TCP OwnerData ACK evidence should graduate the sampled response path"
+        );
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == first)
+                .expect("graduated TCP output remains attached");
+            assert!(
+                outputs
+                    .ack_clock_calibrations
+                    .contains_key(&(entry.key, entry.incarnation)),
+                "TCP graduation creates an exact-incarnation ACK-clock phase"
+            );
+        }
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input(second),
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        assert_eq!(
+            binding
+                .subflow_state_snapshot()
+                .1
+                .and_then(|epoch| epoch.startup_owner_key()),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn tcp_response_graduation_skips_calibration_below_ack_sample_resource_floor() {
+        let limits = MuxLimits {
+            max_path_flight_bytes: PATH_OPEN_SCORE_BYTES - 1,
+            ..MuxLimits::default()
+        };
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(limits) as usize;
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(43),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            limits,
+        );
+        let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        key: candidate,
+                        bulk_rate_proven: false,
+                        startup_owner_allowed: true,
+                        frontier_clear: true,
+                        completion_improves: false,
+                        observed_goodput_non_degrading: true,
+                        read_gap: Duration::ZERO,
+                        owner_bytes: sample_bytes,
+                        optional_overhead_bytes: 0,
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output");
+            mark_test_response_output_bulk_proven(entry, limits);
+        }
+
+        assert!(binding.graduate_bulk_proven_response_startup_owner());
+        let candidate_target = binding
+            .sender_path_targets(FlowLane::Throughput, 1)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("graduated candidate target");
+        assert!(!candidate_target.ack_clock_calibration_eligible);
+    }
+
+    #[test]
+    fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
+        let limits = MuxLimits::default();
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(limits) as usize;
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
+        let first = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let second = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(2),
+        };
+        let (first_commands, _first_receivers) = reliable_path_command_channels(8);
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                first.underlay,
+                first.path_id,
+                first_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert_eq!(
+            binding.attach(
+                second.underlay,
+                second.path_id,
+                second_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let startup_input = |key| SubflowAdmissionInput {
+            key,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: sample_bytes,
+            optional_overhead_bytes: 0,
+        };
+
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input(first),
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        let generation_before_ack = binding.subflow_state_snapshot().0;
+        binding.record_owner_flight(first, &stream_data_frame(sample_bytes));
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: sample_bytes as u64,
+        }]);
+
+        let (generation_after_ack, epoch) = binding.subflow_state_snapshot();
+        assert_eq!(generation_after_ack, generation_before_ack);
+        assert_eq!(
+            epoch.as_ref().and_then(FlowSubflowSet::startup_owner_key),
+            Some(first),
+            "UDP product ACKs alone must not graduate a QUIC response Subflow"
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input(second),
+                )
+                .decision,
+            PathAdmissionDecision::ProbeOnly
+        );
+
+        binding.update_path_metrics(
+            first,
+            PathMetrics {
+                path_id: first.path_id,
+                underlay: first.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 80_000,
+                srtt_us: 80_000,
+                rttvar_us: 5_000,
+                jitter_us: 5_000,
+                delivery_rate_bps: 200_000_000,
+                pacing_rate_bps: 200_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: sample_bytes as u64,
+                inflight_hi_bytes: sample_bytes as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                data_sample_bytes: sample_bytes as u64,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+
+        let (generation_after_carrier_proof, epoch) = binding.subflow_state_snapshot();
+        assert_ne!(generation_after_carrier_proof, generation_after_ack);
+        assert_eq!(
+            epoch.as_ref().and_then(FlowSubflowSet::startup_owner_key),
+            None
+        );
+        assert!(
+            binding
+                .outputs
+                .lock()
+                .expect("test response outputs lock")
+                .ack_clock_calibrations
+                .is_empty(),
+            "UDP/QUIC graduation remains carrier-owned and never enters TCP calibration"
+        );
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input(second),
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+    }
+
+    #[test]
     fn duplicate_response_validation_copy_does_not_become_ordering_owner() {
-        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Udp);
+        let (binding, owner) = binding_for_underlay(UnderlayProtocol::Tcp);
         let duplicate = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(1),
@@ -3966,6 +5629,22 @@ mod tests {
 
         binding.record_owner_flight(owner, &frame);
         binding.record_repair_flight(duplicate, &frame);
+        let owner_identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == owner)
+                .expect("owner output exists");
+            let identity = (entry.key, entry.incarnation);
+            let mut calibration = ResponseAckClockCalibrationState::new(
+                PATH_OPEN_SCORE_BYTES as u64,
+                PATH_OPEN_SCORE_BYTES as u64,
+            );
+            calibration.spent_bytes = PATH_OPEN_SCORE_BYTES as u64;
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            identity
+        };
 
         let lower = binding.lower_flights_before_offset(4096);
         assert!(
@@ -4000,6 +5679,15 @@ mod tests {
         );
         assert_eq!(owner_entry.owner_data_acked_bytes, 0);
         assert_eq!(duplicate_entry.owner_data_acked_bytes, 0);
+        assert!(
+            entries
+                .ack_clock_calibrations
+                .get(&owner_identity)
+                .expect("owner calibration state")
+                .rate_evidence
+                .is_none(),
+            "ambiguous OwnerData/RepairData ACKs cannot advance the TCP ACK clock"
+        );
     }
 
     #[test]
@@ -4275,6 +5963,142 @@ mod tests {
             input,
         );
         assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
+    }
+
+    #[test]
+    fn response_semantic_reset_retires_partial_ack_clock_credit_without_refill() {
+        let mux_limits = MuxLimits::default();
+        let (binding, _service) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(mux_limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
+        let spent_bytes = initial_limit / 2;
+        let identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output");
+            let identity = (entry.key, entry.incarnation);
+            let mut calibration = ResponseAckClockCalibrationState::new(
+                initial_limit,
+                reliable_ack_clock_calibration_ceiling_bytes(mux_limits),
+            );
+            calibration.spent_bytes = spent_bytes;
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            outputs.active_ack_clock_calibration = Some(identity);
+            identity
+        };
+
+        binding.reset_subflow_set();
+
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let calibration = outputs
+            .ack_clock_calibrations
+            .get(&identity)
+            .expect("retired calibration tombstone");
+        assert_eq!(calibration.spent_bytes, spent_bytes);
+        assert_eq!(calibration.credit_limit_bytes, spent_bytes);
+        assert_eq!(calibration.max_limit_bytes, spent_bytes);
+        assert_eq!(outputs.active_ack_clock_calibration, None);
+        drop(outputs);
+
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, 1)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("retired candidate target");
+        assert_eq!(
+            target.ack_clock_calibration_spent_bytes, target.ack_clock_calibration_max_limit_bytes,
+            "selection sees an exhausted tombstone instead of refilled credit"
+        );
+    }
+
+    #[test]
+    fn response_semantic_reset_keeps_retired_active_identity_until_owner_flight_drains() {
+        let mux_limits = MuxLimits::default();
+        let (binding, _service) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(mux_limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let frame = stream_data_frame_at(0, 4096);
+        let identity = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output");
+            let identity = (entry.key, entry.incarnation);
+            let mut calibration = ResponseAckClockCalibrationState::new(
+                reliable_ack_clock_calibration_limit_bytes(mux_limits),
+                reliable_ack_clock_calibration_ceiling_bytes(mux_limits),
+            );
+            calibration.spent_bytes = 4096;
+            outputs.ack_clock_calibrations.insert(identity, calibration);
+            outputs.active_ack_clock_calibration = Some(identity);
+            identity
+        };
+        binding.record_owner_flight(candidate, &frame);
+
+        binding.reset_subflow_set();
+
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            assert_eq!(outputs.active_ack_clock_calibration, Some(identity));
+            let calibration = outputs
+                .ack_clock_calibrations
+                .get(&identity)
+                .expect("retired calibration state");
+            assert_eq!(calibration.spent_bytes, calibration.max_limit_bytes);
+        }
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, 1)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("retired candidate target");
+        assert!(target.ack_clock_calibration_active);
+
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: 4096,
+        }]);
+        assert_eq!(
+            binding
+                .outputs
+                .lock()
+                .expect("test response outputs lock")
+                .active_ack_clock_calibration,
+            None
+        );
     }
 
     #[test]
@@ -4694,6 +6518,285 @@ mod tests {
     }
 
     #[test]
+    fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = PATH_OPEN_SCORE_BYTES;
+        let session_id = SessionId(190);
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let mut second_flow = Some(ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(9),
+            second_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        ));
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 2);
+
+        let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(1);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+
+        let (service_incarnation, candidate_incarnation) = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            for entry in &mut outputs.entries {
+                if entry.key == service || entry.key == candidate {
+                    mark_test_response_output_bulk_proven(entry, mux_limits);
+                }
+            }
+            let service_incarnation = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == service)
+                .expect("service output")
+                .incarnation;
+            let candidate_incarnation = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output")
+                .incarnation;
+            outputs.ack_clock_calibrations.insert(
+                (candidate, candidate_incarnation),
+                ResponseAckClockCalibrationState::new(
+                    reliable_ack_clock_calibration_limit_bytes(mux_limits),
+                    reliable_ack_clock_calibration_ceiling_bytes(mux_limits),
+                ),
+            );
+            (service_incarnation, candidate_incarnation)
+        };
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    payload_bytes,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        key: candidate,
+                        bulk_rate_proven: true,
+                        startup_owner_allowed: false,
+                        frontier_clear: true,
+                        completion_improves: true,
+                        observed_goodput_non_degrading: true,
+                        read_gap: Duration::ZERO,
+                        owner_bytes: payload_bytes,
+                        optional_overhead_bytes: 0,
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("candidate target");
+        let request_for = |binding: &ResponseStreamBinding| {
+            let (expected_planner_generation, _) = binding.subflow_state_snapshot();
+            ResponseAckClockCalibrationRequest {
+                expected_planner_generation,
+                expected_lane_generation: binding.lane_generation(),
+                service,
+                service_incarnation,
+                limit_bytes: reliable_ack_clock_calibration_limit_bytes(mux_limits),
+            }
+        };
+        let frame = stream_data_frame(payload_bytes);
+
+        let stale = request_for(&binding);
+        binding.invalidate_subflow_plan();
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(stale),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+
+        let stale_lane = request_for(&binding);
+        drop(second_flow.take());
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 1);
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(stale_lane),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+        second_flow = Some(ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(9),
+            replacement_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker,
+        ));
+        assert_eq!(binding.lane_generation_and_active_response_flows().1, 2);
+
+        let stale_stage = request_for(&binding);
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let calibration = outputs
+                .ack_clock_calibrations
+                .get_mut(&(candidate, candidate_incarnation))
+                .expect("candidate calibration state");
+            calibration.spent_bytes = calibration.credit_limit_bytes;
+            let stage_authorized_at = calibration.stage_authorized_at;
+            let sample = test_ack_clock_rate_sample(
+                calibration.stage_rate_coverage_floor_bytes,
+                10_000_000.0,
+            );
+            assert!(calibration.record_ack_clock_sample(
+                sample,
+                stage_authorized_at,
+                stage_authorized_at + Duration::from_millis(1),
+            ));
+        }
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(stale_stage),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            outputs.ack_clock_calibrations.insert(
+                (candidate, candidate_incarnation),
+                ResponseAckClockCalibrationState::new(
+                    reliable_ack_clock_calibration_limit_bytes(mux_limits),
+                    reliable_ack_clock_calibration_ceiling_bytes(mux_limits),
+                ),
+            );
+        }
+
+        candidate_commands
+            .try_enqueue_stream_ordered_frame(
+                stream_data_frame_at(payload_bytes as u64, payload_bytes),
+                FlowLane::Throughput,
+            )
+            .expect("fill candidate queue");
+        let fresh = request_for(&binding);
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(fresh),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            assert_eq!(
+                outputs
+                    .ack_clock_calibrations
+                    .get(&(candidate, candidate_incarnation))
+                    .expect("candidate calibration state")
+                    .spent_bytes,
+                0,
+                "blocked enqueue restores cumulative calibration credit"
+            );
+            assert_eq!(outputs.active_ack_clock_calibration, None);
+        }
+        assert!(try_recv_reliable_path_command(&mut candidate_receivers).is_some());
+
+        binding
+            .try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(request_for(&binding)),
+            )
+            .expect("fresh exact calibration reservation enqueues");
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            assert_eq!(
+                outputs
+                    .ack_clock_calibrations
+                    .get(&(candidate, candidate_incarnation))
+                    .expect("candidate calibration state")
+                    .spent_bytes,
+                payload_bytes as u64
+            );
+            assert_eq!(
+                outputs.active_ack_clock_calibration,
+                Some((candidate, candidate_incarnation))
+            );
+        }
+
+        binding.detach(candidate, &candidate_commands);
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(request_for(&binding)),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert!(
+            binding
+                .outputs
+                .lock()
+                .expect("test response outputs lock")
+                .ack_clock_calibrations
+                .get(&(candidate, candidate_incarnation))
+                .is_none(),
+            "detach removes exact-incarnation calibration state"
+        );
+        drop(second_flow);
+    }
+
+    #[test]
     fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -4787,6 +6890,7 @@ mod tests {
                 &frame_for_sender,
                 FlowLane::Throughput,
                 Some(request),
+                None,
                 || {
                     reserved_tx
                         .send(())
@@ -6176,6 +8280,32 @@ mod tests {
         assert!(
             snapshot.delivery_rate_bps < startup_rate * 0.5,
             "startup/default rate is only a hint; persistent local delivery samples must correct it downward"
+        );
+    }
+
+    #[test]
+    fn fixed_output_request_active_snapshot_preserves_send_path_timing() {
+        let mux_limits = MuxLimits::default();
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 123.0, 8_000_000.0);
+        let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
+        let send_snapshot = output
+            .send_path_snapshot(FlowLane::Latency, PATH_OPEN_SCORE_BYTES)
+            .expect("fixed output has a send path snapshot");
+        let request_active_snapshot = output
+            .request_active_path_snapshot(FlowLane::Latency)
+            .expect("fixed output has a request Active path snapshot");
+
+        assert_eq!(request_active_snapshot.id, send_snapshot.id);
+        assert_eq!(request_active_snapshot.underlay, send_snapshot.underlay);
+        assert_eq!(request_active_snapshot.srtt_ms, send_snapshot.srtt_ms);
+        assert_eq!(
+            reliable_stream_recv_progress_interval(
+                Some(request_active_snapshot),
+                FlowLane::Latency,
+            ),
+            reliable_stream_recv_progress_interval(Some(send_snapshot), FlowLane::Latency),
+            "fixed-path replay cadence must remain unchanged"
         );
     }
 }

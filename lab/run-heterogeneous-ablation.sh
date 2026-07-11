@@ -70,6 +70,9 @@ tcp_echo_interval_ms="${TCP_ECHO_INTERVAL_MS:-500}"
 tcp_upload_target_port="${TCP_UPLOAD_TARGET_PORT:-10023}"
 tcp_sink_progress_file="/dev/shm/mptunnel-tcp-sink-progress.json"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
+failover_fat_tx_trigger_bytes="${MPTUNNEL_LAB_FAILOVER_FAT_TX_TRIGGER_BYTES:-0}"
+failover_trigger_timeout_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_TIMEOUT_SECONDS:-60}"
+failover_trigger_poll_interval_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_POLL_INTERVAL_SECONDS:-0.02}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
@@ -81,6 +84,9 @@ lab_perf_samples="${MPTUNNEL_LAB_PERF_SAMPLES:-0}"
 lab_perf_interval_ms="${MPTUNNEL_LAB_PERF_INTERVAL_MS:-1000}"
 container_stats="${MPTUNNEL_LAB_CONTAINER_STATS:-1}"
 container_stats_interval="${MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS:-1}"
+management_snapshots="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS:-0}"
+management_snapshot_interval="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOT_INTERVAL_SECONDS:-1}"
+management_snapshot_port="${MPTUNNEL_LAB_MANAGEMENT_PORT:-17600}"
 fail_on_bad_status="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}"
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
 case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
@@ -141,6 +147,7 @@ flapper_restore_exit_code=""
 active_telemetry_case=""
 active_telemetry_pid=""
 case_telemetry_pid=""
+case_management_pid=""
 
 scale_lab_netem_value() {
   python3 - "$1" "$2" <<'PY'
@@ -370,8 +377,19 @@ validate_mptunnel_config_in() {
   exec_in "$service" "/workspace/target/release/mptunnel --config '$path' --check-config"
 }
 
+management_config_toml() {
+  if ! flag_enabled "$management_snapshots"; then
+    return 0
+  fi
+  if [[ ! "$management_snapshot_port" =~ ^[0-9]+$ ]] || (( management_snapshot_port < 1 || management_snapshot_port > 65535 )); then
+    echo "MPTUNNEL_LAB_MANAGEMENT_PORT must be an integer from 1 through 65535" >&2
+    return 2
+  fi
+  printf '[management]\nlisten = ["127.0.0.1:%s"]\n' "$management_snapshot_port"
+}
+
 server_config_toml() {
-  local log_level_json secret_json endpoints resources
+  local log_level_json secret_json endpoints resources management
   log_level_json="$(toml_string "$lab_log_level")"
   secret_json="$(toml_string "$secret")"
   endpoints="$(toml_array_from_args \
@@ -386,13 +404,17 @@ server_config_toml() {
     "udp://172.31.20.20:${server_port}" \
     "udp://172.31.30.20:${server_port}")"
   resources="$(resource_config_toml)"
+  management="$(management_config_toml)"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
+  fi
+  if [[ -n "$management" ]]; then
+    management="${management}"$'\n'
   fi
   cat <<EOF
 log_level = ${log_level_json}
 
-${resources}[[inbounds]]
+${resources}${management}[[inbounds]]
 tag = "lab-mpp-in"
 protocol = "mpp"
 endpoints = ${endpoints}
@@ -409,23 +431,27 @@ EOF
 
 socks_client_config_toml() {
   local path_args="$1"
-  local log_level_json secret_json listen endpoints resources probe
+  local log_level_json secret_json listen endpoints resources probe management
   log_level_json="$(toml_string "$lab_log_level")"
   secret_json="$(toml_string "$secret")"
   listen="$(toml_array_from_args "127.0.0.1:${proxy_port}")"
   endpoints="$(path_args_to_endpoint_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
+  management="$(management_config_toml)"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
   fi
   if [[ -n "$probe" ]]; then
     probe="${probe}"$'\n'
   fi
+  if [[ -n "$management" ]]; then
+    management="${management}"$'\n'
+  fi
   cat <<EOF
 log_level = ${log_level_json}
 
-${resources}[[inbounds]]
+${resources}${management}[[inbounds]]
 tag = "lab-socks"
 protocol = "socks5"
 listen = ${listen}
@@ -443,22 +469,26 @@ EOF
 
 tun_client_config_toml() {
   local path_args="$1"
-  local log_level_json secret_json endpoints resources probe
+  local log_level_json secret_json endpoints resources probe management
   log_level_json="$(toml_string "$lab_log_level")"
   secret_json="$(toml_string "$secret")"
   endpoints="$(path_args_to_endpoint_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
+  management="$(management_config_toml)"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
   fi
   if [[ -n "$probe" ]]; then
     probe="${probe}"$'\n'
   fi
+  if [[ -n "$management" ]]; then
+    management="${management}"$'\n'
+  fi
   cat <<EOF
 log_level = ${log_level_json}
 
-${resources}[[inbounds]]
+${resources}${management}[[inbounds]]
 tag = "lab-tun"
 protocol = "tun"
 outbound = "lab-mpp-out"
@@ -486,10 +516,20 @@ telemetry_file_for_case() {
   printf '%s/container-stats-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
 }
 
+management_snapshot_file_for_case() {
+  local case_name="$1"
+  printf '%s/management-snapshots-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
+}
+
 netdev_snapshot_file_for_case() {
   local case_name="$1"
   local phase="$2"
   printf '%s/netdev-%s-%s.json' "$result_dir" "$(case_artifact_name "$case_name")" "$phase"
+}
+
+failover_trigger_file_for_case() {
+  local case_name="$1"
+  printf '%s/failover-trigger-%s.json' "$result_dir" "$(case_artifact_name "$case_name")"
 }
 
 telemetry_stop_file_for_case() {
@@ -504,6 +544,10 @@ telemetry_enabled() {
   esac
 }
 
+management_snapshots_enabled() {
+  flag_enabled "$management_snapshots"
+}
+
 log_collection_enabled() {
   case "$collect_logs" in
     0|false|FALSE|no|NO) return 1 ;;
@@ -514,41 +558,68 @@ log_collection_enabled() {
 start_case_telemetry() {
   local case_name="$1"
   case_telemetry_pid=""
-  if ! telemetry_enabled; then
+  case_management_pid=""
+  if ! telemetry_enabled && ! management_snapshots_enabled; then
     return 0
   fi
-  local telemetry_file stop_file before_file after_file
+  local telemetry_file management_file stop_file before_file after_file
   telemetry_file="$(telemetry_file_for_case "$case_name")"
+  management_file="$(management_snapshot_file_for_case "$case_name")"
   stop_file="$(telemetry_stop_file_for_case "$case_name")"
   before_file="$(netdev_snapshot_file_for_case "$case_name" before)"
   after_file="$(netdev_snapshot_file_for_case "$case_name" after)"
-  rm -f "$telemetry_file" "$stop_file" "$before_file" "$after_file"
-  python3 "$script_dir/container_stats.py" snapshot \
-    --compose-file "$compose_file" \
-    > "$before_file" 2>/dev/null || true
-  python3 "$script_dir/container_stats.py" sample \
-    --compose-file "$compose_file" \
-    --case "$case_name" \
-    --output "$telemetry_file" \
-    --stop-file "$stop_file" \
-    --interval "$container_stats_interval" \
-    >/dev/null 2>&1 &
-  case_telemetry_pid="$!"
+  rm -f "$telemetry_file" "$management_file" "$stop_file" "$before_file" "$after_file"
+  if telemetry_enabled; then
+    python3 "$script_dir/container_stats.py" snapshot \
+      --compose-file "$compose_file" \
+      > "$before_file" 2>/dev/null || true
+    python3 "$script_dir/container_stats.py" sample \
+      --compose-file "$compose_file" \
+      --case "$case_name" \
+      --output "$telemetry_file" \
+      --stop-file "$stop_file" \
+      --interval "$container_stats_interval" \
+      >/dev/null 2>&1 &
+    case_telemetry_pid="$!"
+  fi
+  if management_snapshots_enabled; then
+    python3 "$script_dir/management_snapshots.py" \
+      --compose-file "$compose_file" \
+      --case "$case_name" \
+      --output "$management_file" \
+      --stop-file "$stop_file" \
+      --interval "$management_snapshot_interval" \
+      --port "$management_snapshot_port" \
+      >/dev/null 2>&1 &
+    case_management_pid="$!"
+  fi
+  active_telemetry_case="$case_name"
+  active_telemetry_pid="$case_telemetry_pid"
 }
 
 stop_case_telemetry() {
   local case_name="$1"
   local sampler_pid="${2:-}"
-  if ! telemetry_enabled; then
+  if ! telemetry_enabled && ! management_snapshots_enabled; then
     return 0
   fi
   touch "$(telemetry_stop_file_for_case "$case_name")" >/dev/null 2>&1 || true
   if [[ -n "$sampler_pid" ]]; then
     wait "$sampler_pid" >/dev/null 2>&1 || true
   fi
-  python3 "$script_dir/container_stats.py" snapshot \
-    --compose-file "$compose_file" \
-    > "$(netdev_snapshot_file_for_case "$case_name" after)" 2>/dev/null || true
+  if [[ -n "$case_management_pid" ]]; then
+    wait "$case_management_pid" >/dev/null 2>&1 || true
+    case_management_pid=""
+  fi
+  if telemetry_enabled; then
+    python3 "$script_dir/container_stats.py" snapshot \
+      --compose-file "$compose_file" \
+      > "$(netdev_snapshot_file_for_case "$case_name" after)" 2>/dev/null || true
+  fi
+  if [[ "$active_telemetry_case" == "$case_name" ]]; then
+    active_telemetry_case=""
+    active_telemetry_pid=""
+  fi
 }
 
 case_telemetry_summary() {
@@ -1161,6 +1232,36 @@ apply_netem() {
 apply_failover_blackhole() {
   exec_netem client blackhole-fat
   exec_netem server blackhole-fat
+}
+
+mark_client_failover_injection() {
+  local marker_file="$1"
+  exec_in client "python3 -c 'import time; print(time.monotonic())' > '${marker_file}'"
+}
+
+wait_for_tcp_download_failover_trigger() {
+  local case_name="$1"
+  local marker_file="$2"
+  local trigger_file trigger_output trigger_status
+  trigger_file="$(failover_trigger_file_for_case "$case_name")"
+  rm -f "$trigger_file"
+  if [[ "$failover_fat_tx_trigger_bytes" == "0" ]]; then
+    sleep "$failover_after"
+  else
+    set +e
+    trigger_output="$(
+      exec_in server "python3 /workspace/lab/wait_interface_counter.py --address 172.31.20.20 --counter tx_bytes --delta-bytes '${failover_fat_tx_trigger_bytes}' --min-wait '${failover_after}' --timeout '${failover_trigger_timeout_seconds}' --interval '${failover_trigger_poll_interval_seconds}'"
+    )"
+    trigger_status="$?"
+    set -e
+    printf '%s\n' "$trigger_output" > "$trigger_file"
+    if [[ "$trigger_status" != "0" ]]; then
+      case_log_artifacts_summary "$case_name" >/dev/null || true
+      echo "fat-path payload trigger failed for ${case_name}: ${trigger_output}" >&2
+      return "$trigger_status"
+    fi
+  fi
+  mark_client_failover_injection "$marker_file"
 }
 
 apply_latency_spike_fat() {
@@ -2128,13 +2229,18 @@ run_failover_case() {
   local output exit_code
   local telemetry_pid
   local started_file="/tmp/mptunnel-failover.started"
+  local failover_marker_file="/tmp/mptunnel-failover.trigger"
+  local probe_failover_after="$failover_after"
+  if [[ "$failover_fat_tx_trigger_bytes" != "0" ]]; then
+    probe_failover_after="-1"
+  fi
   start_client "$case_name" "$tcp_all"
-  exec_in client "rm -f /tmp/mptunnel-failover.out /tmp/mptunnel-failover.status /tmp/mptunnel-failover.pid '${started_file}'"
+  exec_in client "rm -f /tmp/mptunnel-failover.out /tmp/mptunnel-failover.status /tmp/mptunnel-failover.pid '${started_file}' '${failover_marker_file}'"
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
+  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${probe_failover_after}' --failover-marker-file '${failover_marker_file}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
-  sleep "$failover_after"
+  wait_for_tcp_download_failover_trigger "$case_name" "$failover_marker_file"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-failover.status ]; then echo 124 >/tmp/mptunnel-failover.status; fi"
   stop_case_telemetry "$case_name" "$telemetry_pid"

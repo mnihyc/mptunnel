@@ -58,6 +58,9 @@ pub(super) struct ReliableRelayRemotePath {
     pub(super) instance_id: u64,
     pub(super) placement: RelayPathPlacement,
     pub(super) load_reserved: bool,
+    pub(super) attached_at: Instant,
+    pub(super) path_proof_id: Option<u64>,
+    pub(super) path_proof_generation: u64,
     pub(super) stream: ReliablePathStreamHandle,
 }
 
@@ -88,6 +91,7 @@ pub(super) struct ReliableRelayRemoteSet {
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
     next_instance_id: u64,
+    membership_generation: u64,
 }
 
 impl ReliableRelayRemoteSet {
@@ -100,6 +104,7 @@ impl ReliableRelayRemoteSet {
             frames_tx,
             frames_rx,
             next_instance_id: 0,
+            membership_generation: 0,
         };
         set.attach(opened);
         set
@@ -107,6 +112,10 @@ impl ReliableRelayRemoteSet {
 
     pub(super) fn stream_id(&self) -> StreamId {
         self.stream_id
+    }
+
+    pub(super) fn membership_generation(&self) -> u64 {
+        self.membership_generation
     }
 
     pub(super) fn primary_path_key(&self) -> Option<RelayPathKey> {
@@ -143,10 +152,21 @@ impl ReliableRelayRemoteSet {
         self.paths.iter().any(|path| path.key() == key)
     }
 
+    pub(super) fn contains_path_instance(&self, instance: RelayPathInstance) -> bool {
+        self.paths.iter().any(|path| path.instance() == instance)
+    }
+
     pub(super) fn path_keys(&self) -> Vec<RelayPathKey> {
         self.paths
             .iter()
             .map(ReliableRelayRemotePath::key)
+            .collect()
+    }
+
+    pub(super) fn path_instances(&self) -> Vec<RelayPathInstance> {
+        self.paths
+            .iter()
+            .map(ReliableRelayRemotePath::instance)
             .collect()
     }
 
@@ -186,6 +206,24 @@ impl ReliableRelayRemoteSet {
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
         for path in &mut self.paths {
             path.stream.lane = lane;
+        }
+    }
+
+    pub(super) fn retry_pending_path_proofs(&mut self, context: &ClientPathContext) {
+        for path in &mut self.paths {
+            if path.placement != RelayPathPlacement::Validation {
+                continue;
+            }
+            let generation = context
+                .relay_path_proof_generation(path.key().underlay, path.key().index)
+                .unwrap_or(path.path_proof_generation);
+            if path.path_proof_id.is_some() && path.path_proof_generation == generation {
+                continue;
+            }
+            if let Ok(Some(proof_id)) = path.stream.enqueue_path_proof() {
+                path.path_proof_id = Some(proof_id);
+                path.path_proof_generation = generation;
+            }
         }
     }
 
@@ -259,15 +297,20 @@ impl ReliableRelayRemoteSet {
                 })
                 .await;
         });
-        let path = ReliableRelayRemotePath {
+        let mut path = ReliableRelayRemotePath {
             path_index,
             instance_id,
             placement,
             load_reserved: placement == RelayPathPlacement::Active,
+            attached_at: Instant::now(),
+            path_proof_id: None,
+            path_proof_generation: 0,
             stream,
         };
         if placement == RelayPathPlacement::Validation {
-            let _ = path.stream.enqueue_path_proof();
+            if let Ok(Some(proof_id)) = path.stream.enqueue_path_proof() {
+                path.path_proof_id = Some(proof_id);
+            }
         }
         let insert_at = match placement {
             RelayPathPlacement::Active => self.paths.len(),
@@ -279,6 +322,7 @@ impl ReliableRelayRemoteSet {
             RelayPathPlacement::Repair | RelayPathPlacement::Validation => self.paths.len() - 1,
         };
         self.paths.insert(insert_at, path);
+        self.membership_generation = self.membership_generation.wrapping_add(1);
     }
 
     pub(super) async fn recv_frame(&mut self) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
@@ -345,6 +389,7 @@ impl ReliableRelayRemoteSet {
 
     pub(super) fn remove_path_at(&mut self, position: usize) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
+        self.membership_generation = self.membership_generation.wrapping_add(1);
         Some(path)
     }
 

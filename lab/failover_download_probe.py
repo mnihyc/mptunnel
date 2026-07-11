@@ -56,6 +56,28 @@ def write_started_file(path):
         handle.write(f"{time.time():.9f}\n")
 
 
+def read_failover_marker_elapsed(path, started):
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            marked_at = float(handle.read().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return max(0.0, marked_at - started)
+
+
+def watch_failover_marker(path, started, deadline, state, lock, interval=0.02):
+    while time.monotonic() < deadline:
+        elapsed = read_failover_marker_elapsed(path, started)
+        if elapsed is not None:
+            with lock:
+                state["failover_after_s"] = elapsed
+                state["failover_trigger_source"] = "marker"
+            return
+        time.sleep(interval)
+
+
 def connect_socks5(proxy, target, timeout):
     proxy_host, proxy_port = split_host_port(proxy)
     target_host, target_port = split_host_port(target)
@@ -216,6 +238,7 @@ def interval_download(args):
         "max_read_gap_s": 0.0,
         "recovery_gap_s": 0.0,
         "failover_after_s": args.failover_after,
+        "failover_trigger_source": "fixed" if args.failover_after >= 0 else "pending",
         "interval_seconds": args.interval_seconds,
         "interval_bytes": {},
         "requests": 0,
@@ -224,6 +247,15 @@ def interval_download(args):
         "failures": 0,
     }
     lock = threading.Lock()
+
+    marker_thread = None
+    if args.failover_marker_file:
+        marker_thread = threading.Thread(
+            target=watch_failover_marker,
+            args=(args.failover_marker_file, started, deadline, state, lock),
+            daemon=True,
+        )
+        marker_thread.start()
 
     def worker():
         while time.monotonic() < deadline:
@@ -251,9 +283,14 @@ def interval_download(args):
         thread.start()
     for thread in threads:
         thread.join(timeout=max(0.1, deadline - time.monotonic() + 2.0))
+    if marker_thread is not None:
+        marker_thread.join(timeout=0.1)
 
     elapsed = time.monotonic() - started
-    bytes_read = state["bytes"]
+    with lock:
+        bytes_read = state["bytes"]
+        failover_after_s = state["failover_after_s"]
+        failover_trigger_source = state["failover_trigger_source"]
     status = "ok" if bytes_read > 0 and state["failures"] == 0 else "loss" if bytes_read > 0 else "fail"
     result = {
         "case": args.label,
@@ -276,7 +313,8 @@ def interval_download(args):
         "first_body_s": round(state["first_body_at"], 6) if state["first_body_at"] is not None else None,
         "max_read_gap_s": round(state["max_read_gap_s"], 6),
         "recovery_gap_s": round(state["recovery_gap_s"], 6),
-        "failover_after_s": args.failover_after,
+        "failover_after_s": round(failover_after_s, 6),
+        "failover_trigger_source": failover_trigger_source,
     }
     result.update(interval_metric_fields(state["interval_bytes"], args.interval_seconds))
     return result
@@ -296,6 +334,7 @@ def main():
     parser.add_argument("--parallel-downloads", type=int, default=1)
     parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--started-file")
+    parser.add_argument("--failover-marker-file")
     args = parser.parse_args()
     try:
         result = interval_download(args)

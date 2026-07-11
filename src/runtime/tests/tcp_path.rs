@@ -2273,8 +2273,10 @@ fn path_proof_observation_does_not_promote_tcp_candidate_without_delivery_eviden
         UnderlayProtocol::Tcp,
         1,
         PathProofObservation {
+            proof_id: 1,
             bytes: PATH_OPEN_SCORE_BYTES as u64,
             elapsed: Duration::from_millis(20),
+            sent_at: Instant::now(),
         },
     );
 
@@ -2328,8 +2330,10 @@ fn path_proof_observation_does_not_promote_udp_candidate_without_carrier_sample(
         UnderlayProtocol::Udp,
         1,
         PathProofObservation {
+            proof_id: 2,
             bytes: PATH_OPEN_SCORE_BYTES as u64,
             elapsed: Duration::from_millis(20),
+            sent_at: Instant::now(),
         },
     );
 
@@ -2357,8 +2361,10 @@ fn path_proof_metrics_do_not_publish_probe_rate_as_bulk_capacity() {
         UnderlayProtocol::Udp,
         PathMetricDirection::ServerToClient,
         PathProofObservation {
+            proof_id: 3,
             bytes: PATH_OPEN_SCORE_BYTES as u64,
             elapsed: Duration::from_millis(500),
+            sent_at: Instant::now(),
         },
     )
     .expect("proof metrics");
@@ -3290,6 +3296,9 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
         }
         ClientQueuedDispatch::Repair { .. } => panic!("expected upload data dispatch"),
         ClientQueuedDispatch::RepairDeferred => panic!("expected upload data dispatch"),
+        ClientQueuedDispatch::PersistentRepairCancelled => {
+            panic!("expected upload data dispatch")
+        }
     }
     assert_eq!(sender_queue.data_bytes(), queued_bytes - quantum);
     assert_eq!(send_stream.next_offset(), quantum as u64);
@@ -3704,13 +3713,14 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
     let later_owner_frame = send_stream
         .send_data(Bytes::from(vec![0x44; 64]), StreamFlags::NONE)
         .expect("seed later request OwnerData on the alternate");
-    sender.record_owner_frame_for_test(
-        RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 0,
-        },
-        &later_owner_frame,
-    );
+    let later_owner_key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let later_owner_instance = remotes
+        .path_instance_for_key(later_owner_key)
+        .expect("live alternate owner instance");
+    sender.record_owner_frame_for_test(later_owner_instance, &later_owner_frame);
     let ack_ranges = [OffsetRange { start: 0, end: 128 }];
     let _ = send_stream.apply_ack(&ack_ranges);
     sender.release_normalized_acked_ranges(&context, &ack_ranges);
@@ -4167,7 +4177,7 @@ async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
             FlowLane::Latency,
             &mut remotes,
             &mut send_stream,
-            failed_key,
+            failed_instance,
         )
         .await
         .expect("recover on Repair survivor"),

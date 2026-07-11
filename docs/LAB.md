@@ -78,6 +78,64 @@ Download cases use a sparse 1 GiB HTTP object by default and run for a fixed dur
 
 The HTTP, upload, and mixed cases record wall time, goodput Mbps, startup timing, max transfer gap, recovery gap, and interval goodput samples during sustained load windows. Upload primary bytes and aggregate goodput come from the target observer snapshot. In-band target acknowledgements supply separately labelled delivery intervals, first-delivery time, and recovery gaps; local socket acceptance remains a sender diagnostic. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
 
+Response-capacity diagnostics keep TCP product ACK-clock calibration separate
+from UDP/QUIC carrier metrics. TCP calibration events record the binding-local
+`binding_instance_id` as well as session, exact output path/incarnation,
+cumulative spent credit, current and resource ceilings, stage authorization,
+prior ACK, and earliest/latest sampled send times. The binding ID is required
+because concurrent response streams can share session and path identities.
+A stage-authorizing sample requires a fully spent current stage, every sampled
+send before the prior ACK, and its earliest send after stage authorization. A
+mixed pre/post-ACK or pre-authorization window is not stage evidence.
+
+Interpret credit growth and rate publication independently. A qualifying
+sample may grow the next cumulative ceiling immediately. Separately, all
+strict current-stage windows accumulate their bytes and raw ACK-to-ACK elapsed time.
+At authorization, the byte/time aggregate enters the rolling five-stage rate
+window only when coverage reaches
+`min(initial_credit, max(MIN_RATE_SAMPLE_BYTES, ceil(initial_credit / 2)))`,
+which is 1 MiB with the default 2 MiB initial credit. Under-covered evidence
+still grows or proves the stage, then resets without publishing. Diagnostic
+events expose the current sample bytes/elapsed, aggregate bytes/elapsed,
+coverage floor, acceptance decision, and aggregate rate. Before three accepted
+stage aggregates, the candidate retains its startup rate; from three onward,
+publish the rolling median by overwriting the prior product/delivery rate, even
+when lower. Do not
+report a maximum or upward-only filter as calibrated capacity because ACK
+compression can create multi-gigabit sub-millisecond samples. UDP/QUIC product
+ACK timing never proves this TCP calibration because the local QUIC ACK
+controller owns its delivery-rate and pacing evidence. Calibration must leave
+the response Service owner unchanged. A smaller-than-normal response product
+frame is valid only when two-pass planning returns the exact active TCP
+calibration commit for its residual credit. A Service fallback must use the
+normal chunk, and UDP/QUIC framing remains unchanged.
+
+Apply timer granularity once to the completed stage aggregate. Applying the
+minimum duration to every raw window makes an identical byte/time trace depend
+on how ACKs were partitioned into callbacks. Global ordered-tail,
+per-candidate product-flight, and carrier-queue bytes overlap and must use
+union-style debt for startup/calibration admission; exact
+cumulative spend remains the authoritative credit counter. A proven calibration
+identity remains fenced from generic ownership until its exact calibration
+flights drain.
+
+After that TCP-only serial fence clears, diagnostics may emit
+`server_bulk_output_selected reason=tcp_subflow_reservoir`. This is ordinary
+measured ownership, not more calibration: the exact mature TCP Service already
+holds at least its derived Service horizon, the selected target is an admitted
+same-TCP `Subflow` bound to that Service epoch, neither path/session has latency
+pressure, and projected ordered tail remains inside the existing feed
+reservoir. UDP/QUIC never uses this reason. Interpret the event together with
+per-interface counters; selection count alone does not prove useful capacity.
+The v26 matched diagnostic emitted 147 such 64 KiB decisions (9,633,792 B) and
+kept its final 5-second application windows near 95-96 Mbps versus v23's
+post-calibration 80 Mbps collapse, but differing Service anchors and diagnostic
+CPU make that corroborating causal evidence rather than a clean throughput
+claim. The matched endpoint-only, noninstrumented 45-second release pair is the
+performance result: v25 delivered 492,276,216 B at 87.263 Mbps and v27 delivered
+835,492,784 B at 148.032 Mbps, both with zero failures and
+`performance_comparable=true`.
+
 ### Evidence cohorts
 
 Keep these result families separate when comparing changes:
@@ -174,6 +232,9 @@ Useful environment variables:
 - `UDP_PAYLOAD_BYTES`: UDP probe payload size, default `512`.
 - `UDP_TIMEOUT_MS`: per-datagram UDP timeout, default `2500`.
 - `FAILOVER_AFTER_SECONDS`: seconds before blackholing the high-bandwidth path, default `2`.
+- `MPTUNNEL_LAB_FAILOVER_FAT_TX_TRIGGER_BYTES`: server fat-path TX delta required before the TCP download blackhole, default `0`. Zero keeps fixed `FAILOVER_AFTER_SECONDS` timing. A positive value waits for both that byte delta and `FAILOVER_AFTER_SECONDS` as a minimum dwell before injecting the fault.
+- `MPTUNNEL_LAB_FAILOVER_TRIGGER_TIMEOUT_SECONDS`: maximum wait for a positive fat-path TX trigger, default `60`. Timeout fails the case instead of blackholing a path that did not carry the required traffic.
+- `MPTUNNEL_LAB_FAILOVER_TRIGGER_POLL_INTERVAL_SECONDS`: server interface-counter polling interval for the positive trigger, default `0.02`.
 - `FAILOVER_AFTER_MATRIX`: space-separated failover timing matrix for `lab/run-exhaustive-experiments.sh`.
 - `REPEATS`: repeat count for each matrix point.
 - `MPTUNNEL_LAB_DIAGNOSTICS=1`: build an optimized lab binary with the `lab-diagnostics` feature for extra experiment-only instrumentation when that feature is used. Release packaging and CI release jobs do not enable this feature.
@@ -204,6 +265,27 @@ Useful environment variables:
 - `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_DIAG=1`: build the optimized `lab-diagnostics` binary and emit internal diagnostic lines into the client/server `/tmp/mptunnel-*.log` files, including reliable-stream path open attempts/successes and UDP stream congestion state. Successful download rows also keep bounded client/server log tails when this is enabled. Use this only for investigation; release comparisons should run without diagnostic instrumentation.
 - `MPTUNNEL_LAB_DIAG_EVENTS=event_a,event_b`: with diagnostic emission enabled, retain only the exact comma-separated event names. An unset, empty, or `*` value retains all events. Use a narrow allowlist for multi-gigabit lifecycle traces so per-frame candidate and dispatch formatting does not dominate the workload. `sender_service_conformance` explicitly enables the otherwise filtered per-frame conformance counters and assertion. Filtered runs remain instrumented causal evidence, never release-comparable measurements.
 - `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_PERF=1`: build the optimized `lab-diagnostics` binary and emit interval/cumulative per-component timing lines prefixed with `mptunnel_lab_perf`. `MPTUNNEL_LAB_PERF_INTERVAL_MS` controls the flush interval, default `1000`. `MPTUNNEL_LAB_LOG_TAIL_BYTES` and `MPTUNNEL_LAB_LOG_TAIL_LINES` control retained diagnostic log tails.
+- `MPTUNNEL_LAB_CONTAINER_STATS=0|1`: enable periodic Docker CPU, memory, and network-counter sampling, default `1`. `MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS` sets the cadence, default `1`. Per-case samples are written as `container-stats-<case>.jsonl`; case-boundary non-loopback counters are written separately and summarized into the result row.
+- `MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS=0|1`: enable periodic release management `/diagnostics` snapshots for the client and server, default `0`. `MPTUNNEL_LAB_MANAGEMENT_SNAPSHOT_INTERVAL_SECONDS` sets the cadence, default `1`, and `MPTUNNEL_LAB_MANAGEMENT_PORT` selects the loopback management port, default `17600`. Per-case records, including interface counters and management errors, are written as `management-snapshots-<case>.jsonl`.
+
+With a positive fat-TX trigger, the runner writes
+`failover-trigger-<case>.json` under the result root. The artifact records the
+server interface/address/counter, baseline and triggered values, observed and
+required delta, minimum wait, timeout, and actual trigger elapsed time. The
+runner then writes the client-clock failover marker at the injection boundary.
+The probe row's `failover_after_s` records the marker-relative elapsed time it
+actually used, and `failover_trigger_source` distinguishes an observed
+`marker` from fixed-schedule fallback. These fields are the authoritative fault
+boundary for gap calculations; the configured delay alone is not.
+
+The positive byte trigger is a causal diagnostic control for proving that the
+fat response path carried a required amount before it was blackholed. Its fault
+time depends on the implementation's traffic placement and throughput, so the
+result is not release-comparable performance evidence. Use the default zero
+trigger and matched fixed timing for release comparisons after the causal case
+is established.
+
+The periodic observers are not free. Container statistics invoke Docker control-plane commands and read container network counters; management snapshots additionally use `docker exec` for each client/server sample and run a Python HTTP observer inside the container. Compare performance only when the container-stat setting and cadence match. Treat management-snapshot runs as causal diagnostics, not as performance-comparable release measurements; rerun the same case with management snapshots disabled before claiming a throughput or latency result.
 
 For a repeatable component/process profiling workflow, use `lab/run-perf-diagnostics.sh` and see `docs/PERF.md`.
 

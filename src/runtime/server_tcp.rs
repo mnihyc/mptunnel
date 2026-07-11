@@ -10,7 +10,7 @@ pub(super) async fn handle_server_path(
         PeerRole::Server,
         context.codec_limits,
         context.security.cipher,
-    );
+    )?;
     let session_id = match framed.read_frame().await? {
         Frame::SessionHello { session_id } => session_id,
         _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
@@ -84,7 +84,7 @@ pub(super) async fn handle_server_path(
         return Err(RuntimeError::Encrypted(err));
     }
 
-    let (reader, mut writer) = framed.split();
+    let (reader, mut writer) = framed.split()?;
     let mut path_frames =
         spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(context.mux_limits));
     let (commands_tx, mut commands_rx) =
@@ -593,7 +593,7 @@ async fn drain_server_tcp_path_commands(
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
-    let byte_budget = reliable_path_command_writer_run_budget_bytes(context.mux_limits);
+    let byte_budget = reliable_noninterlocked_tcp_writer_run_budget_bytes(context.mux_limits);
     let item_budget = reliable_path_command_writer_run_budget_items(context.mux_limits);
     let mut next_command = Some(first_command);
     pending_frames.clear();
@@ -621,6 +621,7 @@ async fn drain_server_tcp_path_commands(
             break;
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         if let ReliablePathCommand::SendFrame(Frame::DatagramClose { flow_id }) = &command {
             datagram_flows.retain(|flow| flow.flow_id != *flow_id);
         }
@@ -630,7 +631,7 @@ async fn drain_server_tcp_path_commands(
                 pending_frames.push(frame);
                 commands_rx.release_pending_command_bytes(pending_bytes);
                 wrote_frame = true;
-                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
                     break;

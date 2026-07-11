@@ -997,11 +997,12 @@ async fn drain_client_udp_stream_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
-                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
                     flush_udp_frame_batch_with_path_proofs(
@@ -1851,11 +1852,12 @@ async fn drain_server_udp_reliable_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
-                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
                     flush_udp_frame_batch_with_path_proofs(
@@ -2159,6 +2161,7 @@ async fn drain_server_udp_datagram_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame) => {
                 if let Frame::DatagramClose { flow_id } = frame {
@@ -2166,7 +2169,7 @@ async fn drain_server_udp_datagram_commands(
                 }
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
-                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
                     flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;

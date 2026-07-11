@@ -1113,7 +1113,8 @@ async fn spawn_scripted_tcp_datagram_path(
             PeerRole::Server,
             CodecLimits::default(),
             security.cipher,
-        );
+        )
+        .expect("initialize encrypted stream");
         if !matches!(framed.read_frame().await?, Frame::SessionHello { .. }) {
             return Err(RuntimeError::Protocol("expected SESSION_HELLO"));
         }
@@ -1734,7 +1735,8 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
         b"0123456789abcdef",
         PeerRole::Client,
         CodecLimits::default(),
-    );
+    )
+    .expect("initialize encrypted stream");
     client
         .write_frame(&Frame::SessionHello {
             session_id: SessionId(1),

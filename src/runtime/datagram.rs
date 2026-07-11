@@ -645,6 +645,18 @@ impl TcpDatagramClientAssociation {
                     response_timeout: _,
                 }) => {
                     if path_was_acked {
+                        if !self.session.connection_usable {
+                            let failed_path_index = self.session.path_index;
+                            self.context.mark_tcp_path_delivery(
+                                failed_path_index,
+                                self.session.delivery_stats(),
+                            );
+                            self.context.release_tcp_path_load(
+                                failed_path_index,
+                                FlowLane::RealtimeDatagram,
+                            );
+                            self.context.mark_tcp_path_failure(failed_path_index);
+                        }
                         return Err(DatagramUnderlaySendError::Timeout {
                             path_was_acked,
                             product_attempts,
@@ -844,6 +856,7 @@ impl TcpDatagramClientSession {
             Ok(Ok(flow_id)) => flow_id,
             Ok(Err(err)) => return Err(DatagramPathSendError::runtime(err, false)),
             Err(_) => {
+                self.connection_usable = false;
                 return Err(DatagramPathSendError::Timeout {
                     path_was_acked: false,
                     response_timeout: Duration::ZERO,
@@ -922,6 +935,7 @@ impl TcpDatagramClientSession {
             }
             Err(_) => {
                 self.sent_datagrams.remove(&request_key);
+                self.connection_usable = false;
                 return Err(DatagramPathSendError::Timeout {
                     path_was_acked: false,
                     response_timeout,
@@ -1063,6 +1077,7 @@ impl TcpDatagramClientSession {
                             ));
                         }
                         Err(_) => {
+                            self.connection_usable = false;
                             return Err(DatagramPathSendError::Timeout {
                                 path_was_acked: request_acked,
                                 response_timeout,
@@ -1100,6 +1115,7 @@ impl TcpDatagramClientSession {
                             ));
                         }
                         Err(_) => {
+                            self.connection_usable = false;
                             return Err(DatagramPathSendError::Timeout {
                                 path_was_acked: request_acked,
                                 response_timeout,

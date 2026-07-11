@@ -108,7 +108,8 @@ async fn tcp_path_deadline_bounds_the_complete_mpp_handshake() {
             PeerRole::Server,
             CodecLimits::default(),
             security.cipher,
-        );
+        )
+        .expect("initialize encrypted stream");
         assert!(matches!(
             framed.read_frame().await.expect("session hello"),
             Frame::SessionHello { .. }
@@ -258,7 +259,8 @@ async fn dedicated_tcp_session_expires_pending_accept_and_sends_detach() {
             PeerRole::Server,
             CodecLimits::default(),
             security.cipher,
-        );
+        )
+        .expect("initialize encrypted stream");
         assert!(matches!(
             framed.read_frame().await.expect("session hello"),
             Frame::SessionHello { .. }
@@ -354,7 +356,8 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
             PeerRole::Server,
             CodecLimits::default(),
             security.cipher,
-        );
+        )
+        .expect("initialize encrypted stream");
         let session_id = match framed.read_frame().await? {
             Frame::SessionHello { session_id } => session_id,
             _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
@@ -3108,6 +3111,107 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
             ..
         })) if id == stream_id && payload.len() == quantum
     ));
+}
+
+#[test]
+fn client_sender_pass_budget_does_not_become_frame_quantum() {
+    assert_eq!(
+        reliable_relay_client_dispatch_payload_limit(
+            BBR_MAX_SEND_QUANTUM_BYTES,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        ),
+        BBR_MAX_SEND_QUANTUM_BYTES
+    );
+    assert_eq!(
+        reliable_relay_client_dispatch_payload_limit(BBR_MAX_SEND_QUANTUM_BYTES, 16 * 1024),
+        16 * 1024
+    );
+}
+
+#[test]
+fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
+    let stream_id = StreamId(81);
+    let (frames, mut frame_rx) = mpsc::channel(1);
+    let mut streams = HashMap::from([(
+        stream_id,
+        ClientTcpPathStreamState {
+            frames,
+            pending_open: None,
+            local_close_pending: false,
+        },
+    )]);
+    let mut closed_streams = RecentIdCache::new(4);
+    let ack = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: vec![OffsetRange { start: 0, end: 64 }],
+    };
+
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            ack.clone(),
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Routed
+    ));
+    assert!(matches!(
+        frame_rx.try_recv().expect("routed ACK"),
+        Ok(frame) if frame == ack
+    ));
+
+    streams
+        .get(&stream_id)
+        .expect("stream")
+        .frames
+        .try_send(Ok(Frame::Ping { nonce: 1 }))
+        .expect("fill delivery queue");
+    let response = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"response"),
+    };
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            response.clone(),
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Barrier(frame) if frame == response
+    ));
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            Frame::SessionClose {
+                reason: CloseReason::Normal,
+            },
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Barrier(Frame::SessionClose { .. })
+    ));
+
+    assert!(matches!(
+        frame_rx.try_recv().expect("queued frame"),
+        Ok(Frame::Ping { nonce: 1 })
+    ));
+    let fin = Frame::StreamFin {
+        stream_id,
+        final_offset: 8,
+    };
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            fin.clone(),
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Routed
+    ));
+    assert!(matches!(
+        frame_rx.try_recv().expect("routed FIN"),
+        Ok(frame) if frame == fin
+    ));
+    assert!(!streams.contains_key(&stream_id));
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ Intended status: Standards Track
 
 Protocol version: 1
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
 ## Abstract
 
@@ -36,8 +36,10 @@ document differ, the discrepancy is a defect to resolve by changing behavior or
 by explicitly revising this specification.
 
 The mptunnel project intentionally does not preserve old internal wire formats.
-An implementation of protocol version 1 MUST reject unsupported versions and
-MUST NOT silently accept legacy frame layouts.
+An implementation of product protocol version 1 MUST reject unsupported
+versions and MUST NOT silently accept undocumented legacy frame layouts. TCP
+envelopes use `MPTE` version 2 and MUST reject version 1 because its static
+cross-connection traffic key did not provide a unique AEAD nonce domain.
 
 ## Table of Contents
 
@@ -1009,7 +1011,7 @@ production evidence justify them.
 | Path probe timer | 10s interval, 2s timeout | Idle authenticated liveness probing is common in MPTCP/MPQUIC; exact timers are mptunnel policy | Can delay idle-path discovery; must not gate demand-bearing setup or active recovery | Keep only as the configured bound for one idle authenticated health-probe transaction. It MUST NOT cap or extend Active, Repair, Validation, reattach, TCP-carrier, or datagram deadlines |
 | Extra traffic hint | `extra_traffic_hint_percent = 5` default; 100/200 allowed | Reinjection is common in MPTCP/MPQUIC; numeric hint is mptunnel/operator policy | Bad if treated as product-data throttle, per-event refresh, or blind duplication allowance | Keep as hard optional-work budget; response sender spends repair traffic only with evidence; path proof remains bounded by validation fan-out |
 | Security freshness | `auth_freshness_window_seconds = 300` | Replay freshness windows are common security controls; exact window is mptunnel policy | Affects clock-skew/replay tolerance, not data-plane rate | Keep as security policy; not data-plane adaptive |
-| Cipher default | AES-256-GCM default; ChaCha20-Poly1305 optional | AEAD is mandatory; AES-GCM default follows modern hardware acceleration practice | CPU can matter on CPUs without AES acceleration | Keep as operator choice; no plaintext unless explicit |
+| Cipher default | AES-256-GCM through the `ring` provider already used by the QUIC/TLS stack; ChaCha20-Poly1305 optional | AEAD is mandatory; AES-GCM default follows modern hardware acceleration practice | CPU can matter on CPUs without AES acceleration or with a provider that has high per-record cost | Keep as operator choice; no plaintext unless explicit; validate provider changes against standard vectors and wire-compatible peers |
 | QUIC transport envelope | stream receive window = stream window; receive window = stream + repair + reorder + datagram + flight; send window >= path-flight/read ceiling; bidirectional stream count = QUIC-scoped stream cap | QUIC flow-control/congestion/MAX_STREAMS split is common; mapping is mptunnel policy | Can cap QUIC if mapped envelope or stream count is too small | Keep resource mapping; QUIC BBR pacing/congestion remains carrier-owned; stream count is independent from byte windows |
 | QUIC congestion controller | Quinn BBR by default | Model-based BBR fits endpoint-only proxy/tunnel operation where no accurate per-direction path rate is configured; fixed-rate Brutal-like sending is only safe with explicit accurate bandwidth configuration | BBR is not a substitute for product no-worse scheduling; fixed-rate modes can overload weak/shared paths if guessed | Keep as carrier-owned congestion control; product scheduling consumes metrics but does not replace it; any Brutal-like configured-rate mode must be explicit |
 | QUIC datagram MTU model | Startup 1200 byte payload; lower 512 and upper 65,000 path-spec bounds | 1200-byte UDP support is a QUIC requirement; mptunnel sets lower/upper guardrails | Low MTU can increase fragmentation/overhead | Keep startup safety plus path MTU observation/probing |
@@ -1042,6 +1044,7 @@ their origin is explicit and they do not become hidden modes.
 | Lane priority order | control, realtime datagram, latency, throughput, background | ACK/control protection is common in QUIC-style schedulers; taxonomy is mptunnel product policy | Wrong implementation can starve bulk or control | Keep as fixed priority invariant with dynamic queues |
 | DRR lane/flow quanta | Deficit charge equals actual sender-service packet quantum | DRR/fair queuing is common | Fixed byte quanta previously underfed high-rate carriers | Keep adaptive charge based on actual queued frame size |
 | Service frame quantum | Latency/control use small BBR-style quanta; reliable bulk feeds TCP/QUIC with the bounded 64 KiB BBR send quantum under the configured read/payload envelope and live condition cap | BBR send-quantum model applied at the product-record boundary, with TCP/QUIC packet pacing below | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta while control/repair/latency remain preemptive |
+| TCP AEAD record granularity | Send exactly one encoded product frame per independently counted/authenticated `MPTE` version 2 envelope; a writer run may batch consecutive envelopes into one socket write | TLS 1.3's bounded independently authenticated record layer is the mature design precedent; mptunnel retains its own adaptive product-frame quantum rather than copying the TLS record-size limit | Coalescing a 512 KiB writer run into one record makes one lost TCP segment block decryption and product feedback for the whole run; one syscall per small record can waste CPU | Keep strict frame/record identity on emission and bounded multi-envelope socket-write batching; reject non-canonical multi-frame plaintexts |
 | Startup Subflow sample epoch | With at least two active direction-relevant reliable response flows, cumulative `OwnerData` budget = `max(next_quantum, min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2, path_flight_envelope, receiver_reorder_envelope, repair_envelope, stream_window_envelope))`; the current fixed startup window makes the unclamped floor 256 KiB | Multi-quantum startup sampling follows MPTCP subflow probing, QUIC initial-window growth, and BBR send-quantum/app-limited sampling practice; suppressing it for one flow follows the MPTCP best-single-path goal and MPQUIC same-stream maximum-delay warning; the exact flow-count gate and 256 KiB floor are mptunnel policy | One quantum underfeeds useful paths; an ACK-refilled or one-flow epoch creates HOL debt without independent flow-level path diversity; an unbounded epoch can harm mixed or latency-sensitive traffic | Keep one cumulative, non-refilling epoch for one same-underlay Validation candidate per bulk-only response stream; every quantum remains preemptible and carrier/reorder gated; disable the epoch with fewer than two active direction-relevant reliable response flows or under latency-sensitive/realtime pressure; generation-fence the count at commit |
 | Inflight target | BDP * BBR cwnd gain, send quantum, and MinPipeCwnd under configured flight envelope; latency/realtime lanes use the smaller preemptive target | BBR inflight model and product lane priority | Too low underfeeds; too high queues | Keep adaptive from live BDP/queue/loss/carrier evidence |
 | Stability/backlog factors | Shrink by loss/jitter/queue/backlog relative to BDP with floor derived from MinPipeCwnd or send quantum divided by BDP | Congestion-sensitive adaptation; floor is no longer a fixed fraction | Over-shrinking can create low-rate loops | Keep adaptive; diagnostics must show shrink reason |
@@ -1201,13 +1204,45 @@ encoded as ASCII: `aes-256-gcm` or `chacha20-poly1305`.
 
 ### 7.3 TCP Underlay Key Derivation
 
-TCP encrypted framed streams derive:
+TCP encrypted framed streams use HKDF-SHA256 as defined by RFC 5869. First
+derive suite-bound TCP key material:
 
 ```
-SHA256("mptunnel encrypted framed v1" ||
-       cipher_suite_context ||
-       master_secret)
+tcp_key_material =
+    HKDF-Extract(salt = "mptunnel encrypted framed v2",
+                 IKM = cipher_suite_context || master_secret)
 ```
+
+Each TCP connection has a 16-byte CSPRNG `client_salt`; the server also creates
+an independent 16-byte CSPRNG `server_salt` after authenticating the first
+client record. Derive:
+
+```
+base_prk = HKDF-Extract(salt = client_salt, IKM = tcp_key_material)
+
+client_write_key =
+    HKDF-Expand(base_prk,
+                "mptunnel encrypted framed v2 traffic key" ||
+                cipher_suite_context || 0x01,
+                32)
+
+server_write_key =
+    HKDF-Expand(base_prk,
+                "mptunnel encrypted framed v2 traffic key" ||
+                cipher_suite_context || 0x02 || server_salt,
+                32)
+```
+
+The direction octets above are the values in Section 7.5. Client-to-server
+records carry `client_salt`; server-to-client records carry `server_salt`.
+Both values are part of the authenticated envelope header. The server MUST NOT
+commit a received client salt or generate server traffic before the first
+client record authenticates. The client MUST retain its client salt and MUST
+not commit the received server salt until the first server record authenticates.
+All later records in one direction MUST carry the committed salt. This creates
+a new directional traffic-key domain for every TCP connection without another
+round trip and prevents a captured server response from authenticating on a
+fresh client connection.
 
 TCP underlay encryption intentionally avoids exposing TLS metadata such as SNI
 in the internal transport. The framed AEAD envelope gives confidentiality,
@@ -1239,12 +1274,14 @@ Direction values are:
 * 1: client to server
 * 2: server to client
 
-Counters MUST NOT repeat for the same key and direction.
+Counters start at zero for each freshly salted directional traffic key and MUST
+NOT repeat for the same key and direction. A sender MUST reject counter
+overflow before invoking AEAD or emitting bytes.
 
-The direction byte and monotonic counter make nonce uniqueness easy to audit.
-Direction separation prevents a record emitted by one peer from being valid as
-a replay in the opposite direction under the same session material. QUIC packet
-nonces are owned by QUIC and are not part of the `MPTE` TCP framed envelope.
+The per-connection key domain, direction byte, and monotonic counter make nonce
+uniqueness easy to audit. Directional key separation prevents a record emitted
+by one peer from being valid in the opposite direction. QUIC packet nonces are
+owned by QUIC and are not part of the `MPTE` TCP framed envelope.
 
 ### 7.6 Session Authentication
 
@@ -1621,27 +1658,48 @@ TCP underlay carries product frames in an encrypted `MPTE` envelope:
 
 ```
 0..4    magic = "MPTE"
-4       version = 1
+4       version = 2
 5       direction
-6..14   counter u64
-14..18  ciphertext length u32
-18..    ciphertext || tag16
+6..22   connection salt, 16 bytes
+22..30  counter u64
+30..34  ciphertext length u32
+34..    ciphertext || tag16
 ```
 
-The AEAD plaintext is exactly one encoded product frame. The TCP envelope
-header is AEAD additional authenticated data. The receiver MUST validate:
+For client-to-server records the connection-salt field is `client_salt`; for
+server-to-client records it is `server_salt`. Section 7.3 defines their key
+schedule and binding rules. The entire fixed 34-byte header is AEAD additional
+authenticated data.
+
+The AEAD plaintext is exactly one encoded product frame. A bounded
+writer run MAY serialize multiple consecutive envelopes in one socket write,
+but it MUST assign each product frame its own counter, header, authentication
+tag, and receiver-visible decrypt boundary. A sender MUST NOT coalesce several
+product frames into one AEAD plaintext, and a receiver MUST reject trailing
+product frames or bytes. The receiver MUST validate:
 
 * magic is `MPTE`;
-* version is 1;
+* version is 2;
 * direction is the expected peer direction;
+* the connection salt authenticates and matches the salt already committed for
+  that direction, if any;
 * counter equals the next expected counter for that direction;
 * ciphertext length is at least 16 and does not exceed `max_frame_bytes + 16`;
 * AEAD tag verifies;
 * decrypted product frame validates.
 
-The sender MUST increment the counter after a successful write. The receiver
+The sender MUST preflight counter availability, invoke AEAD once, emit the
+complete envelope, and then increment the counter after a successful write. It
+MUST NOT retry an uncertain partial write on the same connection. The receiver
 MUST increment the expected counter after a successful read. Counter gaps or
 replays are fatal to that underlay path.
+
+An interrupted, cancelled, timed-out, or failed encrypted write can leave both
+the byte-stream boundary and nonce counter uncertain. The writer MUST
+permanently poison that TCP connection before control returns and MUST reject
+all later records without invoking AEAD. Runtime deadline owners MUST retire the
+poisoned carrier even when product feedback had already acknowledged the
+request; an ACK does not make a partially emitted later control record safe.
 
 TCP path sessions maintain independent control, priority, and data queues.
 Control and latency-sensitive frames MUST bypass saturated bulk data queues.
@@ -2928,6 +2986,19 @@ one frame per select wakeup when a healthy carrier has queued work. A narrower
 writer-feed quantum is valid only when diagnostics show it reduces delay without
 underfeeding the carrier; fixed one-frame writer-feed behavior is not a
 protocol requirement and can underfeed high-rate QUIC UDP.
+
+For a TCP carrier, an outbound writer run whose socket write can block MUST
+either continue routing established inbound product feedback while that write
+is pending or return to inbound polling after at most one maximum 64 KiB product
+service quantum. The interlocked form MAY serialize the larger bounded run as
+multiple independently authenticated envelopes in one socket write; it stops
+reading at the first pending-open, session-control, or delivery-backpressure
+barrier so later frames cannot overtake it. This is separate from sender-service
+admission. It prevents a full TCP socket buffer from serializing already-read
+product ACK routing behind the 512 KiB read/pass ceiling without imposing one
+syscall per product quantum on a healthy high-rate carrier. QUIC UDP retains its
+carrier-owned packet scheduling and may use the larger bounded writer-feed run
+above.
 
 The sender-service executor follows the same bounded-run rule at the boundary
 above path command queues. After it dispatches a non-empty ordinary bulk run to
@@ -5136,7 +5207,8 @@ Implementations MUST:
 * require a shared secret;
 * reject short non-UUID secrets;
 * redact secrets and passwords in debug output;
-* use fresh AEAD nonces;
+* create fresh CSPRNG TCP connection salts, derive connection-scoped directional
+  traffic keys, and never reuse an AEAD nonce under one key;
 * reject TCP envelope counter replay and rely on QUIC packet protection to
   reject QUIC packet replay;
 * validate authentication freshness;
@@ -5162,11 +5234,15 @@ private to mptunnel protocol version 1.
 
 ## 24. Versioning and Compatibility
 
-Product frames use version 1 in the `MPTF` header. TCP envelopes use version 1
+Product frames use version 1 in the `MPTF` header. TCP envelopes use version 2
 in the `MPTE` header. UDP carrier packets are QUIC packets and are versioned by
 QUIC; mptunnel does not define a separate UDP packet version byte.
 
-Receivers MUST reject unsupported versions. The project does not preserve
+Receivers MUST reject unsupported versions. `MPTE` version 1 used a static
+traffic key with a counter that restarted on each TCP connection, so concurrent
+paths or reconnects could repeat AEAD key/nonce pairs. Version 2 is a coordinated
+endpoint upgrade: implementations MUST reject version 1 and MUST NOT retry it as
+an automatic fallback after a version 2 failure. The project does not preserve
 backward compatibility for internal experimental versions. A later version that
 changes wire encoding MUST update this RFC and increment the relevant version
 number.
@@ -5179,6 +5255,8 @@ number.
   https://www.rfc-editor.org/rfc/rfc2119
 * RFC 8174, "Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words",
   https://www.rfc-editor.org/rfc/rfc8174
+* RFC 5869, "HMAC-based Extract-and-Expand Key Derivation Function (HKDF)",
+  https://www.rfc-editor.org/rfc/rfc5869
 
 ### 25.2 Informative References
 
@@ -5197,6 +5275,15 @@ number.
 * RFC 9002, "QUIC Loss Detection and Congestion Control", especially ACK ranges,
   PTO, and packet-number-based loss recovery,
   https://www.rfc-editor.org/rfc/rfc9002
+* RFC 8446, "The Transport Layer Security (TLS) Protocol Version 1.3",
+  especially bounded, independently authenticated TLSCiphertext records,
+  https://www.rfc-editor.org/rfc/rfc8446
+* RFC 5116, "An Interface and Algorithms for Authenticated Encryption",
+  especially the uniqueness requirement for a nonce under one key,
+  https://www.rfc-editor.org/rfc/rfc5116
+* RFC 8985, "The RACK-TLP Loss Detection Algorithm for TCP", especially
+  time-based loss detection and bounded tail probes below application framing,
+  https://www.rfc-editor.org/rfc/rfc8985
 * draft-ietf-ccwg-bbr-06, "BBR Congestion Control", especially delivery-rate
   sampling, application-limited sample handling, and bounded send quanta,
   https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-06

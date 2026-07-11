@@ -363,7 +363,8 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
             security.secret.as_bytes(),
             PeerRole::Server,
             CodecLimits::default(),
-        );
+        )
+        .expect("initialize encrypted stream");
         let session_id = match framed.read_frame().await? {
             Frame::SessionHello { session_id } => session_id,
             _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
@@ -2273,6 +2274,65 @@ fn path_writer_coalesces_partial_bulk_run_without_delaying_full_or_empty_runs() 
             item_budget
         ),
         "a full byte-budget writer run should flush immediately"
+    );
+}
+
+#[test]
+fn noninterlocked_tcp_writer_run_is_one_feedback_preemption_quantum() {
+    let mux_limits = MuxLimits::default();
+    let byte_budget = reliable_noninterlocked_tcp_writer_run_budget_bytes(mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
+
+    assert_eq!(byte_budget, BBR_MAX_SEND_QUANTUM_BYTES);
+    assert!(!reliable_path_writer_should_coalesce_partial_bulk_run(
+        1,
+        byte_budget,
+        byte_budget,
+        item_budget,
+    ));
+}
+
+#[test]
+fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
+    let payload = Bytes::from(vec![0x5a; BBR_MAX_SEND_QUANTUM_BYTES]);
+    let frames = [
+        Frame::DatagramData {
+            flow_id: DatagramFlowId(1),
+            datagram_id: DatagramId(1),
+            ttl_ms: 1_000,
+            payload: payload.clone(),
+        },
+        Frame::PathMtuProbe {
+            path_id: PathId(1),
+            probe_id: 1,
+            payload: payload.clone(),
+        },
+        Frame::PathProofData {
+            path_id: PathId(1),
+            proof_id: 1,
+            payload,
+        },
+    ];
+
+    for frame in frames {
+        assert!(
+            reliable_path_command_writer_run_bytes(&ReliablePathCommand::SendFrame(frame))
+                >= BBR_MAX_SEND_QUANTUM_BYTES + crate::protocol::codec::FRAME_HEADER_LEN,
+        );
+    }
+    let ack = Frame::StreamAck {
+        stream_id: StreamId(1),
+        complete: false,
+        ranges: (0..MuxLimits::default().max_ack_ranges)
+            .map(|index| OffsetRange {
+                start: (index as u64) * 2,
+                end: (index as u64) * 2 + 1,
+            })
+            .collect(),
+    };
+    assert!(
+        reliable_path_command_writer_run_bytes(&ReliablePathCommand::SendFrame(ack))
+            > MuxLimits::default().max_ack_ranges * 16
     );
 }
 

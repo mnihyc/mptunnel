@@ -311,6 +311,7 @@ async fn run_client_tcp_path_session(
                                     .expect("checked connected TCP path session"),
                                 &mut state.streams,
                                 &mut state.closed_streams,
+                                &runtime,
                                 runtime.stream_frame_queue,
                                 runtime.mux_limits,
                                 &mut pending_frames,
@@ -345,6 +346,7 @@ async fn run_client_tcp_path_session(
                             state.connection.as_mut().expect("checked connected TCP path session"),
                             &mut state.streams,
                             &mut state.closed_streams,
+                            &runtime,
                             runtime.stream_frame_queue,
                             runtime.mux_limits,
                             &mut pending_frames,
@@ -442,6 +444,7 @@ async fn handle_connected_client_tcp_command_run(
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
+    runtime: &ClientTcpPathSessionRuntime,
     stream_frame_queue: usize,
     mux_limits: MuxLimits,
     pending_frames: &mut Vec<Frame>,
@@ -476,13 +479,14 @@ async fn handle_connected_client_tcp_command_run(
             break;
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         match command {
             ReliablePathCommand::SendFrame(frame) => {
                 let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
                 wrote_frame = true;
-                sent_bytes = sent_bytes.saturating_add(pending_bytes.max(1));
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
                     break;
@@ -490,7 +494,14 @@ async fn handle_connected_client_tcp_command_run(
                 continue;
             }
             command => {
-                flush_client_tcp_frame_batch(connection, pending_frames, mux_limits).await?;
+                flush_client_tcp_frame_batch(
+                    connection,
+                    pending_frames,
+                    streams,
+                    closed_streams,
+                    runtime,
+                )
+                .await?;
                 handle_connected_client_tcp_command(
                     command,
                     connection,
@@ -510,7 +521,8 @@ async fn handle_connected_client_tcp_command_run(
         }
     }
 
-    flush_client_tcp_frame_batch(connection, pending_frames, mux_limits).await?;
+    flush_client_tcp_frame_batch(connection, pending_frames, streams, closed_streams, runtime)
+        .await?;
 
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -536,18 +548,132 @@ async fn handle_connected_client_tcp_command_run(
 async fn flush_client_tcp_frame_batch(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
-    mux_limits: MuxLimits,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
     if frames.is_empty() {
         return Ok(());
     }
-    connection.writer.write_frames(frames).await?;
+    let mut deferred_frame = None;
+    let mut routed_frames = 0usize;
+    {
+        let write = connection.writer.write_frames(frames);
+        tokio::pin!(write);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut write => {
+                    result?;
+                    break;
+                }
+                incoming = connection.frames.recv(), if deferred_frame.is_none() => {
+                    match incoming {
+                        Some(Ok(frame)) => {
+                            match try_route_client_tcp_stream_frame_during_write(
+                                frame,
+                                streams,
+                                closed_streams,
+                            ) {
+                                ClientTcpWriteFrameRoute::Routed => {
+                                    routed_frames = routed_frames.saturating_add(1);
+                                }
+                                ClientTcpWriteFrameRoute::Barrier(frame) => {
+                                    deferred_frame = Some(frame);
+                                }
+                            }
+                        }
+                        Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
+                        None => return Err(RuntimeError::ReliablePathSessionClosed),
+                    }
+                }
+            }
+        }
+    }
     for frame in frames.iter() {
         connection.path_proofs.record_sent_frame(frame);
     }
     frames.clear();
-    record_client_tcp_path_outbound_activity(connection, mux_limits);
+    record_client_tcp_path_outbound_activity(connection, runtime.mux_limits);
+    #[cfg(feature = "lab-diagnostics")]
+    if routed_frames > 0 || deferred_frame.is_some() {
+        lab_diagnostic(
+            "client_tcp_write_feedback_interlock",
+            format_args!(
+                "path_index={} routed_frames={} deferred_frames={}",
+                runtime.path_index,
+                routed_frames,
+                usize::from(deferred_frame.is_some()),
+            ),
+        );
+    }
+    if let Some(frame) = deferred_frame {
+        handle_client_tcp_path_frame(frame, connection, streams, closed_streams, runtime).await?;
+    }
     Ok(())
+}
+
+pub(super) enum ClientTcpWriteFrameRoute {
+    Routed,
+    Barrier(Frame),
+}
+
+pub(super) fn try_route_client_tcp_stream_frame_during_write(
+    frame: Frame,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+) -> ClientTcpWriteFrameRoute {
+    let stream_id = match &frame {
+        Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamReset { stream_id, .. }
+        | Frame::StreamData { stream_id, .. }
+        | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFin { stream_id, .. } => *stream_id,
+        Frame::StreamDetach { stream_id } => {
+            if streams
+                .get(stream_id)
+                .is_some_and(|state| state.pending_open.is_some())
+            {
+                return ClientTcpWriteFrameRoute::Barrier(Frame::StreamDetach {
+                    stream_id: *stream_id,
+                });
+            }
+            streams.remove(stream_id);
+            closed_streams.insert(*stream_id);
+            return ClientTcpWriteFrameRoute::Routed;
+        }
+        _ => return ClientTcpWriteFrameRoute::Barrier(frame),
+    };
+    if streams
+        .get(&stream_id)
+        .is_some_and(|state| state.pending_open.is_some())
+    {
+        return ClientTcpWriteFrameRoute::Barrier(frame);
+    }
+    let closes_stream = matches!(&frame, Frame::StreamReset { .. } | Frame::StreamFin { .. });
+    let Some(state) = streams.get_mut(&stream_id) else {
+        closed_streams.insert(stream_id);
+        return ClientTcpWriteFrameRoute::Routed;
+    };
+    let send_result = state.frames.try_send(Ok(frame));
+    match send_result {
+        Ok(()) => {
+            if closes_stream {
+                streams.remove(&stream_id);
+                closed_streams.insert(stream_id);
+            }
+            ClientTcpWriteFrameRoute::Routed
+        }
+        Err(mpsc::error::TrySendError::Full(Ok(frame))) => ClientTcpWriteFrameRoute::Barrier(frame),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            streams.remove(&stream_id);
+            closed_streams.insert(stream_id);
+            ClientTcpWriteFrameRoute::Routed
+        }
+        Err(mpsc::error::TrySendError::Full(Err(_))) => {
+            unreachable!("client TCP interlock only routes successful frames")
+        }
+    }
 }
 
 async fn handle_disconnected_client_tcp_command(
@@ -703,7 +829,7 @@ pub(super) async fn connect_client_tcp_path(
             PeerRole::Client,
             codec_limits,
             security.cipher,
-        );
+        )?;
         let path_id = PathId(path_index as u16);
         let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
             security,
@@ -741,7 +867,7 @@ pub(super) async fn connect_client_tcp_path(
             }
         }
 
-        let (reader, writer) = framed.split();
+        let (reader, writer) = framed.split()?;
         let now = tokio::time::Instant::now();
         let startup_snapshot = path_startup_snapshot(path, path_index);
         let startup_metrics =
@@ -890,7 +1016,10 @@ async fn handle_client_tcp_path_frame(
             .await
         }
         Frame::StreamReset { stream_id, reason } => {
-            if let Some(mut state) = streams.remove(&stream_id)
+            if streams
+                .get(&stream_id)
+                .is_some_and(|state| state.pending_open.is_some())
+                && let Some(mut state) = streams.remove(&stream_id)
                 && let Some(pending) = state.pending_open.take()
             {
                 closed_streams.insert(stream_id);

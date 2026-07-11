@@ -428,7 +428,7 @@ pub(super) async fn probe_tcp_client_path(
             PeerRole::Client,
             context.codec_limits,
             security.cipher,
-        );
+        )?;
         let path_id = PathId(path_index as u16);
         let (session_hello, session_auth, path_join) =
             authenticated_path_join_frames(security, path, path_id, UnderlayProtocol::Tcp)?;

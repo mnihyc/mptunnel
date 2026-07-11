@@ -409,6 +409,13 @@ pub(super) fn reliable_path_command_writer_run_budget_bytes(mux_limits: MuxLimit
         .max(1)
 }
 
+pub(super) fn reliable_noninterlocked_tcp_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
+    BBR_MAX_SEND_QUANTUM_BYTES
+        .min(reliable_relay_buffer_len(mux_limits))
+        .min(mux_limits.max_payload_bytes)
+        .max(1)
+}
+
 pub(super) fn reliable_path_command_writer_run_budget_items(mux_limits: MuxLimits) -> usize {
     reliable_path_command_queue(mux_limits).max(1)
 }
@@ -500,6 +507,15 @@ pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand)
     match command {
         ReliablePathCommand::SendFrame(frame) => frame_pacing_bytes(frame),
         ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 0,
+    }
+}
+
+pub(super) fn reliable_path_command_writer_run_bytes(command: &ReliablePathCommand) -> usize {
+    match command {
+        ReliablePathCommand::SendFrame(frame) => {
+            crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
+        }
+        ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 1,
     }
 }
 

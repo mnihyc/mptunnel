@@ -10,6 +10,13 @@ fn reliable_relay_request_outstanding_resource_ceiling(mux_limits: MuxLimits) ->
         .max(1)
 }
 
+pub(super) fn reliable_relay_client_dispatch_payload_limit(
+    adaptive_chunk_bytes: usize,
+    remaining_pass_bytes: usize,
+) -> usize {
+    adaptive_chunk_bytes.min(remaining_pass_bytes).max(1)
+}
+
 #[derive(Debug)]
 struct ReliableRelayRequestOutstandingWindow {
     active_tcp_instance: Option<RelayPathInstance>,
@@ -1089,7 +1096,11 @@ where
                             &mut send_stream,
                             &mut sender_queue,
                             local_open,
-                            sender_dispatch_byte_budget.saturating_sub(dispatched_payload_bytes),
+                            reliable_relay_client_dispatch_payload_limit(
+                                adaptive_chunk,
+                                sender_dispatch_byte_budget
+                                    .saturating_sub(dispatched_payload_bytes),
+                            ),
                         )
                         .await
                     {

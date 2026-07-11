@@ -128,13 +128,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     pub(super) fn ensure_session(&self, lane: FlowLane) -> ReliablePathCommandSender {
-        if tcp_path_lane_uses_dedicated_session(lane) && !self.runtime.reuse_latency_session {
-            let (commands, receivers) = reliable_path_command_channels(self.runtime.command_queue);
-            tokio::spawn(run_client_tcp_path_session(self.runtime.clone(), receivers));
-            return commands;
-        }
-
-        let lane = if tcp_path_lane_uses_dedicated_session(lane) {
+        let lane = if tcp_path_lane_uses_latency_session(lane) {
             &self.latency_commands
         } else {
             &self.commands
@@ -153,7 +147,7 @@ impl ClientTcpPathSessionHandle {
     }
 }
 
-pub(super) fn tcp_path_lane_uses_dedicated_session(lane: FlowLane) -> bool {
+pub(super) fn tcp_path_lane_uses_latency_session(lane: FlowLane) -> bool {
     matches!(
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
@@ -199,7 +193,6 @@ pub(super) struct ClientTcpPathSessionRuntime {
     pub(super) command_queue: usize,
     pub(super) stream_frame_queue: usize,
     pub(super) closed_stream_cache_capacity: usize,
-    pub(super) reuse_latency_session: bool,
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
 }
 

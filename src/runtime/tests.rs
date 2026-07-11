@@ -3133,14 +3133,14 @@ fn reliable_relay_bulk_admission_payload_uses_preemptible_quantum_not_inflight_c
 }
 
 #[test]
-fn tcp_path_sessions_are_dedicated_for_latency_sensitive_lanes() {
-    assert!(tcp_path_lane_uses_dedicated_session(FlowLane::Latency));
-    assert!(tcp_path_lane_uses_dedicated_session(FlowLane::Control));
-    assert!(tcp_path_lane_uses_dedicated_session(
+fn tcp_path_lane_classes_separate_latency_from_throughput_opens() {
+    assert!(tcp_path_lane_uses_latency_session(FlowLane::Latency));
+    assert!(tcp_path_lane_uses_latency_session(FlowLane::Control));
+    assert!(tcp_path_lane_uses_latency_session(
         FlowLane::RealtimeDatagram
     ));
-    assert!(!tcp_path_lane_uses_dedicated_session(FlowLane::Throughput));
-    assert!(!tcp_path_lane_uses_dedicated_session(FlowLane::Background));
+    assert!(!tcp_path_lane_uses_latency_session(FlowLane::Throughput));
+    assert!(!tcp_path_lane_uses_latency_session(FlowLane::Background));
 }
 
 #[test]

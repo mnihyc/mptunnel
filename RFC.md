@@ -323,12 +323,21 @@ path-join replay cache, and management snapshot identity. A session does not own
 target sockets and does not directly schedule product bytes; it provides the
 identity and registries used by the sender service and carrier engines.
 
-A path owns one concrete underlay association inside a session. For TCP this is
-one encrypted framed stream session. For UDP this is one QUIC association. A
-path owns path ID, underlay family, bind/peer address, liveness,
-carrier-local RTT/loss/rate/queue samples, carrier credit, and path-specific
-authentication. A path MUST NOT own product stream offsets or decide that a
-reliable stream should stripe onto it merely because it has capacity.
+A path owns one configured underlay route inside a session. For UDP this is one
+QUIC association. For TCP this is a bounded pair of lazy persistent encrypted
+carrier instances: one selected by attachments opened as control, latency, or
+realtime, and one selected by attachments opened as throughput or background.
+The pair is independent of path count and product-stream count; a single
+configured path MUST NOT create an unbounded carrier instance per latency-first
+product stream. Carrier class is fixed for the lifetime of one attachment.
+Later Auto promotion changes sender-service lane priority and admission, not its
+TCP association; frontier-safe detach/reattach remains the only way to move that
+stream. Each concrete TCP instance owns its connection lifecycle and kernel
+congestion state, while the configured path owns path ID, underlay family,
+bind/peer address, health, carrier-local RTT/loss/rate/queue evidence, carrier
+credit, and path-specific authentication. A path MUST NOT own product stream
+offsets or decide that a reliable stream should stripe onto it merely because it
+has capacity.
 
 A path group or carrier subflow set is not a product-offset owner. It is a bounded
 scheduler epoch for one flow: one Service path plus admitted Subflow members
@@ -1042,6 +1051,7 @@ their origin is explicit and they do not become hidden modes.
 | Scheduler state penalties | suspect/backup/expensive/TCP reorder/loss/confidence/shared-bottleneck penalties derive from PTO, payload transmit time, path BDP, RTT variance, jitter, loss, and queue drain time | QUIC PTO and BBR drain-time model | Hidden millisecond weights previously risked benchmark tuning | Fixed ms weights are removed; suspect bulk pays persistent-congestion PTO debt while latency/control/realtime may still validate a suspect low-latency path |
 | Tail and duplication admission | Tail threshold derives from latency-path BDP; duplicate slack derives from jitter or one initial-window fraction of PTO; duplication is only control/realtime and must fit transmit cost | MPTCP/MPQUIC reinjection with QUIC/BBR timing evidence | Blind duplication wastes capacity; no duplication hurts recovery | Keep adaptive and gated by evidence/extra-traffic hint; tail avoidance MUST NOT bypass path capability flags such as no-bulk |
 | Lane priority order | control, realtime datagram, latency, throughput, background | ACK/control protection is common in QUIC-style schedulers; taxonomy is mptunnel product policy | Wrong implementation can starve bulk or control | Keep as fixed priority invariant with dynamic queues |
+| TCP attachment-open carrier classes | At most one lazy persistent control/latency/realtime instance and one lazy persistent throughput/background instance per configured path | Bounded connection pooling plus attachment-open lane isolation; exact two-class split is mptunnel policy | One instance for every product stream repeats TCP/authentication setup and hides unbounded congestion domains behind one path ID; migrating a live attachment on lane promotion creates path-instance and ordering ambiguity | Keep the bounded two-class pool for every topology; multiplex attachments within their class, retain independent carrier lifecycles between classes, and keep a promoted attachment on its existing carrier until explicit frontier-safe reattachment. Product priority and MPTE record boundaries limit application queue blocking, but kernel TCP HOL remains |
 | DRR lane/flow quanta | Deficit charge equals actual sender-service packet quantum | DRR/fair queuing is common | Fixed byte quanta previously underfed high-rate carriers | Keep adaptive charge based on actual queued frame size |
 | Service frame quantum | Latency/control use small BBR-style quanta; reliable bulk feeds TCP/QUIC with the bounded 64 KiB BBR send quantum under the configured read/payload envelope and live condition cap | BBR send-quantum model applied at the product-record boundary, with TCP/QUIC packet pacing below | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta while control/repair/latency remain preemptive |
 | TCP AEAD record granularity | Send exactly one encoded product frame per independently counted/authenticated `MPTE` version 2 envelope; a writer run may batch consecutive envelopes into one socket write | TLS 1.3's bounded independently authenticated record layer is the mature design precedent; mptunnel retains its own adaptive product-frame quantum rather than copying the TLS record-size limit | Coalescing a 512 KiB writer run into one record makes one lost TCP segment block decryption and product feedback for the whole run; one syscall per small record can waste CPU | Keep strict frame/record identity on emission and bounded multi-envelope socket-write batching; reject non-canonical multi-frame plaintexts |
@@ -1904,6 +1914,21 @@ independent streams and independent outbound target connections, which is not
 path attachment, repair, or aggregation. Implementations MUST NOT use separate
 TCP and UDP reliable-stream session IDs for paths that are intended to stripe,
 repair, migrate, or fail over one logical stream.
+
+TCP carrier reuse is attachment-open lane-class scoped, not topology scoped. The
+first control/latency/realtime open on a configured TCP path lazily creates that
+class's carrier actor; later opens in the class reuse it until carrier failure.
+Attachments already opened as throughput/background use the path's separate
+reusable service carrier. An attachment that starts latency-first and later
+promotes to throughput stays on its existing carrier; promotion changes
+sender-service lane priority and budgets, not carrier identity. This bounds
+handshakes, authentication work, connection state, and congestion domains
+independently of concurrent stream count while preserving stream/path ownership.
+Priority queues, bounded writer runs, and independent MPTE records protect
+application control and interactive work at product-frame boundaries, but they
+do not remove kernel TCP head-of-line blocking within a shared carrier. A
+single-path deployment and one member of a multipath deployment follow the same
+rule.
 
 Conceptual flow:
 

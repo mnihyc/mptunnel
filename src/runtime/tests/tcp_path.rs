@@ -1,6 +1,6 @@
 use super::*;
 
-fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSessionRuntime {
+fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
     ClientTcpPathSessionRuntime {
         path: PathSpec {
             underlay: UnderlayProtocol::Tcp,
@@ -15,7 +15,6 @@ fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSession
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        reuse_latency_session,
         health: Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
@@ -23,22 +22,287 @@ fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSession
     }
 }
 
-#[tokio::test]
-async fn tcp_path_latency_lane_reuse_depends_on_topology() {
-    let single_path = ClientTcpPathSessionHandle::new(test_tcp_session_runtime(false));
-    let first_single = single_path.ensure_session(FlowLane::Latency);
-    let second_single = single_path.ensure_session(FlowLane::Latency);
-    assert!(!first_single.same_channel(&second_single));
+async fn accept_authenticated_test_tcp_path(
+    listener: &TcpListener,
+) -> Result<(EncryptedFramedStream<TcpStream>, PathId, PathCapabilities), RuntimeError> {
+    let (stream, _) = listener.accept().await?;
+    let security = security();
+    let mut framed = EncryptedFramedStream::with_cipher_suite(
+        stream,
+        security.secret.as_bytes(),
+        PeerRole::Server,
+        CodecLimits::default(),
+        security.cipher,
+    )?;
+    let session_id = match framed.read_frame().await? {
+        Frame::SessionHello { session_id } => session_id,
+        _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
+    };
+    let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
+    match framed.read_frame().await? {
+        Frame::SessionAuth {
+            session_id: auth_session_id,
+            nonce,
+            issued_at_unix_secs,
+            auth_tag,
+        } if auth_session_id == session_id
+            && authenticator.verify_session_auth(SessionAuthCheck {
+                session_id,
+                nonce,
+                issued_at_unix_secs,
+                tag: auth_tag,
+                now_unix_secs: current_unix_secs()?,
+                freshness_window_secs: security.auth_freshness_window.as_secs(),
+            }) => {}
+        _ => return Err(RuntimeError::Protocol("invalid SESSION_AUTH")),
+    }
+    let (path_id, capabilities) = match framed.read_frame().await? {
+        Frame::PathJoin {
+            session_id: join_session_id,
+            path_id,
+            underlay,
+            nonce,
+            issued_at_unix_secs,
+            capabilities,
+            auth_tag,
+        } if join_session_id == session_id
+            && underlay == UnderlayProtocol::Tcp
+            && authenticator.verify_path_join(PathJoinAuthCheck {
+                session_id,
+                path_id,
+                underlay,
+                nonce,
+                issued_at_unix_secs,
+                capabilities,
+                tag: auth_tag,
+                now_unix_secs: current_unix_secs()?,
+                freshness_window_secs: security.auth_freshness_window.as_secs(),
+            }) =>
+        {
+            (path_id, capabilities)
+        }
+        _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
+    };
+    framed
+        .write_frames(&[
+            Frame::SessionReady,
+            Frame::PathStatus {
+                path_id,
+                status: crate::protocol::PathStatus::Active,
+                capabilities,
+            },
+        ])
+        .await?;
+    framed.flush().await?;
+    Ok((framed, path_id, capabilities))
+}
 
-    let multipath = ClientTcpPathSessionHandle::new(test_tcp_session_runtime(true));
-    let first_latency = multipath.ensure_session(FlowLane::Latency);
-    let second_latency = multipath.ensure_session(FlowLane::Latency);
-    let realtime_latency = multipath.ensure_session(FlowLane::RealtimeDatagram);
+#[tokio::test]
+async fn tcp_path_reuses_one_session_per_lane_class() {
+    let path = ClientTcpPathSessionHandle::new(test_tcp_session_runtime());
+    let first_latency = path.ensure_session(FlowLane::Latency);
+    let second_latency = path.ensure_session(FlowLane::Latency);
+    let realtime_latency = path.ensure_session(FlowLane::RealtimeDatagram);
+    let control_latency = path.ensure_session(FlowLane::Control);
     assert!(first_latency.same_channel(&second_latency));
     assert!(first_latency.same_channel(&realtime_latency));
+    assert!(first_latency.same_channel(&control_latency));
 
-    let bulk = multipath.ensure_session(FlowLane::Throughput);
+    let bulk = path.ensure_session(FlowLane::Throughput);
+    let background = path.ensure_session(FlowLane::Background);
     assert!(!first_latency.same_channel(&bulk));
+    assert!(bulk.same_channel(&background));
+}
+
+#[tokio::test]
+async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
+    let path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=500").await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let server = tokio::spawn(async move {
+        let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let mut opened = HashSet::new();
+        for index in 0..2 {
+            match framed.read_frame().await? {
+                Frame::PathMetrics { metrics } => assert_eq!(metrics.path_id, path_id),
+                other => panic!("expected PATH_METRICS, got {other:?}"),
+            }
+            let stream_id = match framed.read_frame().await? {
+                Frame::OpenStream { stream_id, .. } => stream_id,
+                other => panic!("expected OPEN_STREAM, got {other:?}"),
+            };
+            assert!(opened.insert(stream_id), "stream ID must be unique");
+            framed
+                .write_frame(&Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: ResourceLimits::default().max_stream_window_bytes,
+                })
+                .await?;
+            framed.flush().await?;
+            if index == 0 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                        .await
+                        .is_err(),
+                    "a second latency open must reuse the authenticated carrier"
+                );
+            }
+        }
+        assert_eq!(opened, HashSet::from([StreamId(71), StreamId(72)]));
+        Ok::<(), RuntimeError>(())
+    });
+
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(45),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        health: Arc::new(Mutex::new(ClientPathHealth {
+            tcp: vec![ClientPathHealthRecord::default()],
+            udp: Vec::new(),
+        })),
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let first = handle.open_stream(
+        StreamId(71),
+        TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+        IngressKind::HttpConnect,
+        FlowLane::Latency,
+        StreamOpenRole::Active,
+        deadline,
+    );
+    let second = handle.open_stream(
+        StreamId(72),
+        TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+        IngressKind::HttpConnect,
+        FlowLane::Latency,
+        StreamOpenRole::Active,
+        deadline,
+    );
+    let (first, second) = tokio::join!(first, second);
+    drop(first.expect("first stream"));
+    drop(second.expect("second stream"));
+    server.await.expect("server task").expect("server path");
+}
+
+#[tokio::test]
+async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Result<(), RuntimeError>
+{
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let (opens_seen_tx, opens_seen_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let mut opened = HashSet::new();
+        for _ in 0..2 {
+            assert!(matches!(
+                framed.read_frame().await?,
+                Frame::PathMetrics { .. }
+            ));
+            let stream_id = match framed.read_frame().await? {
+                Frame::OpenStream { stream_id, .. } => stream_id,
+                other => panic!("expected OPEN_STREAM, got {other:?}"),
+            };
+            opened.insert(stream_id);
+        }
+        assert_eq!(opened, HashSet::from([StreamId(81), StreamId(82)]));
+        framed
+            .write_frame(&Frame::StreamMaxData {
+                stream_id: StreamId(82),
+                max_offset: ResourceLimits::default().max_stream_window_bytes,
+            })
+            .await?;
+        framed.flush().await?;
+        let _ = opens_seen_tx.send(());
+
+        loop {
+            match framed.read_frame().await? {
+                Frame::StreamDetach {
+                    stream_id: StreamId(81),
+                } => break,
+                Frame::PathMetrics { metrics } if metrics.path_id == path_id => {}
+                other => panic!("expected pending stream detach, got {other:?}"),
+            }
+        }
+        framed
+            .write_frame(&Frame::StreamData {
+                stream_id: StreamId(82),
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"sibling-live"),
+            })
+            .await?;
+        framed.flush().await?;
+        Ok::<(), RuntimeError>(())
+    });
+
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(46),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        health: Arc::new(Mutex::new(ClientPathHealth {
+            tcp: vec![ClientPathHealthRecord::default()],
+            udp: Vec::new(),
+        })),
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .open_stream(
+                StreamId(81),
+                TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                IngressKind::HttpConnect,
+                FlowLane::Latency,
+                StreamOpenRole::Active,
+                deadline,
+            )
+            .await
+    });
+    let second_handle = handle.clone();
+    let second = tokio::spawn(async move {
+        second_handle
+            .open_stream(
+                StreamId(82),
+                TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+                IngressKind::HttpConnect,
+                FlowLane::Latency,
+                StreamOpenRole::Active,
+                deadline,
+            )
+            .await
+    });
+
+    opens_seen_rx.await.expect("server observed both opens");
+    first.abort();
+    match first.await {
+        Err(err) => assert!(err.is_cancelled()),
+        Ok(_) => panic!("first open task must be canceled"),
+    }
+    let mut sibling = second
+        .await
+        .expect("second task")
+        .expect("second stream accepted");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), sibling.recv_frame())
+            .await
+            .expect("sibling progress deadline")?,
+        Frame::StreamData { stream_id: StreamId(82), payload, .. }
+            if payload == Bytes::from_static(b"sibling-live")
+    ));
+    sibling.close().await;
+    server.await.expect("server task").expect("server path");
+    Ok::<(), RuntimeError>(())
 }
 
 #[tokio::test]
@@ -203,7 +467,6 @@ async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        reuse_latency_session: true,
         health: Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
@@ -247,7 +510,7 @@ async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
 }
 
 #[tokio::test]
-async fn dedicated_tcp_session_expires_pending_accept_and_sends_detach() {
+async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
     let path = reserve_tcp_path().await;
     let listener = bind_listener(&path).await.expect("bind");
     let server = tokio::spawn(async move {
@@ -318,7 +581,6 @@ async fn dedicated_tcp_session_expires_pending_accept_and_sends_detach() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        reuse_latency_session: false,
         health: Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
@@ -346,76 +608,8 @@ async fn dedicated_tcp_session_expires_pending_accept_and_sends_detach() {
 async fn tcp_client_sends_path_metrics_before_open_stream() {
     let path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=500").await;
     let listener = bind_listener(&path).await.expect("bind");
-    let server_path = path.clone();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let security = security();
-        let mut framed = EncryptedFramedStream::with_cipher_suite(
-            stream,
-            security.secret.as_bytes(),
-            PeerRole::Server,
-            CodecLimits::default(),
-            security.cipher,
-        )
-        .expect("initialize encrypted stream");
-        let session_id = match framed.read_frame().await? {
-            Frame::SessionHello { session_id } => session_id,
-            _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
-        };
-        let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
-        match framed.read_frame().await? {
-            Frame::SessionAuth {
-                session_id: auth_session_id,
-                nonce,
-                issued_at_unix_secs,
-                auth_tag,
-            } if auth_session_id == session_id
-                && authenticator.verify_session_auth(SessionAuthCheck {
-                    session_id,
-                    nonce,
-                    issued_at_unix_secs,
-                    tag: auth_tag,
-                    now_unix_secs: current_unix_secs()?,
-                    freshness_window_secs: security.auth_freshness_window.as_secs(),
-                }) => {}
-            _ => return Err(RuntimeError::Protocol("invalid SESSION_AUTH")),
-        }
-        let (path_id, capabilities) = match framed.read_frame().await? {
-            Frame::PathJoin {
-                session_id: join_session_id,
-                path_id,
-                underlay,
-                nonce,
-                issued_at_unix_secs,
-                capabilities,
-                auth_tag,
-            } if join_session_id == session_id
-                && underlay == UnderlayProtocol::Tcp
-                && authenticator.verify_path_join(PathJoinAuthCheck {
-                    session_id,
-                    path_id,
-                    underlay,
-                    nonce,
-                    issued_at_unix_secs,
-                    capabilities,
-                    tag: auth_tag,
-                    now_unix_secs: current_unix_secs()?,
-                    freshness_window_secs: security.auth_freshness_window.as_secs(),
-                }) =>
-            {
-                (path_id, capabilities)
-            }
-            _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
-        };
-        framed.write_frame(&Frame::SessionReady).await?;
-        framed
-            .write_frame(&Frame::PathStatus {
-                path_id,
-                status: crate::protocol::PathStatus::Active,
-                capabilities,
-            })
-            .await?;
-        framed.flush().await?;
+        let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
 
         match framed.read_frame().await? {
             Frame::PathMetrics { metrics } => {
@@ -442,8 +636,6 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
             }
             other => panic!("expected OPEN_STREAM after PATH_METRICS, got {other:?}"),
         }
-
-        let _ = server_path;
         Ok::<(), RuntimeError>(())
     });
 
@@ -457,7 +649,6 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        reuse_latency_session: true,
         health: Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),

@@ -2064,8 +2064,10 @@ where
         let can_read_local = can_read_by_flow && read_budget > 0;
         let can_send_pending_fin = pending_local_fin && response_sender.is_empty() && !close_sent;
 
+        // Carrier input and target responses can both remain continuously
+        // ready during an upload. Fair polling keeps response progress from
+        // being hidden behind an unbounded run of incoming STREAM_DATA.
         tokio::select! {
-            biased;
             _ = tokio::time::sleep_until(tail_repair_deadline), if tail_repair_active => {
                 let repair_outcome = enqueue_reliable_tail_repair(
                     &mut response_sender,

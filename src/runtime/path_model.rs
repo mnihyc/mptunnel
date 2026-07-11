@@ -102,9 +102,15 @@ pub(super) fn active_path_open_timeout(
 }
 
 pub(super) fn active_path_open_pto_multiplier(path: Option<PathSnapshot>) -> u32 {
-    QUIC_PERSISTENT_CONGESTION_THRESHOLD
-        .saturating_add(active_path_open_serialized_exchanges(path))
+    active_path_open_serialized_exchanges(path)
         .saturating_sub(1)
+        .saturating_add(persistent_congestion_pto_backoff_multiplier())
+}
+
+pub(super) fn persistent_congestion_pto_backoff_multiplier() -> u32 {
+    (0..QUIC_PERSISTENT_CONGESTION_THRESHOLD).fold(0_u32, |total, exponent| {
+        total.saturating_add(1_u32.checked_shl(exponent).unwrap_or(u32::MAX))
+    })
 }
 
 pub(super) fn active_path_open_serialized_exchanges(path: Option<PathSnapshot>) -> u32 {

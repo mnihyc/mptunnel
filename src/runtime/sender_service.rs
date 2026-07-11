@@ -1550,6 +1550,16 @@ fn choose_response_sender_target(
     if let Some(cause) = repair_cause {
         return choose_response_repair_target(targets, avoid_keys, cause);
     }
+    if matches!(frame, Frame::StreamAck { .. })
+        && let Some(active) = targets
+            .iter()
+            .find(|target| target.is_request_active && !avoid_keys.contains(&target.key))
+    {
+        // Request admission is clocked by ACKs returned on the current Active
+        // carrier. Prefer that carrier while it has capacity, but retain the
+        // normal fallback below so progress is not lost during backpressure.
+        return Some(active.clone());
+    }
     if !relay_frame_is_bulk_stream_data(frame, lane) {
         if matches!(frame, Frame::StreamData { .. }) {
             return choose_response_service_or_proven_data_target(
@@ -4872,6 +4882,7 @@ mod tests {
             snapshot,
             eta_ms,
             is_active,
+            is_request_active: is_active,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         }
@@ -6317,6 +6328,33 @@ mod tests {
     }
 
     #[test]
+    fn response_stream_ack_prefers_request_active_over_response_owner() {
+        let mut request_active =
+            response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 512 * 1024, false);
+        request_active.is_request_active = true;
+        let mut response_owner =
+            response_target(0, UnderlayProtocol::Udp, 5.0, 0, 512 * 1024, true);
+        response_owner.is_request_active = false;
+        let selected = choose_response_sender_target(
+            &[response_owner, request_active.clone()],
+            FlowLane::Control,
+            &Frame::StreamAck {
+                stream_id: StreamId(7),
+                complete: true,
+                ranges: vec![OffsetRange { start: 0, end: 64 }],
+            },
+            ResponseCarrierEmitMode::Classified,
+            MuxLimits::default(),
+            &[],
+            &[],
+            None,
+        )
+        .expect("request Active ACK carrier should remain dispatchable");
+
+        assert_eq!(selected.key, request_active.key);
+    }
+
+    #[test]
     fn response_stream_ordered_final_control_waits_for_backpressured_active_lead() {
         let (active_commands, _active_receivers) = reliable_path_command_channels(1);
         active_commands
@@ -6402,6 +6440,7 @@ mod tests {
             snapshot,
             eta_ms: 1.0,
             is_active: true,
+            is_request_active: true,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         };
@@ -9803,6 +9842,7 @@ mod tests {
             snapshot: service_snapshot,
             eta_ms: 50.0,
             is_active: true,
+            is_request_active: true,
             has_sender_evidence: true,
             has_bulk_rate_evidence: true,
         };

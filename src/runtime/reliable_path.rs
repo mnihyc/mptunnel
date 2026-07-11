@@ -689,6 +689,7 @@ pub(super) struct ResponseStreamBinding {
     next_output_incarnation: AtomicU64,
     owner_underlay_history: AtomicU8,
     outputs: Mutex<ResponseStreamOutputs>,
+    request_active_owner: Mutex<Option<CarrierPathKey>>,
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
@@ -826,6 +827,7 @@ impl ResponseStreamBinding {
                     peer_path_metrics: None,
                 }],
             }),
+            request_active_owner: Mutex::new(Some(key)),
             ordered_data_owner: Mutex::new(Some(key)),
             flights: Mutex::new(BTreeMap::new()),
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
@@ -1011,6 +1013,9 @@ impl ResponseStreamBinding {
                         self.owner_underlay_history
                             .fetch_or(response_owner_underlay_seen_bit(underlay), Ordering::AcqRel);
                     }
+                    if role == StreamOpenRole::Active {
+                        self.set_request_active_owner(key);
+                    }
                     drop(outputs);
                     drop(current_lane);
                     self.notify_update();
@@ -1142,6 +1147,11 @@ impl ResponseStreamBinding {
         if role != StreamOpenRole::Repair {
             self.owner_underlay_history
                 .fetch_or(response_owner_underlay_seen_bit(underlay), Ordering::AcqRel);
+        }
+        if replaced_closed && role != StreamOpenRole::Active {
+            self.clear_request_active_owner_if(key);
+        } else if role == StreamOpenRole::Active {
+            self.set_request_active_owner(key);
         }
         drop(outputs);
         drop(current_lane);
@@ -1430,6 +1440,7 @@ impl ResponseStreamBinding {
             }
             self.repair_ordered_data_owner_after_output_change(&outputs.entries);
             self.reset_subflow_set();
+            self.clear_request_active_owner_if(key);
             drop(outputs);
             drop(current_lane);
             self.notify_update();
@@ -1569,6 +1580,31 @@ impl ResponseStreamBinding {
             .ordered_data_owner
             .lock()
             .expect("server reliable stream ordered data owner lock")
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_active_owner(&self) -> Option<CarrierPathKey> {
+        *self
+            .request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock")
+    }
+
+    fn set_request_active_owner(&self, key: CarrierPathKey) {
+        *self
+            .request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock") = Some(key);
+    }
+
+    fn clear_request_active_owner_if(&self, key: CarrierPathKey) {
+        let mut active = self
+            .request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock");
+        if *active == Some(key) {
+            *active = None;
+        }
     }
 
     #[cfg(test)]
@@ -2279,6 +2315,10 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let request_active_key = *self
+            .request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock");
         let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
         let now = Instant::now();
         outputs
@@ -2308,6 +2348,7 @@ impl ResponseStreamBinding {
                         self.mux_limits,
                     ),
                     is_active: Some(entry.key) == active_key,
+                    is_request_active: Some(entry.key) == request_active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
                     has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_with_limits(
                         entry,
@@ -3423,6 +3464,11 @@ mod tests {
         drop(outputs);
         assert_eq!(binding.ordered_data_owner(), Some(active));
         assert_eq!(
+            binding.request_active_owner(),
+            Some(repair),
+            "request Active reannounce must not depend on the response data owner"
+        );
+        assert_eq!(
             binding.owner_underlay_history.load(Ordering::Acquire),
             RESPONSE_OWNER_MIXED_SEEN
         );
@@ -3454,7 +3500,7 @@ mod tests {
             targets
                 .iter()
                 .find(|target| target.key == active)
-                .is_some_and(|target| target.is_active),
+                .is_some_and(|target| target.is_active && target.is_request_active),
             "the initial active output remains the scheduler-active target"
         );
         assert!(
@@ -3472,15 +3518,15 @@ mod tests {
             targets
                 .iter()
                 .find(|target| target.key == validation)
-                .is_some_and(|target| target.is_active),
+                .is_some_and(|target| target.is_active && !target.is_request_active),
             "scheduler-active target must follow ordered_data_owner after migration"
         );
         assert!(
             targets
                 .iter()
                 .find(|target| target.key == active)
-                .is_some_and(|target| !target.is_active),
-            "output list tail must not override ordered_data_owner"
+                .is_some_and(|target| !target.is_active && target.is_request_active),
+            "response owner migration must not overwrite the request Active identity"
         );
     }
 

@@ -122,6 +122,16 @@ Recommended production ranges:
 | TCP heartbeat timers | 10s / 30s | keep default | Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair evidence. |
 | Outbound connect timeout | 10s | per egress outbound/member | Target or upstream-proxy dial safety. It is scoped to the outbound that owns the connect and does not affect MPP path probing, pacing, or failover. |
 
+While a request stream's Active carrier is TCP, it does not immediately fill
+the 64 MiB stream and repair envelopes. Its source queue and ACK-retained repair
+bytes share a smaller stream-local startup window that grows only from timely
+unique product ACKs returned on the same active TCP carrier instance. A carrier
+handoff starts a fresh ACK clock; loss without a replacement retains the prior
+bound. This is automatic and has no operator knob. `STREAM_ACK` means the peer
+handed bytes to its local target socket, not that the target application
+consumed them, so target-side kernel buffering can still exceed
+receiver-observed application bytes during a fixed-duration test.
+
 For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
 `max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together
 instead of only raising the frame or read chunk. For a memory-constrained local

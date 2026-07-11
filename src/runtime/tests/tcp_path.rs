@@ -1753,6 +1753,26 @@ fn initial_active_open_timeout_uses_persistent_handshake_budget() {
         underlay: UnderlayProtocol::Tcp,
         index: 1,
     };
+    assert_eq!(persistent_congestion_pto_backoff_multiplier(), 7);
+    assert_eq!(
+        active_path_open_pto_multiplier(context.reliable_path_snapshot(tcp_key)),
+        active_path_open_serialized_exchanges(context.reliable_path_snapshot(tcp_key))
+            .saturating_sub(1)
+            .saturating_add(persistent_congestion_pto_backoff_multiplier()),
+        "a sole TCP candidate reserves its phase prefix plus persistent-congestion PTO backoff"
+    );
+    assert_eq!(
+        active_path_open_pto_multiplier(context.reliable_path_snapshot(tcp_key)),
+        9
+    );
+    let udp_snapshot = PathSnapshot::new(PathId(9), UnderlayProtocol::Udp, 20.0, 100_000_000.0);
+    assert_eq!(
+        active_path_open_pto_multiplier(Some(udp_snapshot)),
+        active_path_open_serialized_exchanges(Some(udp_snapshot))
+            .saturating_sub(1)
+            .saturating_add(persistent_congestion_pto_backoff_multiplier())
+    );
+    assert_eq!(active_path_open_pto_multiplier(Some(udp_snapshot)), 8);
 
     assert_eq!(
         reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false),

@@ -41,6 +41,7 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) eta_ms: f64,
     pub(in crate::runtime) is_active: bool,
+    pub(in crate::runtime) is_request_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
 }

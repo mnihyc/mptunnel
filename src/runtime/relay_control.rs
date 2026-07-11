@@ -1,4 +1,187 @@
+use super::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
 use super::*;
+
+fn reliable_relay_request_outstanding_resource_ceiling(mux_limits: MuxLimits) -> usize {
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    mux_limits
+        .max_repair_bytes
+        .min(mux_limits.max_path_flight_bytes)
+        .min(stream_window)
+        .max(1)
+}
+
+#[derive(Debug)]
+struct ReliableRelayRequestOutstandingWindow {
+    active_tcp_instance: Option<RelayPathInstance>,
+    tcp_limit_bytes: usize,
+    growth_epoch_at: Instant,
+    acked_in_epoch: usize,
+}
+
+impl ReliableRelayRequestOutstandingWindow {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self {
+            active_tcp_instance: None,
+            tcp_limit_bytes: 0,
+            growth_epoch_at: now,
+            acked_in_epoch: 0,
+        }
+    }
+
+    fn limit_bytes(
+        &mut self,
+        active_instance: Option<RelayPathInstance>,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+    ) -> usize {
+        self.limit_bytes_at(
+            active_instance,
+            lane,
+            payload_bytes,
+            mux_limits,
+            Instant::now(),
+        )
+    }
+
+    fn limit_bytes_at(
+        &mut self,
+        active_instance: Option<RelayPathInstance>,
+        lane: FlowLane,
+        payload_bytes: usize,
+        mux_limits: MuxLimits,
+        now: Instant,
+    ) -> usize {
+        let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
+        match active_instance {
+            Some(instance) if instance.key.underlay == UnderlayProtocol::Tcp => {
+                if self.active_tcp_instance != Some(instance) {
+                    self.active_tcp_instance = Some(instance);
+                    self.tcp_limit_bytes = 0;
+                    self.growth_epoch_at = now;
+                    self.acked_in_epoch = 0;
+                }
+            }
+            Some(_) => {
+                self.active_tcp_instance = None;
+                self.tcp_limit_bytes = 0;
+                self.growth_epoch_at = now;
+                self.acked_in_epoch = 0;
+                return resource_ceiling;
+            }
+            None if self.active_tcp_instance.is_none() => return resource_ceiling,
+            None => {
+                // Retain the last TCP allowance while no Active carrier is
+                // available so recovery cannot reopen source read-ahead.
+            }
+        }
+
+        let startup_reservoir = if relay_lane_is_bulk(lane) {
+            bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
+        } else {
+            // Flow classification already expects one full source queue.
+            // Keeping this reservoir avoids turning the 14.6 KiB latency
+            // probe into a stop-and-wait prerequisite for sustained upload.
+            reliable_relay_buffer_len(mux_limits)
+        }
+        .min(resource_ceiling)
+        .max(1);
+        if self.tcp_limit_bytes < startup_reservoir {
+            self.tcp_limit_bytes = startup_reservoir;
+            self.growth_epoch_at = now;
+            self.acked_in_epoch = 0;
+        }
+        self.tcp_limit_bytes.min(resource_ceiling).max(1)
+    }
+
+    fn record_acked(
+        &mut self,
+        released_bytes: usize,
+        ack_instance: RelayPathInstance,
+        active_instance: Option<RelayPathInstance>,
+        lane: FlowLane,
+        growth_interval: Duration,
+        mux_limits: MuxLimits,
+    ) {
+        self.record_acked_at(
+            released_bytes,
+            ack_instance,
+            active_instance,
+            lane,
+            growth_interval,
+            mux_limits,
+            Instant::now(),
+        );
+    }
+
+    fn record_acked_at(
+        &mut self,
+        released_bytes: usize,
+        ack_instance: RelayPathInstance,
+        active_instance: Option<RelayPathInstance>,
+        lane: FlowLane,
+        growth_interval: Duration,
+        mux_limits: MuxLimits,
+        now: Instant,
+    ) {
+        if released_bytes == 0
+            || ack_instance.key.underlay != UnderlayProtocol::Tcp
+            || active_instance != Some(ack_instance)
+            || self.active_tcp_instance != Some(ack_instance)
+            || !relay_lane_is_bulk(lane)
+        {
+            return;
+        }
+        let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
+        if self.tcp_limit_bytes == 0 || self.tcp_limit_bytes >= resource_ceiling {
+            return;
+        }
+        let growth_interval = growth_interval.max(QUIC_TIMER_GRANULARITY);
+        if now.saturating_duration_since(self.growth_epoch_at) > growth_interval {
+            self.growth_epoch_at = now;
+            self.acked_in_epoch = 0;
+            return;
+        }
+        self.acked_in_epoch = self.acked_in_epoch.saturating_add(released_bytes);
+        let growth_threshold = self.tcp_limit_bytes.div_ceil(2).max(1);
+        if self.acked_in_epoch < growth_threshold {
+            return;
+        }
+        self.tcp_limit_bytes = self
+            .tcp_limit_bytes
+            .saturating_mul(2)
+            .min(resource_ceiling)
+            .max(1);
+        self.growth_epoch_at = now;
+        self.acked_in_epoch = 0;
+    }
+}
+
+fn reliable_relay_request_outstanding_headroom_bytes(
+    send_stream: &ReliableSendStream,
+    sender_queue: &ReliableRelaySenderQueue,
+    outstanding_limit_bytes: usize,
+) -> usize {
+    outstanding_limit_bytes.saturating_sub(
+        send_stream
+            .repair_bytes()
+            .saturating_add(sender_queue.data_bytes()),
+    )
+}
+
+fn reliable_relay_request_ack_growth_interval(
+    path_key: RelayPathKey,
+    context: &ClientPathContext,
+) -> Duration {
+    context
+        .reliable_path_snapshot(path_key)
+        .map(|snapshot| transport_pto_from_snapshot(Some(snapshot)))
+        .unwrap_or_else(|| transport_pto_from_snapshot(None))
+}
 
 pub(super) async fn relay_migrating_tcp_stream<S>(
     mut local: S,
@@ -29,6 +212,7 @@ where
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
     let mut path_next_live_sample_bytes = HashMap::<RelayPathKey, u64>::new();
     let mut sender = RelaySenderService::new(stream_id);
+    let mut request_outstanding_window = ReliableRelayRequestOutstandingWindow::new();
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut last_stream_progress_at = Instant::now();
     let mut last_delivery_progress_at = Instant::now();
@@ -58,7 +242,7 @@ where
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
-    let mut last_reported_read_block: Option<(usize, usize, usize)> = None;
+    let mut last_reported_read_block: Option<(usize, usize, usize, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_receive_hole: Option<(u64, usize, usize, u64)> = None;
 
@@ -202,6 +386,12 @@ where
         );
         let adaptive_inflight =
             adaptive_reliable_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
+        let request_outstanding_limit = request_outstanding_window.limit_bytes(
+            remotes.active_path_instance(),
+            relay_lane,
+            adaptive_chunk,
+            context.mux_limits,
+        );
         let sender_queue_limit =
             reliable_relay_sender_queue_limit(context.mux_limits, adaptive_inflight);
         let source_read_ceiling = reliable_relay_buffer_len(context.mux_limits)
@@ -301,6 +491,12 @@ where
             context.mux_limits,
             sender_queue_limit,
         );
+        let request_outstanding_headroom = reliable_relay_request_outstanding_headroom_bytes(
+            &send_stream,
+            &sender_queue,
+            request_outstanding_limit,
+        );
+        let can_read_by_flow = can_read_by_flow && request_outstanding_headroom > 0;
         let prospective_read_budget = if can_read_by_flow {
             reliable_relay_sender_queue_read_budget(
                 &send_stream,
@@ -309,6 +505,7 @@ where
                 sender_queue_limit,
                 source_read_ceiling,
             )
+            .min(request_outstanding_headroom)
         } else {
             0
         };
@@ -331,17 +528,21 @@ where
                     send_stream.repair_bytes(),
                     send_stream.send_credit_bytes(),
                     adaptive_inflight,
+                    request_outstanding_limit,
+                    request_outstanding_headroom,
                 );
                 if last_reported_read_block != Some(blocked_state) {
                     lab_diagnostic(
                         "relay_local_read_blocked",
                         format_args!(
-                            "stream_id={} lane={:?} repair_bytes={} send_credit_bytes={} inflight_limit={} sent_offset={} received_offset={}",
+                            "stream_id={} lane={:?} repair_bytes={} send_credit_bytes={} inflight_limit={} request_outstanding_limit={} request_outstanding_headroom={} sent_offset={} received_offset={}",
                             stream_id.0,
                             relay_lane,
                             blocked_state.0,
                             blocked_state.1,
                             blocked_state.2,
+                            blocked_state.3,
+                            blocked_state.4,
                             send_stream.next_offset(),
                             recv_stream.next_offset(),
                         ),
@@ -1510,6 +1711,14 @@ where
                         let ack = send_stream.apply_normalized_ack(&normalized_ranges);
                         if ack.released_bytes > 0 {
                             sender.record_owner_progress(ack.released_bytes);
+                            request_outstanding_window.record_acked(
+                                ack.released_bytes,
+                                instance,
+                                remotes.active_path_instance(),
+                                relay_lane,
+                                reliable_relay_request_ack_growth_interval(path_key, context),
+                                context.mux_limits,
+                            );
                         }
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
@@ -2917,6 +3126,277 @@ mod tests {
         SecurityConfig::encrypted(
             SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("test secret"),
         )
+    }
+
+    fn request_test_path_instance(
+        underlay: UnderlayProtocol,
+        index: usize,
+        id: u64,
+    ) -> RelayPathInstance {
+        RelayPathInstance {
+            key: RelayPathKey { underlay, index },
+            id,
+        }
+    }
+
+    #[test]
+    fn tcp_request_outstanding_limit_uses_service_reservoir_then_ack_headroom() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = 64 * 1024;
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
+        let limit = window.limit_bytes_at(
+            Some(tcp),
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            now,
+        );
+        assert_eq!(limit, 4 * 1024 * 1024);
+
+        let mut send_stream = ReliableSendStream::new(StreamId(90), mux_limits);
+        send_stream
+            .send_data(Bytes::from(vec![0x11; 512 * 1024]), StreamFlags::NONE)
+            .expect("first dispatched request chunk");
+        send_stream
+            .send_data(Bytes::from(vec![0x22; 512 * 1024]), StreamFlags::NONE)
+            .expect("second dispatched request chunk");
+        let mut sender_queue = ReliableRelaySenderQueue::default();
+        sender_queue.push_data(Bytes::from(vec![0x33; 1024 * 1024]));
+
+        assert_eq!(
+            reliable_relay_request_outstanding_headroom_bytes(&send_stream, &sender_queue, limit),
+            2 * 1024 * 1024
+        );
+        sender_queue.push_data(Bytes::from(vec![0x44; 2 * 1024 * 1024]));
+        assert_eq!(
+            reliable_relay_request_outstanding_headroom_bytes(&send_stream, &sender_queue, limit),
+            0,
+            "raw request data and ACK-retained repair bytes share one unique-byte budget"
+        );
+        let ack = send_stream.apply_ack(&[OffsetRange {
+            start: 0,
+            end: 1024 * 1024,
+        }]);
+        assert_eq!(ack.released_bytes, 1024 * 1024);
+        assert_eq!(
+            reliable_relay_request_outstanding_headroom_bytes(&send_stream, &sender_queue, limit),
+            1024 * 1024,
+            "unique STREAM_ACK release must resume source reads without double-counting raw queue bytes"
+        );
+    }
+
+    #[test]
+    fn tcp_request_outstanding_limit_preserves_classifier_reservoir_and_ack_growth() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
+        let startup = window.limit_bytes_at(
+            Some(tcp),
+            FlowLane::Latency,
+            PATH_OPEN_SCORE_BYTES,
+            mux_limits,
+            now,
+        );
+        assert_eq!(startup, reliable_relay_buffer_len(mux_limits));
+
+        let path = PathSnapshot::new(PathId(3), UnderlayProtocol::Tcp, 100.0, 160_000_000.0);
+        let growth_interval = transport_pto_from_snapshot(Some(path));
+        let promoted_at = now + Duration::from_millis(1);
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                promoted_at,
+            ),
+            4 * 1024 * 1024
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            tcp,
+            Some(tcp),
+            FlowLane::Throughput,
+            growth_interval,
+            mux_limits,
+            promoted_at + Duration::from_millis(50),
+        );
+        assert_eq!(window.tcp_limit_bytes, 8 * 1024 * 1024);
+
+        let expired_at = promoted_at + Duration::from_secs(1);
+        window.record_acked_at(
+            4 * 1024 * 1024,
+            tcp,
+            Some(tcp),
+            FlowLane::Throughput,
+            growth_interval,
+            mux_limits,
+            expired_at,
+        );
+        assert_eq!(
+            window.tcp_limit_bytes,
+            8 * 1024 * 1024,
+            "slow release must not expand the request window"
+        );
+        window.record_acked_at(
+            4 * 1024 * 1024,
+            tcp,
+            Some(tcp),
+            FlowLane::Throughput,
+            growth_interval,
+            mux_limits,
+            expired_at + Duration::from_millis(50),
+        );
+        assert_eq!(window.tcp_limit_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_outstanding_limit_is_scoped_to_the_active_tcp_instance() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let udp = request_test_path_instance(UnderlayProtocol::Udp, 0, 1);
+        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 2);
+        let replacement_tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 3);
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(udp),
+                FlowLane::Latency,
+                PATH_OPEN_SCORE_BYTES,
+                mux_limits,
+                now,
+            ),
+            mux_limits.max_path_flight_bytes
+        );
+        assert_eq!(window.active_tcp_instance, None);
+
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(1),
+            ),
+            4 * 1024 * 1024
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            udp,
+            Some(tcp),
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(
+            window.tcp_limit_bytes,
+            4 * 1024 * 1024,
+            "an ACK from another carrier must not expand the active TCP allowance"
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            tcp,
+            Some(tcp),
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(3),
+        );
+        assert_eq!(window.tcp_limit_bytes, 8 * 1024 * 1024);
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(replacement_tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(4),
+            ),
+            4 * 1024 * 1024,
+            "a direct TCP carrier handoff must start a fresh path-local ACK clock"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                None,
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(5),
+            ),
+            4 * 1024 * 1024,
+            "losing the active TCP carrier must not reopen reads during recovery"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(udp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(6),
+            ),
+            mux_limits.max_path_flight_bytes,
+            "an active UDP carrier retains the existing adaptive product-window policy"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(7),
+            ),
+            4 * 1024 * 1024,
+            "a UDP-to-TCP handoff must start a fresh path-local ACK clock"
+        );
+    }
+
+    #[test]
+    fn tcp_request_outstanding_limit_never_exceeds_product_resource_ceiling() {
+        let mux_limits = MuxLimits {
+            max_stream_window_bytes: 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let growth_interval = transport_pto_from_snapshot(None);
+        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
+
+        assert_eq!(
+            window.limit_bytes_at(Some(tcp), FlowLane::Throughput, 64 * 1024, mux_limits, now,),
+            512 * 1024
+        );
+        window.record_acked_at(
+            256 * 1024,
+            tcp,
+            Some(tcp),
+            FlowLane::Throughput,
+            growth_interval,
+            mux_limits,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(10),
+            ),
+            1024 * 1024
+        );
+        window.record_acked_at(
+            1024 * 1024,
+            tcp,
+            Some(tcp),
+            FlowLane::Throughput,
+            growth_interval,
+            mux_limits,
+            now + Duration::from_millis(20),
+        );
+        assert_eq!(window.tcp_limit_bytes, 1024 * 1024);
     }
 
     fn test_reliable_path_stream(

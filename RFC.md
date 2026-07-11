@@ -1076,7 +1076,7 @@ them.
 | UDP target/datagram clamps `50ms..1s`, `250ms`, `8*SRTT`, and `64Kbps` | Removed from response and suppression policy. Datagram response deadlines and suppression derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold. QUIC carrier setup is additionally bounded by the remaining product TTL and the implementation's handshake safety envelope. |
 | QUIC sampler clamp `10..250ms` | Removed. Active sampling uses SRTT/2 with timer granularity; idle/app-limited sampling uses PTO. |
 | TCP/session/TUN queue slot caps such as `+4`, `1024`, and `4096` where byte envelopes already exist | Removed from data-plane queues. Queue depth is byte envelope divided by actual payload quantum plus lane-derived priority headroom. Security/control-plane cache caps remain separate. |
-| Hard-coded egress and MPP path connect timeout call sites | Removed. Egress target/proxy setup remains owned by its outbound/member. Initial Active setup budgets each serialized exchange: three PTOs for TCP and two for QUIC UDP while another candidate remains, or five/four PTOs respectively for a sole candidate's persistent-congestion tolerance. Every initial Active TCP attempt retains the conservative initial PTO floor because its actor may establish or re-establish the carrier. Attach/recovery uses one live candidate PTO. One absolute deadline covers queue wait, carrier setup, authenticated session and `PATH_JOIN`, `OPEN_STREAM`, current path-metric publication, and the role-required peer accept/reset. Idle-probe policy neither preempts nor extends it. |
+| Hard-coded egress and MPP path connect timeout call sites | Removed. Egress target/proxy setup remains owned by its outbound/member. Initial Active setup budgets each serialized exchange: three PTOs for TCP and two for QUIC UDP while another candidate remains. A sole candidate gets the remaining phase prefix plus the persistent-congestion PTO backoff series, nine/eight PTOs for TCP/QUIC UDP. Every initial Active TCP attempt retains the conservative initial PTO floor because its actor may establish or re-establish the carrier. Attach/recovery uses one live candidate PTO. One absolute deadline covers queue wait, carrier setup, authenticated session and `PATH_JOIN`, `OPEN_STREAM`, current path-metric publication, and the role-required peer accept/reset. Idle-probe policy neither preempts nor extends it. |
 | Fixed closed-stream and `PATH_JOIN` replay cache clamps | Removed. Closed-stream retention scales from configured stream count without preallocation; `PATH_JOIN` nonce replay retention scales from configured stream count and the QUIC persistent-congestion threshold. |
 | Fixed datagram retry exponent cap | Removed. Product datagrams are not retransmitted by mptunnel after feedback or response expiry; PTO/TTL-derived budgets bound only response waiting, carrier setup, path suppression, and a single pre-feedback alternate-carrier failover attempt when one remains schedulable. |
 | TCP/QUIC-underlay datagram product retransmit/reopen loop | Removed. The carrier owns packet/stream retransmission below mptunnel; mptunnel MUST NOT duplicate an acknowledged datagram ID or open a replacement carrier only because a UDP target response timed out. Real setup, encryption, authentication, session errors, and pre-feedback path timeout before useful product expiry remain retryable carrier failures. |
@@ -2151,6 +2151,30 @@ sender-service scheduler, repair ledger, path admission, and carrier-credit
 gates decide how aggressively to use the advertised credit from live path
 state.
 
+For the local-to-remote request direction, a product stream whose Active
+Service carrier is TCP MUST NOT treat the full TCP receive window as immediate
+source-read permission. One stream-local admission window counts undispatched
+unique source bytes and ACK-retained repair bytes together. It retains one
+source-queue reservoir while classifying the flow, starts bulk work at the
+resource-derived Service feed reservoir, and may double only after unique
+`STREAM_ACK` release consumes at least half the current window within that
+active path's PTO. Only an ACK arriving on the same active TCP carrier instance
+is eligible to grow the window. The receiver SHOULD prefer its most recently
+accepted request Active output for ordinary ACKs independently of its response
+OwnerData path; a capacity fallback remains valid release evidence but does not
+grow this clock. The estimator resets on every active TCP carrier handoff and
+MUST NOT inherit path-global, opposite-direction, earlier-flow, other-path, or
+superseded-path rate evidence. If the active TCP carrier is lost before
+replacement, the prior bound remains in force during recovery. When a UDP
+carrier becomes Active, the stream instead relies on its adaptive advertised
+product window; a later TCP handoff applies a fresh TCP allowance and pauses
+new source reads while total outstanding bytes exceed it.
+
+`STREAM_ACK` proves that the receiving mptunnel endpoint accepted contiguous
+product bytes into its local target socket; it does not prove that an arbitrary
+target application consumed them. This admission rule therefore bounds source
+queue and repair retention without claiming end-application delivery telemetry.
+
 A sender-side product stream starts with exactly the peer-advertised credit. An
 implementation MUST NOT manufacture the configured stream window as local send
 credit before receiving the peer's open/MAX_DATA credit. For QUIC reliable
@@ -2994,8 +3018,8 @@ authenticated MPP/`PATH_JOIN`, and product open/accept, and let
 `open_phases(QUIC_UDP) = 2` for QUIC/path setup and product open/accept. A
 candidate with another schedulable alternative gets
 `open_phases(path) * open_pto(path)`. A sole candidate gets
-`(persistent_congestion_threshold + open_phases(path) - 1) * open_pto(path)`,
-which is five PTOs for TCP and four for QUIC UDP. Every initial Active TCP
+`(open_phases(path) - 1 + sum(2^i, i=0..persistent_congestion_threshold-1)) * open_pto(path)`,
+which is nine PTOs for TCP and eight for QUIC UDP. Every initial Active TCP
 attempt keeps the conservative initial PTO floor even after a low-latency idle
 probe because the shared session actor may establish or re-establish its carrier. Explicit
 Active reattach, Repair, and Validation/recovery opens instead get one candidate
@@ -4723,8 +4747,9 @@ may need to establish or re-establish the carrier. Define
 `open_phases(TCP) = 3` and `open_phases(QUIC_UDP) = 2`. An initial
 demand-bearing Active attempt with another schedulable candidate MUST establish
 `deadline = attempt_start + open_phases(path) * open_pto(path)`. A sole
-candidate adds persistent-congestion tolerance with multiplier
-`persistent_congestion_threshold + open_phases(path) - 1`. An Active reattach,
+candidate adds persistent-congestion backoff after its phase prefix with
+multiplier `open_phases(path) - 1 +
+sum(2^i, i=0..persistent_congestion_threshold-1)`. An Active reattach,
 Repair, or Validation/recovery attempt MUST establish
 `deadline = attempt_start + candidate_pto(path)`.
 
@@ -5603,7 +5628,8 @@ initial_active_open(path, stream, alternative_exists):
         pto = max(pto, conservative_initial_pto())
     phases = 3 if path.underlay == TCP else 2
     multiplier = phases if alternative_exists
-                 else persistent_congestion_threshold + phases - 1
+                 else phases - 1 + sum(2^i,
+                                       i=0..persistent_congestion_threshold-1)
     deadline = now() + multiplier * pto
     open_stream_on_path_until(path, stream.id, deadline)
 

@@ -5,6 +5,42 @@ pub(super) struct OpenedRemoteStream {
     pub(super) path_index: usize,
 }
 
+pub(super) struct AcceptedRemoteStreamGuard {
+    stream: Option<ReliablePathStream>,
+}
+
+impl AcceptedRemoteStreamGuard {
+    pub(super) fn new(stream: ReliablePathStream) -> Self {
+        Self {
+            stream: Some(stream),
+        }
+    }
+
+    fn stream(&self) -> &ReliablePathStream {
+        self.stream.as_ref().expect("accepted stream guard")
+    }
+
+    fn commit(mut self) -> ReliablePathStream {
+        self.stream.take().expect("accepted stream guard")
+    }
+}
+
+impl Drop for AcceptedRemoteStreamGuard {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let stream_id = stream.stream_id;
+        let output = stream.output.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                output.send_stream_detach(stream_id).await;
+                output.close_stream(stream_id).await;
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct RelayPathKey {
     pub(super) underlay: UnderlayProtocol,
@@ -468,30 +504,32 @@ async fn open_reliable_initial_active_attempt(
     target: TargetAddr,
     ingress: IngressKind,
     lane: FlowLane,
+    has_unattempted_alternative: bool,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let ReliableInitialOpenAttempt { key, stream_id } = attempt;
     match key.underlay {
         UnderlayProtocol::Tcp => {
-            let open_timeout = reliable_initial_active_open_timeout(context, key, lane);
-            match tokio::time::timeout(
-                open_timeout,
-                open_remote_stream_on_reserved_path(
-                    context,
-                    stream_id,
-                    target,
-                    ingress,
-                    lane,
-                    key.index,
-                    StreamOpenRole::Active,
-                ),
+            let open_timeout = reliable_initial_active_open_timeout(
+                context,
+                key,
+                lane,
+                has_unattempted_alternative,
+            );
+            let open_deadline = tokio::time::Instant::now() + open_timeout;
+            match open_remote_stream_on_reserved_path(
+                context,
+                stream_id,
+                target,
+                ingress,
+                lane,
+                key.index,
+                StreamOpenRole::Active,
+                open_deadline,
             )
             .await
             {
-                Ok(result) => result,
-                Err(_) => {
-                    if let Some(session) = context.tcp_sessions.get(key.index) {
-                        session.cancel_stream_open(lane, stream_id).await;
-                    }
+                Ok(opened) => Ok(opened),
+                Err(RuntimeError::PathOpenTimedOut) => {
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "reliable_stream_open_timeout",
@@ -506,10 +544,16 @@ async fn open_reliable_initial_active_attempt(
                     );
                     Err(RuntimeError::PathOpenTimedOut)
                 }
+                Err(err) => Err(err),
             }
         }
         UnderlayProtocol::Udp => {
-            let open_timeout = reliable_initial_active_open_timeout(context, key, lane);
+            let open_timeout = reliable_initial_active_open_timeout(
+                context,
+                key,
+                lane,
+                has_unattempted_alternative,
+            );
             match tokio::time::timeout(
                 open_timeout,
                 open_remote_stream_on_reserved_udp_path(
@@ -557,8 +601,19 @@ pub(super) async fn open_remote_stream(
         reserve_reliable_initial_open_attempt(context, lane, PATH_OPEN_SCORE_BYTES, &mut attempted)?
     {
         let key = attempt.key;
-        match open_reliable_initial_active_attempt(context, attempt, target.clone(), ingress, lane)
-            .await
+        let has_unattempted_alternative = context
+            .ordered_reliable_path_keys(lane, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .any(|candidate| !attempted.contains(&candidate));
+        match open_reliable_initial_active_attempt(
+            context,
+            attempt,
+            target.clone(),
+            ingress,
+            lane,
+            has_unattempted_alternative,
+        )
+        .await
         {
             Ok(opened) => return Ok(opened),
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
@@ -592,25 +647,27 @@ pub(super) async fn open_remote_stream_on_path(
         },
         lane,
     );
-    let open_result = tokio::time::timeout(
-        open_timeout,
-        open_remote_stream_on_reserved_path(
-            context, stream_id, target, ingress, lane, path_index, role,
-        ),
+    let open_deadline = tokio::time::Instant::now() + open_timeout;
+    let open_result = open_remote_stream_on_reserved_path(
+        context,
+        stream_id,
+        target,
+        ingress,
+        lane,
+        path_index,
+        role,
+        open_deadline,
     )
     .await;
     match open_result {
-        Ok(Ok(opened)) => Ok(opened),
-        Ok(Err(err)) => {
+        Ok(opened) => Ok(opened),
+        Err(err) if !matches!(err, RuntimeError::PathOpenTimedOut) => {
             context.release_tcp_path_load(path_index, lane);
             Err(err)
         }
-        Err(_) => {
+        Err(RuntimeError::PathOpenTimedOut) => {
             context.release_tcp_path_load(path_index, lane);
             context.mark_tcp_path_data_plane_failure(path_index);
-            if let Some(session) = context.tcp_sessions.get(path_index) {
-                session.cancel_stream_open(lane, stream_id).await;
-            }
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "reliable_stream_open_timeout",
@@ -624,6 +681,10 @@ pub(super) async fn open_remote_stream_on_path(
                 ),
             );
             Err(RuntimeError::PathOpenTimedOut)
+        }
+        Err(err) => {
+            context.release_tcp_path_load(path_index, lane);
+            Err(err)
         }
     }
 }
@@ -640,12 +701,18 @@ pub(super) fn reliable_initial_active_open_timeout(
     context: &ClientPathContext,
     key: RelayPathKey,
     lane: FlowLane,
+    has_unattempted_alternative: bool,
 ) -> Duration {
-    let attach_timeout = reliable_relay_attach_open_timeout(context, key, lane);
-    attach_timeout
-        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
-        .min(context.path_connect_timeout)
-        .max(attach_timeout)
+    let _ = lane;
+    let snapshot = context.reliable_path_snapshot(key);
+    let rtt_is_observed =
+        key.underlay == UnderlayProtocol::Udp && context.reliable_path_rtt_is_observed(key);
+    if has_unattempted_alternative {
+        path_open_pto(snapshot, rtt_is_observed)
+            .saturating_mul(active_path_open_serialized_exchanges(snapshot))
+    } else {
+        active_path_open_timeout(snapshot, rtt_is_observed)
+    }
 }
 
 pub(super) async fn open_remote_stream_on_reserved_path(
@@ -656,6 +723,7 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     lane: FlowLane,
     path_index: usize,
     role: StreamOpenRole,
+    open_deadline: tokio::time::Instant,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -675,11 +743,22 @@ pub(super) async fn open_remote_stream_on_reserved_path(
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream(stream_id, target, ingress, lane, role)
+        .open_stream(stream_id, target, ingress, lane, role, open_deadline)
         .await?;
+    let accepted = AcceptedRemoteStreamGuard::new(stream);
+    tokio::time::timeout_at(
+        open_deadline,
+        send_open_path_metrics(
+            context,
+            accepted.stream(),
+            UnderlayProtocol::Tcp,
+            path_index,
+        ),
+    )
+    .await
+    .map_err(|_| RuntimeError::PathOpenTimedOut)??;
     let elapsed = started_at.elapsed();
     context.mark_tcp_path_reserved_open_success(path_index, elapsed);
-    send_open_path_metrics(context, &stream, UnderlayProtocol::Tcp, path_index).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -692,7 +771,10 @@ pub(super) async fn open_remote_stream_on_reserved_path(
             elapsed.as_secs_f64() * 1000.0,
         ),
     );
-    Ok(OpenedRemoteStream { stream, path_index })
+    Ok(OpenedRemoteStream {
+        stream: accepted.commit(),
+        path_index,
+    })
 }
 
 pub(super) async fn open_remote_stream_on_udp_path(
@@ -781,9 +863,16 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
         .open_stream(stream_id, target, ingress, lane, options)
         .await?;
+    let accepted = AcceptedRemoteStreamGuard::new(stream);
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed, wait_for_accept);
-    send_open_path_metrics(context, &stream, UnderlayProtocol::Udp, path_index).await?;
+    send_open_path_metrics(
+        context,
+        accepted.stream(),
+        UnderlayProtocol::Udp,
+        path_index,
+    )
+    .await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -797,7 +886,10 @@ pub(super) async fn open_remote_stream_on_reserved_udp_path(
             elapsed.as_secs_f64() * 1000.0,
         ),
     );
-    Ok(OpenedRemoteStream { stream, path_index })
+    Ok(OpenedRemoteStream {
+        stream: accepted.commit(),
+        path_index,
+    })
 }
 
 async fn send_open_path_metrics(

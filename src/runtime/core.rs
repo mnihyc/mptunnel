@@ -156,7 +156,6 @@ fn new_client_path_context(
         ProxyAuthConfig::disabled(),
         client.route_target.clone(),
         client.ingresses.clone(),
-        client.path_probe_timeout,
     )
 }
 
@@ -301,7 +300,6 @@ pub struct ClientPathContext {
     pub(super) tcp_security: Arc<Vec<SecurityConfig>>,
     pub(super) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
-    pub(super) path_connect_timeout: Duration,
     // Product ownership: reliable stream IDs live above TCP and QUIC UDP paths.
     pub(super) next_reliable_stream_id: Arc<Mutex<u64>>,
     // Path-model ownership: health records are evidence snapshots consumed by
@@ -880,14 +878,7 @@ impl ClientPathContext {
                 security: security.clone(),
             })
             .collect();
-        Self::new_with_path_configs_and_target(
-            paths,
-            resources,
-            proxy_auth,
-            None,
-            Vec::new(),
-            crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
-        )
+        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None, Vec::new())
     }
 
     pub fn new_with_path_configs_and_target(
@@ -896,7 +887,6 @@ impl ClientPathContext {
         proxy_auth: ProxyAuthConfig,
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
-        path_connect_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
@@ -963,7 +953,6 @@ impl ClientPathContext {
                         resources.max_streams,
                     ),
                     reuse_latency_session: reuse_tcp_latency_sessions,
-                    connect_timeout: path_connect_timeout,
                     health: health.clone(),
                 })
             })
@@ -997,7 +986,6 @@ impl ClientPathContext {
             tcp_security: Arc::new(tcp_security),
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
-            path_connect_timeout,
             next_reliable_stream_id: Arc::new(Mutex::new(0)),
             health,
             codec_limits,
@@ -1486,6 +1474,20 @@ impl ClientPathContext {
             UnderlayProtocol::Tcp => self.tcp_path_snapshot(key.index),
             UnderlayProtocol::Udp => self.udp_path_snapshot(key.index),
         }
+    }
+
+    pub(super) fn reliable_path_rtt_is_observed(&self, key: RelayPathKey) -> bool {
+        let health = self.health.lock().expect("client path health lock");
+        let record = match key.underlay {
+            UnderlayProtocol::Tcp => health.tcp.get(key.index),
+            UnderlayProtocol::Udp => health.udp.get(key.index),
+        };
+        record.is_some_and(|record| {
+            record.carrier_srtt_ms.is_some()
+                || record.carrier_rttvar_ms.is_some()
+                || record.measured_srtt_ms.is_some()
+                || record.measured_jitter_ms.is_some()
+        })
     }
 
     pub(super) fn reliable_relay_path_eta_ms(

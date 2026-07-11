@@ -85,6 +85,35 @@ pub(super) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duratio
     .unwrap_or_else(default_transport_pto)
 }
 
+pub(super) fn path_open_pto(path: Option<PathSnapshot>, rtt_is_observed: bool) -> Duration {
+    let path_pto = transport_pto_from_snapshot(path);
+    if rtt_is_observed {
+        path_pto
+    } else {
+        path_pto.max(default_transport_pto())
+    }
+}
+
+pub(super) fn active_path_open_timeout(
+    path: Option<PathSnapshot>,
+    rtt_is_observed: bool,
+) -> Duration {
+    path_open_pto(path, rtt_is_observed).saturating_mul(active_path_open_pto_multiplier(path))
+}
+
+pub(super) fn active_path_open_pto_multiplier(path: Option<PathSnapshot>) -> u32 {
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD
+        .saturating_add(active_path_open_serialized_exchanges(path))
+        .saturating_sub(1)
+}
+
+pub(super) fn active_path_open_serialized_exchanges(path: Option<PathSnapshot>) -> u32 {
+    match path.map(|snapshot| snapshot.underlay) {
+        Some(UnderlayProtocol::Udp) => 2,
+        Some(UnderlayProtocol::Tcp) | None => 3,
+    }
+}
+
 pub(super) fn default_transport_pto() -> Duration {
     transport_pto_from_ms(
         RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0,

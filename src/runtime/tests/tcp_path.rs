@@ -16,7 +16,6 @@ fn test_tcp_session_runtime(reuse_latency_session: bool) -> ClientTcpPathSession
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
         reuse_latency_session,
-        connect_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         health: Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
@@ -40,6 +39,305 @@ async fn tcp_path_latency_lane_reuse_depends_on_topology() {
 
     let bulk = multipath.ensure_session(FlowLane::Throughput);
     assert!(!first_latency.same_channel(&bulk));
+}
+
+#[tokio::test]
+async fn canceled_tcp_open_queues_detach_and_local_close() {
+    let stream_id = StreamId(91);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    drop(ClientTcpOpenCancellation::new(commands, stream_id));
+
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut receivers),
+        )
+        .await
+        .expect("detach command deadline"),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+    ));
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut receivers),
+        )
+        .await
+        .expect("close command deadline"),
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+}
+
+#[tokio::test]
+async fn dropped_accepted_stream_guard_queues_detach_and_local_close() {
+    let stream_id = StreamId(92);
+    let (opened, mut receivers, _frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    drop(AcceptedRemoteStreamGuard::new(opened.stream));
+
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut receivers),
+        )
+        .await
+        .expect("detach command deadline"),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+    ));
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut receivers),
+        )
+        .await
+        .expect("close command deadline"),
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+}
+
+#[tokio::test]
+async fn tcp_path_deadline_bounds_the_complete_mpp_handshake() {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let security = security();
+        let mut framed = EncryptedFramedStream::with_cipher_suite(
+            stream,
+            security.secret.as_bytes(),
+            PeerRole::Server,
+            CodecLimits::default(),
+            security.cipher,
+        );
+        assert!(matches!(
+            framed.read_frame().await.expect("session hello"),
+            Frame::SessionHello { .. }
+        ));
+        assert!(matches!(
+            framed.read_frame().await.expect("session auth"),
+            Frame::SessionAuth { .. }
+        ));
+        assert!(matches!(
+            framed.read_frame().await.expect("path join"),
+            Frame::PathJoin { .. }
+        ));
+        framed
+            .write_frame(&Frame::SessionReady)
+            .await
+            .expect("session ready");
+        framed.flush().await.expect("flush session ready");
+        let _ = ready_tx.send(());
+        let (mut stream, _write_half) = framed.into_inner().into_split();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stream
+                .read(&mut buffer)
+                .await
+                .expect("read client handshake")
+            {
+                0 => break,
+                _ => continue,
+            }
+        }
+    });
+
+    let security = security();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let started_at = Instant::now();
+    let client = tokio::spawn(async move {
+        connect_client_tcp_path(
+            &path,
+            0,
+            SessionId(41),
+            &security,
+            CodecLimits::default(),
+            MuxLimits::default(),
+            deadline,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_millis(300), ready_rx)
+        .await
+        .expect("client completed authenticated MPP writes")
+        .expect("server ready signal");
+    let result = client.await.expect("client task");
+
+    assert!(matches!(result, Err(RuntimeError::PathOpenTimedOut)));
+    assert!(
+        started_at.elapsed() < Duration::from_millis(800),
+        "the absolute deadline must include the authenticated MPP read handshake"
+    );
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("server observed deadline close")
+        .expect("server task");
+}
+
+#[tokio::test]
+async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("first accept");
+        let _ = accepted_tx.send(());
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stream.read(&mut buffer).await.expect("read first client") {
+                0 => break,
+                _ => continue,
+            }
+        }
+        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_err()
+    });
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(42),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        reuse_latency_session: true,
+        health: Arc::new(Mutex::new(ClientPathHealth {
+            tcp: vec![ClientPathHealthRecord::default()],
+            udp: Vec::new(),
+        })),
+    });
+
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .open_stream(
+                StreamId(1),
+                TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                IngressKind::HttpConnect,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                tokio::time::Instant::now() + Duration::from_millis(200),
+            )
+            .await
+    });
+    accepted_rx.await.expect("first carrier accepted");
+
+    let second = handle
+        .open_stream(
+            StreamId(2),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+            IngressKind::HttpConnect,
+            FlowLane::Throughput,
+            StreamOpenRole::Active,
+            tokio::time::Instant::now() + Duration::from_millis(40),
+        )
+        .await;
+    assert!(matches!(second, Err(RuntimeError::PathOpenTimedOut)));
+    assert!(matches!(
+        first.await.expect("first open task"),
+        Err(RuntimeError::PathOpenTimedOut)
+    ));
+    assert!(
+        server.await.expect("server task"),
+        "an open that expired in the actor queue must not dial after the preceding command ends"
+    );
+}
+
+#[tokio::test]
+async fn dedicated_tcp_session_expires_pending_accept_and_sends_detach() {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let security = security();
+        let mut framed = EncryptedFramedStream::with_cipher_suite(
+            stream,
+            security.secret.as_bytes(),
+            PeerRole::Server,
+            CodecLimits::default(),
+            security.cipher,
+        );
+        assert!(matches!(
+            framed.read_frame().await.expect("session hello"),
+            Frame::SessionHello { .. }
+        ));
+        assert!(matches!(
+            framed.read_frame().await.expect("session auth"),
+            Frame::SessionAuth { .. }
+        ));
+        let (path_id, capabilities) = match framed.read_frame().await.expect("path join") {
+            Frame::PathJoin {
+                path_id,
+                capabilities,
+                ..
+            } => (path_id, capabilities),
+            other => panic!("expected PATH_JOIN, got {other:?}"),
+        };
+        framed
+            .write_frames(&[
+                Frame::SessionReady,
+                Frame::PathStatus {
+                    path_id,
+                    status: crate::protocol::PathStatus::Active,
+                    capabilities,
+                },
+            ])
+            .await
+            .expect("write path ready");
+        framed.flush().await.expect("flush path ready");
+        assert!(matches!(
+            framed.read_frame().await.expect("path metrics"),
+            Frame::PathMetrics { .. }
+        ));
+        let stream_id = match framed.read_frame().await.expect("open stream") {
+            Frame::OpenStream { stream_id, .. } => stream_id,
+            other => panic!("expected OPEN_STREAM, got {other:?}"),
+        };
+        match tokio::time::timeout(Duration::from_secs(1), framed.read_frame())
+            .await
+            .expect("detach deadline")
+            .expect("detach frame")
+        {
+            Frame::StreamDetach {
+                stream_id: detached,
+            } => assert_eq!(detached, stream_id),
+            other => panic!("expected STREAM_DETACH, got {other:?}"),
+        }
+    });
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(43),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        reuse_latency_session: false,
+        health: Arc::new(Mutex::new(ClientPathHealth {
+            tcp: vec![ClientPathHealthRecord::default()],
+            udp: Vec::new(),
+        })),
+    });
+
+    let result = handle
+        .open_stream(
+            StreamId(3),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
+            IngressKind::HttpConnect,
+            FlowLane::Latency,
+            StreamOpenRole::Active,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+    assert!(matches!(result, Err(RuntimeError::PathOpenTimedOut)));
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("server saw detach")
+        .expect("server task");
 }
 
 #[tokio::test]
@@ -157,7 +455,6 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
         reuse_latency_session: true,
-        connect_timeout: crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         health: Arc::new(Mutex::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
@@ -170,6 +467,7 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
             IngressKind::HttpConnect,
             FlowLane::Throughput,
             StreamOpenRole::Active,
+            tokio::time::Instant::now() + active_path_open_timeout(None, false),
         )
         .await
         .expect("open stream");
@@ -1438,7 +1736,7 @@ fn initial_active_open_timeout_uses_persistent_handshake_budget() {
     let low_latency_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=100"
         .parse::<PathSpec>()
         .expect("low latency path");
-    let high_rtt_path = "udp://127.0.0.1:10131?srtt-ms=900&jitter-ms=400&rate-mbps=500"
+    let high_rtt_path = "tcp://127.0.0.1:10131?srtt-ms=900&jitter-ms=400&rate-mbps=500"
         .parse::<PathSpec>()
         .expect("high rtt path");
     let context = ClientPathContext::new(
@@ -1451,21 +1749,52 @@ fn initial_active_open_timeout_uses_persistent_handshake_budget() {
         underlay: UnderlayProtocol::Tcp,
         index: 0,
     };
-    let udp_key = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
+    let high_rtt_tcp_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 1,
     };
 
     assert_eq!(
-        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency),
-        reliable_relay_attach_open_timeout(&context, tcp_key, FlowLane::Latency)
-            .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false),
+        active_path_open_timeout(context.reliable_path_snapshot(tcp_key), false),
         "initial Active TCP opens own product streams and must survive more than one lost open/accept exchange"
     );
+    assert!(!context.reliable_path_rtt_is_observed(tcp_key));
+    let cold_timeout =
+        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false);
+    context.mark_tcp_path_probe_success(0, Duration::from_millis(20));
+    assert!(context.reliable_path_rtt_is_observed(tcp_key));
+    let live_timeout =
+        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false);
     assert_eq!(
-        reliable_initial_active_open_timeout(&context, udp_key, FlowLane::Latency),
-        reliable_relay_attach_open_timeout(&context, udp_key, FlowLane::Latency),
-        "the configured path timeout can cap a high-RTT Active open, but must not reduce it below the one-PTO attach budget"
+        live_timeout,
+        active_path_open_timeout(context.reliable_path_snapshot(tcp_key), false),
+        "a probe RTT must not shrink a fresh TCP carrier below its initial retransmission budget"
+    );
+    assert_eq!(live_timeout, cold_timeout);
+    assert_eq!(
+        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, true),
+        path_open_pto(context.reliable_path_snapshot(tcp_key), false).saturating_mul(
+            active_path_open_serialized_exchanges(context.reliable_path_snapshot(tcp_key))
+        ),
+        "a viable alternate gets enough PTOs for serialized carrier, MPP, and product-open exchanges"
+    );
+    assert_eq!(
+        reliable_initial_active_open_timeout(&context, high_rtt_tcp_key, FlowLane::Latency, false,),
+        active_path_open_timeout(context.reliable_path_snapshot(high_rtt_tcp_key), false),
+        "initial Active opens use the candidate path's persistent-congestion budget"
+    );
+    assert_eq!(
+        cold_timeout,
+        default_transport_pto().saturating_mul(active_path_open_pto_multiplier(
+            context.reliable_path_snapshot(tcp_key)
+        )),
+        "configured startup priors must not shrink the RFC initial PTO before live RTT evidence exists"
+    );
+    assert!(
+        reliable_initial_active_open_timeout(&context, high_rtt_tcp_key, FlowLane::Latency, false,)
+            > crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
+        "an idle probe timeout must not cap a demand-bearing high-RTT path open"
     );
 }
 

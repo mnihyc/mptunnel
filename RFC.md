@@ -1006,7 +1006,7 @@ production evidence justify them.
 | Path/product flight ceiling | `max_path_flight_bytes = 64 MiB`; omitted config derives it from repair capacity | Sender inflight/window concepts are common; exact envelope is mptunnel/operator policy | Can limit high-BDP transfers if below required flight | Keep as upper resource envelope; actual flight is BDP/queue/loss/carrier adaptive |
 | Reliable relay read ceiling | `max_reliable_relay_chunk_bytes = 512 KiB` | Large reads are common user-space amortization; exact ceiling is mptunnel policy | Bad only if treated as indivisible send/AEAD quantum | Keep as read-buffer ceiling; sender service splits into adaptive preemptible quanta |
 | TCP idle heartbeat | 10s interval, 30s timeout | Idle keepalive/liveness is common; exact timers are mptunnel policy | Would violate failover target if used for active data | Keep for idle liveness only; active failover uses data-plane stall/PTO/repair evidence |
-| Path probe timer | 10s interval, 2s timeout | Path validation is common in MPTCP/MPQUIC; exact timers are mptunnel policy | Can delay idle-path discovery; must not gate active recovery | Keep as idle path-manager default; active path recovery is adaptive |
+| Path probe timer | 10s interval, 2s timeout | Idle authenticated liveness probing is common in MPTCP/MPQUIC; exact timers are mptunnel policy | Can delay idle-path discovery; must not gate demand-bearing setup or active recovery | Keep only as the configured bound for one idle authenticated health-probe transaction. It MUST NOT cap or extend Active, Repair, Validation, reattach, TCP-carrier, or datagram deadlines |
 | Extra traffic hint | `extra_traffic_hint_percent = 5` default; 100/200 allowed | Reinjection is common in MPTCP/MPQUIC; numeric hint is mptunnel/operator policy | Bad if treated as product-data throttle, per-event refresh, or blind duplication allowance | Keep as hard optional-work budget; response sender spends repair traffic only with evidence; path proof remains bounded by validation fan-out |
 | Security freshness | `auth_freshness_window_seconds = 300` | Replay freshness windows are common security controls; exact window is mptunnel policy | Affects clock-skew/replay tolerance, not data-plane rate | Keep as security policy; not data-plane adaptive |
 | Cipher default | AES-256-GCM default; ChaCha20-Poly1305 optional | AEAD is mandatory; AES-GCM default follows modern hardware acceleration practice | CPU can matter on CPUs without AES acceleration | Keep as operator choice; no plaintext unless explicit |
@@ -1015,7 +1015,7 @@ production evidence justify them.
 | QUIC datagram MTU model | Startup 1200 byte payload; lower 512 and upper 65,000 path-spec bounds | 1200-byte UDP support is a QUIC requirement; mptunnel sets lower/upper guardrails | Low MTU can increase fragmentation/overhead | Keep startup safety plus path MTU observation/probing |
 | TUN defaults | IPv4 `10.88.0.1/24`, MTU 1500, DNS TTL 5s | Local-interface defaults are common deployment choices; exact values are mptunnel examples | MTU/TTL can affect TUN behavior but not sender scheduling | Keep as operator defaults, scoped to TUN |
 | Outbound DNS timeout | 5s default | Resolver timeouts are common control-plane safety; exact value is mptunnel policy | Slow resolvers may fail resolution; not hot path after resolve | Keep per outbound, not global data-plane behavior |
-| Outbound target/proxy connect timeout | 10s default, scoped to each egress outbound or routing member | Connect setup deadlines are common control-plane safety; exact value is mptunnel policy | Too low can fail slow upstreams; too high can delay connect-time fallback | Keep per egress outbound/member; MPP path setup uses path-probe timeout instead; neither value participates in data-plane scheduling |
+| Outbound target/proxy connect timeout | 10s default, scoped to each egress outbound or routing member | Connect setup deadlines are common control-plane safety; exact value is mptunnel policy | Too low can fail slow upstreams; too high can delay connect-time fallback | Keep per egress outbound/member; this owns only server-side target or upstream-proxy setup. Client MPP carrier and product-open attempts use role-specific PTO deadlines. The configured idle path-probe timeout owns neither |
 | SOCKS5 UDP/TUN idle TTLs | SOCKS5 UDP TTL 30s, TUN UDP flow idle 60s | NAT-style UDP state expiry is common; exact TTLs are mptunnel policy | Too short/long affects idle UDP associations | Keep as flow expiry policy; not a throughput cap |
 | Management API bounds | request 64 KiB, trend 300 samples, sample interval 1s | Control-plane bounding is common; exact values are mptunnel policy | Can limit observability resolution, not packet throughput | Keep as low-overhead management-plane bounds |
 
@@ -1073,10 +1073,10 @@ them.
 | Fixed stability/backlog floors such as 0.125/0.25 | Removed. Floors now come from MinPipeCwnd or send quantum divided by current BDP, so low-BDP/idle paths stay efficient while high-BDP paths are not arbitrarily capped. |
 | Fixed path-open 4 KiB score sample | Removed. Startup scoring uses QUIC initial-window packet-count shape, `10 * MSS`, not an unrelated small byte count. |
 | Fixed 5s path failure cooldown | Removed. Cooldown is derived from PTO and consecutive failure count under the QUIC persistent-congestion threshold. |
-| UDP target/datagram clamps `50ms..1s`, `250ms`, `8*SRTT`, and `64Kbps` | Removed. Datagram response deadlines, suppression, and path-open timing derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold. |
+| UDP target/datagram clamps `50ms..1s`, `250ms`, `8*SRTT`, and `64Kbps` | Removed from response and suppression policy. Datagram response deadlines and suppression derive from PTO, RTT variance, TTL, loss, and persistent congestion threshold. QUIC carrier setup is additionally bounded by the remaining product TTL and the implementation's handshake safety envelope. |
 | QUIC sampler clamp `10..250ms` | Removed. Active sampling uses SRTT/2 with timer granularity; idle/app-limited sampling uses PTO. |
 | TCP/session/TUN queue slot caps such as `+4`, `1024`, and `4096` where byte envelopes already exist | Removed from data-plane queues. Queue depth is byte envelope divided by actual payload quantum plus lane-derived priority headroom. Security/control-plane cache caps remain separate. |
-| Hard-coded egress and MPP path connect timeout call sites | Removed. Egress target/proxy connect timeout is owned by the selected outbound or routing member. MPP TCP path connect timeout is owned by the MPP path group probe/open timeout. Transport-layer defaults remain only as library fallbacks and tests. |
+| Hard-coded egress and MPP path connect timeout call sites | Removed. Egress target/proxy setup remains owned by its outbound/member. Initial Active setup budgets each serialized exchange: three PTOs for TCP and two for QUIC UDP while another candidate remains, or five/four PTOs respectively for a sole candidate's persistent-congestion tolerance. Every initial Active TCP attempt retains the conservative initial PTO floor because its actor may establish or re-establish the carrier. Attach/recovery uses one live candidate PTO. One absolute deadline covers queue wait, carrier setup, authenticated session and `PATH_JOIN`, `OPEN_STREAM`, current path-metric publication, and the role-required peer accept/reset. Idle-probe policy neither preempts nor extends it. |
 | Fixed closed-stream and `PATH_JOIN` replay cache clamps | Removed. Closed-stream retention scales from configured stream count without preallocation; `PATH_JOIN` nonce replay retention scales from configured stream count and the QUIC persistent-congestion threshold. |
 | Fixed datagram retry exponent cap | Removed. Product datagrams are not retransmitted by mptunnel after feedback or response expiry; PTO/TTL-derived budgets bound only response waiting, carrier setup, path suppression, and a single pre-feedback alternate-carrier failover attempt when one remains schedulable. |
 | TCP/QUIC-underlay datagram product retransmit/reopen loop | Removed. The carrier owns packet/stream retransmission below mptunnel; mptunnel MUST NOT duplicate an acknowledged datagram ID or open a replacement carrier only because a UDP target response timed out. Real setup, encryption, authentication, session errors, and pre-feedback path timeout before useful product expiry remain retryable carrier failures. |
@@ -2326,11 +2326,15 @@ ttl_ms:u32
 payload:u32 bytes
 ```
 
-Datagrams are unordered. TTL controls freshness, carrier selection, and the
-response-wait budget; it is not permission to replay an emitted product
-datagram. A path whose ETA cannot fit the TTL SHOULD be avoided.
-`DGRAM_FEEDBACK` acknowledges received datagram ID ranges and feeds
-RTT/loss/delivery-rate observations into path models.
+Datagrams are unordered. TTL establishes one absolute product-expiry time
+before carrier selection. Carrier setup, flow setup, pacing, request emission,
+feedback/response waiting, and pre-feedback fallback all consume its remaining
+time; none may reset it. TTL is not permission to replay an acknowledged or
+expired product datagram. A path whose ETA cannot fit the remaining TTL SHOULD
+be avoided.
+`DGRAM_FEEDBACK` acknowledges received datagram ID ranges. QUIC UDP feedback
+feeds scheduler RTT/loss/delivery-rate observations; TCP-carried feedback feeds
+association-local response timing and later useful-payload delivery accounting.
 
 Datagram workers MUST treat target responses, `DGRAM_FEEDBACK`, and
 `DGRAM_CLOSE` as realtime feedback. If target responses and additional outbound
@@ -2379,7 +2383,9 @@ QUIC DATAGRAM-style applications are freshness-bound rather than reliable.
 If the selected carrier/path times out before any product feedback acknowledges
 the request and another schedulable carrier can still complete inside the TTL,
 the client MAY treat that as pre-feedback path failover and send one fresh
-datagram attempt on the next evidence-ordered carrier. The failed carrier is
+datagram attempt on the next evidence-ordered carrier. This two-attempt limit is
+global across TCP and QUIC UDP underlays, including same-family replacement
+paths. The failed carrier is
 suppressed by PTO-derived path failure backoff. This is not a repair or
 duplicate-discovery mechanism: it creates no ordered-stream debt, no path
 delivery proof, and no right to replay after feedback. Once feedback has
@@ -2387,6 +2393,15 @@ acknowledged the datagram request, response absence is terminal product expiry.
 This boundary keeps UDP target delivery unreliable and freshness-aware while
 avoiding a single dead carrier from consuming the whole realtime TTL budget
 before the server has even acknowledged the request.
+
+For a TCP-carried datagram that needs a carrier, TCP dial, authenticated MPP and
+`PATH_JOIN` setup, datagram-flow setup, request emission, and feedback/response
+waiting consume the original absolute TTL. QUIC UDP carrier handshake, MTU
+probing, pacing, flow setup, request emission, and feedback/response waiting use
+the same rule. When an unattempted carrier remains, a pre-feedback attempt
+reserves part of the remaining TTL for that alternative; after
+`DGRAM_FEEDBACK`, response waiting may consume the rest of the original product
+TTL but carrier replay is forbidden.
 
 UDP targets need unordered, freshness-aware product delivery. Old datagrams
 should expire rather than block later datagrams, but the underlay carrier used
@@ -2974,16 +2989,24 @@ rate, queue/inflight debt, and lane-protection pressure. The selected path is
 then opened through the corresponding TCP or UDP carrier engine. UDP-only and
 TCP-only deployments are degenerate candidate sets of this rule.
 Initial Active opens are bounded path attempts, not unbounded waits on the
-first configured candidate. If the selected path does not complete the stream
-open before the same PTO/stall-derived deadline used for explicit attach opens,
-the sender cancels the pending open if the carrier supports cancellation,
-releases the reserved path load, marks that path as failed/suspect for data
-scheduling, and tries the next schedulable candidate with a fresh product
-stream ID. A timed-out initial open can still arrive late at the peer; using a
-fresh ID prevents that stale candidate from creating and closing the product
-stream ID that a later candidate needs. Attach, Repair, and Validation opens are
-different: they attach to an already accepted product stream and therefore MUST
-reuse that accepted stream ID.
+first configured candidate. Let `open_phases(TCP) = 3` for TCP dial,
+authenticated MPP/`PATH_JOIN`, and product open/accept, and let
+`open_phases(QUIC_UDP) = 2` for QUIC/path setup and product open/accept. A
+candidate with another schedulable alternative gets
+`open_phases(path) * open_pto(path)`. A sole candidate gets
+`(persistent_congestion_threshold + open_phases(path) - 1) * open_pto(path)`,
+which is five PTOs for TCP and four for QUIC UDP. Every initial Active TCP
+attempt keeps the conservative initial PTO floor even after a low-latency idle
+probe because the shared session actor may establish or re-establish its carrier. Explicit
+Active reattach, Repair, and Validation/recovery opens instead get one candidate
+PTO. These deadlines are intentionally different. On expiry the path actor
+rejects or detaches the pending open, the sender releases reserved load, marks
+the path failed/suspect for data scheduling, and tries the next schedulable
+candidate with a fresh product stream ID. A timed-out initial open can still
+arrive late at the peer; using a fresh ID prevents that stale candidate from
+creating and closing the product stream ID that a later candidate needs.
+Attach, Repair, and Validation opens attach to an already accepted product
+stream and therefore MUST reuse that accepted stream ID.
 When an initial Active open fails or times out and another schedulable path
 exists, the failed candidate enters the same data-plane cooldown used for active
 reopen failures. A sole remaining path may remain probeable, but a user-visible
@@ -3428,24 +3451,25 @@ inside the hot data loop.
 
 For QUIC UDP carrier streams, Validation attachment is non-blocking with respect
 to the byte-producing path. The client bounds carrier connection setup by the
-reliable-path attach deadline, sends `OPEN_STREAM`, starts the carrier reader and
+one-candidate-PTO attach deadline, sends `OPEN_STREAM`, starts the carrier reader and
 writer, and may return a Validation output with a zero initial product send
 window. The later `STREAM_MAX_DATA` accept frame is processed through the normal
 stream frame path and updates flow control when it arrives. Completing that
 optimistic Validation attach proves only that the local endpoint queued
 `OPEN_STREAM`; it is not peer acceptance or path liveness proof.
 
-An Active or Repair attachment is usable product state, not speculative proof.
-It MUST receive the peer's `STREAM_MAX_DATA` accept or terminal reset within the
-bounded attach deadline before entering the attached path set. This includes a
-survivor expected to carry unique Service bytes and a Repair output expected to
-carry correctness `RepairData`. A timed-out candidate remains path-failure
-evidence and the path manager continues to the next candidate; it MUST NOT leave
-a local-only attachment that suppresses further recovery. Validation still MUST
-NOT clear a recent data-plane failure or promote a path for new Active Service
-opens until peer evidence arrives: `STREAM_MAX_DATA`, `PATH_PROOF_ACK`, carrier
-ACK-derived data evidence, or ordinary accepted owner-data delivery according to
-the role rules below.
+An initial Active attachment MUST receive the peer's `STREAM_MAX_DATA` accept or
+terminal reset within its phase-counted Active deadline. An Active reattach or Repair
+attachment MUST do so within its one-candidate-PTO attach/recovery deadline
+before entering the attached path set. This includes a survivor expected to
+carry unique Service bytes and a Repair output expected to carry correctness
+`RepairData`. A timed-out candidate remains path-failure evidence and the path
+manager continues to the next candidate; it MUST NOT leave a local-only
+attachment that suppresses further recovery. Validation retains the optimistic
+behavior above where applicable, but still MUST NOT clear a recent data-plane
+failure or promote a path for new Active Service opens until peer evidence
+arrives: `STREAM_MAX_DATA`, `PATH_PROOF_ACK`, carrier ACK-derived data evidence,
+or ordinary accepted owner-data delivery according to the role rules below.
 
 A stream ACK for duplicated data proves end-to-end byte delivery but does not
 identify which underlay path delivered the bytes. It therefore releases product
@@ -4692,15 +4716,27 @@ survivor path. After repeated PTOs or an absolute stall budget below the
 5-second fluency target, active work MUST detach from that path when a usable
 survivor exists.
 
-Repair, validation, and reattach opens that are launched on behalf of an active
-stream are part of data-plane recovery. Such opens MUST be bounded by the same
-active stall/PTO-derived budget used for that stream and path. They MUST NOT
-wait for a generic operating-system TCP connect timeout, idle heartbeat timeout,
-or long path-probe timeout before the scheduler can try another survivor. If a
-recovery open exceeds that budget, the endpoint marks the attempted path as a
-data-plane failure for active scheduling, cancels the pending logical stream
-open, releases its reserved load, and continues with other candidates or the
-best currently attached survivor.
+Define `open_pto(path)` as the PTO computed from live RTT/rttvar once applicable
+live evidence exists. Every initial Active TCP attempt MUST use at least
+`max(candidate_derived_pto, conservative_initial_pto)` because its session actor
+may need to establish or re-establish the carrier. Define
+`open_phases(TCP) = 3` and `open_phases(QUIC_UDP) = 2`. An initial
+demand-bearing Active attempt with another schedulable candidate MUST establish
+`deadline = attempt_start + open_phases(path) * open_pto(path)`. A sole
+candidate adds persistent-congestion tolerance with multiplier
+`persistent_congestion_threshold + open_phases(path) - 1`. An Active reattach,
+Repair, or Validation/recovery attempt MUST establish
+`deadline = attempt_start + candidate_pto(path)`.
+
+Each is one absolute per-candidate deadline. Command-queue wait and every
+carrier or role-required phase, including DNS, address attempts, TCP dial,
+encrypted MPP authentication/session setup, `PATH_JOIN`, product-open emission,
+and peer acceptance, consume only the remaining time. No nested phase may
+restart the budget. The configured idle path-probe timeout MUST neither shorten
+nor extend it. On expiry the path actor rejects or detaches the pending open,
+the endpoint marks the attempted path as a data-plane failure, releases its
+reserved load, and continues with another candidate or the best attached
+survivor without blocking past the deadline on queued cleanup.
 
 Validation opens are evidence-gathering probes, not proof of throughput
 eligibility. A successful open proves liveness. It does not by itself make a
@@ -5561,10 +5597,19 @@ on_quic_or_product_stall(path, stream):
         detach_active_work_to_survivor_path()
         cool_failed_active_path_for_data_scheduling()
 
+initial_active_open(path, stream, alternative_exists):
+    pto = candidate_pto(path)
+    if path.underlay == TCP:
+        pto = max(pto, conservative_initial_pto())
+    phases = 3 if path.underlay == TCP else 2
+    multiplier = phases if alternative_exists
+                 else persistent_congestion_threshold + phases - 1
+    deadline = now() + multiplier * pto
+    open_stream_on_path_until(path, stream.id, deadline)
+
 recovery_open(path, stream):
-    deadline = active_stall_or_pto_budget(path, stream.lane)
-    if open_stream_on_path(path, stream.id) does not complete before deadline:
-        cancel_pending_stream_open(path, stream.id)
+    deadline = now() + candidate_pto(path)
+    if open_stream_on_path_until(path, stream.id, deadline) fails:
         release_reserved_path_load(path, stream.lane)
         mark_data_plane_failure(path)
         try_next_survivor_without_waiting_for_idle_heartbeat()

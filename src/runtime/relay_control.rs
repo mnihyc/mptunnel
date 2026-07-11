@@ -2216,6 +2216,7 @@ fn spawn_reliable_relay_validation_opens(
             let open_timeout = reliable_relay_attach_open_timeout(&context, key, lane);
             let result = match key.underlay {
                 UnderlayProtocol::Tcp => {
+                    let open_deadline = tokio::time::Instant::now() + open_timeout;
                     let result = relay_path_open_with_timeout(
                         open_timeout,
                         open_remote_stream_on_reserved_path(
@@ -2226,14 +2227,10 @@ fn spawn_reliable_relay_validation_opens(
                             lane,
                             key.index,
                             StreamOpenRole::Validation,
+                            open_deadline,
                         ),
                     )
                     .await;
-                    if matches!(result, Err(RuntimeError::PathOpenTimedOut))
-                        && let Some(session) = context.tcp_sessions.get(key.index)
-                    {
-                        session.cancel_stream_open(lane, stream_id).await;
-                    }
                     result
                 }
                 UnderlayProtocol::Udp => {

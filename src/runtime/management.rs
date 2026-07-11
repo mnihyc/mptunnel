@@ -1192,7 +1192,6 @@ mod tests {
                 tag: "edge-mpp".to_string(),
             }),
             Vec::new(),
-            crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         )
         .expect("context");
         let target = ManagementTarget::Node {
@@ -1238,7 +1237,6 @@ mod tests {
                     ),
                 },
             }],
-            crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         )
         .expect("context");
         let target = ManagementTarget::Client {

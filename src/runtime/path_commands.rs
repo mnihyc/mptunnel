@@ -533,6 +533,7 @@ pub(super) enum ReliablePathCommand {
         ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
+        open_deadline: tokio::time::Instant,
         session_commands: ReliablePathCommandSender,
         response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
     },

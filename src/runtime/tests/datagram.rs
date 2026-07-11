@@ -435,6 +435,12 @@ fn datagram_response_timeout_is_terminal_product_expiry() {
     assert!(!runtime_error_is_datagram_response_timeout(
         &RuntimeError::Protocol("other datagram protocol error")
     ));
+    assert!(datagram_underlay_error_is_retryable(
+        &RuntimeError::PathOpenTimedOut
+    ));
+    assert!(tcp_datagram_error_is_path_retryable(
+        &RuntimeError::PathOpenTimedOut
+    ));
 }
 
 #[test]
@@ -450,6 +456,64 @@ fn unacked_datagram_timeout_retries_unattempted_alternative_before_product_feedb
     assert_eq!(
         datagram_timeout_action(false, false),
         DatagramTimeoutAction::TerminalProductExpiry
+    );
+}
+
+#[test]
+fn tcp_datagram_open_budget_is_ttl_bounded_and_reserves_an_alternative() {
+    let ttl = Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into());
+    let initial_pto = path_open_pto(None, false);
+    assert_eq!(
+        tcp_datagram_path_open_timeout(None, false, false, ttl),
+        initial_pto
+            .saturating_mul(active_path_open_pto_multiplier(None))
+            .min(ttl)
+    );
+    assert_eq!(
+        tcp_datagram_path_open_timeout(None, false, true, ttl),
+        initial_pto
+            .saturating_mul(active_path_open_serialized_exchanges(None))
+            .min(ttl / 2)
+    );
+
+    let tight_ttl = Duration::from_millis(250);
+    assert_eq!(
+        tcp_datagram_path_open_timeout(None, false, false, tight_ttl),
+        tight_ttl
+    );
+    assert_eq!(
+        tcp_datagram_path_open_timeout(None, false, true, tight_ttl),
+        tight_ttl / 2
+    );
+}
+
+#[test]
+fn fresh_tcp_datagram_carrier_keeps_initial_pto_floor_after_live_probe() {
+    let path = "tcp://127.0.0.1:10130?srtt-ms=20&jitter-ms=1&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    context.mark_tcp_path_probe_success(0, Duration::from_millis(20));
+    assert!(context.reliable_path_rtt_is_observed(key));
+    assert!(path_open_pto(context.tcp_path_snapshot(0), true) < default_transport_pto());
+
+    let ttl = Duration::from_secs(30);
+    assert_eq!(
+        tcp_datagram_path_open_timeout(context.tcp_path_snapshot(0), true, true, ttl),
+        path_open_pto(context.tcp_path_snapshot(0), false).saturating_mul(
+            active_path_open_serialized_exchanges(context.tcp_path_snapshot(0))
+        ),
+    );
+    assert_eq!(
+        tcp_datagram_path_open_timeout(context.tcp_path_snapshot(0), true, false, ttl),
+        path_open_pto(context.tcp_path_snapshot(0), false).saturating_mul(
+            active_path_open_pto_multiplier(context.tcp_path_snapshot(0))
+        ),
     );
 }
 

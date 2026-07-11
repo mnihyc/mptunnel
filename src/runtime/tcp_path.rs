@@ -13,6 +13,48 @@ pub(super) struct ClientTcpPathSessionHandle {
     latency_commands: Arc<Mutex<Option<ReliablePathCommandSender>>>,
 }
 
+pub(super) struct ClientTcpOpenCancellation {
+    commands: ReliablePathCommandSender,
+    stream_id: StreamId,
+    armed: bool,
+}
+
+impl ClientTcpOpenCancellation {
+    pub(super) fn new(commands: ReliablePathCommandSender, stream_id: StreamId) -> Self {
+        Self {
+            commands,
+            stream_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClientTcpOpenCancellation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let commands = self.commands.clone();
+        let stream_id = self.stream_id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = commands
+                    .send_control(ReliablePathCommand::SendFrame(Frame::StreamDetach {
+                        stream_id,
+                    }))
+                    .await;
+                let _ = commands
+                    .send_control(ReliablePathCommand::CloseStream(stream_id))
+                    .await;
+            });
+        }
+    }
+}
+
 impl std::fmt::Debug for ClientTcpPathSessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientTcpPathSessionHandle")
@@ -51,49 +93,37 @@ impl ClientTcpPathSessionHandle {
         ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
+        open_deadline: tokio::time::Instant,
     ) -> Result<ReliablePathStream, RuntimeError> {
         let commands = self.ensure_session(lane);
         let (response_tx, response_rx) = oneshot::channel();
-        commands
-            .send_control(ReliablePathCommand::OpenStream {
+        let mut cancellation = ClientTcpOpenCancellation::new(commands.clone(), stream_id);
+        tokio::time::timeout_at(
+            open_deadline,
+            commands.send_control(ReliablePathCommand::OpenStream {
                 stream_id,
                 target,
                 ingress,
                 lane,
                 role,
+                open_deadline,
                 session_commands: commands.clone(),
                 response: response_tx,
-            })
+            }),
+        )
+        .await
+        .map_err(|_| RuntimeError::PathOpenTimedOut)?
+        .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        let response = tokio::time::timeout_at(open_deadline, response_rx)
             .await
+            .map_err(|_| RuntimeError::PathOpenTimedOut)?
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
-        response_rx
-            .await
-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?
-    }
-
-    pub(super) async fn cancel_stream_open(&self, lane: FlowLane, stream_id: StreamId) {
-        let commands =
-            if tcp_path_lane_uses_dedicated_session(lane) && !self.runtime.reuse_latency_session {
-                None
-            } else if tcp_path_lane_uses_dedicated_session(lane) {
-                self.latency_commands
-                    .lock()
-                    .expect("TCP path session lock")
-                    .clone()
-            } else {
-                self.commands.lock().expect("TCP path session lock").clone()
-            };
-        if let Some(commands) = commands
-            && !commands.is_closed()
-        {
-            let _ = commands
-                .send_control(ReliablePathCommand::SendFrame(Frame::StreamDetach {
-                    stream_id,
-                }))
-                .await;
-            let _ = commands
-                .send_control(ReliablePathCommand::CloseStream(stream_id))
-                .await;
+        match response {
+            Ok(stream) => {
+                cancellation.disarm();
+                Ok(stream)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -155,6 +185,7 @@ pub(super) struct ClientTcpPendingOpen {
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
     session_commands: ReliablePathCommandSender,
     lane: FlowLane,
+    open_deadline: tokio::time::Instant,
 }
 
 #[derive(Clone)]
@@ -169,7 +200,6 @@ pub(super) struct ClientTcpPathSessionRuntime {
     pub(super) stream_frame_queue: usize,
     pub(super) closed_stream_cache_capacity: usize,
     pub(super) reuse_latency_session: bool,
-    pub(super) connect_timeout: Duration,
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
 }
 
@@ -185,6 +215,7 @@ struct ClientTcpOpenStreamRequest {
     ingress: IngressKind,
     lane: FlowLane,
     role: StreamOpenRole,
+    open_deadline: tokio::time::Instant,
     session_commands: ReliablePathCommandSender,
     response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
 }
@@ -226,6 +257,10 @@ async fn run_client_tcp_path_session(
         };
         let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
         tokio::pin!(heartbeat_timer);
+        let pending_open_deadline = next_client_tcp_pending_open_deadline(&state.streams);
+        let pending_open_timer =
+            tokio::time::sleep_until(pending_open_deadline.unwrap_or(heartbeat_at));
+        tokio::pin!(pending_open_timer);
 
         let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
@@ -243,6 +278,12 @@ async fn run_client_tcp_path_session(
         let mut drop_connection = false;
         tokio::select! {
             biased;
+            _ = &mut pending_open_timer, if pending_open_deadline.is_some() => {
+                expire_client_tcp_pending_opens(
+                    &mut state.streams,
+                    &mut state.closed_streams,
+                );
+            }
             frame = state.connection.as_mut().expect("checked connected TCP path session").frames.recv() => {
                 match frame {
                     Some(Ok(frame)) => {
@@ -348,6 +389,50 @@ async fn run_client_tcp_path_session(
         if drop_connection {
             state.connection = None;
         }
+    }
+}
+
+fn next_client_tcp_pending_open_deadline(
+    streams: &HashMap<StreamId, ClientTcpPathStreamState>,
+) -> Option<tokio::time::Instant> {
+    let now = tokio::time::Instant::now();
+    streams
+        .values()
+        .filter_map(|state| state.pending_open.as_ref())
+        .map(|pending| {
+            if pending.response.is_closed() {
+                now
+            } else {
+                pending.open_deadline
+            }
+        })
+        .min()
+}
+
+fn expire_client_tcp_pending_opens(
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+) {
+    let now = tokio::time::Instant::now();
+    let expired = streams
+        .iter()
+        .filter_map(|(stream_id, state)| {
+            state.pending_open.as_ref().and_then(|pending| {
+                (pending.response.is_closed() || pending.open_deadline <= now).then_some(*stream_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return;
+    }
+
+    for stream_id in expired {
+        if let Some(mut state) = streams.remove(&stream_id)
+            && let Some(pending) = state.pending_open.take()
+        {
+            let _ = pending.response.send(Err(RuntimeError::PathOpenTimedOut));
+        }
+        closed_streams.insert(stream_id);
     }
 }
 
@@ -477,47 +562,66 @@ async fn handle_disconnected_client_tcp_command(
             ingress,
             lane,
             role,
+            open_deadline,
             session_commands,
-            response,
-        } => match connect_client_tcp_path(
-            &runtime.path,
-            runtime.path_index,
-            runtime.session_id,
-            &runtime.security,
-            runtime.codec_limits,
-            runtime.mux_limits,
-            runtime.connect_timeout,
-        )
-        .await
-        {
-            Ok(mut connected) => {
-                let open = ClientTcpOpenStreamRequest {
-                    stream_id,
-                    target,
-                    ingress,
-                    lane,
-                    role,
-                    session_commands,
-                    response,
-                };
-                let result = open_client_tcp_stream_on_connection(
-                    &mut connected,
-                    open,
-                    &mut state.streams,
-                    runtime.stream_frame_queue,
-                )
-                .await;
-                if result.is_ok() {
-                    state.connection = Some(connected);
-                } else if let Err(err) = result {
-                    eprintln!("warning: reliable stream open on new path session failed: {err}");
-                    fail_client_tcp_streams(&mut state.streams, &err);
+            mut response,
+        } => {
+            if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                return;
+            }
+            let connect = connect_client_tcp_path(
+                &runtime.path,
+                runtime.path_index,
+                runtime.session_id,
+                &runtime.security,
+                runtime.codec_limits,
+                runtime.mux_limits,
+                open_deadline,
+            );
+            tokio::pin!(connect);
+            let connect_result = tokio::select! {
+                biased;
+                _ = response.closed() => return,
+                result = &mut connect => result,
+            };
+            match connect_result {
+                Ok(mut connected) => {
+                    if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                        let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                        return;
+                    }
+                    let open = ClientTcpOpenStreamRequest {
+                        stream_id,
+                        target,
+                        ingress,
+                        lane,
+                        role,
+                        open_deadline,
+                        session_commands,
+                        response,
+                    };
+                    let result = open_client_tcp_stream_on_connection(
+                        &mut connected,
+                        open,
+                        &mut state.streams,
+                        runtime.stream_frame_queue,
+                    )
+                    .await;
+                    if result.is_ok() {
+                        state.connection = Some(connected);
+                    } else if let Err(err) = result {
+                        eprintln!(
+                            "warning: reliable stream open on new path session failed: {err}"
+                        );
+                        fail_client_tcp_streams(&mut state.streams, &err);
+                    }
+                }
+                Err(err) => {
+                    let _ = response.send(Err(err));
                 }
             }
-            Err(err) => {
-                let _ = response.send(Err(err));
-            }
-        },
+        }
         ReliablePathCommand::SendFrame(_) | ReliablePathCommand::CloseStream(_) => {}
     }
 }
@@ -538,6 +642,7 @@ async fn handle_connected_client_tcp_command(
             ingress,
             lane,
             role,
+            open_deadline,
             session_commands,
             response,
         } => {
@@ -547,6 +652,7 @@ async fn handle_connected_client_tcp_command(
                 ingress,
                 lane,
                 role,
+                open_deadline,
                 session_commands,
                 response,
             };
@@ -579,75 +685,84 @@ pub(super) async fn connect_client_tcp_path(
     security: &SecurityConfig,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
-    connect_timeout: Duration,
+    open_deadline: tokio::time::Instant,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
-    let tcp_stream = tcp::connect_path(
-        path,
-        TcpConnectOptions {
-            timeout: connect_timeout,
-            ..TcpConnectOptions::default()
-        },
-    )
-    .await?;
-    let mut framed = EncryptedFramedStream::with_cipher_suite(
-        tcp_stream,
-        security.secret.as_bytes(),
-        PeerRole::Client,
-        codec_limits,
-        security.cipher,
-    );
-    let path_id = PathId(path_index as u16);
-    let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
-        security,
-        path,
-        path_id,
-        UnderlayProtocol::Tcp,
-        session_id,
-    )?;
-
-    framed
-        .write_frames(&[session_hello, session_auth, path_join])
+    let connect = async {
+        let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let tcp_stream = tcp::connect_path(
+            path,
+            TcpConnectOptions {
+                timeout: connect_timeout,
+                ..TcpConnectOptions::default()
+            },
+        )
         .await?;
-    framed.flush().await?;
+        let mut framed = EncryptedFramedStream::with_cipher_suite(
+            tcp_stream,
+            security.secret.as_bytes(),
+            PeerRole::Client,
+            codec_limits,
+            security.cipher,
+        );
+        let path_id = PathId(path_index as u16);
+        let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
+            security,
+            path,
+            path_id,
+            UnderlayProtocol::Tcp,
+            session_id,
+        )?;
 
-    let mut session_ready = false;
-    let mut path_active = false;
-    while !session_ready || !path_active {
-        match framed.read_frame().await? {
-            Frame::SessionReady => session_ready = true,
-            Frame::PathStatus {
-                status: crate::protocol::PathStatus::Active,
-                ..
-            } => path_active = true,
-            Frame::PathStatus { .. } => {
-                return Err(RuntimeError::Protocol(
-                    "TCP path session did not become active",
-                ));
-            }
-            Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-            _ => {
-                return Err(RuntimeError::Protocol(
-                    "unexpected TCP path handshake frame",
-                ));
+        framed
+            .write_frames(&[session_hello, session_auth, path_join])
+            .await?;
+        framed.flush().await?;
+
+        let mut session_ready = false;
+        let mut path_active = false;
+        while !session_ready || !path_active {
+            match framed.read_frame().await? {
+                Frame::SessionReady => session_ready = true,
+                Frame::PathStatus {
+                    status: crate::protocol::PathStatus::Active,
+                    ..
+                } => path_active = true,
+                Frame::PathStatus { .. } => {
+                    return Err(RuntimeError::Protocol(
+                        "TCP path session did not become active",
+                    ));
+                }
+                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+                _ => {
+                    return Err(RuntimeError::Protocol(
+                        "unexpected TCP path handshake frame",
+                    ));
+                }
             }
         }
-    }
 
-    let (reader, writer) = framed.split();
-    let now = tokio::time::Instant::now();
-    let startup_snapshot = path_startup_snapshot(path, path_index);
-    let startup_metrics =
-        path_startup_metrics(path, path_index, PathMetricDirection::ClientToServer);
-    Ok(ClientTcpPathConnection {
-        startup_snapshot,
-        startup_metrics,
-        writer,
-        frames: spawn_encrypted_tcp_reader(reader, reliable_path_writer_frame_queue(mux_limits)),
-        heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
-        next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
-        pending_heartbeat: None,
-        path_proofs: PathProofTracker::default(),
-    })
+        let (reader, writer) = framed.split();
+        let now = tokio::time::Instant::now();
+        let startup_snapshot = path_startup_snapshot(path, path_index);
+        let startup_metrics =
+            path_startup_metrics(path, path_index, PathMetricDirection::ClientToServer);
+        Ok(ClientTcpPathConnection {
+            startup_snapshot,
+            startup_metrics,
+            writer,
+            frames: spawn_encrypted_tcp_reader(
+                reader,
+                reliable_path_writer_frame_queue(mux_limits),
+            ),
+            heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
+            next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
+            pending_heartbeat: None,
+            path_proofs: PathProofTracker::default(),
+        })
+    };
+    tokio::time::timeout_at(open_deadline, connect)
+        .await
+        .map_err(|_| RuntimeError::PathOpenTimedOut)?
 }
 
 async fn open_client_tcp_stream_on_connection(
@@ -656,39 +771,58 @@ async fn open_client_tcp_stream_on_connection(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     stream_frame_queue: usize,
 ) -> Result<(), RuntimeError> {
-    let stream_id = open.stream_id;
+    let ClientTcpOpenStreamRequest {
+        stream_id,
+        target,
+        ingress,
+        lane,
+        role,
+        open_deadline,
+        session_commands,
+        response,
+    } = open;
+    if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+        let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+        return Ok(());
+    }
     let (frames_tx, frames_rx) = mpsc::channel(stream_frame_queue);
     streams.insert(
         stream_id,
         ClientTcpPathStreamState {
             frames: frames_tx,
             pending_open: Some(ClientTcpPendingOpen {
-                response: open.response,
+                response,
                 frames: Some(frames_rx),
-                session_commands: open.session_commands,
-                lane: open.lane,
+                session_commands,
+                lane,
+                open_deadline,
             }),
             local_close_pending: false,
         },
     );
-    connection
-        .writer
-        .write_frame(&Frame::PathMetrics {
-            metrics: connection.startup_metrics,
-        })
-        .await?;
-    connection
-        .writer
-        .write_frame(&Frame::OpenStream {
-            stream_id,
-            target: open.target,
-            ingress: open.ingress,
-            outbound: OutboundPolicy::Direct,
-            demand: stream_demand_hint_for_lane(open.lane),
-            role: open.role,
-        })
-        .await?;
-    connection.writer.flush().await?;
+    let send_open = async {
+        connection
+            .writer
+            .write_frame(&Frame::PathMetrics {
+                metrics: connection.startup_metrics,
+            })
+            .await?;
+        connection
+            .writer
+            .write_frame(&Frame::OpenStream {
+                stream_id,
+                target,
+                ingress,
+                outbound: OutboundPolicy::Direct,
+                demand: stream_demand_hint_for_lane(lane),
+                role,
+            })
+            .await?;
+        connection.writer.flush().await
+    };
+    tokio::time::timeout_at(open_deadline, send_open)
+        .await
+        .map_err(|_| RuntimeError::PathOpenTimedOut)??;
     connection.next_heartbeat_at = tokio::time::Instant::now() + connection.heartbeat_interval;
     Ok(())
 }
@@ -701,6 +835,7 @@ async fn handle_client_tcp_path_frame(
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
     refresh_client_tcp_path_liveness(connection, runtime.mux_limits);
+    expire_client_tcp_pending_opens(streams, closed_streams);
     let path_id = PathId(runtime.path_index as u16);
     match frame {
         Frame::StreamMaxData {
@@ -731,7 +866,15 @@ async fn handle_client_tcp_path_frame(
                         ),
                         frames,
                     };
-                    let _ = pending.response.send(Ok(stream));
+                    if pending.response.send(Ok(stream)).is_err() {
+                        streams.remove(&stream_id);
+                        closed_streams.insert(stream_id);
+                        let detach = Frame::StreamDetach { stream_id };
+                        connection.writer.write_frame(&detach).await?;
+                        connection.path_proofs.record_sent_frame(&detach);
+                        connection.writer.flush().await?;
+                        record_client_tcp_path_outbound_activity(connection, runtime.mux_limits);
+                    }
                     return Ok(());
                 }
             }

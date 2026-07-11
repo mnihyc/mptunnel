@@ -35,7 +35,7 @@ The lab starts three containers:
 
 - `client`: local SOCKS5 ingress and benchmark driver.
 - `server`: mptunnel path listener and direct outbound connector.
-- `target`: HTTP download target and UDP echo target.
+- `target`: HTTP download target, receiver-confirming TCP upload sink, and UDP echo target.
 
 Each container is capped at two CPUs in Docker Compose to approximate a modest VPS instead of an unconstrained host.
 
@@ -74,9 +74,9 @@ It records:
 - mptunnel mixed-workload ideal comparisons where one selected path is forced to 0% loss.
 - mptunnel controlled matrix download and upload cases over one TCP+UDP path where bandwidth, latency, and loss each toggle between good and poor values.
 
-Download cases use a sparse 1 GiB HTTP object by default and run for a fixed duration, so a valid measurement is usually a partial HTTP body at the end of the test window rather than a completed small file. Upload cases use persistent TCP streams to a lab sink for the same fixed duration, so they measure client-to-server sender behavior instead of repeated short transfers. Mixed cases run several workloads for the same fixed window: a sustained large-object download, repeated small-object HTTP requests for browsing latency, one persistent TCP echo stream with periodic payloads for SSH-like interaction, and duration-driven UDP datagrams for realtime traffic. The harness should not finish early just because one request completed.
+Download cases use a sparse 1 GiB HTTP object by default and run for a fixed duration, so a valid measurement is usually a partial HTTP body at the end of the test window rather than a completed small file. Upload cases use persistent TCP streams to a lab sink for the same fixed duration. The sink emits cumulative application-byte acknowledgements while receiving and an exact final total after EOF; the probe reads them concurrently with its writes. The sink keeps per-connection receive totals in memory and publishes atomic snapshots on a bounded background cadence, so filesystem serialization is not in the per-receive hot path. After the probe exits, the runner cooperatively quiesces the sink, waits for every handler, and requires a finalized snapshot. Mixed cases run several workloads for the same fixed window: a sustained large-object download, repeated small-object HTTP requests for browsing latency, one persistent TCP echo stream with periodic payloads for SSH-like interaction, and duration-driven UDP datagrams for realtime traffic. The harness should not finish early just because one request completed.
 
-The HTTP, upload, and mixed cases record wall time, goodput Mbps, startup timing, max transfer gap, recovery gap, and one-second interval goodput samples during sustained load windows. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
+The HTTP, upload, and mixed cases record wall time, goodput Mbps, startup timing, max transfer gap, recovery gap, and interval goodput samples during sustained load windows. Upload primary bytes and aggregate goodput come from the target observer snapshot. In-band target acknowledgements supply separately labelled delivery intervals, first-delivery time, and recovery gaps; local socket acceptance remains a sender diagnostic. UDP cases record attempted/received datagram counts, loss rate, and latency percentiles over the same duration-driven window. JSONL rows with `status:"loss"` are retained as valid lossy-network measurements; rows with `status:"fail"` indicate a failed experiment.
 
 ### Evidence cohorts
 
@@ -88,6 +88,59 @@ Keep these result families separate when comparing changes:
 - `unconstrained` means Docker paths with netem cleared. It is still a local container experiment, not a real-Internet measurement.
 - The shaped real-profile cases emulate Internet conditions. They are not evidence from the public Internet.
 - Real-Internet results require a separately recorded endpoint inventory, route/path context, time window, and reproducible runner. When those inputs are unavailable, record the cohort as not run rather than treating an emulated case as a substitute.
+
+### Upload accounting
+
+Standalone probe metric version 2 uses
+`upload_accounting_source:"target_sink_ack"`. A Docker runner row promotes a
+valid, quiesced target snapshot to metric version 4 with
+`upload_accounting_source:"target_sink_observer"`. If quiesce, snapshot, or
+schema validation fails, the row retains its in-band v2 accounting and records
+the observer error instead of claiming promotion. `bytes`,
+`target_confirmed_bytes`, `target_observed_bytes`, `goodput_mbps`, and
+`upload_goodput_mbps` then count application bytes observed by the receiving
+sink. `observer_elapsed_s` spans runner invocation through finalized target
+quiesce and becomes the v4 `time_s` denominator; `probe_elapsed_s` preserves
+the earlier client window. The sink is finalized before the case-boundary
+target-edge after-snapshot, so target application bytes cannot advance beyond
+that counter window. `in_band_target_confirmed_bytes` retains the acknowledgement
+lower bound, and `upload_interval_accounting_source:"target_sink_ack"` labels
+interval and gap timing only when ACK parsing remained valid.
+`local_accepted_bytes`, `local_accepted_goodput_mbps`,
+`first_write_s`, `max_write_gap_s`, and `local_recovery_gap_s` describe only
+what the client socket or local proxy accepted; they MUST NOT be reported as
+end-to-end delivery.
+
+Each stream sends `ACK <cumulative-bytes>` progress and a final
+`OK <cumulative-bytes>` after EOF, while the observer stores the same receiving
+connection's current total and final state out of band. `ok` requires the
+expected connection count, every final marker, and aggregate target/local byte
+equality. Positive target progress without complete drain is `loss`, its byte
+count is an eventual-delivery lower bound, and
+`upload_accounting_lower_bound` is true. Zero target bytes is `fail`.
+Unexpected target connections make the observer snapshot non-authoritative:
+without an application stream identity and offset, retry prefixes cannot be
+deduplicated safely. The default one-second post-window drain is recorded as
+`drain_timeout_s` and can be changed explicitly; it never turns unconfirmed
+sender buffering into delivery. The outer process timeout is derived from the
+load, connection, and configured drain bounds rather than a fixed allowance.
+
+Summaries accept both receiver-confirmed sources and retain legacy upload row
+statuses as `unverified`. Exact completed rows, incomplete receiver lower
+bounds, and sender-only rows have separate counts and metrics. Lower bounds do
+not enter exact medians, best values, or equal-profile ratios. Observer v3 rows
+remain receiver-byte evidence but are not exact performance-comparable because
+their snapshot I/O and elapsed windows predate the v4 contract.
+
+RFC 6349 motivates measuring a block across the TCP connection rather than
+send-buffer admission, but these fixed-duration incomplete cases are not its
+completed predetermined-block Transfer Time Ratio procedure. The lab also
+mirrors iperf3's distinction between sender and receiver results; iperf3
+documents that server output is available only when a test completes, while
+this lab's progress acknowledgements retain a bounded receiver-side lower bound
+for deliberately harsh, incomplete cases.
+
+References: [RFC 6349 TCP throughput testing](https://www.rfc-editor.org/rfc/rfc6349.html#section-4.1) and [iperf3 server output](https://software.es.net/iperf/invoking.html).
 
 ### Traffic accounting
 
@@ -113,6 +166,7 @@ Useful environment variables:
 - `MPTUNNEL_LAB_LARGE_HTTP_PATH`: large-object URL path, default `/large.bin`.
 - `MPTUNNEL_LAB_SMALL_HTTP_PATH`: small-object URL path, default `/small.bin`.
 - `MPTUNNEL_LAB_LOAD_DURATION_SECONDS`: sustained workload duration for download and mixed probes, default `30`.
+- `MPTUNNEL_LAB_UPLOAD_DRAIN_TIMEOUT_SECONDS`: bounded time after the upload load window for target progress/final acknowledgements, default `1`. The value is recorded in upload rows.
 - `LOAD_DURATION_MATRIX`: space-separated sustained workload duration matrix for `lab/run-exhaustive-experiments.sh`.
 - `MPTUNNEL_LAB_BULK_CONNECTIONS`: parallel pure-download or pure-upload connections for capacity tests, default `2`.
 - `BULK_CONNECTIONS_MATRIX`: space-separated bulk connection-count matrix for `lab/run-exhaustive-experiments.sh`.
@@ -194,6 +248,7 @@ For release decisions, compare at least:
 - TUN TCP, TUN UDP reliable-stream, and TUN mixed underlay cases.
 - Failover completion and stall time after blackholing `path_fat`.
 - Sustained interval goodput, first-body time, max read gap, UDP p95, and SSH-like echo success gap during the same fixed-duration window.
+- Receiver-confirmed upload goodput and delivery gaps; locally accepted upload bytes are diagnostics only.
 - Clean-lab aggregate goodput against the manual ~1 Gbps target.
 - Lab RSS or equivalent process-memory samples against the manual ~256 MiB target.
 

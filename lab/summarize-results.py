@@ -5,6 +5,17 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+try:
+    from result_enrichment import (
+        is_exact_upload_measurement,
+        is_proven_upload_measurement,
+    )
+except ModuleNotFoundError:
+    from lab.result_enrichment import (
+        is_exact_upload_measurement,
+        is_proven_upload_measurement,
+    )
+
 
 def fmt_float(value, digits=3):
     if value is None:
@@ -37,6 +48,18 @@ def complete_median(records, field, divisor=1.0):
             return None
         values.append(value / divisor)
     return median(values)
+
+
+def is_upload_lower_bound(record):
+    value = record.get("bytes")
+    return (
+        is_proven_upload_measurement(record)
+        and not is_exact_upload_measurement(record)
+        and record.get("upload_accounting_lower_bound") is True
+        and not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and value > 0
+    )
 
 
 def collect_files(paths):
@@ -88,13 +111,23 @@ def tcp_rows(by_case):
                 "fail": len(records) - len(ok),
                 "median_goodput": median([record.get("goodput_mbps") for record in ok]),
                 "best_goodput": max(
-                    [record.get("goodput_mbps") for record in ok if isinstance(record.get("goodput_mbps"), (int, float))],
+                    [
+                        record.get("goodput_mbps")
+                        for record in ok
+                        if isinstance(record.get("goodput_mbps"), (int, float))
+                    ],
                     default=None,
                 ),
                 "median_time": median([record.get("time_s") for record in ok]),
-                "median_recovery_gap": median([record.get("recovery_gap_s") for record in ok]),
+                "median_recovery_gap": median(
+                    [record.get("recovery_gap_s") for record in ok]
+                ),
                 "max_recovery_gap": max(
-                    [record.get("recovery_gap_s") for record in ok if isinstance(record.get("recovery_gap_s"), (int, float))],
+                    [
+                        record.get("recovery_gap_s")
+                        for record in ok
+                        if isinstance(record.get("recovery_gap_s"), (int, float))
+                    ],
                     default=None,
                 ),
                 "median_client_probe_gap_pct": complete_median(
@@ -125,7 +158,11 @@ def udp_rows(by_case):
                 "runs": len(records),
                 "ok": sum(1 for record in records if record.get("status") == "ok"),
                 "loss": sum(1 for record in records if record.get("status") == "loss"),
-                "fail": sum(1 for record in records if record.get("status") not in ("ok", "loss")),
+                "fail": sum(
+                    1
+                    for record in records
+                    if record.get("status") not in ("ok", "loss")
+                ),
                 "received": median([record.get("received") for record in records]),
                 "count": median([record.get("count") for record in records]),
                 "avg_loss_rate": mean([record.get("loss_rate") for record in records]),
@@ -145,54 +182,105 @@ def udp_rows(by_case):
 def upload_rows(by_case):
     rows = []
     for case, records in by_case.items():
-        if not any(str(record.get("protocol", "")).endswith("-upload") for record in records):
+        if not any(
+            str(record.get("protocol", "")).endswith("-upload") for record in records
+        ):
             continue
-        accepted = [
-            record for record in records if record.get("status") in ("ok", "loss")
+        exact = [record for record in records if is_exact_upload_measurement(record)]
+        lower_bound = [record for record in records if is_upload_lower_bound(record)]
+        receiver_other = [
+            record
+            for record in records
+            if is_proven_upload_measurement(record)
+            and not is_exact_upload_measurement(record)
+            and not is_upload_lower_bound(record)
+        ]
+        accepted_lower_bound = [
+            record for record in lower_bound if record.get("status") in ("ok", "loss")
         ]
         rows.append(
             {
                 "case": case,
                 "runs": len(records),
+                "proven": len(exact) + len(lower_bound) + len(receiver_other),
+                "exact": len(exact),
+                "lower_bound": len(lower_bound),
+                "receiver_other": len(receiver_other),
+                "unverified": sum(
+                    1 for record in records if not is_proven_upload_measurement(record)
+                ),
                 "ok": sum(1 for record in records if record.get("status") == "ok"),
                 "loss": sum(1 for record in records if record.get("status") == "loss"),
                 "fail": sum(
-                    1 for record in records if record.get("status") not in ("ok", "loss")
+                    1
+                    for record in records
+                    if record.get("status") not in ("ok", "loss")
                 ),
-                "median_goodput": median(
-                    [record.get("upload_goodput_mbps") for record in accepted]
+                "exact_median_goodput": median(
+                    [record.get("upload_goodput_mbps") for record in exact]
                 ),
-                "best_goodput": max(
+                "exact_best_goodput": max(
                     [
                         record.get("upload_goodput_mbps")
-                        for record in accepted
+                        for record in exact
                         if isinstance(record.get("upload_goodput_mbps"), (int, float))
                     ],
                     default=None,
                 ),
-                "median_time": median([record.get("time_s") for record in accepted]),
+                "lower_bound_median_goodput": median(
+                    [
+                        record.get("upload_goodput_mbps")
+                        for record in accepted_lower_bound
+                    ]
+                ),
+                "lower_bound_best_goodput": max(
+                    [
+                        record.get("upload_goodput_mbps")
+                        for record in accepted_lower_bound
+                        if isinstance(record.get("upload_goodput_mbps"), (int, float))
+                    ],
+                    default=None,
+                ),
+                "exact_median_time": median([record.get("time_s") for record in exact]),
+                "lower_bound_median_time": median(
+                    [record.get("time_s") for record in accepted_lower_bound]
+                ),
                 "median_recovery_gap": median(
-                    [record.get("recovery_gap_s") for record in accepted]
+                    [record.get("recovery_gap_s") for record in exact]
                 ),
                 "max_recovery_gap": max(
                     [
                         record.get("recovery_gap_s")
-                        for record in accepted
+                        for record in exact
+                        if isinstance(record.get("recovery_gap_s"), (int, float))
+                    ],
+                    default=None,
+                ),
+                "lower_bound_median_recovery_gap": median(
+                    [record.get("recovery_gap_s") for record in accepted_lower_bound]
+                ),
+                "lower_bound_max_recovery_gap": max(
+                    [
+                        record.get("recovery_gap_s")
+                        for record in accepted_lower_bound
                         if isinstance(record.get("recovery_gap_s"), (int, float))
                     ],
                     default=None,
                 ),
                 "median_client_probe_gap_pct": complete_median(
-                    accepted, "client_vs_probe_payload_excess_pct_approx"
+                    exact, "client_vs_probe_payload_excess_pct_approx"
                 ),
                 "median_client_target_balance_pct": complete_median(
-                    accepted, "client_target_endpoint_balance_pct_approx"
+                    exact, "client_target_endpoint_balance_pct_approx"
                 ),
                 "median_client_edge_mib": complete_median(
-                    accepted, "client_edge_traffic_bytes_approx", 1024 * 1024
+                    exact, "client_edge_traffic_bytes_approx", 1024 * 1024
                 ),
             }
         )
+        rows[-1]["median_goodput"] = rows[-1]["exact_median_goodput"]
+        rows[-1]["best_goodput"] = rows[-1]["exact_best_goodput"]
+        rows[-1]["median_time"] = rows[-1]["exact_median_time"]
     return rows
 
 
@@ -212,7 +300,9 @@ def mixed_rows(by_case):
                 "ok": len(ok),
                 "loss": sum(1 for record in records if record.get("status") == "loss"),
                 "fail": sum(
-                    1 for record in records if record.get("status") not in ("ok", "loss")
+                    1
+                    for record in records
+                    if record.get("status") not in ("ok", "loss")
                 ),
                 "bulk_median_goodput": median(
                     [record.get("bulk_goodput_mbps") for record in accepted]
@@ -234,7 +324,9 @@ def mixed_rows(by_case):
                     ],
                     default=None,
                 ),
-                "interactive_ok": median([record.get("interactive_ok") for record in records]),
+                "interactive_ok": median(
+                    [record.get("interactive_ok") for record in records]
+                ),
                 "interactive_count": median(
                     [record.get("interactive_count") for record in records]
                 ),
@@ -324,10 +416,25 @@ def equal_cohort_comparisons(records):
             for workload, spec in workloads.items():
                 values = {}
                 statuses = {}
+                exact = 0
+                lower_bound = 0
+                receiver_other = 0
+                unverified = 0
                 for cohort, pattern in spec["cases"].items():
                     record = by_case.get(pattern.format(profile=profile))
                     statuses[cohort] = record.get("status") if record else None
                     value = record.get(spec["metric"]) if record else None
+                    if workload == "upload" and record is not None:
+                        if is_exact_upload_measurement(record):
+                            exact += 1
+                        else:
+                            value = None
+                            if is_upload_lower_bound(record):
+                                lower_bound += 1
+                            elif is_proven_upload_measurement(record):
+                                receiver_other += 1
+                            else:
+                                unverified += 1
                     if isinstance(value, (int, float)):
                         values[cohort] = value
                     else:
@@ -336,7 +443,11 @@ def equal_cohort_comparisons(records):
                     status is None for status in statuses.values()
                 ):
                     continue
-                numeric = [value for value in values.values() if isinstance(value, (int, float))]
+                numeric = [
+                    value
+                    for value in values.values()
+                    if isinstance(value, (int, float))
+                ]
                 rows.append(
                     {
                         "source": Path(source).name,
@@ -348,6 +459,10 @@ def equal_cohort_comparisons(records):
                         "tcp_status": statuses["tcp"],
                         "udp_status": statuses["udp"],
                         "mixed_status": statuses["mixed"],
+                        "exact": exact,
+                        "lower_bound": lower_bound,
+                        "receiver_other": receiver_other,
+                        "unverified": unverified,
                         "min_vs_best": min(numeric) / max(numeric)
                         if len(numeric) == 3 and max(numeric) > 0
                         else None,
@@ -408,8 +523,12 @@ def source_comparisons(records):
                 "best_raw_case": best_raw.get("case") if best_raw else None,
                 "best_raw_goodput": best_raw.get("goodput_mbps") if best_raw else None,
                 "best_single_case": best_single.get("case") if best_single else None,
-                "best_single_goodput": best_single.get("goodput_mbps") if best_single else None,
-                "multipath_goodput": multipath.get("goodput_mbps") if multipath else None,
+                "best_single_goodput": best_single.get("goodput_mbps")
+                if best_single
+                else None,
+                "multipath_goodput": multipath.get("goodput_mbps")
+                if multipath
+                else None,
                 "multipath_vs_raw": (
                     multipath["goodput_mbps"] / best_raw["goodput_mbps"]
                     if multipath and best_raw and best_raw.get("goodput_mbps")
@@ -422,7 +541,9 @@ def source_comparisons(records):
                 ),
                 "failover_status": failover.get("status") if failover else None,
                 "failover_time": failover.get("time_s") if failover else None,
-                "failover_recovery_gap": failover.get("recovery_gap_s") if failover else None,
+                "failover_recovery_gap": failover.get("recovery_gap_s")
+                if failover
+                else None,
                 "udp_multi_loss": udp_multi.get("loss_rate") if udp_multi else None,
                 "udp_multi_p95": udp_multi.get("p95_ms") if udp_multi else None,
                 "udp_low_p95": udp_low.get("p95_ms") if udp_low else None,
@@ -502,23 +623,38 @@ def render_markdown(records):
             "",
             "## TCP Uploads",
             "",
-            "| case | runs | ok | loss | fail | median Mbps | best Mbps | median seconds | median recovery gap s | max recovery gap s | client/probe gap % approx | client/target balance % approx | client edge MiB approx |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "Receiver evidence requires upload metric version 2 or newer with `target_sink_ack` or `target_sink_observer` accounting. Exact comparative metrics require an exact v2 ACK row or a finalized v4 observer row; lower bounds, other receiver-confirmed rows, and legacy rows remain visible but separate.",
+            "",
+            "| case | runs | exact | lower bound | receiver other | unverified | ok | loss | fail | exact median Mbps | exact best Mbps | lower-bound median Mbps | lower-bound best Mbps | exact median seconds | lower-bound median seconds | exact median recovery gap s | exact max recovery gap s | lower-bound median recovery gap s | lower-bound max recovery gap s | exact client/probe gap % approx | exact client/target balance % approx | exact client edge MiB approx |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in upload_rows(by_case):
         lines.append(
-            "| {case} | {runs} | {ok} | {loss} | {fail} | {median_goodput} | {best_goodput} | {median_time} | {median_recovery_gap} | {max_recovery_gap} | {median_client_probe_gap_pct} | {median_client_target_balance_pct} | {median_client_edge_mib} |".format(
+            "| {case} | {runs} | {exact} | {lower_bound} | {receiver_other} | {unverified} | {ok} | {loss} | {fail} | {median_goodput} | {best_goodput} | {lower_bound_median_goodput} | {lower_bound_best_goodput} | {median_time} | {lower_bound_median_time} | {median_recovery_gap} | {max_recovery_gap} | {lower_bound_median_recovery_gap} | {lower_bound_max_recovery_gap} | {median_client_probe_gap_pct} | {median_client_target_balance_pct} | {median_client_edge_mib} |".format(
                 case=row["case"],
                 runs=row["runs"],
+                exact=row["exact"],
+                lower_bound=row["lower_bound"],
+                receiver_other=row["receiver_other"],
+                unverified=row["unverified"],
                 ok=row["ok"],
                 loss=row["loss"],
                 fail=row["fail"],
                 median_goodput=fmt_float(row["median_goodput"]),
                 best_goodput=fmt_float(row["best_goodput"]),
+                lower_bound_median_goodput=fmt_float(row["lower_bound_median_goodput"]),
+                lower_bound_best_goodput=fmt_float(row["lower_bound_best_goodput"]),
                 median_time=fmt_float(row["median_time"]),
+                lower_bound_median_time=fmt_float(row["lower_bound_median_time"]),
                 median_recovery_gap=fmt_float(row["median_recovery_gap"]),
                 max_recovery_gap=fmt_float(row["max_recovery_gap"]),
+                lower_bound_median_recovery_gap=fmt_float(
+                    row["lower_bound_median_recovery_gap"]
+                ),
+                lower_bound_max_recovery_gap=fmt_float(
+                    row["lower_bound_max_recovery_gap"]
+                ),
                 median_client_probe_gap_pct=fmt_float(
                     row["median_client_probe_gap_pct"]
                 ),
@@ -606,15 +742,20 @@ def render_markdown(records):
         [
             "## Equal Underlay Cohorts",
             "",
-            "| source | profile | workload | TCP Mbps | UDP Mbps | mixed Mbps | TCP status | UDP status | mixed status | min/best |",
-            "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: |",
+            "| source | profile | workload | TCP Mbps | UDP Mbps | mixed Mbps | TCP status | UDP status | mixed status | exact uploads | lower-bound uploads | receiver-other uploads | unverified uploads | min/best |",
+            "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in equal_cohort_comparisons(records):
-        if row["tcp"] is None and row["udp"] is None and row["mixed"] is None:
+        if (
+            row["workload"] != "upload"
+            and row["tcp"] is None
+            and row["udp"] is None
+            and row["mixed"] is None
+        ):
             continue
         lines.append(
-            "| {source} | {profile} | {workload} | {tcp} | {udp} | {mixed} | {tcp_status} | {udp_status} | {mixed_status} | {min_vs_best} |".format(
+            "| {source} | {profile} | {workload} | {tcp} | {udp} | {mixed} | {tcp_status} | {udp_status} | {mixed_status} | {exact} | {lower_bound} | {receiver_other} | {unverified} | {min_vs_best} |".format(
                 source=row["source"],
                 profile=row["profile"],
                 workload=row["workload"],
@@ -624,6 +765,10 @@ def render_markdown(records):
                 tcp_status=row["tcp_status"] or "-",
                 udp_status=row["udp_status"] or "-",
                 mixed_status=row["mixed_status"] or "-",
+                exact=row["exact"],
+                lower_bound=row["lower_bound"],
+                receiver_other=row["receiver_other"],
+                unverified=row["unverified"],
                 min_vs_best=fmt_float(row["min_vs_best"], 2),
             )
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
@@ -82,6 +83,266 @@ def _int_number(value: Any) -> int | None:
     return int(number)
 
 
+def is_proven_upload_measurement(row: dict[str, Any]) -> bool:
+    """Return whether an upload row uses receiver-confirmed accounting."""
+
+    version = _number(row.get("upload_metric_version"))
+    return (
+        version is not None
+        and version >= 2
+        and row.get("upload_accounting_source")
+        in {"target_sink_ack", "target_sink_observer"}
+    )
+
+
+def is_exact_upload_measurement(row: dict[str, Any]) -> bool:
+    """Return whether an upload row is exact and performance-comparable."""
+
+    if not is_proven_upload_measurement(row):
+        return False
+    if row.get("upload_observer_error"):
+        return False
+    observer_freeze_exit_code = row.get("upload_observer_freeze_exit_code")
+    if observer_freeze_exit_code not in (None, 0):
+        return False
+    version = _number(row.get("upload_metric_version"))
+    source = row.get("upload_accounting_source")
+    exact_source = (source == "target_sink_ack" and version == 2) or (
+        source == "target_sink_observer" and version is not None and version >= 4
+    )
+    if not exact_source:
+        return False
+    if source == "target_sink_observer" and (
+        row.get("upload_ack_accounting_valid") is not True
+        or row.get("upload_probe_errors") != []
+    ):
+        return False
+    if source == "target_sink_observer":
+        probe_elapsed = _number(row.get("probe_elapsed_s"))
+        observer_elapsed = _number(row.get("observer_elapsed_s"))
+        primary_elapsed = _number(row.get("time_s"))
+        if (
+            row.get("target_observer_snapshot_version") != 2
+            or row.get("target_observer_quiesced") is not True
+            or row.get("target_observer_finalized") is not True
+            or probe_elapsed is None
+            or probe_elapsed <= 0
+            or observer_elapsed is None
+            or observer_elapsed < probe_elapsed
+            or primary_elapsed != observer_elapsed
+        ):
+            return False
+    if (
+        row.get("upload_accounting_exact") is not True
+        or row.get("upload_accounting_lower_bound") is not False
+        or row.get("complete") is not True
+        or row.get("status") != "ok"
+    ):
+        return False
+    delivered_bytes = _int_number(row.get("bytes"))
+    if delivered_bytes is None or delivered_bytes <= 0:
+        return False
+    probe_errors = row.get("upload_probe_errors")
+    if probe_errors is not None and (
+        not isinstance(probe_errors, list) or len(probe_errors) > 0
+    ):
+        return False
+    if (
+        "upload_ack_accounting_valid" in row
+        and row.get("upload_ack_accounting_valid") is not True
+    ):
+        return False
+    failed_streams = _int_number(row.get("failed_streams"))
+    return failed_streams in (None, 0)
+
+
+def _positive_duration(value: Any, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} is invalid")
+    try:
+        duration = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} is invalid") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"{field} is invalid")
+    return duration
+
+
+def _strict_nonnegative_integer(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def enrich_upload_target_observer(
+    row: dict[str, Any],
+    snapshot: str | dict[str, Any],
+    observer_elapsed_s: Any,
+) -> None:
+    """Make an atomic target-sink snapshot authoritative for an upload row."""
+
+    if isinstance(snapshot, str):
+        if not snapshot.strip():
+            raise ValueError("target sink observer snapshot is empty")
+        parsed = json.loads(snapshot)
+    else:
+        parsed = snapshot
+    if not isinstance(parsed, dict):
+        raise ValueError("target sink observer snapshot has an unsupported version")
+    snapshot_version = parsed.get("version")
+    if isinstance(snapshot_version, bool) or snapshot_version not in (1, 2):
+        raise ValueError("target sink observer snapshot has an unsupported version")
+    if snapshot_version == 2 and (
+        parsed.get("quiesced") is not True or parsed.get("finalized") is not True
+    ):
+        raise ValueError("target sink observer snapshot is not finalized and quiesced")
+    connections = parsed.get("connections")
+    if not isinstance(connections, dict):
+        raise ValueError("target sink observer connections are missing")
+
+    expected_streams = _strict_nonnegative_integer(
+        row.get("parallel_uploads"), "upload parallel stream count"
+    )
+    if expected_streams <= 0:
+        raise ValueError("upload row has no valid parallel stream count")
+    if len(connections) > expected_streams:
+        raise ValueError("target sink observer contains unexpected connections")
+    probe_elapsed_s = _positive_duration(row.get("time_s"), "upload probe elapsed")
+    observer_elapsed = _positive_duration(observer_elapsed_s, "target observer elapsed")
+    if observer_elapsed < probe_elapsed_s:
+        raise ValueError("target observer elapsed is shorter than probe elapsed")
+
+    observed_bytes = 0
+    final_connections = 0
+    connections_with_delivery = 0
+    normalized_ids = set()
+    connection_summaries = []
+    for raw_connection_id, raw_connection in connections.items():
+        try:
+            connection_id = int(raw_connection_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target sink observer connection ID is invalid") from exc
+        if connection_id < 0 or connection_id in normalized_ids:
+            raise ValueError("target sink observer connection ID is invalid")
+        normalized_ids.add(connection_id)
+        if not isinstance(raw_connection, dict):
+            raise ValueError("target sink observer connection is invalid")
+        connection_bytes = _strict_nonnegative_integer(
+            raw_connection.get("bytes"), "target sink observer byte count"
+        )
+        if not isinstance(raw_connection.get("final"), bool):
+            raise ValueError("target sink observer final marker is invalid")
+        connection_updated_at = None
+        if snapshot_version == 2 or "updated_wall_time_ns" in raw_connection:
+            connection_updated_at = _strict_nonnegative_integer(
+                raw_connection.get("updated_wall_time_ns"),
+                "target sink observer connection timestamp",
+            )
+        observed_bytes += connection_bytes
+        final_connections += int(raw_connection["final"])
+        connections_with_delivery += int(connection_bytes > 0)
+        connection_summary = {
+            "connection_id": connection_id,
+            "bytes": connection_bytes,
+            "final": raw_connection["final"],
+        }
+        if connection_updated_at is not None:
+            connection_summary["updated_wall_time_ns"] = connection_updated_at
+        connection_summaries.append(connection_summary)
+
+    local_accepted_bytes = _strict_nonnegative_integer(
+        row.get("local_accepted_bytes"), "upload local accepted-byte diagnostic"
+    )
+    if "target_confirmed_bytes" in row:
+        prior_confirmed_bytes = _strict_nonnegative_integer(
+            row.get("target_confirmed_bytes"), "upload target-confirmed byte count"
+        )
+    else:
+        prior_confirmed_bytes = 0
+    if observed_bytes < prior_confirmed_bytes:
+        raise ValueError("target observer is behind its in-band acknowledgement")
+    if observed_bytes > local_accepted_bytes:
+        raise ValueError("target observer exceeds locally accepted bytes")
+
+    probe_errors = row.get("upload_probe_errors")
+    probe_errors_valid = isinstance(probe_errors, list)
+    ack_accounting_valid = row.get("upload_ack_accounting_valid")
+    legacy_ack_assumed_valid = snapshot_version == 1 and (
+        "upload_probe_errors" not in row and "upload_ack_accounting_valid" not in row
+    )
+    ack_accounting_usable = legacy_ack_assumed_valid or (
+        ack_accounting_valid is True and probe_errors_valid and len(probe_errors) == 0
+    )
+    target_exact = (
+        observed_bytes > 0
+        and len(connections) == expected_streams
+        and final_connections == expected_streams
+        and observed_bytes == local_accepted_bytes
+    )
+    exact = snapshot_version == 2 and target_exact and ack_accounting_usable
+    goodput = observed_bytes * 8 / observer_elapsed / 1_000_000
+    status = "ok" if exact else "loss" if observed_bytes > 0 else "fail"
+
+    accounting_error_slots = 0
+    if probe_errors_valid:
+        accounting_error_slots = min(len(probe_errors), expected_streams)
+    elif snapshot_version == 2:
+        accounting_error_slots = 1
+    if "upload_ack_accounting_valid" in row and ack_accounting_valid is not True:
+        accounting_error_slots = max(accounting_error_slots, 1)
+    complete_streams = min(
+        final_connections,
+        expected_streams - min(accounting_error_slots, expected_streams),
+    )
+
+    updates = {
+        "in_band_target_confirmed_bytes": prior_confirmed_bytes,
+        "target_confirmed_bytes": observed_bytes,
+        "target_observed_bytes": observed_bytes,
+        "bytes": observed_bytes,
+        "probe_elapsed_s": round(probe_elapsed_s, 6),
+        "observer_elapsed_s": round(observer_elapsed, 6),
+        "time_s": round(observer_elapsed, 6),
+        "goodput_mbps": round(goodput, 3),
+        "upload_goodput_mbps": round(goodput, 3),
+        "upload_metric_version": 4 if snapshot_version == 2 else 3,
+        "upload_accounting_source": "target_sink_observer",
+        "upload_accounting_exact": exact,
+        "upload_accounting_lower_bound": observed_bytes > 0 and not exact,
+        "upload_interval_accounting_source": (
+            "target_sink_ack" if ack_accounting_usable else None
+        ),
+        "target_observer_snapshot_version": snapshot_version,
+        "target_observer_quiesced": (
+            parsed.get("quiesced") if snapshot_version == 2 else None
+        ),
+        "target_observer_finalized": (
+            parsed.get("finalized") if snapshot_version == 2 else None
+        ),
+        "target_observer_connections": len(connections),
+        "target_observer_final_connections": final_connections,
+        "target_observer_unexpected_connections": 0,
+        "target_observer_connection_summaries": sorted(
+            connection_summaries, key=lambda connection: connection["connection_id"]
+        ),
+        "streams": expected_streams,
+        "streams_with_delivery": min(connections_with_delivery, expected_streams),
+        "complete_streams": complete_streams,
+        "failed_streams": expected_streams - complete_streams,
+        "complete": exact,
+        "status": status,
+        "exit_code": 0 if status != "fail" else 1,
+    }
+    snapshot_updated_at = None
+    if snapshot_version == 2 or "updated_wall_time_ns" in parsed:
+        snapshot_updated_at = _strict_nonnegative_integer(
+            parsed.get("updated_wall_time_ns"), "target sink observer timestamp"
+        )
+    if snapshot_updated_at is not None:
+        updates["target_observer_updated_wall_time_ns"] = snapshot_updated_at
+    row.update(updates)
+
+
 def application_payload_bytes(row: dict[str, Any]) -> tuple[int | None, str | None]:
     """Return delivered/requested application bytes represented by a lab row.
 
@@ -90,6 +351,16 @@ def application_payload_bytes(row: dict[str, Any]) -> tuple[int | None, str | No
     explicit all-lane payload sum so overhead estimates do not subtract only the
     bulk transfer while counting latency and datagram traffic in tunnel bytes.
     """
+
+    if str(row.get("protocol", "")).endswith("-upload"):
+        if not is_proven_upload_measurement(row):
+            return None, None
+        # Upload metric v2 makes `bytes` receiver-confirmed. Sender-local
+        # acceptance remains useful diagnostics but is not delivered payload.
+        value = _int_number(row.get("bytes"))
+        if value is not None and value > 0:
+            return value, "bytes"
+        return None, None
 
     for field in ("mixed_app_payload_bytes", "bytes", "bulk_bytes"):
         value = _int_number(row.get(field))
@@ -103,7 +374,10 @@ def application_payload_bytes(row: dict[str, Any]) -> tuple[int | None, str | No
         if attempted is not None and received is not None and payload_bytes is not None:
             total_payloads = attempted + received
             if total_payloads > 0:
-                return total_payloads * payload_bytes, "udp_count_plus_received*payload_bytes"
+                return (
+                    total_payloads * payload_bytes,
+                    "udp_count_plus_received*payload_bytes",
+                )
         if received is not None and payload_bytes is not None and received > 0:
             return received * payload_bytes, "received*payload_bytes"
 

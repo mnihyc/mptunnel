@@ -12,6 +12,20 @@ flag_enabled() {
   esac
 }
 
+elapsed_seconds_between_ns() {
+  local started_ns="$1"
+  local stopped_ns="$2"
+  local elapsed_ns=$((stopped_ns - started_ns))
+  if (( elapsed_ns < 0 )); then
+    return 2
+  fi
+  printf '%d.%09d\n' "$((elapsed_ns / 1000000000))" "$((elapsed_ns % 1000000000))"
+}
+
+monotonic_time_ns() {
+  python3 -c 'import time; print(time.monotonic_ns())'
+}
+
 lab_lock_file="/tmp/mptunnel-compose-lab.lock"
 exec {lab_lock_fd}>"$lab_lock_file"
 if ! flock -n "$lab_lock_fd"; then
@@ -28,6 +42,7 @@ large_http_path="${MPTUNNEL_LAB_LARGE_HTTP_PATH:-/large.bin}"
 small_http_path="${MPTUNNEL_LAB_SMALL_HTTP_PATH:-/small.bin}"
 small_object_kib="${MPTUNNEL_LAB_SMALL_OBJECT_KIB:-32}"
 load_duration_seconds="${MPTUNNEL_LAB_LOAD_DURATION_SECONDS:-30}"
+upload_drain_timeout_seconds="${MPTUNNEL_LAB_UPLOAD_DRAIN_TIMEOUT_SECONDS:-1}"
 bulk_connections="${MPTUNNEL_LAB_BULK_CONNECTIONS:-2}"
 proxy_port="${PROXY_PORT:-1080}"
 baseline_proxy_port="${BASELINE_PROXY_PORT:-1090}"
@@ -36,12 +51,24 @@ baseline_vmess_port="${BASELINE_VMESS_PORT:-18443}"
 baseline_hysteria2_port="${BASELINE_HYSTERIA2_PORT:-18444}"
 baseline_mptcp_port="${BASELINE_MPTCP_PORT:-18081}"
 curl_timeout="${CURL_TIMEOUT_SECONDS:-120}"
+upload_process_timeout_seconds="$(
+  LOAD_DURATION_SECONDS="$load_duration_seconds" \
+  CURL_TIMEOUT_SECONDS="$curl_timeout" \
+  UPLOAD_DRAIN_TIMEOUT_SECONDS="$upload_drain_timeout_seconds" \
+    python3 -c 'import math, os
+load = float(os.environ["LOAD_DURATION_SECONDS"])
+timeout = float(os.environ["CURL_TIMEOUT_SECONDS"])
+drain = max(0.0, float(os.environ["UPLOAD_DRAIN_TIMEOUT_SECONDS"]))
+active = timeout if load <= 0 else min(load, timeout)
+print(max(1, math.ceil(active + drain + 10.0)))'
+)"
 udp_payload_bytes="${UDP_PAYLOAD_BYTES:-512}"
 udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
 tcp_echo_payload_bytes="${TCP_ECHO_PAYLOAD_BYTES:-64}"
 tcp_echo_timeout_ms="${TCP_ECHO_TIMEOUT_MS:-5000}"
 tcp_echo_interval_ms="${TCP_ECHO_INTERVAL_MS:-500}"
 tcp_upload_target_port="${TCP_UPLOAD_TARGET_PORT:-10023}"
+tcp_sink_progress_file="/dev/shm/mptunnel-tcp-sink-progress.json"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
@@ -814,16 +841,22 @@ append_upload_probe_result() {
   local probe_stderr="$4"
   local mptunnel_row="${5:-1}"
   local fallback_protocol="${6:-tcp-upload}"
-  local client_log server_log
+  local observer_elapsed_seconds="${7:-}"
+  local observer_freeze_exit_code="${8:-0}"
+  local client_log server_log target_sink_observer
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
   server_log="$(exec_in server "tail -n '${log_tail_lines}' /tmp/mptunnel-server.log 2>/dev/null | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
+  target_sink_observer="$(exec_in target "cat '${tcp_sink_progress_file}' 2>/dev/null || true")"
 
   ROW="$output" \
   EXIT_CODE="$exit_code" \
   PROBE_STDERR="$probe_stderr" \
   CLIENT_LOG="$client_log" \
-	  SERVER_LOG="$server_log" \
+  SERVER_LOG="$server_log" \
+  TARGET_SINK_OBSERVER="$target_sink_observer" \
+  TARGET_OBSERVER_ELAPSED_SECONDS="$observer_elapsed_seconds" \
+  TARGET_OBSERVER_FREEZE_EXIT_CODE="$observer_freeze_exit_code" \
 	  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
 	  LAB_DIAG_EVENTS="${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
 	  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
@@ -855,6 +888,26 @@ if not row:
         "status": "fail",
         "exit_code": exit_code,
     }
+try:
+    observer_freeze_exit_code = int(
+        os.environ.get("TARGET_OBSERVER_FREEZE_EXIT_CODE", "0")
+    )
+except ValueError:
+    observer_freeze_exit_code = 1
+if observer_freeze_exit_code != 0:
+    row["upload_observer_freeze_exit_code"] = observer_freeze_exit_code
+try:
+    if observer_freeze_exit_code != 0:
+        raise RuntimeError("target sink did not quiesce cleanly")
+    sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+    from result_enrichment import enrich_upload_target_observer
+    enrich_upload_target_observer(
+        row,
+        os.environ.get("TARGET_SINK_OBSERVER", ""),
+        os.environ.get("TARGET_OBSERVER_ELAPSED_SECONDS", ""),
+    )
+except Exception as exc:
+    row["upload_observer_error"] = str(exc)
 sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
 from result_enrichment import enrich_instrumentation_for_scope
 lab_diag, lab_perf = enrich_instrumentation_for_scope(
@@ -913,36 +966,50 @@ run_unproxied_upload_probe_case() {
   local protocol="${4:-tcp-upload}"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
-  local telemetry_pid
+  local telemetry_pid observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
+  restart_target_tcp_sink
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}' --target '${target}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" "$mptunnel_row" "$protocol"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" "$mptunnel_row" "$protocol" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
 }
 
 run_tcp_upload_probe_case() {
   local case_name="$1"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
-  local telemetry_pid
+  local telemetry_pid observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
+  restart_target_tcp_sink
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 1 "tcp-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
 }
 
 stop_process() {
@@ -1287,17 +1354,36 @@ should_run_case() {
   return 1
 }
 
+restart_target_tcp_sink() {
+  exec_in target "sink_process_active() { local state; [ -r \"/proc/\$pid/stat\" ] || return 1; state=\$(awk '{print \$3}' \"/proc/\$pid/stat\" 2>/dev/null) || return 1; [ \"\$state\" != Z ] && kill -0 \"\$pid\" >/dev/null 2>&1; }; if [ -f /tmp/mptunnel-tcp-sink.pid ]; then pid=\$(cat /tmp/mptunnel-tcp-sink.pid 2>/dev/null || true); if [[ \"\$pid\" =~ ^[0-9]+$ ]] && sink_process_active; then kill -TERM \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 7)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; if sink_process_active; then kill -KILL \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 1)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; sink_process_active && exit 1; fi; fi; rm -f /tmp/mptunnel-tcp-sink.pid; fi"
+  exec_in target "rm -f '${tcp_sink_progress_file}'; python3 /workspace/lab/tcp_sink.py --bind 0.0.0.0:${tcp_upload_target_port} --progress-file '${tcp_sink_progress_file}' >/tmp/mptunnel-tcp-sink.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-sink.pid"
+  exec_in target "pid=\$(cat /tmp/mptunnel-tcp-sink.pid); sink_process_active() { local state; [ -r \"/proc/\$pid/stat\" ] || return 1; state=\$(awk '{print \$3}' \"/proc/\$pid/stat\" 2>/dev/null) || return 1; [ \"\$state\" != Z ] && kill -0 \"\$pid\" >/dev/null 2>&1; }; deadline=\$((SECONDS + 5)); while { [ ! -s '${tcp_sink_progress_file}' ] || ! sink_process_active; } && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -s '${tcp_sink_progress_file}'; sink_process_active"
+}
+
+freeze_target_tcp_sink() {
+  exec_in target "sink_process_active() { local state; [ -r \"/proc/\$pid/stat\" ] || return 1; state=\$(awk '{print \$3}' \"/proc/\$pid/stat\" 2>/dev/null) || return 1; [ \"\$state\" != Z ] && kill -0 \"\$pid\" >/dev/null 2>&1; }; test -f /tmp/mptunnel-tcp-sink.pid; pid=\$(cat /tmp/mptunnel-tcp-sink.pid); [[ \"\$pid\" =~ ^[0-9]+$ ]]; sink_process_active; kill -TERM \"\$pid\"; deadline=\$((SECONDS + 7)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; if sink_process_active; then kill -KILL \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 1)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; rm -f /tmp/mptunnel-tcp-sink.pid; exit 1; fi; rm -f /tmp/mptunnel-tcp-sink.pid; python3 - '${tcp_sink_progress_file}' <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as handle:
+    snapshot = json.load(handle)
+if snapshot.get('version') != 2:
+    raise SystemExit('target sink did not write snapshot v2')
+if snapshot.get('quiesced') is not True or snapshot.get('finalized') is not True:
+    raise SystemExit('target sink snapshot is not finalized')
+PY"
+}
+
 start_target_services() {
   exec_in target "mkdir -p /tmp/mptunnel-lab && truncate -s '${object_mib}M' /tmp/mptunnel-lab/large.bin"
   exec_in target "dd if=/dev/zero of=/tmp/mptunnel-lab/small.bin bs=1K count='${small_object_kib}' status=none && printf 'mptunnel lab target\\n' >/tmp/mptunnel-lab/index.html"
   exec_in target "if [ -f /tmp/mptunnel-http.pid ]; then kill \$(cat /tmp/mptunnel-http.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-http.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-udp-echo.pid ]; then kill \$(cat /tmp/mptunnel-udp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-udp-echo.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-tcp-echo.pid ]; then kill \$(cat /tmp/mptunnel-tcp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-tcp-echo.pid; fi"
-  exec_in target "if [ -f /tmp/mptunnel-tcp-sink.pid ]; then kill \$(cat /tmp/mptunnel-tcp-sink.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-tcp-sink.pid; fi"
   exec_in target "python3 -m http.server 8080 --bind 0.0.0.0 --directory /tmp/mptunnel-lab >/tmp/mptunnel-http.log 2>&1 & echo \$! >/tmp/mptunnel-http.pid"
   exec_in target "python3 /workspace/lab/udp_echo.py --bind 0.0.0.0:9090 >/tmp/mptunnel-udp-echo.log 2>&1 & echo \$! >/tmp/mptunnel-udp-echo.pid"
   exec_in target "python3 /workspace/lab/tcp_echo.py --bind 0.0.0.0:10022 >/tmp/mptunnel-tcp-echo.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-echo.pid"
-  exec_in target "python3 /workspace/lab/tcp_sink.py --bind 0.0.0.0:${tcp_upload_target_port} >/tmp/mptunnel-tcp-sink.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-sink.pid"
+  restart_target_tcp_sink
 }
 
 start_server() {
@@ -1459,17 +1545,24 @@ run_baseline_upload_probe_case() {
   local out_file="/tmp/mptunnel-baseline-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-baseline-upload-${case_name}.err"
   local output probe_stderr exit_code
-  local telemetry_pid
+  local telemetry_pid observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
+  restart_target_tcp_sink
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   set +e
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol '${protocol}-upload' --proxy 127.0.0.1:${proxy_port_arg} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
   exit_code="$?"
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 0 "${protocol}-upload"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 0 "${protocol}-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
 }
 
 ensure_baseline_tool() {
@@ -2060,27 +2153,32 @@ run_failover_case() {
 run_upload_failover_case() {
   local case_name="mptunnel_tcp_multipath_failover_blackhole_fat_upload"
   local output exit_code
-  local telemetry_pid
+  local telemetry_pid observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
   local started_file="/tmp/mptunnel-upload-failover.started"
   start_client "$case_name" "$tcp_all"
+  restart_target_tcp_sink
   exec_in client "rm -f /tmp/mptunnel-upload-failover.out /tmp/mptunnel-upload-failover.status /tmp/mptunnel-upload-failover.pid '${started_file}'"
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_failover_blackhole
-  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-upload-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-failover.status ]; then echo 124 >/tmp/mptunnel-upload-failover.status; fi"
+  exec_in client "deadline=\$((SECONDS + ${upload_process_timeout_seconds} + 5)); while [ ! -f /tmp/mptunnel-upload-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-failover.status ]; then echo 124 >/tmp/mptunnel-upload-failover.status; fi"
+  set +e
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  set -e
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-upload-failover.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-upload-failover.status 2>/dev/null || echo 124")"
-  if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output" "" 1
-  else
-    local probe_stderr
-    probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-failover.err 2>/dev/null | tail -c 4000 || true")"
-    append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
-  fi
+  local probe_stderr
+  probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-failover.err 2>/dev/null | tail -c 4000 || true")"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 1 "tcp-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
   apply_netem apply
 }
 
@@ -2114,27 +2212,32 @@ run_latency_spike_case() {
 run_upload_latency_spike_case() {
   local case_name="mptunnel_tcp_multipath_latency_spike_fat_upload"
   local output exit_code
-  local telemetry_pid
+  local telemetry_pid observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
   local started_file="/tmp/mptunnel-upload-spike.started"
   start_client "$case_name" "$tcp_all"
+  restart_target_tcp_sink
   exec_in client "rm -f /tmp/mptunnel-upload-spike.out /tmp/mptunnel-upload-spike.status /tmp/mptunnel-upload-spike.pid '${started_file}'"
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
-  exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-spike.out 2>/tmp/mptunnel-upload-spike.err; echo \$? >/tmp/mptunnel-upload-spike.status) & echo \$! >/tmp/mptunnel-upload-spike.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
   sleep "$failover_after"
   apply_latency_spike_fat
-  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-upload-spike.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-spike.status ]; then echo 124 >/tmp/mptunnel-upload-spike.status; fi"
+  exec_in client "deadline=\$((SECONDS + ${upload_process_timeout_seconds} + 5)); while [ ! -f /tmp/mptunnel-upload-spike.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-spike.status ]; then echo 124 >/tmp/mptunnel-upload-spike.status; fi"
+  set +e
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  set -e
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat /tmp/mptunnel-upload-spike.out 2>/dev/null || true")"
   exit_code="$(exec_in client "cat /tmp/mptunnel-upload-spike.status 2>/dev/null || echo 124")"
-  if [[ "$exit_code" == "0" && -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output" "" 1
-  else
-    local probe_stderr
-    probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-spike.err 2>/dev/null | tail -c 4000 || true")"
-    append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
-  fi
+  local probe_stderr
+  probe_stderr="$(exec_in client "tail -n 80 /tmp/mptunnel-upload-spike.err 2>/dev/null | tail -c 4000 || true")"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 1 "tcp-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
   apply_netem apply
 }
 

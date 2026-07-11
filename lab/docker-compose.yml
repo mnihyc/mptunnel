@@ -4,6 +4,7 @@ services:
       context: ..
       dockerfile: lab/docker/Dockerfile
     cpus: 2
+    init: true
     cap_add:
       - NET_ADMIN
     volumes:
@@ -27,6 +28,7 @@ services:
       context: ..
       dockerfile: lab/docker/Dockerfile
     cpus: 2
+    init: true
     cap_add:
       - NET_ADMIN
     volumes:
@@ -52,6 +54,7 @@ services:
       context: ..
       dockerfile: lab/docker/Dockerfile
     cpus: 2
+    init: true
     cap_add:
       - NET_ADMIN
     volumes:

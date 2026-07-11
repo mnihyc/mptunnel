@@ -11,6 +11,7 @@ import time
 
 DEFAULT_INTERVAL_SECONDS = 0.2
 INTERVAL_TRIM_DISCARD_EACH_END = 3
+MAX_ACK_LINE_BYTES = 128
 
 
 def split_host_port(value):
@@ -38,10 +39,23 @@ def socks_target(host, port):
     return b"\x04" + address.packed + struct.pack("!H", port)
 
 
-def read_exact(sock, size):
+def remaining_before(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("upload load deadline expired")
+    return remaining
+
+
+def sendall_before(sock, data, deadline):
+    sock.settimeout(remaining_before(deadline))
+    sock.sendall(data)
+
+
+def read_exact(sock, size, deadline):
     chunks = []
     remaining = size
     while remaining:
+        sock.settimeout(remaining_before(deadline))
         chunk = sock.recv(remaining)
         if not chunk:
             raise RuntimeError("unexpected EOF")
@@ -57,41 +71,52 @@ def write_started_file(path):
         handle.write(f"{time.time():.9f}\n")
 
 
-def connect_socks5(proxy, target, timeout):
+def connect_socks5(proxy, target, deadline):
     proxy_host, proxy_port = split_host_port(proxy)
     target_host, target_port = split_host_port(target)
-    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
-    sock.settimeout(timeout)
-    sock.sendall(b"\x05\x01\x00")
-    response = read_exact(sock, 2)
-    if response != b"\x05\x00":
-        raise RuntimeError(f"SOCKS5 authentication failed: {response!r}")
-    request = b"\x05\x01\x00" + socks_target(target_host, target_port)
-    sock.sendall(request)
-    header = read_exact(sock, 4)
-    if header[0] != 5 or header[1] != 0:
-        raise RuntimeError(f"SOCKS5 connect failed: {header!r}")
-    atyp = header[3]
-    if atyp == 1:
-        read_exact(sock, 4)
-    elif atyp == 3:
-        length = read_exact(sock, 1)[0]
-        read_exact(sock, length)
-    elif atyp == 4:
-        read_exact(sock, 16)
-    else:
-        raise RuntimeError(f"unknown SOCKS5 address type: {atyp}")
-    read_exact(sock, 2)
-    return sock
+    sock = socket.create_connection(
+        (proxy_host, proxy_port), timeout=remaining_before(deadline)
+    )
+    try:
+        sendall_before(sock, b"\x05\x01\x00", deadline)
+        response = read_exact(sock, 2, deadline)
+        if response != b"\x05\x00":
+            raise RuntimeError(f"SOCKS5 authentication failed: {response!r}")
+        request = b"\x05\x01\x00" + socks_target(target_host, target_port)
+        sendall_before(sock, request, deadline)
+        header = read_exact(sock, 4, deadline)
+        if header[0] != 5 or header[1] != 0:
+            raise RuntimeError(f"SOCKS5 connect failed: {header!r}")
+        atyp = header[3]
+        if atyp == 1:
+            read_exact(sock, 4, deadline)
+        elif atyp == 3:
+            length = read_exact(sock, 1, deadline)[0]
+            read_exact(sock, length, deadline)
+        elif atyp == 4:
+            read_exact(sock, 16, deadline)
+        else:
+            raise RuntimeError(f"unknown SOCKS5 address type: {atyp}")
+        read_exact(sock, 2, deadline)
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
 
-def connect_target(args):
+def connect_target(args, deadline):
     if args.proxy:
-        return connect_socks5(args.proxy, args.target, args.timeout)
+        return connect_socks5(args.proxy, args.target, deadline)
     target_host, target_port = split_host_port(args.target)
-    sock = socket.create_connection((target_host, target_port), timeout=args.timeout)
-    sock.settimeout(args.timeout)
-    return sock
+    sock = socket.create_connection(
+        (target_host, target_port), timeout=remaining_before(deadline)
+    )
+    try:
+        sock.settimeout(remaining_before(deadline))
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
 
 def interval_metric_fields(interval_bytes, interval_seconds):
@@ -123,124 +148,270 @@ def interval_metric_fields(interval_bytes, interval_seconds):
     return fields
 
 
-def record_interval_chunk(started, state, lock, size):
+def parse_acknowledgement(line):
+    try:
+        text = line.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("upload sink acknowledgement is not ASCII") from exc
+    parts = text.split()
+    if len(parts) != 2 or parts[0] not in {"ACK", "OK"}:
+        raise RuntimeError(f"invalid upload sink acknowledgement: {text!r}")
+    if not parts[1].isdigit():
+        raise RuntimeError(f"invalid upload sink byte count: {parts[1]!r}")
+    return parts[0], int(parts[1])
+
+
+def record_local_chunk(started, state, lock, size):
     if size <= 0:
         return
     now = time.monotonic()
     now_s = now - started
-    interval = int(now_s // state["interval_seconds"])
     with lock:
         if state["first_write_at"] is None:
             state["first_write_at"] = now_s
         if state["last_write_at"] is not None:
             gap = now_s - state["last_write_at"]
             state["max_write_gap_s"] = max(state["max_write_gap_s"], gap)
-            if (
-                state["failover_after_s"] >= 0
-                and (
-                    now_s >= state["failover_after_s"]
-                    or state["last_write_at"] >= state["failover_after_s"]
-                )
+            if state["failover_after_s"] >= 0 and (
+                now_s >= state["failover_after_s"]
+                or state["last_write_at"] >= state["failover_after_s"]
+            ):
+                state["local_recovery_gap_s"] = max(state["local_recovery_gap_s"], gap)
+        state["last_write_at"] = now_s
+        state["local_accepted_bytes"] += size
+
+
+def record_delivery_progress(started, state, lock, stream_state, total):
+    if total < stream_state["confirmed_bytes"]:
+        raise RuntimeError("upload sink acknowledgement decreased")
+    if total > stream_state["local_accepted_bytes"]:
+        raise RuntimeError("upload sink acknowledged bytes not accepted locally")
+    delta = total - stream_state["confirmed_bytes"]
+    stream_state["confirmed_bytes"] = total
+    if delta <= 0:
+        return
+
+    now = time.monotonic()
+    now_s = now - started
+    interval = int(now_s // state["interval_seconds"])
+    with lock:
+        if not stream_state["delivery_observed"]:
+            stream_state["delivery_observed"] = True
+            state["streams_with_delivery"] += 1
+        if state["first_delivery_at"] is None:
+            state["first_delivery_at"] = now_s
+        if state["last_delivery_at"] is not None:
+            gap = now_s - state["last_delivery_at"]
+            state["max_delivery_gap_s"] = max(state["max_delivery_gap_s"], gap)
+            if state["failover_after_s"] >= 0 and (
+                now_s >= state["failover_after_s"]
+                or state["last_delivery_at"] >= state["failover_after_s"]
             ):
                 state["recovery_gap_s"] = max(state["recovery_gap_s"], gap)
-        state["last_write_at"] = now_s
-        state["bytes"] += size
-        state["interval_bytes"][interval] = state["interval_bytes"].get(interval, 0) + size
+        state["last_delivery_at"] = now_s
+        state["bytes"] += delta
+        state["interval_bytes"][interval] = (
+            state["interval_bytes"].get(interval, 0) + delta
+        )
 
 
-def upload_one_stream(args, started, deadline, state, lock, payload):
-    sock = connect_target(args)
-    bytes_sent = 0
+def consume_acknowledgements(data, started, state, lock, stream_state):
+    response_buffer = stream_state["response_buffer"]
+    response_buffer.extend(data)
+    while True:
+        newline = response_buffer.find(b"\n")
+        if newline < 0:
+            break
+        line = bytes(response_buffer[:newline])
+        del response_buffer[: newline + 1]
+        if stream_state["final_total"] is not None:
+            raise RuntimeError("upload sink sent data after final acknowledgement")
+        kind, total = parse_acknowledgement(line)
+        record_delivery_progress(started, state, lock, stream_state, total)
+        if kind == "OK":
+            stream_state["final_total"] = total
+    if len(response_buffer) > MAX_ACK_LINE_BYTES:
+        raise RuntimeError("upload sink acknowledgement line is too long")
+
+
+def upload_one_stream(
+    args, started, load_deadline, drain_deadline, state, lock, payload
+):
+    sock = connect_target(args, load_deadline)
+    stream_state = {
+        "local_accepted_bytes": 0,
+        "confirmed_bytes": 0,
+        "delivery_observed": False,
+        "final_total": None,
+        "response_buffer": bytearray(),
+    }
     with sock:
         sock.setblocking(False)
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
+        while time.monotonic() < load_deadline:
+            remaining = load_deadline - time.monotonic()
             if remaining <= 0:
                 break
-            _, writable, _ = select.select([], [sock], [], min(remaining, 0.25))
-            if not writable:
-                continue
-            chunk = memoryview(payload)[: max(1, min(len(payload), args.chunk_bytes))]
-            try:
-                sent = sock.send(chunk)
-            except BlockingIOError:
-                continue
-            except OSError:
-                if time.monotonic() >= deadline and bytes_sent > 0:
+            readable, writable, _ = select.select(
+                [sock], [sock], [], min(remaining, 0.25)
+            )
+            if readable:
+                try:
+                    response = sock.recv(4096)
+                except BlockingIOError:
+                    response = None
+                if response == b"":
                     break
-                raise
-            if sent <= 0:
-                break
-            bytes_sent += sent
-            record_interval_chunk(started, state, lock, sent)
-        sock.setblocking(True)
-        sock.settimeout(1.0)
+                if response:
+                    consume_acknowledgements(
+                        response, started, state, lock, stream_state
+                    )
+            if writable:
+                chunk = memoryview(payload)[
+                    : max(1, min(len(payload), args.chunk_bytes))
+                ]
+                try:
+                    sent = sock.send(chunk)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    break
+                if sent <= 0:
+                    break
+                stream_state["local_accepted_bytes"] += sent
+                record_local_chunk(started, state, lock, sent)
+
         try:
             sock.shutdown(socket.SHUT_WR)
         except OSError:
-            return bytes_sent > 0
-        try:
-            sock.settimeout(1.0)
-            sock.recv(128)
-        except OSError:
             pass
-    return bytes_sent > 0
+
+        while stream_state["final_total"] is None and time.monotonic() < drain_deadline:
+            readable, _, _ = select.select(
+                [sock], [], [], max(0.0, drain_deadline - time.monotonic())
+            )
+            if not readable:
+                break
+            try:
+                response = sock.recv(4096)
+            except BlockingIOError:
+                continue
+            if not response:
+                break
+            consume_acknowledgements(response, started, state, lock, stream_state)
+
+    if stream_state["response_buffer"]:
+        raise RuntimeError("upload sink ended with a partial acknowledgement")
+    complete = (
+        stream_state["final_total"] is not None
+        and stream_state["final_total"] == stream_state["local_accepted_bytes"]
+    )
+    return {
+        "complete": complete,
+        "confirmed_bytes": stream_state["confirmed_bytes"],
+        "local_accepted_bytes": stream_state["local_accepted_bytes"],
+    }
 
 
 def interval_upload(args):
     started = time.monotonic()
     write_started_file(args.started_file)
     load_duration = args.load_duration if args.load_duration > 0 else args.timeout
-    deadline = started + min(load_duration, args.timeout)
+    load_deadline = started + min(load_duration, args.timeout)
+    drain_timeout = max(0.0, getattr(args, "drain_timeout", 1.0))
+    drain_deadline = load_deadline + drain_timeout
     state = {
         "bytes": 0,
+        "local_accepted_bytes": 0,
         "first_write_at": None,
         "last_write_at": None,
         "max_write_gap_s": 0.0,
+        "local_recovery_gap_s": 0.0,
+        "first_delivery_at": None,
+        "last_delivery_at": None,
+        "max_delivery_gap_s": 0.0,
         "recovery_gap_s": 0.0,
         "failover_after_s": args.failover_after,
         "interval_seconds": args.interval_seconds,
         "interval_bytes": {},
         "streams": 0,
+        "streams_with_delivery": 0,
         "complete_streams": 0,
         "failures": 0,
+        "probe_errors": [],
     }
     lock = threading.Lock()
     payload = bytes([index % 251 for index in range(max(1, args.chunk_bytes))])
 
-    def worker():
+    def worker(stream_index):
+        complete = False
+        probe_error = None
         try:
-            complete = upload_one_stream(args, started, deadline, state, lock, payload)
-            with lock:
-                state["streams"] += 1
-                if complete:
-                    state["complete_streams"] += 1
-                else:
-                    state["failures"] += 1
-        except Exception:
-            with lock:
-                state["streams"] += 1
+            stream_result = upload_one_stream(
+                args,
+                started,
+                load_deadline,
+                drain_deadline,
+                state,
+                lock,
+                payload,
+            )
+            complete = stream_result["complete"]
+        except Exception as exc:
+            detail = str(exc) or "no error detail"
+            probe_error = (stream_index, f"{type(exc).__name__}: {detail}")
+        with lock:
+            state["streams"] += 1
+            if complete:
+                state["complete_streams"] += 1
+            else:
                 state["failures"] += 1
+            if probe_error is not None:
+                state["probe_errors"].append(probe_error)
 
     threads = [
-        threading.Thread(target=worker, daemon=True)
-        for _ in range(max(1, args.parallel_uploads))
+        threading.Thread(
+            target=worker,
+            args=(stream_index,),
+            name=f"upload-worker-{stream_index}",
+            daemon=False,
+        )
+        for stream_index in range(max(1, args.parallel_uploads))
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=max(0.1, deadline - time.monotonic() + 2.0))
+        thread.join()
+
+    if any(thread.is_alive() for thread in threads):
+        raise RuntimeError("upload worker remained alive after join")
+
+    with lock:
+        aggregate = dict(state)
+        aggregate["interval_bytes"] = dict(state["interval_bytes"])
+        aggregate["probe_errors"] = [
+            f"stream {stream_index}: {message}"
+            for stream_index, message in sorted(state["probe_errors"])
+        ]
 
     elapsed = time.monotonic() - started
-    bytes_sent = state["bytes"]
-    status = (
-        "ok"
-        if bytes_sent > 0 and state["failures"] == 0
-        else "loss"
-        if bytes_sent > 0
-        else "fail"
+    confirmed_bytes = aggregate["bytes"]
+    local_accepted_bytes = aggregate["local_accepted_bytes"]
+    expected_streams = max(1, args.parallel_uploads)
+    ack_accounting_valid = (
+        not aggregate["probe_errors"] and aggregate["streams"] == expected_streams
     )
-    goodput = bytes_sent * 8 / elapsed / 1_000_000 if elapsed > 0 else 0.0
+    delivery_exact = (
+        confirmed_bytes > 0
+        and aggregate["streams"] == expected_streams
+        and aggregate["complete_streams"] == expected_streams
+        and aggregate["failures"] == 0
+        and ack_accounting_valid
+    )
+    status = "ok" if delivery_exact else "loss" if confirmed_bytes > 0 else "fail"
+    goodput = confirmed_bytes * 8 / elapsed / 1_000_000 if elapsed > 0 else 0.0
+    local_accepted_goodput = (
+        local_accepted_bytes * 8 / elapsed / 1_000_000 if elapsed > 0 else 0.0
+    )
     result = {
         "case": args.label,
         "protocol": args.protocol,
@@ -248,23 +419,44 @@ def interval_upload(args):
         "exit_code": 0 if status != "fail" else 1,
         "mode": "duration-upload",
         "load_duration_s": round(load_duration, 6),
+        "drain_timeout_s": round(drain_timeout, 6),
         "parallel_uploads": max(1, args.parallel_uploads),
         "time_s": round(elapsed, 6),
         "goodput_mbps": round(goodput, 3),
         "upload_goodput_mbps": round(goodput, 3),
-        "bytes": bytes_sent,
-        "complete": bytes_sent > 0,
-        "streams": state["streams"],
-        "complete_streams": state["complete_streams"],
-        "failed_streams": state["failures"],
-        "first_write_s": round(state["first_write_at"], 6)
-        if state["first_write_at"] is not None
+        "bytes": confirmed_bytes,
+        "target_confirmed_bytes": confirmed_bytes,
+        "local_accepted_bytes": local_accepted_bytes,
+        "local_accepted_goodput_mbps": round(local_accepted_goodput, 3),
+        "upload_metric_version": 2,
+        "upload_accounting_source": "target_sink_ack",
+        "upload_accounting_exact": delivery_exact,
+        "upload_accounting_lower_bound": confirmed_bytes > 0 and not delivery_exact,
+        "upload_probe_errors": aggregate["probe_errors"],
+        "upload_ack_accounting_valid": ack_accounting_valid,
+        "complete": delivery_exact,
+        "streams": aggregate["streams"],
+        "streams_with_delivery": aggregate["streams_with_delivery"],
+        "complete_streams": aggregate["complete_streams"],
+        "failed_streams": aggregate["failures"],
+        "first_write_s": round(aggregate["first_write_at"], 6)
+        if aggregate["first_write_at"] is not None
         else None,
-        "max_write_gap_s": round(state["max_write_gap_s"], 6),
-        "recovery_gap_s": round(state["recovery_gap_s"], 6),
+        "max_write_gap_s": round(aggregate["max_write_gap_s"], 6),
+        "first_delivery_s": round(aggregate["first_delivery_at"], 6)
+        if aggregate["first_delivery_at"] is not None
+        else None,
+        "max_delivery_gap_s": round(aggregate["max_delivery_gap_s"], 6),
+        "recovery_gap_s": round(aggregate["recovery_gap_s"], 6),
+        "local_recovery_gap_s": round(aggregate["local_recovery_gap_s"], 6),
         "failover_after_s": args.failover_after,
     }
-    result.update(interval_metric_fields(state["interval_bytes"], args.interval_seconds))
+    result.update(
+        interval_metric_fields(
+            aggregate["interval_bytes"] if ack_accounting_valid else {},
+            args.interval_seconds,
+        )
+    )
     return result
 
 
@@ -279,7 +471,10 @@ def main():
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--parallel-uploads", type=int, default=1)
-    parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
+    parser.add_argument(
+        "--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS
+    )
+    parser.add_argument("--drain-timeout", type=float, default=1.0)
     parser.add_argument("--started-file")
     args = parser.parse_args()
     try:

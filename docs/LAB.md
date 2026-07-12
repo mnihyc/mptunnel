@@ -255,6 +255,29 @@ remained near 4 MiB for the full 9-second row. The matched release pair in
 144.885/180.210 Mbps on one path. This proves a useful window-boundary gain,
 not ideal aggregation; retain the separate one-flow scheduler investigation.
 
+Iterations 42-49 close two tempting one-flow bootstrap directions without
+shipping them. The bounded product sample reached its full 256 KiB cap and
+exact ACK release, but Quinn still classified the finite burst app-limited, so
+it created no strict optional-path proof. The typed carrier-only alternative
+did produce exact whole-train receipts: iteration 45 sent 7,109,686 bytes and
+published 18.190 Mbps over 3.127 s. It still selected no product Subflow.
+Draining the Service tail made proof usable, but serialized useful traffic and
+regressed the 12-second rows. Iteration 47 completed the entire proof-to-Subflow
+transition, then exposed a separate ownership error: carrier-only probing had
+grown native QUIC cwnd enough to authorize 7 MiB of product reorder debt,
+causing a 2.233 s read gap and only 46.000 Mbps. An initial attempt to cap only
+native cwnd missed the carrier pacing input: iteration 48 still assigned about
+7.2 MiB and reached 101.949 Mbps. Bounded Service refills in iteration 49
+reached only 58.955 Mbps and collapsed to about 1 Mbps late. These instrumented
+diagnostics are causal evidence, not release-comparable throughput rows. The
+one-flow product/probe policies were therefore removed. Retain only the general
+conclusions: an exact startup epoch owner may continue its own non-refilling
+lower frontier to the declared cap, and a high-confidence additional
+same-underlay QUIC path without durable product progress uses a BBR-style
+`2 * delivery-rate BDP` product inflight target instead of carrier pacing or
+cwnd. The latter invariant is unit-model verified; no rejected one-flow
+mechanism remains enabled to claim a release throughput gain from it.
+
 ### Evidence cohorts
 
 Keep these result families separate when comparing changes:

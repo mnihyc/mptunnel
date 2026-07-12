@@ -748,7 +748,8 @@ fn mixed_reliable_latency_startup_uses_delivery_backed_metrics_after_idle() {
     )
     .expect("context");
     context.mark_udp_path_probe_success(0, Duration::from_millis(1));
-    context.mark_udp_path_delivery(
+    context.mark_relay_path_delivery(
+        UnderlayProtocol::Udp,
         0,
         PathDeliveryStats {
             payload_bytes: 1024 * 1024,
@@ -2558,7 +2559,8 @@ fn udp_latency_flow_is_protected_from_bulk_like_other_reliable_paths() {
     .expect("context");
     let now = Instant::now();
     for index in 0..2 {
-        context.mark_udp_path_delivery(
+        context.mark_relay_path_delivery(
+            UnderlayProtocol::Udp,
             index,
             PathDeliveryStats {
                 payload_bytes: 4 * 1024 * 1024,

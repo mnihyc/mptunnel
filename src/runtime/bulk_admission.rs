@@ -784,13 +784,40 @@ fn bulk_same_underlay_reorder_budget_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> u64 {
-    let product_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
-    if candidate.underlay != UnderlayProtocol::Udp || candidate.inflight_limit_bytes == 0 {
-        return product_budget;
+    if candidate.underlay != UnderlayProtocol::Udp {
+        return bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
     }
+    let delivery_rate_inflight_target = bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(
+        candidate.delivery_rate_bps,
+        candidate.srtt_ms,
+    ));
+    let product_progress_budget = match (
+        candidate.has_durable_product_progress,
+        candidate.product_progress_rate_bps,
+    ) {
+        (true, Some(product_progress_rate_bps)) => bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(
+            product_progress_rate_bps,
+            candidate.srtt_ms,
+        )),
+        (true, None) => delivery_rate_inflight_target,
+        _ if candidate.confidence >= 1.0 => {
+            // A high-confidence QUIC carrier may grow cwnd before exact product
+            // ACKs reach their sample floor. Its receipt-rate inflight target
+            // remains the ordered authority.
+            return delivery_rate_inflight_target
+                .max(payload_bytes as u64)
+                .min(mux_limits.max_reorder_bytes as u64);
+        }
+        // Low-confidence paths remain inside the separately bounded startup
+        // epoch. Use native credit when present, otherwise the delivery-rate
+        // target; carrier pacing is never product authority.
+        _ => candidate
+            .inflight_limit_bytes
+            .max(delivery_rate_inflight_target),
+    };
     candidate
         .inflight_limit_bytes
-        .max(product_budget)
+        .max(product_progress_budget)
         .max(payload_bytes as u64)
         .min(mux_limits.max_reorder_bytes as u64)
 }
@@ -1655,6 +1682,49 @@ mod tests {
                 BulkAdmissionRole::AdditionalCrossUnderlay,
             ),
             Some("reorder_budget")
+        );
+    }
+
+    #[test]
+    fn high_confidence_quic_window_needs_product_progress_before_expanding_reorder_budget() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = 64 * 1024;
+        let mut proof_only = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 360.0, mbps(18.0));
+        proof_only.pacing_rate_bps = mbps(500.0);
+
+        let receipt_rate_inflight_target =
+            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits);
+        assert_eq!(receipt_rate_inflight_target, 1_620_000);
+
+        proof_only.inflight_limit_bytes = 7 * 1024 * 1024;
+        assert_eq!(
+            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            receipt_rate_inflight_target,
+            "strict carrier pacing is not product authority with or without a native window"
+        );
+        assert!(receipt_rate_inflight_target < proof_only.inflight_limit_bytes);
+
+        proof_only.confidence = 0.1;
+        assert_eq!(
+            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            proof_only.inflight_limit_bytes,
+            "the explicit startup epoch retains its native-window allowance"
+        );
+
+        proof_only.confidence = 1.0;
+        proof_only.product_progress_rate_bps = Some(mbps(18.0));
+        assert_eq!(
+            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            receipt_rate_inflight_target,
+            "one exact product ACK is not yet durable window authority"
+        );
+
+        proof_only.has_durable_product_progress = true;
+        proof_only.product_progress_rate_bps = None;
+        assert_eq!(
+            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            proof_only.inflight_limit_bytes,
+            "durable product bytes may couple the native window without a point rate"
         );
     }
 

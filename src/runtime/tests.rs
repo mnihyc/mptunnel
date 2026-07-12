@@ -846,9 +846,97 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
         .expect("fixed output exposes learned path model");
     assert!(learned.product_progress_rate_bps.is_some());
     assert!(
+        !learned.has_durable_product_progress,
+        "one small ACK batch exposes a rate without graduating product authority"
+    );
+    assert!(
         adaptive_reliable_relay_chunk_bytes(Some(learned), FlowLane::Throughput, mux_limits)
             >= startup_quantum
     );
+}
+
+#[test]
+fn client_snapshot_graduates_product_progress_only_at_bulk_sample_floor() {
+    let path: PathSpec = "udp://127.0.0.1:1".parse().expect("UDP path");
+    let sample_floor = (BBR_MAX_SEND_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
+    let mut observation = ClientPathObservation {
+        measured_rate_bps: Some(100_000_000.0),
+        product_delivery_rate_bps: Some(100_000_000.0),
+        delivery_samples: 1,
+        product_delivery_sample_bytes: sample_floor - 1,
+        carrier_inflight_limit_bytes: sample_floor,
+        ..ClientPathObservation::default()
+    };
+
+    let point_rate = path_snapshot(&path, 0, observation);
+    assert!(point_rate.product_progress_rate_bps.is_some());
+    assert!(!point_rate.has_durable_product_progress);
+    assert!(!bulk_candidate_has_bulk_rate_evidence(&path, observation));
+
+    observation.product_delivery_sample_bytes = sample_floor;
+    let durable = path_snapshot(&path, 0, observation);
+    assert!(durable.has_durable_product_progress);
+    assert!(bulk_candidate_has_bulk_rate_evidence(&path, observation));
+}
+
+#[test]
+fn data_plane_failure_invalidates_durable_product_and_native_window_authority() {
+    let path: PathSpec = "udp://127.0.0.1:2".parse().expect("UDP path");
+    let sample_floor = 7 * 1024 * 1024_u64;
+    let mut health = ClientPathHealthRecord::default();
+    health.carrier_inflight_limit_bytes = sample_floor;
+    health.carrier_delivery_rate_bps = Some(500_000_000.0);
+    health.carrier_delivery_sample_bytes = sample_floor;
+    health.carrier_delivery_samples = 32;
+    health.mark_product_delivery(
+        PathRateSample::new(sample_floor, Duration::from_millis(360)).expect("rate sample"),
+    );
+    let before_failure = health.observe(Instant::now());
+    assert!(path_snapshot(&path, 0, before_failure).has_durable_product_progress);
+
+    health.mark_data_plane_failure(Instant::now(), false);
+    let after_failure = health.observe(Instant::now());
+    assert_eq!(after_failure.state, SchedulerPathState::Suspect);
+    assert!(after_failure.product_delivery_rate_bps.is_none());
+    assert_eq!(after_failure.product_delivery_sample_bytes, 0);
+    assert!(after_failure.carrier_delivery_rate_bps.is_none());
+    assert_eq!(after_failure.carrier_inflight_limit_bytes, 0);
+    assert!(!path_snapshot(&path, 0, after_failure).has_durable_product_progress);
+}
+
+#[test]
+fn fixed_output_graduates_fragmented_product_acks_at_exact_sample_floor() {
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let output =
+        ReliablePathStreamOutput::fixed(UnderlayProtocol::Udp, PathId(4), commands, mux_limits);
+    let sample_bytes =
+        usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits)).unwrap();
+    let frame = Frame::StreamData {
+        stream_id: StreamId(53),
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from(vec![0x5b; sample_bytes]),
+    };
+    let ReliablePathStreamOutput::Fixed(fixed) = &output else {
+        panic!("expected fixed output");
+    };
+    fixed.record_owner_flight(&frame);
+    let ack_fragment_bytes = MIN_RATE_SAMPLE_BYTES / 2;
+    let mut start = 0_u64;
+    while start < sample_bytes as u64 {
+        let end = start
+            .saturating_add(ack_fragment_bytes)
+            .min(sample_bytes as u64);
+        output.release_normalized_acked_ranges(&[OffsetRange { start, end }]);
+        start = end;
+    }
+
+    let snapshot = output
+        .send_path_snapshot(FlowLane::Throughput, 1)
+        .expect("fixed output exposes learned path model");
+    assert!(snapshot.product_progress_rate_bps.is_none());
+    assert!(snapshot.has_durable_product_progress);
 }
 
 #[test]

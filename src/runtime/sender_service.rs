@@ -2146,6 +2146,27 @@ fn response_target_unique_owner_admission_with_epoch(
     }
     let liveness_service_failover = allow_liveness_service_failover && target.key == service_key;
     let continues_lower_frontier = lower_owner == Some(target.key);
+    let current_startup_owner_continues_lower_frontier = startup_sampling_allowed
+        && continues_lower_frontier
+        && target.key != service_key
+        && !target.has_bulk_rate_evidence
+        && subflow_set.is_some_and(|epoch| {
+            epoch.service_key() == service_key && epoch.startup_owner_key() == Some(target.key)
+        })
+        && candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.key == service_key)
+            .is_some_and(|service| {
+                response_target_is_startup_same_underlay_subflow_candidate(
+                    service_key,
+                    service,
+                    target,
+                    candidate_tail_debt_bytes,
+                    payload_bytes,
+                    mux_limits,
+                )
+            });
     if continues_lower_frontier && (target.key == service_key || target.is_active) {
         if ordering_debt > 0 {
             return result(PathAdmission::standby(), None, None);
@@ -2159,10 +2180,10 @@ fn response_target_unique_owner_admission_with_epoch(
     if continues_lower_frontier
         && target.key != service_key
         && (!target.has_bulk_rate_evidence || target.is_active)
+        && !current_startup_owner_continues_lower_frontier
     {
-        // An authoritative ACK hole suspends startup sampling. Only an already
-        // measured Subflow may continue its own lower frontier without changing
-        // Service role, regardless of carrier family.
+        // Only the exact bounded startup owner or an already measured Subflow
+        // may continue its own authoritative lower frontier.
         return result(PathAdmission::standby(), None, None);
     }
     if lower_owner.is_some() && !continues_lower_frontier {
@@ -17375,6 +17396,146 @@ mod tests {
 
         assert_eq!(selected.target.key, service.key);
         assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let startup_credit =
+            usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits)).unwrap();
+        assert_eq!(startup_credit % payload_bytes, 0);
+
+        let mut service =
+            response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.active_flows = 2;
+        service.has_bulk_rate_evidence = true;
+        let mut startup_owner =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        startup_owner.has_bulk_rate_evidence = false;
+
+        let first = select_response_sender_data_target_with_ordered_debt_inner(
+            &[service.clone(), startup_owner.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+            true,
+        )
+        .expect("the first bounded startup quantum should be admitted");
+        let input = first
+            .subflow_set_commit
+            .expect("startup admission must carry the exact epoch commit")
+            .input;
+        let mut partial_epoch =
+            FlowSubflowSet::new(0, service.key, startup_credit, 0, Duration::ZERO);
+        assert_eq!(
+            partial_epoch.admit_subflow_owner(input).decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        startup_owner.snapshot.product_bytes_in_flight = payload_bytes as u64;
+        startup_owner.owner_data_in_flight_bytes = payload_bytes as u64;
+        let startup_lower_flight = [CarrierPathFlightDebt {
+            key: startup_owner.key,
+            bytes: payload_bytes as u64,
+        }];
+
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_inner(
+                &[service.clone(), startup_owner.clone()],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &startup_lower_flight,
+                Some(service.key),
+                payload_bytes,
+                Some(&partial_epoch),
+                false,
+            )
+            .is_none(),
+            "an exact startup owner cannot bypass a disabled startup policy"
+        );
+
+        let continued = select_response_sender_data_target_with_ordered_debt_inner(
+            &[service.clone(), startup_owner.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &startup_lower_flight,
+            Some(service.key),
+            payload_bytes,
+            Some(&partial_epoch),
+            true,
+        )
+        .expect("the exact startup owner should continue its own lower frontier");
+        assert_eq!(continued.target.key, startup_owner.key);
+        assert_eq!(continued.admission.role, PathRuntimeRole::Subflow);
+
+        let mut other_unmeasured =
+            response_target(2, UnderlayProtocol::Udp, 4.0, 0, 16 * 1024 * 1024, false);
+        other_unmeasured.has_bulk_rate_evidence = false;
+        let other_lower_flight = [CarrierPathFlightDebt {
+            key: other_unmeasured.key,
+            bytes: payload_bytes as u64,
+        }];
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_inner(
+                &[service.clone(), startup_owner.clone(), other_unmeasured],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &other_lower_flight,
+                Some(service.key),
+                payload_bytes,
+                Some(&partial_epoch),
+                true,
+            )
+            .is_none(),
+            "a different unmeasured lower owner cannot borrow the startup epoch"
+        );
+
+        let mut exhausted_epoch = partial_epoch;
+        for _ in 1..(startup_credit / payload_bytes) {
+            assert_eq!(
+                exhausted_epoch.admit_subflow_owner(input).decision,
+                PathAdmissionDecision::AdmitSubflow
+            );
+        }
+        startup_owner.snapshot.product_bytes_in_flight = startup_credit as u64;
+        startup_owner.owner_data_in_flight_bytes = startup_credit as u64;
+        assert!(
+            select_response_sender_data_target_with_ordered_debt_inner(
+                &[service.clone(), startup_owner.clone()],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &startup_lower_flight,
+                Some(service.key),
+                startup_credit,
+                Some(&exhausted_epoch),
+                true,
+            )
+            .is_none(),
+            "an exhausted unproven startup owner must wait for its lower ACK hole"
+        );
+
+        let after_ack = select_response_sender_data_target_with_ordered_debt_inner(
+            &[service.clone(), startup_owner],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            startup_credit,
+            Some(&exhausted_epoch),
+            true,
+        )
+        .expect("Service should resume after the exhausted startup hole clears");
+        assert_eq!(after_ack.target.key, service.key);
+        assert_eq!(after_ack.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]

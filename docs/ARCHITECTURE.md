@@ -141,7 +141,15 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   feed reservoir, and TCP or QUIC still owns its per-path emission credit. The
   weaker QUIC product-progress/carrier Service-feed predicates do not prove
   optional capacity or admit a Subflow; QUIC Subflow, handoff, and capacity
-  decisions still require strict non-app-limited local carrier proof.
+  decisions still require strict non-app-limited local carrier proof. Before a
+  high-confidence additional QUIC path has durable product progress, a
+  BBR-style inflight target of `2 * delivery-rate BDP` bounds product reorder
+  exposure; carrier-only pacing/cwnd growth stays below that boundary.
+  Low-confidence startup remains separately epoch-bounded and uses native
+  inflight credit, falling back to the delivery-rate target when no native
+  window is available. Datagram goodput may rank datagram paths but never
+  satisfies reliable product durability; data-plane failure invalidates both
+  durable product and native-window authority for the failed association.
 - Encode large probe trains incrementally. Do not allocate a vector containing
   every frame or copy the complete train solely for queue admission.
 - Treat time sources explicitly. Carrier ACK timing, scheduler poll timing, and

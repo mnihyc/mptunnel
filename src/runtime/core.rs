@@ -330,6 +330,8 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
     pub(super) delivery_samples: u32,
+    // Reliable product rate is separate from generic/datagram path goodput.
+    pub(super) product_delivery_rate_bps: Option<f64>,
     pub(super) product_delivery_sample_bytes: u64,
     pub(super) datagram_feedback_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
@@ -376,6 +378,7 @@ impl Default for ClientPathHealthRecord {
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
             delivery_samples: 0,
+            product_delivery_rate_bps: None,
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
@@ -424,6 +427,7 @@ pub(super) struct ClientPathObservation {
     pub(super) measured_loss_rate: Option<f64>,
     pub(super) measured_mtu_payload_bytes: Option<usize>,
     pub(super) delivery_samples: u32,
+    pub(super) product_delivery_rate_bps: Option<f64>,
     pub(super) product_delivery_sample_bytes: u64,
     pub(super) datagram_feedback_samples: u32,
     pub(super) last_delivery_at: Option<Instant>,
@@ -456,6 +460,7 @@ impl Default for ClientPathObservation {
             measured_loss_rate: None,
             measured_mtu_payload_bytes: None,
             delivery_samples: 0,
+            product_delivery_rate_bps: None,
             product_delivery_sample_bytes: 0,
             datagram_feedback_samples: 0,
             last_delivery_at: None,
@@ -517,6 +522,7 @@ impl ClientPathHealthRecord {
                 measured_loss_rate: self.measured_loss_rate,
                 measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
                 delivery_samples: self.delivery_samples,
+                product_delivery_rate_bps: self.product_delivery_rate_bps,
                 product_delivery_sample_bytes: self.product_delivery_sample_bytes,
                 datagram_feedback_samples: self.datagram_feedback_samples,
                 last_delivery_at: self.last_delivery_at,
@@ -553,6 +559,7 @@ impl ClientPathHealthRecord {
             measured_loss_rate: self.measured_loss_rate,
             measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
             delivery_samples: self.delivery_samples,
+            product_delivery_rate_bps: self.product_delivery_rate_bps,
             product_delivery_sample_bytes: self.product_delivery_sample_bytes,
             datagram_feedback_samples: self.datagram_feedback_samples,
             last_delivery_at: self.last_delivery_at,
@@ -693,6 +700,11 @@ impl ClientPathHealthRecord {
         if self.manual_disabled {
             return;
         }
+        let sample_bps = sample.rate_bps();
+        self.product_delivery_rate_bps = Some(match self.product_delivery_rate_bps {
+            Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+            None => sample_bps,
+        });
         self.product_delivery_sample_bytes = self
             .product_delivery_sample_bytes
             .saturating_add(sample.bytes);
@@ -706,6 +718,7 @@ impl ClientPathHealthRecord {
         self.product_delivery_sample_bytes = self
             .product_delivery_sample_bytes
             .saturating_add(sample.bytes);
+        self.product_delivery_rate_bps = Some(sample.rate_bps());
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
@@ -785,6 +798,18 @@ impl ClientPathHealthRecord {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
+        // Product and native carrier evidence belongs to the failed association.
+        self.product_delivery_rate_bps = None;
+        self.product_delivery_sample_bytes = 0;
+        self.carrier_delivery_rate_bps = None;
+        self.carrier_bytes_in_flight = 0;
+        self.carrier_queue_bytes = 0;
+        self.carrier_inflight_limit_bytes = 0;
+        self.carrier_delivery_samples = 0;
+        self.carrier_delivery_sample_bytes = 0;
+        self.carrier_last_delivery_at = None;
+        self.carrier_app_limited = true;
+        self.carrier_ack_derived_data_seen = false;
         self.invalidate_path_proofs();
         if has_schedulable_alternative {
             self.state = SchedulerPathState::Failed;
@@ -2056,7 +2081,7 @@ impl ClientPathContext {
     ) {
         match underlay {
             UnderlayProtocol::Tcp => self.mark_tcp_path_delivery(index, stats),
-            UnderlayProtocol::Udp => self.mark_udp_path_delivery(index, stats),
+            UnderlayProtocol::Udp => self.mark_udp_reliable_path_delivery(index, stats),
         }
     }
 
@@ -2196,7 +2221,7 @@ impl ClientPathContext {
         }
     }
 
-    pub(super) fn mark_udp_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
+    fn mark_udp_reliable_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
         let Some(sample) = stats.rate_sample() else {
             return;
         };
@@ -2208,6 +2233,23 @@ impl ClientPathContext {
             .get_mut(index)
         {
             current.mark_product_delivery(sample);
+        }
+    }
+
+    pub(super) fn mark_udp_datagram_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
+        let Some(sample) = stats.rate_sample() else {
+            return;
+        };
+        if let Some(current) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(index)
+        {
+            // Datagram goodput ranks datagram paths but never proves reliable
+            // product ownership or unlocks ordered-stream overlap.
+            current.mark_delivery(sample);
         }
     }
 

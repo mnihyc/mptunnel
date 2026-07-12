@@ -980,6 +980,8 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
         snapshot.min_rtt_ms = f64::from(path_metrics.metrics.min_rtt_us.max(1)) / 1000.0;
     }
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
+    snapshot.has_durable_product_progress =
+        server_output_has_durable_product_ack_progress(entry, mux_limits);
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
     if let Some(path_metrics) = local_carrier_metrics {
@@ -1293,13 +1295,22 @@ pub(in crate::runtime) fn server_output_has_durable_product_progress(
     entry: &ResponseStreamOutputEntry,
     mux_limits: MuxLimits,
 ) -> bool {
+    entry.product_progress_rate_bps.is_some()
+        && server_output_has_durable_product_ack_progress(entry, mux_limits)
+}
+
+fn server_output_has_durable_product_ack_progress(
+    entry: &ResponseStreamOutputEntry,
+    mux_limits: MuxLimits,
+) -> bool {
+    // Exact ownership bytes may be durable even when fragmented callbacks do
+    // not produce an individual point-rate sample.
     let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
     let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
-    entry.product_progress_rate_bps.is_some()
-        && entry
-            .owner_data_acked_bytes
-            .saturating_add(accounting_slack)
-            >= sample_floor
+    entry
+        .owner_data_acked_bytes
+        .saturating_add(accounting_slack)
+        >= sample_floor
 }
 
 #[cfg(test)]
@@ -2271,7 +2282,7 @@ mod tests {
             path_id: PathId(0),
         };
         let product_rate = 42_000_000.0;
-        let entry = ResponseStreamOutputEntry {
+        let mut entry = ResponseStreamOutputEntry {
             key,
             path_instance_id: next_server_carrier_path_instance_id(),
             incarnation: 1,
@@ -2342,10 +2353,27 @@ mod tests {
             "product STREAM_ACK timing is backlog evidence, not QUIC carrier delivery rate"
         );
         assert_eq!(snapshot.product_progress_rate_bps, Some(product_rate));
+        assert!(snapshot.has_durable_product_progress);
         assert_eq!(
             snapshot.pacing_rate_bps, 200_000_000.0,
             "local QUIC pacing remains carrier-owned scheduling evidence even when the carrier ACK sample is app-limited"
         );
+
+        entry.product_progress_rate_bps = None;
+        let fragmented_snapshot = server_bulk_output_snapshot(
+            &entry,
+            SessionId(78),
+            FlowLane::Throughput,
+            &ServerPathLaneTracker::default(),
+            MuxLimits::default(),
+            Instant::now(),
+        );
+        assert!(fragmented_snapshot.has_durable_product_progress);
+        assert!(fragmented_snapshot.product_progress_rate_bps.is_none());
+        assert!(!server_output_has_durable_product_progress(
+            &entry,
+            MuxLimits::default()
+        ));
     }
 
     #[test]
@@ -2380,6 +2408,10 @@ mod tests {
             };
 
             assert!(server_output_has_sender_evidence(&entry), "{underlay:?}");
+            assert!(
+                !server_output_has_durable_product_progress(&entry, mux_limits),
+                "{underlay:?} one-quantum point rate is not durable product progress"
+            );
             assert!(
                 !server_output_has_bulk_rate_evidence_with_limits(&entry, mux_limits),
                 "{underlay:?} must not graduate from one application-limited OwnerData quantum"

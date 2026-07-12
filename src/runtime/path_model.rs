@@ -355,6 +355,7 @@ fn endpoint_only_startup_observation_for_scoring(
         measured_loss_rate: None,
         measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
         delivery_samples: 0,
+        product_delivery_rate_bps: None,
         product_delivery_sample_bytes: 0,
         last_delivery_at: None,
         carrier_srtt_ms: None,
@@ -590,8 +591,10 @@ pub(super) fn path_snapshot(
     };
     let product_progress_rate_bps = (reliable_product_delivery_samples(path, observation) > 0
         && observation.product_delivery_sample_bytes > 0)
-        .then_some(observation.measured_rate_bps)
+        .then_some(observation.product_delivery_rate_bps)
         .flatten();
+    let has_durable_product_progress =
+        client_path_observation_has_durable_product_progress(path, observation);
     let delivery_rate_bps = observation
         .carrier_delivery_rate_bps
         .or(observation.measured_rate_bps)
@@ -629,6 +632,7 @@ pub(super) fn path_snapshot(
         jitter_ms,
         delivery_rate_bps,
         product_progress_rate_bps,
+        has_durable_product_progress,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
         queue_bytes: observation.carrier_queue_bytes,
         product_queue_bytes: observation.relay_queue_bytes,
@@ -870,15 +874,21 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    let product_rate = observation.measured_rate_bps.is_some()
-        && reliable_product_delivery_samples(path, observation) > 0
-        && observation.product_delivery_sample_bytes
-            >= client_path_observation_bulk_sample_floor_bytes(observation);
+    let product_rate = client_path_observation_has_durable_product_progress(path, observation);
     product_rate
         || (observation.carrier_delivery_rate_bps.is_some()
             && !observation.carrier_app_limited
             && observation.carrier_delivery_sample_bytes
                 >= client_path_observation_bulk_sample_floor_bytes(observation))
+}
+
+fn client_path_observation_has_durable_product_progress(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+) -> bool {
+    reliable_product_delivery_samples(path, observation) > 0
+        && observation.product_delivery_sample_bytes
+            >= client_path_observation_bulk_sample_floor_bytes(observation)
 }
 
 pub(super) fn bulk_candidate_has_sender_delivery_evidence(

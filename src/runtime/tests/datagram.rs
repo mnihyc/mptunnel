@@ -51,7 +51,7 @@ fn measured_udp_delivery_rate_updates_next_datagram_order() {
         Some(1)
     );
 
-    context.mark_udp_path_delivery(
+    context.mark_udp_datagram_path_delivery(
         0,
         PathDeliveryStats {
             payload_bytes: 1024 * 1024,
@@ -66,6 +66,14 @@ fn measured_udp_delivery_rate_updates_next_datagram_order() {
             .copied(),
         Some(0)
     );
+    let observation =
+        context.health.lock().expect("client path health lock").udp[0].observe(Instant::now());
+    let reliable_snapshot = path_snapshot(&context.udp_paths[0], 0, observation);
+    assert!(observation.measured_rate_bps.is_some());
+    assert!(observation.product_delivery_rate_bps.is_none());
+    assert_eq!(observation.product_delivery_sample_bytes, 0);
+    assert!(reliable_snapshot.product_progress_rate_bps.is_none());
+    assert!(!reliable_snapshot.has_durable_product_progress);
 }
 
 #[test]

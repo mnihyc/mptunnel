@@ -1238,6 +1238,17 @@ their origin is explicit and they do not become hidden modes.
 | Replay/security cache sizes | closed-stream cache and PATH_JOIN replay cache derive from stream/path scale with bounded caps | Security/control-plane state bounding | Not a throughput cap unless accidentally used for data-plane queues | Keep as security/resource envelope, not scheduler input |
 | Header/parser safety | HTTP CONNECT request/response 64 KiB; CONNECT-UDP payload 65,527; SOCKS5 UDP packet 65,535; target host 255 | Parser/protocol bounds are common | These bound protocol parsing and packet buffers, not scheduling | Keep as scoped parser/packet envelopes, not scheduler input |
 
+For any high-confidence additional same-underlay QUIC path without a durable
+product-progress sample, ordered overlap uses a BBR-style inflight target of
+`2 * delivery-rate BDP`, bounded by the reorder envelope. Native pacing and
+congestion-window growth remain carrier-local and MUST NOT enlarge product
+reorder authority. Low-confidence startup instead uses
+its native inflight window, or the delivery-rate inflight target when the native
+window is unavailable, inside the separately bounded, non-refilling startup
+epoch; carrier pacing is not product authority. After durable product progress
+exists, the native inflight window may participate in the bounded product
+reorder budget.
+
 The following items were found during the parameter audit and are resolved in
 protocol version 1. They are listed so stale implementations do not reintroduce
 them.
@@ -4066,8 +4077,11 @@ are true:
   evidence, and does not yet have bulk-rate evidence;
 * no other candidate has been assigned startup-sampling credit in this response
   stream's current subflow-set epoch; and
-* no authoritative lower-flight debt, repair-authoritative ACK hole, missing- or
-  failed-owner debt, or queued/active repair range lies below the next offset.
+* no authoritative lower-flight debt owned by another path,
+  repair-authoritative ACK hole, missing- or failed-owner debt, or queued/active
+  repair range lies below the next offset. A begun startup owner may continue
+  only its own exact lower frontier while the same epoch remains eligible and
+  has cumulative non-refilling credit.
 
 The active-flow and latency/realtime pressure guards are categorical, not
 smaller sampling gains. With fewer than two active direction-relevant reliable
@@ -4123,7 +4137,11 @@ counts that suffix plus the candidate's queued, in-flight, and next-quantum
 owner bytes as projected ordering debt, and the result MUST fit the startup
 product envelope: the configured path-flight, receiver-reorder, repair-cache,
 and stream-window envelopes clamped by the actual next quantum. An unmeasured
-path's tiny prior-rate BDP MUST NOT replace this finite startup envelope.
+path's tiny prior-rate BDP MUST NOT replace this finite startup envelope. Once
+the candidate owns the lower frontier, later sample quanta MUST remain on that
+exact startup owner until its epoch suspends, seals, or exhausts; another
+unmeasured candidate and Service MUST NOT interleave higher unique offsets
+behind that bounded train.
 
 Each selected candidate's cumulative unique-owner budget is:
 
@@ -4159,8 +4177,9 @@ sealed, the candidate receives no more startup `OwnerData`, the Service resumes
 normal ordinary feed, and a sealed evidence record remains only to attribute
 ACKs for already-admitted sample ranges. The epoch MUST NOT restart or refill on
 an ACK, timer, queue wakeup, smaller later frame, or app-limited metric refresh. Bulk-demand demotion,
-authoritative debt, or newly active latency/realtime pressure suspends further
-sampling without transferring ownership; if those conditions fully clear, only
+authoritative debt owned by another path, or newly active latency/realtime
+pressure suspends further sampling without transferring ownership; if those
+conditions fully clear, only
 the same candidate's remaining non-refilling credit may resume. A detach,
 failure, role change, output replacement, or Service change invalidates the
 active candidate rather than preserving stale credit. On the response side this

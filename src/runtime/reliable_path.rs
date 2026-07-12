@@ -282,6 +282,7 @@ pub(super) struct FixedReliablePathOutput {
 struct FixedReliablePathModel {
     bytes_in_flight: u64,
     product_queue_bytes: u64,
+    product_progress_bytes: u64,
     product_progress_rate_bps: Option<f64>,
     delivery_rate_bps: Option<f64>,
     srtt_ms: Option<f64>,
@@ -368,6 +369,8 @@ impl FixedReliablePathOutput {
         snapshot.srtt_ms = srtt_ms;
         snapshot.delivery_rate_bps = delivery_rate_bps;
         snapshot.product_progress_rate_bps = model.product_progress_rate_bps;
+        snapshot.has_durable_product_progress = model.product_progress_bytes
+            >= reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
         snapshot.pacing_rate_bps = delivery_rate_bps
             .max(model.product_progress_rate_bps.unwrap_or(0.0))
             .max(1.0);
@@ -447,6 +450,7 @@ impl FixedReliablePathOutput {
                 released_proven_flights = released_proven_flights.saturating_add(1);
             }
         }
+        model.product_progress_bytes = model.product_progress_bytes.saturating_add(sample_bytes);
         if let Some(sample) =
             PathRateSample::new(sample_bytes, now.saturating_duration_since(sample_start))
         {

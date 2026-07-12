@@ -62,6 +62,9 @@ pub struct PathSnapshot {
     pub jitter_ms: f64,
     pub delivery_rate_bps: f64,
     pub product_progress_rate_bps: Option<f64>,
+    /// Exact product ACK accounting satisfies the transport-specific durable
+    /// sample threshold; a point rate alone is not admission evidence.
+    pub has_durable_product_progress: bool,
     pub loss_rate: f64,
     pub queue_bytes: u64,
     pub product_queue_bytes: u64,
@@ -93,6 +96,7 @@ impl PathSnapshot {
             jitter_ms: 0.0,
             delivery_rate_bps,
             product_progress_rate_bps: None,
+            has_durable_product_progress: false,
             loss_rate: 0.0,
             queue_bytes: 0,
             product_queue_bytes: 0,

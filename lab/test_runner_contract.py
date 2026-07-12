@@ -32,6 +32,57 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("trap '' TTOU TTIN TSTP", flapper)
         self.assertIn(") </dev/null &", flapper)
 
+    def test_equal_fat_mptcp_cases_match_bulk_and_exact_upload_contracts(self):
+        download = SCRIPT.split("run_mptcp_baseline_case() {", 1)[1].split(
+            "\n}\n\nrun_mptcp_baseline_upload_case()", 1
+        )[0]
+        upload = SCRIPT.split("run_mptcp_baseline_upload_case() {", 1)[1].split(
+            "\n}\n\nappend_mixed_probe_result()", 1
+        )[0]
+
+        self.assertIn("--parallel-downloads '${bulk_connections}'", download)
+        self.assertIn('start_mptcp_evidence "$case_name"', download)
+        self.assertIn('stop_mptcp_evidence "$case_name"', download)
+        self.assertIn('mptcp_evidence_summary "$case_name"', download)
+        self.assertIn("restart_target_tcp_sink mptcp", upload)
+        self.assertIn("--protocol 'mptcp-upload' --mptcp", upload)
+        self.assertIn("--parallel-uploads '${bulk_connections}'", upload)
+        self.assertIn("freeze_target_tcp_sink", upload)
+        self.assertIn("append_upload_probe_result", upload)
+        self.assertIn('start_mptcp_evidence "$case_name"', upload)
+        self.assertIn('stop_mptcp_evidence "$case_name"', upload)
+        self.assertIn('mptcp_evidence_summary "$case_name"', upload)
+        self.assertIn(
+            'run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_equal_fat" ideal-all-fat',
+            SCRIPT,
+        )
+        self.assertIn(
+            'run_mptcp_baseline_upload_case "baseline_mptcp_tcp_multipath_equal_fat_upload" ideal-all-fat',
+            SCRIPT,
+        )
+
+    def test_mptcp_endpoint_setup_cannot_silently_accept_missing_addresses(self):
+        configure = SCRIPT.split("configure_mptcp_endpoints() {", 1)[1].split(
+            "\n}\n\ncheck_mptcp_baseline_case()", 1
+        )[0]
+
+        self.assertIn("no interface owns requested MPTCP address", configure)
+        self.assertIn("failed to add MPTCP endpoint", configure)
+        self.assertIn("kernel endpoint table did not retain", configure)
+        self.assertNotIn("|| true", configure)
+        self.assertIn("client MPTCP endpoint configuration failed:", SCRIPT)
+        self.assertIn("target MPTCP endpoint configuration failed:", SCRIPT)
+
+    def test_mixed_single_equal_fat_controls_use_one_tcp_and_one_udp_endpoint(self):
+        self.assertIn(
+            'run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_equal_fat" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"',
+            SCRIPT,
+        )
+        self.assertIn(
+            'run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_equal_fat_upload" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"',
+            SCRIPT,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

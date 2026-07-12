@@ -640,6 +640,12 @@ fn choose_request_startup_subflow(
     attempted_subflows: Option<&HashSet<RelayPathInstance>>,
 ) -> Option<BulkRelayPathChoice> {
     let service_key = active_key?;
+    // TCP can turn bounded OwnerData into strict ACK-clock capacity evidence.
+    // A finite QUIC burst stays app-limited and cannot prove native capacity;
+    // using ordered product bytes for that purpose only creates HOL debt.
+    if service_key.underlay != UnderlayProtocol::Tcp {
+        return None;
+    }
     let service = paths
         .iter()
         .find(|path| path.key() == service_key && path.placement == RelayPathPlacement::Active)?;
@@ -678,12 +684,10 @@ fn choose_request_startup_subflow(
     {
         return None;
     }
-    let oldest_lower_age = flights.oldest_ordering_owner_age_before_offset(offset);
-    if oldest_lower_age
-        .is_some_and(|age| age >= reliable_relay_tail_repair_delay(Some(service_snapshot), lane))
-    {
-        return None;
-    }
+    // Product-flight age starts at carrier enqueue and is not stale-tail
+    // authority: a healthy high-BDP TCP writer can retain work past one PTO.
+    // The caller fences missing instances, foreign/active-repair flights are
+    // rejected above, and the product envelope bounds the live-Service suffix.
 
     let startup_credit = usize::try_from(reliable_subflow_startup_sample_limit_bytes(
         context.mux_limits,
@@ -790,6 +794,11 @@ fn choose_request_ack_clock_calibration(
     calibration: Option<RequestAckClockCalibration<'_>>,
 ) -> Option<BulkRelayPathChoice> {
     let service_key = active_key?;
+    // Product ACK-clock calibration is the TCP fallback for unavailable native
+    // carrier telemetry. QUIC capacity remains owned by its packet ACK model.
+    if service_key.underlay != UnderlayProtocol::Tcp {
+        return None;
+    }
     let service = paths
         .iter()
         .find(|path| path.key() == service_key && path.placement == RelayPathPlacement::Active)?;
@@ -2440,6 +2449,139 @@ mod tests {
             )
             .is_none(),
             "Repair ambiguity must drain before optional unique-data sampling"
+        );
+    }
+
+    #[test]
+    fn request_startup_allows_aged_ordinary_service_flight_within_envelope() {
+        let mut context = context(&[
+            "tcp://127.0.0.1:10094?srtt-ms=20&rate-mbps=500",
+            "tcp://127.0.0.1:10095?srtt-ms=10&rate-mbps=500",
+        ]);
+        context.mux_limits.max_stream_window_bytes = 128 * 1024;
+        context.mux_limits.max_repair_bytes = 128 * 1024;
+        context.mux_limits.max_reorder_bytes = 128 * 1024;
+        context.mux_limits.max_path_flight_bytes = 128 * 1024;
+        let service_key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let candidate_key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        };
+        mark_bulk_service(&context, service_key);
+        let paths = vec![
+            relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active),
+            relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation),
+        ];
+        mark_path_proof(&context, candidate_key, Duration::from_millis(8));
+        let mut ledger = RelayPathFlightLedger::default();
+        ledger.record_owner_frame(service_key, &data_frame(0, 64 * 1024));
+        assert!(
+            choose_request_startup_subflow(
+                &context,
+                &paths,
+                FlowLane::Throughput,
+                None,
+                64 * 1024,
+                64 * 1024,
+                Some(service_key),
+                Some(&ledger),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_some(),
+            "the healthy Service and fresh Validation proof satisfy every startup gate"
+        );
+        ledger.age_product_flights_for_test(Duration::from_secs(10));
+
+        assert!(
+            matches!(
+                choose_request_startup_subflow(
+                    &context,
+                    &paths,
+                    FlowLane::Throughput,
+                    None,
+                    64 * 1024,
+                    64 * 1024,
+                    Some(service_key),
+                    Some(&ledger),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                Some(BulkRelayPathChoice::SelectedStartupSubflow {
+                    position: 1,
+                    service,
+                    candidate,
+                }) if service == paths[0].instance() && candidate == paths[1].instance()
+            ),
+            "an old ordinary Service owner flight is not foreign debt or repair ambiguity; bounded startup remains inside the product envelope"
+        );
+
+        ledger.record_owner_frame(service_key, &data_frame(64 * 1024, 64 * 1024));
+        assert!(
+            choose_request_startup_subflow(
+                &context,
+                &paths,
+                FlowLane::Throughput,
+                None,
+                128 * 1024,
+                64 * 1024,
+                Some(service_key),
+                Some(&ledger),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_none(),
+            "ordinary Service suffix plus candidate quantum must remain inside the product envelope"
+        );
+    }
+
+    #[test]
+    fn request_startup_does_not_use_ordered_product_bytes_to_probe_quic_capacity() {
+        let context = context(&[
+            "udp://127.0.0.1:10096?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10097?srtt-ms=10&rate-mbps=500",
+        ]);
+        let service_key = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let candidate_key = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        };
+        mark_bulk_service(&context, service_key);
+        let paths = vec![
+            relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
+            relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
+        ];
+        mark_path_proof(&context, candidate_key, Duration::from_millis(8));
+
+        assert!(
+            choose_request_startup_subflow(
+                &context,
+                &paths,
+                FlowLane::Throughput,
+                None,
+                64 * 1024,
+                64 * 1024,
+                Some(service_key),
+                Some(&RelayPathFlightLedger::default()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_none(),
+            "QUIC Validation needs native non-app-limited carrier proof; product startup sampling is TCP-only"
         );
     }
 

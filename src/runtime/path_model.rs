@@ -875,11 +875,45 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
     observation: ClientPathObservation,
 ) -> bool {
     let product_rate = client_path_observation_has_durable_product_progress(path, observation);
-    product_rate
-        || (observation.carrier_delivery_rate_bps.is_some()
-            && !observation.carrier_app_limited
-            && observation.carrier_delivery_sample_bytes
-                >= client_path_observation_bulk_sample_floor_bytes(observation))
+    product_rate || bulk_candidate_has_native_carrier_rate_evidence(observation)
+}
+
+pub(super) fn bulk_candidate_has_native_carrier_rate_evidence(
+    observation: ClientPathObservation,
+) -> bool {
+    observation.carrier_delivery_rate_bps.is_some()
+        && observation.carrier_ack_derived_data_seen
+        && observation.carrier_delivery_samples > 0
+        && !observation.carrier_app_limited
+        && observation.carrier_delivery_sample_bytes
+            >= client_path_observation_bulk_sample_floor_bytes(observation)
+}
+
+pub(super) fn bulk_candidate_has_fresh_native_carrier_rate_evidence(
+    observation: ClientPathObservation,
+    valid_after: Instant,
+    now: Instant,
+) -> bool {
+    let Some(sample_at) = observation.carrier_last_delivery_at else {
+        return false;
+    };
+    if sample_at < valid_after || sample_at > now {
+        return false;
+    }
+    let srtt = Duration::from_secs_f64(
+        observation
+            .carrier_srtt_ms
+            .unwrap_or(RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0)
+            .max(0.001)
+            / 1000.0,
+    );
+    let rttvar = observation
+        .carrier_rttvar_ms
+        .map(|rttvar_ms| Duration::from_secs_f64(rttvar_ms.max(0.001) / 1000.0))
+        .unwrap_or(srtt / 2);
+    bulk_candidate_has_native_carrier_rate_evidence(observation)
+        && now.saturating_duration_since(sample_at)
+            < quic_bulk_proof_freshness_horizon(srtt, rttvar)
 }
 
 fn client_path_observation_has_durable_product_progress(
@@ -996,4 +1030,60 @@ pub(super) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
 pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
     let _ = underlay;
     PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_carrier_evidence_is_post_attachment_fresh_and_ack_derived() {
+        let now = Instant::now();
+        let valid_after = now - Duration::from_millis(10);
+        let evidence = ClientPathObservation {
+            carrier_srtt_ms: Some(20.0),
+            carrier_rttvar_ms: Some(2.0),
+            carrier_delivery_rate_bps: Some(500_000_000.0),
+            carrier_inflight_limit_bytes: 4 * 1024 * 1024,
+            carrier_delivery_samples: 1,
+            carrier_delivery_sample_bytes: 4 * 1024 * 1024,
+            carrier_last_delivery_at: Some(now - Duration::from_millis(1)),
+            carrier_app_limited: false,
+            carrier_ack_derived_data_seen: true,
+            ..ClientPathObservation::default()
+        };
+        assert!(bulk_candidate_has_fresh_native_carrier_rate_evidence(
+            evidence,
+            valid_after,
+            now,
+        ));
+
+        let before_attachment = ClientPathObservation {
+            carrier_last_delivery_at: Some(valid_after - Duration::from_millis(1)),
+            ..evidence
+        };
+        assert!(!bulk_candidate_has_fresh_native_carrier_rate_evidence(
+            before_attachment,
+            valid_after,
+            now,
+        ));
+        let future = ClientPathObservation {
+            carrier_last_delivery_at: Some(now + Duration::from_millis(1)),
+            ..evidence
+        };
+        assert!(!bulk_candidate_has_fresh_native_carrier_rate_evidence(
+            future,
+            valid_after,
+            now,
+        ));
+        let stale = ClientPathObservation {
+            carrier_last_delivery_at: Some(now - Duration::from_secs(10)),
+            ..evidence
+        };
+        assert!(!bulk_candidate_has_fresh_native_carrier_rate_evidence(
+            stale,
+            now - Duration::from_secs(20),
+            now,
+        ));
+    }
 }

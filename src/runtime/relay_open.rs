@@ -188,7 +188,8 @@ impl ReliableRelayRemoteSet {
 
     pub(super) fn accepted_product_path_count(&self) -> usize {
         // Active and Repair opens enter this set only after peer acceptance.
-        // Validation remains product-ineligible until explicit Active promotion.
+        // Validation remains excluded from this attachment-role count even
+        // when a stream separately graduates it from exact capacity evidence.
         self.paths
             .iter()
             .filter(|path| path.placement != RelayPathPlacement::Validation)

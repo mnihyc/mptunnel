@@ -86,13 +86,19 @@ def serve_client(conn, file_path):
             "Connection: close\r\n"
             "\r\n"
         ).encode("ascii")
-        conn.sendall(headers)
+        try:
+            conn.sendall(headers)
+        except OSError:
+            return
         with open(file_path, "rb") as handle:
             while True:
                 chunk = handle.read(256 * 1024)
                 if not chunk:
                     break
-                conn.sendall(chunk)
+                try:
+                    conn.sendall(chunk)
+                except OSError:
+                    return
 
 
 def serve(args):
@@ -109,7 +115,7 @@ def serve(args):
             thread.start()
 
 
-def download_once(args, started, deadline, state):
+def download_once(args, started, deadline, state, lock):
     host, port = split_host_port(args.target)
     sock = mptcp_socket()
     sock.settimeout(min(args.timeout, 1.0))
@@ -125,7 +131,7 @@ def download_once(args, started, deadline, state):
         buffer = b""
         while b"\r\n\r\n" not in buffer:
             if time.monotonic() >= deadline:
-                return False, None
+                return False, None, "deadline"
             try:
                 chunk = sock.recv(args.chunk_bytes)
             except socket.timeout:
@@ -134,15 +140,15 @@ def download_once(args, started, deadline, state):
                 raise RuntimeError("EOF before HTTP headers")
             buffer += chunk
         status, content_length, body = parse_headers(buffer)
-        if not 200 <= status < 400:
-            return False, status
+        if not 200 <= status < 300:
+            return False, status, "http_status"
         request_bytes = 0
         if body:
             request_bytes += len(body)
-            record_chunk(started, state, len(body))
+            record_chunk(started, state, lock, len(body))
         while content_length is None or request_bytes < content_length:
             if time.monotonic() >= deadline:
-                return False, status
+                return False, status, "deadline"
             try:
                 chunk = sock.recv(args.chunk_bytes)
             except socket.timeout:
@@ -150,23 +156,70 @@ def download_once(args, started, deadline, state):
             if not chunk:
                 break
             request_bytes += len(chunk)
-            record_chunk(started, state, len(chunk))
-    return content_length is None or request_bytes == content_length, status
+            record_chunk(started, state, lock, len(chunk))
+    complete = content_length is None or request_bytes == content_length
+    return complete, status, "complete" if complete else "eof"
 
 
-def record_chunk(started, state, size):
+def record_chunk(started, state, lock, size):
     if size <= 0:
         return
     now_s = time.monotonic() - started
-    interval = int(now_s // state["interval_seconds"])
-    if state["first_body_s"] is None:
-        state["first_body_s"] = now_s
-    if state["last_body_s"] is not None:
-        gap = now_s - state["last_body_s"]
-        state["max_read_gap_s"] = max(state["max_read_gap_s"], gap)
-    state["last_body_s"] = now_s
-    state["bytes"] += size
-    state["interval_bytes"][interval] = state["interval_bytes"].get(interval, 0) + size
+    with lock:
+        interval = int(now_s // state["interval_seconds"])
+        if state["first_body_s"] is None:
+            state["first_body_s"] = now_s
+        if state["last_body_s"] is not None:
+            gap = now_s - state["last_body_s"]
+            state["max_read_gap_s"] = max(state["max_read_gap_s"], gap)
+        state["last_body_s"] = now_s
+        state["bytes"] += size
+        state["interval_bytes"][interval] = (
+            state["interval_bytes"].get(interval, 0) + size
+        )
+
+
+def run_download_worker(
+    args,
+    started,
+    deadline,
+    state,
+    lock,
+    download_request=None,
+):
+    if download_request is None:
+        download_request = download_once
+    while time.monotonic() < deadline:
+        with lock:
+            state["requests"] += 1
+        try:
+            done, status, termination = download_request(
+                args, started, deadline, state, lock
+            )
+        except Exception as exc:
+            with lock:
+                state["errors"].append(str(exc))
+                state["failed"] += 1
+            return
+        ended_at_deadline = time.monotonic() >= deadline
+        with lock:
+            state["last_status"] = status
+            if done:
+                state["complete"] += 1
+            elif termination == "http_status":
+                state["failed"] += 1
+            else:
+                state["partial"] += 1
+                duration_cutoff = (
+                    state["deadline_reason"] == "duration"
+                    and (termination == "deadline" or ended_at_deadline)
+                )
+                if duration_cutoff:
+                    state["duration_end_partial"] += 1
+                else:
+                    state["premature_partial"] += 1
+        if not done:
+            return
 
 
 def download(args):
@@ -174,6 +227,11 @@ def download(args):
     started = time.monotonic()
     duration = args.load_duration if args.load_duration > 0 else args.timeout
     deadline = started + min(duration, args.timeout)
+    deadline_reason = (
+        "duration"
+        if args.load_duration <= 0 or args.load_duration <= args.timeout
+        else "timeout"
+    )
     state = {
         "bytes": 0,
         "first_body_s": None,
@@ -181,37 +239,61 @@ def download(args):
         "max_read_gap_s": 0.0,
         "interval_seconds": args.interval_seconds,
         "interval_bytes": {},
+        "requests": 0,
+        "complete": 0,
+        "partial": 0,
+        "duration_end_partial": 0,
+        "premature_partial": 0,
+        "failed": 0,
+        "deadline_reason": deadline_reason,
+        "last_status": None,
+        "errors": [],
     }
-    requests = 0
-    complete = 0
-    partial = 0
-    last_status = None
-    error = None
-    while time.monotonic() < deadline:
-        requests += 1
-        try:
-            done, last_status = download_once(args, started, deadline, state)
-            if done:
-                complete += 1
-            else:
-                partial += 1
-                break
-        except Exception as exc:
-            error = str(exc)
-            break
+    lock = threading.Lock()
+    worker_count = max(1, args.parallel_downloads)
+    # Independent MPTCP connections make the baseline's concurrency match the
+    # product cohorts without changing how one MPTCP connection uses subflows.
+    threads = [
+        threading.Thread(
+            target=run_download_worker,
+            args=(args, started, deadline, state, lock),
+            daemon=False,
+        )
+        for _ in range(worker_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
     elapsed = time.monotonic() - started
+    error = state["errors"][0] if state["errors"] else None
+    successful = (
+        state["bytes"] > 0
+        and error is None
+        and state["premature_partial"] == 0
+        and state["failed"] == 0
+    )
+    status = "ok" if successful else "loss" if state["bytes"] > 0 else "fail"
     row = {
         "case": args.label,
         "protocol": "mptcp",
-        "status": "ok" if state["bytes"] > 0 and error is None else "fail",
+        "status": status,
+        "exit_code": 0 if status == "ok" else 1,
         "target": args.target,
-        "http_code": last_status,
+        "http_code": state["last_status"],
         "bytes": state["bytes"],
         "time_s": elapsed,
         "load_duration_s": args.load_duration,
-        "requests": requests,
-        "complete_requests": complete,
-        "partial_requests": partial,
+        "parallel_downloads": worker_count,
+        "requests": state["requests"],
+        "complete_requests": state["complete"],
+        "partial_requests": state["partial"],
+        "duration_end_partial_requests": state["duration_end_partial"],
+        "premature_partial_requests": state["premature_partial"],
+        "failed_requests": state["failed"],
+        "deadline_reason": deadline_reason,
+        "complete": successful,
         "goodput_mbps": state["bytes"] * 8 / elapsed / 1_000_000 if elapsed > 0 else 0.0,
         "first_body_s": state["first_body_s"],
         "max_read_gap_s": state["max_read_gap_s"],
@@ -220,7 +302,7 @@ def download(args):
     if error:
         row["error"] = error
     print(json.dumps(row, separators=(",", ":")))
-    return 0 if row["status"] == "ok" else 1
+    return row["exit_code"]
 
 
 def main():
@@ -236,6 +318,7 @@ def main():
     client.add_argument("--path", default="/large.bin")
     client.add_argument("--timeout", type=float, default=120.0)
     client.add_argument("--load-duration", type=float, default=30.0)
+    client.add_argument("--parallel-downloads", type=int, default=1)
     client.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     client.add_argument("--chunk-bytes", type=int, default=256 * 1024)
     args = parser.parse_args()

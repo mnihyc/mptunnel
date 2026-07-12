@@ -130,8 +130,13 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   evidence. After graduation and without same-path latency pressure, either
   underlay may fill one configured product envelope so its native transport
   owns the pipe.
-  Mixed-family raw staging stays in a separate bounded reservoir, and fixed
-  request-side staging keeps its narrower policy.
+  Mixed-family raw staging stays in a separate bounded reservoir. Request-side
+  source and repair debt share one carrier-neutral product window: it starts at
+  the same 4 MiB reservoir, grows on exact unambiguous OwnerData ACK turnover,
+  and resets only when ordered product ownership commits an exact Service
+  handoff. Active attachment-list churn is not a handoff; temporary Service
+  absence retains the bound, and bulk-to-latency demotion closes it to the
+  classifier reservoir. Those ACKs never set TCP or QUIC carrier capacity.
 - Treat bulk receive credit as receiver-memory authority. TCP and QUIC
   `STREAM_MAX_DATA` advertise the configured product window independently of
   path proof; source staging and native carrier congestion control separately
@@ -141,13 +146,17 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   feed reservoir, and TCP or QUIC still owns its per-path emission credit. The
   weaker QUIC product-progress/carrier Service-feed predicates do not prove
   optional capacity or admit a Subflow; QUIC Subflow, handoff, and capacity
-  decisions still require strict non-app-limited local carrier proof. Before a
+  decisions still require strict non-app-limited local carrier proof. A QUIC
+  request Validation attachment graduates only when its exact path proof and a
+  fresh native packet-ACK sample produced after attachment are both valid. This
+  can reuse capacity established by concurrent carrier traffic but cannot bootstrap
+  an otherwise idle one-flow QUIC candidate from ordered product bytes. Before a
   high-confidence additional QUIC path has durable product progress, a
   BBR-style inflight target of `2 * delivery-rate BDP` bounds product reorder
   exposure; carrier-only pacing/cwnd growth stays below that boundary.
-  Low-confidence startup remains separately epoch-bounded and uses native
-  inflight credit, falling back to the delivery-rate target when no native
-  window is available. Datagram goodput may rank datagram paths but never
+  Low-confidence QUIC response startup remains separately epoch-bounded and
+  uses native inflight credit, falling back to the delivery-rate target when no
+  native window is available. Datagram goodput may rank datagram paths but never
   satisfies reliable product durability; data-plane failure invalidates both
   durable product and native-window authority for the failed association.
 - Encode large probe trains incrementally. Do not allocate a vector containing

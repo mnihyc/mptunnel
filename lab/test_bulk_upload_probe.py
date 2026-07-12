@@ -1,3 +1,4 @@
+import socket
 import socketserver
 import sys
 import threading
@@ -9,7 +10,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bulk_upload_probe import connect_socks5, connect_target, interval_upload
+from bulk_upload_probe import (
+    IPPROTO_MPTCP,
+    connect_socks5,
+    connect_target,
+    interval_upload,
+)
 
 
 class ScriptedAckHandler(socketserver.BaseRequestHandler):
@@ -324,6 +330,61 @@ class BulkUploadProbeTests(unittest.TestCase):
             create_connection.call_args.kwargs["timeout"], 1.0, places=6
         )
         self.assertAlmostEqual(fake_socket.timeout, 0.9, places=6)
+
+    def test_mptcp_direct_connect_uses_mptcp_protocol_on_socket(self):
+        class FakeSocket:
+            def __init__(self):
+                self.connected = None
+                self.timeouts = []
+                self.closed = False
+
+            def settimeout(self, timeout):
+                self.timeouts.append(timeout)
+
+            def connect(self, address):
+                self.connected = address
+
+            def close(self):
+                self.closed = True
+
+        args = SimpleNamespace(
+            proxy=None,
+            target="127.0.0.1:443",
+            timeout=30.0,
+            mptcp=True,
+        )
+        fake_socket = FakeSocket()
+        with (
+            mock.patch(
+                "bulk_upload_probe.socket.socket",
+                return_value=fake_socket,
+            ) as socket_factory,
+            mock.patch(
+                "bulk_upload_probe.time.monotonic", side_effect=[200.0, 200.1]
+            ),
+        ):
+            connected = connect_target(args, deadline=201.0)
+
+        self.assertIs(connected, fake_socket)
+        socket_factory.assert_called_once_with(
+            socket.AF_INET, socket.SOCK_STREAM, IPPROTO_MPTCP
+        )
+        self.assertEqual(fake_socket.connected, ("127.0.0.1", 443))
+        self.assertEqual(len(fake_socket.timeouts), 2)
+        self.assertAlmostEqual(fake_socket.timeouts[0], 1.0, places=6)
+        self.assertAlmostEqual(fake_socket.timeouts[1], 0.9, places=6)
+        self.assertFalse(fake_socket.closed)
+
+    def test_mptcp_direct_connect_rejects_proxy_fallback(self):
+        args = SimpleNamespace(
+            proxy="127.0.0.1:1080",
+            target="127.0.0.1:443",
+            timeout=30.0,
+            mptcp=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot be combined with a proxy"):
+            connect_target(args, deadline=time.monotonic() + 1.0)
 
     def test_workers_share_one_load_and_drain_deadline(self):
         server = SimpleNamespace(server_address=("127.0.0.1", 9))

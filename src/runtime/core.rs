@@ -1962,6 +1962,27 @@ impl ClientPathContext {
         }
     }
 
+    pub(super) fn relay_path_has_native_bulk_model_evidence_since(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        valid_after: Instant,
+    ) -> bool {
+        if underlay != UnderlayProtocol::Udp {
+            return false;
+        }
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        health
+            .udp
+            .get_mut(index)
+            .map(|record| {
+                let observation = record.observe(now);
+                bulk_candidate_has_fresh_native_carrier_rate_evidence(observation, valid_after, now)
+            })
+            .unwrap_or(false)
+    }
+
     pub(super) fn relay_path_has_fresh_proof(
         &self,
         underlay: UnderlayProtocol,

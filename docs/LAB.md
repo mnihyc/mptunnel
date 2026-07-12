@@ -354,6 +354,14 @@ New rows use traffic metric version 3 and retain several distinct quantities:
 - `traffic_accounting_identity_residual_bytes_approx` checks the byte identity `client-probe = (target-probe) + (client-target)` and should be zero. This identity is algebraic, not causal.
 - `traffic_expansion_estimate_available` and `traffic_expansion_exact_available` are false. Aggregate bidirectional counters cannot separate simultaneous upload/download in-flight bytes, sequential snapshot skew, unrelated interface traffic, or packets lost before an observation point. Expansion requires direction-split, per-interface sender accounting over finite transfers whose endpoint delivery windows are drained.
 
+The same existing case-boundary snapshots retain every non-loopback interface's
+IPv4 address when available and its rx/tx byte and packet counters. The telemetry
+summary exposes nonnegative before/after deltas under
+`services.<service>.interfaces.<interface>` only when that interface exists in
+both snapshots. This adds no periodic sampler call. Use these deltas to prove
+which shaped paths carried a matched case; they remain bidirectional edge
+counters and therefore do not establish transport expansion.
+
 The legacy `traffic_overhead_*_approx` and `tunnel_traffic_bytes_approx` fields remain in JSONL rows for schema compatibility. They are respectively a nonnegative client/probe delivery-window gap and an alias for aggregate client-edge traffic; both also appear on direct controls and must not be interpreted as tunnel expansion. The Markdown summarizer uses only version-3 names and renders a diagnostic median only when every accepted row in that case supplies it.
 
 ## Controls
@@ -463,6 +471,38 @@ docker compose -f lab/docker-compose.yml down --remove-orphans
 ## Interpreting Results
 
 The deterministic benchmark gates in `lab/benchmarks/` are useful manual regression checks, but they are model results. The Docker lab is the minimum comparison surface before claiming real performance improvement because it compares raw paths, single-path mptunnel, multipath mptunnel, UDP behavior, and a forced path failure under the same emulated network.
+
+A throughput comparison is valid only within a matched cohort: direction,
+underlay/carrier set, application-flow count, measurement duration and drain,
+effective netem profile, topology, and instrumentation mode must all match.
+Diagnostics and management snapshots are causal evidence, not release
+throughput rows. In particular, iteration 41 is a download cohort and MUST NOT
+be compared as a throughput regression or gain against the iteration 55 upload
+cohort.
+
+Use only finalized metric-v4 uploads with
+`upload_accounting_source:"target_sink_observer"` and
+`upload_accounting_exact:true` for exact upload ratios. Incomplete, lossy, or
+older upload accounting remains useful as a labelled lower bound, but it cannot
+establish an exact aggregation result.
+
+Keep constituent-path baselines separate from aggregation controls. Direct,
+VMess, Hysteria2, and single-path mptunnel rows show what one shaped path or
+carrier can deliver; they do not prove that multiple paths were aggregated.
+Matched kernel MPTCP and a raw five-path aggregate, when available, are
+aggregation controls. A final comparison must report these ratios explicitly:
+
+- mptunnel multipath / matched same-carrier mptunnel single-path.
+- mptunnel multipath / matched direct baseline.
+- mptunnel multipath / matched kernel MPTCP.
+- mptunnel multipath / raw five-path aggregate, when that control exists.
+- mptunnel multipath / the sum of configured path ceilings (nominal efficiency).
+
+Report overall and final-three-second goodput together with first delivery,
+maximum and recovery delivery gaps, client/server CPU and RSS, and
+per-interface byte use. Selection events alone do not establish useful path
+aggregation; the interface counters must show which paths carried the measured
+payload.
 
 For release decisions, compare at least:
 

@@ -14,6 +14,7 @@ ACK_INTERVAL_SECONDS = 0.2
 ACK_BYTES = 64 * 1024 * 1024
 SNAPSHOT_INTERVAL_SECONDS = 0.05
 QUIESCE_TIMEOUT_SECONDS = 5.0
+IPPROTO_MPTCP = getattr(socket, "IPPROTO_MPTCP", 262)
 
 
 def acknowledgement(kind, total):
@@ -87,6 +88,7 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         handler_class,
         progress_file=None,
         snapshot_interval_seconds=SNAPSHOT_INTERVAL_SECONDS,
+        socket_protocol=0,
     ):
         self.progress_file = progress_file
         self.snapshot_interval_seconds = max(0.001, snapshot_interval_seconds)
@@ -109,7 +111,20 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.serving_lock = threading.Lock()
         self.serving = False
         self.serving_thread_id = None
-        super().__init__(server_address, handler_class)
+        super().__init__(server_address, handler_class, bind_and_activate=False)
+        if socket_protocol:
+            # A client-only MPTCP socket may fall back to TCP. Opting in on the
+            # listener keeps the baseline's transport identity unambiguous.
+            self.socket.close()
+            self.socket = socket.socket(
+                self.address_family, self.socket_type, socket_protocol
+            )
+        try:
+            self.server_bind()
+            self.server_activate()
+        except Exception:
+            self.server_close()
+            raise
         self.flush_progress(force=True)
         if self.progress_file:
             self.snapshot_thread = threading.Thread(
@@ -365,9 +380,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", default="0.0.0.0:10023")
     parser.add_argument("--progress-file")
+    parser.add_argument(
+        "--mptcp",
+        action="store_true",
+        help="listen with IPPROTO_MPTCP instead of a TCP socket",
+    )
     args = parser.parse_args()
     server = ThreadingTcpServer(
-        parse_bind(args.bind), SinkHandler, progress_file=args.progress_file
+        parse_bind(args.bind),
+        SinkHandler,
+        progress_file=args.progress_file,
+        socket_protocol=IPPROTO_MPTCP if args.mptcp else 0,
     )
 
     def request_shutdown(_signum, _frame):

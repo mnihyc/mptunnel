@@ -19,8 +19,8 @@ pub(super) fn reliable_relay_client_dispatch_payload_limit(
 
 #[derive(Debug)]
 struct ReliableRelayRequestOutstandingWindow {
-    active_tcp_instance: Option<RelayPathInstance>,
-    tcp_limit_bytes: usize,
+    service_epoch_instance: Option<RelayPathInstance>,
+    product_limit_bytes: usize,
     growth_epoch_at: Instant,
     acked_in_epoch: usize,
 }
@@ -32,8 +32,8 @@ impl ReliableRelayRequestOutstandingWindow {
 
     fn new_at(now: Instant) -> Self {
         Self {
-            active_tcp_instance: None,
-            tcp_limit_bytes: 0,
+            service_epoch_instance: None,
+            product_limit_bytes: 0,
             growth_epoch_at: now,
             acked_in_epoch: 0,
         }
@@ -41,13 +41,13 @@ impl ReliableRelayRequestOutstandingWindow {
 
     fn limit_bytes(
         &mut self,
-        active_instance: Option<RelayPathInstance>,
+        service_instance: Option<RelayPathInstance>,
         lane: FlowLane,
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> usize {
         self.limit_bytes_at(
-            active_instance,
+            service_instance,
             lane,
             payload_bytes,
             mux_limits,
@@ -55,38 +55,28 @@ impl ReliableRelayRequestOutstandingWindow {
         )
     }
 
+    fn resolved_service_instance(
+        &self,
+        ordered_service: Option<RelayPathInstance>,
+        pre_owner_active: Option<RelayPathInstance>,
+    ) -> Option<RelayPathInstance> {
+        ordered_service.or_else(|| {
+            self.service_epoch_instance
+                .is_none()
+                .then_some(pre_owner_active)
+                .flatten()
+        })
+    }
+
     fn limit_bytes_at(
         &mut self,
-        active_instance: Option<RelayPathInstance>,
+        service_instance: Option<RelayPathInstance>,
         lane: FlowLane,
         payload_bytes: usize,
         mux_limits: MuxLimits,
         now: Instant,
     ) -> usize {
         let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
-        match active_instance {
-            Some(instance) if instance.key.underlay == UnderlayProtocol::Tcp => {
-                if self.active_tcp_instance != Some(instance) {
-                    self.active_tcp_instance = Some(instance);
-                    self.tcp_limit_bytes = 0;
-                    self.growth_epoch_at = now;
-                    self.acked_in_epoch = 0;
-                }
-            }
-            Some(_) => {
-                self.active_tcp_instance = None;
-                self.tcp_limit_bytes = 0;
-                self.growth_epoch_at = now;
-                self.acked_in_epoch = 0;
-                return resource_ceiling;
-            }
-            None if self.active_tcp_instance.is_none() => return resource_ceiling,
-            None => {
-                // Retain the last TCP allowance while no Active carrier is
-                // available so recovery cannot reopen source read-ahead.
-            }
-        }
-
         let startup_reservoir = if lane.is_bulk() {
             bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
         } else {
@@ -97,19 +87,43 @@ impl ReliableRelayRequestOutstandingWindow {
         }
         .min(resource_ceiling)
         .max(1);
-        if self.tcp_limit_bytes < startup_reservoir {
-            self.tcp_limit_bytes = startup_reservoir;
+        if service_instance.is_none() && self.service_epoch_instance.is_some() {
+            // Demotion still closes read-ahead during recovery, but promotion
+            // cannot manufacture a larger allowance without a Service epoch.
+            if !lane.is_bulk() && self.product_limit_bytes > startup_reservoir {
+                self.product_limit_bytes = startup_reservoir;
+                self.growth_epoch_at = now;
+                self.acked_in_epoch = 0;
+            }
+            return self.product_limit_bytes.min(resource_ceiling).max(1);
+        }
+        if let Some(instance) = service_instance
+            && self.service_epoch_instance != Some(instance)
+        {
+            // Product admission is unified above the carriers, but its ACK
+            // epoch belongs to one exact Service association. Handoffs across
+            // either protocol start from the same bounded reservoir.
+            self.service_epoch_instance = Some(instance);
+            self.product_limit_bytes = 0;
             self.growth_epoch_at = now;
             self.acked_in_epoch = 0;
         }
-        self.tcp_limit_bytes.min(resource_ceiling).max(1)
+        // Retain a bounded allowance while Service placement is temporarily
+        // absent so recovery cannot reopen source read-ahead.
+        let lane_demoted = !lane.is_bulk() && self.product_limit_bytes > startup_reservoir;
+        if lane_demoted || self.product_limit_bytes < startup_reservoir {
+            self.product_limit_bytes = startup_reservoir;
+            self.growth_epoch_at = now;
+            self.acked_in_epoch = 0;
+        }
+        self.product_limit_bytes.min(resource_ceiling).max(1)
     }
 
     fn record_acked(
         &mut self,
         released_bytes: usize,
         owner_instance: RelayPathInstance,
-        active_instance: Option<RelayPathInstance>,
+        service_instance: Option<RelayPathInstance>,
         owner_capable: bool,
         lane: FlowLane,
         growth_interval: Duration,
@@ -118,7 +132,7 @@ impl ReliableRelayRequestOutstandingWindow {
         self.record_acked_at(
             released_bytes,
             owner_instance,
-            active_instance,
+            service_instance,
             owner_capable,
             lane,
             growth_interval,
@@ -131,24 +145,26 @@ impl ReliableRelayRequestOutstandingWindow {
         &mut self,
         released_bytes: usize,
         owner_instance: RelayPathInstance,
-        active_instance: Option<RelayPathInstance>,
+        service_instance: Option<RelayPathInstance>,
         owner_capable: bool,
         lane: FlowLane,
         growth_interval: Duration,
         mux_limits: MuxLimits,
         now: Instant,
     ) {
+        let Some(service_instance) = service_instance else {
+            return;
+        };
         if released_bytes == 0
-            || owner_instance.key.underlay != UnderlayProtocol::Tcp
             || !owner_capable
-            || active_instance.is_none()
-            || self.active_tcp_instance != active_instance
+            || service_instance.key.underlay != owner_instance.key.underlay
+            || self.service_epoch_instance != Some(service_instance)
             || !lane.is_bulk()
         {
             return;
         }
         let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
-        if self.tcp_limit_bytes == 0 || self.tcp_limit_bytes >= resource_ceiling {
+        if self.product_limit_bytes == 0 || self.product_limit_bytes >= resource_ceiling {
             return;
         }
         let growth_interval = growth_interval.max(QUIC_TIMER_GRANULARITY);
@@ -158,12 +174,20 @@ impl ReliableRelayRequestOutstandingWindow {
             return;
         }
         self.acked_in_epoch = self.acked_in_epoch.saturating_add(released_bytes);
-        let growth_threshold = self.tcp_limit_bytes.div_ceil(2).max(1);
+        let durable_product_floor =
+            usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits))
+                .unwrap_or(usize::MAX)
+                .min(self.product_limit_bytes);
+        let growth_threshold = self
+            .product_limit_bytes
+            .div_ceil(2)
+            .max(durable_product_floor)
+            .max(1);
         if self.acked_in_epoch < growth_threshold {
             return;
         }
-        self.tcp_limit_bytes = self
-            .tcp_limit_bytes
+        self.product_limit_bytes = self
+            .product_limit_bytes
             .saturating_mul(2)
             .min(resource_ceiling)
             .max(1);
@@ -185,11 +209,11 @@ fn reliable_relay_request_outstanding_headroom_bytes(
 }
 
 fn reliable_relay_request_ack_growth_interval(
-    path_key: RelayPathKey,
+    service_instance: RelayPathInstance,
     context: &ClientPathContext,
 ) -> Duration {
     context
-        .reliable_path_snapshot(path_key)
+        .reliable_path_snapshot(service_instance.key)
         .map(|snapshot| transport_pto_from_snapshot(Some(snapshot)))
         .unwrap_or_else(|| transport_pto_from_snapshot(None))
 }
@@ -397,8 +421,14 @@ where
         );
         let adaptive_inflight =
             adaptive_reliable_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
-        let request_outstanding_limit = request_outstanding_window.limit_bytes(
+        let request_service_instance = request_outstanding_window.resolved_service_instance(
+            sender
+                .request_ordered_service_instance()
+                .filter(|service| remotes.contains_path_instance(*service)),
             remotes.active_path_instance(),
+        );
+        let request_outstanding_limit = request_outstanding_window.limit_bytes(
+            request_service_instance,
             relay_lane,
             adaptive_chunk,
             context.mux_limits,
@@ -1750,19 +1780,26 @@ where
                                 context,
                                 &normalized_ranges,
                             );
-                        let active_instance = remotes.active_path_instance();
-                        let growth_interval = active_instance
-                            .map(|active| {
-                                reliable_relay_request_ack_growth_interval(active.key, context)
+                        let service_instance = request_outstanding_window
+                            .resolved_service_instance(
+                                sender
+                                    .request_ordered_service_instance()
+                                    .filter(|service| remotes.contains_path_instance(*service)),
+                                remotes.active_path_instance(),
+                            );
+                        let growth_interval = service_instance
+                            .map(|service| {
+                                reliable_relay_request_ack_growth_interval(service, context)
                             })
                             .unwrap_or_else(|| transport_pto_from_snapshot(None));
                         for progress in owner_progress {
                             request_outstanding_window.record_acked(
                                 progress.bytes,
                                 progress.instance,
-                                active_instance,
+                                service_instance,
                                 sender.request_owner_ack_can_grow_window(
                                     &remotes,
+                                    service_instance,
                                     progress.instance,
                                 ),
                                 relay_lane,
@@ -3291,6 +3328,55 @@ mod tests {
     }
 
     #[test]
+    fn request_window_epoch_ignores_active_churn_until_ordered_service_commit() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let first_active = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
+        let later_active = request_test_path_instance(UnderlayProtocol::Tcp, 1, 2);
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+
+        let provisional = window.resolved_service_instance(None, Some(first_active));
+        assert_eq!(provisional, Some(first_active));
+        assert_eq!(
+            window.limit_bytes_at(
+                provisional,
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now,
+            ),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            window.resolved_service_instance(None, Some(later_active)),
+            None,
+            "a later Active attachment is not a committed Service and cannot reopen the retained epoch"
+        );
+        assert_eq!(window.service_epoch_instance, Some(first_active));
+        assert_eq!(
+            window.resolved_service_instance(Some(first_active), Some(later_active)),
+            Some(first_active),
+            "committing the original owner preserves the same exact epoch"
+        );
+        assert_eq!(
+            window.resolved_service_instance(Some(later_active), Some(later_active)),
+            Some(later_active),
+            "only an ordered Service commit authorizes an exact epoch handoff"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(later_active),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(1),
+            ),
+            4 * 1024 * 1024
+        );
+        assert_eq!(window.service_epoch_instance, Some(later_active));
+    }
+
+    #[test]
     fn tcp_request_outstanding_limit_preserves_classifier_reservoir_and_ack_growth() {
         let mux_limits = MuxLimits::default();
         let now = Instant::now();
@@ -3328,7 +3414,7 @@ mod tests {
             mux_limits,
             promoted_at + Duration::from_millis(50),
         );
-        assert_eq!(window.tcp_limit_bytes, 8 * 1024 * 1024);
+        assert_eq!(window.product_limit_bytes, 8 * 1024 * 1024);
 
         let expired_at = promoted_at + Duration::from_secs(1);
         window.record_acked_at(
@@ -3342,7 +3428,7 @@ mod tests {
             expired_at,
         );
         assert_eq!(
-            window.tcp_limit_bytes,
+            window.product_limit_bytes,
             8 * 1024 * 1024,
             "slow release must not expand the request window"
         );
@@ -3356,11 +3442,203 @@ mod tests {
             mux_limits,
             expired_at + Duration::from_millis(50),
         );
-        assert_eq!(window.tcp_limit_bytes, 16 * 1024 * 1024);
+        assert_eq!(window.product_limit_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Latency,
+                PATH_OPEN_SCORE_BYTES,
+                mux_limits,
+                expired_at + Duration::from_millis(51),
+            ),
+            reliable_relay_buffer_len(mux_limits),
+            "bulk-to-latency demotion must close previously grown source read-ahead"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                expired_at + Duration::from_millis(52),
+            ),
+            4 * 1024 * 1024,
+            "promotion starts from the bounded Service reservoir, not the old bulk allowance"
+        );
     }
 
     #[test]
-    fn request_outstanding_limit_is_scoped_to_the_active_tcp_instance() {
+    fn udp_request_outstanding_limit_uses_service_reservoir_then_product_ack_growth() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let udp = request_test_path_instance(UnderlayProtocol::Udp, 0, 1);
+
+        assert_eq!(
+            window.limit_bytes_at(Some(udp), FlowLane::Throughput, 64 * 1024, mux_limits, now,),
+            4 * 1024 * 1024,
+            "QUIC carrier capacity must not bypass the staged product window"
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            udp,
+            Some(udp),
+            true,
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(udp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(1),
+            ),
+            8 * 1024 * 1024,
+            "durable UDP product ACKs should grow stream read-ahead without becoming carrier-capacity evidence"
+        );
+    }
+
+    #[test]
+    fn request_outstanding_limit_resets_on_protocol_and_exact_instance_handoff() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let udp = request_test_path_instance(UnderlayProtocol::Udp, 0, 1);
+        let replacement_udp = request_test_path_instance(UnderlayProtocol::Udp, 0, 2);
+        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 3);
+
+        let mut recovering = ReliableRelayRequestOutstandingWindow::new_at(now);
+        let latency_limit = recovering.limit_bytes_at(
+            Some(udp),
+            FlowLane::Latency,
+            PATH_OPEN_SCORE_BYTES,
+            mux_limits,
+            now,
+        );
+        let unavailable = recovering.resolved_service_instance(None, Some(replacement_udp));
+        assert_eq!(unavailable, None);
+        assert_eq!(
+            recovering.limit_bytes_at(
+                unavailable,
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(1),
+            ),
+            latency_limit,
+            "lane promotion without an Active Service must retain the prior bound"
+        );
+
+        assert_eq!(
+            window.limit_bytes_at(Some(udp), FlowLane::Throughput, 64 * 1024, mux_limits, now,),
+            4 * 1024 * 1024
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            udp,
+            Some(udp),
+            true,
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(1),
+        );
+        let unavailable = window.resolved_service_instance(None, Some(replacement_udp));
+        assert_eq!(unavailable, None);
+        assert_eq!(
+            window.limit_bytes_at(
+                unavailable,
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(2),
+            ),
+            8 * 1024 * 1024,
+            "temporary loss of Active placement must retain the bounded product allowance"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                unavailable,
+                FlowLane::Latency,
+                PATH_OPEN_SCORE_BYTES,
+                mux_limits,
+                now + Duration::from_micros(2500),
+            ),
+            reliable_relay_buffer_len(mux_limits),
+            "demotion must shrink read-ahead even while Service is absent"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                unavailable,
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_micros(2750),
+            ),
+            reliable_relay_buffer_len(mux_limits),
+            "promotion without Service must not restore the prior bulk allowance"
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(replacement_udp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(3),
+            ),
+            4 * 1024 * 1024,
+            "same-key replacement must not inherit an old UDP instance's ACK epoch"
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            replacement_udp,
+            Some(replacement_udp),
+            true,
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(4),
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(tcp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(5),
+            ),
+            4 * 1024 * 1024,
+            "UDP-to-TCP handoff must begin a fresh product ACK epoch"
+        );
+        window.record_acked_at(
+            2 * 1024 * 1024,
+            tcp,
+            Some(tcp),
+            true,
+            FlowLane::Throughput,
+            Duration::from_secs(1),
+            mux_limits,
+            now + Duration::from_millis(6),
+        );
+        assert_eq!(
+            window.limit_bytes_at(
+                Some(udp),
+                FlowLane::Throughput,
+                64 * 1024,
+                mux_limits,
+                now + Duration::from_millis(7),
+            ),
+            4 * 1024 * 1024,
+            "TCP-to-UDP handoff must not borrow the TCP product ACK epoch"
+        );
+    }
+
+    #[test]
+    fn request_outstanding_growth_is_scoped_to_the_ordered_service_family() {
         let mux_limits = MuxLimits::default();
         let now = Instant::now();
         let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
@@ -3375,9 +3653,9 @@ mod tests {
                 mux_limits,
                 now,
             ),
-            mux_limits.max_path_flight_bytes
+            reliable_relay_buffer_len(mux_limits)
         );
-        assert_eq!(window.active_tcp_instance, None);
+        assert_eq!(window.service_epoch_instance, Some(udp));
 
         assert_eq!(
             window.limit_bytes_at(
@@ -3400,9 +3678,9 @@ mod tests {
             now + Duration::from_millis(2),
         );
         assert_eq!(
-            window.tcp_limit_bytes,
+            window.product_limit_bytes,
             4 * 1024 * 1024,
-            "UDP-owned progress must not expand the active TCP allowance"
+            "UDP-owned progress must not expand the ordered TCP Service allowance"
         );
         window.record_acked_at(
             2 * 1024 * 1024,
@@ -3414,7 +3692,7 @@ mod tests {
             mux_limits,
             now + Duration::from_millis(3),
         );
-        assert_eq!(window.tcp_limit_bytes, 8 * 1024 * 1024);
+        assert_eq!(window.product_limit_bytes, 8 * 1024 * 1024);
         assert_eq!(
             window.limit_bytes_at(
                 Some(replacement_tcp),
@@ -3435,7 +3713,7 @@ mod tests {
                 now + Duration::from_millis(5),
             ),
             4 * 1024 * 1024,
-            "losing the active TCP carrier must not reopen reads during recovery"
+            "losing the ordered TCP Service must not reopen reads during recovery"
         );
         assert_eq!(
             window.limit_bytes_at(
@@ -3445,8 +3723,8 @@ mod tests {
                 mux_limits,
                 now + Duration::from_millis(6),
             ),
-            mux_limits.max_path_flight_bytes,
-            "an active UDP carrier retains the existing adaptive product-window policy"
+            4 * 1024 * 1024,
+            "a TCP-to-UDP handoff starts a fresh product window"
         );
         assert_eq!(
             window.limit_bytes_at(
@@ -3490,7 +3768,7 @@ mod tests {
             now + Duration::from_millis(1),
         );
         assert_eq!(
-            window.tcp_limit_bytes,
+            window.product_limit_bytes,
             4 * 1024 * 1024,
             "detached or stale exact instances must not grow the Service epoch"
         );
@@ -3506,58 +3784,79 @@ mod tests {
             now + Duration::from_millis(2),
         );
         assert_eq!(
-            window.tcp_limit_bytes,
+            window.product_limit_bytes,
             8 * 1024 * 1024,
             "receiver-confirmed OwnerData on a live same-family subflow must grow stream read-ahead"
         );
     }
 
     #[test]
-    fn tcp_request_outstanding_limit_never_exceeds_product_resource_ceiling() {
+    fn request_outstanding_limit_never_exceeds_product_resource_ceiling_for_either_underlay() {
         let mux_limits = MuxLimits {
             max_stream_window_bytes: 1024 * 1024,
             ..MuxLimits::default()
         };
         let now = Instant::now();
-        let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
-        let growth_interval = transport_pto_from_snapshot(None);
-        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
 
-        assert_eq!(
-            window.limit_bytes_at(Some(tcp), FlowLane::Throughput, 64 * 1024, mux_limits, now,),
-            512 * 1024
-        );
-        window.record_acked_at(
-            256 * 1024,
-            tcp,
-            Some(tcp),
-            true,
-            FlowLane::Throughput,
-            growth_interval,
-            mux_limits,
-            now + Duration::from_millis(10),
-        );
-        assert_eq!(
-            window.limit_bytes_at(
-                Some(tcp),
+        for (ordinal, underlay) in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp]
+            .into_iter()
+            .enumerate()
+        {
+            let instance = request_test_path_instance(underlay, ordinal, ordinal as u64 + 1);
+            let mut window = ReliableRelayRequestOutstandingWindow::new_at(now);
+            assert_eq!(
+                window.limit_bytes_at(
+                    Some(instance),
+                    FlowLane::Throughput,
+                    64 * 1024,
+                    mux_limits,
+                    now,
+                ),
+                512 * 1024,
+                "{underlay:?} should start below the product resource ceiling"
+            );
+            window.record_acked_at(
+                256 * 1024,
+                instance,
+                Some(instance),
+                true,
                 FlowLane::Throughput,
-                64 * 1024,
+                Duration::from_secs(1),
                 mux_limits,
-                now + Duration::from_millis(10),
-            ),
-            1024 * 1024
-        );
-        window.record_acked_at(
-            1024 * 1024,
-            tcp,
-            Some(tcp),
-            true,
-            FlowLane::Throughput,
-            growth_interval,
-            mux_limits,
-            now + Duration::from_millis(20),
-        );
-        assert_eq!(window.tcp_limit_bytes, 1024 * 1024);
+                now + Duration::from_millis(1),
+            );
+            assert_eq!(
+                window.limit_bytes_at(
+                    Some(instance),
+                    FlowLane::Throughput,
+                    64 * 1024,
+                    mux_limits,
+                    now + Duration::from_millis(1),
+                ),
+                1024 * 1024
+            );
+            window.record_acked_at(
+                1024 * 1024,
+                instance,
+                Some(instance),
+                true,
+                FlowLane::Throughput,
+                Duration::from_secs(1),
+                mux_limits,
+                now + Duration::from_millis(2),
+            );
+            assert_eq!(
+                window.limit_bytes_at(
+                    Some(instance),
+                    FlowLane::Throughput,
+                    64 * 1024,
+                    mux_limits,
+                    now + Duration::from_millis(2),
+                ),
+                1024 * 1024,
+                "{underlay:?} product read-ahead must remain resource-bounded"
+            );
+        }
     }
 
     fn test_reliable_path_stream(

@@ -9,7 +9,7 @@ import sys
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tcp_sink import ACK_BYTES, SinkHandler, ThreadingTcpServer
+from tcp_sink import ACK_BYTES, IPPROTO_MPTCP, SinkHandler, ThreadingTcpServer
 
 
 class SizedChunk:
@@ -63,6 +63,47 @@ def read_snapshot(path):
 
 
 class TcpSinkTests(unittest.TestCase):
+    def test_mptcp_listener_replaces_default_socket_before_binding(self):
+        class FakeSocket:
+            def __init__(self):
+                self.closed = False
+                self.bound = None
+
+            def close(self):
+                self.closed = True
+
+            def setsockopt(self, *_args):
+                return None
+
+            def bind(self, address):
+                self.bound = address
+
+            def getsockname(self):
+                return self.bound
+
+            def listen(self, _backlog):
+                return None
+
+        tcp_socket = FakeSocket()
+        mptcp_socket = FakeSocket()
+        with mock.patch(
+            "tcp_sink.socket.socket", side_effect=[tcp_socket, mptcp_socket]
+        ) as socket_factory:
+            server = ThreadingTcpServer(
+                ("127.0.0.1", 0),
+                SinkHandler,
+                socket_protocol=IPPROTO_MPTCP,
+            )
+            server.server_close()
+
+        self.assertTrue(tcp_socket.closed)
+        self.assertTrue(mptcp_socket.closed)
+        self.assertEqual(mptcp_socket.bound, ("127.0.0.1", 0))
+        self.assertEqual(
+            socket_factory.call_args_list[-1],
+            mock.call(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_MPTCP),
+        )
+
     def test_reports_monotonic_progress_and_exact_final_total(self):
         request = FakeRequest([b"abc", SizedChunk(ACK_BYTES)])
 

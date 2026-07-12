@@ -122,15 +122,18 @@ Recommended production ranges:
 | TCP heartbeat timers | 10s / 30s | keep default | Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair evidence. |
 | Outbound connect timeout | 10s | per egress outbound/member | Target or upstream-proxy dial safety. It is scoped to the outbound that owns the connect and does not affect MPP path probing, pacing, or failover. |
 
-While a request stream's Active carrier is TCP, it does not immediately fill
-the 64 MiB stream and repair envelopes. Its source queue and ACK-retained repair
-bytes share a smaller stream-local startup window that grows only from timely
-unique product ACKs returned on the same active TCP carrier instance. A carrier
-handoff starts a fresh ACK clock; loss without a replacement retains the prior
-bound. This is automatic and has no operator knob. `STREAM_ACK` means the peer
-handed bytes to its local target socket, not that the target application
-consumed them, so target-side kernel buffering can still exceed
-receiver-observed application bytes during a fixed-duration test.
+Request streams do not immediately fill the 64 MiB stream and repair envelopes.
+Their source queue and ACK-retained repair bytes share a stream-local product
+window that starts at 4 MiB for bulk traffic and grows from exact, unambiguous
+OwnerData ACK turnover within the current Service PTO. The ACK carrier is
+irrelevant; the flight owner must be the exact ordered Service instance or an
+eligible same-family graduated Subflow. Active attachment or reverse-direction
+delivery churn does not move this epoch. An exact committed TCP/QUIC Service
+handoff resets the window, loss without a replacement retains the prior bound,
+and bulk-to-latency demotion closes old read-ahead to the classifier reservoir.
+This is automatic and has no operator knob. `STREAM_ACK` means the peer handed
+bytes to its local target socket, not that the target application consumed them,
+and it never supplies QUIC carrier capacity.
 
 A QUIC bulk stream advertises the configured product receive window, 64 MiB by
 default. This is receiver-memory authority, not the QUIC congestion window or
@@ -142,8 +145,12 @@ ACK-derived DATA estimate may graduate the current QUIC Service's staging;
 the carrier estimate may be app-limited. Neither authority is carrier capacity
 proof, and same-path latency pressure still prevents graduation. Optional
 Subflows, capacity ranking, and handoff require strict non-app-limited carrier
-proof. TCP and QUIC keep separate recovery, pacing, and flow-control loops below
-this unified product policy.
+proof. A request-side QUIC Validation attachment additionally requires its exact
+fresh path proof and a native packet-ACK sample produced after attachment. An
+idle one-flow candidate therefore does not bootstrap from product data; a
+concurrent flow may establish reusable carrier evidence. TCP and QUIC keep
+separate recovery, pacing, and flow-control loops below this unified product
+policy.
 
 For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
 `max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together

@@ -28,6 +28,8 @@ BYTE_UNITS = {
 }
 
 STOP_POLL_INTERVAL_SECONDS = 0.05
+NETDEV_COUNTER_FIELDS = ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")
+IPV4_MARKER = "__MPTUNNEL_IPV4__"
 
 
 def run(argv: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
@@ -144,30 +146,77 @@ def stat_for_container(stats: dict[str, dict[str, object]], container_id: str) -
     return {}
 
 
-def read_netdev(container_id: str) -> dict[str, int] | None:
-    result = run(["docker", "exec", container_id, "cat", "/proc/net/dev"])
-    if result.returncode != 0:
-        return None
+def parse_netdev(payload: str) -> tuple[dict[str, int], dict[str, dict[str, object]]]:
     totals = {
         "rx_bytes": 0,
         "rx_packets": 0,
         "tx_bytes": 0,
         "tx_packets": 0,
     }
-    for line in result.stdout.splitlines():
+    interfaces: dict[str, dict[str, object]] = {}
+    for line in payload.splitlines():
         if ":" not in line:
             continue
         iface, values = line.split(":", 1)
-        if iface.strip() == "lo":
+        iface = iface.strip()
+        if iface == "lo":
             continue
         fields = values.split()
         if len(fields) < 16:
             continue
-        totals["rx_bytes"] += int(fields[0])
-        totals["rx_packets"] += int(fields[1])
-        totals["tx_bytes"] += int(fields[8])
-        totals["tx_packets"] += int(fields[9])
+        try:
+            counters = {
+                "rx_bytes": int(fields[0]),
+                "rx_packets": int(fields[1]),
+                "tx_bytes": int(fields[8]),
+                "tx_packets": int(fields[9]),
+            }
+        except ValueError:
+            continue
+        interfaces[iface] = counters
+        for field in NETDEV_COUNTER_FIELDS:
+            totals[field] += counters[field]
+    return totals, interfaces
+
+
+def parse_ipv4_addresses(payload: str) -> dict[str, str]:
+    addresses = {}
+    for line in payload.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] != "inet":
+            continue
+        iface = fields[1].split("@", 1)[0]
+        if iface == "lo":
+            continue
+        addresses.setdefault(iface, fields[3].split("/", 1)[0])
+    return addresses
+
+
+def read_netdev(container_id: str) -> dict[str, int] | None:
+    result = run(["docker", "exec", container_id, "cat", "/proc/net/dev"])
+    if result.returncode != 0:
+        return None
+    totals, _ = parse_netdev(result.stdout)
     return totals
+
+
+def read_netdev_snapshot(container_id: str) -> dict[str, object] | None:
+    command = (
+        "cat /proc/net/dev; "
+        f"printf '\\n{IPV4_MARKER}\\n'; "
+        "ip -o -4 addr show 2>/dev/null || true"
+    )
+    result = run(["docker", "exec", container_id, "sh", "-c", command])
+    if result.returncode != 0:
+        return None
+    netdev_payload, separator, address_payload = result.stdout.partition(
+        f"\n{IPV4_MARKER}\n"
+    )
+    totals, interfaces = parse_netdev(netdev_payload)
+    addresses = parse_ipv4_addresses(address_payload) if separator else {}
+    for iface, counters in interfaces.items():
+        counters["ipv4"] = addresses.get(iface)
+    return {**totals, "interfaces": interfaces}
 
 
 def snapshot_netdev(
@@ -177,7 +226,7 @@ def snapshot_netdev(
     ids = compose_container_ids(compose_file, services)
     service_rows = {}
     for service, container_id in sorted(ids.items()):
-        net = read_netdev(container_id)
+        net = read_netdev_snapshot(container_id)
         if net is None:
             continue
         service_rows[service] = {
@@ -213,11 +262,39 @@ def apply_snapshot_deltas(
         if not isinstance(before_row, dict) or not isinstance(after_row, dict):
             continue
         service_summary = services.setdefault(service, {})
-        for field in ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets"):
+        for field in NETDEV_COUNTER_FIELDS:
             before_value = int(before_row.get(field, 0) or 0)
             after_value = int(after_row.get(field, 0) or 0)
             service_summary[f"delta_{field}"] = max(after_value - before_value, 0)
         service_summary["netdev_delta_source"] = "case_before_after_snapshot"
+
+        before_interfaces = before_row.get("interfaces")
+        after_interfaces = after_row.get("interfaces")
+        if not isinstance(before_interfaces, dict) or not isinstance(
+            after_interfaces, dict
+        ):
+            continue
+        interface_deltas = {}
+        for iface, after_interface in sorted(after_interfaces.items()):
+            before_interface = before_interfaces.get(iface)
+            if not isinstance(before_interface, dict) or not isinstance(
+                after_interface, dict
+            ):
+                continue
+            delta = {}
+            for field in NETDEV_COUNTER_FIELDS:
+                before_value = int(before_interface.get(field, 0) or 0)
+                after_value = int(after_interface.get(field, 0) or 0)
+                delta[f"delta_{field}"] = max(after_value - before_value, 0)
+            ipv4 = after_interface.get("ipv4") or before_interface.get("ipv4")
+            if isinstance(ipv4, str) and ipv4:
+                delta["ipv4"] = ipv4
+            interface_deltas[str(iface)] = delta
+        if interface_deltas:
+            service_summary["interfaces"] = interface_deltas
+            service_summary["netdev_interface_delta_source"] = (
+                "case_before_after_snapshot"
+            )
 
 
 def rate_fields(

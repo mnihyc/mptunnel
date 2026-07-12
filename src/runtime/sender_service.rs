@@ -6091,6 +6091,9 @@ impl RelaySenderService {
         remotes: &ReliableRelayRemoteSet,
         owner: RelayPathInstance,
     ) {
+        if owner.key.underlay != UnderlayProtocol::Tcp {
+            return;
+        }
         let proof_generation = context
             .relay_path_proof_generation(owner.key.underlay, owner.key.index)
             .unwrap_or(0);
@@ -6195,6 +6198,34 @@ impl RelaySenderService {
                 .retain(|instance, _| live_instances.contains(instance));
             self.request_membership_generation = Some(membership_generation);
         }
+        if self.ordered_data_owner_instance.is_some_and(|service| {
+            service.key.underlay == UnderlayProtocol::Udp && remotes.contains_path_instance(service)
+        }) {
+            for path in &remotes.paths {
+                let instance = path.instance();
+                let native_evidence = path.placement == RelayPathPlacement::Validation
+                    && instance.key.underlay == UnderlayProtocol::Udp
+                    && path.path_proof_id.is_some_and(|proof_id| {
+                        context.relay_path_has_fresh_proof(
+                            instance.key.underlay,
+                            instance.key.index,
+                            proof_id,
+                            path.attached_at,
+                        )
+                    })
+                    && context.relay_path_has_native_bulk_model_evidence_since(
+                        instance.key.underlay,
+                        instance.key.index,
+                        path.attached_at,
+                    );
+                if native_evidence {
+                    // QUIC graduates directly from its fresh, non-app-limited
+                    // packet-ACK model. No ordered product sample or receipt
+                    // marker participates in this carrier decision.
+                    self.request_graduated_subflows.insert(instance);
+                }
+            }
+        }
         let service = self.ordered_data_owner_instance.filter(|owner| {
             remotes.paths.iter().any(|path| {
                 path.instance() == *owner && path.placement == RelayPathPlacement::Active
@@ -6215,6 +6246,10 @@ impl RelaySenderService {
         else {
             return;
         };
+        if owner.key.underlay != UnderlayProtocol::Tcp {
+            self.reset_request_subflow_epoch();
+            return;
+        }
         if !remotes.paths.iter().any(|path| {
             path.instance() == owner && path.placement == RelayPathPlacement::Validation
         }) {
@@ -6307,6 +6342,11 @@ impl RelaySenderService {
         candidate: RelayPathInstance,
         payload_bytes: usize,
     ) -> Result<(Option<FlowSubflowSet<RelayPathInstance>>, bool), RuntimeError> {
+        if service.key.underlay != UnderlayProtocol::Tcp
+            || candidate.key.underlay != UnderlayProtocol::Tcp
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         let startup_credit = usize::try_from(reliable_subflow_startup_sample_limit_bytes(
             context.mux_limits,
         ))
@@ -6498,7 +6538,7 @@ impl RelaySenderService {
                 release.key.index,
                 release.bytes,
             );
-            if release.path_proving && release.key.underlay == UnderlayProtocol::Tcp {
+            if release.path_proving {
                 if let Some(progress) = owner_progress
                     .iter_mut()
                     .find(|progress| progress.instance == release.instance)
@@ -6668,18 +6708,32 @@ impl RelaySenderService {
             .collect()
     }
 
+    pub(super) fn request_ordered_service_instance(&self) -> Option<RelayPathInstance> {
+        self.ordered_data_owner_instance
+    }
+
     pub(super) fn request_owner_ack_can_grow_window(
         &self,
         remotes: &ReliableRelayRemoteSet,
+        service_instance: Option<RelayPathInstance>,
         instance: RelayPathInstance,
     ) -> bool {
-        instance.key.underlay == UnderlayProtocol::Tcp
-            && remotes.paths.iter().any(|path| {
-                path.instance() == instance
-                    && (path.placement == RelayPathPlacement::Active
-                        || (self.request_graduated_subflows.contains(&instance)
-                            && self.request_ack_clock_proven_subflows.contains(&instance)))
-            })
+        let Some(service) = service_instance else {
+            return false;
+        };
+        if self.ordered_data_owner_instance != Some(service)
+            || !remotes.contains_path_instance(service)
+            || service.key.underlay != instance.key.underlay
+        {
+            return false;
+        }
+        remotes.paths.iter().any(|path| {
+            path.instance() == instance
+                && (instance == service
+                    || (self.request_graduated_subflows.contains(&instance)
+                        && (instance.key.underlay == UnderlayProtocol::Udp
+                            || self.request_ack_clock_proven_subflows.contains(&instance))))
+        })
     }
 
     pub(super) fn unreported_missing_owner_instances(
@@ -7654,6 +7708,96 @@ mod tests {
     }
 
     #[test]
+    fn udp_stream_ack_reports_exact_product_progress_without_carrier_capacity_evidence() {
+        let path = "udp://127.0.0.1:10255".parse::<PathSpec>().expect("path");
+        let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+            .expect("context");
+        let instance = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            id: 17,
+        };
+        let frame = client_data_frame_for_test(StreamId(11), 0, PATH_OPEN_SCORE_BYTES);
+        context.record_relay_path_send(
+            instance.key.underlay,
+            instance.key.index,
+            PATH_OPEN_SCORE_BYTES,
+        );
+        let mut sender = RelaySenderService::new(StreamId(11));
+        sender.flights.record_owner_frame_instance(instance, &frame);
+
+        let owner_progress = sender.release_normalized_acked_ranges_with_owner_progress(
+            &context,
+            &[OffsetRange::new(0, PATH_OPEN_SCORE_BYTES as u64).expect("ACK range")],
+        );
+
+        assert_eq!(
+            context
+                .udp_path_snapshot(0)
+                .expect("UDP path snapshot")
+                .bytes_in_flight,
+            0
+        );
+        assert_eq!(
+            owner_progress.as_slice(),
+            &[RequestOwnerAckProgress {
+                instance,
+                bytes: PATH_OPEN_SCORE_BYTES,
+            }],
+            "exact QUIC OwnerData ACKs are product-consumption evidence"
+        );
+        assert!(
+            !context.relay_path_has_bulk_model_evidence(instance.key.underlay, instance.key.index,),
+            "product STREAM_ACK timing must not become QUIC carrier-capacity evidence"
+        );
+    }
+
+    #[test]
+    fn ambiguous_udp_stream_ack_does_not_report_product_window_progress() {
+        let path = "udp://127.0.0.1:10256".parse::<PathSpec>().expect("path");
+        let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+            .expect("context");
+        let instance = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            id: 18,
+        };
+        let frame = client_data_frame_for_test(StreamId(12), 0, PATH_OPEN_SCORE_BYTES);
+        context.record_relay_path_send(
+            instance.key.underlay,
+            instance.key.index,
+            PATH_OPEN_SCORE_BYTES,
+        );
+        context.record_relay_path_send(
+            instance.key.underlay,
+            instance.key.index,
+            PATH_OPEN_SCORE_BYTES,
+        );
+        let mut sender = RelaySenderService::new(StreamId(12));
+        sender.flights.record_owner_frame_instance(instance, &frame);
+        sender
+            .flights
+            .record_repair_frame_instance(instance, &frame);
+
+        let owner_progress = sender.release_normalized_acked_ranges_with_owner_progress(
+            &context,
+            &[OffsetRange::new(0, PATH_OPEN_SCORE_BYTES as u64).expect("ACK range")],
+        );
+
+        assert!(
+            owner_progress.is_empty(),
+            "an OwnerData/RepairData duplicate ACK is not exact product-owner progress"
+        );
+        assert!(
+            !context.relay_path_has_bulk_model_evidence(instance.key.underlay, instance.key.index,)
+        );
+    }
+
+    #[test]
     fn cumulative_stream_ack_emits_one_aggregated_path_rate_sample() {
         let path = "tcp://127.0.0.1:10253".parse::<PathSpec>().expect("path");
         let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
@@ -8475,6 +8619,39 @@ mod tests {
         );
     }
 
+    fn seed_client_quic_native_bulk_evidence_for_test(context: &ClientPathContext, index: usize) {
+        context.health.lock().expect("path health lock").udp[index].mark_quic_path_metrics(
+            UdpPathMetrics {
+                direction: 1,
+                srtt: Duration::from_millis(20),
+                rttvar: Duration::from_millis(2),
+                min_rtt: Duration::from_millis(18),
+                min_rtt_observed: true,
+                delivery_rate_bps: 500_000_000.0,
+                pacing_rate_bps: 500_000_000.0,
+                inflight_hi: 4 * 1024 * 1024,
+                bytes_in_flight: 0,
+                pending_bytes: 0,
+                loss_ppm: Some(0),
+                ecn_ppm: Some(0),
+                app_limited: false,
+                ack_derived_data_seen: true,
+                delivery_sample_count: 1,
+                delivery_sample_bytes: 4 * 1024 * 1024,
+                last_delivery_sample_at: Some(Instant::now()),
+                bulk_proof_expires_at: None,
+                latest_delivery_sample_bytes: 4 * 1024 * 1024,
+                latest_delivery_sample_count: 1,
+                latest_carrier_ack_elapsed: Some(Duration::from_millis(20)),
+                latest_rate_sample_elapsed: Some(Duration::from_millis(20)),
+                capacity_proof_candidate: None,
+                capacity_probe: None,
+                #[cfg(feature = "lab-diagnostics")]
+                ack_poll: QuicAckPollDiagnostics::default(),
+            },
+        );
+    }
+
     fn consume_client_validation_proof_for_test(receivers: &mut ReliablePathCommandReceivers) {
         assert!(matches!(
             try_recv_reliable_path_priority_command(receivers),
@@ -9130,8 +9307,18 @@ mod tests {
             underlay: UnderlayProtocol::Tcp,
             index: 1,
         };
+        let slow_instance = remotes
+            .path_instance_for_key(slow_key)
+            .expect("stable Service instance");
         let mut sender = RelaySenderService::new(stream_id);
         sender.ordered_data_owner = Some(slow_key);
+        sender.ordered_data_owner_instance = Some(slow_instance);
+        assert_ne!(remotes.active_path_instance(), Some(slow_instance));
+        assert_eq!(
+            sender.request_ordered_service_instance(),
+            Some(slow_instance),
+            "the product epoch follows ordered ownership, not the newest Active placement"
+        );
 
         let frame = Frame::StreamData {
             stream_id,
@@ -9149,6 +9336,11 @@ mod tests {
             sender.ordered_data_owner,
             Some(slow_key),
             "a selected Subflow owns its exact ranges without silently replacing the stable Service anchor"
+        );
+        assert_eq!(
+            sender.request_ordered_service_instance(),
+            Some(slow_instance),
+            "Subflow data must not reset the stable Service product window"
         );
         assert!(matches!(
             try_recv_reliable_path_command(&mut fast_rx),
@@ -9542,6 +9734,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_product_window_growth_accepts_only_live_owner_capable_instances() {
+        let stream_id = StreamId(117);
+        let (service_commands, _service_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                service_commands,
+            ),
+            8,
+        );
+        let (candidate_commands, _candidate_rx) = reliable_path_command_channels(8);
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            1,
+            candidate_commands,
+        ));
+        let service = remotes.active_path_instance().expect("active UDP Service");
+        let candidate = remotes
+            .path_instance_for_key(RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 1,
+            })
+            .expect("UDP Validation candidate");
+        let stale_service = RelayPathInstance {
+            key: service.key,
+            id: service.id.wrapping_add(1000),
+        };
+        let mut sender = RelaySenderService::new(stream_id);
+        sender.ordered_data_owner = Some(service.key);
+        sender.ordered_data_owner_instance = Some(service);
+
+        assert!(
+            sender.request_owner_ack_can_grow_window(&remotes, Some(service), service),
+            "exact active UDP OwnerData progress should advance its product window"
+        );
+        assert!(
+            !sender.request_owner_ack_can_grow_window(&remotes, Some(service), stale_service),
+            "a detached same-key instance must not advance the current product epoch"
+        );
+        assert!(
+            !sender.request_owner_ack_can_grow_window(&remotes, Some(service), candidate),
+            "proof-only Validation is not yet an ordinary product owner"
+        );
+
+        sender.request_graduated_subflows.insert(candidate);
+        assert!(
+            sender.request_owner_ack_can_grow_window(&remotes, Some(service), candidate),
+            "durably graduated UDP Subflow progress may grow the same-family product window without borrowing TCP ACK-clock policy"
+        );
+
+        let (replacement_commands, _replacement_rx) = reliable_path_command_channels(8);
+        remotes.attach(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            2,
+            replacement_commands,
+        ));
+        let replacement = remotes
+            .active_path_instance()
+            .expect("replacement UDP Service");
+        assert_ne!(replacement, service);
+        assert!(
+            sender.request_owner_ack_can_grow_window(&remotes, Some(service), service),
+            "Active-list churn must not replace the ordered Service epoch"
+        );
+        sender.ordered_data_owner = Some(replacement.key);
+        sender.ordered_data_owner_instance = Some(replacement);
+        assert!(
+            !sender.request_owner_ack_can_grow_window(&remotes, Some(replacement), service),
+            "an explicit exact Service handoff invalidates the older owner"
+        );
+        assert!(
+            sender.request_owner_ack_can_grow_window(&remotes, Some(replacement), replacement),
+            "the committed replacement owns its new product epoch"
+        );
+    }
+
+    #[tokio::test]
     async fn graduated_candidate_calibration_produces_ack_clock_capacity_sample() {
         let stream_id = StreamId(116);
         let context = client_test_context_with_paths(&[
@@ -9598,7 +9871,7 @@ mod tests {
         sender.request_rate_proven_subflows.insert(service);
         sender.request_rate_proven_subflows.insert(candidate);
         sender.request_graduated_subflows.insert(candidate);
-        assert!(!sender.request_owner_ack_can_grow_window(&remotes, candidate));
+        assert!(!sender.request_owner_ack_can_grow_window(&remotes, Some(service), candidate));
 
         let calibration_limit = usize::try_from(reliable_ack_clock_calibration_limit_bytes(
             context.mux_limits,
@@ -9642,9 +9915,9 @@ mod tests {
                 .request_ack_clock_proven_subflows
                 .contains(&candidate)
         );
-        assert!(sender.request_owner_ack_can_grow_window(&remotes, service));
+        assert!(sender.request_owner_ack_can_grow_window(&remotes, Some(service), service));
         assert!(
-            sender.request_owner_ack_can_grow_window(&remotes, candidate),
+            sender.request_owner_ack_can_grow_window(&remotes, Some(service), candidate),
             "a live graduated instance gains window-growth rights only after ACK-clock proof"
         );
         for frame in calibration_frames.iter().skip(2) {
@@ -9889,7 +10162,7 @@ mod tests {
         assert_eq!(owner_progress.len(), 1);
         assert_eq!(owner_progress[0].instance, stale);
         assert!(
-            !sender.request_owner_ack_can_grow_window(&remotes, stale),
+            !sender.request_owner_ack_can_grow_window(&remotes, Some(service), stale),
             "same-key progress from a detached instance must not grow the replacement epoch"
         );
         sender.reconcile_request_subflow_set(&context, &remotes);
@@ -10109,13 +10382,13 @@ mod tests {
                 .request_subflow_set
                 .as_ref()
                 .and_then(FlowSubflowSet::startup_owner_key),
-            Some(candidate),
-            "QUIC requires direction-correct local carrier ACK evidence, not product STREAM_ACK timing"
+            None,
+            "a defensive UDP product-startup epoch is discarded instead of becoming QUIC carrier evidence"
         );
     }
 
     #[tokio::test]
-    async fn ordered_receipt_proof_graduates_ambiguous_udp_startup_sample() {
+    async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
         let stream_id = StreamId(110);
         let context = client_test_context_with_paths(&[
             "udp://127.0.0.1:10295?srtt-ms=20&rate-mbps=500",
@@ -10203,37 +10476,15 @@ mod tests {
             candidate_key.underlay,
             candidate_key.index,
             PathProofObservation {
-                proof_id: receipt_proof_id + 1,
-                bytes: PATH_OPEN_SCORE_BYTES as u64,
-                elapsed: Duration::from_millis(10),
-                sent_at: Instant::now(),
-            },
-        );
-        sender.reconcile_request_subflow_set(&context, &remotes);
-        assert_eq!(
-            sender
-                .request_subflow_set
-                .as_ref()
-                .and_then(FlowSubflowSet::startup_owner_key),
-            Some(candidate),
-            "a different proof on the shared path cannot graduate this attachment"
-        );
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        context.mark_relay_path_proof_observation(
-            candidate_key.underlay,
-            candidate_key.index,
-            PathProofObservation {
                 proof_id: receipt_proof_id,
                 bytes: PATH_OPEN_SCORE_BYTES as u64,
                 elapsed: Duration::from_millis(10),
                 sent_at: Instant::now(),
             },
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
         sender.reconcile_request_subflow_set(&context, &remotes);
 
-        assert!(sender.request_graduated_subflows.contains(&candidate));
+        assert!(!sender.request_graduated_subflows.contains(&candidate));
         assert_eq!(
             sender
                 .request_subflow_set
@@ -10241,18 +10492,15 @@ mod tests {
                 .and_then(FlowSubflowSet::startup_owner_key),
             None
         );
-        let measured_rate = context.health.lock().expect("path health lock").udp
-            [candidate_key.index]
-            .measured_rate_bps
-            .expect("receipt goodput sample");
         assert!(
-            measured_rate > 60_000_000.0,
-            "rate must use proof ACK completion, not a much later reconciliation poll: {measured_rate}"
+            !context
+                .relay_path_has_bulk_model_evidence(candidate_key.underlay, candidate_key.index,),
+            "an ordered product receipt is not native QUIC packet-ACK capacity evidence"
         );
     }
 
     #[tokio::test]
-    async fn udp_service_evidence_bootstraps_and_graduates_validation_candidate() {
+    async fn udp_service_evidence_does_not_bootstrap_validation_with_product_bytes() {
         let stream_id = StreamId(114);
         let context = client_test_context_with_paths(&[
             "udp://127.0.0.1:10303?srtt-ms=20&rate-mbps=500",
@@ -10341,60 +10589,115 @@ mod tests {
             candidate,
             Duration::from_millis(10),
         );
-        let startup_limit = usize::try_from(reliable_subflow_startup_sample_limit_bytes(
-            context.mux_limits,
-        ))
-        .expect("startup limit");
-        let mut offset = BBR_MAX_SEND_QUANTUM_BYTES as u64;
-        let mut sent = 0;
-        while sent < startup_limit {
-            let payload_bytes = BBR_MAX_SEND_QUANTUM_BYTES.min(startup_limit - sent);
-            let frame = client_data_frame_for_test(stream_id, offset, payload_bytes);
-            let outcome = sender
-                .send_stream_data(&context, &mut remotes, frame.clone())
-                .await
-                .expect("bounded UDP startup sample");
-            assert_eq!(outcome.path_key, candidate_key);
-            assert!(matches!(
-                try_recv_reliable_path_command(&mut candidate_rx),
-                Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
-            ));
-            ack_client_frame_for_test(&mut sender, &context, &frame);
-            sent += payload_bytes;
-            offset += payload_bytes as u64;
-        }
-        let (receipt_proof_id, _) = sender.request_startup_receipt_proofs[&candidate];
-        assert!(matches!(
-            try_recv_reliable_path_command(&mut candidate_rx),
-            Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
-                proof_id,
-                ..
-            })) if proof_id == receipt_proof_id
-        ));
-        context.mark_relay_path_proof_observation(
-            candidate_key.underlay,
-            candidate_key.index,
-            PathProofObservation {
-                proof_id: receipt_proof_id,
-                bytes: PATH_OPEN_SCORE_BYTES as u64,
-                elapsed: Duration::from_millis(10),
-                sent_at: Instant::now(),
-            },
+        let frame = client_data_frame_for_test(
+            stream_id,
+            BBR_MAX_SEND_QUANTUM_BYTES as u64,
+            BBR_MAX_SEND_QUANTUM_BYTES,
         );
-        sender.reconcile_request_subflow_set(&context, &remotes);
-
-        assert!(sender.request_graduated_subflows.contains(&candidate));
+        let outcome = sender
+            .send_stream_data(&context, &mut remotes, frame)
+            .await
+            .expect("UDP Service remains the only product owner");
+        assert_eq!(outcome.path_key, service_key);
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut service_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert!(try_recv_reliable_path_command(&mut candidate_rx).is_none());
         assert!(
-            context
+            !context
                 .relay_path_has_bulk_model_evidence(candidate_key.underlay, candidate_key.index,)
         );
+        assert!(!sender.request_attempted_subflows.contains(&candidate));
+        assert!(!sender.request_graduated_subflows.contains(&candidate));
         assert_eq!(
             sender
                 .request_subflow_set
                 .as_ref()
                 .and_then(FlowSubflowSet::startup_owner_key),
-            None
+            None,
+            "reachability plus Service capacity cannot turn an app-limited QUIC product burst into candidate carrier evidence"
         );
+    }
+
+    #[tokio::test]
+    async fn udp_validation_uses_fresh_native_evidence_after_service_is_established() {
+        let stream_id = StreamId(118);
+        let context = client_test_context_with_paths(&[
+            "udp://127.0.0.1:10305?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10306?srtt-ms=10&rate-mbps=500",
+        ]);
+        let service_key = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        };
+        let candidate_key = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        };
+        let (service_commands, mut service_rx) = reliable_path_command_channels(16);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Udp,
+                service_key.index,
+                service_commands,
+            ),
+            16,
+        );
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(16);
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            candidate_key.index,
+            candidate_commands,
+        ));
+        let candidate = remotes
+            .path_instance_for_key(candidate_key)
+            .expect("Validation candidate");
+        consume_client_validation_proof_for_test(&mut candidate_rx);
+        mark_client_validation_proof_fresh_for_test(
+            &context,
+            &remotes,
+            candidate,
+            Duration::from_millis(10),
+        );
+        seed_client_quic_native_bulk_evidence_for_test(&context, candidate_key.index);
+
+        let mut sender = RelaySenderService::new(stream_id);
+        let service_frame = client_data_frame_for_test(stream_id, 0, BBR_MAX_SEND_QUANTUM_BYTES);
+        let first = sender
+            .send_stream_data(&context, &mut remotes, service_frame.clone())
+            .await
+            .expect("offset zero establishes the stable Service owner");
+        assert_eq!(first.path_key, service_key);
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut service_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert!(
+            !sender.request_graduated_subflows.contains(&candidate),
+            "path-wide carrier evidence must not steal offset zero before a Service instance exists"
+        );
+        ack_client_frame_for_test(&mut sender, &context, &service_frame);
+
+        let candidate_frame = client_data_frame_for_test(
+            stream_id,
+            BBR_MAX_SEND_QUANTUM_BYTES as u64,
+            BBR_MAX_SEND_QUANTUM_BYTES,
+        );
+        let second = sender
+            .send_stream_data(&context, &mut remotes, candidate_frame)
+            .await
+            .expect("fresh native QUIC evidence should admit the live Validation instance");
+        assert_eq!(second.path_key, candidate_key);
+        assert!(sender.request_graduated_subflows.contains(&candidate));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert!(sender.request_subflow_set.is_none());
+        assert!(sender.request_startup_receipt_proofs.is_empty());
     }
 
     #[tokio::test]

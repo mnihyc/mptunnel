@@ -62,6 +62,8 @@ drain = max(0.0, float(os.environ["UPLOAD_DRAIN_TIMEOUT_SECONDS"]))
 active = timeout if load <= 0 else min(load, timeout)
 print(max(1, math.ceil(active + drain + 10.0)))'
 )"
+mptcp_evidence_interval_seconds="${MPTUNNEL_LAB_MPTCP_EVIDENCE_INTERVAL_SECONDS:-1.0}"
+mptcp_evidence_max_duration_seconds="${MPTUNNEL_LAB_MPTCP_EVIDENCE_MAX_DURATION_SECONDS:-$((upload_process_timeout_seconds + 5))}"
 udp_payload_bytes="${UDP_PAYLOAD_BYTES:-512}"
 udp_timeout_ms="${UDP_TIMEOUT_MS:-2500}"
 tcp_echo_payload_bytes="${TCP_ECHO_PAYLOAD_BYTES:-64}"
@@ -152,6 +154,7 @@ active_telemetry_case=""
 active_telemetry_pid=""
 case_telemetry_pid=""
 case_management_pid=""
+active_mptcp_evidence_case=""
 
 scale_lab_netem_value() {
   python3 - "$1" "$2" <<'PY'
@@ -515,6 +518,97 @@ case_artifact_name() {
   printf '%s' "$raw" | tr -c 'A-Za-z0-9_.=-' '_'
 }
 
+mptcp_evidence_file_for_case() {
+  local case_name="$1"
+  printf '%s/mptcp-evidence-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
+}
+
+mptcp_evidence_container_file_for_case() {
+  local case_name="$1"
+  local service="$2"
+  printf '/tmp/mptunnel-mptcp-evidence-%s-%s.jsonl' "$(case_artifact_name "$case_name")" "$service"
+}
+
+mptcp_evidence_container_stop_file_for_case() {
+  local case_name="$1"
+  local service="$2"
+  printf '/tmp/mptunnel-mptcp-evidence-%s-%s.stop' "$(case_artifact_name "$case_name")" "$service"
+}
+
+mptcp_evidence_container_pid_file_for_case() {
+  local case_name="$1"
+  local service="$2"
+  printf '/tmp/mptunnel-mptcp-evidence-%s-%s.pid' "$(case_artifact_name "$case_name")" "$service"
+}
+
+record_mptcp_evidence_error() {
+  local case_name="$1"
+  local service="$2"
+  local error="$3"
+  SERVICE="$service" ERROR="$error" python3 - "$(mptcp_evidence_file_for_case "$case_name")" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    print(json.dumps({
+        "kind": "sampler_error",
+        "schema_version": 1,
+        "service": os.environ["SERVICE"],
+        "error": os.environ["ERROR"][-2000:],
+    }, sort_keys=True), file=handle)
+PY
+}
+
+start_mptcp_evidence() {
+  local case_name="$1"
+  local host_file service sample_file stop_file pid_file start_error
+  host_file="$(mptcp_evidence_file_for_case "$case_name")"
+  : > "$host_file"
+  for service in client target; do
+    sample_file="$(mptcp_evidence_container_file_for_case "$case_name" "$service")"
+    stop_file="$(mptcp_evidence_container_stop_file_for_case "$case_name" "$service")"
+    pid_file="$(mptcp_evidence_container_pid_file_for_case "$case_name" "$service")"
+    if ! start_error="$(exec_in "$service" "rm -f '${sample_file}' '${stop_file}' '${pid_file}'; python3 /workspace/lab/mptcp_evidence.py sample --service '${service}' --output '${sample_file}' --stop-file '${stop_file}' --interval '${mptcp_evidence_interval_seconds}' --max-duration '${mptcp_evidence_max_duration_seconds}' >/tmp/mptunnel-mptcp-evidence-${service}.log 2>&1 & echo \$! > '${pid_file}'; test -s '${pid_file}'" 2>&1)"; then
+      record_mptcp_evidence_error "$case_name" "$service" "sampler start failed: ${start_error}"
+    fi
+  done
+  active_mptcp_evidence_case="$case_name"
+}
+
+stop_mptcp_evidence() {
+  local case_name="$1"
+  local host_file service sample_file stop_file pid_file tmp_file sampler_error
+  host_file="$(mptcp_evidence_file_for_case "$case_name")"
+  for service in client target; do
+    sample_file="$(mptcp_evidence_container_file_for_case "$case_name" "$service")"
+    stop_file="$(mptcp_evidence_container_stop_file_for_case "$case_name" "$service")"
+    pid_file="$(mptcp_evidence_container_pid_file_for_case "$case_name" "$service")"
+    exec_in "$service" "touch '${stop_file}'; if [ -s '${pid_file}' ]; then pid=\$(cat '${pid_file}'); deadline=\$((SECONDS + 3)); while kill -0 \"\$pid\" >/dev/null 2>&1 && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; if kill -0 \"\$pid\" >/dev/null 2>&1; then kill -TERM \"\$pid\" >/dev/null 2>&1 || true; fi; fi" >/dev/null 2>&1 || true
+    tmp_file="${host_file}.${service}.tmp"
+    if exec_in "$service" "test -s '${sample_file}' && cat '${sample_file}'" > "$tmp_file" 2>/dev/null; then
+      cat "$tmp_file" >> "$host_file"
+    else
+      sampler_error="$(exec_in "$service" "tail -c 2000 /tmp/mptunnel-mptcp-evidence-${service}.log 2>/dev/null || true" 2>/dev/null || true)"
+      record_mptcp_evidence_error "$case_name" "$service" "sampler produced no artifact: ${sampler_error}"
+    fi
+    rm -f "$tmp_file"
+    exec_in "$service" "rm -f '${sample_file}' '${stop_file}' '${pid_file}'" >/dev/null 2>&1 || true
+  done
+  if [[ "$active_mptcp_evidence_case" == "$case_name" ]]; then
+    active_mptcp_evidence_case=""
+  fi
+}
+
+mptcp_evidence_summary() {
+  local case_name="$1"
+  local evidence_file
+  evidence_file="$(mptcp_evidence_file_for_case "$case_name")"
+  python3 "$script_dir/mptcp_evidence.py" summarize \
+    --input "$evidence_file" \
+    --artifact "$evidence_file" 2>/dev/null || printf '{"collection_ok":false,"aggregation_evidence":"unavailable"}'
+}
+
 telemetry_file_for_case() {
   local case_name="$1"
   printf '%s/container-stats-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
@@ -717,6 +811,7 @@ append_row_with_telemetry() {
   local row_json="$2"
   local protocol="${3:-}"
   local mptunnel_row="${4:-0}"
+  local mptcp_evidence_json="${5:-}"
   local telemetry_json log_artifacts_json
   telemetry_json="$(case_telemetry_summary "$case_name")"
   log_artifacts_json="$(case_log_artifacts_summary "$case_name")"
@@ -728,6 +823,7 @@ append_row_with_telemetry() {
     LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
     TELEMETRY="$telemetry_json" \
     LOG_ARTIFACTS="$log_artifacts_json" \
+    MPTCP_EVIDENCE="$mptcp_evidence_json" \
     LAB_SCRIPT_DIR="$script_dir" \
     python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -773,6 +869,14 @@ except json.JSONDecodeError:
     log_artifacts = {}
 if log_artifacts:
     row["log_artifacts"] = log_artifacts
+if os.environ.get("MPTCP_EVIDENCE", ""):
+    try:
+        row["mptcp_runtime_evidence"] = json.loads(os.environ["MPTCP_EVIDENCE"])
+    except json.JSONDecodeError as exc:
+        row["mptcp_runtime_evidence"] = {
+            "collection_ok": False,
+            "error": f"invalid evidence summary: {exc}",
+        }
 if log_artifacts or row.get("status") not in ("ok", "loss"):
     try:
         sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
@@ -1132,6 +1236,7 @@ append_upload_probe_result() {
   local fallback_protocol="${6:-tcp-upload}"
   local observer_elapsed_seconds="${7:-}"
   local observer_freeze_exit_code="${8:-0}"
+  local mptcp_evidence_json="${9:-}"
   local client_log server_log target_sink_observer
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -1146,6 +1251,7 @@ append_upload_probe_result() {
   TARGET_SINK_OBSERVER="$target_sink_observer" \
   TARGET_OBSERVER_ELAPSED_SECONDS="$observer_elapsed_seconds" \
   TARGET_OBSERVER_FREEZE_EXIT_CODE="$observer_freeze_exit_code" \
+  MPTCP_EVIDENCE="$mptcp_evidence_json" \
 	  LAB_DIAG="${MPTUNNEL_LAB_DIAG:-0}" \
 	  LAB_DIAG_EVENTS="${MPTUNNEL_LAB_DIAG_EVENTS:-}" \
 	  LAB_PERF="${MPTUNNEL_LAB_PERF:-0}" \
@@ -1237,6 +1343,14 @@ except json.JSONDecodeError:
     log_artifacts = {}
 if log_artifacts:
     row["log_artifacts"] = log_artifacts
+if os.environ.get("MPTCP_EVIDENCE", ""):
+    try:
+        row["mptcp_runtime_evidence"] = json.loads(os.environ["MPTCP_EVIDENCE"])
+    except json.JSONDecodeError as exc:
+        row["mptcp_runtime_evidence"] = {
+            "collection_ok": False,
+            "error": f"invalid evidence summary: {exc}",
+        }
 if log_artifacts or row.get("status") not in ("ok", "loss"):
     try:
         sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
@@ -1426,6 +1540,10 @@ flapping_result_metadata() {
 
 cleanup() {
   stop_random_flapping
+  if [[ -n "$active_mptcp_evidence_case" ]]; then
+    stop_mptcp_evidence "$active_mptcp_evidence_case"
+    active_mptcp_evidence_case=""
+  fi
   if [[ -n "$active_telemetry_case" ]]; then
     stop_case_telemetry "$active_telemetry_case" "$active_telemetry_pid"
     active_telemetry_case=""
@@ -1674,8 +1792,18 @@ should_run_case() {
 }
 
 restart_target_tcp_sink() {
-  exec_in target "sink_process_active() { local state; [ -r \"/proc/\$pid/stat\" ] || return 1; state=\$(awk '{print \$3}' \"/proc/\$pid/stat\" 2>/dev/null) || return 1; [ \"\$state\" != Z ] && kill -0 \"\$pid\" >/dev/null 2>&1; }; if [ -f /tmp/mptunnel-tcp-sink.pid ]; then pid=\$(cat /tmp/mptunnel-tcp-sink.pid 2>/dev/null || true); if [[ \"\$pid\" =~ ^[0-9]+$ ]] && sink_process_active; then kill -TERM \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 7)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; if sink_process_active; then kill -KILL \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 1)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; sink_process_active && exit 1; fi; fi; rm -f /tmp/mptunnel-tcp-sink.pid; fi"
-  exec_in target "rm -f '${tcp_sink_progress_file}'; python3 /workspace/lab/tcp_sink.py --bind 0.0.0.0:${tcp_upload_target_port} --progress-file '${tcp_sink_progress_file}' >/tmp/mptunnel-tcp-sink.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-sink.pid"
+  local transport="${1:-tcp}"
+  local socket_arg=""
+  case "$transport" in
+    tcp) ;;
+    mptcp) socket_arg="--mptcp" ;;
+    *)
+      echo "unknown target sink transport: $transport" >&2
+      return 2
+      ;;
+  esac
+  exec_in target "sink_process_active() { local state; [ -r \"/proc/\$pid/stat\" ] || return 1; state=\$(awk '{print \$3}' \"/proc/\$pid/stat\" 2>/dev/null) || return 1; [ \"\$state\" != Z ] && kill -0 \"\$pid\" >/dev/null 2>&1; }; if [ -f /tmp/mptunnel-tcp-sink.pid ]; then pid=\$(cat /tmp/mptunnel-tcp-sink.pid 2>/dev/null || true); if [[ \"\$pid\" =~ ^[0-9]+$ ]] && sink_process_active; then kill -TERM \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 7)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; if sink_process_active; then kill -KILL \"\$pid\" >/dev/null 2>&1 || true; deadline=\$((SECONDS + 1)); while sink_process_active && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; sink_process_active && exit 1; fi; fi; rm -f /tmp/mptunnel-tcp-sink.pid; fi" || return
+  exec_in target "rm -f '${tcp_sink_progress_file}'; python3 /workspace/lab/tcp_sink.py ${socket_arg} --bind 0.0.0.0:${tcp_upload_target_port} --progress-file '${tcp_sink_progress_file}' >/tmp/mptunnel-tcp-sink.log 2>&1 & echo \$! >/tmp/mptunnel-tcp-sink.pid" || return
   exec_in target "pid=\$(cat /tmp/mptunnel-tcp-sink.pid); sink_process_active() { local state; [ -r \"/proc/\$pid/stat\" ] || return 1; state=\$(awk '{print \$3}' \"/proc/\$pid/stat\" 2>/dev/null) || return 1; [ \"\$state\" != Z ] && kill -0 \"\$pid\" >/dev/null 2>&1; }; deadline=\$((SECONDS + 5)); while { [ ! -s '${tcp_sink_progress_file}' ] || ! sink_process_active; } && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -s '${tcp_sink_progress_file}'; sink_process_active"
 }
 
@@ -1995,31 +2123,57 @@ run_hysteria2_baseline_upload_case() {
 configure_mptcp_endpoints() {
   local service="$1"
   shift
-  exec_in "$service" "ip mptcp limits set subflows 5 add_addr_accepted 5 && { ip mptcp endpoint flush || true; }"
+  if ! exec_in "$service" "ip mptcp limits set subflows 5 add_addr_accepted 5 && ip mptcp endpoint flush"; then
+    echo "${service}: could not set MPTCP limits and flush old endpoints" >&2
+    return 1
+  fi
   local id=1
   local addr dev
   for addr in "$@"; do
-    dev="$(exec_in "$service" "ip -o addr show | awk -v ip='${addr}' '\$4 ~ \"^\" ip \"/\" {print \$2; exit}'" 2>/dev/null || true)"
-    if [[ -n "$dev" ]]; then
-      exec_in "$service" "ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal subflow fullmesh 2>/dev/null || ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal 2>/dev/null || true"
+    if ! dev="$(exec_in "$service" "ip -o addr show | awk -v ip='${addr}' '\$4 ~ \"^\" ip \"/\" {print \$2; exit}'")" || [[ -z "$dev" ]]; then
+      echo "${service}: no interface owns requested MPTCP address ${addr}" >&2
+      return 1
+    fi
+    if ! exec_in "$service" "ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal subflow fullmesh 2>/dev/null || ip mptcp endpoint add '${addr}' dev '${dev}' id '${id}' signal"; then
+      echo "${service}: failed to add MPTCP endpoint ${addr} on ${dev} with id ${id}" >&2
+      return 1
+    fi
+    if ! exec_in "$service" "ip mptcp endpoint show id '${id}' | awk -v ip='${addr}' '\$1 == ip {found=1} END {exit !found}'"; then
+      echo "${service}: kernel endpoint table did not retain ${addr} with id ${id}" >&2
+      return 1
     fi
     id=$((id + 1))
   done
-  exec_in "$service" "ip mptcp endpoint show | grep -q ."
+  return 0
+}
+
+check_mptcp_baseline_case() {
+  local case_name="$1"
+  local protocol="$2"
+  if ! exec_in client "python3 /workspace/lab/mptcp_http.py check" || \
+     ! exec_in target "python3 /workspace/lab/mptcp_http.py check"; then
+    append_skipped_result "$case_name" "$protocol" "kernel MPTCP sockets unavailable"
+    return 1
+  fi
+  local endpoint_error
+  if ! endpoint_error="$(configure_mptcp_endpoints client 172.31.10.10 172.31.15.10 172.31.16.10 172.31.20.10 172.31.30.10 2>&1)"; then
+    endpoint_error="${endpoint_error//$'\n'/; }"
+    append_skipped_result "$case_name" "$protocol" "client MPTCP endpoint configuration failed: ${endpoint_error: -1500}"
+    return 1
+  fi
+  if ! endpoint_error="$(configure_mptcp_endpoints target 172.31.10.30 172.31.15.30 172.31.16.30 172.31.20.30 172.31.30.30 2>&1)"; then
+    endpoint_error="${endpoint_error//$'\n'/; }"
+    append_skipped_result "$case_name" "$protocol" "target MPTCP endpoint configuration failed: ${endpoint_error: -1500}"
+    return 1
+  fi
+  return 0
 }
 
 run_mptcp_baseline_case() {
   local case_name="$1"
   local netem_mode="${2:-apply}"
   prepare_baseline_case "$netem_mode"
-  if ! exec_in client "python3 /workspace/lab/mptcp_http.py check" || \
-     ! exec_in target "python3 /workspace/lab/mptcp_http.py check"; then
-    append_skipped_result "$case_name" "mptcp" "kernel MPTCP sockets unavailable"
-    return 0
-  fi
-  if ! configure_mptcp_endpoints client 172.31.10.10 172.31.15.10 172.31.16.10 172.31.20.10 172.31.30.10 || \
-     ! configure_mptcp_endpoints target 172.31.10.30 172.31.15.30 172.31.16.30 172.31.20.30 172.31.30.30; then
-    append_skipped_result "$case_name" "mptcp" "kernel MPTCP endpoint configuration unavailable"
+  if ! check_mptcp_baseline_case "$case_name" "mptcp"; then
     return 0
   fi
   exec_in target "python3 /workspace/lab/mptcp_http.py serve --bind 0.0.0.0:${baseline_mptcp_port} --file /tmp/mptunnel-lab/large.bin >/tmp/mptunnel-baseline-mptcp-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-mptcp-server.pid"
@@ -2029,20 +2183,64 @@ run_mptcp_baseline_case() {
     stop_baselines
     return 0
   fi
-  local telemetry_pid
+  local telemetry_pid mptcp_evidence_json
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
+  start_mptcp_evidence "$case_name"
   set +e
   local output exit_code
-  output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/mptcp_http.py download --label '${case_name}' --target 172.31.10.30:${baseline_mptcp_port} --path '${large_http_path}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}'" 2>/dev/null)"
+  output="$(exec_in client "timeout $((curl_timeout + 10))s python3 /workspace/lab/mptcp_http.py download --label '${case_name}' --target 172.31.10.30:${baseline_mptcp_port} --path '${large_http_path}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}'" 2>/dev/null)"
   exit_code="$?"
+  stop_mptcp_evidence "$case_name"
+  mptcp_evidence_json="$(mptcp_evidence_summary "$case_name")"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   set -e
   if [[ -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output" "mptcp"
+    append_row_with_telemetry "$case_name" "$output" "mptcp" 0 "$mptcp_evidence_json"
   else
-    append_row_with_telemetry "$case_name" "{\"case\":\"$case_name\",\"protocol\":\"mptcp\",\"status\":\"fail\",\"exit_code\":$exit_code}"
+    append_row_with_telemetry "$case_name" "{\"case\":\"$case_name\",\"protocol\":\"mptcp\",\"status\":\"fail\",\"exit_code\":$exit_code}" "mptcp" 0 "$mptcp_evidence_json"
   fi
+  stop_baselines
+}
+
+run_mptcp_baseline_upload_case() {
+  local case_name="$1"
+  local netem_mode="${2:-apply}"
+  prepare_baseline_case "$netem_mode"
+  if ! check_mptcp_baseline_case "$case_name" "mptcp-upload"; then
+    return 0
+  fi
+
+  # Both endpoints use MPTCP sockets; the finalized sink snapshot supplies the
+  # same exact metric-v4 receiver authority as every other upload cohort.
+  if ! restart_target_tcp_sink mptcp; then
+    append_skipped_result "$case_name" "mptcp-upload" "MPTCP upload sink failed to start"
+    stop_baselines
+    return 0
+  fi
+  local out_file="/tmp/mptunnel-baseline-upload-${case_name}.out"
+  local err_file="/tmp/mptunnel-baseline-upload-${case_name}.err"
+  local output probe_stderr exit_code mptcp_evidence_json
+  local telemetry_pid observer_started_ns observer_stopped_ns
+  local observer_elapsed_seconds observer_freeze_exit_code
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  start_mptcp_evidence "$case_name"
+  set +e
+  observer_started_ns="$(monotonic_time_ns)"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --protocol 'mptcp-upload' --mptcp --target 172.31.10.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exit_code="$?"
+  freeze_target_tcp_sink
+  observer_freeze_exit_code="$?"
+  observer_stopped_ns="$(monotonic_time_ns)"
+  observer_elapsed_seconds="$(elapsed_seconds_between_ns "$observer_started_ns" "$observer_stopped_ns")"
+  stop_mptcp_evidence "$case_name"
+  mptcp_evidence_json="$(mptcp_evidence_summary "$case_name")"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  set -e
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 0 "mptcp-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code" "$mptcp_evidence_json"
   stop_baselines
 }
 
@@ -2720,6 +2918,12 @@ fi
 if should_run_case "baseline_mptcp_tcp_multipath_unconstrained"; then
   run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_unconstrained" unconstrained
 fi
+if should_run_case "baseline_mptcp_tcp_multipath_equal_fat"; then
+  run_mptcp_baseline_case "baseline_mptcp_tcp_multipath_equal_fat" ideal-all-fat
+fi
+if should_run_case "baseline_mptcp_tcp_multipath_equal_fat_upload"; then
+  run_mptcp_baseline_upload_case "baseline_mptcp_tcp_multipath_equal_fat_upload" ideal-all-fat
+fi
 
 if should_run_case "mptunnel_tcp_single_low_latency"; then
   start_client "tcp_single_low_latency" "$tcp_lowlat"
@@ -2789,6 +2993,9 @@ if should_run_case "mptunnel_reliable_mixed_single_balanced"; then
 fi
 if should_run_case "mptunnel_reliable_mixed_single_unconstrained"; then
   run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_unconstrained" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
+fi
+if should_run_case "mptunnel_reliable_mixed_single_equal_fat"; then
+  run_reliable_ideal_download_case "mptunnel_reliable_mixed_single_equal_fat" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"
 fi
 
 if should_run_case "mptunnel_reliable_mixed_multipath_all"; then
@@ -2893,6 +3100,9 @@ if should_run_case "mptunnel_reliable_mixed_single_balanced_upload"; then
 fi
 if should_run_case "mptunnel_reliable_mixed_single_unconstrained_upload"; then
   run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_unconstrained_upload" "unconstrained" "$tcp_endpoint_lowlat $udp_endpoint_lowlat"
+fi
+if should_run_case "mptunnel_reliable_mixed_single_equal_fat_upload"; then
+  run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_equal_fat_upload" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"
 fi
 
 if should_run_case "mptunnel_reliable_mixed_multipath_all_upload"; then

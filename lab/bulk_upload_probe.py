@@ -12,6 +12,7 @@ import time
 DEFAULT_INTERVAL_SECONDS = 0.2
 INTERVAL_TRIM_DISCARD_EACH_END = 3
 MAX_ACK_LINE_BYTES = 128
+IPPROTO_MPTCP = getattr(socket, "IPPROTO_MPTCP", 262)
 
 
 def split_host_port(value):
@@ -106,11 +107,21 @@ def connect_socks5(proxy, target, deadline):
 
 def connect_target(args, deadline):
     if args.proxy:
+        if getattr(args, "mptcp", False):
+            raise ValueError("MPTCP direct sockets cannot be combined with a proxy")
         return connect_socks5(args.proxy, args.target, deadline)
     target_host, target_port = split_host_port(args.target)
-    sock = socket.create_connection(
-        (target_host, target_port), timeout=remaining_before(deadline)
-    )
+    timeout = remaining_before(deadline)
+    if getattr(args, "mptcp", False):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_MPTCP)
+        try:
+            sock.settimeout(timeout)
+            sock.connect((target_host, target_port))
+        except Exception:
+            sock.close()
+            raise
+    else:
+        sock = socket.create_connection((target_host, target_port), timeout=timeout)
     try:
         sock.settimeout(remaining_before(deadline))
         return sock
@@ -465,6 +476,11 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--protocol", default="tcp-upload")
     parser.add_argument("--proxy")
+    parser.add_argument(
+        "--mptcp",
+        action="store_true",
+        help="open direct client sockets with IPPROTO_MPTCP",
+    )
     parser.add_argument("--target", required=True)
     parser.add_argument("--failover-after", type=float, required=True)
     parser.add_argument("--timeout", type=float, default=120.0)

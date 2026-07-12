@@ -132,6 +132,10 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   owns the pipe.
   Mixed-family raw staging stays in a separate bounded reservoir, and fixed
   request-side staging keeps its narrower policy.
+- Treat bulk receive credit as receiver-memory authority. TCP and QUIC
+  `STREAM_MAX_DATA` advertise the configured product window independently of
+  path proof; source staging and native carrier congestion control separately
+  bound admitted and network flight. Latency QUIC retains its smaller window.
 - Bound same-family striping inside that envelope. Service owns the first
   horizon; only a strictly measured same-underlay Subflow may use the remaining
   feed reservoir, and TCP or QUIC still owns its per-path emission credit. The

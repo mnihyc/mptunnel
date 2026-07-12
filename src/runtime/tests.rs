@@ -1,4 +1,3 @@
-use super::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
@@ -2553,7 +2552,7 @@ fn sender_service_retry_delay_is_ack_paced_not_one_millisecond_spin() {
 }
 
 #[test]
-fn udp_reliable_stream_uses_adaptive_product_window_below_config_ceiling() {
+fn bulk_product_window_is_configured_memory_authority_not_path_proof() {
     let mux_limits = MuxLimits::default();
     let tcp_initial = reliable_stream_initial_advertised_window_bytes(
         UnderlayProtocol::Tcp,
@@ -2567,22 +2566,21 @@ fn udp_reliable_stream_uses_adaptive_product_window_below_config_ceiling() {
     );
 
     assert_eq!(tcp_initial, mux_limits.max_stream_window_bytes);
-    assert!(udp_initial < mux_limits.max_stream_window_bytes);
-    assert_eq!(
-        udp_initial,
-        u64::try_from(bulk_service_feed_reservoir_payload_bytes(
-            reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
-            mux_limits,
-        ))
-        .unwrap()
-    );
+    assert_eq!(udp_initial, mux_limits.max_stream_window_bytes);
 
     let snapshot = PathSnapshot::new(PathId(7), UnderlayProtocol::Udp, 40.0, 200_000_000.0);
     let measured_window =
         reliable_stream_advertised_window_bytes(Some(snapshot), FlowLane::Throughput, mux_limits);
 
-    assert!(measured_window >= udp_initial);
-    assert!(measured_window <= mux_limits.max_stream_window_bytes);
+    assert_eq!(measured_window, mux_limits.max_stream_window_bytes);
+    assert!(
+        reliable_stream_initial_advertised_window_bytes(
+            UnderlayProtocol::Udp,
+            FlowLane::Latency,
+            mux_limits,
+        ) < udp_initial,
+        "latency QUIC retains its bounded startup product window"
+    );
 }
 
 #[test]

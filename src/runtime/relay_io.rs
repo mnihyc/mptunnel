@@ -1,10 +1,11 @@
 use super::bulk_admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
-    bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
+    reliable_relay_source_staging_owner_tail_headroom,
 };
 #[cfg(test)]
 use super::bulk_admission::{
-    bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
+    bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
+    bulk_service_product_envelope_payload_bytes,
 };
 use super::*;
 
@@ -481,12 +482,11 @@ impl ReliableRecvProgress {
 
 /// Initial stream-level product receive window advertised to the peer.
 ///
-/// TCP keeps the configured application window because kernel TCP backpressure is
-/// the visible carrier queue at this layer. QUIC reliable streams are different:
-/// once Quinn accepts bytes, mptunnel no longer observes those bytes as product
-/// queue, and a 64 MiB product window can turn into seconds of hidden QUIC
-/// stream backlog on shaped links. Start QUIC with a small but BDP-useful window
-/// and let `STREAM_MAX_DATA` grow it from real receive progress.
+/// Bulk credit is receiver-memory authority, not path-capacity proof. Both TCP
+/// and QUIC therefore advertise the configured product envelope; source
+/// staging and each carrier's native congestion controller independently bound
+/// how much data can reach that envelope. Latency QUIC keeps a smaller window
+/// so unrelated bulk work cannot consume its reserved product memory.
 pub(super) fn reliable_stream_initial_advertised_window_bytes(
     underlay: UnderlayProtocol,
     lane: FlowLane,
@@ -507,13 +507,13 @@ pub(super) fn reliable_stream_advertised_window_bytes(
 }
 
 fn reliable_stream_advertised_window_from_underlay(
-    path: Option<PathSnapshot>,
+    _path: Option<PathSnapshot>,
     underlay: UnderlayProtocol,
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> u64 {
     let configured = mux_limits.max_stream_window_bytes.max(1);
-    if underlay != UnderlayProtocol::Udp {
+    if underlay != UnderlayProtocol::Udp || lane.is_bulk() {
         return configured;
     }
 
@@ -524,34 +524,7 @@ fn reliable_stream_advertised_window_from_underlay(
     let startup_window = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
         .max(min_window)
         .min(configured);
-    if !lane.is_bulk() {
-        return startup_window;
-    }
-    let bulk_bootstrap_window = u64::try_from(bulk_service_feed_reservoir_payload_bytes(
-        reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
-        mux_limits,
-    ))
-    .unwrap_or(u64::MAX)
-    .max(startup_window)
-    .min(configured);
-
-    let Some(path) = path else {
-        return bulk_bootstrap_window;
-    };
-
-    let bdp_window = (reliable_path_product_bdp_bytes(path) * RELIABLE_UDP_BULK_BDP_GAIN)
-        .ceil()
-        .max(min_window as f64) as u64;
-    let carrier_window = path
-        .inflight_limit_bytes
-        .saturating_mul(4)
-        .max(path.bytes_in_flight.saturating_mul(2))
-        .max(path.queue_bytes.saturating_mul(2));
-
-    bdp_window
-        .max(carrier_window)
-        .max(bulk_bootstrap_window)
-        .min(configured)
+    startup_window
 }
 
 pub(super) fn reliable_stream_max_data_update_bytes(

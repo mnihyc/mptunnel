@@ -132,12 +132,13 @@ handed bytes to its local target socket, not that the target application
 consumed them, so target-side kernel buffering can still exceed
 receiver-observed application bytes during a fixed-duration test.
 
-A QUIC bulk response initially advertises a derived product receive window
-(4 MiB with default limits) instead of immediately advertising the configured
-64 MiB envelope. The bootstrap is derived from the product quantum and resource
-envelopes; it is not the QUIC congestion window. Either substantial uniquely
-owned product `STREAM_ACK` progress or a durable local carrier ACK-derived DATA
-estimate may graduate the current QUIC Service's source and emission staging;
+A QUIC bulk stream advertises the configured product receive window, 64 MiB by
+default. This is receiver-memory authority, not the QUIC congestion window or
+path-capacity proof. Before exact feed evidence, response source and emission
+staging remain in the derived 4 MiB reservoir, so advertising memory does not
+bypass bounded admission or native QUIC congestion control. Either substantial
+uniquely owned product `STREAM_ACK` progress or a durable local carrier
+ACK-derived DATA estimate may graduate the current QUIC Service's staging;
 the carrier estimate may be app-limited. Neither authority is carrier capacity
 proof, and same-path latency pressure still prevents graduation. Optional
 Subflows, capacity ranking, and handoff require strict non-app-limited carrier

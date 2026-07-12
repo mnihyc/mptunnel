@@ -240,11 +240,20 @@ performance result: v25 delivered 492,276,216 B at 87.263 Mbps and v27 delivered
 
 With default limits and a 64 KiB bulk quantum, the derived feed reservoir is
 4 MiB. A one-flow QUIC plateau at approximately that much product data per RTT
-is therefore evidence that bounded bootstrap staging or initial
-`STREAM_MAX_DATA` remains active; it is not a measured QUIC congestion window
-and does not prove a 4 MiB carrier capacity limit. Compare subsequent product
-`STREAM_ACK` or carrier ACK-derived feed graduation separately from strict
-optional-path bulk proof.
+is not a measured QUIC congestion window. First distinguish source/emission
+bootstrap from receive credit: if diagnostics show feed graduation and the
+configured source/emission envelope while product flight remains near 4 MiB,
+`STREAM_MAX_DATA` is the limiter. Bulk receive credit now uses the configured
+receiver-memory window independently of path proof; strict optional-path proof
+remains a separate scheduler condition.
+
+The priority trace in `iteration40-service-feed-transition-diag-r1` observed
+feed graduation at 1.671 s and strict QUIC proof at 2.187 s while product flight
+remained near 4 MiB for the full 9-second row. The matched release pair in
+`iteration41-configured-bulk-window-equal-fat-release-r1` then reached
+176.625/274.340 Mbps overall/final-three-seconds on five equal paths versus
+144.885/180.210 Mbps on one path. This proves a useful window-boundary gain,
+not ideal aggregation; retain the separate one-flow scheduler investigation.
 
 ### Evidence cohorts
 

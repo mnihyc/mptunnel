@@ -51,6 +51,14 @@ impl From<PathCapabilities> for PathFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRateScope {
+    /// Product ACK timing already measures one flow's delivered share.
+    PerFlowGoodput,
+    /// Carrier telemetry or a configured prior describes shared path capacity.
+    PathCapacity,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PathSnapshot {
     pub id: PathId,
@@ -61,6 +69,7 @@ pub struct PathSnapshot {
     pub min_rtt_ms: f64,
     pub jitter_ms: f64,
     pub delivery_rate_bps: f64,
+    pub rate_scope: PathRateScope,
     pub product_progress_rate_bps: Option<f64>,
     /// Exact product ACK accounting satisfies the transport-specific durable
     /// sample threshold; a point rate alone is not admission evidence.
@@ -95,6 +104,7 @@ impl PathSnapshot {
             min_rtt_ms: srtt_ms,
             jitter_ms: 0.0,
             delivery_rate_bps,
+            rate_scope: PathRateScope::PathCapacity,
             product_progress_rate_bps: None,
             has_durable_product_progress: false,
             loss_rate: 0.0,
@@ -460,16 +470,26 @@ fn active_flow_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
 }
 
 fn effective_path_rate_bps(path: PathSnapshot, lane: FlowLane) -> f64 {
-    let rate = path.pacing_rate_bps.max(path.delivery_rate_bps).max(1.0);
+    let rate = match path.rate_scope {
+        PathRateScope::PerFlowGoodput => path.delivery_rate_bps,
+        PathRateScope::PathCapacity => path.pacing_rate_bps.max(path.delivery_rate_bps),
+    }
+    .max(1.0);
     match lane {
-        FlowLane::Throughput | FlowLane::Background => {
+        FlowLane::Throughput | FlowLane::Background
+            if matches!(path.rate_scope, PathRateScope::PathCapacity) =>
+        {
             let active_bulk_flows = path
                 .active_flows
                 .saturating_sub(path.active_latency_sensitive_flows)
                 .max(1) as f64;
             rate / active_bulk_flows
         }
-        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram => rate,
+        FlowLane::Control
+        | FlowLane::Latency
+        | FlowLane::RealtimeDatagram
+        | FlowLane::Throughput
+        | FlowLane::Background => rate,
     }
 }
 
@@ -738,6 +758,19 @@ mod tests {
         );
 
         assert_eq!(choice.map(|score| score.path_id), Some(PathId(1)));
+    }
+
+    #[test]
+    fn throughput_scoring_does_not_divide_per_flow_goodput_again() {
+        let mut measured = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, mbps(200.0));
+        measured.active_flows = 3;
+        measured.rate_scope = PathRateScope::PerFlowGoodput;
+        measured.pacing_rate_bps = mbps(600.0);
+
+        assert_eq!(
+            effective_path_rate_bps(measured, FlowLane::Throughput),
+            mbps(200.0)
+        );
     }
 
     #[test]

@@ -471,7 +471,6 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) attachment_role: StreamOpenRole,
     pub(in crate::runtime) snapshot: PathSnapshot,
-    pub(in crate::runtime) rate_scope: ResponseRateScope,
     pub(in crate::runtime) owner_data_in_flight_bytes: u64,
     /// Once-captured command pressure used by both projection and commit
     /// revalidation; equality is a value fingerprint, not a queue generation.
@@ -837,7 +836,6 @@ impl ResponseStreamOutputs {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ResponseBulkOutputSnapshot {
     pub(super) path: PathSnapshot,
-    pub(super) rate_scope: ResponseRateScope,
     pub(super) quic_capacity_calibration_attempts: u8,
 }
 
@@ -976,6 +974,7 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
     };
     let rate_bps = rate_bps.max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
+    snapshot.rate_scope = rate_scope;
     if let Some(path_metrics) = liveness_metrics {
         snapshot.min_rtt_ms = f64::from(path_metrics.metrics.min_rtt_us.max(1)) / 1000.0;
     }
@@ -1037,7 +1036,6 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
     }
     ResponseBulkOutputSnapshot {
         path: snapshot,
-        rate_scope,
         quic_capacity_calibration_attempts: response_scheduling.quic_capacity_calibration_attempts,
     }
 }

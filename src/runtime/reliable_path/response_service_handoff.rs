@@ -236,9 +236,9 @@ impl ResponseStreamBinding {
             .saturating_add(1)
             .max(1);
         let service_share_bps =
-            response_rate_fair_share_bps(service_snapshot, service_model.rate_scope, false);
+            response_rate_fair_share_bps(service_snapshot, service_snapshot.rate_scope, false);
         let target_share_bps =
-            response_rate_fair_share_bps(target_snapshot, target_model.rate_scope, true);
+            response_rate_fair_share_bps(target_snapshot, target_snapshot.rate_scope, true);
         let family_loads = self.response_scheduling_snapshot().service_family_loads;
         let handoff_mode = response_service_handoff_mode(
             request.service.underlay,
@@ -493,7 +493,7 @@ impl ResponseStreamBinding {
         );
         if let Some(proof) = pinned_proof {
             target_model.path.delivery_rate_bps = proof.rate_bps.max(1) as f64;
-            target_model.rate_scope = ResponseRateScope::PathCapacity;
+            target_model.path.rate_scope = ResponseRateScope::PathCapacity;
         }
         let service_snapshot = service_model.path;
         let target_snapshot = target_model.path;
@@ -509,9 +509,9 @@ impl ResponseStreamBinding {
             .saturating_add(1)
             .max(1);
         let service_share_bps =
-            response_rate_fair_share_bps(service_snapshot, service_model.rate_scope, false);
+            response_rate_fair_share_bps(service_snapshot, service_snapshot.rate_scope, false);
         let target_share_bps =
-            response_rate_fair_share_bps(target_snapshot, target_model.rate_scope, true);
+            response_rate_fair_share_bps(target_snapshot, target_snapshot.rate_scope, true);
         let handoff_mode = response_service_handoff_mode(
             request.service.underlay,
             service_share_bps,

@@ -3104,6 +3104,11 @@ fi
 if should_run_case "mptunnel_reliable_mixed_single_equal_fat_upload"; then
   run_reliable_ideal_upload_case "mptunnel_reliable_mixed_single_equal_fat_upload" "fat" "$tcp_endpoint_fat $udp_endpoint_fat"
 fi
+if should_run_case "mptunnel_reliable_mixed_family_contention_equal_fat_upload"; then
+  # UDP-first ordering makes one QUIC Service compete with one TCP Service;
+  # the second TCP endpoint exists only to expose cross-family admission bugs.
+  run_reliable_ideal_upload_case "mptunnel_reliable_mixed_family_contention_equal_fat_upload" "fat" "$udp_endpoint_fat $tcp_endpoint_lowlat $tcp_endpoint_balanced"
+fi
 
 if should_run_case "mptunnel_reliable_mixed_multipath_all_upload"; then
   start_client "reliable_mixed_multipath_all_upload" "$tcp_all $udp_all"

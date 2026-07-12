@@ -83,6 +83,12 @@ class RunnerContractTests(unittest.TestCase):
             SCRIPT,
         )
 
+    def test_mixed_family_contention_upload_orders_quic_before_two_tcp_paths(self):
+        self.assertIn(
+            'run_reliable_ideal_upload_case "mptunnel_reliable_mixed_family_contention_equal_fat_upload" "fat" "$udp_endpoint_fat $tcp_endpoint_lowlat $tcp_endpoint_balanced"',
+            SCRIPT,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

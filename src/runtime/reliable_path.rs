@@ -354,20 +354,25 @@ impl FixedReliablePathOutput {
     fn send_path_snapshot(&self) -> PathSnapshot {
         let model = self.model.lock().expect("fixed reliable path model lock");
         let prior_rate_bps = self.startup.delivery_rate_bps.max(1.0);
-        let delivery_rate_bps = match (self.key.underlay, model.delivery_rate_bps) {
+        let (delivery_rate_bps, rate_scope) = match (self.key.underlay, model.delivery_rate_bps) {
             (UnderlayProtocol::Tcp, Some(rate))
                 if !product_delivery_samples_override_startup_prior(model.delivery_samples) =>
             {
-                rate.max(prior_rate_bps)
+                if rate >= prior_rate_bps {
+                    (rate, PathRateScope::PerFlowGoodput)
+                } else {
+                    (prior_rate_bps, PathRateScope::PathCapacity)
+                }
             }
-            (_, Some(rate)) => rate,
-            (_, None) => prior_rate_bps,
-        }
-        .max(1.0);
+            (_, Some(rate)) => (rate, PathRateScope::PerFlowGoodput),
+            (_, None) => (prior_rate_bps, PathRateScope::PathCapacity),
+        };
+        let delivery_rate_bps = delivery_rate_bps.max(1.0);
         let srtt_ms = model.srtt_ms.unwrap_or(self.startup.srtt_ms);
         let mut snapshot = self.startup;
         snapshot.srtt_ms = srtt_ms;
         snapshot.delivery_rate_bps = delivery_rate_bps;
+        snapshot.rate_scope = rate_scope;
         snapshot.product_progress_rate_bps = model.product_progress_rate_bps;
         snapshot.has_durable_product_progress = model.product_progress_bytes
             >= reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
@@ -3883,7 +3888,6 @@ impl ResponseStreamBinding {
                     commands: entry.commands.clone(),
                     attachment_role: entry.role,
                     snapshot,
-                    rate_scope: response_snapshot.rate_scope,
                     owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
                     command_pending_bytes,
                     eta_ms: server_bulk_output_eta_ms(
@@ -11133,6 +11137,10 @@ mod tests {
         let ReliablePathStreamOutput::Fixed(fixed) = &output else {
             panic!("expected fixed output");
         };
+        assert_eq!(
+            fixed.send_path_snapshot().rate_scope,
+            PathRateScope::PathCapacity
+        );
         let mut offset = 0_u64;
 
         for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
@@ -11159,6 +11167,7 @@ mod tests {
             snapshot.delivery_rate_bps < startup_rate * 0.5,
             "startup/default rate is only a hint; persistent local delivery samples must correct it downward"
         );
+        assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
     }
 
     #[test]

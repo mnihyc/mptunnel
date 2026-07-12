@@ -4,11 +4,13 @@ mod response_service_handoff_diagnostics;
 #[cfg(feature = "lab-diagnostics")]
 use self::response_service_handoff_diagnostics::lab_response_service_handoff_evaluation;
 use super::ack_clock_policy::{
-    TcpAckClockCalibrationOpportunity, reliable_tcp_ack_clock_calibration_opportunity,
+    TcpAckClockCalibrationOpportunity, reliable_ack_clock_calibration_rate_coverage_floor_bytes,
+    reliable_tcp_ack_clock_calibration_opportunity,
 };
 #[cfg(test)]
 use super::ack_clock_policy::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
+    reliable_request_ack_clock_calibration_target_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::bulk_admission::BulkExplorationCompletionProjection;
@@ -193,7 +195,16 @@ struct RelayPathSendSelection {
     data_role: Option<PathRuntimeRole>,
     request_subflow_rollback: Option<Option<FlowSubflowSet<RelayPathInstance>>>,
     request_attempted_rollback: Option<RelayPathInstance>,
-    request_calibration_rollback: Option<(RelayPathInstance, Option<u64>)>,
+    request_calibration_rollback: Option<RequestAckClockCalibrationRollback>,
+    request_load_expectation: Option<(RelayPathKey, u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestAckClockCalibrationRollback {
+    candidate: RelayPathInstance,
+    previous_owner: Option<RequestAckClockCalibrationOwner>,
+    previous_bytes: Option<u64>,
+    previous_target: Option<u64>,
 }
 
 impl RelayPathSendSelection {
@@ -204,12 +215,14 @@ impl RelayPathSendSelection {
             request_subflow_rollback: None,
             request_attempted_rollback: None,
             request_calibration_rollback: None,
+            request_load_expectation: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct RequestPathRateEvidence {
+    exact_attributed_bytes: u64,
     pending_bytes: u64,
     pending_first_sent_at: Instant,
     pending_latest_sent_at: Instant,
@@ -224,6 +237,12 @@ enum RequestPathRateEvidenceUpdate {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RequestPerFlowRateModel {
+    pub(super) rate_bps: f64,
+    pub(super) delivery_samples: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RequestOwnerAckProgress {
     pub(super) instance: RelayPathInstance,
@@ -233,6 +252,7 @@ pub(super) struct RequestOwnerAckProgress {
 impl RequestPathRateEvidence {
     fn new(first_sent_at: Instant) -> Self {
         Self {
+            exact_attributed_bytes: 0,
             pending_bytes: 0,
             pending_first_sent_at: first_sent_at,
             pending_latest_sent_at: first_sent_at,
@@ -246,7 +266,10 @@ impl RequestPathRateEvidence {
         first_sent_at: Instant,
         latest_sent_at: Instant,
         acked_at: Instant,
+        coverage_floor_bytes: u64,
+        require_post_boundary_send: bool,
     ) -> RequestPathRateEvidenceUpdate {
+        self.exact_attributed_bytes = self.exact_attributed_bytes.saturating_add(bytes);
         if self.pending_bytes == 0 {
             self.pending_first_sent_at = first_sent_at;
             self.pending_latest_sent_at = latest_sent_at;
@@ -255,7 +278,8 @@ impl RequestPathRateEvidence {
             self.pending_latest_sent_at = self.pending_latest_sent_at.max(latest_sent_at);
         }
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
-        if self.pending_bytes < PATH_OPEN_SCORE_BYTES as u64 {
+        let coverage_floor_bytes = coverage_floor_bytes.max(PATH_OPEN_SCORE_BYTES as u64);
+        if self.pending_bytes < coverage_floor_bytes {
             return RequestPathRateEvidenceUpdate::Pending;
         }
 
@@ -264,23 +288,56 @@ impl RequestPathRateEvidence {
         let sample_started_at = self
             .previous_window_acked_at
             .unwrap_or(self.pending_first_sent_at);
-        // A later window is ACK-clocked only when every sampled byte was already
-        // in flight at the ACK that starts the interval.
-        let ack_clocked = first_window || self.pending_latest_sent_at <= sample_started_at;
+        // A later staged window is causal only when every sampled byte was sent
+        // at or after the ACK that starts the interval. Charging the full
+        // ACK-to-ACK gap is conservative when the sender was briefly idle.
+        let ack_clocked = first_window
+            || !require_post_boundary_send
+            || self.pending_first_sent_at >= sample_started_at;
         self.pending_bytes = 0;
         self.previous_window_acked_at = Some(acked_at);
+        let ack_elapsed = acked_at.saturating_duration_since(sample_started_at);
+        let send_elapsed = self
+            .pending_latest_sent_at
+            .saturating_duration_since(self.pending_first_sent_at);
+        // Product ACKs can arrive in compressed batches. As in BBR delivery
+        // sampling, use the slower of the send and ACK clocks so ACK timing
+        // alone cannot claim a rate above the observed sender rate.
         let sample = ack_clocked
-            .then(|| {
-                PathRateSample::new(
-                    sample_bytes,
-                    acked_at.saturating_duration_since(sample_started_at),
-                )
-            })
+            .then(|| PathRateSample::new(sample_bytes, ack_elapsed.max(send_elapsed)))
             .flatten();
         RequestPathRateEvidenceUpdate::Proven {
             sample,
             first_window,
         }
+    }
+
+    fn has_exact_path_provenance(&self) -> bool {
+        self.exact_attributed_bytes >= PATH_OPEN_SCORE_BYTES as u64
+    }
+
+    fn seed_ack_boundary(&mut self, acked_at: Instant) {
+        self.pending_bytes = 0;
+        self.previous_window_acked_at = Some(acked_at);
+    }
+}
+
+fn request_path_rate_coverage_floor_bytes(
+    instance: RelayPathInstance,
+    ordered_service: Option<RelayPathInstance>,
+    calibration_target: Option<u64>,
+    mux_limits: MuxLimits,
+) -> u64 {
+    match instance.key.underlay {
+        UnderlayProtocol::Tcp if Some(instance) != ordered_service => calibration_target
+            .unwrap_or_else(|| {
+                reliable_ack_clock_calibration_rate_coverage_floor_bytes(mux_limits)
+            }),
+        // Service has continuous feed; it does not need a new pipe-sized train.
+        UnderlayProtocol::Tcp => {
+            reliable_ack_clock_calibration_rate_coverage_floor_bytes(mux_limits)
+        }
+        UnderlayProtocol::Udp => PATH_OPEN_SCORE_BYTES as u64,
     }
 }
 
@@ -305,12 +362,17 @@ pub(super) struct RelaySenderService {
     request_startup_rate_evidence: HashSet<RelayPathInstance>,
     request_startup_receipt_proofs: HashMap<RelayPathInstance, (u64, u64)>,
     request_rate_evidence: HashMap<RelayPathInstance, RequestPathRateEvidence>,
+    request_per_flow_rate_bps: HashMap<RelayPathInstance, RequestPerFlowRateModel>,
     request_rate_proven_subflows: HashSet<RelayPathInstance>,
+    request_ack_clock_first_window_subflows: HashSet<RelayPathInstance>,
     request_ack_clock_proven_subflows: HashSet<RelayPathInstance>,
     request_ack_clock_calibration_bytes: HashMap<RelayPathInstance, u64>,
+    request_ack_clock_calibration_targets: HashMap<RelayPathInstance, u64>,
+    request_ack_clock_calibration_owner: Option<RequestAckClockCalibrationOwner>,
     request_graduated_subflows: HashSet<RelayPathInstance>,
     request_attempted_subflows: HashSet<RelayPathInstance>,
     request_membership_generation: Option<u64>,
+    request_bulk_flow_registration: Option<ReliableTcpRequestBulkFlowRegistration>,
     missing_owner_repair_attempts: HashMap<RelayPathInstance, Instant>,
     next_send_index: usize,
     performance: MppPerformanceConfig,
@@ -1440,7 +1502,7 @@ fn response_service_handoff_preserves_fair_share(
 }
 
 fn response_service_fair_share_bps(target: &ResponseSenderPathTarget, adds_flow: bool) -> f64 {
-    response_rate_fair_share_bps(target.snapshot, target.rate_scope, adds_flow)
+    response_rate_fair_share_bps(target.snapshot, target.snapshot.rate_scope, adds_flow)
 }
 
 fn response_service_handoff_mode_for_targets(
@@ -1492,7 +1554,7 @@ fn response_service_handoff_target_view(
         // The ordinary marker still expires; only this transaction view retains it.
         target.has_bulk_rate_evidence = true;
         target.snapshot.delivery_rate_bps = proof.rate_bps.max(1) as f64;
-        target.rate_scope = ResponseRateScope::PathCapacity;
+        target.snapshot.rate_scope = ResponseRateScope::PathCapacity;
         target.snapshot.confidence = target.snapshot.confidence.max(
             (proof.received_bytes as f64 / proof.sample_floor_bytes.max(1) as f64).clamp(0.0, 1.0),
         );
@@ -5281,17 +5343,47 @@ impl RelaySenderService {
             request_startup_rate_evidence: HashSet::new(),
             request_startup_receipt_proofs: HashMap::new(),
             request_rate_evidence: HashMap::new(),
+            request_per_flow_rate_bps: HashMap::new(),
             request_rate_proven_subflows: HashSet::new(),
+            request_ack_clock_first_window_subflows: HashSet::new(),
             request_ack_clock_proven_subflows: HashSet::new(),
             request_ack_clock_calibration_bytes: HashMap::new(),
+            request_ack_clock_calibration_targets: HashMap::new(),
+            request_ack_clock_calibration_owner: None,
             request_graduated_subflows: HashSet::new(),
             request_attempted_subflows: HashSet::new(),
             request_membership_generation: None,
+            request_bulk_flow_registration: None,
             missing_owner_repair_attempts: HashMap::new(),
             next_send_index: 0,
             performance,
             extra_traffic: ExtraTrafficLedger::default(),
         }
+    }
+
+    pub(super) fn bind_request_bulk_flow_registration(
+        &mut self,
+        registration: ReliableTcpRequestBulkFlowRegistration,
+    ) {
+        self.request_bulk_flow_registration = Some(registration);
+    }
+
+    pub(super) async fn fail_client_path_instance(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        instance: RelayPathInstance,
+    ) -> bool {
+        // Removal cleanup can await a full carrier queue. Only losing an
+        // active Service invalidates logical contention; an optional
+        // Validation failure must not hide the still-live Service meanwhile.
+        let removes_active_service = remotes.paths.iter().any(|path| {
+            path.instance() == instance && path.placement == RelayPathPlacement::Active
+        });
+        if removes_active_service && let Some(registration) = &self.request_bulk_flow_registration {
+            registration.update(false, None);
+        }
+        remotes.fail_path_instance(context, instance).await
     }
 
     fn extra_traffic_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
@@ -5373,14 +5465,60 @@ impl RelaySenderService {
         self.extra_traffic.record_owner_progress(bytes);
     }
 
+    fn record_request_per_flow_rate_sample(
+        &mut self,
+        instance: RelayPathInstance,
+        sample: PathRateSample,
+        replace: bool,
+    ) {
+        if instance.key.underlay != UnderlayProtocol::Tcp {
+            return;
+        }
+        let sample_bps = sample.rate_bps();
+        let previous = self.request_per_flow_rate_bps.get(&instance).copied();
+        let model = if replace {
+            RequestPerFlowRateModel {
+                rate_bps: sample_bps,
+                delivery_samples: 1,
+            }
+        } else {
+            RequestPerFlowRateModel {
+                rate_bps: previous.map_or(sample_bps, |previous| {
+                    previous.rate_bps.mul_add(0.75, sample_bps * 0.25)
+                }),
+                delivery_samples: previous
+                    .map_or(1, |previous| previous.delivery_samples.saturating_add(1)),
+            }
+        };
+        self.request_per_flow_rate_bps.insert(instance, model);
+    }
+
+    #[cfg(test)]
     pub(super) async fn send_stream_data(
         &mut self,
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
     ) -> Result<RelaySendOutcome, RuntimeError> {
-        self.send_frame(context, remotes, frame, RelaySendCause::StreamData)
+        self.send_frame(context, remotes, frame, RelaySendCause::StreamData, None)
             .await
+    }
+
+    async fn send_stream_data_for_request_lane(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        frame: Frame,
+        request_lane: FlowLane,
+    ) -> Result<RelaySendOutcome, RuntimeError> {
+        self.send_frame(
+            context,
+            remotes,
+            frame,
+            RelaySendCause::StreamData,
+            Some(request_lane),
+        )
+        .await
     }
 
     pub(super) async fn send_control_frame(
@@ -5391,7 +5529,7 @@ impl RelaySenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         debug_assert!(!cause.is_repair());
-        self.send_frame(context, remotes, frame, cause).await
+        self.send_frame(context, remotes, frame, cause, None).await
     }
 
     pub(super) async fn send_repair_frame(
@@ -5402,7 +5540,7 @@ impl RelaySenderService {
         cause: RelaySendCause,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         debug_assert!(cause.is_repair());
-        self.send_frame(context, remotes, frame, cause).await
+        self.send_frame(context, remotes, frame, cause, None).await
     }
 
     pub(super) fn ack_gap_repair_path_model(
@@ -5467,6 +5605,7 @@ impl RelaySenderService {
         context: &ClientPathContext,
         spec: &ReliableRelayOpenSpec,
         relay_lane: FlowLane,
+        request_lane: FlowLane,
         remotes: &mut ReliableRelayRemoteSet,
         send_stream: &mut ReliableSendStream,
         sender_queue: &mut ReliableRelaySenderQueue,
@@ -5486,6 +5625,7 @@ impl RelaySenderService {
                     context,
                     spec,
                     relay_lane,
+                    request_lane,
                     remotes,
                     send_stream,
                     sender_queue,
@@ -5518,6 +5658,7 @@ impl RelaySenderService {
         context: &ClientPathContext,
         spec: &ReliableRelayOpenSpec,
         relay_lane: FlowLane,
+        request_lane: FlowLane,
         remotes: &mut ReliableRelayRemoteSet,
         send_stream: &mut ReliableSendStream,
         sender_queue: &mut ReliableRelaySenderQueue,
@@ -5531,7 +5672,12 @@ impl RelaySenderService {
             .send_data(dispatch_payload, StreamFlags::NONE)
             .map_err(RuntimeError::Stream)?;
         let retry_frame = frame.clone();
-        match self.send_stream_data(context, remotes, frame.clone()).await {
+        // Queue priority stays duplex-aware, but request exploration must not
+        // borrow bulk classification from reverse-direction response bytes.
+        match self
+            .send_stream_data_for_request_lane(context, remotes, frame.clone(), request_lane)
+            .await
+        {
             Ok(outcome) => {
                 let committed = sender_queue
                     .commit_front_data_prefix(dispatch_payload_bytes)
@@ -5562,7 +5708,15 @@ impl RelaySenderService {
                         if let Err(err) = send_stream.commit_prepared_data(&frame) {
                             return Err(RuntimeError::Stream(err));
                         }
-                        match self.send_stream_data(context, remotes, retry_frame).await {
+                        match self
+                            .send_stream_data_for_request_lane(
+                                context,
+                                remotes,
+                                retry_frame,
+                                request_lane,
+                            )
+                            .await
+                        {
                             Ok(outcome) => {
                                 let committed = sender_queue
                                     .commit_front_data_prefix(dispatch_payload_bytes)
@@ -5711,6 +5865,7 @@ impl RelaySenderService {
         remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         cause: RelaySendCause,
+        request_lane: Option<FlowLane>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
         let avoid_keys = match cause {
@@ -5724,7 +5879,7 @@ impl RelaySenderService {
             _ => Vec::new(),
         };
         let instance = self
-            .emit_relay_frame(context, remotes, frame, cause, &avoid_keys)
+            .emit_relay_frame(context, remotes, frame, cause, &avoid_keys, request_lane)
             .await?;
         let path_key = instance.key;
         let payload_bytes = if cause.is_repair() {
@@ -5745,6 +5900,7 @@ impl RelaySenderService {
         frame: Frame,
         cause: RelaySendCause,
         avoid_keys: &[RelayPathKey],
+        request_lane: Option<FlowLane>,
     ) -> Result<RelayPathInstance, RuntimeError> {
         let mut last_error = None;
         while !remotes.paths.is_empty() {
@@ -5759,11 +5915,12 @@ impl RelaySenderService {
             {
                 remotes.retry_pending_path_proofs(context);
             }
+            let selection_lane = request_lane.unwrap_or(stream_lane);
             let selection = match self.choose_relay_path_position(
                 context,
                 remotes,
                 &frame,
-                stream_lane,
+                selection_lane,
                 cause,
                 avoid_keys,
             ) {
@@ -5779,6 +5936,7 @@ impl RelaySenderService {
                 request_subflow_rollback,
                 request_attempted_rollback,
                 request_calibration_rollback,
+                request_load_expectation,
             } = selection;
             let instance = remotes.paths[position].instance();
             let (lane, emit_mode) = if matches!(cause, RelaySendCause::StreamFin) {
@@ -5792,6 +5950,38 @@ impl RelaySenderService {
                     ResponseCarrierEmitMode::Classified,
                 )
             };
+            let request_load_claim =
+                if let Some((key, active, latency_sensitive)) = request_load_expectation {
+                    let Some(claim) = context.try_reserve_relay_path_load_if_unchanged(
+                        key,
+                        selection_lane,
+                        active,
+                        latency_sensitive,
+                    ) else {
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "request_startup_selection",
+                            format_args!(
+                                "phase=claim_stale stream_id={} path_index={} instance_id={}",
+                                self.stream_id.0, instance.key.index, instance.id,
+                            ),
+                        );
+                        if let Some(previous) = request_subflow_rollback {
+                            self.request_subflow_set = previous;
+                        }
+                        if let Some(instance) = request_attempted_rollback {
+                            // No product byte was emitted, so this was not an
+                            // attempt. The occupied-path filter prevents an
+                            // immediate unsafe retry while the winner owns it.
+                            self.request_attempted_subflows.remove(&instance);
+                        }
+                        self.rollback_request_ack_clock_calibration(request_calibration_rollback);
+                        return Err(RuntimeError::SenderServiceBlocked);
+                    };
+                    Some(claim)
+                } else {
+                    None
+                };
             match emit_relay_path_frame_with_mode(
                 &remotes.paths[position].stream,
                 frame.clone(),
@@ -5801,8 +5991,33 @@ impl RelaySenderService {
             .await
             {
                 Ok(()) => {
+                    let claimed_load = request_load_claim.is_some();
+                    if let Some(claim) = request_load_claim {
+                        // The exact path owns the lease after carrier enqueue;
+                        // path removal or relay cancellation releases it.
+                        let _ = remotes.commit_path_instance_load_claim(instance, claim);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "request_startup_selection",
+                            format_args!(
+                                "phase=claim_committed stream_id={} path_index={} instance_id={}",
+                                self.stream_id.0, instance.key.index, instance.id,
+                            ),
+                        );
+                    }
                     if matches!(frame, Frame::StreamData { .. }) {
                         let sent_bytes = reliable_stream_frame_payload_bytes(&frame);
+                        if data_role.is_some() && !claimed_load {
+                            // Validation attachment is not demand. Its first
+                            // unique OwnerData commits this flow's carrier load
+                            // so concurrent flows divide capacity and explore a
+                            // different idle Subflow when one exists.
+                            remotes.reserve_path_instance_load_if_needed(
+                                context,
+                                instance,
+                                selection_lane,
+                            );
+                        }
                         context.record_relay_path_send(
                             instance.key.underlay,
                             instance.key.index,
@@ -5869,7 +6084,8 @@ impl RelaySenderService {
                         self.request_startup_receipt_proofs.remove(&instance);
                         self.request_graduated_subflows.remove(&instance);
                     }
-                    remotes.fail_path_instance(context, instance).await;
+                    self.fail_client_path_instance(context, remotes, instance)
+                        .await;
                     if !remotes.paths.is_empty() {
                         self.next_send_index %= remotes.paths.len();
                     } else {
@@ -5959,9 +6175,12 @@ impl RelaySenderService {
                 graduated_subflows: Some(&self.request_graduated_subflows),
                 attempted_subflows: Some(&self.request_attempted_subflows),
                 ack_clock_calibration: Some(RequestAckClockCalibration {
+                    owner: self.request_ack_clock_calibration_owner,
                     proven_subflows: &self.request_ack_clock_proven_subflows,
+                    first_window_acked_subflows: &self.request_ack_clock_first_window_subflows,
                     spent_bytes: &self.request_ack_clock_calibration_bytes,
                 }),
+                request_per_flow_rate_bps: Some(&self.request_per_flow_rate_bps),
             }) {
                 BulkRelayPathChoice::Selected(position) => {
                     let key = remotes.paths[position].key();
@@ -5976,6 +6195,7 @@ impl RelaySenderService {
                     position,
                     service,
                     candidate,
+                    load_expectation,
                 } => {
                     let payload_bytes = reliable_stream_frame_payload_bytes(frame);
                     let (previous, newly_attempted) = self.reserve_request_startup_subflow(
@@ -5990,40 +6210,73 @@ impl RelaySenderService {
                         request_subflow_rollback: Some(previous),
                         request_attempted_rollback: newly_attempted.then_some(candidate),
                         request_calibration_rollback: None,
+                        request_load_expectation: load_expectation
+                            .map(|(active, latency)| (candidate.key, active, latency)),
                     });
                 }
                 BulkRelayPathChoice::SelectedAckClockCalibration {
                     position,
                     candidate,
+                    target_bytes,
                 } => {
+                    let previous_owner = self.request_ack_clock_calibration_owner;
+                    let previous_target = self
+                        .request_ack_clock_calibration_targets
+                        .insert(candidate, target_bytes);
+                    let owner = *self.request_ack_clock_calibration_owner.get_or_insert(
+                        RequestAckClockCalibrationOwner {
+                            candidate,
+                            target_bytes,
+                        },
+                    );
+                    debug_assert_eq!(owner.candidate, candidate);
+                    let _target_bytes = owner.target_bytes;
                     let payload_bytes = reliable_stream_frame_payload_bytes(frame) as u64;
-                    let previous = self.request_ack_clock_calibration_bytes.insert(
+                    let previous_bytes = self.request_ack_clock_calibration_bytes.insert(
                         candidate,
-                        self.request_ack_clock_calibration_bytes
-                            .get(&candidate)
-                            .copied()
-                            .unwrap_or(0)
-                            .saturating_add(payload_bytes),
+                        if previous_owner.is_some() {
+                            self.request_ack_clock_calibration_bytes
+                                .get(&candidate)
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(payload_bytes)
+                        } else {
+                            payload_bytes
+                        },
                     );
                     #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "ack_clock_calibration",
-                        format_args!(
-                            "phase=selected stream_id={} underlay={:?} path_index={} instance_id={} payload_bytes={} spent_bytes={}",
-                            self.stream_id.0,
-                            candidate.key.underlay,
-                            candidate.key.index,
-                            candidate.id,
-                            payload_bytes,
-                            self.request_ack_clock_calibration_bytes[&candidate],
-                        ),
-                    );
+                    {
+                        static TRACE_COUNT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let count = TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if count < 16 || count % 256 == 0 {
+                            lab_diagnostic(
+                                "ack_clock_calibration",
+                                format_args!(
+                                    "phase=selected stream_id={} underlay={:?} path_index={} instance_id={} payload_bytes={} spent_bytes={} target_bytes={}",
+                                    self.stream_id.0,
+                                    candidate.key.underlay,
+                                    candidate.key.index,
+                                    candidate.id,
+                                    payload_bytes,
+                                    self.request_ack_clock_calibration_bytes[&candidate],
+                                    _target_bytes,
+                                ),
+                            );
+                        }
+                    }
                     return Ok(RelayPathSendSelection {
                         position,
                         data_role: Some(PathRuntimeRole::Subflow),
                         request_subflow_rollback: None,
                         request_attempted_rollback: None,
-                        request_calibration_rollback: Some((candidate, previous)),
+                        request_calibration_rollback: Some(RequestAckClockCalibrationRollback {
+                            candidate,
+                            previous_owner,
+                            previous_bytes,
+                            previous_target,
+                        }),
+                        request_load_expectation: None,
                     });
                 }
                 BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
@@ -6057,16 +6310,25 @@ impl RelaySenderService {
 
     fn rollback_request_ack_clock_calibration(
         &mut self,
-        rollback: Option<(RelayPathInstance, Option<u64>)>,
+        rollback: Option<RequestAckClockCalibrationRollback>,
     ) {
-        let Some((instance, previous)) = rollback else {
+        let Some(rollback) = rollback else {
             return;
         };
-        if let Some(previous) = previous {
+        self.request_ack_clock_calibration_owner = rollback.previous_owner;
+        if let Some(previous) = rollback.previous_bytes {
             self.request_ack_clock_calibration_bytes
-                .insert(instance, previous);
+                .insert(rollback.candidate, previous);
         } else {
-            self.request_ack_clock_calibration_bytes.remove(&instance);
+            self.request_ack_clock_calibration_bytes
+                .remove(&rollback.candidate);
+        }
+        if let Some(previous) = rollback.previous_target {
+            self.request_ack_clock_calibration_targets
+                .insert(rollback.candidate, previous);
+        } else {
+            self.request_ack_clock_calibration_targets
+                .remove(&rollback.candidate);
         }
     }
 
@@ -6182,11 +6444,17 @@ impl RelaySenderService {
                 .retain(|instance| live_instances.contains(instance));
             self.request_rate_proven_subflows
                 .retain(|instance| live_instances.contains(instance));
+            self.request_ack_clock_first_window_subflows
+                .retain(|instance| live_instances.contains(instance));
             self.request_ack_clock_proven_subflows
                 .retain(|instance| live_instances.contains(instance));
             self.request_ack_clock_calibration_bytes
                 .retain(|instance, _| live_instances.contains(instance));
+            self.request_ack_clock_calibration_targets
+                .retain(|instance, _| live_instances.contains(instance));
             self.request_rate_evidence
+                .retain(|instance, _| live_instances.contains(instance));
+            self.request_per_flow_rate_bps
                 .retain(|instance, _| live_instances.contains(instance));
             self.request_startup_acked_bytes
                 .retain(|instance, _| live_instances.contains(instance));
@@ -6197,6 +6465,23 @@ impl RelaySenderService {
             self.request_startup_receipt_proofs
                 .retain(|instance, _| live_instances.contains(instance));
             self.request_membership_generation = Some(membership_generation);
+        }
+        if self
+            .request_ack_clock_calibration_owner
+            .is_some_and(|owner| {
+                self.request_ack_clock_proven_subflows
+                    .contains(&owner.candidate)
+                    || !remotes.paths.iter().any(|path| {
+                        path.instance() == owner.candidate
+                            && path.placement == RelayPathPlacement::Validation
+                    })
+            })
+        {
+            // Optional calibration ownership is exact-instance and
+            // exact-placement state. Historical byte/target records may stay
+            // long enough to reject partial late ACK evidence, but cannot
+            // reconstruct a new owner.
+            self.request_ack_clock_calibration_owner = None;
         }
         if self.ordered_data_owner_instance.is_some_and(|service| {
             service.key.underlay == UnderlayProtocol::Udp && remotes.contains_path_instance(service)
@@ -6298,6 +6583,7 @@ impl RelaySenderService {
         {
             self.request_startup_rate_evidence.insert(owner);
             self.request_rate_proven_subflows.insert(owner);
+            self.record_request_per_flow_rate_sample(owner, sample, false);
             context.mark_relay_path_rate_sample(owner.key.underlay, owner.key.index, sample);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -6315,6 +6601,18 @@ impl RelaySenderService {
                     sample.rate_bps(),
                 ),
             );
+        }
+        if let Some(receipt_acked_at) = receipt_acked_at
+            && self.request_startup_rate_evidence.contains(&owner)
+            && self.request_ack_clock_first_window_subflows.insert(owner)
+        {
+            // The ordered receipt follows the sealed startup sample on this
+            // exact TCP attachment. Once product flight also drains below, it
+            // is the causal boundary for the first calibration window.
+            self.request_rate_evidence
+                .entry(owner)
+                .or_insert_with(|| RequestPathRateEvidence::new(receipt_acked_at))
+                .seed_ack_boundary(receipt_acked_at);
         }
         if self.request_startup_rate_evidence.contains(&owner)
             && !self.flights.has_ordering_owner_flights_for_instance(owner)
@@ -6605,27 +6903,89 @@ impl RelaySenderService {
             && self.request_startup_rate_evidence.insert(owner)
         {
             self.request_rate_proven_subflows.insert(owner);
+            self.record_request_per_flow_rate_sample(owner, sample, false);
             context.mark_relay_path_rate_sample(owner.key.underlay, owner.key.index, sample);
+            if self.request_ack_clock_first_window_subflows.insert(owner) {
+                // The exact product ACK that completes the sealed TCP startup
+                // owner window is also a causal boundary: every calibration
+                // byte selected after this point is post-boundary by
+                // construction. The explicit path receipt remains an
+                // equivalent boundary when it arrives first.
+                self.request_rate_evidence
+                    .entry(owner)
+                    .or_insert_with(|| RequestPathRateEvidence::new(acked_at))
+                    .seed_ack_boundary(acked_at);
+            }
         }
         for (instance, (bytes, first_sent_at, latest_sent_at)) in ordinary_owner_samples {
-            let update = self
-                .request_rate_evidence
-                .entry(instance)
-                .or_insert_with(|| RequestPathRateEvidence::new(first_sent_at))
-                .observe(bytes, first_sent_at, latest_sent_at, acked_at);
+            // TCP lacks carrier-native delivery telemetry, so its product ACK
+            // fallback needs a representative window. QUIC keeps its existing
+            // small product-provenance threshold; carrier ACKs own its rate.
+            let coverage_floor_bytes = request_path_rate_coverage_floor_bytes(
+                instance,
+                self.ordered_data_owner_instance,
+                self.request_ack_clock_calibration_targets
+                    .get(&instance)
+                    .copied(),
+                context.mux_limits,
+            );
+            let is_ordered_service = self.ordered_data_owner_instance == Some(instance);
+            let (update, has_exact_path_provenance) = {
+                let evidence = self
+                    .request_rate_evidence
+                    .entry(instance)
+                    .or_insert_with(|| RequestPathRateEvidence::new(first_sent_at));
+                let update = evidence.observe(
+                    bytes,
+                    first_sent_at,
+                    latest_sent_at,
+                    acked_at,
+                    coverage_floor_bytes,
+                    !is_ordered_service,
+                );
+                (update, evidence.has_exact_path_provenance())
+            };
+            if has_exact_path_provenance {
+                // Exact ownership is enough to establish that this flow used
+                // the path. It is not enough to publish a rate sample.
+                self.request_rate_proven_subflows.insert(instance);
+            }
             if let RequestPathRateEvidenceUpdate::Proven {
                 sample,
                 first_window,
             } = update
             {
-                let already_proven = self.request_rate_proven_subflows.contains(&instance);
-                self.request_rate_proven_subflows.insert(instance);
                 if instance.key.underlay == UnderlayProtocol::Tcp
+                    && is_ordered_service
                     && let Some(sample) = sample
-                    && (!first_window || !already_proven)
+                {
+                    context.mark_relay_path_rate_sample(
+                        instance.key.underlay,
+                        instance.key.index,
+                        sample,
+                    );
+                    if !first_window {
+                        self.record_request_per_flow_rate_sample(instance, sample, false);
+                    }
+                } else if instance.key.underlay == UnderlayProtocol::Tcp && first_window {
+                    self.request_ack_clock_first_window_subflows
+                        .insert(instance);
+                } else if instance.key.underlay == UnderlayProtocol::Tcp
+                    && let Some(sample) = sample
                 {
                     let replace_startup_rate =
-                        !first_window && self.request_ack_clock_proven_subflows.insert(instance);
+                        self.request_ack_clock_proven_subflows.insert(instance);
+                    if self
+                        .request_ack_clock_calibration_owner
+                        .is_some_and(|owner| owner.candidate == instance)
+                    {
+                        self.request_ack_clock_calibration_owner = None;
+                    }
+                    self.record_request_per_flow_rate_sample(
+                        instance,
+                        sample,
+                        replace_startup_rate,
+                    );
                     context.mark_relay_path_ack_clock_rate_sample(
                         instance.key.underlay,
                         instance.key.index,
@@ -6633,15 +6993,17 @@ impl RelaySenderService {
                         replace_startup_rate,
                     );
                     #[cfg(feature = "lab-diagnostics")]
-                    if !first_window && replace_startup_rate {
+                    {
                         lab_diagnostic(
                             "ack_clock_calibration",
                             format_args!(
-                                "phase=ack_clock_sample stream_id={} underlay={:?} path_index={} instance_id={} replace_startup_rate={} rate_bps={}",
+                                "phase=ack_clock_sample stream_id={} underlay={:?} path_index={} instance_id={} evidence_bytes={} sample_elapsed_us={} replace_startup_rate={} rate_bps={}",
                                 self.stream_id.0,
                                 instance.key.underlay,
                                 instance.key.index,
                                 instance.id,
+                                sample.bytes(),
+                                sample.elapsed().as_micros(),
                                 replace_startup_rate,
                                 sample.rate_bps(),
                             ),
@@ -6834,7 +7196,8 @@ impl RelaySenderService {
         {
             Ok(()) => Ok(()),
             Err(err) => {
-                remotes.fail_path_instance(context, instance).await;
+                self.fail_client_path_instance(context, remotes, instance)
+                    .await;
                 Err(err)
             }
         }
@@ -6882,7 +7245,8 @@ impl RelaySenderService {
                 Ok(activated)
             }
             Err(err) => {
-                remotes.fail_path_instance(context, instance).await;
+                self.fail_client_path_instance(context, remotes, instance)
+                    .await;
                 Err(err)
             }
         }
@@ -7311,6 +7675,40 @@ mod tests {
     };
 
     #[test]
+    fn request_tcp_rate_uses_representative_coverage_for_service_and_candidate() {
+        let service = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            id: 1,
+        };
+        let candidate = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            },
+            id: 2,
+        };
+        let mux_limits = MuxLimits::default();
+        assert_eq!(
+            request_path_rate_coverage_floor_bytes(service, Some(service), None, mux_limits,),
+            reliable_ack_clock_calibration_rate_coverage_floor_bytes(mux_limits)
+        );
+        assert_eq!(
+            request_path_rate_coverage_floor_bytes(
+                candidate,
+                Some(service),
+                Some(reliable_request_ack_clock_calibration_target_bytes(
+                    mux_limits
+                )),
+                mux_limits,
+            ),
+            reliable_request_ack_clock_calibration_target_bytes(mux_limits)
+        );
+    }
+
+    #[test]
     fn request_rate_evidence_uses_ack_clock_after_initial_provenance() {
         let started = Instant::now();
         let bytes = PATH_OPEN_SCORE_BYTES as u64;
@@ -7321,6 +7719,8 @@ mod tests {
             started,
             started,
             started + Duration::from_millis(100),
+            bytes,
+            true,
         ) {
             RequestPathRateEvidenceUpdate::Proven {
                 sample: Some(sample),
@@ -7330,9 +7730,11 @@ mod tests {
         };
         let ack_clocked = match evidence.observe(
             bytes,
-            started + Duration::from_millis(90),
-            started + Duration::from_millis(90),
+            started + Duration::from_millis(100),
+            started + Duration::from_millis(100),
             started + Duration::from_millis(101),
+            bytes,
+            true,
         ) {
             RequestPathRateEvidenceUpdate::Proven {
                 sample: Some(sample),
@@ -7343,12 +7745,43 @@ mod tests {
 
         assert!(
             ack_clocked > initial * 50.0,
-            "RTT must not be charged again once exact bytes were already in flight at the previous ACK"
+            "a post-boundary stage must use ACK-to-ACK time without charging the first-stage RTT again"
         );
     }
 
     #[test]
-    fn request_rate_evidence_ignores_app_limited_ack_window() {
+    fn request_service_rate_keeps_continuous_ack_clock_for_pipelined_bytes() {
+        let started = Instant::now();
+        let bytes = PATH_OPEN_SCORE_BYTES as u64;
+        let first_ack = started + Duration::from_millis(100);
+        let mut evidence = RequestPathRateEvidence::new(started);
+        assert!(matches!(
+            evidence.observe(bytes, started, started, first_ack, bytes, false),
+            RequestPathRateEvidenceUpdate::Proven {
+                sample: Some(_),
+                first_window: true,
+            }
+        ));
+
+        let sample = match evidence.observe(
+            bytes,
+            started + Duration::from_millis(90),
+            started + Duration::from_millis(95),
+            started + Duration::from_millis(120),
+            bytes,
+            false,
+        ) {
+            RequestPathRateEvidenceUpdate::Proven {
+                sample: Some(sample),
+                first_window: false,
+            } => sample,
+            _ => panic!("ordered Service bytes must retain continuous ACK-clock evidence"),
+        };
+        assert_eq!(sample.elapsed(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn request_rate_evidence_charges_post_boundary_idle_gap() {
         let started = Instant::now();
         let bytes = PATH_OPEN_SCORE_BYTES as u64;
         let mut evidence = RequestPathRateEvidence::new(started);
@@ -7357,7 +7790,9 @@ mod tests {
                 bytes,
                 started,
                 started,
-                started + Duration::from_millis(100)
+                started + Duration::from_millis(100),
+                bytes,
+                true,
             ),
             RequestPathRateEvidenceUpdate::Proven {
                 sample: Some(_),
@@ -7365,37 +7800,42 @@ mod tests {
             }
         ));
 
+        let conservative = match evidence.observe(
+            bytes,
+            started + Duration::from_millis(200),
+            started + Duration::from_millis(200),
+            started + Duration::from_millis(300),
+            bytes,
+            true,
+        ) {
+            RequestPathRateEvidenceUpdate::Proven {
+                sample: Some(sample),
+                ..
+            } => sample,
+            _ => panic!("post-boundary bytes must retain the full idle gap in their rate"),
+        };
+        assert_eq!(conservative.elapsed(), Duration::from_millis(200));
         assert!(matches!(
             evidence.observe(
                 bytes,
-                started + Duration::from_millis(200),
-                started + Duration::from_millis(200),
-                started + Duration::from_millis(300)
+                started + Duration::from_millis(290),
+                started + Duration::from_millis(290),
+                started + Duration::from_millis(301),
+                bytes,
+                true,
             ),
             RequestPathRateEvidenceUpdate::Proven { sample: None, .. }
-        ));
-        assert!(matches!(
-            evidence.observe(
-                bytes,
-                started + Duration::from_millis(290),
-                started + Duration::from_millis(290),
-                started + Duration::from_millis(301)
-            ),
-            RequestPathRateEvidenceUpdate::Proven {
-                sample: Some(_),
-                ..
-            }
         ));
     }
 
     #[test]
-    fn request_rate_evidence_rejects_window_with_mostly_post_ack_bytes() {
+    fn request_rate_evidence_rejects_window_with_any_pre_ack_bytes() {
         let started = Instant::now();
         let bytes = PATH_OPEN_SCORE_BYTES as u64;
         let previous_ack = started + Duration::from_millis(100);
         let mut evidence = RequestPathRateEvidence::new(started);
         assert!(matches!(
-            evidence.observe(bytes, started, started, previous_ack),
+            evidence.observe(bytes, started, started, previous_ack, bytes, true),
             RequestPathRateEvidenceUpdate::Proven {
                 sample: Some(_),
                 ..
@@ -7410,6 +7850,8 @@ mod tests {
                 old_byte_sent_at,
                 old_byte_sent_at,
                 started + Duration::from_millis(110),
+                bytes,
+                true,
             ),
             RequestPathRateEvidenceUpdate::Pending
         ));
@@ -7419,9 +7861,83 @@ mod tests {
                 new_bytes_sent_at,
                 new_bytes_sent_at,
                 started + Duration::from_millis(200),
+                bytes,
+                true,
             ),
             RequestPathRateEvidenceUpdate::Proven { sample: None, .. }
         ));
+    }
+
+    #[test]
+    fn request_rate_evidence_waits_for_representative_coverage() {
+        let started = Instant::now();
+        let coverage_floor =
+            reliable_ack_clock_calibration_rate_coverage_floor_bytes(MuxLimits::default());
+        let mut evidence = RequestPathRateEvidence::new(started);
+
+        assert!(matches!(
+            evidence.observe(
+                coverage_floor / 2,
+                started,
+                started,
+                started + Duration::from_millis(10),
+                coverage_floor,
+                true,
+            ),
+            RequestPathRateEvidenceUpdate::Pending
+        ));
+        assert!(matches!(
+            evidence.observe(
+                coverage_floor - coverage_floor / 2,
+                started,
+                started,
+                started + Duration::from_millis(20),
+                coverage_floor,
+                true,
+            ),
+            RequestPathRateEvidenceUpdate::Proven {
+                sample: Some(_),
+                first_window: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn request_rate_evidence_post_boundary_clock_cannot_outrun_send_rate() {
+        let started = Instant::now();
+        let bytes = reliable_ack_clock_calibration_rate_coverage_floor_bytes(MuxLimits::default());
+        let mut evidence = RequestPathRateEvidence::new(started);
+        assert!(matches!(
+            evidence.observe(
+                bytes,
+                started,
+                started,
+                started + Duration::from_millis(100),
+                bytes,
+                true,
+            ),
+            RequestPathRateEvidenceUpdate::Proven {
+                first_window: true,
+                ..
+            }
+        ));
+
+        let sample = match evidence.observe(
+            bytes,
+            started + Duration::from_millis(100),
+            started + Duration::from_millis(140),
+            started + Duration::from_millis(141),
+            bytes,
+            true,
+        ) {
+            RequestPathRateEvidenceUpdate::Proven {
+                sample: Some(sample),
+                first_window: false,
+            } => sample,
+            _ => panic!("a causal second window must produce a sample"),
+        };
+        assert_eq!(sample.elapsed(), Duration::from_millis(41));
+        assert_eq!(sample.rate_bps(), bytes as f64 * 8.0 / 0.041);
     }
 
     #[test]
@@ -7662,7 +8178,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_ack_releases_sender_service_flights_with_path_scoped_rate_sample() {
+    fn stream_ack_releases_flights_without_publishing_a_tiny_rate_sample() {
         let path = "tcp://127.0.0.1:10251".parse::<PathSpec>().expect("path");
         let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
             .expect("context");
@@ -7693,9 +8209,9 @@ mod tests {
         let after = context.tcp_path_snapshot(0).expect("after snapshot");
 
         assert_eq!(after.bytes_in_flight, 0);
-        assert_ne!(
+        assert_eq!(
             after.delivery_rate_bps, before.delivery_rate_bps,
-            "an unambiguous owner STREAM_ACK is path-scoped delivery evidence"
+            "an unambiguous tiny ACK proves ownership but must not replace the retained rate"
         );
         assert_eq!(
             owner_progress.as_slice(),
@@ -7798,7 +8314,7 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_stream_ack_emits_one_aggregated_path_rate_sample() {
+    fn sub_coverage_stream_ack_does_not_publish_a_path_rate_sample() {
         let path = "tcp://127.0.0.1:10253".parse::<PathSpec>().expect("path");
         let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
             .expect("context");
@@ -7843,17 +8359,15 @@ mod tests {
                 .bytes_in_flight,
             0
         );
-        assert_eq!(
-            delivery_samples, 1,
-            "one cumulative STREAM_ACK must contribute one byte-aggregated path sample, not one tiny sample per frame"
-        );
+        assert_eq!(delivery_samples, 0);
         assert!(
-            context.relay_path_has_bulk_model_evidence(instance.key.underlay, instance.key.index,)
+            !context.relay_path_has_bulk_model_evidence(instance.key.underlay, instance.key.index,),
+            "callback-sized ACK batches must not become a shared scheduling rate"
         );
     }
 
     #[test]
-    fn fragmented_service_acks_accumulate_before_publishing_exact_evidence() {
+    fn fragmented_service_acks_establish_provenance_without_publishing_rate() {
         let path = "tcp://127.0.0.1:10254".parse::<PathSpec>().expect("path");
         let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
             .expect("context");
@@ -7889,10 +8403,101 @@ mod tests {
         );
         let health = context.health.lock().expect("path health lock");
         assert!(sender.request_rate_proven_subflows.contains(&instance));
+        assert_eq!(health.tcp[0].delivery_samples, 0);
+        assert_eq!(health.tcp[0].product_delivery_sample_bytes, 0);
+    }
+
+    #[test]
+    fn tcp_request_service_first_window_publishes_bulk_authority_without_rate_override() {
+        let path = "tcp://127.0.0.1:10257?rate-mbps=500"
+            .parse::<PathSpec>()
+            .expect("path");
+        let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+            .expect("context");
+        let instance = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            id: 14,
+        };
+        let mut sender = RelaySenderService::new(StreamId(12));
+        sender.ordered_data_owner = Some(instance.key);
+        sender.ordered_data_owner_instance = Some(instance);
+        let coverage = usize::try_from(reliable_ack_clock_calibration_rate_coverage_floor_bytes(
+            context.mux_limits,
+        ))
+        .expect("coverage");
+        let frame = client_data_frame_for_test(StreamId(12), 0, coverage);
+        context.record_relay_path_send(instance.key.underlay, instance.key.index, coverage);
+        sender.flights.record_owner_frame_instance(instance, &frame);
+
+        sender.release_normalized_acked_ranges(
+            &context,
+            &[OffsetRange::new(0, coverage as u64).expect("Service ACK")],
+        );
+
+        assert!(
+            context.relay_path_has_bulk_model_evidence(instance.key.underlay, instance.key.index)
+        );
+        assert!(!sender.request_per_flow_rate_bps.contains_key(&instance));
+        assert!(!sender.request_ack_clock_proven_subflows.contains(&instance));
+    }
+
+    #[test]
+    fn tcp_request_first_window_only_establishes_the_ack_clock() {
+        let path = "tcp://127.0.0.1:10255".parse::<PathSpec>().expect("path");
+        let context = ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+            .expect("context");
+        let instance = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            id: 13,
+        };
+        let mut sender = RelaySenderService::new(StreamId(11));
+        let coverage_floor = usize::try_from(
+            reliable_ack_clock_calibration_rate_coverage_floor_bytes(context.mux_limits),
+        )
+        .expect("coverage floor");
+        let first = client_data_frame_for_test(StreamId(11), 0, coverage_floor);
+        let second =
+            client_data_frame_for_test(StreamId(11), coverage_floor as u64, coverage_floor);
+        context.record_relay_path_send(instance.key.underlay, instance.key.index, coverage_floor);
+        sender.flights.record_owner_frame_instance(instance, &first);
+
+        sender.release_normalized_acked_ranges(
+            &context,
+            &[OffsetRange::new(0, coverage_floor as u64).expect("first window")],
+        );
+        assert!(sender.request_rate_proven_subflows.contains(&instance));
+        assert!(!sender.request_ack_clock_proven_subflows.contains(&instance));
+        assert!(!sender.request_per_flow_rate_bps.contains_key(&instance));
+        assert_eq!(
+            context.health.lock().expect("path health lock").tcp[0].delivery_samples,
+            0,
+            "the RTT-bearing first window establishes the clock but is not a rate sample"
+        );
+
+        context.record_relay_path_send(instance.key.underlay, instance.key.index, coverage_floor);
+        sender
+            .flights
+            .record_owner_frame_instance(instance, &second);
+        sender.release_normalized_acked_ranges(
+            &context,
+            &[
+                OffsetRange::new(coverage_floor as u64, (2 * coverage_floor) as u64)
+                    .expect("second window"),
+            ],
+        );
+        let health = context.health.lock().expect("path health lock");
+        assert!(sender.request_ack_clock_proven_subflows.contains(&instance));
+        assert!(sender.request_per_flow_rate_bps.contains_key(&instance));
         assert_eq!(health.tcp[0].delivery_samples, 1);
         assert_eq!(
             health.tcp[0].product_delivery_sample_bytes,
-            (2 * chunk) as u64
+            coverage_floor as u64
         );
     }
 
@@ -7971,7 +8576,6 @@ mod tests {
                 StreamOpenRole::Validation
             },
             snapshot,
-            rate_scope: ResponseRateScope::PathCapacity,
             owner_data_in_flight_bytes: bytes_in_flight,
             command_pending_bytes: 0,
             eta_ms,
@@ -8550,6 +9154,16 @@ mod tests {
         .expect("context")
     }
 
+    fn active_request_bulk_flow_registrations(
+        context: &ClientPathContext,
+    ) -> [ReliableTcpRequestBulkFlowRegistration; 2] {
+        let first = context.reliable_tcp_request_bulk_flow_registration();
+        let second = context.reliable_tcp_request_bulk_flow_registration();
+        first.update(true, Some(UnderlayProtocol::Tcp));
+        second.update(true, Some(UnderlayProtocol::Tcp));
+        [first, second]
+    }
+
     fn opened_test_relay_stream(
         stream_id: StreamId,
         path_index: usize,
@@ -8833,6 +9447,7 @@ mod tests {
                     target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
                     ingress: IngressKind::Socks5,
                 },
+                FlowLane::Throughput,
                 FlowLane::Throughput,
                 &mut remotes,
                 &mut send_stream,
@@ -9355,6 +9970,7 @@ mod tests {
             "tcp://127.0.0.1:10280?srtt-ms=20&rate-mbps=500",
             "tcp://127.0.0.1:10281?srtt-ms=10&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -9438,12 +10054,277 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_request_startup_does_not_borrow_reverse_promoted_relay_lane() {
+        let stream_id = StreamId(123);
+        let context = client_test_context_with_paths(&[
+            "tcp://127.0.0.1:10320?srtt-ms=20&rate-mbps=500",
+            "tcp://127.0.0.1:10321?srtt-ms=10&rate-mbps=500",
+        ]);
+        let _other_request_bulk_flows = active_request_bulk_flow_registrations(&context);
+        let service_key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+        let candidate_key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        };
+        seed_client_bulk_evidence_for_test(&context, service_key);
+
+        let (service_commands, mut service_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream(stream_id, service_key.index, service_commands),
+            8,
+        );
+        let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
+        let service_frame = send_stream
+            .send_data(
+                Bytes::from(vec![0x41; PATH_OPEN_SCORE_BYTES]),
+                StreamFlags::NONE,
+            )
+            .expect("initial Service request frame");
+        let mut sender = RelaySenderService::new(stream_id);
+        sender
+            .send_stream_data(&context, &mut remotes, service_frame.clone())
+            .await
+            .expect("establish request Service owner");
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut service_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        ack_client_frame_for_test(&mut sender, &context, &service_frame);
+        let service_range = OffsetRange::new(0, PATH_OPEN_SCORE_BYTES as u64)
+            .expect("initial Service request range");
+        let _ = send_stream.apply_ack(&[service_range]);
+
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(8);
+        remotes.attach_for_validation(opened_test_relay_stream(
+            stream_id,
+            candidate_key.index,
+            candidate_commands,
+        ));
+        let candidate = remotes
+            .path_instance_for_key(candidate_key)
+            .expect("Validation candidate");
+        consume_client_validation_proof_for_test(&mut candidate_rx);
+        mark_client_validation_proof_fresh_for_test(
+            &context,
+            &remotes,
+            candidate,
+            Duration::from_millis(10),
+        );
+
+        let spec = ReliableRelayOpenSpec {
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            ingress: IngressKind::Socks5,
+        };
+        let mut sender_queue = ReliableRelaySenderQueue::default();
+        sender_queue.push_data(Bytes::from(vec![0x42; 8 * 1024]));
+        sender
+            .dispatch_client_queued_work(
+                &context,
+                &spec,
+                FlowLane::Throughput,
+                FlowLane::Latency,
+                &mut remotes,
+                &mut send_stream,
+                &mut sender_queue,
+                true,
+                8 * 1024,
+            )
+            .await
+            .expect("latency request stays on Service");
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut service_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert!(try_recv_reliable_path_command(&mut candidate_rx).is_none());
+        assert_eq!(
+            sender
+                .request_subflow_set
+                .as_ref()
+                .and_then(FlowSubflowSet::startup_owner_key),
+            None,
+            "reverse-direction bulk classification must not authorize request exploration"
+        );
+
+        sender_queue.push_data(Bytes::from(vec![0x43; 8 * 1024]));
+        sender
+            .dispatch_client_queued_work(
+                &context,
+                &spec,
+                FlowLane::Throughput,
+                FlowLane::Throughput,
+                &mut remotes,
+                &mut send_stream,
+                &mut sender_queue,
+                true,
+                8 * 1024,
+            )
+            .await
+            .expect("request-direction bulk classification enables bounded startup");
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_rx),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+        ));
+        assert_eq!(
+            sender
+                .request_subflow_set
+                .as_ref()
+                .and_then(FlowSubflowSet::startup_owner_key),
+            Some(candidate)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_path_failure_unpublishes_contention_before_cleanup_waits() {
+        let stream_id = StreamId(124);
+        let context = Arc::new(client_test_context());
+        let registration = context.reliable_tcp_request_bulk_flow_registration();
+        registration.update(true, Some(UnderlayProtocol::Tcp));
+        assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
+
+        let (commands, mut receivers) = reliable_path_command_channels(1);
+        commands
+            .send_control(ReliablePathCommand::CloseStream(StreamId(999)))
+            .await
+            .expect("prefill cleanup control queue");
+        let mut remotes =
+            ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 1);
+        let service = remotes.active_path_instance().expect("active Service");
+        let mut sender = RelaySenderService::new(stream_id);
+        sender.ordered_data_owner = Some(service.key);
+        sender.ordered_data_owner_instance = Some(service);
+        sender.bind_request_bulk_flow_registration(registration.clone());
+
+        let task_context = context.clone();
+        let failure = tokio::spawn(async move {
+            let removed = sender
+                .fail_client_path_instance(&task_context, &mut remotes, service)
+                .await;
+            (removed, sender, remotes)
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            context.active_tcp_service_request_bulk_flows(),
+            0,
+            "a removed Service must stop authorizing concurrent exploration before cleanup can await"
+        );
+        assert!(
+            !failure.is_finished(),
+            "the full control queue must keep detach cleanup pending for the race assertion"
+        );
+        assert!(matches!(
+            recv_reliable_path_command(&mut receivers).await,
+            Some(ReliablePathCommand::CloseStream(StreamId(999)))
+        ));
+        assert!(matches!(
+            recv_reliable_path_command(&mut receivers).await,
+            Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id }))
+                if id == stream_id
+        ));
+        assert!(matches!(
+            recv_reliable_path_command(&mut receivers).await,
+            Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+        ));
+        let (removed, _, remotes) = failure.await.expect("path failure task");
+        assert!(removed);
+        assert!(remotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
+        let stream_id = StreamId(125);
+        let context = Arc::new(client_test_context_with_paths(&[
+            "tcp://127.0.0.1:10331?srtt-ms=20&rate-mbps=500",
+            "tcp://127.0.0.1:10332?srtt-ms=20&rate-mbps=500",
+        ]));
+        let (service_commands, _service_rx) = reliable_path_command_channels(1);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream(stream_id, 0, service_commands),
+            2,
+        );
+        let service = remotes.active_path_instance().expect("active Service");
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(1);
+        candidate_commands
+            .send_control(ReliablePathCommand::CloseStream(StreamId(999)))
+            .await
+            .expect("prefill cleanup control queue");
+        remotes.attach_for_validation(opened_test_relay_stream(stream_id, 1, candidate_commands));
+        let candidate = remotes
+            .path_instance_for_key(RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            })
+            .expect("Validation candidate");
+        let lease = context
+            .try_reserve_relay_path_load_if_unchanged(candidate.key, FlowLane::Throughput, 0, 0)
+            .expect("reserve optional path load");
+        assert!(
+            remotes
+                .commit_path_instance_load_claim(candidate, lease)
+                .is_ok(),
+            "commit optional path load"
+        );
+        let registration = context.reliable_tcp_request_bulk_flow_registration();
+        registration.update(true, Some(UnderlayProtocol::Tcp));
+        let mut sender = RelaySenderService::new(stream_id);
+        sender.ordered_data_owner = Some(service.key);
+        sender.ordered_data_owner_instance = Some(service);
+        sender.bind_request_bulk_flow_registration(registration);
+
+        let task_context = context.clone();
+        let failure = tokio::spawn(async move {
+            let removed = sender
+                .fail_client_path_instance(&task_context, &mut remotes, candidate)
+                .await;
+            (removed, sender, remotes)
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            context.health.lock().expect("path health lock").tcp[1].active_flows,
+            0,
+            "a removed optional path must release load before detach can block"
+        );
+        assert_eq!(
+            context.active_tcp_service_request_bulk_flows(),
+            1,
+            "optional cleanup must not unpublish the still-live TCP Service"
+        );
+        assert!(!failure.is_finished());
+        assert!(matches!(
+            recv_reliable_path_command(&mut candidate_rx).await,
+            Some(ReliablePathCommand::CloseStream(StreamId(999)))
+        ));
+        loop {
+            match recv_reliable_path_command(&mut candidate_rx).await {
+                Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id }))
+                    if id == stream_id =>
+                {
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("candidate command channel closed before detach"),
+            }
+        }
+        assert!(matches!(
+            recv_reliable_path_command(&mut candidate_rx).await,
+            Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+        ));
+        let (removed, _, _) = failure.await.expect("path failure task");
+        assert!(removed);
+    }
+
+    #[tokio::test]
     async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() {
         let stream_id = StreamId(101);
         let context = client_test_context_with_paths(&[
             "tcp://127.0.0.1:10282?srtt-ms=20&rate-mbps=500",
             "tcp://127.0.0.1:10283?srtt-ms=10&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -9607,6 +10488,7 @@ mod tests {
             "tcp://127.0.0.1:10305?srtt-ms=20&rate-mbps=500",
             "tcp://127.0.0.1:10306?srtt-ms=10&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -9726,6 +10608,17 @@ mod tests {
         sender.reconcile_request_subflow_set(&context, &remotes);
 
         assert!(sender.request_graduated_subflows.contains(&candidate));
+        assert!(
+            sender
+                .request_ack_clock_first_window_subflows
+                .contains(&candidate),
+            "the ordered startup receipt is the causal boundary for calibration"
+        );
+        assert!(
+            sender.request_rate_evidence[&candidate]
+                .previous_window_acked_at
+                .is_some()
+        );
         let health = context.health.lock().expect("path health lock");
         assert_eq!(
             health.tcp[candidate_key.index].product_delivery_sample_bytes, admitted_bytes as u64,
@@ -9821,6 +10714,7 @@ mod tests {
             "tcp://127.0.0.1:10307?srtt-ms=20&rate-mbps=500",
             "tcp://127.0.0.1:10308?srtt-ms=10&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -9840,15 +10734,15 @@ mod tests {
             PathRateSample::new(256 * 1024, Duration::from_secs(1)).expect("receipt rate"),
         );
 
-        let (service_commands, mut service_rx) = reliable_path_command_channels(16);
+        let (service_commands, mut service_rx) = reliable_path_command_channels(1024);
         let mut remotes = ReliableRelayRemoteSet::new(
             opened_test_relay_stream(stream_id, service_key.index, service_commands),
-            16,
+            1024,
         );
         let service = remotes
             .path_instance_for_key(service_key)
             .expect("Service instance");
-        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(16);
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(1024);
         remotes.attach_for_validation(opened_test_relay_stream(
             stream_id,
             candidate_key.index,
@@ -9873,12 +10767,11 @@ mod tests {
         sender.request_graduated_subflows.insert(candidate);
         assert!(!sender.request_owner_ack_can_grow_window(&remotes, Some(service), candidate));
 
-        let calibration_limit = usize::try_from(reliable_ack_clock_calibration_limit_bytes(
-            context.mux_limits,
-        ))
-        .expect("calibration limit");
-        assert_eq!(calibration_limit % BBR_MAX_SEND_QUANTUM_BYTES, 0);
-        let calibration_frames = (0..(calibration_limit / BBR_MAX_SEND_QUANTUM_BYTES))
+        let calibration_target = usize::try_from(
+            reliable_request_ack_clock_calibration_target_bytes(context.mux_limits),
+        )
+        .expect("calibration target");
+        let calibration_frames = (0..calibration_target.div_ceil(BBR_MAX_SEND_QUANTUM_BYTES))
             .map(|index| {
                 client_data_frame_for_test(
                     stream_id,
@@ -9887,6 +10780,16 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        sender
+            .request_ack_clock_first_window_subflows
+            .insert(candidate);
+        sender
+            .request_rate_evidence
+            .entry(candidate)
+            .or_insert_with(|| RequestPathRateEvidence::new(Instant::now()))
+            .seed_ack_boundary(Instant::now());
+
+        let mut sent_calibration_frames = Vec::new();
         for frame in &calibration_frames {
             let outcome = sender
                 .send_stream_data(&context, &mut remotes, frame.clone())
@@ -9897,32 +10800,43 @@ mod tests {
                 try_recv_reliable_path_command(&mut candidate_rx),
                 Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
             ));
+            sent_calibration_frames.push(frame.clone());
+            if sender.request_ack_clock_calibration_bytes[&candidate]
+                >= sender.request_ack_clock_calibration_targets[&candidate]
+            {
+                break;
+            }
         }
-        assert_eq!(
-            sender.request_ack_clock_calibration_bytes[&candidate],
-            calibration_limit as u64
+        assert!(
+            sender.request_ack_clock_calibration_bytes[&candidate]
+                >= sender.request_ack_clock_calibration_targets[&candidate]
         );
-
-        ack_client_frame_for_test(&mut sender, &context, &calibration_frames[0]);
+        assert_eq!(
+            sender.request_ack_clock_calibration_owner,
+            Some(RequestAckClockCalibrationOwner {
+                candidate,
+                target_bytes: sender.request_ack_clock_calibration_targets[&candidate],
+            })
+        );
         assert!(
             !sender
                 .request_ack_clock_proven_subflows
                 .contains(&candidate)
         );
-        ack_client_frame_for_test(&mut sender, &context, &calibration_frames[1]);
+        for frame in &sent_calibration_frames {
+            ack_client_frame_for_test(&mut sender, &context, frame);
+        }
         assert!(
             sender
                 .request_ack_clock_proven_subflows
                 .contains(&candidate)
         );
+        assert_eq!(sender.request_ack_clock_calibration_owner, None);
         assert!(sender.request_owner_ack_can_grow_window(&remotes, Some(service), service));
         assert!(
             sender.request_owner_ack_can_grow_window(&remotes, Some(service), candidate),
             "a live graduated instance gains window-growth rights only after ACK-clock proof"
         );
-        for frame in calibration_frames.iter().skip(2) {
-            ack_client_frame_for_test(&mut sender, &context, frame);
-        }
         let learned_rate = context
             .tcp_path_snapshot(candidate_key.index)
             .expect("candidate snapshot")
@@ -9934,7 +10848,7 @@ mod tests {
 
         let third = client_data_frame_for_test(
             stream_id,
-            calibration_limit as u64,
+            sender.request_ack_clock_calibration_bytes[&candidate],
             BBR_MAX_SEND_QUANTUM_BYTES,
         );
         let outcome = sender
@@ -9952,8 +10866,9 @@ mod tests {
             )),
             key => panic!("unexpected post-calibration path: {key:?}"),
         }
-        assert_eq!(
-            sender.request_ack_clock_calibration_bytes[&candidate], calibration_limit as u64,
+        assert!(
+            sender.request_ack_clock_calibration_bytes[&candidate]
+                >= sender.request_ack_clock_calibration_targets[&candidate],
             "ACK release and ordinary scheduling must not refill calibration credit"
         );
     }
@@ -9966,6 +10881,7 @@ mod tests {
             "tcp://127.0.0.1:10285?srtt-ms=5&rate-mbps=500",
             "tcp://127.0.0.1:10286?srtt-ms=40&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -10105,6 +11021,7 @@ mod tests {
             underlay: UnderlayProtocol::Tcp,
             index: 1,
         };
+        seed_client_bulk_evidence_for_test(&context, candidate_key);
         let (service_commands, _service_rx) = reliable_path_command_channels(8);
         let mut remotes = ReliableRelayRemoteSet::new(
             opened_test_relay_stream(stream_id, service_key.index, service_commands),
@@ -10161,6 +11078,7 @@ mod tests {
         );
         assert_eq!(owner_progress.len(), 1);
         assert_eq!(owner_progress[0].instance, stale);
+        assert!(sender.request_rate_proven_subflows.contains(&stale));
         assert!(
             !sender.request_owner_ack_can_grow_window(&remotes, Some(service), stale),
             "same-key progress from a detached instance must not grow the replacement epoch"
@@ -10194,6 +11112,7 @@ mod tests {
             "tcp://127.0.0.1:10293?srtt-ms=20&rate-mbps=500",
             "tcp://127.0.0.1:10294?srtt-ms=10&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -10202,6 +11121,7 @@ mod tests {
             underlay: UnderlayProtocol::Tcp,
             index: 1,
         };
+        seed_client_bulk_evidence_for_test(&context, service_key);
         let (old_commands, mut old_rx) = reliable_path_command_channels(8);
         let mut remotes = ReliableRelayRemoteSet::new(
             opened_test_relay_stream(stream_id, service_key.index, old_commands),
@@ -10707,6 +11627,7 @@ mod tests {
             "tcp://127.0.0.1:10291?srtt-ms=20&rate-mbps=500",
             "tcp://127.0.0.1:10292?srtt-ms=10&rate-mbps=500",
         ]);
+        let _request_bulk_flows = active_request_bulk_flow_registrations(&context);
         let service_key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -10766,6 +11687,57 @@ mod tests {
             Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
         ));
         assert_eq!(sender.ordered_data_owner, Some(service_key));
+        assert!(
+            remotes
+                .paths
+                .iter()
+                .find(|path| path.instance() == candidate)
+                .expect("candidate path")
+                .has_load_reservation(),
+            "first optional OwnerData commits this logical flow's path load"
+        );
+        assert_eq!(
+            context.health.lock().expect("path health lock").tcp[1].active_flows,
+            1,
+            "concurrent flows must see that this Subflow already consumes carrier capacity"
+        );
+
+        drop(remotes);
+        assert_eq!(
+            context.health.lock().expect("path health lock").tcp[1].active_flows,
+            0,
+            "dropping the remote set must release a committed startup load lease"
+        );
+    }
+
+    #[test]
+    fn stale_shared_load_snapshot_has_only_one_claim_winner() {
+        let context =
+            client_test_context_with_paths(&["tcp://127.0.0.1:10307?srtt-ms=180&rate-mbps=500"]);
+        let key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        };
+
+        let first = context
+            .try_reserve_relay_path_load_if_unchanged(key, FlowLane::Throughput, 0, 0)
+            .expect("first exact snapshot claim");
+        assert!(
+            context
+                .try_reserve_relay_path_load_if_unchanged(key, FlowLane::Throughput, 0, 0,)
+                .is_none(),
+            "a stale contender must rescore instead of sharing the same idle candidate"
+        );
+        assert_eq!(
+            context.health.lock().expect("path health lock").tcp[0].active_flows,
+            1
+        );
+
+        drop(first);
+        assert_eq!(
+            context.health.lock().expect("path health lock").tcp[0].active_flows,
+            0
+        );
     }
 
     #[tokio::test]
@@ -10943,6 +11915,84 @@ mod tests {
         assert!(sender.request_graduated_subflows.contains(&graduated));
     }
 
+    #[test]
+    fn request_calibration_rollback_restores_owner_spend_and_target_atomically() {
+        let candidate = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            },
+            id: 7,
+        };
+        let mut sender = RelaySenderService::new(StreamId(109));
+        sender.request_ack_clock_calibration_owner = Some(RequestAckClockCalibrationOwner {
+            candidate,
+            target_bytes: 2 * 1024 * 1024,
+        });
+        sender
+            .request_ack_clock_calibration_bytes
+            .insert(candidate, 64 * 1024);
+        sender
+            .request_ack_clock_calibration_targets
+            .insert(candidate, 2 * 1024 * 1024);
+
+        sender
+            .request_ack_clock_calibration_bytes
+            .insert(candidate, 128 * 1024);
+        sender.rollback_request_ack_clock_calibration(Some(RequestAckClockCalibrationRollback {
+            candidate,
+            previous_owner: Some(RequestAckClockCalibrationOwner {
+                candidate,
+                target_bytes: 2 * 1024 * 1024,
+            }),
+            previous_bytes: Some(64 * 1024),
+            previous_target: Some(2 * 1024 * 1024),
+        }));
+        assert_eq!(
+            sender.request_ack_clock_calibration_bytes[&candidate],
+            64 * 1024
+        );
+        assert_eq!(
+            sender.request_ack_clock_calibration_targets[&candidate],
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            sender.request_ack_clock_calibration_owner,
+            Some(RequestAckClockCalibrationOwner {
+                candidate,
+                target_bytes: 2 * 1024 * 1024,
+            })
+        );
+
+        sender.request_ack_clock_calibration_owner = Some(RequestAckClockCalibrationOwner {
+            candidate,
+            target_bytes: 2 * 1024 * 1024,
+        });
+        sender
+            .request_ack_clock_calibration_bytes
+            .insert(candidate, 64 * 1024);
+        sender
+            .request_ack_clock_calibration_targets
+            .insert(candidate, 2 * 1024 * 1024);
+        sender.rollback_request_ack_clock_calibration(Some(RequestAckClockCalibrationRollback {
+            candidate,
+            previous_owner: None,
+            previous_bytes: None,
+            previous_target: None,
+        }));
+        assert_eq!(sender.request_ack_clock_calibration_owner, None);
+        assert!(
+            !sender
+                .request_ack_clock_calibration_bytes
+                .contains_key(&candidate)
+        );
+        assert!(
+            !sender
+                .request_ack_clock_calibration_targets
+                .contains_key(&candidate)
+        );
+    }
+
     #[tokio::test]
     async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
         let stream_id = StreamId(111);
@@ -10991,6 +12041,16 @@ mod tests {
         sender.ordered_data_owner_instance = Some(service);
         sender.request_subflow_set = Some(epoch);
         sender.request_attempted_subflows.insert(candidate);
+        sender.request_ack_clock_calibration_owner = Some(RequestAckClockCalibrationOwner {
+            candidate,
+            target_bytes: 2 * 1024 * 1024,
+        });
+        sender
+            .request_ack_clock_calibration_bytes
+            .insert(candidate, 64 * 1024);
+        sender
+            .request_ack_clock_calibration_targets
+            .insert(candidate, 2 * 1024 * 1024);
         remotes
             .paths
             .iter_mut()
@@ -11001,6 +12061,10 @@ mod tests {
         sender.reconcile_request_subflow_set(&context, &remotes);
 
         assert!(sender.request_subflow_set.is_none());
+        assert_eq!(
+            sender.request_ack_clock_calibration_owner, None,
+            "an optional calibration epoch cannot survive promotion away from Validation"
+        );
         assert!(
             sender.request_attempted_subflows.contains(&candidate),
             "a live role change invalidates the epoch without minting fresh credit"
@@ -11077,6 +12141,7 @@ mod tests {
             .dispatch_client_queued_work(
                 &context,
                 &spec,
+                FlowLane::Throughput,
                 FlowLane::Throughput,
                 &mut remotes,
                 &mut send_stream,
@@ -12055,7 +13120,6 @@ mod tests {
             commands,
             attachment_role: StreamOpenRole::Active,
             snapshot,
-            rate_scope: ResponseRateScope::PathCapacity,
             owner_data_in_flight_bytes: 0,
             command_pending_bytes: 0,
             eta_ms: 1.0,
@@ -15549,7 +16613,6 @@ mod tests {
             commands: service_commands,
             attachment_role: StreamOpenRole::Active,
             snapshot: service_snapshot,
-            rate_scope: ResponseRateScope::PathCapacity,
             owner_data_in_flight_bytes: 0,
             command_pending_bytes: 0,
             eta_ms: 50.0,
@@ -18956,7 +20019,7 @@ mod tests {
     fn balanced_service_handoff_requires_two_x_projected_gain() {
         let mut service =
             response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-        service.rate_scope = ResponseRateScope::PerFlowGoodput;
+        service.snapshot.rate_scope = ResponseRateScope::PerFlowGoodput;
         service.snapshot.delivery_rate_bps = 60_000_000.0;
         let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         udp.snapshot.delivery_rate_bps = 100_000_000.0;
@@ -18988,7 +20051,7 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut service =
             response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-        service.rate_scope = ResponseRateScope::PerFlowGoodput;
+        service.snapshot.rate_scope = ResponseRateScope::PerFlowGoodput;
         service.snapshot.delivery_rate_bps = 1_000_000.0;
         let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
@@ -19485,6 +20548,11 @@ mod tests {
         );
         assert_eq!(effective.quic_capacity_proof, Some(proof));
         assert_eq!(effective.snapshot.delivery_rate_bps, proof.rate_bps as f64);
+        assert_eq!(
+            effective.snapshot.rate_scope,
+            ResponseRateScope::PathCapacity,
+            "the pinned QUIC receipt rate and its capacity scope are one snapshot authority"
+        );
         assert!(response_service_handoff_preserves_fair_share(
             &service, &effective
         ));
@@ -19531,9 +20599,9 @@ mod tests {
         udp.snapshot.delivery_rate_bps = 80_000_000.0;
         udp.snapshot.active_flows = 0;
 
-        tcp.rate_scope = ResponseRateScope::PathCapacity;
+        tcp.snapshot.rate_scope = ResponseRateScope::PathCapacity;
         assert!(response_service_handoff_preserves_fair_share(&tcp, &udp));
-        tcp.rate_scope = ResponseRateScope::PerFlowGoodput;
+        tcp.snapshot.rate_scope = ResponseRateScope::PerFlowGoodput;
         assert!(
             !response_service_handoff_preserves_fair_share(&tcp, &udp),
             "a 100 Mbps per-flow TCP observation must not be divided a second time"

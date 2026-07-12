@@ -19,7 +19,8 @@ pub(super) use crate::protocol::{
     UnderlayProtocol,
 };
 pub(super) use crate::scheduler::{
-    self, FlowDemand, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
+    self, FlowDemand, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState,
+    SchedulerPolicy,
 };
 pub(super) use crate::transport::PathSpec;
 pub(super) use crate::transport::encrypted::{

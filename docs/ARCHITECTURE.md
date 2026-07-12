@@ -39,7 +39,17 @@ contract as same-family multipath placement.
   being representable here does not make it legal on every carrier or role.
 - `src/runtime/relay_*`: product-flow lifecycle, local/target I/O, validation,
   repair triggers, and client-side relay coordination.
-- `src/runtime/sender_service.rs`: ranks immutable response-path snapshots and
+- `src/runtime/core.rs`: owns the session-shared TCP-Service request-flow count
+  and its cancellation-safe registration lifetime. One active request stream
+  with present work contributes once only while its exact Service is TCP; path
+  attachment load and QUIC-Service demand are different ledgers.
+- `src/runtime/relay_striping.rs`: owns TCP request startup, exact-owner
+  graduation, and product-ACK calibration admission. It consumes the frozen
+  exact calibration owner/target plus logical-flow and path evidence but does
+  not redefine any of them.
+- `src/runtime/sender_service.rs`: owns request-local exact calibration identity,
+  frozen target/spend rollback, causal ACK boundaries, and the continuous
+  per-flow ACK model. It also ranks immutable response-path snapshots and
   proposes work. It must not mutate carrier recovery state or claim product
   offsets before the reliable-path commit.
 - `src/runtime/reliable_path.rs`: owns product stream attachments, exact range
@@ -159,6 +169,29 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   native window is available. Datagram goodput may rank datagram paths but never
   satisfies reliable product durability; data-plane failure invalidates both
   durable product and native-window authority for the failed association.
+- Open fresh TCP request discovery only under real same-family logical
+  contention. Startup and zero-spend ACK-clock calibration require at least two
+  active logical bulk request flows whose exact committed Service is TCP,
+  counting each stream once regardless of its path attachments. Present queued
+  or outstanding request data is required; reverse bytes, idle completed
+  uploads, QUIC-Service demand, and per-path load cannot substitute for this
+  gate. A begun exact-owner epoch may drain after a two-to-one transition.
+  No path-wide completion estimate may veto fresh request calibration until
+  request-direction, provenance-bound authority exists. The ACK of all exact
+  sealed startup `OwnerData`, or the exact ordered receipt ACK when it arrives
+  first, establishes the candidate's calibration boundary. One explicit
+  exact-instance calibration owner then spends one frozen, cumulative,
+  non-refilling target, 2 MiB with default envelopes. Exact-owner, debt,
+  resource, pressure, and post-boundary causality guards still apply. The
+  target does not expand to a modeled pipe. Instead, exact ownership permits a
+  provisional Service-derived rate and pipe only for an endpoint-only
+  candidate until its continuous product-ACK model reaches ten exact samples,
+  at which point its own model replaces that prior. A configured candidate
+  retains its own capacity hint. This avoids serial probe work stalling the only
+  data-bearing upload while still giving kernel TCP enough bounded exploration
+  credit to leave slow start. QUIC stays outside product-ACK calibration and
+  requires attributable post-attachment native packet-ACK evidence. One-flow
+  optional-path aggregation remains unproven for both carrier families.
 - Encode large probe trains incrementally. Do not allocate a vector containing
   every frame or copy the complete train solely for queue admission.
 - Treat time sources explicitly. Carrier ACK timing, scheduler poll timing, and
@@ -184,6 +217,21 @@ throughput. Use matched, instrumentation-free release rows for performance
 claims. A poor row should first identify the violated ownership, evidence,
 queue, or clock contract; repeating the same row without a new hypothesis is
 not an optimization iteration.
+
+The current accepted same-condition TCP request result is Iteration 109. Its
+diagnostics-disabled, exact 18-second upload rows use two logical flows and five
+500 Mbps, 180 ms, 1 ms jitter, zero-loss paths: multipath reaches 691.368 Mbps
+against 314.999 Mbps single-path, or 2.195x overall. The broad `[9,18)` and
+supporting `[15,18)` ratios are 2.935x and 2.409x. Client transmit shares are
+37.15%, 33.44%, 4.78%, 10.47%, and 14.17%. Relative to Iteration 69 under the
+same profile, multipath changes +10.38% overall, +11.77% broad, and -6.36% late;
+the `[9,15)` window improves 22.02%, so the lower late burst reflects earlier
+delivery rather than a hidden aggregate loss. The matched single control changes
+-0.32%, +0.56%, and +3.53%. This proves the
+final TCP ownership/calibration model did not silently trade away the retained
+multi-flow aggregation result. It does not prove one-flow striping, QUIC or
+mixed-carrier aggregation, real-Internet performance, failover, or current
+MPTCP/Hysteria2 superiority.
 
 The staged TCP-to-QUIC placement row keeps an attached UDP transport warm while
 management excludes it from scheduling. This isolates proof and ownership from

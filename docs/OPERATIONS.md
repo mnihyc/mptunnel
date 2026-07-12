@@ -135,6 +135,44 @@ This is automatic and has no operator knob. `STREAM_ACK` means the peer handed
 bytes to its local target socket, not that the target application consumed them,
 and it never supplies QUIC carrier capacity.
 
+TCP request-path discovery also uses an automatic logical-contention gate. A
+fresh optional-path startup sample and a fresh zero-spend ACK-clock calibration
+require at least two active logical bulk request flows whose exact committed
+Service is TCP; one stream still counts once when attached to several paths,
+because per-path load is occupancy rather than independent demand. Only present
+queued or outstanding request-direction work counts; reverse bytes, idle
+completed uploads, and QUIC-Service flows never do. A begun exact-owner epoch
+may drain after the count falls from two to one. No path-wide completion estimate
+may veto fresh request calibration until
+request-direction, provenance-bound authority exists. Either the exact ACK that
+completes all sealed startup `OwnerData`, or the exact ordered receipt ACK when
+it arrives first, starts the follow-on causal interval. Calibration has one
+explicit exact path-instance owner and a target frozen when that owner is
+claimed. With default envelopes the target is a cumulative, non-refilling
+2 MiB proof, not a pipe-sized transfer; exact-owner, debt, resource, pressure,
+causality, and enqueue-credit guards remain active. After exact ownership, a
+Service-derived provisional rate and pipe may keep an endpoint-only TCP
+candidate from remaining artificially underfilled; a configured candidate
+retains its own capacity hint. The candidate's continuous exact product-ACK
+model replaces the provisional prior at ten exact samples. With one upload, the
+two-flow gate still preserves Service stability instead of serially probing
+optional TCP paths. This is not proof of one-flow aggregation: TCP still needs
+independent attributable evidence, while QUIC requires fresh post-attachment,
+non-app-limited native packet-ACK evidence and never uses product-ACK
+calibration.
+
+The retained clean control for this behavior is Iteration 109, not a production
+capacity promise. With two upload flows and five shaped 500 Mbps, 180 ms,
+1 ms-jitter, zero-loss paths, exact diagnostics-disabled goodput is
+691.368 Mbps multipath and 314.999 Mbps single-path: 2.195x overall, 2.935x in
+the `[9,18)` sink-ACK window, and 2.409x in `[15,18)`. Client transmit shares
+are 37.15%, 33.44%, 4.78%, 10.47%, and 14.17%. Versus the matched Iteration 69
+profile, multipath improves 10.38% overall and 11.77% broad but changes -6.36%
+late; `[9,15)` improves 22.02%, so delivery moved earlier instead of depending
+on a final burst. The single control changes -0.32%, +0.56%, and +3.53%. Do not extrapolate this
+row to one-flow aggregation, QUIC, mixed carriers, real Internet, failover, or
+current MPTCP/Hysteria2 comparisons; those require their own matched cohorts.
+
 A QUIC bulk stream advertises the configured product receive window, 64 MiB by
 default. This is receiver-memory authority, not the QUIC congestion window or
 path-capacity proof. Before exact feed evidence, response source and emission

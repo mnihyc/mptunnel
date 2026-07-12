@@ -218,6 +218,45 @@ fn reliable_relay_request_ack_growth_interval(
         .unwrap_or_else(|| transport_pto_from_snapshot(None))
 }
 
+fn reliable_tcp_service_request_bulk_flow_is_active(
+    local_open: bool,
+    request_observed_bytes: u64,
+    bulk_threshold_bytes: u64,
+    queued_data_bytes: usize,
+    outstanding_data_bytes: usize,
+) -> bool {
+    local_open
+        && request_observed_bytes >= bulk_threshold_bytes
+        && (queued_data_bytes > 0 || outstanding_data_bytes > 0)
+}
+
+fn update_tcp_service_request_bulk_flow_registration(
+    registration: &ReliableTcpRequestBulkFlowRegistration,
+    sender: &RelaySenderService,
+    remotes: &ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    sender_queue: &ReliableRelaySenderQueue,
+    local_open: bool,
+    path_snapshot: Option<PathSnapshot>,
+    mux_limits: MuxLimits,
+) {
+    let request_observed_bytes = send_stream
+        .next_offset()
+        .saturating_add(sender_queue.data_bytes() as u64);
+    let request_bulk_active = reliable_tcp_service_request_bulk_flow_is_active(
+        local_open,
+        request_observed_bytes,
+        reliable_flow_bulk_threshold_bytes(path_snapshot, mux_limits),
+        sender_queue.data_bytes(),
+        send_stream.repair_bytes(),
+    );
+    let service_underlay = sender
+        .request_ordered_service_instance()
+        .filter(|service| remotes.contains_path_instance(*service))
+        .map(|service| service.key.underlay);
+    registration.update(request_bulk_active, service_underlay);
+}
+
 pub(super) async fn relay_migrating_tcp_stream<S>(
     mut local: S,
     context: &ClientPathContext,
@@ -249,6 +288,9 @@ where
     let mut sender = RelaySenderService::new(stream_id);
     let mut request_outstanding_window = ReliableRelayRequestOutstandingWindow::new();
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
+    let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
+    let request_bulk_flow = context.reliable_tcp_request_bulk_flow_registration();
+    sender.bind_request_bulk_flow_registration(request_bulk_flow.clone());
     let mut last_stream_progress_at = Instant::now();
     let mut last_delivery_progress_at = Instant::now();
     let mut last_response_stall_repair_at = Instant::now();
@@ -301,6 +343,40 @@ where
         );
         let relay_demand = demand_update.demand;
         let relay_lane = relay_demand.lane;
+        let request_observed_bytes = send_stream
+            .next_offset()
+            .saturating_add(sender_queue.data_bytes() as u64);
+        let request_demand_update = request_flow_demand.refresh(
+            ReliableRelayFlowSignals::new(request_observed_bytes, 0, 0),
+            path_snapshot,
+            context.mux_limits,
+        );
+        let request_lane = request_demand_update.demand.lane;
+        #[cfg(feature = "lab-diagnostics")]
+        if reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane) {
+            lab_diagnostic(
+                "client_request_lane_changed",
+                format_args!(
+                    "stream_id={} previous={:?} lane={:?} observed_bytes={} send_rate_mbps={:.3} relay_lane={:?}",
+                    stream_id.0,
+                    request_demand_update.previous_lane,
+                    request_lane,
+                    request_demand_update.observed_bytes,
+                    request_demand_update.send_rate_bps / 1_000_000.0,
+                    relay_lane,
+                ),
+            );
+        }
+        update_tcp_service_request_bulk_flow_registration(
+            &request_bulk_flow,
+            &sender,
+            &remotes,
+            &send_stream,
+            &sender_queue,
+            local_open,
+            path_snapshot,
+            context.mux_limits,
+        );
         for failed_instance in sender.unreported_missing_owner_instances(
             &remotes,
             reliable_relay_stall_timeout(path_snapshot, relay_lane),
@@ -1132,11 +1208,12 @@ where
                     && (dispatched_payload_bytes < sender_dispatch_byte_budget
                         || dispatched_items == 0)
                 {
-                    match sender
+                    let dispatch = sender
                         .dispatch_client_queued_work(
                             context,
                             &spec,
                             relay_lane,
+                            request_lane,
                             &mut remotes,
                             &mut send_stream,
                             &mut sender_queue,
@@ -1147,8 +1224,20 @@ where
                                     .saturating_sub(dispatched_payload_bytes),
                             ),
                         )
-                        .await
-                    {
+                        .await;
+                    // A successful Service dispatch may commit a carrier-family
+                    // handoff. Publish it before another item in this batch.
+                    update_tcp_service_request_bulk_flow_registration(
+                        &request_bulk_flow,
+                        &sender,
+                        &remotes,
+                        &send_stream,
+                        &sender_queue,
+                        local_open,
+                        path_snapshot,
+                        context.mux_limits,
+                    );
+                    match dispatch {
                         Ok(ClientQueuedDispatch::Data { payload_bytes }) => {
                             dispatched_items = dispatched_items.saturating_add(1);
                             dispatched_payload_bytes =
@@ -1408,7 +1497,9 @@ where
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
-                        remotes.fail_path_instance(context, instance).await;
+                        sender
+                            .fail_client_path_instance(context, &mut remotes, instance)
+                            .await;
                         recovery_excluded_paths.insert(path_key);
                         match recover_reliable_relay_after_path_failure(
                             &mut sender,
@@ -2096,7 +2187,9 @@ where
                             }
                             Ok(false) => {}
                             Err(err) if reliable_relay_error_is_migratable(&err) => {
-                                remotes.fail_path_instance(context, instance).await;
+                                sender
+                                    .fail_client_path_instance(context, &mut remotes, instance)
+                                    .await;
                                 recovery_excluded_paths.insert(path_key);
                                 if remotes.is_empty() {
                                     break Err(err);
@@ -2148,6 +2241,8 @@ where
             else => break Ok(stats),
         }
     };
+
+    request_bulk_flow.update(false, None);
 
     let _ = drain_completed_validation_opens(
         context,
@@ -2635,10 +2730,13 @@ fn reliable_relay_validation_open_candidates(
     remotes: &ReliableRelayRemoteSet,
     payload_bytes: usize,
 ) -> Vec<RelayPathKey> {
+    // Admission gives unproven OwnerData only to an idle carrier. Offer the
+    // same candidates first here; otherwise the one-shot opener can attach an
+    // occupied measured path that startup policy must immediately reject.
     let mut candidates = context
-        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
+        .ordered_reliable_bulk_validation_path_keys(payload_bytes)
         .into_iter()
-        .chain(context.ordered_reliable_bulk_validation_path_keys(payload_bytes))
+        .chain(context.ordered_reliable_bulk_striping_path_keys(payload_bytes))
         .collect::<Vec<_>>();
     let mut unique_candidates = Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
@@ -3276,6 +3374,30 @@ mod tests {
         assert!(!reliable_relay_lane_changed(
             FlowLane::Throughput,
             FlowLane::Throughput,
+        ));
+    }
+
+    #[test]
+    fn tcp_request_contention_requires_present_request_work() {
+        let threshold = 256 * 1024;
+        assert!(!reliable_tcp_service_request_bulk_flow_is_active(
+            true, threshold, threshold, 0, 0,
+        ));
+        assert!(reliable_tcp_service_request_bulk_flow_is_active(
+            true, threshold, threshold, 1, 0,
+        ));
+        assert!(!reliable_tcp_service_request_bulk_flow_is_active(
+            true,
+            threshold - 1,
+            threshold,
+            0,
+            1,
+        ));
+        assert!(!reliable_tcp_service_request_bulk_flow_is_active(
+            false, threshold, threshold, 1, 1,
+        ));
+        assert!(reliable_tcp_service_request_bulk_flow_is_active(
+            true, threshold, threshold, 0, 1,
         ));
     }
 
@@ -4186,6 +4308,73 @@ mod tests {
                 index: 0,
             }),
             "cross-family validation remains eligible as fallback/probe, but not before the Service-family survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_open_candidates_offer_distinct_idle_paths_before_occupied_services() {
+        let context = ClientPathContext::new(
+            (0..5)
+                .map(|index| {
+                    format!(
+                        "tcp://127.0.0.1:{}?srtt-ms=180&rate-mbps=500",
+                        23201 + index
+                    )
+                    .parse()
+                    .expect("equal TCP path")
+                })
+                .collect(),
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+        context.reserve_tcp_path_load(0, FlowLane::Throughput);
+        context.reserve_tcp_path_load(1, FlowLane::Throughput);
+
+        let (first_commands, _first_receivers) = reliable_path_command_channels(1);
+        let first = ReliableRelayRemoteSet::new(
+            OpenedRemoteStream {
+                path_index: 0,
+                stream: test_reliable_path_stream(
+                    StreamId(12),
+                    UnderlayProtocol::Tcp,
+                    0,
+                    first_commands,
+                    FlowLane::Throughput,
+                ),
+            },
+            5,
+        );
+        let first_candidates = reliable_relay_validation_open_candidates(
+            &context,
+            &first,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+        assert_eq!(first_candidates[0].index, 2);
+
+        context.reserve_tcp_path_load(2, FlowLane::Throughput);
+        let (second_commands, _second_receivers) = reliable_path_command_channels(1);
+        let second = ReliableRelayRemoteSet::new(
+            OpenedRemoteStream {
+                path_index: 1,
+                stream: test_reliable_path_stream(
+                    StreamId(13),
+                    UnderlayProtocol::Tcp,
+                    1,
+                    second_commands,
+                    FlowLane::Throughput,
+                ),
+            },
+            5,
+        );
+        let second_candidates = reliable_relay_validation_open_candidates(
+            &context,
+            &second,
+            reliable_relay_buffer_len(MuxLimits::default()),
+        );
+        assert_eq!(
+            second_candidates[0].index, 3,
+            "the second flow must not collide with either Service or the first claimed candidate"
         );
     }
 

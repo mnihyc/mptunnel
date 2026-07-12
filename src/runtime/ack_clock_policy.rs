@@ -81,6 +81,32 @@ pub(super) fn reliable_ack_clock_calibration_rate_coverage_floor_bytes(
         .min(product_limit)
 }
 
+pub(super) fn reliable_request_ack_clock_calibration_target_bytes(mux_limits: MuxLimits) -> u64 {
+    let base = reliable_ack_clock_calibration_limit_bytes(mux_limits);
+    let ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
+    if base == 0 {
+        return 0;
+    }
+    // This bounded epoch proves causal request ownership; it is not a second
+    // congestion controller and must not serialize an entire high-BDP pipe.
+    // Continuous exact samples mature after admission. Reserve one maximum
+    // frame so non-divisible configured geometry can cross the target.
+    let max_payload = BBR_MAX_SEND_QUANTUM_BYTES
+        .min(mux_limits.max_reliable_relay_chunk_bytes)
+        .min(mux_limits.max_payload_bytes)
+        .min(mux_limits.max_path_flight_bytes)
+        .max(1) as u64;
+    if max_payload > ceiling {
+        return 0;
+    }
+    let reachable_target = ceiling.saturating_sub(max_payload);
+    if reachable_target == 0 {
+        base.min(ceiling)
+    } else {
+        base.min(reachable_target)
+    }
+}
+
 pub(super) fn reliable_tcp_ack_clock_calibration_initial_limit_bytes(
     candidate: PathSnapshot,
     mux_limits: MuxLimits,
@@ -159,6 +185,50 @@ mod tests {
         assert_eq!(
             reliable_tcp_ack_clock_calibration_initial_limit_bytes(fast, mux_limits),
             product_limit
+        );
+    }
+
+    #[test]
+    fn request_calibration_is_a_bounded_seed_below_a_high_bdp_pipe() {
+        let mux_limits = MuxLimits::default();
+        let service = PathSnapshot::new(PathId(3), UnderlayProtocol::Tcp, 180.0, 500_000_000.0);
+        let target = reliable_request_ack_clock_calibration_target_bytes(mux_limits);
+        assert!(target <= reliable_ack_clock_calibration_ceiling_bytes(mux_limits));
+        assert_eq!(
+            target,
+            reliable_ack_clock_calibration_limit_bytes(mux_limits)
+        );
+        assert!(target < bulk_candidate_pipe_bytes(service));
+    }
+
+    #[test]
+    fn request_calibration_target_is_reachable_with_configured_chunk_geometry() {
+        let mux_limits = MuxLimits {
+            max_stream_window_bytes: 30_000,
+            max_repair_bytes: 30_000,
+            max_reorder_bytes: 30_000,
+            max_path_flight_bytes: 30_000,
+            max_reliable_relay_chunk_bytes: 9_000,
+            ..MuxLimits::default()
+        };
+        let target = reliable_request_ack_clock_calibration_target_bytes(mux_limits);
+        let emitted = target.div_ceil(9_000) * 9_000;
+        assert!(target > 0);
+        assert!(emitted <= reliable_ack_clock_calibration_ceiling_bytes(mux_limits));
+
+        let frame_exceeds_ceiling = MuxLimits {
+            max_repair_bytes: 30_000,
+            max_reorder_bytes: 30_000,
+            max_stream_window_bytes: 30_000,
+            max_reliable_relay_chunk_bytes: 64 * 1024,
+            max_payload_bytes: 64 * 1024,
+            max_path_flight_bytes: 64 * 1024,
+            ..MuxLimits::default()
+        };
+        assert_eq!(
+            reliable_request_ack_clock_calibration_target_bytes(frame_exceeds_ceiling),
+            0,
+            "request calibration is disabled when one maximum frame cannot fit its resource ceiling"
         );
     }
 }

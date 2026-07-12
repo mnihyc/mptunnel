@@ -1,17 +1,11 @@
 use super::response_session::ResponseServiceFamilyLoads;
 use crate::protocol::UnderlayProtocol;
-use crate::scheduler::PathSnapshot;
+use crate::scheduler::{PathRateScope, PathSnapshot};
 
 // Carrier-neutral placement policy consumes normalized evidence. TCP and QUIC
 // produce different rate scopes; neither transport owns whole-flow decisions.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum ResponseRateScope {
-    /// Product ACK clock already measures this response stream's delivered share.
-    PerFlowGoodput,
-    /// Carrier/receipt evidence measures aggregate path capacity.
-    PathCapacity,
-}
+pub(in crate::runtime) type ResponseRateScope = PathRateScope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ResponseServiceHandoffMode {

@@ -58,6 +58,7 @@ pub(super) struct ReliableRelayRemotePath {
     pub(super) instance_id: u64,
     pub(super) placement: RelayPathPlacement,
     pub(super) load_reserved: bool,
+    pub(super) load_lease: Option<RelayPathLoadLease>,
     pub(super) attached_at: Instant,
     pub(super) path_proof_id: Option<u64>,
     pub(super) path_proof_generation: u64,
@@ -77,6 +78,10 @@ impl ReliableRelayRemotePath {
             key: self.key(),
             id: self.instance_id,
         }
+    }
+
+    pub(super) fn has_load_reservation(&self) -> bool {
+        self.load_reserved || self.load_lease.is_some()
     }
 }
 
@@ -173,7 +178,7 @@ impl ReliableRelayRemoteSet {
     pub(super) fn load_reserved_path_keys(&self) -> Vec<RelayPathKey> {
         self.paths
             .iter()
-            .filter(|path| path.load_reserved)
+            .filter(|path| path.has_load_reservation())
             .map(ReliableRelayRemotePath::key)
             .collect()
     }
@@ -207,6 +212,10 @@ impl ReliableRelayRemoteSet {
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
         for path in &mut self.paths {
             path.stream.lane = lane;
+            if let Some(lease) = &mut path.load_lease {
+                // Relay control has already moved the shared load counters.
+                lease.set_recorded_lane(lane);
+            }
         }
     }
 
@@ -303,6 +312,7 @@ impl ReliableRelayRemoteSet {
             instance_id,
             placement,
             load_reserved: placement == RelayPathPlacement::Active,
+            load_lease: None,
             attached_at: Instant::now(),
             path_proof_id: None,
             path_proof_generation: 0,
@@ -361,7 +371,7 @@ impl ReliableRelayRemoteSet {
         context: &ClientPathContext,
         instance: RelayPathInstance,
     ) -> bool {
-        let Some(path) = self.remove_path_instance(instance) else {
+        let Some(mut path) = self.remove_path_instance(instance) else {
             return false;
         };
         context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
@@ -372,6 +382,9 @@ impl ReliableRelayRemoteSet {
                 path.stream.lane,
             );
         }
+        // The path is no longer schedulable. Release its exact optional-flow
+        // lease before detach can wait behind a saturated carrier queue.
+        drop(path.load_lease.take());
         path.stream.send_detach().await;
         path.stream.close().await;
         true
@@ -433,7 +446,7 @@ impl ReliableRelayRemoteSet {
         else {
             return false;
         };
-        if path.load_reserved {
+        if path.has_load_reservation() {
             return false;
         }
         match path.stream.underlay {
@@ -442,6 +455,25 @@ impl ReliableRelayRemoteSet {
         }
         path.load_reserved = true;
         true
+    }
+
+    pub(super) fn commit_path_instance_load_claim(
+        &mut self,
+        instance: RelayPathInstance,
+        lease: RelayPathLoadLease,
+    ) -> Result<(), RelayPathLoadLease> {
+        let Some(path) = self
+            .paths
+            .iter_mut()
+            .find(|path| path.instance() == instance)
+        else {
+            return Err(lease);
+        };
+        if path.has_load_reservation() {
+            return Err(lease);
+        }
+        path.load_lease = Some(lease);
+        Ok(())
     }
 
     fn active_path_position(&self) -> Option<usize> {

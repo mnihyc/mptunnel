@@ -18,6 +18,7 @@ use super::udp_metrics::UdpPathMetrics;
 use super::udp_path::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 // RFC 9002's recommended QUIC initial congestion window is based on ten max
@@ -304,6 +305,9 @@ pub struct ClientPathContext {
     pub(super) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
     // Product ownership: reliable stream IDs live above TCP and QUIC UDP paths.
     pub(super) next_reliable_stream_id: Arc<Mutex<u64>>,
+    // TCP exploration is amortized by distinct TCP-Service request flows, not
+    // by path attachments or QUIC traffic in the same product session.
+    active_tcp_service_request_bulk_flows: Arc<AtomicU32>,
     // Path-model ownership: health records are evidence snapshots consumed by
     // schedulers; they must not own product bytes or carrier queues.
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
@@ -311,6 +315,91 @@ pub struct ClientPathContext {
     pub(super) mux_limits: MuxLimits,
     #[cfg(test)]
     pub(super) proxy_auth: ProxyAuthConfig,
+}
+
+/// Cancellation-safe ownership of one logical flow's shared path load.
+///
+/// Validation attachment alone is not demand. The lease starts only when the
+/// flow commits unique product bytes and releases the shared scheduler load if
+/// that path, relay task, or enqueue attempt is dropped.
+pub(super) struct RelayPathLoadLease {
+    context: ClientPathContext,
+    key: RelayPathKey,
+    lane: FlowLane,
+}
+
+impl RelayPathLoadLease {
+    pub(super) fn set_recorded_lane(&mut self, lane: FlowLane) {
+        self.lane = lane;
+    }
+}
+
+impl Drop for RelayPathLoadLease {
+    fn drop(&mut self) {
+        self.context
+            .release_relay_path_load(self.key.underlay, self.key.index, self.lane);
+    }
+}
+
+#[derive(Debug)]
+struct ReliableTcpRequestBulkFlowRegistrationState {
+    active_tcp_service_request_bulk_flows: Arc<AtomicU32>,
+    counted: Mutex<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ReliableTcpRequestBulkFlowRegistration {
+    state: Arc<ReliableTcpRequestBulkFlowRegistrationState>,
+}
+
+impl ReliableTcpRequestBulkFlowRegistration {
+    pub(super) fn update(
+        &self,
+        request_bulk_active: bool,
+        service_underlay: Option<UnderlayProtocol>,
+    ) {
+        let counted = request_bulk_active && service_underlay == Some(UnderlayProtocol::Tcp);
+        let mut current = self
+            .state
+            .counted
+            .lock()
+            .expect("TCP-Service request bulk flow registration lock");
+        if *current == counted {
+            return;
+        }
+        if counted {
+            self.state
+                .active_tcp_service_request_bulk_flows
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_add(1)
+                })
+                .expect("TCP-Service request bulk flow count overflow");
+        } else {
+            self.state
+                .active_tcp_service_request_bulk_flows
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .expect("TCP-Service request bulk flow registration is unbalanced");
+        }
+        *current = counted;
+    }
+}
+
+impl Drop for ReliableTcpRequestBulkFlowRegistrationState {
+    fn drop(&mut self) {
+        let counted = self
+            .counted
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *counted {
+            self.active_tcp_service_request_bulk_flows
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                })
+                .expect("TCP-Service request bulk flow registration is unbalanced");
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1095,6 +1184,7 @@ impl ClientPathContext {
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
             next_reliable_stream_id: Arc::new(Mutex::new(0)),
+            active_tcp_service_request_bulk_flows: Arc::new(AtomicU32::new(0)),
             health,
             codec_limits,
             mux_limits,
@@ -1143,6 +1233,24 @@ impl ClientPathContext {
         Ok(stream_id)
     }
 
+    pub(super) fn reliable_tcp_request_bulk_flow_registration(
+        &self,
+    ) -> ReliableTcpRequestBulkFlowRegistration {
+        ReliableTcpRequestBulkFlowRegistration {
+            state: Arc::new(ReliableTcpRequestBulkFlowRegistrationState {
+                active_tcp_service_request_bulk_flows: self
+                    .active_tcp_service_request_bulk_flows
+                    .clone(),
+                counted: Mutex::new(false),
+            }),
+        }
+    }
+
+    pub(super) fn active_tcp_service_request_bulk_flows(&self) -> u32 {
+        self.active_tcp_service_request_bulk_flows
+            .load(Ordering::Acquire)
+    }
+
     pub(super) fn ordered_tcp_path_indices(
         &self,
         lane: FlowLane,
@@ -1174,6 +1282,37 @@ impl ClientPathContext {
         {
             current.reserve_load(lane);
         }
+    }
+
+    pub(super) fn try_reserve_relay_path_load_if_unchanged(
+        &self,
+        key: RelayPathKey,
+        lane: FlowLane,
+        expected_active_flows: u32,
+        expected_active_latency_sensitive_flows: u32,
+    ) -> Option<RelayPathLoadLease> {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        let Some(current) = records.get_mut(key.index) else {
+            return None;
+        };
+        if current.manual_disabled
+            || current.state != SchedulerPathState::Active
+            || current.active_flows != expected_active_flows
+            || current.active_latency_sensitive_flows != expected_active_latency_sensitive_flows
+        {
+            return None;
+        }
+        current.reserve_load(lane);
+        drop(health);
+        Some(RelayPathLoadLease {
+            context: self.clone(),
+            key,
+            lane,
+        })
     }
 
     pub(super) fn reserve_udp_stream_path_load(&self, index: usize, lane: FlowLane) {

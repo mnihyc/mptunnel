@@ -522,7 +522,9 @@ pub(super) fn lab_response_service_handoff_evaluation(
                 .delivery_rate_bps
                 .round()
                 .to_string()),
-            service.map_or_else(unknown, |service| format!("{:?}", service.rate_scope)),
+            service.map_or_else(unknown, |service| {
+                format!("{:?}", service.snapshot.rate_scope)
+            }),
             service_bulk_flows.map_or_else(unknown, |flows| flows.to_string()),
             current_share_bps.map_or_else(unknown, |share| share.to_string()),
             target.map_or_else(unknown, |target| format!("{:?}", target.key.underlay)),
@@ -551,7 +553,9 @@ pub(super) fn lab_response_service_handoff_evaluation(
                 .delivery_rate_bps
                 .round()
                 .to_string()),
-            target.map_or_else(unknown, |target| format!("{:?}", target.rate_scope)),
+            target.map_or_else(unknown, |target| {
+                format!("{:?}", target.snapshot.rate_scope)
+            }),
             target_bulk_flows.map_or_else(unknown, |flows| flows.to_string()),
             projected_share_bps.map_or_else(unknown, |share| share.to_string()),
             service

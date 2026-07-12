@@ -3410,6 +3410,7 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
                 ingress: IngressKind::Socks5,
             },
             FlowLane::Throughput,
+            FlowLane::Throughput,
             &mut remotes,
             &mut send_stream,
             &mut sender_queue,
@@ -3895,6 +3896,7 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
             &context,
             &spec,
             FlowLane::Latency,
+            FlowLane::Latency,
             &mut remotes,
             &mut send_stream,
             &mut sender_queue,
@@ -4325,6 +4327,7 @@ async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
         .dispatch_client_queued_work(
             &context,
             &spec,
+            FlowLane::Latency,
             FlowLane::Latency,
             &mut remotes,
             &mut send_stream,

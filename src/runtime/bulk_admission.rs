@@ -42,9 +42,9 @@ pub(super) struct BulkAdmissionCheck {
     pub(super) payload_bytes: usize,
     pub(super) mux_limits: MuxLimits,
     pub(super) role: BulkAdmissionRole,
-    // Candidate product flight is added inside bulk admission. Callers with a
-    // global product tail must remove overlapping candidate bytes first; a
-    // deliberately conservative full-tail value is a stricter policy choice.
+    // Lower unique bytes on other owners are completion/HOL debt. Same-family
+    // TCP charges their aggregate only to the stream reorder envelope; the
+    // candidate-local pipe is bounded independently by the inflight gate.
     pub(super) stream_ordering_debt_bytes: u64,
 }
 
@@ -785,7 +785,14 @@ fn bulk_same_underlay_reorder_budget_bytes(
     mux_limits: MuxLimits,
 ) -> u64 {
     if candidate.underlay != UnderlayProtocol::Udp {
-        return bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
+        // A TCP Subflow's BDP is its local pipe allowance, not the budget for
+        // all lower ranges concurrently owned by the product stream. Reusing
+        // 2*BDP here makes a healthy Service prefix permanently lock out an
+        // empty candidate. The inflight gate already bounds this candidate;
+        // this gate owns the aggregate stream/receiver reorder resource.
+        return (mux_limits.max_reorder_bytes as u64)
+            .min(mux_limits.max_stream_window_bytes)
+            .max(payload_bytes as u64);
     }
     let delivery_rate_inflight_target = bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(
         candidate.delivery_rate_bps,
@@ -2251,6 +2258,70 @@ mod tests {
                 BulkAdmissionRole::AdditionalCrossUnderlay,
             ),
             Some("reorder_budget")
+        );
+    }
+
+    #[test]
+    fn tcp_subflow_uses_global_reorder_envelope_not_its_local_pipe_budget() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            max_stream_window_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let best = candidate(0, 700.0, 180.0, 400.0);
+        let mut extra = candidate(1, 100.0, 180.0, 500.0);
+        extra.key.underlay = UnderlayProtocol::Tcp;
+        extra.snapshot.underlay = UnderlayProtocol::Tcp;
+        extra.snapshot.confidence = 0.5;
+        extra.snapshot.app_limited = true;
+        let payload_bytes = 64 * 1024;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes,
+                mux_limits,
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 40 * 1024 * 1024,
+            }),
+            None,
+            "foreign lower-owner debt consumes the stream reorder resource, not this candidate's 2*BDP pipe allowance"
+        );
+
+        extra.snapshot.product_bytes_in_flight = 24 * 1024 * 1024;
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes,
+                mux_limits,
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 0,
+            }),
+            Some("inflight_limit"),
+            "the independent candidate-local BDP gate must still bound its own pipe"
+        );
+
+        extra.snapshot.product_bytes_in_flight = 1024 * 1024;
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes,
+                mux_limits,
+                role: BulkAdmissionRole::AdditionalSameUnderlay,
+                stream_ordering_debt_bytes: 64 * 1024 * 1024,
+            }),
+            Some("reorder_budget"),
+            "candidate flight plus foreign debt must still fit the aggregate stream envelope"
         );
     }
 

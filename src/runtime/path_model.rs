@@ -589,17 +589,31 @@ pub(super) fn path_snapshot(
         RateHint::Unlimited => 1_000_000_000_000.0,
         RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     };
-    let product_progress_rate_bps = (reliable_product_delivery_samples(path, observation) > 0
+    let product_delivery_samples = reliable_product_delivery_samples(path, observation);
+    let product_progress_rate_bps = (product_delivery_samples > 0
         && observation.product_delivery_sample_bytes > 0)
         .then_some(observation.product_delivery_rate_bps)
         .flatten();
     let has_durable_product_progress =
         client_path_observation_has_durable_product_progress(path, observation);
-    let delivery_rate_bps = observation
-        .carrier_delivery_rate_bps
-        .or(observation.measured_rate_bps)
-        .unwrap_or(hinted_delivery_rate_bps)
-        .max(1.0);
+    let (delivery_rate_bps, rate_scope) = if let Some(rate) = observation.carrier_delivery_rate_bps
+    {
+        (rate, PathRateScope::PathCapacity)
+    } else if let Some(rate) = product_progress_rate_bps {
+        if path.underlay == UnderlayProtocol::Tcp
+            && !product_delivery_samples_override_startup_prior(product_delivery_samples)
+            && hinted_delivery_rate_bps > rate
+        {
+            (hinted_delivery_rate_bps, PathRateScope::PathCapacity)
+        } else {
+            (rate, PathRateScope::PerFlowGoodput)
+        }
+    } else if let Some(rate) = observation.measured_rate_bps {
+        (rate, PathRateScope::PathCapacity)
+    } else {
+        (hinted_delivery_rate_bps, PathRateScope::PathCapacity)
+    };
+    let delivery_rate_bps = delivery_rate_bps.max(1.0);
     let srtt_ms = path_model_srtt_ms(path, observation);
     let jitter_ms = observation
         .carrier_rttvar_ms
@@ -631,6 +645,7 @@ pub(super) fn path_snapshot(
         min_rtt_ms: srtt_ms,
         jitter_ms,
         delivery_rate_bps,
+        rate_scope,
         product_progress_rate_bps,
         has_durable_product_progress,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
@@ -1035,6 +1050,52 @@ pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_snapshot_preserves_rate_provenance() {
+        let tcp = "tcp://127.0.0.1:10000?rate-mbps=400"
+            .parse::<PathSpec>()
+            .expect("TCP path");
+        let product = ClientPathObservation {
+            measured_rate_bps: Some(100_000_000.0),
+            product_delivery_rate_bps: Some(120_000_000.0),
+            product_delivery_sample_bytes: 1024 * 1024,
+            delivery_samples: 1,
+            ..ClientPathObservation::default()
+        };
+        let provisional_snapshot = path_snapshot(&tcp, 0, product);
+        assert_eq!(provisional_snapshot.delivery_rate_bps, 400_000_000.0);
+        assert_eq!(provisional_snapshot.rate_scope, PathRateScope::PathCapacity);
+
+        let mature_product = ClientPathObservation {
+            delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            ..product
+        };
+        let product_snapshot = path_snapshot(&tcp, 0, mature_product);
+        assert_eq!(product_snapshot.delivery_rate_bps, 120_000_000.0);
+        assert_eq!(product_snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+
+        let carrier = ClientPathObservation {
+            carrier_delivery_rate_bps: Some(500_000_000.0),
+            ..mature_product
+        };
+        let carrier_snapshot = path_snapshot(&tcp, 0, carrier);
+        assert_eq!(carrier_snapshot.delivery_rate_bps, 500_000_000.0);
+        assert_eq!(carrier_snapshot.rate_scope, PathRateScope::PathCapacity);
+
+        let generic = ClientPathObservation {
+            measured_rate_bps: Some(90_000_000.0),
+            ..ClientPathObservation::default()
+        };
+        assert_eq!(
+            path_snapshot(&tcp, 0, generic).rate_scope,
+            PathRateScope::PathCapacity
+        );
+        assert_eq!(
+            path_snapshot(&tcp, 0, ClientPathObservation::default()).rate_scope,
+            PathRateScope::PathCapacity
+        );
+    }
 
     #[test]
     fn native_carrier_evidence_is_post_attachment_fresh_and_ack_derived() {

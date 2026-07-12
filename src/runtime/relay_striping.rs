@@ -1,12 +1,15 @@
+use super::ack_clock_policy::reliable_ack_clock_calibration_limit_bytes;
 #[cfg(feature = "lab-diagnostics")]
 use super::bulk_admission::bulk_completion_horizon_ms_with_ordering_debt;
 use super::bulk_admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
     bulk_candidate_admission_suppression_with_ordering_debt, bulk_service_horizon_payload_bytes,
-    reliable_ack_clock_calibration_limit_bytes,
 };
 use super::*;
 use std::collections::BTreeMap;
+
+// Client/request-side striping owns dispatch choices and its exact flight
+// ledger. Carrier TCP/QUIC controllers remain responsible for wire emission.
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RelayPathRelease {
@@ -529,12 +532,8 @@ pub(super) fn reliable_stream_frame_payload_bytes(frame: &Frame) -> usize {
     reliable_stream_frame_extent(frame).map_or(1, |(_, _, bytes)| bytes)
 }
 
-pub(super) fn relay_lane_is_bulk(lane: FlowLane) -> bool {
-    matches!(lane, FlowLane::Throughput | FlowLane::Background)
-}
-
 pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
-    relay_lane_is_bulk(lane) && matches!(frame, Frame::StreamData { .. })
+    lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1242,7 +1241,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     } = request;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
-    if !relay_lane_is_bulk(lane) || payload_bytes == 0 {
+    if !lane.is_bulk() || payload_bytes == 0 {
         return BulkRelayPathChoice::NotApplicable;
     }
     let policy = SchedulerPolicy::default();
@@ -1554,7 +1553,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             );
             continue;
         };
-        let scoring_payload_bytes = if relay_lane_is_bulk(lane) {
+        let scoring_payload_bytes = if lane.is_bulk() {
             bulk_service_horizon_payload_bytes(payload_bytes, context.mux_limits)
         } else {
             payload_bytes
@@ -1847,7 +1846,7 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     policy: SchedulerPolicy,
 ) -> Option<(PathSnapshot, f64)> {
     let snapshot = relay_path_snapshot_for_bulk_choice(context, key, active_key)?;
-    let scoring_payload_bytes = if relay_lane_is_bulk(lane) {
+    let scoring_payload_bytes = if lane.is_bulk() {
         bulk_service_horizon_payload_bytes(payload_bytes, context.mux_limits)
     } else {
         payload_bytes

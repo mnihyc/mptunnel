@@ -1,20 +1,29 @@
+use super::ack_clock_policy::{
+    TcpAckClockCalibrationOpportunity, reliable_tcp_ack_clock_calibration_opportunity,
+};
+#[cfg(test)]
+use super::ack_clock_policy::{
+    reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
+};
+#[cfg(feature = "lab-diagnostics")]
+use super::bulk_admission::BulkExplorationCompletionProjection;
 use super::bulk_admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_active_service_product_envelope_bytes,
     bulk_additional_admission_role, bulk_candidate_admission_suppression_with_ordering_debt,
     bulk_latency_pressure_service_feed_window_bytes, bulk_service_feed_reservoir_payload_bytes,
     bulk_service_horizon_payload_bytes,
 };
-#[cfg(test)]
-use super::bulk_admission::{
-    reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
+use super::response_ownership::{
+    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseTcpReservoir,
 };
 use super::*;
 
 // Ownership boundary:
 // Sender services own product work before it reaches carrier command queues.
 // Client relay sending and server response dispatch both use this module for
-// queueing, product flight ledgers, stream-ACK release, and diagnostics. Final
-// TCP/UDP emission still happens through carrier command senders.
+// queueing, path ranking, reservation intents, and diagnostics. Reliable-path
+// bindings own exact range flight and atomic commit; final TCP/UDP emission
+// still happens through carrier command senders.
 
 // Local diagnostic naming helper.  `response_admission` has a private helper
 // with the same purpose, but sender_service is a sibling module and must not
@@ -888,8 +897,8 @@ pub(super) fn reliable_relay_sender_queue_read_budget(
 /// Current server response sender-service boundary.
 ///
 /// Target reads enqueue STREAM_DATA here before any carrier path write. The
-/// service owns queue accounting and dispatch diagnostics, while the
-/// `ReliablePathStream` binding owns the current carrier-neutral path choice.
+/// service owns queueing, path ranking, and reservation intents. The
+/// `ReliablePathStream` binding revalidates and atomically commits exact ranges.
 pub(super) struct ServerResponseSenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     session_id: SessionId,
@@ -967,8 +976,10 @@ fn lab_response_bulk_output_candidate(
     lab_diagnostic(
         "server_bulk_output_candidate",
         format_args!(
-            "reason={} path_underlay={:?} path_id={} is_active={} sender_evidence={} bulk_rate_evidence={} role={} eta_ms={:.3} lead_underlay={} lead_path_id={} lead_eta_ms={:.3} stream_ordering_debt={} payload_bytes={} command_pending_bytes={} path_queue_bytes={} product_queue_bytes={} carrier_inflight_bytes={} product_inflight_bytes={} carrier_inflight_limit={} delivery_rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence={:.3} app_limited={} mux_max_path_flight={} mux_max_reorder={}",
+            "reason={} session_id={} binding_instance_id={} path_underlay={:?} path_id={} is_active={} sender_evidence={} bulk_rate_evidence={} role={} eta_ms={:.3} lead_underlay={} lead_path_id={} lead_eta_ms={:.3} stream_ordering_debt={} payload_bytes={} command_pending_bytes={} path_queue_bytes={} product_queue_bytes={} carrier_inflight_bytes={} product_inflight_bytes={} owner_data_inflight_bytes={} carrier_inflight_limit={} delivery_rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence={:.3} app_limited={} calibration_eligible={} calibration_proven={} calibration_active={} calibration_spent_bytes={} calibration_credit_bytes={} calibration_max_bytes={} mux_max_path_flight={} mux_max_reorder={}",
             reason,
+            target.session_id.0,
+            target.binding_instance_id,
             target.key.underlay,
             target.key.path_id.0,
             target.is_active,
@@ -983,17 +994,24 @@ fn lab_response_bulk_output_candidate(
             lead_eta_ms,
             diag.ordering_debt,
             payload_bytes,
-            target.commands.pending_bytes(),
+            target.command_pending_bytes,
             target.snapshot.queue_bytes,
             target.snapshot.product_queue_bytes,
             target.snapshot.bytes_in_flight,
             target.snapshot.product_bytes_in_flight,
+            target.owner_data_in_flight_bytes,
             target.snapshot.inflight_limit_bytes,
             target.snapshot.delivery_rate_bps / 1_000_000.0,
             target.snapshot.pacing_rate_bps / 1_000_000.0,
             target.snapshot.srtt_ms,
             target.snapshot.confidence,
             target.snapshot.app_limited,
+            target.ack_clock_calibration_eligible,
+            target.ack_clock_calibration_proven,
+            target.ack_clock_calibration_active,
+            target.ack_clock_calibration_spent_bytes,
+            target.ack_clock_calibration_credit_limit_bytes,
+            target.ack_clock_calibration_max_limit_bytes,
             mux_limits.max_path_flight_bytes,
             mux_limits.max_reorder_bytes,
         ),
@@ -1012,17 +1030,70 @@ fn lab_response_bulk_output_selected(
     lab_diagnostic(
         "server_bulk_output_selected",
         format_args!(
-            "reason={} path_underlay={:?} path_id={} role={:?} work={:?} payload_bytes={} command_pending_bytes={} eta_ms={:.3} app_limited={} bulk_rate_evidence={}",
+            "reason={} session_id={} binding_instance_id={} path_underlay={:?} path_id={} role={:?} work={:?} payload_bytes={} command_pending_bytes={} product_inflight_bytes={} owner_data_inflight_bytes={} eta_ms={:.3} app_limited={} bulk_rate_evidence={} calibration_eligible={} calibration_proven={} calibration_active={} calibration_spent_bytes={} calibration_credit_bytes={} calibration_max_bytes={}",
             reason,
+            selected.target.session_id.0,
+            selected.target.binding_instance_id,
             selected.target.key.underlay,
             selected.target.key.path_id.0,
             selected.admission.role,
             selected.admission.work,
             payload_bytes,
-            selected.target.commands.pending_bytes(),
+            selected.target.command_pending_bytes,
+            selected.target.snapshot.product_bytes_in_flight,
+            selected.target.owner_data_in_flight_bytes,
             selected.target.eta_ms,
             selected.target.snapshot.app_limited,
             selected.target.has_bulk_rate_evidence,
+            selected.target.ack_clock_calibration_eligible,
+            selected.target.ack_clock_calibration_proven,
+            selected.target.ack_clock_calibration_active,
+            selected.target.ack_clock_calibration_spent_bytes,
+            selected.target.ack_clock_calibration_credit_limit_bytes,
+            selected.target.ack_clock_calibration_max_limit_bytes,
+        ),
+    );
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn lab_response_ack_clock_calibration_admission(
+    target: &ResponseSenderPathTarget,
+    service: &ResponseSenderPathTarget,
+    projection: BulkExplorationCompletionProjection,
+    admitted: bool,
+) {
+    if !lab_diagnostic_event_enabled("response_ack_clock_calibration_admission") {
+        return;
+    }
+    lab_diagnostic(
+        "response_ack_clock_calibration_admission",
+        format_args!(
+            "session_id={} binding_instance_id={} path_underlay={:?} path_id={} service_underlay={:?} service_path_id={} admitted={} candidate_completion_ms={:.3} service_reservoir_horizon_ms={:.3} exploration_bytes={} service_followup_bytes={} candidate_eta_ms={:.3} service_eta_ms={:.3} candidate_rate_mbps={:.3} service_rate_mbps={:.3} candidate_srtt_ms={:.3} service_srtt_ms={:.3}",
+            target.session_id.0,
+            target.binding_instance_id,
+            target.key.underlay,
+            target.key.path_id.0,
+            service.key.underlay,
+            service.key.path_id.0,
+            admitted,
+            projection.candidate_completion_ms,
+            projection.service_reservoir_horizon_ms,
+            projection.exploration_bytes,
+            projection.service_followup_bytes,
+            target.eta_ms,
+            service.eta_ms,
+            target
+                .snapshot
+                .delivery_rate_bps
+                .max(target.snapshot.pacing_rate_bps)
+                / 1_000_000.0,
+            service
+                .snapshot
+                .delivery_rate_bps
+                .max(service.snapshot.pacing_rate_bps)
+                / 1_000_000.0,
+            target.snapshot.srtt_ms,
+            service.snapshot.srtt_ms,
         ),
     );
 }
@@ -1096,8 +1167,26 @@ struct ResponseSubflowAdmissionCommit {
 struct ResponseAckClockCalibrationCommit {
     planner_generation: u64,
     lane_generation: u64,
+    model_generation: u64,
     service: CarrierPathKey,
     service_incarnation: u64,
+    service_pending_bytes: u64,
+    target_pending_bytes: u64,
+    limit_bytes: u64,
+    requires_multi_flow_start: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ResponseAckClockCalibrationRetirementIntent {
+    planner_generation: u64,
+    lane_generation: u64,
+    model_generation: u64,
+    service: CarrierPathKey,
+    service_incarnation: u64,
+    service_pending_bytes: u64,
+    target: CarrierPathKey,
+    target_incarnation: u64,
+    target_pending_bytes: u64,
     limit_bytes: u64,
 }
 
@@ -1237,10 +1326,10 @@ fn select_response_ack_clock_calibration_target(
     mux_limits: MuxLimits,
     lower_flights: &[CarrierPathFlightDebt],
     subflow_set: Option<&FlowSubflowSet>,
-    calibration_allowed: bool,
+    may_start_fresh_calibration: bool,
+    retirement_intents: &mut Vec<ResponseAckClockCalibrationRetirementIntent>,
 ) -> Option<ResponseSelectedDataTarget> {
-    if !calibration_allowed
-        || !lower_flights.is_empty()
+    if !lower_flights.is_empty()
         || subflow_set
             .and_then(FlowSubflowSet::startup_owner_key)
             .is_some()
@@ -1285,6 +1374,9 @@ fn select_response_ack_clock_calibration_target(
                 && target.has_bulk_rate_evidence
                 && target.ack_clock_calibration_eligible
                 && !target.ack_clock_calibration_proven
+                && (may_start_fresh_calibration
+                    || target.ack_clock_calibration_active
+                    || target.ack_clock_calibration_spent_bytes > 0)
                 && target.snapshot.active_latency_sensitive_flows == 0
                 && target.snapshot.session_active_latency_sensitive_flows == 0
                 && target.ack_clock_calibration_credit_limit_bytes > 0
@@ -1294,10 +1386,12 @@ fn select_response_ack_clock_calibration_target(
                     .ack_clock_calibration_spent_bytes
                     .saturating_add(payload_bytes as u64)
                     <= target.ack_clock_calibration_credit_limit_bytes
-                && target.commands.can_enqueue_lane_now(lane)
         })
         .filter(|target| {
-            let candidate_debt = response_target_assigned_product_bytes(target);
+            // Calibration spends unique OwnerData only. RepairData and carrier
+            // queue copies remain real carrier pressure but never consume or
+            // preserve this product-ownership fence.
+            let candidate_debt = target.owner_data_in_flight_bytes;
             let projected_candidate_debt = candidate_debt.saturating_add(payload_bytes as u64);
             // Global ordered tail and per-candidate flight overlap; only the
             // newly assigned payload is outside both current views.
@@ -1306,6 +1400,75 @@ fn select_response_ack_clock_calibration_target(
                     .max(candidate_debt)
                     .saturating_add(payload_bytes as u64)
                     <= product_envelope
+        })
+        .filter(|target| {
+            if target.ack_clock_calibration_active || target.ack_clock_calibration_spent_bytes > 0 {
+                // Once exact calibration ownership exists, finish its authorized
+                // stage. Reapplying an exploration gate could strand lower offsets.
+                return true;
+            }
+            let exploration_bytes = target
+                .ack_clock_calibration_credit_limit_bytes
+                .saturating_sub(target.ack_clock_calibration_spent_bytes);
+            let opportunity = reliable_tcp_ack_clock_calibration_opportunity(
+                service.snapshot,
+                service.eta_ms,
+                target.snapshot,
+                target.eta_ms,
+                exploration_bytes,
+                payload_bytes,
+                mux_limits,
+            );
+            #[cfg(feature = "lab-diagnostics")]
+            let projection = opportunity.projection();
+            let admitted = opportunity.is_admitted();
+            #[cfg(feature = "lab-diagnostics")]
+            {
+                lab_response_ack_clock_calibration_admission(target, service, projection, admitted);
+                if !admitted {
+                    lab_response_bulk_output_candidate(
+                        "calibration_completion_horizon",
+                        target,
+                        payload_bytes,
+                        mux_limits,
+                        ResponseBulkCandidateDiag {
+                            lead: Some(ResponseBulkLead {
+                                key: service.key,
+                                snapshot: service.snapshot,
+                                eta_ms: service.eta_ms,
+                            }),
+                            role: Some(BulkAdmissionRole::AdditionalSameUnderlay),
+                            ordering_debt: ordered_owner_debt_bytes as u64,
+                        },
+                    );
+                }
+            }
+            if matches!(opportunity, TcpAckClockCalibrationOpportunity::Retire(_)) {
+                retirement_intents.push(ResponseAckClockCalibrationRetirementIntent {
+                    planner_generation: 0,
+                    lane_generation: 0,
+                    model_generation: 0,
+                    service: service.key,
+                    service_incarnation: service.incarnation,
+                    service_pending_bytes: service.command_pending_bytes,
+                    target: target.key,
+                    target_incarnation: target.incarnation,
+                    target_pending_bytes: target.command_pending_bytes,
+                    limit_bytes: target.ack_clock_calibration_credit_limit_bytes,
+                });
+            }
+            admitted
+        })
+        .filter(|target| {
+            // RepairData cannot preserve the unique-owner fence, but it still
+            // occupies the carrier/product pipe that the atomic commit checks.
+            let carrier_pressure = target
+                .snapshot
+                .product_bytes_in_flight
+                .max(target.command_pending_bytes);
+            target.commands.can_enqueue_lane_now(lane)
+                && carrier_pressure.saturating_add(payload_bytes as u64)
+                    <= target.ack_clock_calibration_credit_limit_bytes
         })
         .min_by(|left, right| {
             right
@@ -1326,32 +1489,90 @@ fn select_response_ack_clock_calibration_target(
             ack_clock_calibration_commit: Some(ResponseAckClockCalibrationCommit {
                 planner_generation: 0,
                 lane_generation: 0,
+                model_generation: 0,
                 service: service_key,
                 service_incarnation: service.incarnation,
+                service_pending_bytes: service.command_pending_bytes,
+                target_pending_bytes: target.command_pending_bytes,
                 limit_bytes: target.ack_clock_calibration_credit_limit_bytes,
+                requires_multi_flow_start: !target.ack_clock_calibration_active
+                    && target.ack_clock_calibration_spent_bytes == 0,
             }),
         })
 }
 
+fn response_ack_clock_calibration_pending(
+    target: &ResponseSenderPathTarget,
+    may_start_fresh_calibration: bool,
+) -> bool {
+    // Begun exact ownership serializes the binding. Fresh state does so only
+    // while the session can actually start exploration; otherwise it is dormant.
+    target.ack_clock_calibration_active
+        || (!target.commands.is_closed()
+            && target.ack_clock_calibration_eligible
+            && !target.ack_clock_calibration_proven
+            && (target.ack_clock_calibration_spent_bytes > 0
+                || (may_start_fresh_calibration
+                    && target.ack_clock_calibration_spent_bytes
+                        < target.ack_clock_calibration_max_limit_bytes)))
+}
+
 fn response_ack_clock_calibration_blocks_generic_owner(target: &ResponseSenderPathTarget) -> bool {
+    // Dormancy opens the binding reservoir, but this exact identity stays
+    // excluded so ordinary OwnerData cannot contaminate later ACK calibration.
     !target.is_active
         && (target.ack_clock_calibration_active
-            || (target.ack_clock_calibration_eligible
+            || (!target.commands.is_closed()
+                && target.ack_clock_calibration_eligible
                 && !target.ack_clock_calibration_proven
                 && target.ack_clock_calibration_spent_bytes
                     < target.ack_clock_calibration_max_limit_bytes))
 }
 
-fn response_ordered_owner_tail_debt_for_candidate(
-    target_key: CarrierPathKey,
-    ordered_data_owner: Option<CarrierPathKey>,
-    ordered_owner_debt_bytes: usize,
-) -> u64 {
-    if ordered_owner_debt_bytes > 0 && Some(target_key) != ordered_data_owner {
-        ordered_owner_debt_bytes as u64
-    } else {
-        0
+fn response_ack_clock_calibration_needs_opportunity_decision(
+    target: &ResponseSenderPathTarget,
+) -> bool {
+    target.key.underlay == UnderlayProtocol::Tcp
+        && target.ack_clock_calibration_eligible
+        && !target.ack_clock_calibration_proven
+        && !target.ack_clock_calibration_active
+        && target.ack_clock_calibration_spent_bytes == 0
+        && target.ack_clock_calibration_credit_limit_bytes > 0
+}
+
+struct ResponseOwnerAdmission {
+    admission: PathAdmission,
+    subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
+    bulk_role: BulkAdmissionRole,
+    model_suppression: Option<&'static str>,
+}
+
+fn response_owner_bulk_model_suppression(
+    target: &ResponseSenderPathTarget,
+    lead: ResponseBulkLead,
+    lower_owner: Option<CarrierPathKey>,
+    effective_ordering_debt: u64,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    role: BulkAdmissionRole,
+) -> Option<&'static str> {
+    if response_unique_quic_data_would_expand_ordering_debt(
+        lower_owner,
+        target,
+        effective_ordering_debt,
+    ) {
+        return Some("quic_ordering_debt");
     }
+    bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+        best_snapshot: lead.snapshot,
+        best_eta_ms: lead.eta_ms,
+        candidate_snapshot: response_target_measured_admission_snapshot(target),
+        candidate_eta_ms: target.eta_ms,
+        payload_bytes,
+        mux_limits,
+        role,
+        stream_ordering_debt_bytes: effective_ordering_debt,
+    })
 }
 
 #[cfg(test)]
@@ -1371,14 +1592,14 @@ fn response_target_unique_owner_admission(
         lower_owner,
         None,
         ordering_debt,
-        0,
+        ResponseOrderedTail::new(None, 0).for_candidate(target.key),
         payload_bytes,
         mux_limits,
         None,
         true,
         false,
     )
-    .0
+    .admission
 }
 
 // Decides whether one candidate may own the next unique product byte range.
@@ -1398,28 +1619,65 @@ fn response_target_unique_owner_admission_with_epoch(
     lower_owner: Option<CarrierPathKey>,
     ordered_data_owner: Option<CarrierPathKey>,
     ordering_debt: u64,
-    ordered_owner_debt_bytes: usize,
+    ordered_tail_debt: ResponseCandidateTailDebt,
     payload_bytes: usize,
     mux_limits: MuxLimits,
     subflow_set: Option<&FlowSubflowSet>,
     startup_sampling_allowed: bool,
     allow_liveness_service_failover: bool,
-) -> (PathAdmission, Option<ResponseSubflowAdmissionCommit>) {
-    if target.attachment_role == StreamOpenRole::Repair {
-        return (PathAdmission::standby(), None);
-    }
+) -> ResponseOwnerAdmission {
     let service_key =
         response_service_anchor_key(candidates, lower_owner, ordered_data_owner, lead.key);
+    let candidate_tail_debt_bytes = ordered_tail_debt.external_bytes();
+    let effective_ordering_debt = ordering_debt.max(candidate_tail_debt_bytes);
+    let role = response_bulk_admission_role(
+        service_key,
+        target.key,
+        lower_owner,
+        effective_ordering_debt,
+    );
+    let result = |admission, subflow_set_commit, model_suppression| ResponseOwnerAdmission {
+        admission,
+        subflow_set_commit,
+        bulk_role: role,
+        model_suppression,
+    };
+    let direct_result = |admission: PathAdmission| {
+        let owns_unique_data = matches!(
+            admission.decision,
+            PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
+        ) && admission.work == CarrierWorkKind::OwnerData
+            && admission.role.may_own_unique_data();
+        if !owns_unique_data {
+            return result(admission, None, None);
+        }
+        let suppression = response_owner_bulk_model_suppression(
+            target,
+            lead,
+            lower_owner,
+            effective_ordering_debt,
+            payload_bytes,
+            mux_limits,
+            role,
+        );
+        suppression.map_or_else(
+            || result(admission, None, None),
+            |reason| result(PathAdmission::standby(), None, Some(reason)),
+        )
+    };
+    if target.attachment_role == StreamOpenRole::Repair {
+        return result(PathAdmission::standby(), None, None);
+    }
     let liveness_service_failover = allow_liveness_service_failover && target.key == service_key;
     let continues_lower_frontier = lower_owner == Some(target.key);
     if continues_lower_frontier && (target.key == service_key || target.is_active) {
         if ordering_debt > 0 {
-            return (PathAdmission::standby(), None);
+            return result(PathAdmission::standby(), None, None);
         }
         return if target.is_active || target.has_bulk_rate_evidence {
-            (PathAdmission::service(), None)
+            direct_result(PathAdmission::service())
         } else {
-            (PathAdmission::probe_only(), None)
+            result(PathAdmission::probe_only(), None, None)
         };
     }
     if continues_lower_frontier
@@ -1429,33 +1687,28 @@ fn response_target_unique_owner_admission_with_epoch(
         // An authoritative ACK hole suspends startup sampling. Only an already
         // measured Subflow may continue its own lower frontier without changing
         // Service role, regardless of carrier family.
-        return (PathAdmission::standby(), None);
+        return result(PathAdmission::standby(), None, None);
     }
     if lower_owner.is_some() && !continues_lower_frontier {
-        return (PathAdmission::standby(), None);
+        return result(PathAdmission::standby(), None, None);
     }
     if target.key == service_key {
-        if ordered_owner_debt_bytes > 0
+        if ordered_tail_debt.global_bytes() > 0
             && Some(target.key) != ordered_data_owner
             && !target.has_bulk_rate_evidence
             && !liveness_service_failover
         {
-            return (PathAdmission::standby(), None);
+            return result(PathAdmission::standby(), None, None);
         }
         return if target.is_active || target.has_bulk_rate_evidence || liveness_service_failover {
-            (PathAdmission::service(), None)
+            direct_result(PathAdmission::service())
         } else {
-            (PathAdmission::probe_only(), None)
+            result(PathAdmission::probe_only(), None, None)
         };
     }
     if target.is_active {
-        return (PathAdmission::standby(), None);
+        return result(PathAdmission::standby(), None, None);
     }
-    let ordered_tail_debt = response_ordered_owner_tail_debt_for_candidate(
-        target.key,
-        ordered_data_owner,
-        ordered_owner_debt_bytes,
-    );
     let startup_owner_allowed = startup_sampling_allowed
         && candidates
             .iter()
@@ -1466,37 +1719,29 @@ fn response_target_unique_owner_admission_with_epoch(
                     service_key,
                     service,
                     target,
-                    ordered_tail_debt,
+                    candidate_tail_debt_bytes,
                     payload_bytes,
                     mux_limits,
                 )
             });
-    if ordered_tail_debt > 0
+    if candidate_tail_debt_bytes > 0
         && !continues_lower_frontier
         && !response_target_is_measured_same_underlay_subflow_candidate(service_key, target)
         && !startup_owner_allowed
     {
-        return (PathAdmission::standby(), None);
+        return result(PathAdmission::standby(), None, None);
     }
 
-    let role = response_bulk_admission_role(service_key, target.key, lower_owner, ordering_debt);
-    let effective_ordering_debt = ordering_debt.max(ordered_tail_debt);
-    let measured_model_allows_owner =
-        !response_unique_quic_data_would_expand_ordering_debt(
-            lower_owner,
-            target,
-            effective_ordering_debt,
-        ) && bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-            best_snapshot: lead.snapshot,
-            best_eta_ms: lead.eta_ms,
-            candidate_snapshot: response_target_measured_admission_snapshot(target),
-            candidate_eta_ms: target.eta_ms,
-            payload_bytes,
-            mux_limits,
-            role,
-            stream_ordering_debt_bytes: effective_ordering_debt,
-        })
-        .is_none();
+    let model_suppression = response_owner_bulk_model_suppression(
+        target,
+        lead,
+        lower_owner,
+        effective_ordering_debt,
+        payload_bytes,
+        mux_limits,
+        role,
+    );
+    let measured_model_allows_owner = model_suppression.is_none();
     // A candidate cannot produce a meaningful completion model until it has
     // received enough work to leave the app-limited startup state. The bounded
     // startup epoch therefore uses explicit role/pressure/resource guards and
@@ -1544,7 +1789,15 @@ fn response_target_unique_owner_admission_with_epoch(
             input,
         },
     );
-    (admission, commit)
+    result(
+        admission,
+        commit,
+        if startup_owner_allowed {
+            None
+        } else {
+            model_suppression
+        },
+    )
 }
 
 fn response_target_can_own_unique_bulk_data(
@@ -1585,14 +1838,14 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         lower_owner,
         None,
         ordering_debt,
-        0,
+        ResponseOrderedTail::new(None, 0).for_candidate(target.key),
         payload_bytes,
         mux_limits,
         subflow_set,
         true,
         false,
     )
-    .0;
+    .admission;
     matches!(
         admission.decision,
         PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
@@ -2170,6 +2423,125 @@ fn select_response_sender_data_target_with_ordered_debt_and_epoch(
     )
 }
 
+#[derive(Debug)]
+struct ResponseDataAdmissionPolicy {
+    lead: ResponseBulkLead,
+    lower_owner: Option<CarrierPathKey>,
+    service_anchor: Option<CarrierPathKey>,
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    startup_sampling_allowed: bool,
+    allow_liveness_service_failover: bool,
+}
+
+// Converts one scheduling snapshot into a reservation intent. Path ranking
+// stays outside this helper, and `ResponseStreamBinding` revalidates the intent
+// at commit; this keeps mutable ownership state out of speculative admission.
+fn admit_response_data_target(
+    target: &ResponseSenderPathTarget,
+    candidates: &[&ResponseSenderPathTarget],
+    subflow_set: Option<&FlowSubflowSet>,
+    policy: &ResponseDataAdmissionPolicy,
+    authoritative_ordering_debt: u64,
+    ordered_tail_debt: ResponseCandidateTailDebt,
+) -> Option<ResponseSelectedDataTarget> {
+    let effective_ordering_debt =
+        authoritative_ordering_debt.max(ordered_tail_debt.external_bytes());
+    let ResponseOwnerAdmission {
+        admission,
+        subflow_set_commit,
+        bulk_role: role,
+        model_suppression,
+    } = response_target_unique_owner_admission_with_epoch(
+        target,
+        candidates,
+        policy.lead,
+        policy.lower_owner,
+        policy.service_anchor,
+        authoritative_ordering_debt,
+        ordered_tail_debt,
+        policy.payload_bytes,
+        policy.mux_limits,
+        subflow_set,
+        policy.startup_sampling_allowed,
+        policy.allow_liveness_service_failover,
+    );
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = (effective_ordering_debt, role, model_suppression);
+    if !matches!(
+        admission.decision,
+        PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
+    ) || admission.work != CarrierWorkKind::OwnerData
+        || !admission.role.may_own_unique_data()
+    {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_response_bulk_output_candidate(
+            model_suppression.unwrap_or("not_owner_admission"),
+            target,
+            policy.payload_bytes,
+            policy.mux_limits,
+            ResponseBulkCandidateDiag {
+                lead: Some(policy.lead),
+                role: Some(role),
+                ordering_debt: effective_ordering_debt,
+            },
+        );
+        return None;
+    }
+    if admission.role == PathRuntimeRole::Service
+        && !response_service_has_assigned_owner_credit(
+            target,
+            policy.lane,
+            policy.payload_bytes,
+            policy.mux_limits,
+        )
+    {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_response_bulk_output_candidate(
+            "assigned_owner_credit",
+            target,
+            policy.payload_bytes,
+            policy.mux_limits,
+            ResponseBulkCandidateDiag {
+                lead: Some(policy.lead),
+                role: Some(role),
+                ordering_debt: effective_ordering_debt,
+            },
+        );
+        return None;
+    }
+    if admission.role == PathRuntimeRole::Subflow
+        && !response_target_has_emission_credit(
+            target,
+            policy.lane,
+            policy.payload_bytes,
+            policy.mux_limits,
+        )
+    {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_response_bulk_output_candidate(
+            "no_emission_credit",
+            target,
+            policy.payload_bytes,
+            policy.mux_limits,
+            ResponseBulkCandidateDiag {
+                lead: Some(policy.lead),
+                role: Some(role),
+                ordering_debt: effective_ordering_debt,
+            },
+        );
+        return None;
+    }
+    Some(ResponseSelectedDataTarget {
+        target: target.clone(),
+        admission,
+        subflow_set_commit,
+        ack_clock_calibration_commit: None,
+    })
+}
+
+#[cfg(test)]
 fn select_response_sender_data_target_with_ordered_debt_inner(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
@@ -2180,6 +2552,33 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
     ordered_owner_debt_bytes: usize,
     subflow_set: Option<&FlowSubflowSet>,
     startup_sampling_allowed: bool,
+) -> Option<ResponseSelectedDataTarget> {
+    let mut retirement_intents = Vec::new();
+    select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        lower_flights,
+        ordered_data_owner,
+        ordered_owner_debt_bytes,
+        subflow_set,
+        startup_sampling_allowed,
+        &mut retirement_intents,
+    )
+}
+
+fn select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    ordered_data_owner: Option<CarrierPathKey>,
+    ordered_owner_debt_bytes: usize,
+    subflow_set: Option<&FlowSubflowSet>,
+    startup_sampling_allowed: bool,
+    retirement_intents: &mut Vec<ResponseAckClockCalibrationRetirementIntent>,
 ) -> Option<ResponseSelectedDataTarget> {
     if targets.is_empty() {
         return None;
@@ -2201,7 +2600,10 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
             );
             continue;
         }
-        if !target.commands.can_enqueue_lane_now(lane) {
+        if !target.commands.can_enqueue_lane_now(lane)
+            && !(startup_sampling_allowed
+                && response_ack_clock_calibration_needs_opportunity_decision(target))
+        {
             #[cfg(feature = "lab-diagnostics")]
             lab_response_bulk_output_candidate(
                 "no_lane_capacity",
@@ -2227,7 +2629,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
     {
         return None;
     }
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return choose_response_service_or_proven_data_target(
             &capacity_targets,
             lower_flights,
@@ -2482,14 +2884,12 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
         && !candidate_targets.iter().any(|target| target.is_active);
     let service_baseline = service_anchor
         .and_then(|service_key| targets.iter().find(|target| target.key == service_key));
-    let calibration_serialized = targets.iter().any(|target| {
-        target.ack_clock_calibration_active
-            || (!target.commands.is_closed()
-                && target.ack_clock_calibration_eligible
-                && !target.ack_clock_calibration_proven
-                && target.ack_clock_calibration_spent_bytes
-                    < target.ack_clock_calibration_max_limit_bytes)
-    });
+    // Begun TCP product-ACK calibration owns one binding tail. Fresh state does
+    // so only while the two-flow start gate is open; dormant state blocks only
+    // its exact target below. QUIC remains under its carrier ACK controller.
+    let tcp_calibration_serialized = targets
+        .iter()
+        .any(|target| response_ack_clock_calibration_pending(target, startup_sampling_allowed));
     if let Some(service_key) = service_anchor
         && let Some(calibration) = select_response_ack_clock_calibration_target(
             targets,
@@ -2502,6 +2902,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
             lower_flights,
             subflow_set,
             startup_sampling_allowed,
+            retirement_intents,
         )
     {
         #[cfg(feature = "lab-diagnostics")]
@@ -2545,139 +2946,67 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
         service_anchor,
         lead.key,
     );
-    let admitted = candidate_targets
+    let ordered_tail = ResponseOrderedTail::new(service_anchor, ordered_owner_debt_bytes);
+    let admission_policy = ResponseDataAdmissionPolicy {
+        lead,
+        lower_owner: effective_lower_owner,
+        service_anchor,
+        lane,
+        payload_bytes,
+        mux_limits,
+        startup_sampling_allowed: startup_sampling_allowed && !tcp_calibration_serialized,
+        allow_liveness_service_failover,
+    };
+    let service_target = candidate_targets
         .iter()
         .copied()
-        .filter_map(|target| {
-            let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-            let effective_ordering_debt =
-                ordering_debt.max(response_ordered_owner_tail_debt_for_candidate(
-                    target.key,
-                    service_anchor,
-                    ordered_owner_debt_bytes,
-                ));
-            let (admission, subflow_set_commit) = response_target_unique_owner_admission_with_epoch(
-                target,
-                &candidate_targets,
-                lead,
-                effective_lower_owner,
-                service_anchor,
-                ordering_debt,
-                ordered_owner_debt_bytes,
-                payload_bytes,
-                mux_limits,
-                subflow_set,
-                startup_sampling_allowed && !calibration_serialized,
-                allow_liveness_service_failover,
+        .find(|target| target.key == service_key);
+    let mut admitted = Vec::with_capacity(candidate_targets.len());
+    if let Some(target) = service_target {
+        let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
+        if let Some(selected) = admit_response_data_target(
+            target,
+            &candidate_targets,
+            subflow_set,
+            &admission_policy,
+            ordering_debt,
+            ordered_tail.for_candidate(target.key),
+        ) {
+            admitted.push(selected);
+        }
+    }
+    // Service admission establishes the reservoir precondition. Each remaining
+    // candidate produces one admission-model result with either ordinary debt
+    // or the TCP-only ownership-aware view.
+    // A calibration stage needs isolated product ACK coverage. Keep ordinary
+    // TCP reservoir work out until its exact flights drain; Service remains the
+    // fallback and the carrier-specific controller continues draining below.
+    let tcp_reservoir = (!tcp_calibration_serialized && effective_lower_owner.is_none())
+        .then(|| response_tcp_reservoir_policy(&admitted, ordered_tail, payload_bytes, mux_limits))
+        .flatten();
+    for target in candidate_targets
+        .iter()
+        .copied()
+        .filter(|target| target.key != service_key)
+    {
+        let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
+        let candidate_debt = tcp_reservoir
+            .filter(|reservoir| response_target_is_tcp_reservoir_candidate(*reservoir, target))
+            .map_or_else(
+                || ordered_tail.for_candidate(target.key),
+                |reservoir| response_tcp_reservoir_candidate_debt(reservoir, target),
             );
-            if !matches!(
-                admission.decision,
-                PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
-            ) || admission.work != CarrierWorkKind::OwnerData
-                || !admission.role.may_own_unique_data()
-            {
-                #[cfg(feature = "lab-diagnostics")]
-                lab_response_bulk_output_candidate(
-                    "not_owner_admission",
-                    target,
-                    payload_bytes,
-                    mux_limits,
-                    ResponseBulkCandidateDiag {
-                        lead: Some(lead),
-                        role: Some(response_bulk_admission_role(
-                            service_key,
-                            target.key,
-                            effective_lower_owner,
-                            effective_ordering_debt,
-                        )),
-                        ordering_debt: effective_ordering_debt,
-                    },
-                );
-                return None;
-            }
-            let role = response_bulk_admission_role(
-                service_key,
-                target.key,
-                effective_lower_owner,
-                effective_ordering_debt,
-            );
-            if admission.role == PathRuntimeRole::Service
-                && !response_service_has_assigned_owner_credit(
-                    target,
-                    lane,
-                    payload_bytes,
-                    mux_limits,
-                )
-            {
-                #[cfg(feature = "lab-diagnostics")]
-                lab_response_bulk_output_candidate(
-                    "assigned_owner_credit",
-                    target,
-                    payload_bytes,
-                    mux_limits,
-                    ResponseBulkCandidateDiag {
-                        lead: Some(lead),
-                        role: Some(role),
-                        ordering_debt: effective_ordering_debt,
-                    },
-                );
-                return None;
-            }
-            if admission.role == PathRuntimeRole::Subflow
-                && !response_target_has_emission_credit(target, lane, payload_bytes, mux_limits)
-            {
-                #[cfg(feature = "lab-diagnostics")]
-                lab_response_bulk_output_candidate(
-                    "no_emission_credit",
-                    target,
-                    payload_bytes,
-                    mux_limits,
-                    ResponseBulkCandidateDiag {
-                        lead: Some(lead),
-                        role: Some(role),
-                        ordering_debt: effective_ordering_debt,
-                    },
-                );
-                return None;
-            }
-            let suppression =
-                bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
-                    best_snapshot: lead.snapshot,
-                    best_eta_ms: lead.eta_ms,
-                    candidate_snapshot: response_target_measured_admission_snapshot(target),
-                    candidate_eta_ms: target.eta_ms,
-                    payload_bytes,
-                    mux_limits,
-                    role,
-                    stream_ordering_debt_bytes: effective_ordering_debt,
-                });
-            let startup_owner_admission =
-                subflow_set_commit.is_some_and(|commit| commit.input.startup_owner_allowed);
-            if let Some(_reason) = suppression
-                && !startup_owner_admission
-            {
-                #[cfg(feature = "lab-diagnostics")]
-                lab_response_bulk_output_candidate(
-                    _reason,
-                    target,
-                    payload_bytes,
-                    mux_limits,
-                    ResponseBulkCandidateDiag {
-                        lead: Some(lead),
-                        role: Some(role),
-                        ordering_debt: effective_ordering_debt,
-                    },
-                );
-                return None;
-            }
-            Some(ResponseSelectedDataTarget {
-                target: target.clone(),
-                admission,
-                subflow_set_commit,
-                ack_clock_calibration_commit: None,
-            })
-        })
-        .collect::<Vec<_>>();
+        if let Some(selected) = admit_response_data_target(
+            target,
+            &candidate_targets,
+            subflow_set,
+            &admission_policy,
+            ordering_debt,
+            candidate_debt,
+        ) {
+            admitted.push(selected);
+        }
+    }
     if let Some(startup) = admitted
         .iter()
         .filter(|selected| {
@@ -2697,13 +3026,8 @@ fn select_response_sender_data_target_with_ordered_debt_inner(
         lab_response_bulk_output_selected("startup_sample", &startup, payload_bytes);
         return Some(startup);
     }
-    if !calibration_serialized
-        && let Some(subflow_target) = response_tcp_reservoir_subflow_target(
-            &admitted,
-            ordered_owner_debt_bytes,
-            payload_bytes,
-            mux_limits,
-        )
+    if let Some(reservoir) = tcp_reservoir
+        && let Some(subflow_target) = response_tcp_reservoir_subflow_target(&admitted, reservoir)
     {
         #[cfg(feature = "lab-diagnostics")]
         lab_response_bulk_output_selected("tcp_subflow_reservoir", &subflow_target, payload_bytes);
@@ -2798,12 +3122,12 @@ fn response_feedable_service_owner_target(
         .cloned()
 }
 
-fn response_tcp_reservoir_subflow_target(
+fn response_tcp_reservoir_policy(
     admitted: &[ResponseSelectedDataTarget],
-    ordered_owner_debt_bytes: usize,
+    ordered_tail: ResponseOrderedTail,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-) -> Option<ResponseSelectedDataTarget> {
+) -> Option<ResponseTcpReservoir> {
     let service = response_feedable_service_owner_target(admitted)?;
     if service.target.key.underlay != UnderlayProtocol::Tcp
         || !service.target.is_active
@@ -2817,19 +3141,46 @@ fn response_tcp_reservoir_subflow_target(
     {
         return None;
     }
-    let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64;
-    let service_assigned = response_target_assigned_product_bytes(&service.target);
-    let feed_reservoir =
-        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits) as u64;
-    if service_assigned < service_horizon
-        || (ordered_owner_debt_bytes as u64)
-            .max(service_assigned)
-            .saturating_add(payload_bytes as u64)
-            > feed_reservoir
-    {
-        return None;
-    }
+    let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+    let service_assigned = service.target.owner_data_in_flight_bytes;
+    let feed_reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits);
 
+    ResponseTcpReservoir::new(
+        service.target.key,
+        ordered_tail,
+        service_assigned,
+        service_horizon,
+        feed_reservoir,
+        payload_bytes,
+    )
+}
+
+fn response_target_is_tcp_reservoir_candidate(
+    reservoir: ResponseTcpReservoir,
+    target: &ResponseSenderPathTarget,
+) -> bool {
+    target.key != reservoir.service()
+        && target.key.underlay == UnderlayProtocol::Tcp
+        && !target.is_active
+        && target.has_bulk_rate_evidence
+        && target.snapshot.active_latency_sensitive_flows == 0
+        && target.snapshot.session_active_latency_sensitive_flows == 0
+}
+
+fn response_tcp_reservoir_candidate_debt(
+    reservoir: ResponseTcpReservoir,
+    target: &ResponseSenderPathTarget,
+) -> ResponseCandidateTailDebt {
+    // The global tail contains unique OwnerData. Subtract only this candidate's
+    // unique share; generic carrier admission separately keeps every OwnerData
+    // and RepairData copy charged as product flight.
+    reservoir.for_candidate(target.key, target.owner_data_in_flight_bytes)
+}
+
+fn response_tcp_reservoir_subflow_target(
+    admitted: &[ResponseSelectedDataTarget],
+    reservoir: ResponseTcpReservoir,
+) -> Option<ResponseSelectedDataTarget> {
     // The single-family source reader already caps total ordered tail plus raw
     // staging at the Service feed reservoir. Keep the first horizon on Service,
     // then let one already-admitted measured TCP Subflow use the remaining
@@ -2838,18 +3189,10 @@ fn response_tcp_reservoir_subflow_target(
         .iter()
         .filter(|selected| {
             selected.admission.role == PathRuntimeRole::Subflow
-                && selected.target.key.underlay == UnderlayProtocol::Tcp
-                && !selected.target.is_active
-                && selected.target.has_bulk_rate_evidence
-                && selected.target.snapshot.active_latency_sensitive_flows == 0
-                && selected
-                    .target
-                    .snapshot
-                    .session_active_latency_sensitive_flows
-                    == 0
+                && response_target_is_tcp_reservoir_candidate(reservoir, &selected.target)
                 && selected
                     .subflow_set_commit
-                    .is_some_and(|commit| commit.service == service.target.key)
+                    .is_some_and(|commit| commit.service == reservoir.service())
         })
         .min_by(|left, right| {
             left.target
@@ -2870,7 +3213,7 @@ fn response_target_has_emission_credit(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> bool {
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return true;
     }
     let credit = response_target_emission_credit_bytes(target, lane, payload_bytes, mux_limits);
@@ -2887,7 +3230,7 @@ fn response_service_has_assigned_owner_credit(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> bool {
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return true;
     }
     let credit = response_service_emission_credit_bytes(target, payload_bytes, mux_limits);
@@ -2938,7 +3281,7 @@ fn response_target_emission_credit_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    if relay_lane_is_bulk(lane) {
+    if lane.is_bulk() {
         if target.is_active {
             return response_service_emission_credit_bytes(target, payload_bytes, mux_limits);
         }
@@ -3027,59 +3370,96 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
             }
         }
         ReliablePathStreamOutput::Switchable(binding) => {
-            let (planner_generation, subflow_set) = binding.subflow_state_snapshot();
-            let (lane_generation, active_response_flows) =
-                binding.lane_generation_and_active_response_flows();
-            let lower_flights = binding.lower_flights_before_offset(next_offset);
-            let targets = binding.sender_path_targets(relay_lane, payload_bytes);
-            let ordered_data_owner = binding.ordered_data_owner();
-            let Some(mut selected) = select_response_sender_data_target_with_ordered_debt_inner(
-                &targets,
-                relay_lane,
-                payload_bytes,
-                binding.mux_limits(),
-                &lower_flights,
-                ordered_data_owner,
-                ordered_owner_debt_bytes,
-                subflow_set.as_ref(),
-                active_response_flows >= 2,
-            ) else {
-                return Err(RuntimeError::SenderServiceBlocked);
-            };
-            if let Some(commit) = selected.subflow_set_commit.as_mut() {
-                commit.planner_generation = planner_generation;
-                commit.lane_generation = lane_generation;
-            }
-            if let Some(commit) = selected.ack_clock_calibration_commit.as_mut() {
-                commit.planner_generation = planner_generation;
-                commit.lane_generation = lane_generation;
-            }
-            let target = selected.target;
-            let role = selected.admission.role;
-            debug_assert!(
-                role != PathRuntimeRole::Subflow
-                    || target.has_bulk_rate_evidence
-                    || selected
-                        .subflow_set_commit
-                        .is_some_and(|commit| commit.input.startup_owner_allowed),
-                "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
-                target.key,
-                role,
-                ordered_data_owner,
-                response_oldest_lower_flight_owner(&lower_flights),
-                target.is_active,
-                target.has_sender_evidence,
-                target.has_bulk_rate_evidence,
-            );
-            Ok(ResponseDataDispatchPlan {
-                primary: ResponseDataDispatchTarget::Switchable {
-                    binding: binding.clone(),
-                    target,
+            let mut may_resnapshot_after_retirement = true;
+            loop {
+                let (planner_generation, subflow_set) = binding.subflow_state_snapshot();
+                let (lane_generation, active_response_flows) =
+                    binding.lane_generation_and_active_response_flows();
+                let model_generation = binding.response_model_generation();
+                let lower_flights = binding.lower_flights_before_offset(next_offset);
+                let targets = binding.sender_path_targets(relay_lane, payload_bytes);
+                let ordered_data_owner = binding.ordered_data_owner();
+                let mut retirement_intents = Vec::new();
+                let selected =
+                    select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
+                        &targets,
+                        relay_lane,
+                        payload_bytes,
+                        binding.mux_limits(),
+                        &lower_flights,
+                        ordered_data_owner,
+                        ordered_owner_debt_bytes,
+                        subflow_set.as_ref(),
+                        active_response_flows >= 2,
+                        &mut retirement_intents,
+                    );
+                let mut retired_any = false;
+                if may_resnapshot_after_retirement {
+                    for mut intent in retirement_intents {
+                        intent.planner_generation = planner_generation;
+                        intent.lane_generation = lane_generation;
+                        intent.model_generation = model_generation;
+                        retired_any |= binding.try_retire_tcp_ack_clock_calibration(
+                            ResponseAckClockCalibrationRetirementRequest {
+                                expected_planner_generation: intent.planner_generation,
+                                expected_lane_generation: intent.lane_generation,
+                                expected_model_generation: intent.model_generation,
+                                service: intent.service,
+                                service_incarnation: intent.service_incarnation,
+                                service_pending_bytes: intent.service_pending_bytes,
+                                target: intent.target,
+                                target_incarnation: intent.target_incarnation,
+                                target_pending_bytes: intent.target_pending_bytes,
+                                limit_bytes: intent.limit_bytes,
+                            },
+                        );
+                    }
+                }
+                if retired_any {
+                    // Retirement invalidates the planner generation. Recompute
+                    // once so the resulting Service/reservoir plan uses the tombstone.
+                    may_resnapshot_after_retirement = false;
+                    continue;
+                }
+                let Some(mut selected) = selected else {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                };
+                if let Some(commit) = selected.subflow_set_commit.as_mut() {
+                    commit.planner_generation = planner_generation;
+                    commit.lane_generation = lane_generation;
+                }
+                if let Some(commit) = selected.ack_clock_calibration_commit.as_mut() {
+                    commit.planner_generation = planner_generation;
+                    commit.lane_generation = lane_generation;
+                    commit.model_generation = model_generation;
+                }
+                let target = selected.target;
+                let role = selected.admission.role;
+                debug_assert!(
+                    role != PathRuntimeRole::Subflow
+                        || target.has_bulk_rate_evidence
+                        || selected
+                            .subflow_set_commit
+                            .is_some_and(|commit| commit.input.startup_owner_allowed),
+                    "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
+                    target.key,
                     role,
-                    subflow_set_commit: selected.subflow_set_commit,
-                    ack_clock_calibration_commit: selected.ack_clock_calibration_commit,
-                },
-            })
+                    ordered_data_owner,
+                    response_oldest_lower_flight_owner(&lower_flights),
+                    target.is_active,
+                    target.has_sender_evidence,
+                    target.has_bulk_rate_evidence,
+                );
+                return Ok(ResponseDataDispatchPlan {
+                    primary: ResponseDataDispatchTarget::Switchable {
+                        binding: binding.clone(),
+                        target,
+                        role,
+                        subflow_set_commit: selected.subflow_set_commit,
+                        ack_clock_calibration_commit: selected.ack_clock_calibration_commit,
+                    },
+                });
+            }
         }
     }
 }
@@ -3275,9 +3655,13 @@ async fn emit_planned_response_data_frame(
                 ack_clock_calibration_commit.map(|commit| ResponseAckClockCalibrationRequest {
                     expected_planner_generation: commit.planner_generation,
                     expected_lane_generation: commit.lane_generation,
+                    expected_model_generation: commit.model_generation,
                     service: commit.service,
                     service_incarnation: commit.service_incarnation,
+                    service_pending_bytes: commit.service_pending_bytes,
+                    target_pending_bytes: commit.target_pending_bytes,
                     limit_bytes: commit.limit_bytes,
+                    requires_multi_flow_start: commit.requires_multi_flow_start,
                 });
             let calibrating = calibration_request.is_some();
             match binding.try_enqueue_owner_frame_for_target(
@@ -4581,7 +4965,7 @@ impl RelaySenderService {
                 .last()
                 .map(|path| path.stream.lane)
                 .unwrap_or(FlowLane::Latency);
-            if relay_lane_is_bulk(stream_lane)
+            if stream_lane.is_bulk()
                 && matches!(frame, Frame::StreamData { .. })
                 && !cause.is_repair()
             {
@@ -6638,6 +7022,10 @@ mod tests {
         snapshot.inflight_limit_bytes = inflight_limit_bytes;
         snapshot.confidence = 1.0;
         ResponseSenderPathTarget {
+            #[cfg(feature = "lab-diagnostics")]
+            session_id: SessionId(0),
+            #[cfg(feature = "lab-diagnostics")]
+            binding_instance_id: 0,
             key: CarrierPathKey {
                 underlay,
                 path_id: PathId(path_id),
@@ -6650,6 +7038,8 @@ mod tests {
                 StreamOpenRole::Validation
             },
             snapshot,
+            owner_data_in_flight_bytes: bytes_in_flight,
+            command_pending_bytes: 0,
             eta_ms,
             is_active,
             is_request_active: is_active,
@@ -6672,7 +7062,7 @@ mod tests {
         candidate_commands: ReliablePathCommandSender,
         service_receivers: ReliablePathCommandReceivers,
         candidate_receivers: ReliablePathCommandReceivers,
-        _second_binding: Arc<ResponseStreamBinding>,
+        second_binding: Option<Arc<ResponseStreamBinding>>,
     }
 
     fn response_calibration_dispatch_fixture(
@@ -6777,7 +7167,57 @@ mod tests {
             candidate_commands,
             service_receivers,
             candidate_receivers,
-            _second_binding: second_binding,
+            second_binding: Some(second_binding),
+        }
+    }
+
+    fn install_slow_fresh_response_calibration(fixture: &ResponseCalibrationDispatchFixture) {
+        fixture
+            .binding
+            .set_output_product_model_for_test(fixture.service, 47_429_000.0, 333.0);
+        fixture
+            .binding
+            .set_output_product_model_for_test(fixture.candidate, 1_342_000.0, 891.787);
+        fixture.binding.install_tcp_ack_clock_calibration_for_test(
+            fixture.candidate,
+            0,
+            299_176,
+            reliable_ack_clock_calibration_ceiling_bytes(MuxLimits::default()),
+            false,
+        );
+    }
+
+    fn response_calibration_retirement_request(
+        fixture: &ResponseCalibrationDispatchFixture,
+    ) -> ResponseAckClockCalibrationRetirementRequest {
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let targets = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes);
+        let service = targets
+            .iter()
+            .find(|target| target.key == fixture.service)
+            .expect("Service target");
+        let candidate = targets
+            .iter()
+            .find(|target| target.key == fixture.candidate)
+            .expect("calibration target");
+        let (expected_planner_generation, _) = fixture.binding.subflow_state_snapshot();
+        let expected_lane_generation = fixture
+            .binding
+            .lane_generation_and_active_response_flows()
+            .0;
+        ResponseAckClockCalibrationRetirementRequest {
+            expected_planner_generation,
+            expected_lane_generation,
+            expected_model_generation: fixture.binding.response_model_generation(),
+            service: service.key,
+            service_incarnation: service.incarnation,
+            service_pending_bytes: service.command_pending_bytes,
+            target: candidate.key,
+            target_incarnation: candidate.incarnation,
+            target_pending_bytes: candidate.command_pending_bytes,
+            limit_bytes: candidate.ack_clock_calibration_credit_limit_bytes,
         }
     }
 
@@ -10280,6 +10720,27 @@ mod tests {
         let mut saturated =
             response_target(0, UnderlayProtocol::Udp, 1.0, 512 * 1024, 512 * 1024, true);
         saturated.snapshot.product_bytes_in_flight = mux_limits.max_path_flight_bytes as u64;
+        let candidates = [&saturated];
+        let outcome = response_target_unique_owner_admission_with_epoch(
+            &saturated,
+            &candidates,
+            ResponseBulkLead {
+                key: saturated.key,
+                snapshot: saturated.snapshot,
+                eta_ms: saturated.eta_ms,
+            },
+            None,
+            Some(saturated.key),
+            0,
+            ResponseOrderedTail::new(Some(saturated.key), 0).for_candidate(saturated.key),
+            64 * 1024,
+            mux_limits,
+            None,
+            true,
+            false,
+        );
+        assert_eq!(outcome.admission.decision, PathAdmissionDecision::Standby);
+        assert_eq!(outcome.model_suppression, Some("inflight_limit"));
 
         let selected = choose_response_sender_data_target(
             &[saturated],
@@ -10310,6 +10771,10 @@ mod tests {
         let mut snapshot = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 1.0, 8_000_000.0);
         snapshot.confidence = 1.0;
         let saturated = ResponseSenderPathTarget {
+            #[cfg(feature = "lab-diagnostics")]
+            session_id: SessionId(0),
+            #[cfg(feature = "lab-diagnostics")]
+            binding_instance_id: 0,
             key: CarrierPathKey {
                 underlay: UnderlayProtocol::Udp,
                 path_id: PathId(0),
@@ -10318,6 +10783,8 @@ mod tests {
             commands,
             attachment_role: StreamOpenRole::Active,
             snapshot,
+            owner_data_in_flight_bytes: 0,
+            command_pending_bytes: 0,
             eta_ms: 1.0,
             is_active: true,
             is_request_active: true,
@@ -13724,6 +14191,10 @@ mod tests {
         service_snapshot.inflight_limit_bytes = 16 * 1024 * 1024;
         service_snapshot.confidence = 1.0;
         let service = ResponseSenderPathTarget {
+            #[cfg(feature = "lab-diagnostics")]
+            session_id: SessionId(0),
+            #[cfg(feature = "lab-diagnostics")]
+            binding_instance_id: 0,
             key: CarrierPathKey {
                 underlay: UnderlayProtocol::Tcp,
                 path_id: PathId(1),
@@ -13732,6 +14203,8 @@ mod tests {
             commands: service_commands,
             attachment_role: StreamOpenRole::Active,
             snapshot: service_snapshot,
+            owner_data_in_flight_bytes: 0,
+            command_pending_bytes: 0,
             eta_ms: 50.0,
             is_active: true,
             is_request_active: true,
@@ -13969,6 +14442,7 @@ mod tests {
         assert_eq!(below_horizon.admission.role, PathRuntimeRole::Service);
 
         service.snapshot.product_bytes_in_flight = service_horizon as u64;
+        service.owner_data_in_flight_bytes = service_horizon as u64;
         let reservoir_subflow = select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[service.clone(), measured_subflow.clone()],
             FlowLane::Throughput,
@@ -14004,6 +14478,150 @@ mod tests {
         .expect("Service remains the liveness fallback at the reservoir boundary");
         assert_eq!(exhausted_reservoir.target.key, service.key);
         assert_eq!(exhausted_reservoir.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            25.0,
+            service_horizon as u64,
+            mux_limits.max_path_flight_bytes as u64,
+            true,
+        );
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+
+        let mut low_bdp_subflow = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        low_bdp_subflow.snapshot.product_progress_rate_bps = Some(54_016_000.0);
+        low_bdp_subflow.snapshot.delivery_rate_bps = 54_016_000.0;
+        low_bdp_subflow.snapshot.pacing_rate_bps = 54_016_000.0;
+        low_bdp_subflow.snapshot.srtt_ms = 137.968;
+        low_bdp_subflow.snapshot.min_rtt_ms = 137.968;
+        low_bdp_subflow.snapshot.app_limited = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), low_bdp_subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            service_horizon,
+            None,
+        )
+        .expect("Service or its measured TCP Subflow must remain feedable");
+
+        assert_eq!(
+            selected.target.key, low_bdp_subflow.key,
+            "the connection-level Service horizon consumes global reservoir credit once; it is not candidate-local BDP flight"
+        );
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    }
+
+    #[test]
+    fn tcp_reservoir_subtracts_only_unique_owner_not_queue_or_repair() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+        let overflow = 1024 * 1024;
+        let candidate_owner_bytes = 128 * 1024;
+        let candidate_product_copies = 2 * 1024 * 1024;
+        let service = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            25.0,
+            service_horizon as u64,
+            mux_limits.max_path_flight_bytes as u64,
+            true,
+        );
+        let mut candidate = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            candidate_product_copies,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        candidate.owner_data_in_flight_bytes = candidate_owner_bytes;
+        candidate.snapshot.queue_bytes = (3 * 1024 * 1024) as u64;
+        let tail = ResponseOrderedTail::new(Some(service.key), service_horizon + overflow);
+        let reservoir = ResponseTcpReservoir::new(
+            service.key,
+            tail,
+            service_horizon as u64,
+            service_horizon,
+            bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits),
+            payload_bytes,
+        )
+        .expect("global reservoir has credit");
+
+        let debt = response_tcp_reservoir_candidate_debt(reservoir, &candidate);
+        assert_eq!(
+            debt.external_bytes(),
+            (overflow - candidate_owner_bytes as usize) as u64
+        );
+        assert_eq!(
+            debt.external_bytes() + candidate.snapshot.product_bytes_in_flight,
+            (overflow + candidate_product_copies as usize - candidate_owner_bytes as usize) as u64,
+            "shared queue pressure and duplicate RepairData cannot erase unique tail exposure"
+        );
+    }
+
+    #[test]
+    fn tcp_reservoir_requires_unique_service_owner_horizon() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            25.0,
+            service_horizon as u64,
+            mux_limits.max_path_flight_bytes as u64,
+            true,
+        );
+        service.owner_data_in_flight_bytes = payload_bytes as u64;
+        service.snapshot.queue_bytes = service_horizon as u64;
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+
+        let mut measured_subflow = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        measured_subflow.snapshot.product_progress_rate_bps = Some(200_000_000.0);
+        measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
+        measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
+        measured_subflow.snapshot.app_limited = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), measured_subflow],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            service_horizon,
+            None,
+        )
+        .expect("Service remains the fallback until its unique quota is assigned");
+
+        assert_eq!(selected.target.key, service.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
@@ -14139,6 +14757,65 @@ mod tests {
         .expect("Service remains available while exact calibration flights drain");
         assert_eq!(calibration_fence.target.key, service.key);
         assert_eq!(calibration_fence.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn tcp_reservoir_waits_for_binding_calibration_tail() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            25.0,
+            service_horizon as u64,
+            mux_limits.max_path_flight_bytes as u64,
+            true,
+        );
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+
+        let mut proven = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            5.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        proven.snapshot.product_progress_rate_bps = Some(200_000_000.0);
+        proven.snapshot.delivery_rate_bps = 200_000_000.0;
+        proven.snapshot.pacing_rate_bps = 200_000_000.0;
+        proven.snapshot.app_limited = false;
+
+        let mut calibrating = response_target(
+            2,
+            UnderlayProtocol::Tcp,
+            10.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        let stage = reliable_ack_clock_calibration_limit_bytes(mux_limits);
+        calibrating.ack_clock_calibration_eligible = true;
+        calibrating.ack_clock_calibration_active = true;
+        calibrating.ack_clock_calibration_spent_bytes = stage;
+        calibrating.ack_clock_calibration_credit_limit_bytes = stage;
+        calibrating.ack_clock_calibration_max_limit_bytes = 2 * stage;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), proven, calibrating],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            service_horizon,
+            None,
+        )
+        .expect("Service remains available while calibration waits for ACK evidence");
+
+        assert_eq!(selected.target.key, service.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
     }
 
     #[test]
@@ -14279,7 +14956,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_ack_clock_calibration_bypasses_low_startup_rate_without_transferring_service() {
+    fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let service = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, true);
@@ -14329,11 +15006,100 @@ mod tests {
             0,
             None,
         )
-        .expect("the explicit bounded TCP calibration phase is selected");
+        .expect("Service remains available when exploration would create an ordering stall");
+        assert_eq!(selected.target.key, service.key);
+        assert!(selected.ack_clock_calibration_commit.is_none());
+    }
+
+    #[test]
+    fn fresh_tcp_calibration_is_dormant_when_multi_flow_start_is_closed() {
+        let mut candidate =
+            response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        candidate.commands = commands;
+        candidate.ack_clock_calibration_eligible = true;
+        candidate.ack_clock_calibration_credit_limit_bytes = 256 * 1024;
+        candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
+
+        assert!(response_ack_clock_calibration_pending(&candidate, true));
+        assert!(!response_ack_clock_calibration_pending(&candidate, false));
+        assert!(response_ack_clock_calibration_blocks_generic_owner(
+            &candidate
+        ));
+    }
+
+    #[test]
+    fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Tcp,
+            1_098.657,
+            0,
+            16 * 1024 * 1024,
+            true,
+        );
+        service.snapshot.delivery_rate_bps = 18_561_000.0;
+        service.snapshot.pacing_rate_bps = 18_561_000.0;
+        service.snapshot.srtt_ms = 333.0;
+        service.snapshot.min_rtt_ms = 333.0;
+
+        let mut candidate = response_target(
+            1,
+            UnderlayProtocol::Tcp,
+            1_406.704,
+            0,
+            16 * 1024 * 1024,
+            false,
+        );
+        candidate.snapshot.delivery_rate_bps = 1_007_000.0;
+        candidate.snapshot.pacing_rate_bps = 1_007_000.0;
+        candidate.snapshot.product_progress_rate_bps = Some(1_007_000.0);
+        candidate.snapshot.srtt_ms = 730.287;
+        candidate.snapshot.min_rtt_ms = 730.287;
+        candidate.snapshot.app_limited = true;
+        candidate.ack_clock_calibration_eligible = true;
+        let initial_limit = 183_802;
+        candidate.ack_clock_calibration_credit_limit_bytes = initial_limit;
+        candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
+        let candidates = [&service, &candidate];
+        let lead = ResponseBulkLead {
+            key: service.key,
+            snapshot: service.snapshot,
+            eta_ms: service.eta_ms,
+        };
+        assert_eq!(
+            response_target_unique_owner_admission(
+                &candidate,
+                &candidates,
+                lead,
+                None,
+                0,
+                payload_bytes,
+                mux_limits,
+            )
+            .decision,
+            PathAdmissionDecision::Standby,
+            "the provisional model still cannot claim ordinary ownership"
+        );
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), candidate.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("bounded exploration should fit behind the Service reservoir");
         assert_eq!(selected.target.key, candidate.key);
         assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
         assert!(selected.ack_clock_calibration_commit.is_some());
 
+        candidate.ack_clock_calibration_active = true;
         candidate.ack_clock_calibration_spent_bytes = initial_limit;
         candidate.ack_clock_calibration_credit_limit_bytes = initial_limit.saturating_mul(2);
         let grown = select_response_sender_data_target_with_ordered_debt_and_epoch(
@@ -14370,6 +15136,239 @@ mod tests {
         .expect("a stage awaiting new ACK evidence returns to Service");
         assert_eq!(awaiting_evidence.target.key, service.key);
         assert!(awaiting_evidence.ack_clock_calibration_commit.is_none());
+    }
+
+    #[test]
+    fn safe_tcp_calibration_waits_for_repair_carrier_headroom() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Tcp, 5_000.0, 0, 16 * 1024 * 1024, true);
+        let mut candidate =
+            response_target(1, UnderlayProtocol::Tcp, 100.0, 0, 16 * 1024 * 1024, false);
+        candidate.ack_clock_calibration_eligible = true;
+        candidate.ack_clock_calibration_credit_limit_bytes = 256 * 1024;
+        candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
+        candidate.snapshot.product_bytes_in_flight = 256 * 1024;
+        candidate.owner_data_in_flight_bytes = 0;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), candidate],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            None,
+        )
+        .expect("Service remains available while RepairData occupies candidate headroom");
+
+        assert_eq!(selected.target.key, service.key);
+        assert!(selected.ack_clock_calibration_commit.is_none());
+    }
+
+    #[test]
+    fn tcp_ack_clock_calibration_retirement_releases_binding_fences() {
+        let fixture = response_calibration_dispatch_fixture(8);
+        install_slow_fresh_response_calibration(&fixture);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let generation_before = fixture.binding.subflow_state_snapshot().0;
+
+        let plan =
+            plan_response_data_dispatch(&fixture.stream, FlowLane::Throughput, 0, payload_bytes)
+                .expect("Service remains available after retiring unsafe exploration");
+
+        assert_eq!(plan.primary_key(), Some(fixture.service));
+        assert_ne!(
+            fixture.binding.subflow_state_snapshot().0,
+            generation_before
+        );
+        let candidate = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.candidate)
+            .expect("retired candidate remains attached");
+        assert_eq!(candidate.ack_clock_calibration_spent_bytes, 0);
+        assert_eq!(candidate.ack_clock_calibration_credit_limit_bytes, 0);
+        assert_eq!(candidate.ack_clock_calibration_max_limit_bytes, 0);
+        assert!(!candidate.ack_clock_calibration_active);
+        assert!(!response_ack_clock_calibration_blocks_generic_owner(
+            &candidate
+        ));
+    }
+
+    #[test]
+    fn tcp_ack_clock_calibration_retirement_ignores_repair_only_carrier_debt() {
+        let fixture = response_calibration_dispatch_fixture(1);
+        install_slow_fresh_response_calibration(&fixture);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let repair = Frame::StreamData {
+            stream_id: fixture.stream.stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"repair-only"),
+        };
+        fixture
+            .candidate_commands
+            .try_enqueue_stream_ordered_frame(repair.clone(), FlowLane::Throughput)
+            .expect("fill the candidate lane with RepairData");
+        fixture
+            .binding
+            .record_repair_flight(fixture.candidate, &repair);
+
+        let plan = plan_response_data_dispatch(
+            &fixture.stream,
+            FlowLane::Throughput,
+            reliable_stream_frame_payload_bytes(&repair) as u64,
+            payload_bytes,
+        )
+        .expect("RepairData must not preserve a unique-owner calibration fence");
+
+        assert_eq!(plan.primary_key(), Some(fixture.service));
+        let candidate = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.candidate)
+            .expect("candidate remains attached");
+        assert_eq!(candidate.owner_data_in_flight_bytes, 0);
+        assert!(candidate.snapshot.product_bytes_in_flight > 0);
+        assert_eq!(candidate.ack_clock_calibration_credit_limit_bytes, 0);
+        assert_eq!(candidate.ack_clock_calibration_max_limit_bytes, 0);
+        assert!(!response_ack_clock_calibration_blocks_generic_owner(
+            &candidate
+        ));
+    }
+
+    #[test]
+    fn tcp_ack_clock_calibration_retirement_refuses_exact_owner_flight() {
+        let fixture = response_calibration_dispatch_fixture(8);
+        install_slow_fresh_response_calibration(&fixture);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let candidate = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.candidate)
+            .expect("fresh calibration candidate");
+        fixture.binding.record_owner_flight_for_target(
+            &candidate,
+            &Frame::StreamData {
+                stream_id: fixture.stream.stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"stale-owner"),
+            },
+        );
+
+        let plan =
+            plan_response_data_dispatch(&fixture.stream, FlowLane::Throughput, 0, payload_bytes)
+                .expect("stale calibration state must fall back without erasing exact flight");
+
+        assert_eq!(plan.primary_key(), Some(fixture.service));
+        let candidate = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.candidate)
+            .expect("candidate remains attached");
+        assert!(candidate.ack_clock_calibration_credit_limit_bytes > 0);
+        assert!(candidate.ack_clock_calibration_max_limit_bytes > 0);
+        assert!(response_ack_clock_calibration_blocks_generic_owner(
+            &candidate
+        ));
+    }
+
+    #[test]
+    fn tcp_ack_clock_calibration_retirement_rejects_stale_path_model() {
+        let fixture = response_calibration_dispatch_fixture(8);
+        install_slow_fresh_response_calibration(&fixture);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let request = response_calibration_retirement_request(&fixture);
+        fixture
+            .binding
+            .set_output_product_model_for_test(fixture.candidate, 500_000_000.0, 10.0);
+
+        assert!(
+            !fixture
+                .binding
+                .try_retire_tcp_ack_clock_calibration(request)
+        );
+        let candidate = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.candidate)
+            .expect("candidate remains attached");
+        assert!(candidate.ack_clock_calibration_credit_limit_bytes > 0);
+    }
+
+    #[test]
+    fn tcp_ack_clock_calibration_retirement_rejects_stale_pending_snapshots() {
+        let mut fixture = response_calibration_dispatch_fixture(8);
+        install_slow_fresh_response_calibration(&fixture);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+
+        let stale_candidate = response_calibration_retirement_request(&fixture);
+        fixture
+            .candidate_commands
+            .try_enqueue_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: fixture.stream.stream_id,
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"candidate-pending"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("change candidate pending bytes");
+        let candidate_command = try_recv_reliable_path_command(&mut fixture.candidate_receivers)
+            .expect("drain candidate queue without releasing pending bytes");
+        let candidate_pending_bytes = reliable_path_command_pending_bytes(&candidate_command);
+        assert!(
+            !fixture
+                .binding
+                .try_retire_tcp_ack_clock_calibration(stale_candidate)
+        );
+        fixture
+            .candidate_receivers
+            .release_pending_command_bytes(candidate_pending_bytes);
+
+        let stale_service = response_calibration_retirement_request(&fixture);
+        let service = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.service)
+            .expect("Service target");
+        service
+            .commands
+            .try_enqueue_stream_ordered_frame(
+                Frame::StreamData {
+                    stream_id: fixture.stream.stream_id,
+                    offset: payload_bytes as u64,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"service-pending"),
+                },
+                FlowLane::Throughput,
+            )
+            .expect("change Service pending bytes");
+        let service_command = try_recv_reliable_path_command(&mut fixture.service_receivers)
+            .expect("drain Service queue without releasing pending bytes");
+        let service_pending_bytes = reliable_path_command_pending_bytes(&service_command);
+        assert!(
+            !fixture
+                .binding
+                .try_retire_tcp_ack_clock_calibration(stale_service)
+        );
+        fixture
+            .service_receivers
+            .release_pending_command_bytes(service_pending_bytes);
+
+        assert!(fixture.binding.try_retire_tcp_ack_clock_calibration(
+            response_calibration_retirement_request(&fixture)
+        ));
     }
 
     #[test]
@@ -14494,7 +15493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_response_calibration_dispatch_fills_exact_stage_remainder() {
+    async fn tcp_response_calibration_dispatch_restores_credit_after_exact_remainder() {
         let mux_limits = MuxLimits::default();
         let normal_payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut fixture = response_calibration_dispatch_fixture(8);
@@ -14552,12 +15551,59 @@ mod tests {
             .into_iter()
             .find(|target| target.key == fixture.candidate)
             .expect("drained calibration target");
-        assert!(!drained.ack_clock_calibration_active);
-        assert_eq!(
-            drained.ack_clock_calibration_spent_bytes,
-            drained.ack_clock_calibration_max_limit_bytes,
-            "a sub-sample residual drains to an exhausted tombstone instead of stranding the serial fence"
+        assert!(drained.ack_clock_calibration_active);
+        assert!(
+            drained.ack_clock_calibration_credit_limit_bytes
+                > drained.ack_clock_calibration_spent_bytes,
+            "exact drain restores bounded credit when no representative strict window was reachable"
         );
+        assert!(
+            drained.ack_clock_calibration_credit_limit_bytes
+                <= drained.ack_clock_calibration_max_limit_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn active_tcp_calibration_finishes_after_response_flow_count_drops() {
+        let mux_limits = MuxLimits::default();
+        let normal_payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut fixture = response_calibration_dispatch_fixture(8);
+        drop(fixture.second_binding.take());
+        assert_eq!(
+            fixture
+                .binding
+                .lane_generation_and_active_response_flows()
+                .1,
+            1
+        );
+        let mut sender = ServerResponseSenderService::new(SessionId(191), fixture.stream.stream_id);
+        sender.enqueue_data_for_lane(
+            Bytes::from(vec![0x5a; normal_payload_bytes]),
+            FlowLane::Throughput,
+        );
+        let mut send_stream = ReliableSendStream::new_with_initial_max_offset(
+            fixture.stream.stream_id,
+            mux_limits,
+            u64::MAX,
+        );
+
+        let dispatch = sender
+            .dispatch_next(
+                &fixture.stream,
+                &mut send_stream,
+                FlowLane::Throughput,
+                mux_limits,
+            )
+            .await
+            .expect("an exact active calibration may finish after the start gate closes");
+
+        assert_eq!(dispatch.selected_path, Some(fixture.candidate));
+        assert_eq!(dispatch.payload_bytes, 4032);
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut fixture.candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { payload, .. }))
+                if payload.len() == 4032
+        ));
     }
 
     #[tokio::test]
@@ -15184,21 +16230,23 @@ mod tests {
             snapshot: service.snapshot,
             eta_ms: service.eta_ms,
         };
-        let (_, commit) = response_target_unique_owner_admission_with_epoch(
+        let outcome = response_target_unique_owner_admission_with_epoch(
             &validation,
             &candidates,
             lead,
             None,
             Some(service.key),
             0,
-            payload_bytes,
+            ResponseOrderedTail::new(Some(service.key), payload_bytes)
+                .for_candidate(validation.key),
             payload_bytes,
             mux_limits,
             None,
             true,
             false,
         );
-        let input = commit
+        let input = outcome
+            .subflow_set_commit
             .expect("first sample quantum should be admitted")
             .input;
         let mut epoch = FlowSubflowSet::new(0, service.key, startup_credit, 0, Duration::ZERO);

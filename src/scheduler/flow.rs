@@ -7,6 +7,14 @@ pub enum FlowLane {
     Background,
 }
 
+impl FlowLane {
+    /// Bulk lanes may trade latency for sustained carrier feeding; the
+    /// transport-specific schedulers consume this product classification.
+    pub(crate) const fn is_bulk(self) -> bool {
+        matches!(self, Self::Throughput | Self::Background)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowDemand {
     pub lane: FlowLane,

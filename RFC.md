@@ -569,10 +569,10 @@ This Service rule is deliberately different from optional Subflow admission:
 the Service is the current primary owner and must remain fed while its ordered
 frontier is clear, whereas optional paths must prove positive contribution
 before receiving owner bytes.
-For a mature TCP response with no serialized calibration or latency pressure,
+For a mature TCP response with no latency pressure,
 "remain fed" means soft priority through the derived Service horizon, not
 exclusive use of the entire hard Service envelope. Once the exact live
-Service's union-style assigned debt reaches that horizon, an already-admitted,
+Service's unacknowledged unique `OwnerData` reaches that horizon, an already-admitted,
 bulk-rate-proven same-TCP Subflow MAY own the next quantum while
 `max(global_ordered_tail, Service_assigned) + quantum` remains within the
 derived Service feed reservoir. The selected Subflow MUST carry a commit for
@@ -1109,7 +1109,8 @@ their origin is explicit and they do not become hidden modes.
 | Service frame quantum | Latency/control use small BBR-style quanta; reliable bulk feeds TCP/QUIC with the bounded 64 KiB BBR send quantum under the configured read/payload envelope and live condition cap | BBR send-quantum model applied at the product-record boundary, with TCP/QUIC packet pacing below | Tiny quanta cap throughput; giant quanta harm latency | Keep adaptive; high-rate stable paths repeatedly dispatch bounded quanta while control/repair/latency remain preemptive |
 | TCP AEAD record granularity | Send exactly one encoded product frame per independently counted/authenticated `MPTE` version 2 envelope; a writer run may batch consecutive envelopes into one socket write | TLS 1.3's bounded independently authenticated record layer is the mature design precedent; mptunnel retains its own adaptive product-frame quantum rather than copying the TLS record-size limit | Coalescing a 512 KiB writer run into one record makes one lost TCP segment block decryption and product feedback for the whole run; one syscall per small record can waste CPU | Keep strict frame/record identity on emission and bounded multi-envelope socket-write batching; reject non-canonical multi-frame plaintexts |
 | Startup Subflow sample epoch | Per candidate, cumulative `OwnerData` budget = `min(RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2, path_flight_envelope, receiver_reorder_envelope, repair_envelope, stream_window_envelope)`; the current fixed startup window makes the unclamped budget 256 KiB. A product frame is never split to consume remaining credit. After a useful sample exists, a next frame larger than the remaining credit irrevocably seals the request sample at its actual admitted byte count, sends that whole frame on Service, and queues one proof marker behind the sealed sample on the exact reliable carrier stream. Marker ACK time measures conservative receipt goodput using that sealed count. Response sampling additionally requires at least two active direction-relevant reliable response flows. Request/upload sampling instead requires sustained bulk-only Throughput/Background demand, a stable direction-correct bulk-rate-proven Active Service attachment, and fresh proof on the exact same-underlay Validation attachment instance | Multi-quantum startup sampling follows MPTCP subflow probing, QUIC path validation and initial-window growth, and BBR send-quantum/app-limited sampling practice; the response flow-count gate, request sustained-demand gate, ordered receipt marker, and 256 KiB budget are mptunnel policy | One quantum underfeeds useful paths; ACK-refilled or concurrent candidates create unbounded HOL debt; attachment proof mistaken for rate admits an unmeasured path; ambiguous repair ACKs can strand an exhausted sample without a receipt fence; splitting or accepting a later small frame after a near-cap seal changes record identity and reopens ordering debt | Keep one frozen cumulative, non-refilling budget per exact candidate instance and at most one unproven startup owner per stream. Every whole frame and the single marker remain preemptible and carrier/reorder gated. A near-cap seal is final even if smaller frames arrive later. A request candidate may release the startup-owner slot only after exact ordered-receipt or unambiguous ACK-derived bulk-rate graduation and release of its ordering-owner flights; retained sampled membership prevents that instance from receiving fresh startup credit. A response candidate releases the slot after its OwnerData flights drain and canonical bulk proof exists: exact product ACK evidence is sufficient for TCP, while QUIC requires local carrier ACK-derived evidence. Keep the response two-flow and generation fence unchanged, and suppress both directions under latency-sensitive/realtime pressure or authoritative lower debt |
-| TCP response ACK-clock calibration | After response startup graduation, one exact TCP Validation instance receives 2 MiB of cumulative, non-refilling calibration credit. Once the current stage is fully spent, a later ACK window may double the authorized cumulative ceiling up to the path-flight, repair, receiver-reorder, and stream-window resource envelope only when every sampled send precedes the prior ACK and the earliest send follows stage authorization. Strict current-stage windows form a byte/raw-time aggregate with timer granularity applied once; at authorization it enters a rolling five-stage window only with at least half the initial credit in coverage (1 MiB by default, clamped to the initial resource limit). Under-covered evidence may still grow/prove the stage. Retain startup rate before three aggregates, then overwrite with the median. Product-flight and carrier-queue views use union-style admission debt while cumulative spend stays exact. An exact active residual smaller than the normal chunk is emitted only when a residual-sized first plan returns that exact calibration commit; otherwise a second pass gives Service its normal chunk. Service ownership never moves, and a proven identity remains fenced until its calibration flights drain. UDP/QUIC is excluded | TCP lacks QUIC's local packet ACK controller; staged product ACK-clock sampling is mptunnel policy for filling a high-BDP response path without granting the full resource envelope from a hint | A fixed 2 MiB sample underfills high-BDP paths; ACK-refill is unbounded; mixed-stage, small terminal, per-callback timer rounding, or ACK-compressed windows can publish misleading artifacts; double-counted queue debt can make the strict terminal window impossible; max-filtering makes high artifacts permanent; unconditional residual framing fragments ordinary Service work; applying product ACK timing to QUIC corrupts carrier pacing evidence | Keep cumulative spend monotonic and credit growth independent from publication. Aggregate only strictly causal current-stage windows, require representative byte coverage for rate insertion, apply timer granularity once, use union-style debt with exact spend, publish the rolling median after three stage aggregates without max-filtering, use two-pass exact-commit residual planning, fence commit by exact output and generations through flight drain, roll back failed enqueue, retain Service, serialize candidates until exact flights drain, and cap at the configured resource envelope |
+| TCP response ACK-clock calibration | After response startup graduation, one exact TCP Validation instance receives cumulative, non-refilling initial credit `I = min(resource ceiling, Service horizon, max(one send quantum, 2 * candidate BDP))`. For one measurement stage let `B` be spend at authorization, `L` the cumulative ceiling, `A=L-B` fresh capacity, `W` fresh bytes ACKed in first/noncausal/mixed windows, `E` strict causal fresh evidence, and `F=min(resource-clamped Service horizon, max(path-proof floor, Service horizon/2))`. Only `E` enters the rate aggregate. When fully spent, `A-W<F` tops up the same stage to `min(resource ceiling, max(2L, B+W+F))` without resetting `B`, `W`, `E`, or provenance; `A-W>=F` waits until `E>=F` or exact drain. Three accepted aggregates publish their median and end exclusive calibration. Service ownership never moves, exact commits remain binding-local, and UDP/QUIC is excluded | TCP lacks QUIC's local packet ACK controller; staged product ACK-clock sampling is mptunnel policy for estimating a response path without granting the full resource envelope from a hint | A path-sized seed can be safe but too small to publish; an exact-`F` stage cannot yield `F` strict bytes because its first window establishes the clock; fixed `2F` is still insufficient when ACKs coalesce more than `F`; resetting after each reachability growth repeats that loss; ACK refill is unbounded; mixed-stage or ACK-compressed windows can fabricate rates; max-filtering makes high artifacts permanent; applying product ACK timing to QUIC corrupts carrier evidence | Keep cumulative spend monotonic and distinguish bounded delivery-ACK turnover from strict rate proof. Attribute only fresh mixed-window bytes to `W`, top up the same stage only enough to restore reachable strict capacity, infer missing `W` at exact drain, and terminate without a rate at the hard envelope. Aggregate only strict current-stage windows, apply timer granularity once, publish the three-stage median without max-filtering, stop before another exclusive stage, use exact two-pass residual commits, fence the binding-local identity through flight drain, retain Service, and leave QUIC packet ACK congestion/pacing authoritative |
+| Fresh TCP calibration opportunity | Before the first calibration byte, project the whole seed against the remaining Service feed reservoir; retire an unsafe zero-spend identity only after coherent revalidation. Two response flows are required to start. A begun stage may finish after a two-to-one transition; an unstarted identity becomes dormant and blocks only itself | MPTCP ECF/BLEST ordered-completion reasoning above kernel TCP; mptunnel keeps QUIC carrier ACK control separate | Unconditional probing creates HOL stalls; canceling begun work strands offsets; dormant binding-wide serialization wastes proven capacity | Gate and retire only fresh zero-spend TCP calibration, keep begun exact ownership serial until drain, and leave dormant Service/other measured work open |
 | Inflight target | BDP * BBR cwnd gain, send quantum, and MinPipeCwnd under configured flight envelope; latency/realtime lanes use the smaller preemptive target | BBR inflight model and product lane priority | Too low underfeeds; too high queues | Keep adaptive from live BDP/queue/loss/carrier evidence |
 | Stability/backlog factors | Shrink by loss/jitter/queue/backlog relative to BDP with floor derived from MinPipeCwnd or send quantum divided by BDP | Congestion-sensitive adaptation; floor is no longer a fixed fraction | Over-shrinking can create low-rate loops | Keep adaptive; diagnostics must show shrink reason |
 | Auto bulk classification | EWMA/rate/byte/idle-gap evidence promotes/demotes demand using service quantum, BDP, and PTO; per-stream bulk prevalidation requires an amortized multi-window floor, not merely one initial window and not a full throughput-promotion delay | Product-specific but measurement-based | Late/early promotion affects latency/throughput; too-early prevalidation creates short-flow open/close churn | Keep adaptive; no user-visible mode tag or port rule |
@@ -4080,9 +4081,18 @@ graduate it. It receives no additional startup credit.
 A graduated TCP response candidate uses a separate staged exact-instance
 ACK-clock calibration. At most one exact live graduated response Validation
 instance may own calibration `OwnerData` at a time, and the response Service
-owner MUST remain unchanged. The initial authorized cumulative credit is one
-service horizon, 2 MiB with the default envelopes. Spent bytes never decrease
-or refill. Once cumulative spend reaches the current authorized ceiling, that
+owner MUST remain unchanged. The initial authorized cumulative credit is the
+minimum of the resource-clamped Service horizon and two candidate BDPs, with a
+one-send-quantum floor. This keeps an underestimated candidate measurable
+without turning the full product horizon into its first HOL obligation. A fresh
+zero-spend stage may start only while a generation-stable count of at least two
+direction-relevant response flows exists. That count is a start gate, not a
+lifecycle cancellation: after exact calibration ownership is active or partly
+spent, the authorized stage may finish if the count falls from two to one. An
+unstarted identity then becomes dormant without refill or identity change; it
+blocks only itself from generic `OwnerData`, not Service or other measured
+reservoir work. Spent
+bytes never decrease or refill. Once cumulative spend reaches the current authorized ceiling, that
 ceiling may double only after a strictly causal later ACK-to-ACK sample whose
 latest sampled send precedes the prior ACK and whose earliest sampled send is
 not earlier than the current stage's authorization time. Bytes sent after the
@@ -4091,9 +4101,11 @@ stage authorization make it the wrong stage. Neither case authorizes growth.
 Each doubling is capped by the configured path-flight, repair,
 receiver-reorder, and stream-window resource ceiling; peer hints and
 wrong-direction metrics MUST NOT raise it. Failed enqueue rolls back only the
-unemitted reservation. Exact path key, output incarnation, Service key,
-planner generation, lane-pressure generation, and response-flow generation are
-revalidated at commit.
+unemitted reservation. Commit revalidates planner generation, the combined
+session lane/response-flow generation, the response path/ordering model
+generation, exact Service and target key/incarnation, captured Service and
+target command-pending byte values, and the exact calibration ceiling. Pending
+byte equality is a pressure-value fingerprint, not a queue event generation.
 
 An exact active TCP response calibration may have positive credit smaller than
 the normal response source chunk. The sender handles that residual with
@@ -4108,32 +4120,62 @@ proven, retired, stale, or UDP/QUIC calibration produces no TCP residual pass.
 UDP/QUIC response work retains normal product-frame sizing and its carrier-local
 controller.
 
-Stage-credit growth and response-rate publication are separate decisions. A
-stage-authorizing sample may grow credit immediately without waiting for a
-publishable rate. Every strict ACK-to-ACK window whose earliest send follows
-the current stage authorization accumulates its bytes and raw elapsed time for that
-stage. When a fully spent stage is authorized, its aggregate rate is eligible
-for the exact instance's rolling five-stage window only if aggregate bytes
-reach `min(initial_credit, max(MIN_RATE_SAMPLE_BYTES,
-ceil(initial_credit / 2)))`, 1 MiB under the default 2 MiB initial credit.
-An under-covered stage still grows or proves, but resets without inserting a
-rate; prior-stage, mixed-causal, retired, or stale-incarnation evidence MUST NOT
-carry into the next aggregate. Before three qualifying stage aggregates exist,
-the candidate retains its provisional startup/receipt rate. At three aggregates
-and thereafter, the median of the available rolling window MUST
-overwrite both product-progress and delivery rate, including when the median is
-lower than the prior value. A max filter or upward-only EWMA is forbidden here:
+Stage-credit growth and response-rate publication are separate decisions. Let
+`B` be cumulative spend at measurement-stage authorization, `L` the cumulative
+credit ceiling, `A = L - B` fresh authorized capacity, `W` fresh current-stage
+bytes consumed by first, noncausal, or mixed windows, and `E` strict causal
+fresh bytes. A mixed window charges only its exact fresh suffix to `W`. Thus
+`A - W`, not cumulative `L` or raw `A`, is the maximum strict evidence still
+reachable in this stage.
+
+Every strict ACK-to-ACK window whose sends all follow current authorization and
+precede the prior ACK accumulates bytes and raw elapsed time into `E`. Its
+aggregate is eligible for the exact instance's bounded stage-rate buffer only
+when `E` reaches `F = min(service_horizon, max(MIN_RATE_SAMPLE_BYTES,
+ceil(service_horizon / 2)))`, 1 MiB under the default horizon. `F` is
+independent from the candidate-BDP seed. Product ACK delivery may justify
+bounded credit turnover, but only strict causality may justify rate publication.
+
+When a stage is fully spent and `A - W < F`, the sender MUST top up the same
+measurement stage to `min(resource_ceiling, max(2 * L, B + W + F))`. This
+reachability growth preserves `B`, authorization time, `W`, and `E`; resetting
+them would repeat the clock-establishment loss. When `A - W >= F` but `E < F`,
+the sender waits for later strict windows. When exact OwnerData flights drain,
+all authorized current-stage bytes not already in `E` become `W`; the state
+then either restores reachable credit or terminates at the hard envelope. It
+MUST NOT wait with an exhausted, flightless, unreachable stage. Prior-stage,
+retired, or stale-incarnation evidence MUST NOT carry into the next accepted
+aggregate. Before three qualifying stage aggregates exist,
+the candidate retains its provisional startup/receipt rate. At three aggregates,
+their median MUST overwrite both product-progress
+and delivery rate, including when the median is lower than the prior value, and
+the calibration MUST become proven without authorizing another exclusive
+doubling stage. A max filter or upward-only EWMA is forbidden here:
 ACK-compressed sub-millisecond bursts can be orders of magnitude above sustained
-path capacity. Each later accepted stage aggregate evicts the oldest after five
-and republishes the new median. Ordinary strict ACK windows contribute only to
-their current stage aggregate and never publish independently. ACK release never
-restores spent credit; an exhausted stage without a qualifying causal window
-does not grow, and the serial slot advances only after that candidate's exact
-ordering-owner flights drain. Lab diagnostic selection and sample events MUST
+path capacity. Ordinary strict ACK windows contribute only to their current
+stage aggregate and never publish independently. ACK release never restores
+spent credit; credit can grow only under the bounded reachability or accepted
+stage transitions above. A calibration that reaches the hard resource ceiling with fewer than
+three representative aggregates publishes no fabricated rate. In either
+terminal case, the serial slot advances only after that candidate's exact
+ordering-owner flights drain. The terminal ACK itself remains calibration
+evidence; after drain, a terminal state with no robust calibrated rate MUST NOT
+freeze later unambiguous ordinary TCP OwnerData rate updates. Lab diagnostic selection and sample events MUST
 include a binding-local `binding_instance_id` in addition to session, path, and
 incarnation so concurrent response streams cannot be conflated. UDP/QUIC
 response candidates never enter this product-ACK calibration; their bulk
 delivery-rate evidence remains owned by the local QUIC carrier ACK controller.
+
+Active or partly spent calibration serialization is binding-wide because one
+stage needs isolated product ACK coverage and owns the response's ordered tail.
+The TCP reservoir remains closed until that identity's exact calibration
+flights drain, while Service may continue under the unchanged product gates.
+A fresh unspent identity serializes only while the two-flow start gate is open.
+If that gate closes, the state is dormant and its exact target remains excluded
+from ordinary `OwnerData`, but the rest of the binding reservoir remains open.
+Other response bindings retain independent product ledgers; session-scoped
+physical-path coordination may prevent duplicate calibration but MUST NOT merge
+those ledgers.
 
 The accumulator MUST apply timer granularity once to the completed stage
 aggregate. Repeated per-window clamping makes the result depend on ACK callback
@@ -4144,7 +4186,10 @@ overlapping views rather than adding them. Exact
 `spent_bytes + payload` remains the calibration-credit authority. A calibration
 identity that has become proven MUST remain excluded from generic owner
 selection while it is still the exact active calibration; its existing flights
-drain before the fence clears or another candidate advances.
+drain before the fence clears or another candidate advances. `RepairData` does
+not spend or preserve this unique-owner fence and does not prevent zero-spend
+retirement. It remains real carrier pressure: aggregate `OwnerData + RepairData`
+and command-pending bytes MUST still fit Admit headroom.
 
 The production SafeBestPath guard separates live in-flight tail state from
 authoritative repair debt. A contiguous unacknowledged `OwnerData` suffix below
@@ -5017,6 +5062,32 @@ ordinary debt-bearing same-family admission and for explicit cross-underlay
 Service migration once the migration policy decides the carrier family may
 change.
 
+The measured-TCP response reservoir is a narrower conjunctive exception, not a
+larger reorder window. Let `T` be the global unacknowledged unique-product tail,
+`S` the Service's unacknowledged unique `OwnerData`, `H` the protected Service
+quota, `C` the candidate's unacknowledged unique `OwnerData`, `P` all product
+copies assigned to that candidate (`OwnerData + RepairData`), `q` the next
+quantum, and `R` the derived Service feed reservoir. Global admission MUST
+first satisfy
+`max(T, S) + q <= R`. Only after the exact live TCP Service is generically
+admitted, `S >= H`, the authoritative lower frontier is clear, no TCP
+calibration identity in the binding is active, partly spent, or currently
+eligible to start, and both paths have no
+latency pressure may a bulk-rate-proven same-TCP Subflow retry admission with external ordering debt
+`max(T - H - C, 0)`. Generic bulk admission separately charges `P`, so duplicate
+repair copies remain fully charged; when no repairs exist, the candidate-local
+total reduces to `max(C, T - H)` rather than `C + T`. `S` and `C` MUST come from
+the exact response flight ledger and MUST NOT be inferred from carrier-wide
+queue pressure or aggregate product copies. This is an ownership-aware union:
+the Service quota consumes global reservoir credit once, and the candidate
+consumes its own path BDP/emission allowance plus unowned overflow.
+Authoritative lower-frontier debt remains fully charged. The
+exception MUST NOT apply to UDP/QUIC, cross-family, proof-only, Repair, stale-
+Service, any active or partly spent TCP calibration, or a fresh calibration
+while its start gate is open. A fresh dormant identity blocks only its exact
+target from generic ownership; it MUST NOT close the reservoir for Service and
+other measured candidates. The exception MUST NOT move Service ownership.
+
 For request/upload, the one selected freshly proven same-underlay Validation
 instance may spend its own startup budget under the same projected-tail and
 candidate-debt envelope. This request exception is disabled on bulk-demand
@@ -5130,13 +5201,32 @@ metrics. Graduation retains the measured member and Service key, increments the
 planner generation, and preserves the Service owner. Before another unproven
 response candidate may consume a separate startup sample, one graduated TCP
 candidate at a time may use staged exact-instance ACK-clock calibration. Its
-2 MiB initial cumulative credit never refills; after full stage spend, a
+initial cumulative credit is the smaller of the resource-clamped Service
+horizon and a two-BDP candidate window, with a one-send-quantum floor; it never
+refills. Starting a fresh stage requires at least two active direction-relevant
+response flows. Once the stage is active or partly spent, exact authorized work
+may finish after a two-to-one flow transition. A fresh identity instead becomes
+dormant and excludes only itself from ordinary ownership until the start gate
+reopens or it is safely retired. After full stage spend, a
 strictly causal later ACK window whose earliest send follows stage authorization
 may double the authorized cumulative ceiling up to the resource envelope.
+Before the first calibration byte, the scheduler MUST project completion of the
+whole initial credit. Let `C` be that credit, `Q` the next payload, and `R` the
+bounded Service feed reservoir. Candidate completion is its next-payload ETA
+plus transmission time for `C-Q`; the ordering deadline is current Service ETA
+plus Service transmission time for `R-C`. If candidate completion exceeds that
+deadline, the binding retires only this unspent calibration identity after
+revalidating the planner, combined lane/flow, and path/ordering-model
+generations; exact Service and target incarnations; captured command-pending
+values; the calibration ceiling; the two-flow start gate; and absence of exact
+OwnerData flight, then resnapshots. Repair-only flight does not preserve this
+policy identity, although aggregate repair pressure still gates Admit. This
+opportunity gate is not reapplied after any calibration spend because an active
+exact stage must finish rather than strand lower offsets.
 Growth does not wait for rate-publication readiness. Strict windows form one
 byte/raw-time aggregate per stage; only aggregates covering at least half the
-initial credit, 1 MiB by default and resource-clamped, enter the rolling
-five-stage rate estimator. Startup rate remains before three aggregates, then
+resource-clamped Service horizon, with a path-proof floor, enter the bounded
+stage-rate buffer. Startup rate remains before three aggregates, then
 the median overwrites the old rate without max-filtering. UDP/QUIC candidates
 skip this product-ACK calibration and continue to use local carrier ACK-derived
 evidence. The serial slot and ordinary proven ownership advance only after the
@@ -5719,17 +5809,19 @@ number.
 * draft-ietf-ccwg-bbr-06, "BBR Congestion Control", especially delivery-rate
   sampling, application-limited sample handling, and bounded send quanta,
   https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-06
-* draft-ietf-quic-multipath, "Multipath Extension for QUIC", especially
+* draft-ietf-quic-multipath-21, "Multipath Extension for QUIC", especially
   per-path identifiers, path management, and the deliberate separation between
   multipath protocol mechanisms and implementation-specific scheduling policy,
   including the warning that distributing one stream over paths with different
   delays can impose the maximum delay of all paths used,
-  https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/
+  https://datatracker.ietf.org/doc/html/draft-ietf-quic-multipath-21
 * RFC 9298, "Proxying UDP in HTTP", for HTTP CONNECT-UDP outbound behavior,
   https://www.rfc-editor.org/rfc/rfc9298
-* Hysteria2 protocol documentation, for QUIC-based proxy transport and
-  BBR-style performance motivation,
+* Hysteria2 protocol and congestion-controller documentation, for QUIC-based
+  proxy transport, direction-local BBR/Brutal selection, and the warning that
+  an overstated fixed-rate target wastes traffic and becomes unstable,
   https://v2.hysteria.network/docs/developers/Protocol/
+  and https://v2.hysteria.network/docs/advanced/Full-Server-Config/#congestion-control-details
 * Lim et al., "MPTCP is not Pareto-Optimal: Performance Issues and a Possible
   Solution", for earliest-completion-first subflow scheduling,
   https://api.repository.cam.ac.uk/server/api/core/bitstreams/3ec47f93-4360-4630-bd4a-9e1ed23605fa/content
@@ -6347,9 +6439,31 @@ select_response_owner_path(stream, work):
     calibration = exact_live_graduated_TCP_response_calibration_candidate(stream)
     if calibration exists:
         assert stream.service_path did not change
+        if calibration.spent_bytes == 0 and not calibration.is_active:
+            if stream.session.active_direction_relevant_reliable_response_flows < 2:
+                keep_exact_identity_dormant_and_block_only_it_from_generic_owner(calibration)
+                return select_path_excluding_exact_calibration_identity(stream, work)
+            C = calibration.authorized_cumulative_ceiling
+            R = service_feed_reservoir(stream, work)
+            candidate_completion = calibration.next_payload_eta
+                + transmit_time(calibration, C - work.payload.len)
+            ordering_deadline = stream.service_path.current_eta
+                + transmit_time(stream.service_path, max(0, R - C))
+            if candidate_completion > ordering_deadline:
+                atomically_retire_unspent_calibration_if(
+                    planner_and_combined_lane_flow_generations_match
+                    and response_path_ordering_model_generation_matches
+                    and exact_service_and_target_incarnations_match
+                    and captured_service_and_target_pending_values_match
+                    and exact_ceiling_and_two_flow_start_gate_match
+                    and calibration_has_no_exact_owner_flight)
+                resnapshot_response_plan_once()
+                return select_response_owner_path(stream, work)
+        # An exact active or partly spent stage may finish after a 2 -> 1 flow
+        # transition; the flow-count predicate is deliberately not repeated.
         if calibration.spent_bytes + work.payload.len
                <= calibration.authorized_cumulative_ceiling
-           and response_calibration_pressure_debt_and_resource_guards_allow(
+           and aggregate_owner_repair_pressure_pending_and_resource_guards_allow(
                    stream, calibration, work):
             reserve_exact_nonrefilling_calibration_credit_with_enqueue_rollback(
                 calibration, work)
@@ -6364,38 +6478,59 @@ select_response_owner_path(stream, work):
         return select_response_owner_path(stream, work)
     return select_path_by_eta_and_lane(work)
 
-on_exact_TCP_response_owner_ACK(calibration, sample):
-    if sample.is_later_ACK_window
-       and sample.latest_sampled_send_at <= sample.previous_ACK_at
-       and sample.earliest_sampled_send_at >= calibration.stage_authorized_at:
-        calibration.stage_rate_bytes += sample.bytes
-        calibration.stage_rate_elapsed += sample.raw_ACK_to_ACK_elapsed
-        if calibration.spent_bytes >= calibration.authorized_cumulative_ceiling:
-            # Credit authorization is independent from publication readiness.
-            coverage_floor = min(
-                calibration.initial_credit,
-                max(MIN_RATE_SAMPLE_BYTES,
-                    ceil(calibration.initial_credit / 2)))
-            if calibration.stage_rate_bytes >= coverage_floor:
-                aggregate_rate = 8 * calibration.stage_rate_bytes
-                    / max(calibration.stage_rate_elapsed, TIMER_GRANULARITY)
-                append_to_rolling_last_five_stage_rates(
-                    calibration, aggregate_rate)
-                if calibration.stage_rate_count >= 3:
-                    calibrated = median(calibration.rolling_stage_rates)
-                    overwrite_product_progress_and_delivery_rate(
-                        calibration, calibrated)
-                else:
-                    retain_provisional_startup_rate(calibration)
-            reset_current_stage_rate_evidence(calibration)
-            if calibration.authorized_cumulative_ceiling
-                   < calibration.path_flight_repair_reorder_stream_window_ceiling:
-                calibration.authorized_cumulative_ceiling = min(
-                    2 * calibration.authorized_cumulative_ceiling,
-                    calibration.path_flight_repair_reorder_stream_window_ceiling)
-                calibration.stage_authorized_at = sample.acked_at
-            else:
-                calibration.proven = true
+on_exact_TCP_response_owner_ACK(calibration, window):
+    fresh = exact_bytes_sent_at_or_after(
+        window.released_owner_flights, calibration.stage_authorized_at)
+    if fresh == 0:
+        return
+    strict = window.is_later_ACK_window
+        and window.latest_sampled_send_at <= window.previous_ACK_at
+        and window.earliest_sampled_send_at >= calibration.stage_authorized_at
+        and fresh == window.total_bytes
+    if strict:
+        calibration.E += fresh
+        calibration.stage_rate_elapsed += window.raw_ACK_to_ACK_elapsed
+    else:
+        calibration.W += fresh
+    if calibration.spent_bytes < calibration.L:
+        return
+
+    F = min(calibration.resource_clamped_service_horizon,
+        max(MIN_RATE_SAMPLE_BYTES,
+            ceil(calibration.resource_clamped_service_horizon / 2)))
+    A = calibration.L - calibration.B
+    if A - calibration.W < F:
+        required = calibration.B + calibration.W + F
+        if required > calibration.resource_ceiling:
+            calibration.terminal_without_rate = true
+            return
+        calibration.L = min(calibration.resource_ceiling,
+            max(2 * calibration.L, required))
+        return  # Preserve B, authorization time, E, and W.
+    if calibration.E < F:
+        return  # Later strict windows can still complete this stage.
+
+    aggregate_rate = 8 * calibration.E
+        / max(calibration.stage_rate_elapsed, TIMER_GRANULARITY)
+    append_to_bounded_stage_rates(calibration, aggregate_rate)
+    reset_current_stage_rate_evidence(calibration)  # E = W = 0.
+    if calibration.stage_rate_count >= 3:
+        calibrated = median(calibration.stage_rates)
+        overwrite_product_progress_and_delivery_rate(calibration, calibrated)
+        calibration.proven = true
+        return
+    retain_provisional_startup_rate(calibration)
+    if calibration.L < calibration.resource_ceiling:
+        calibration.B = calibration.spent_bytes
+        calibration.L = min(2 * calibration.L, calibration.resource_ceiling)
+        calibration.stage_authorized_at = window.acked_at
+    else:
+        calibration.terminal_without_rate = true
+
+on_TCP_calibration_owner_flights_drained(calibration):
+    A = calibration.L - calibration.B
+    calibration.W = max(calibration.W, A - calibration.E)
+    apply_the_same_reachability_topup_or_hard_terminal(calibration)
     # ACK release never decreases cumulative spent credit. UDP/QUIC product
     # ACKs never enter this calibration; their local carrier ACK controller
     # remains authoritative.

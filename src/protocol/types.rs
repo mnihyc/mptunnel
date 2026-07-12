@@ -45,6 +45,8 @@ pub enum IngressKind {
     TunUdp,
 }
 
+/// Control-plane attachment role; product Service/Subflow ownership is chosen
+/// independently for each direction after the attachment is live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOpenRole {
     Active,

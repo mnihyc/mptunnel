@@ -1,8 +1,11 @@
 use super::prelude::*;
 use super::relay_open::RelayPathKey;
-use super::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
+use super::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+
+// Pure bulk admission model: decide whether another unique-byte assignment
+// fits product resources and improves completion. This module mutates no path.
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BulkPathCandidate {
@@ -39,6 +42,9 @@ pub(super) struct BulkAdmissionCheck {
     pub(super) payload_bytes: usize,
     pub(super) mux_limits: MuxLimits,
     pub(super) role: BulkAdmissionRole,
+    // Candidate product flight is added inside bulk admission. Callers with a
+    // global product tail must remove overlapping candidate bytes first; a
+    // deliberately conservative full-tail value is a stricter policy choice.
     pub(super) stream_ordering_debt_bytes: u64,
 }
 
@@ -151,28 +157,6 @@ pub(super) fn bulk_service_horizon_payload_bytes(
     horizon.clamp(service_payload, envelope)
 }
 
-pub(super) fn reliable_ack_clock_calibration_limit_bytes(mux_limits: MuxLimits) -> u64 {
-    let resource_ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
-    if resource_ceiling == 0 {
-        return 0;
-    }
-    let service_horizon =
-        bulk_service_horizon_payload_bytes(BBR_MAX_SEND_QUANTUM_BYTES, mux_limits) as u64;
-    service_horizon.min(resource_ceiling)
-}
-
-pub(super) fn reliable_ack_clock_calibration_ceiling_bytes(mux_limits: MuxLimits) -> u64 {
-    let resource_ceiling = (mux_limits.max_path_flight_bytes as u64)
-        .min(mux_limits.max_repair_bytes as u64)
-        .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes);
-    if resource_ceiling < PATH_OPEN_SCORE_BYTES as u64 {
-        0
-    } else {
-        resource_ceiling
-    }
-}
-
 pub(super) fn bulk_service_product_envelope_payload_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
@@ -198,6 +182,84 @@ pub(super) fn bulk_service_feed_reservoir_payload_bytes(
     ((horizon as f64) * BBR_DEFAULT_CWND_GAIN)
         .ceil()
         .clamp(horizon as f64, envelope as f64) as usize
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BulkExplorationCompletionProjection {
+    pub(super) candidate_completion_ms: f64,
+    pub(super) service_reservoir_horizon_ms: f64,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) exploration_bytes: u64,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) service_followup_bytes: u64,
+}
+
+impl BulkExplorationCompletionProjection {
+    pub(super) fn completes_within_service_reservoir(self) -> bool {
+        self.candidate_completion_ms <= self.service_reservoir_horizon_ms
+    }
+}
+
+/// Bounds unique-byte exploration by the ordered product reservoir it may block.
+///
+/// The candidate ETA already includes the next payload. After that payload, the
+/// candidate must finish its authorized seed before Service can consume the
+/// remaining feed reservoir behind those lower offsets. Carrier controllers
+/// still own pacing; this model only decides whether exploration can own bytes.
+pub(super) fn bulk_exploration_completion_projection(
+    service_snapshot: PathSnapshot,
+    service_eta_ms: f64,
+    candidate_snapshot: PathSnapshot,
+    candidate_eta_ms: f64,
+    exploration_bytes: u64,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> BulkExplorationCompletionProjection {
+    let candidate_followup_bytes = exploration_bytes.saturating_sub(payload_bytes as u64);
+    let service_reservoir_bytes =
+        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits) as u64;
+    let service_followup_bytes = service_reservoir_bytes.saturating_sub(exploration_bytes);
+    BulkExplorationCompletionProjection {
+        candidate_completion_ms: candidate_eta_ms.max(0.0)
+            + bulk_bytes_tx_ms(candidate_snapshot, candidate_followup_bytes),
+        service_reservoir_horizon_ms: service_eta_ms.max(0.0)
+            + bulk_bytes_tx_ms(service_snapshot, service_followup_bytes),
+        exploration_bytes,
+        service_followup_bytes,
+    }
+}
+
+// Source staging is product admission, not socket-loop orchestration. Keeping
+// this limit beside the Service horizon prevents event loops from inventing a
+// second ownership model for bytes that do not have offsets yet.
+pub(super) fn reliable_relay_source_staging_owner_tail_headroom(
+    independent_source_staging: bool,
+    lane: FlowLane,
+    service_is_live: bool,
+    service_has_latency_pressure: bool,
+    service_has_feed_evidence: bool,
+    ordered_owner_debt_bytes: usize,
+    queued_data_bytes: usize,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if !lane.is_bulk() {
+        return usize::MAX;
+    }
+    let has_feed_reservoir = service_is_live && service_has_feed_evidence;
+    let feed_limit = if service_has_latency_pressure || !has_feed_reservoir {
+        bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+    } else {
+        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
+    };
+    let staged_debt = if independent_source_staging {
+        // Mixed-family raw bytes have no offset/path owner yet, but still use
+        // sender-service memory and therefore consume the global feed limit.
+        queued_data_bytes
+    } else {
+        ordered_owner_debt_bytes.saturating_add(queued_data_bytes)
+    };
+    feed_limit.saturating_sub(staged_debt)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -615,7 +677,11 @@ fn bulk_total_reorder_debt_bytes(
 }
 
 fn bulk_payload_tx_ms(snapshot: PathSnapshot, payload_bytes: usize) -> f64 {
-    payload_bytes as f64 * 8.0 / bulk_effective_rate_bps(snapshot) * 1000.0
+    bulk_bytes_tx_ms(snapshot, payload_bytes as u64)
+}
+
+fn bulk_bytes_tx_ms(snapshot: PathSnapshot, bytes: u64) -> f64 {
+    bytes as f64 * 8.0 / bulk_effective_rate_bps(snapshot) * 1000.0
 }
 
 fn bulk_effective_rate_bps(snapshot: PathSnapshot) -> f64 {
@@ -718,6 +784,10 @@ fn bulk_path_bdp_bytes(candidate: PathSnapshot) -> u64 {
     bulk_rate_bdp_bytes(rate, candidate.srtt_ms)
 }
 
+pub(super) fn bulk_candidate_pipe_bytes(candidate: PathSnapshot) -> u64 {
+    bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate))
+}
+
 fn bulk_rate_bdp_bytes(rate_bps: f64, srtt_ms: f64) -> u64 {
     let rate_bps = rate_bps.max(1.0);
     (rate_bps / 8.0 * srtt_ms.max(1.0) / 1000.0).ceil() as u64
@@ -755,6 +825,41 @@ mod tests {
                 mbps(rate_mbps),
             ),
         }
+    }
+
+    #[test]
+    fn exploration_completion_separates_useful_uncertainty_from_ordering_stalls() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = 64 * 1024;
+        let useful_service =
+            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(18.561));
+        let useful_candidate =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 730.287, mbps(1.007));
+        let useful = bulk_exploration_completion_projection(
+            useful_service,
+            1_098.657,
+            useful_candidate,
+            1_406.704,
+            183_802,
+            payload_bytes,
+            mux_limits,
+        );
+        assert!(useful.completes_within_service_reservoir());
+
+        let stalled_service =
+            PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(47.429));
+        let stalled_candidate =
+            PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 891.787, mbps(1.342));
+        let stalled = bulk_exploration_completion_projection(
+            stalled_service,
+            575.508,
+            stalled_candidate,
+            836.595,
+            299_176,
+            payload_bytes,
+            mux_limits,
+        );
+        assert!(!stalled.completes_within_service_reservoir());
     }
 
     #[test]
@@ -2266,34 +2371,5 @@ mod tests {
 
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].key.index, 0);
-    }
-
-    #[test]
-    fn ack_clock_calibration_never_raises_a_configured_resource_ceiling() {
-        let below_sample_floor = MuxLimits {
-            max_path_flight_bytes: PATH_OPEN_SCORE_BYTES - 1,
-            ..MuxLimits::default()
-        };
-        assert_eq!(
-            reliable_ack_clock_calibration_ceiling_bytes(below_sample_floor),
-            0
-        );
-        assert_eq!(
-            reliable_ack_clock_calibration_limit_bytes(below_sample_floor),
-            0
-        );
-
-        let exact_sample_floor = MuxLimits {
-            max_path_flight_bytes: PATH_OPEN_SCORE_BYTES,
-            ..MuxLimits::default()
-        };
-        assert_eq!(
-            reliable_ack_clock_calibration_ceiling_bytes(exact_sample_floor),
-            PATH_OPEN_SCORE_BYTES as u64
-        );
-        assert_eq!(
-            reliable_ack_clock_calibration_limit_bytes(exact_sample_floor),
-            PATH_OPEN_SCORE_BYTES as u64
-        );
     }
 }

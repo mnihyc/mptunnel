@@ -1,9 +1,16 @@
-use super::bulk_admission::{
-    reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
+#[cfg(test)]
+use super::ack_clock_policy::reliable_ack_clock_calibration_limit_bytes;
+use super::ack_clock_policy::{
+    reliable_ack_clock_calibration_ceiling_bytes,
+    reliable_ack_clock_calibration_rate_coverage_floor_bytes,
+    reliable_tcp_ack_clock_calibration_initial_limit_bytes,
 };
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+// Reliable-path bindings own attachment instances, exact range flights,
+// evidence, and atomic commit. Sender services rank immutable snapshots.
 
 static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "lab-diagnostics")]
@@ -745,11 +752,33 @@ pub(super) struct ResponseSubflowAdmissionRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Optimistic calibration reservation. Generations fence product/path model
+/// changes; pending values fence the exact queue-pressure projection.
 pub(super) struct ResponseAckClockCalibrationRequest {
     pub(super) expected_planner_generation: u64,
     pub(super) expected_lane_generation: u64,
+    pub(super) expected_model_generation: u64,
     pub(super) service: CarrierPathKey,
     pub(super) service_incarnation: u64,
+    pub(super) service_pending_bytes: u64,
+    pub(super) target_pending_bytes: u64,
+    pub(super) limit_bytes: u64,
+    /// Two response flows are required to start, not to finish exact begun work.
+    pub(super) requires_multi_flow_start: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Zero-spend retirement uses the same coherent planner/model snapshot as Admit.
+pub(super) struct ResponseAckClockCalibrationRetirementRequest {
+    pub(super) expected_planner_generation: u64,
+    pub(super) expected_lane_generation: u64,
+    pub(super) expected_model_generation: u64,
+    pub(super) service: CarrierPathKey,
+    pub(super) service_incarnation: u64,
+    pub(super) service_pending_bytes: u64,
+    pub(super) target: CarrierPathKey,
+    pub(super) target_incarnation: u64,
+    pub(super) target_pending_bytes: u64,
     pub(super) limit_bytes: u64,
 }
 
@@ -776,9 +805,14 @@ pub(super) struct ResponseStreamBinding {
     lane_tracker: Arc<ServerPathLaneTracker>,
     response_flow_registration: ServerResponseFlowRegistration,
     next_output_incarnation: AtomicU64,
+    // Publishes coherent path evidence, exact flights, ACK ordering, and queue
+    // inputs so calibration cannot commit a mixture of old and new views.
+    response_model_generation: AtomicU64,
     owner_underlay_history: AtomicU8,
     outputs: Mutex<ResponseStreamOutputs>,
     request_active_owner: Mutex<Option<CarrierPathKey>>,
+    // Historical name: this is the persistent response Service anchor, not
+    // exclusive ownership of every range. `flights` owns exact byte identity.
     ordered_data_owner: Mutex<Option<CarrierPathKey>>,
     flights: Mutex<BTreeMap<u64, Vec<CarrierPathFlight>>>,
     ack_ordering: Mutex<ResponseAckOrderingState>,
@@ -899,6 +933,7 @@ impl ResponseStreamBinding {
             lane_tracker,
             response_flow_registration,
             next_output_incarnation: AtomicU64::new(2),
+            response_model_generation: AtomicU64::new(0),
             owner_underlay_history: AtomicU8::new(response_owner_underlay_seen_bit(underlay)),
             outputs: Mutex::new(ResponseStreamOutputs {
                 entries: vec![ResponseStreamOutputEntry {
@@ -907,6 +942,7 @@ impl ResponseStreamBinding {
                     incarnation: 1,
                     commands,
                     role: StreamOpenRole::Active,
+                    owner_data_in_flight_bytes: 0,
                     bytes_in_flight: 0,
                     product_queue_bytes: 0,
                     product_progress_rate_bps: None,
@@ -1139,6 +1175,7 @@ impl ResponseStreamBinding {
                 entry.incarnation = self.allocate_output_incarnation();
                 entry.commands = commands;
                 entry.role = role;
+                entry.owner_data_in_flight_bytes = 0;
                 entry.bytes_in_flight = 0;
                 entry.product_queue_bytes = 0;
                 entry.product_progress_rate_bps = None;
@@ -1179,6 +1216,7 @@ impl ResponseStreamBinding {
                 incarnation: self.allocate_output_incarnation(),
                 commands,
                 role,
+                owner_data_in_flight_bytes: 0,
                 bytes_in_flight: 0,
                 product_queue_bytes: 0,
                 product_progress_rate_bps: None,
@@ -1370,6 +1408,10 @@ impl ResponseStreamBinding {
                 entry.product_queue_bytes = bytes;
                 changed = true;
             }
+        }
+        if changed {
+            self.response_model_generation
+                .fetch_add(1, Ordering::AcqRel);
         }
         drop(outputs);
         if changed {
@@ -1577,12 +1619,18 @@ impl ResponseStreamBinding {
         let released = release_carrier_path_flight_ranges(&mut flights, ranges);
         if released.is_empty() {
             drop(flights);
-            drop(outputs);
             let ordering_update = self
                 .ack_ordering
                 .lock()
                 .expect("server response ACK ordering lock")
                 .apply_normalized_ack(ranges, &[]);
+            if ordering_update.changed {
+                // Publish the generation only after the coherent ordering view
+                // exists. Duplicate ACKs need no fence or shared atomic write.
+                self.response_model_generation
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            drop(outputs);
             if ordering_update.changed {
                 self.notify_update();
             }
@@ -1622,28 +1670,49 @@ impl ResponseStreamBinding {
 
         let now = Instant::now();
         let mut changed = false;
-        let mut path_samples = HashMap::<(CarrierPathKey, u64), (u64, Instant, Instant)>::new();
+        let mut path_samples =
+            HashMap::<(CarrierPathKey, u64), (u64, u64, Instant, Instant)>::new();
         for (_, release) in released {
             let flight = release.flight;
+            let identity = (flight.key, flight.output_incarnation);
+            let stage_authorized_at = outputs
+                .ack_clock_calibrations
+                .get(&identity)
+                .map(|calibration| calibration.stage_authorized_at);
             if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
                 entry.key == flight.key && entry.incarnation == flight.output_incarnation
             }) {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
+                if flight.kind.is_ordering_owner() {
+                    entry.owner_data_in_flight_bytes = entry
+                        .owner_data_in_flight_bytes
+                        .saturating_sub(flight.bytes as u64);
+                }
                 if release.path_proving {
                     entry.owner_data_acked_bytes = entry
                         .owner_data_acked_bytes
                         .saturating_add(flight.bytes as u64);
-                    let sample = path_samples
-                        .entry((flight.key, flight.output_incarnation))
-                        .or_insert((0_u64, flight.sent_at, flight.sent_at));
+                    let sample = path_samples.entry(identity).or_insert((
+                        0_u64,
+                        0_u64,
+                        flight.sent_at,
+                        flight.sent_at,
+                    ));
                     sample.0 = sample.0.saturating_add(flight.bytes as u64);
-                    sample.1 = sample.1.min(flight.sent_at);
-                    sample.2 = sample.2.max(flight.sent_at);
+                    if stage_authorized_at
+                        .is_some_and(|authorized_at| flight.sent_at >= authorized_at)
+                    {
+                        sample.1 = sample.1.saturating_add(flight.bytes as u64);
+                    }
+                    sample.2 = sample.2.min(flight.sent_at);
+                    sample.3 = sample.3.max(flight.sent_at);
                 }
                 changed = true;
             }
         }
-        for ((key, output_incarnation), (bytes, first_sent_at, last_sent_at)) in path_samples {
+        for ((key, output_incarnation), (bytes, fresh_bytes, first_sent_at, last_sent_at)) in
+            path_samples
+        {
             let identity = (key, output_incarnation);
             let ack_clock_update = if outputs.active_ack_clock_calibration == Some(identity) {
                 outputs
@@ -1656,76 +1725,139 @@ impl ResponseStreamBinding {
                         calibration
                             .rate_evidence
                             .get_or_insert_with(|| ResponseAckClockRateEvidence::new(first_sent_at))
-                            .observe(bytes, first_sent_at, last_sent_at, now)
+                            .observe_with_fresh_bytes(
+                                bytes,
+                                fresh_bytes,
+                                first_sent_at,
+                                last_sent_at,
+                                now,
+                            )
                     })
             } else {
                 None
             };
-            let strict_ack_clock_sample = match ack_clock_update {
+            let ack_clock_window = match ack_clock_update {
                 Some(ResponseAckClockRateEvidenceUpdate::Proven {
-                    sample: Some(sample),
-                    first_window: false,
+                    sample,
+                    bytes,
+                    fresh_bytes,
+                    first_window,
                     earliest_sent_at,
-                    previous_window_acked_at: Some(previous_ack_at),
+                    previous_window_acked_at,
                     latest_sent_at,
-                }) => Some((sample, earliest_sent_at, previous_ack_at, latest_sent_at)),
+                }) => Some((
+                    if first_window { None } else { sample },
+                    bytes,
+                    fresh_bytes,
+                    first_window,
+                    earliest_sent_at,
+                    previous_window_acked_at,
+                    latest_sent_at,
+                )),
                 _ => None,
             };
-            let calibration_update = strict_ack_clock_sample.and_then(
-                |(sample, earliest_sent_at, previous_ack_at, latest_sent_at)| {
+            let calibration_update = ack_clock_window.and_then(
+                |(
+                    strict_rate_sample,
+                    window_bytes,
+                    fresh_window_bytes,
+                    first_window,
+                    earliest_sent_at,
+                    previous_ack_at,
+                    latest_sent_at,
+                )| {
                     outputs
                         .ack_clock_calibrations
                         .get_mut(&identity)
                         .map(|calibration| {
-                            let sample_bps = sample.rate_bps();
+                            let sample_bps = strict_rate_sample
+                                .map(PathRateSample::rate_bps)
+                                .unwrap_or(0.0);
+                            let sample_elapsed = strict_rate_sample
+                                .map(PathRateSample::elapsed)
+                                .unwrap_or(Duration::ZERO);
                             let previous_credit = calibration.credit_limit_bytes;
                             let stage_authorized_at = calibration.stage_authorized_at;
-                            let stage_evidence_eligible = earliest_sent_at >= stage_authorized_at;
-                            let stage_evidence_bytes = if stage_evidence_eligible {
+                            let stage_authorized_spent_bytes =
+                                calibration.stage_authorized_spent_bytes;
+                            let stage_credit_bytes = calibration.stage_credit_bytes();
+                            let stage_window_eligible = earliest_sent_at >= stage_authorized_at;
+                            let stage_rate_evidence_accepted = stage_window_eligible
+                                && strict_rate_sample.is_some()
+                                && fresh_window_bytes == window_bytes;
+                            let stage_evidence_bytes = if stage_rate_evidence_accepted {
                                 calibration
                                     .stage_rate_evidence_bytes
-                                    .saturating_add(sample.bytes())
+                                    .saturating_add(window_bytes)
                             } else {
                                 calibration.stage_rate_evidence_bytes
                             };
-                            let stage_evidence_elapsed = if stage_evidence_eligible {
+                            let stage_evidence_elapsed = if stage_rate_evidence_accepted {
                                 calibration
                                     .stage_rate_evidence_elapsed
-                                    .saturating_add(sample.elapsed())
+                                    .saturating_add(sample_elapsed)
                             } else {
                                 calibration.stage_rate_evidence_elapsed
                             };
-                            let stage_rate_accepted = calibration.spent_bytes
-                                >= calibration.credit_limit_bytes
-                                && stage_evidence_eligible;
-                            let stage_rate_sample_accepted = stage_rate_accepted
+                            let stage_rate_ineligible_bytes =
+                                if fresh_window_bytes > 0 && !stage_rate_evidence_accepted {
+                                    calibration
+                                        .stage_rate_ineligible_bytes
+                                        .saturating_add(fresh_window_bytes)
+                                } else {
+                                    calibration.stage_rate_ineligible_bytes
+                                };
+                            let stage_fully_spent =
+                                calibration.spent_bytes >= calibration.credit_limit_bytes;
+                            let stage_strict_capacity_bytes =
+                                stage_credit_bytes.saturating_sub(stage_rate_ineligible_bytes);
+                            let previous_stage_rate_sample_count =
+                                calibration.stage_rate_sample_count();
+                            let aggregate_rate_bps = (stage_fully_spent
+                                && stage_strict_capacity_bytes
+                                    >= calibration.stage_rate_coverage_floor_bytes
                                 && stage_evidence_bytes
-                                    >= calibration.stage_rate_coverage_floor_bytes;
-                            let aggregate_rate_bps = stage_rate_sample_accepted
+                                    >= calibration.stage_rate_coverage_floor_bytes)
                                 .then(|| {
                                     stage_evidence_bytes as f64 * 8.0
                                         / stage_evidence_elapsed
-                                            .max(QUIC_TIMER_GRANULARITY)
+                                            .max(TRANSPORT_TIMER_GRANULARITY)
                                             .as_secs_f64()
                                 })
                                 .unwrap_or(0.0);
-                            let credit_grew =
-                                calibration.record_ack_clock_sample(sample, earliest_sent_at, now);
+                            let credit_grew = calibration.record_ack_clock_window(
+                                strict_rate_sample,
+                                window_bytes,
+                                fresh_window_bytes,
+                                earliest_sent_at,
+                                now,
+                            );
                             debug_assert_eq!(
                                 credit_grew,
                                 calibration.credit_limit_bytes > previous_credit
                             );
+                            let stage_rate_sample_accepted = calibration.stage_rate_sample_count()
+                                > previous_stage_rate_sample_count;
                             (
                                 sample_bps,
                                 *calibration,
                                 credit_grew,
-                                stage_rate_accepted,
+                                first_window,
+                                strict_rate_sample.is_some(),
+                                stage_window_eligible,
+                                stage_rate_evidence_accepted,
+                                stage_fully_spent,
                                 stage_rate_sample_accepted,
-                                sample.bytes(),
-                                sample.elapsed(),
+                                window_bytes,
+                                fresh_window_bytes,
+                                sample_elapsed,
                                 stage_evidence_bytes,
                                 stage_evidence_elapsed,
+                                stage_rate_ineligible_bytes,
                                 calibration.stage_rate_coverage_floor_bytes,
+                                stage_authorized_spent_bytes,
+                                stage_credit_bytes,
+                                stage_strict_capacity_bytes,
                                 aggregate_rate_bps,
                                 stage_authorized_at,
                                 earliest_sent_at,
@@ -1736,6 +1868,8 @@ impl ResponseStreamBinding {
                 },
             );
             let calibration_snapshot = outputs.ack_clock_calibrations.get(&identity).copied();
+            let calibration_identity_active =
+                outputs.active_ack_clock_calibration == Some(identity);
             if let Some(entry) = outputs
                 .entries
                 .iter_mut()
@@ -1748,9 +1882,16 @@ impl ResponseStreamBinding {
                     let carrier_app_limited = entry
                         .local_path_metrics
                         .is_some_and(|metrics| metrics.metrics.app_limited);
-                    let has_tcp_ack_clock_calibration = entry.key.underlay == UnderlayProtocol::Tcp
-                        && calibration_snapshot.is_some();
-                    if !has_tcp_ack_clock_calibration {
+                    // The terminal ACK stays calibration-owned, but a no-rate
+                    // tombstone must not freeze later ordinary TCP evidence.
+                    let tcp_calibration_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
+                        && (calibration_identity_active
+                            || calibration_update.is_some()
+                            || calibration_snapshot.is_some_and(|calibration| {
+                                calibration.calibrated_rate_bps.is_some()
+                                    || (!calibration.proven && !calibration.retired)
+                            }));
+                    if !tcp_calibration_owns_rate {
                         entry.product_progress_rate_bps =
                             Some(match entry.product_progress_rate_bps {
                                 Some(previous) if carrier_app_limited => previous.max(sample_bps),
@@ -1786,13 +1927,22 @@ impl ResponseStreamBinding {
                 sample_bps,
                 calibration,
                 credit_grew,
-                stage_rate_accepted,
+                first_window,
+                strict_rate_window,
+                stage_window_eligible,
+                stage_rate_evidence_accepted,
+                stage_fully_spent,
                 stage_rate_sample_accepted,
                 sample_bytes,
+                fresh_sample_bytes,
                 sample_elapsed,
                 stage_evidence_bytes,
                 stage_evidence_elapsed,
+                stage_rate_ineligible_bytes,
                 stage_rate_coverage_floor_bytes,
+                stage_authorized_spent_bytes,
+                stage_credit_bytes,
+                stage_strict_capacity_bytes,
                 aggregate_rate_bps,
                 stage_authorized_at,
                 earliest_sent_at,
@@ -1805,13 +1955,22 @@ impl ResponseStreamBinding {
                     sample_bps,
                     calibration,
                     credit_grew,
-                    stage_rate_accepted,
+                    first_window,
+                    strict_rate_window,
+                    stage_window_eligible,
+                    stage_rate_evidence_accepted,
+                    stage_fully_spent,
                     stage_rate_sample_accepted,
                     sample_bytes,
+                    fresh_sample_bytes,
                     sample_elapsed,
                     stage_evidence_bytes,
                     stage_evidence_elapsed,
+                    stage_rate_ineligible_bytes,
                     stage_rate_coverage_floor_bytes,
+                    stage_authorized_spent_bytes,
+                    stage_credit_bytes,
+                    stage_strict_capacity_bytes,
                     aggregate_rate_bps,
                     stage_authorized_at,
                     earliest_sent_at,
@@ -1822,7 +1981,7 @@ impl ResponseStreamBinding {
                 lab_diagnostic(
                     "response_ack_clock_calibration",
                     format_args!(
-                        "phase=ack_clock_sample session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} rate_bps={} sample_bytes={} sample_elapsed_us={} calibrated_rate_bps={} calibrated_rate_ready={} stage_rate_accepted={} stage_rate_sample_accepted={} stage_evidence_bytes={} stage_evidence_elapsed_us={} stage_rate_coverage_floor_bytes={} aggregate_rate_bps={} spent_bytes={} credit_limit_bytes={} max_limit_bytes={} credit_grew={} proven={} stage_authorized_age_us={} earliest_sent_age_us={} previous_ack_age_us={} latest_sent_age_us={} stage_provenance_slack_us={} causal_slack_us={}",
+                        "phase=ack_clock_window session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} rate_bps={} sample_bytes={} fresh_sample_bytes={} sample_elapsed_us={} calibrated_rate_bps={} calibrated_rate_ready={} first_window={} strict_rate_window={} stage_window_eligible={} stage_rate_evidence_accepted={} stage_fully_spent={} stage_rate_sample_accepted={} stage_evidence_bytes={} stage_evidence_elapsed_us={} stage_rate_ineligible_bytes={} stage_rate_coverage_floor_bytes={} stage_authorized_spent_bytes={} stage_credit_bytes={} stage_strict_capacity_bytes={} aggregate_rate_bps={} spent_bytes={} credit_limit_bytes={} max_limit_bytes={} credit_grew={} proven={} stage_authorized_age_us={} earliest_sent_age_us={} previous_ack_age_us={} latest_sent_age_us={} stage_provenance_slack_us={} causal_slack_us={}",
                         self.session_id.0,
                         self.binding_instance_id,
                         key.underlay,
@@ -1830,14 +1989,23 @@ impl ResponseStreamBinding {
                         output_incarnation,
                         sample_bps,
                         sample_bytes,
+                        fresh_sample_bytes,
                         sample_elapsed.as_micros(),
                         calibration.calibrated_rate_bps.unwrap_or(0.0),
                         calibration.calibrated_rate_bps.is_some(),
-                        stage_rate_accepted,
+                        first_window,
+                        strict_rate_window,
+                        stage_window_eligible,
+                        stage_rate_evidence_accepted,
+                        stage_fully_spent,
                         stage_rate_sample_accepted,
                         stage_evidence_bytes,
                         stage_evidence_elapsed.as_micros(),
+                        stage_rate_ineligible_bytes,
                         stage_rate_coverage_floor_bytes,
+                        stage_authorized_spent_bytes,
+                        stage_credit_bytes,
+                        stage_strict_capacity_bytes,
                         aggregate_rate_bps,
                         calibration.spent_bytes,
                         calibration.credit_limit_bytes,
@@ -1847,14 +2015,18 @@ impl ResponseStreamBinding {
                         now.saturating_duration_since(stage_authorized_at)
                             .as_micros(),
                         now.saturating_duration_since(earliest_sent_at).as_micros(),
-                        now.saturating_duration_since(previous_ack_at).as_micros(),
+                        previous_ack_at.map_or(0, |acked_at| {
+                            now.saturating_duration_since(acked_at).as_micros()
+                        }),
                         now.saturating_duration_since(latest_sent_at).as_micros(),
                         earliest_sent_at
                             .saturating_duration_since(stage_authorized_at)
                             .as_micros(),
-                        previous_ack_at
-                            .saturating_duration_since(latest_sent_at)
-                            .as_micros(),
+                        previous_ack_at.map_or(0, |acked_at| {
+                            acked_at
+                                .saturating_duration_since(latest_sent_at)
+                                .as_micros()
+                        }),
                     ),
                 );
             }
@@ -1862,18 +2034,103 @@ impl ResponseStreamBinding {
         if !active_calibration_has_owner_flights
             && let Some(identity) = outputs.active_ack_clock_calibration
         {
-            let clear_active = match outputs.ack_clock_calibrations.get_mut(&identity) {
-                None => true,
-                Some(calibration) if calibration.proven => true,
-                Some(calibration) if calibration.spent_bytes >= calibration.max_limit_bytes => {
-                    calibration.retire();
-                    true
-                }
-                Some(calibration) if calibration.spent_bytes >= calibration.credit_limit_bytes => {
-                    calibration.retire();
-                    true
-                }
-                Some(_) => false,
+            let previous_credit = outputs
+                .ack_clock_calibrations
+                .get(&identity)
+                .map_or(0, |calibration| calibration.credit_limit_bytes);
+            let mut transition_snapshot = None;
+            let (clear_active, terminal_reason) =
+                match outputs.ack_clock_calibrations.get_mut(&identity) {
+                    None => (true, "missing_state"),
+                    Some(calibration) => {
+                        if calibration.proven {
+                            transition_snapshot = Some(*calibration);
+                            (
+                                true,
+                                if calibration.calibrated_rate_bps.is_some() {
+                                    "robust_rate"
+                                } else {
+                                    "hard_ceiling_no_rate"
+                                },
+                            )
+                        } else if calibration.retired {
+                            transition_snapshot = Some(*calibration);
+                            (true, "retired_drain")
+                        } else {
+                            let previous_stage_rate_samples = calibration.stage_rate_sample_count();
+                            if calibration.advance_drained_stage(now) {
+                                let accepted_stage = calibration.stage_rate_sample_count()
+                                    > previous_stage_rate_samples;
+                                transition_snapshot = Some(*calibration);
+                                (
+                                    false,
+                                    if accepted_stage {
+                                        "drain_stage_advance"
+                                    } else {
+                                        "drain_reachability_topup"
+                                    },
+                                )
+                            } else if calibration.proven {
+                                transition_snapshot = Some(*calibration);
+                                (
+                                    true,
+                                    if calibration.calibrated_rate_bps.is_some() {
+                                        "robust_rate"
+                                    } else {
+                                        "hard_ceiling_no_rate"
+                                    },
+                                )
+                            } else if calibration.spent_bytes >= calibration.max_limit_bytes {
+                                transition_snapshot = Some(*calibration);
+                                calibration.retire();
+                                (true, "hard_ceiling_drain")
+                            } else if calibration.spent_bytes >= calibration.credit_limit_bytes {
+                                transition_snapshot = Some(*calibration);
+                                calibration.retire();
+                                (true, "under_covered_drain")
+                            } else {
+                                (false, "credit_remaining")
+                            }
+                        }
+                    }
+                };
+            if clear_active || terminal_reason != "credit_remaining" {
+                let terminal = transition_snapshot;
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "response_ack_clock_calibration",
+                    format_args!(
+                        "phase={} session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} reason={} active_owner_flights=false calibrated_rate_ready={} calibrated_rate_bps={} spent_bytes={} previous_credit_limit_bytes={} credit_limit_bytes={} max_limit_bytes={} stage_authorized_spent_bytes={} stage_credit_bytes={} stage_strict_capacity_bytes={} stage_evidence_bytes={} stage_rate_ineligible_bytes={} proven={} retired={}",
+                        if clear_active {
+                            "terminal"
+                        } else {
+                            "drain_transition"
+                        },
+                        self.session_id.0,
+                        self.binding_instance_id,
+                        identity.0.underlay,
+                        identity.0.path_id.0,
+                        identity.1,
+                        terminal_reason,
+                        terminal.is_some_and(|state| state.calibrated_rate_bps.is_some()),
+                        terminal
+                            .and_then(|state| state.calibrated_rate_bps)
+                            .unwrap_or(0.0),
+                        terminal.map_or(0, |state| state.spent_bytes),
+                        previous_credit,
+                        terminal.map_or(0, |state| state.credit_limit_bytes),
+                        terminal.map_or(0, |state| state.max_limit_bytes),
+                        terminal.map_or(0, |state| state.stage_authorized_spent_bytes),
+                        terminal.map_or(0, |state| state.stage_credit_bytes()),
+                        terminal.map_or(0, |state| state.stage_strict_capacity_bytes()),
+                        terminal.map_or(0, |state| state.stage_rate_evidence_bytes),
+                        terminal.map_or(0, |state| state.stage_rate_ineligible_bytes),
+                        terminal.is_some_and(|state| state.proven),
+                        terminal.is_some_and(|state| state.retired),
+                    ),
+                );
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = (terminal_reason, terminal, previous_credit);
             };
             if clear_active {
                 outputs.active_ack_clock_calibration = None;
@@ -1895,6 +2152,10 @@ impl ResponseStreamBinding {
                 }
             }
         }
+        // A planner captures this before reading lower flights and path
+        // snapshots. Publish it only after both ledgers describe the ACK.
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         if changed || ordering_update.changed {
             self.graduate_bulk_proven_response_startup_owner();
@@ -2090,6 +2351,10 @@ impl ResponseStreamBinding {
         (state.planner_generation, state.set.clone())
     }
 
+    pub(super) fn response_model_generation(&self) -> u64 {
+        self.response_model_generation.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(super) fn lane_generation(&self) -> u64 {
         self.lane_tracker.generation(self.session_id)
@@ -2275,6 +2540,7 @@ impl ResponseStreamBinding {
         else {
             return false;
         };
+        let lane = self.lane();
 
         // Owner enqueue holds the outputs lock from Subflow reservation through
         // flight recording. Keep it here so the no-flight proof and graduation
@@ -2318,14 +2584,31 @@ impl ResponseStreamBinding {
                 outputs.entries[owner_position].incarnation,
             );
             if owner_identity.0.underlay == UnderlayProtocol::Tcp {
-                let initial_limit = reliable_ack_clock_calibration_limit_bytes(self.mux_limits);
+                let calibration_snapshot = server_bulk_output_snapshot(
+                    &outputs.entries[owner_position],
+                    self.session_id,
+                    lane,
+                    &self.lane_tracker,
+                    self.mux_limits,
+                    Instant::now(),
+                );
+                let initial_limit = reliable_tcp_ack_clock_calibration_initial_limit_bytes(
+                    calibration_snapshot,
+                    self.mux_limits,
+                );
                 let max_limit = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
                 if initial_limit > 0 && max_limit >= initial_limit {
+                    let coverage_floor =
+                        reliable_ack_clock_calibration_rate_coverage_floor_bytes(self.mux_limits);
                     outputs
                         .ack_clock_calibrations
                         .entry(owner_identity)
                         .or_insert_with(|| {
-                            ResponseAckClockCalibrationState::new(initial_limit, max_limit)
+                            ResponseAckClockCalibrationState::new_with_rate_coverage_floor(
+                                initial_limit,
+                                max_limit,
+                                coverage_floor,
+                            )
                         });
                 }
             }
@@ -2427,6 +2710,139 @@ impl ResponseStreamBinding {
         )
     }
 
+    pub(super) fn try_retire_tcp_ack_clock_calibration(
+        &self,
+        request: ResponseAckClockCalibrationRetirementRequest,
+    ) -> bool {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let mut retired = None;
+        let applied = self
+            .lane_tracker
+            .with_matching_generation_and_min_active_response_flows(
+                self.session_id,
+                request.expected_lane_generation,
+                2,
+                || {
+                    if self.response_model_generation.load(Ordering::Acquire)
+                        != request.expected_model_generation
+                    {
+                        return false;
+                    }
+                    let mut subflow_state = self
+                        .subflow_set
+                        .lock()
+                        .expect("server reliable stream subflow set lock");
+                    if subflow_state.planner_generation != request.expected_planner_generation
+                        || subflow_state.set.as_ref().is_none_or(|epoch| {
+                            epoch.service_key() != request.service
+                                || epoch.startup_owner_key().is_some()
+                        })
+                    {
+                        return false;
+                    }
+                    let service_is_exact_and_proven = outputs.entries.iter().any(|entry| {
+                        entry.key == request.service
+                            && entry.incarnation == request.service_incarnation
+                            && entry.role != StreamOpenRole::Repair
+                            && !entry.commands.is_closed()
+                            && entry.commands.pending_bytes() == request.service_pending_bytes
+                            && entry.key.underlay == UnderlayProtocol::Tcp
+                            && server_output_has_bulk_rate_evidence_with_limits(
+                                entry,
+                                self.mux_limits,
+                            )
+                    });
+                    let target_is_exact_and_drained = outputs.entries.iter().any(|entry| {
+                        entry.key == request.target
+                            && entry.incarnation == request.target_incarnation
+                            && entry.role == StreamOpenRole::Validation
+                            && !entry.commands.is_closed()
+                            && entry.commands.pending_bytes() == request.target_pending_bytes
+                            && entry.key.underlay == UnderlayProtocol::Tcp
+                            && entry.key.underlay == request.service.underlay
+                            // RepairData may remain as carrier pressure, but it
+                            // cannot preserve a unique OwnerData policy fence.
+                            && entry.owner_data_in_flight_bytes == 0
+                    });
+                    let identity = (request.target, request.target_incarnation);
+                    if !service_is_exact_and_proven
+                        || !target_is_exact_and_drained
+                        || outputs.active_ack_clock_calibration.is_some()
+                    {
+                        return false;
+                    }
+                    let flights = self
+                        .flights
+                        .lock()
+                        .expect("server reliable stream flight lock");
+                    let has_exact_owner_flight = flights.values().flatten().any(|flight| {
+                        flight.key == request.target
+                            && flight.output_incarnation == request.target_incarnation
+                            && flight.kind.is_ordering_owner()
+                    });
+                    if has_exact_owner_flight {
+                        return false;
+                    }
+                    drop(flights);
+
+                    let Some(calibration) = outputs.ack_clock_calibrations.get_mut(&identity)
+                    else {
+                        return false;
+                    };
+                    if calibration.proven
+                        || calibration.retired
+                        || calibration.spent_bytes != 0
+                        || calibration.credit_limit_bytes != request.limit_bytes
+                        || calibration.credit_limit_bytes > calibration.max_limit_bytes
+                    {
+                        return false;
+                    }
+                    calibration.retire();
+                    retired = Some(*calibration);
+                    subflow_state.planner_generation =
+                        subflow_state.planner_generation.wrapping_add(1);
+                    true
+                },
+            )
+            .unwrap_or(false);
+        drop(outputs);
+        if !applied {
+            return false;
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        if let Some(calibration) = retired {
+            lab_diagnostic(
+                "response_ack_clock_calibration",
+                format_args!(
+                    "phase=terminal session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} reason=completion_horizon active_owner_flights=false calibrated_rate_ready=false calibrated_rate_bps=0 spent_bytes={} previous_credit_limit_bytes={} credit_limit_bytes={} max_limit_bytes={} stage_authorized_spent_bytes={} stage_credit_bytes={} stage_strict_capacity_bytes={} stage_evidence_bytes={} stage_rate_ineligible_bytes={} proven={} retired={}",
+                    self.session_id.0,
+                    self.binding_instance_id,
+                    request.target.underlay,
+                    request.target.path_id.0,
+                    request.target_incarnation,
+                    calibration.spent_bytes,
+                    request.limit_bytes,
+                    calibration.credit_limit_bytes,
+                    calibration.max_limit_bytes,
+                    calibration.stage_authorized_spent_bytes,
+                    calibration.stage_credit_bytes(),
+                    calibration.stage_strict_capacity_bytes(),
+                    calibration.stage_rate_evidence_bytes,
+                    calibration.stage_rate_ineligible_bytes,
+                    calibration.proven,
+                    calibration.retired,
+                ),
+            );
+        }
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = retired;
+        self.notify_update();
+        true
+    }
+
     pub(super) fn try_enqueue_owner_frame_for_target(
         &self,
         target: &ResponseSenderPathTarget,
@@ -2488,9 +2904,14 @@ impl ResponseStreamBinding {
                 .with_matching_generation_and_min_active_response_flows(
                     self.session_id,
                     request.expected_lane_generation,
-                    2,
+                    if request.requires_multi_flow_start { 2 } else { 0 },
                     || {
                     {
+                        if self.response_model_generation.load(Ordering::Acquire)
+                            != request.expected_model_generation
+                        {
+                            return Err(RuntimeError::SenderServiceBlocked);
+                        }
                         let state = self
                             .subflow_set
                             .lock()
@@ -2509,6 +2930,7 @@ impl ResponseStreamBinding {
                             && entry.incarnation == request.service_incarnation
                             && entry.role != StreamOpenRole::Repair
                             && !entry.commands.is_closed()
+                            && entry.commands.pending_bytes() == request.service_pending_bytes
                             && entry.key.underlay == UnderlayProtocol::Tcp
                             && server_output_has_bulk_rate_evidence_with_limits(
                                 entry,
@@ -2520,7 +2942,8 @@ impl ResponseStreamBinding {
                     let target_is_tcp_validation = target_entry.role == StreamOpenRole::Validation
                         && target_entry.key.underlay == UnderlayProtocol::Tcp
                         && target_entry.key.underlay == request.service.underlay
-                        && !target_entry.commands.is_closed();
+                        && !target_entry.commands.is_closed()
+                        && target_entry.commands.pending_bytes() == request.target_pending_bytes;
                     // The product-flight ledger already includes frames that
                     // remain pending in the carrier command pipe.
                     let target_has_calibration_headroom = target_entry
@@ -2662,6 +3085,9 @@ impl ResponseStreamBinding {
                 .get_mut(target_index)
                 .expect("validated response output index");
             debug_assert_ne!(entry.role, StreamOpenRole::Repair);
+            entry.owner_data_in_flight_bytes = entry
+                .owner_data_in_flight_bytes
+                .saturating_add(bytes as u64);
             entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
             (entry.key, entry.incarnation)
         };
@@ -2679,6 +3105,10 @@ impl ResponseStreamBinding {
                 kind: CarrierWorkKind::OwnerData,
                 evidence_eligible: true,
             });
+        // Keep path counters and the exact range ledger in one published model
+        // generation so a concurrent calibration plan cannot mix the views.
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     pub(super) fn try_enqueue_repair_frame_for_target(
@@ -2820,6 +3250,11 @@ impl ResponseStreamBinding {
         {
             let incarnation_matches = entry.incarnation == output_incarnation;
             let role_matches = entry.role == planned_role;
+            if kind.is_ordering_owner() {
+                entry.owner_data_in_flight_bytes = entry
+                    .owner_data_in_flight_bytes
+                    .saturating_add(bytes as u64);
+            }
             entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
             (
                 entry.incarnation,
@@ -2842,6 +3277,9 @@ impl ResponseStreamBinding {
                 kind,
                 evidence_eligible,
             });
+        // The generation becomes visible only after the matching exact range.
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     fn invalidate_path_flight_evidence(&self, key: CarrierPathKey, output_incarnation: u64) {
@@ -2985,25 +3423,33 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .map(|entry| {
+                let command_pending_bytes = entry.commands.pending_bytes();
                 let calibration_identity = (entry.key, entry.incarnation);
                 let calibration = outputs
                     .ack_clock_calibrations
                     .get(&calibration_identity)
                     .copied();
-                let snapshot = server_bulk_output_snapshot(
+                let snapshot = server_bulk_output_snapshot_with_command_pending(
                     entry,
                     self.session_id,
                     lane,
                     &self.lane_tracker,
                     self.mux_limits,
                     now,
+                    command_pending_bytes,
                 );
                 ResponseSenderPathTarget {
+                    #[cfg(feature = "lab-diagnostics")]
+                    session_id: self.session_id,
+                    #[cfg(feature = "lab-diagnostics")]
+                    binding_instance_id: self.binding_instance_id,
                     key: entry.key,
                     incarnation: entry.incarnation,
                     commands: entry.commands.clone(),
                     attachment_role: entry.role,
                     snapshot,
+                    owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
+                    command_pending_bytes,
                     eta_ms: server_bulk_output_eta_ms(
                         entry.key,
                         snapshot,
@@ -3074,6 +3520,32 @@ impl ResponseStreamBinding {
         entry.delivery_samples = 1;
         entry.owner_data_acked_bytes = reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
         entry.last_delivery_at = Some(Instant::now());
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_output_product_model_for_test(
+        &self,
+        key: CarrierPathKey,
+        rate_bps: f64,
+        srtt_ms: f64,
+    ) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let entry = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .expect("test modeled output");
+        entry.product_progress_rate_bps = Some(rate_bps.max(1.0));
+        entry.delivery_rate_bps = Some(rate_bps.max(1.0));
+        entry.srtt_ms = Some(srtt_ms.max(1.0));
+        entry.last_delivery_at = Some(Instant::now());
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -3102,6 +3574,8 @@ impl ResponseStreamBinding {
         outputs.ack_clock_calibrations.insert(identity, calibration);
         if active {
             outputs.active_ack_clock_calibration = Some(identity);
+        } else if outputs.active_ack_clock_calibration == Some(identity) {
+            outputs.active_ack_clock_calibration = None;
         }
     }
 
@@ -3197,6 +3671,10 @@ impl ResponseStreamBinding {
                 }
                 changed = true;
             }
+        }
+        if changed {
+            self.response_model_generation
+                .fetch_add(1, Ordering::AcqRel);
         }
         drop(outputs);
         if changed {
@@ -3804,10 +4282,11 @@ impl Drop for ServerRealtimeFlowRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
-    use crate::runtime::relay_io::{
-        reliable_relay_source_staging_owner_tail_headroom, reliable_stream_recv_progress_interval,
+    use crate::runtime::bulk_admission::{
+        bulk_service_feed_reservoir_payload_bytes,
+        reliable_relay_source_staging_owner_tail_headroom,
     };
+    use crate::runtime::relay_io::reliable_stream_recv_progress_interval;
     use bytes::Bytes;
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
@@ -4260,6 +4739,7 @@ mod tests {
                 source.has_bulk_rate_evidence,
                 0,
                 0,
+                reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()),
                 MuxLimits::default(),
             ),
             bulk_service_feed_reservoir_payload_bytes(
@@ -4995,6 +5475,23 @@ mod tests {
             "one compressed stage sample cannot replace the startup rate"
         );
         assert_eq!(outputs.active_ack_clock_calibration, None);
+        drop(outputs);
+
+        let next_offset = (2 * window_bytes) as u64;
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(next_offset, MIN_RATE_SAMPLE_BYTES as usize),
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: next_offset,
+            end: next_offset + MIN_RATE_SAMPLE_BYTES,
+        }]);
+        let entry = first_output_entry(&binding);
+        assert!(
+            entry.delivery_rate_bps.is_some_and(|rate| rate > 1.0),
+            "a terminal calibration without a robust rate must not freeze later ordinary TCP evidence"
+        );
     }
 
     #[test]
@@ -5183,7 +5680,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_response_mixed_pre_and_post_ack_window_does_not_advance_calibration() {
+    fn tcp_response_mixed_window_consumes_fresh_capacity_without_publishing_rate() {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
         let window_bytes = PATH_OPEN_SCORE_BYTES;
         let identity = {
@@ -5221,7 +5718,10 @@ mod tests {
             .get(&identity)
             .expect("calibration state");
         assert_eq!(calibration.calibrated_rate_bps, None);
-        assert!(!calibration.proven);
+        assert!(
+            calibration.proven,
+            "the hard-capped stage cannot recover a representative strict window"
+        );
         assert_eq!(
             outputs.active_ack_clock_calibration, None,
             "a terminal stage without causal evidence retires after exact flights drain"
@@ -5712,6 +6212,24 @@ mod tests {
         binding.record_owner_flight(owner, &stream_data_frame_at(0, 4096));
         binding.record_repair_flight(repair, &stream_data_frame_at(0, 1024));
 
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            let owner_entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == owner)
+                .expect("owner output exists");
+            let repair_entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == repair)
+                .expect("repair output exists");
+            assert_eq!(owner_entry.owner_data_in_flight_bytes, 4096);
+            assert_eq!(owner_entry.bytes_in_flight, 4096);
+            assert_eq!(repair_entry.owner_data_in_flight_bytes, 0);
+            assert_eq!(repair_entry.bytes_in_flight, 1024);
+        }
+
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: 1024,
@@ -5730,6 +6248,8 @@ mod tests {
                 .expect("repair output exists");
             assert_eq!(owner_entry.bytes_in_flight, 3072);
             assert_eq!(repair_entry.bytes_in_flight, 0);
+            assert_eq!(owner_entry.owner_data_in_flight_bytes, 3072);
+            assert_eq!(repair_entry.owner_data_in_flight_bytes, 0);
             assert_eq!(
                 owner_entry.delivery_samples, 0,
                 "the duplicated prefix ACK is not path-scoped owner evidence"
@@ -5766,6 +6286,8 @@ mod tests {
             .expect("repair output exists");
         assert_eq!(owner_entry.bytes_in_flight, 0);
         assert_eq!(repair_entry.bytes_in_flight, 0);
+        assert_eq!(owner_entry.owner_data_in_flight_bytes, 0);
+        assert_eq!(repair_entry.owner_data_in_flight_bytes, 0);
         assert_eq!(
             owner_entry.delivery_samples, 1,
             "the later owner-only suffix ACK may become path-scoped evidence"
@@ -6054,9 +6576,11 @@ mod tests {
             let mut outputs = binding.outputs.lock().expect("test response outputs lock");
             let entry = outputs
                 .entries
-                .iter()
+                .iter_mut()
                 .find(|entry| entry.key == candidate)
                 .expect("candidate output");
+            entry.product_progress_rate_bps = Some(1.0);
+            entry.delivery_rate_bps = Some(1.0);
             let identity = (entry.key, entry.incarnation);
             let mut calibration = ResponseAckClockCalibrationState::new(
                 reliable_ack_clock_calibration_limit_bytes(mux_limits),
@@ -6087,6 +6611,7 @@ mod tests {
             .expect("retired candidate target");
         assert!(target.ack_clock_calibration_active);
 
+        std::thread::sleep(Duration::from_millis(1));
         binding.release_normalized_acked_ranges(&[OffsetRange {
             start: 0,
             end: 4096,
@@ -6099,6 +6624,30 @@ mod tests {
                 .active_ack_clock_calibration,
             None
         );
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output after calibration drain");
+            assert_eq!(entry.delivery_rate_bps, Some(1.0));
+        }
+
+        let ordinary = stream_data_frame_at(4096, MIN_RATE_SAMPLE_BYTES as usize);
+        binding.record_owner_flight(candidate, &ordinary);
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 4096,
+            end: 4096 + MIN_RATE_SAMPLE_BYTES,
+        }]);
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == candidate)
+            .expect("candidate output after ordinary ACK");
+        assert!(entry.delivery_rate_bps.is_some_and(|rate| rate > 1.0));
     }
 
     #[test]
@@ -6531,7 +7080,7 @@ mod tests {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(1),
         };
-        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let (service_commands, mut service_receivers) = reliable_path_command_channels(8);
         let binding = ResponseStreamBinding::new_with_limits_and_tracker(
             session_id,
             service.underlay,
@@ -6625,17 +7174,39 @@ mod tests {
             .into_iter()
             .find(|target| target.key == candidate)
             .expect("candidate target");
+        let service_target = binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == service)
+            .expect("service target");
         let request_for = |binding: &ResponseStreamBinding| {
             let (expected_planner_generation, _) = binding.subflow_state_snapshot();
             ResponseAckClockCalibrationRequest {
                 expected_planner_generation,
                 expected_lane_generation: binding.lane_generation(),
+                expected_model_generation: binding.response_model_generation(),
                 service,
                 service_incarnation,
+                service_pending_bytes: 0,
+                target_pending_bytes: target.commands.pending_bytes(),
                 limit_bytes: reliable_ack_clock_calibration_limit_bytes(mux_limits),
+                requires_multi_flow_start: true,
             }
         };
         let frame = stream_data_frame(payload_bytes);
+
+        let stale_model = request_for(&binding);
+        binding.set_output_product_model_for_test(candidate, 500_000_000.0, 10.0);
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(stale_model),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
 
         let stale = request_for(&binding);
         binding.invalidate_subflow_plan();
@@ -6714,6 +7285,52 @@ mod tests {
                 ),
             );
         }
+
+        let stale_target_pending = request_for(&binding);
+        candidate_commands
+            .try_enqueue_stream_ordered_frame(
+                stream_data_frame_at(payload_bytes as u64, payload_bytes),
+                FlowLane::Throughput,
+            )
+            .expect("change candidate pending bytes");
+        let candidate_pending_command = try_recv_reliable_path_command(&mut candidate_receivers)
+            .expect("drain candidate queue without releasing pending bytes");
+        let candidate_pending_bytes =
+            reliable_path_command_pending_bytes(&candidate_pending_command);
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(stale_target_pending),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        candidate_receivers.release_pending_command_bytes(candidate_pending_bytes);
+
+        let stale_service_pending = request_for(&binding);
+        service_target
+            .commands
+            .try_enqueue_stream_ordered_frame(
+                stream_data_frame_at(payload_bytes as u64, payload_bytes),
+                FlowLane::Throughput,
+            )
+            .expect("change service pending bytes");
+        let service_pending_command = try_recv_reliable_path_command(&mut service_receivers)
+            .expect("drain service queue without releasing pending bytes");
+        let service_pending_bytes = reliable_path_command_pending_bytes(&service_pending_command);
+        assert!(matches!(
+            binding.try_enqueue_owner_frame_for_target(
+                &target,
+                &frame,
+                FlowLane::Throughput,
+                None,
+                Some(stale_service_pending),
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        service_receivers.release_pending_command_bytes(service_pending_bytes);
 
         candidate_commands
             .try_enqueue_stream_ordered_frame(

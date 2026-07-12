@@ -38,7 +38,10 @@ pub(super) const BBR_MAX_SEND_QUANTUM_BYTES: usize = 64 * 1024;
 pub(super) const BBR_MIN_SEND_QUANTUM_PACKETS: usize = 2;
 pub(super) const BBR_MIN_PIPE_CWND_PACKETS: usize = 4;
 pub(super) const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
-pub(super) const QUIC_TIMER_GRANULARITY: Duration = Duration::from_millis(1);
+// Shared measurement floor. QUIC supplies the 1 ms precedent, but TCP product
+// ACK calibration and carrier-neutral rate samples use the same timer bound.
+pub(super) const TRANSPORT_TIMER_GRANULARITY: Duration = Duration::from_millis(1);
+pub(super) const QUIC_TIMER_GRANULARITY: Duration = TRANSPORT_TIMER_GRANULARITY;
 // Generic reliable-stream startup prior. The value follows QUIC's conservative
 // initial RTT recommendation, but product/scheduler code intentionally names it
 // without tying it to UDP or QUIC.
@@ -817,7 +820,7 @@ impl PathRateSample {
     }
 
     pub(super) fn rate_bps(self) -> f64 {
-        self.bytes as f64 * 8.0 / self.elapsed.max(QUIC_TIMER_GRANULARITY).as_secs_f64()
+        self.bytes as f64 * 8.0 / self.elapsed.max(TRANSPORT_TIMER_GRANULARITY).as_secs_f64()
     }
 
     pub(super) fn bytes(self) -> u64 {

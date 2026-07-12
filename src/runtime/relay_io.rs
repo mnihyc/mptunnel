@@ -1,7 +1,12 @@
+use super::bulk_admission::reliable_relay_source_staging_owner_tail_headroom;
+#[cfg(test)]
 use super::bulk_admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
 };
 use super::*;
+
+// Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
+// counters but delegates product admission limits to their policy modules.
 
 pub(super) async fn send_sender_service_attach_control_frames(
     path_stream: &ReliablePathStream,
@@ -105,43 +110,13 @@ pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     ack_frontier: u64,
     next_offset: u64,
 ) -> usize {
-    if !relay_lane_is_bulk(lane) || ack_frontier >= next_offset {
+    if !lane.is_bulk() || ack_frontier >= next_offset {
         return 0;
     }
     // This is a tail guard, not repair debt. It blocks alternate OwnerData and
     // missing-owner failover while lower Service bytes are unresolved, but it
     // must not make the live Service owner itself inadmissible.
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
-}
-
-pub(super) fn reliable_relay_source_staging_owner_tail_headroom(
-    independent_source_staging: bool,
-    lane: FlowLane,
-    service_is_live: bool,
-    service_has_latency_pressure: bool,
-    service_has_feed_evidence: bool,
-    ordered_owner_debt_bytes: usize,
-    queued_data_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    if !relay_lane_is_bulk(lane) {
-        return usize::MAX;
-    }
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let has_feed_reservoir = service_is_live && service_has_feed_evidence;
-    let feed_limit = if service_has_latency_pressure || !has_feed_reservoir {
-        bulk_service_horizon_payload_bytes(payload, mux_limits)
-    } else {
-        bulk_service_feed_reservoir_payload_bytes(payload, mux_limits)
-    };
-    let staged_debt = if independent_source_staging {
-        // Raw bytes on a mixed-family switchable response have no offset or
-        // path owner, but still consume sender-service queue capacity.
-        queued_data_bytes
-    } else {
-        ordered_owner_debt_bytes.saturating_add(queued_data_bytes)
-    };
-    feed_limit.saturating_sub(staged_debt)
 }
 
 pub(super) fn stream_ack_contiguous_frontier(_complete: bool, ranges: &[OffsetRange]) -> u64 {
@@ -544,7 +519,7 @@ fn reliable_stream_advertised_window_from_underlay(
     let startup_window = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
         .max(min_window)
         .min(configured);
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return startup_window;
     }
 
@@ -583,7 +558,7 @@ pub(super) fn reliable_stream_ack_update_bytes(
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> u64 {
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return 1;
     }
     let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
@@ -890,7 +865,7 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
         .max(1);
     let Some(path) = path else {
         let startup = relay_lane_startup_chunk_bytes(lane, mux_limits);
-        let startup = if relay_lane_is_bulk(lane) {
+        let startup = if lane.is_bulk() {
             startup.max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
         } else {
             startup
@@ -910,7 +885,7 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
             ((quantum as f64) * condition).ceil() as usize
         }
     };
-    let target = if relay_lane_is_bulk(lane) {
+    let target = if lane.is_bulk() {
         // TCP and QUIC UDP already own packet pacing and congestion below
         // mptunnel. Once a reliable stream is classified as throughput demand,
         // the product sender must not keep the carrier app-limited with a
@@ -965,7 +940,7 @@ pub(super) fn reliable_relay_sender_dispatch_budget(
     queue_limit: usize,
 ) -> (usize, usize) {
     let quantum = adaptive_chunk.max(1);
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return (quantum, 1);
     }
 
@@ -1022,7 +997,7 @@ pub(super) fn reliable_persistent_ack_gap_repair_limit_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     let event_limit = adaptive_reliable_relay_repair_bytes(path, lane, mux_limits);
-    let event_limit = if owner_underlay == Some(UnderlayProtocol::Tcp) && relay_lane_is_bulk(lane) {
+    let event_limit = if owner_underlay == Some(UnderlayProtocol::Tcp) && lane.is_bulk() {
         // A complete ACK with the same cross-carrier hole for three PTOs is
         // stronger evidence than ordinary packet loss. Repair one modeled
         // service flight so a dead TCP owner cannot advance a 64 MiB product
@@ -1989,6 +1964,7 @@ where
             source_staging_has_feed_evidence,
             ordered_owner_debt_bytes,
             response_sender.data_bytes(),
+            reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
             mux_limits,
         );
         // Mixed-family response bytes have neither offsets nor owners while
@@ -2008,6 +1984,7 @@ where
                 source_staging_has_feed_evidence,
                 ordered_owner_debt_bytes,
                 response_sender.data_bytes(),
+                reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
                 mux_limits,
             );
             if former_owner_tail_read_headroom == 0 && source_read_ceiling > 0 {
@@ -2910,6 +2887,7 @@ where
                                 source_staging_has_feed_evidence,
                                 ordered_owner_debt_bytes,
                                 response_sender.data_bytes(),
+                                reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
                                 mux_limits,
                             );
                         if owner_tail_read_headroom == 0 {
@@ -3342,6 +3320,7 @@ mod tests {
                 true,
                 horizon,
                 0,
+                payload,
                 mux_limits,
             ),
             reservoir.saturating_sub(horizon),
@@ -3363,6 +3342,7 @@ mod tests {
                 true,
                 horizon,
                 0,
+                payload,
                 mux_limits,
             ),
             0,
@@ -3384,6 +3364,7 @@ mod tests {
                 false,
                 usize::MAX,
                 0,
+                payload,
                 mux_limits,
             ),
             horizon,
@@ -3398,6 +3379,7 @@ mod tests {
                 false,
                 usize::MAX,
                 horizon,
+                payload,
                 mux_limits,
             ),
             0,
@@ -3421,6 +3403,7 @@ mod tests {
                 true,
                 usize::MAX,
                 horizon,
+                payload,
                 mux_limits,
             ),
             reservoir.saturating_sub(horizon),
@@ -3443,6 +3426,7 @@ mod tests {
                 true,
                 usize::MAX,
                 horizon.saturating_sub(payload),
+                payload,
                 mux_limits,
             ),
             payload,
@@ -3465,6 +3449,7 @@ mod tests {
                 false,
                 usize::MAX,
                 0,
+                payload,
                 mux_limits,
             ),
             horizon,

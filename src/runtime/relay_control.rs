@@ -87,7 +87,7 @@ impl ReliableRelayRequestOutstandingWindow {
             }
         }
 
-        let startup_reservoir = if relay_lane_is_bulk(lane) {
+        let startup_reservoir = if lane.is_bulk() {
             bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
         } else {
             // Flow classification already expects one full source queue.
@@ -143,7 +143,7 @@ impl ReliableRelayRequestOutstandingWindow {
             || !owner_capable
             || active_instance.is_none()
             || self.active_tcp_instance != active_instance
-            || !relay_lane_is_bulk(lane)
+            || !lane.is_bulk()
         {
             return;
         }
@@ -318,7 +318,7 @@ where
             }
             remotes.set_lane(relay_lane);
         }
-        if demand_update.prevalidate_bulk && !relay_lane_is_bulk(relay_lane) {
+        if demand_update.prevalidate_bulk && !relay_lane.is_bulk() {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "client_stream_prevalidation_due",
@@ -359,7 +359,7 @@ where
                 ),
             );
             flow_demand.mark_rebalance_attempted();
-            if relay_lane_is_bulk(relay_lane) {
+            if relay_lane.is_bulk() {
                 if spawn_reliable_relay_validation_opens(
                     context,
                     &spec,
@@ -1244,7 +1244,7 @@ where
                     sender_queue.push_data(payload);
                     let mut opportunistic_reads = 1usize;
                     while local_open
-                        && !relay_lane_is_bulk(relay_lane)
+                        && !relay_lane.is_bulk()
                         && opportunistic_reads < sender_dispatch_item_budget
                         && reliable_relay_can_read_product_source(
                             local_open,
@@ -2482,7 +2482,7 @@ fn spawn_reliable_relay_validation_opens(
     attempted: &mut std::collections::HashSet<RelayPathKey>,
     result_tx: &mpsc::Sender<RelayValidationOpenResult>,
 ) -> bool {
-    if !relay_lane_is_bulk(lane) {
+    if !lane.is_bulk() {
         return false;
     }
     if !pending.is_empty() {
@@ -3140,7 +3140,7 @@ pub(super) fn reliable_relay_delivery_path_should_become_active(
     // Measured bulk delivery admits a Subflow; it does not implicitly rewrite
     // per-stream Service placement. Explicit stall/failure recovery owns bulk
     // Active reannouncement.
-    if relay_lane_is_bulk(lane) {
+    if lane.is_bulk() {
         return false;
     }
     let Some(delivered_eta) = context.reliable_relay_path_eta_ms(delivered, lane, payload_bytes)

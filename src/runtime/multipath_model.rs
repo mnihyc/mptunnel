@@ -1,6 +1,9 @@
 use super::prelude::*;
 use super::{CarrierPathKey, MIN_RATE_SAMPLE_BYTES};
 
+// Shared product vocabulary for work, path roles, and cross-family health.
+// Carrier implementations consume these decisions but do not define them.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CarrierWorkKind {
     OwnerData,

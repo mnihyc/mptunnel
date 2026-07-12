@@ -232,12 +232,25 @@ pub(super) fn bulk_exploration_completion_projection(
 // Source staging is product admission, not socket-loop orchestration. Keeping
 // this limit beside the Service horizon prevents event loops from inventing a
 // second ownership model for bytes that do not have offsets yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReliableSourceServiceStagingContext {
+    /// Switchable responses own an exact global tail; fixed request-side
+    /// outputs keep their narrower established staging policy.
+    pub(super) allows_product_envelope: bool,
+    pub(super) has_latency_pressure: bool,
+    pub(super) has_feed_evidence: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReliableSourceStagingContext {
+    /// Mixed-family raw bytes remain unassigned until dispatch chooses a path.
+    pub(super) independent: bool,
+    pub(super) service: Option<ReliableSourceServiceStagingContext>,
+}
+
 pub(super) fn reliable_relay_source_staging_owner_tail_headroom(
-    independent_source_staging: bool,
+    context: ReliableSourceStagingContext,
     lane: FlowLane,
-    service_is_live: bool,
-    service_has_latency_pressure: bool,
-    service_has_feed_evidence: bool,
     ordered_owner_debt_bytes: usize,
     queued_data_bytes: usize,
     payload_bytes: usize,
@@ -246,13 +259,35 @@ pub(super) fn reliable_relay_source_staging_owner_tail_headroom(
     if !lane.is_bulk() {
         return usize::MAX;
     }
-    let has_feed_reservoir = service_is_live && service_has_feed_evidence;
-    let feed_limit = if service_has_latency_pressure || !has_feed_reservoir {
+    let service_has_latency_pressure = context
+        .service
+        .is_some_and(|service| service.has_latency_pressure);
+    let service_has_feed_evidence = context
+        .service
+        .is_some_and(|service| service.has_feed_evidence);
+    let service_allows_product_envelope = context
+        .service
+        .is_some_and(|service| service.allows_product_envelope);
+    let feed_limit = if service_has_latency_pressure {
         bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+    } else if !service_has_feed_evidence {
+        if service_allows_product_envelope && !context.independent {
+            // A switchable Service needs enough bounded work to escape an
+            // app-limited carrier sample. This is still only the feed
+            // reservoir; native evidence is required for the full envelope.
+            bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
+        } else {
+            bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+        }
+    } else if service_allows_product_envelope && !context.independent {
+        // Same-family responses charge every assigned owner range plus raw
+        // queue byte to one exact tail. Per-path admission still decides where
+        // those bytes go; this boundary only avoids starving native carriers.
+        bulk_service_product_envelope_payload_bytes(payload_bytes, mux_limits)
     } else {
         bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
     };
-    let staged_debt = if independent_source_staging {
+    let staged_debt = if context.independent {
         // Mixed-family raw bytes have no offset/path owner yet, but still use
         // sender-service memory and therefore consume the global feed limit.
         queued_data_bytes

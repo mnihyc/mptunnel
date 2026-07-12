@@ -87,6 +87,10 @@ container_stats_interval="${MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS:-1}"
 management_snapshots="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS:-0}"
 management_snapshot_interval="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOT_INTERVAL_SECONDS:-1}"
 management_snapshot_port="${MPTUNNEL_LAB_MANAGEMENT_PORT:-17600}"
+management_control="${MPTUNNEL_LAB_MANAGEMENT_CONTROL:-0}"
+handoff_initial_wait_seconds="${MPTUNNEL_LAB_HANDOFF_INITIAL_WAIT_SECONDS:-10}"
+handoff_calibration_wait_seconds="${MPTUNNEL_LAB_HANDOFF_CALIBRATION_WAIT_SECONDS:-10}"
+handoff_wait_seconds="${MPTUNNEL_LAB_HANDOFF_WAIT_SECONDS:-20}"
 fail_on_bad_status="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}"
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
 case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
@@ -378,7 +382,7 @@ validate_mptunnel_config_in() {
 }
 
 management_config_toml() {
-  if ! flag_enabled "$management_snapshots"; then
+  if ! flag_enabled "$management_snapshots" && ! flag_enabled "$management_control"; then
     return 0
   fi
   if [[ ! "$management_snapshot_port" =~ ^[0-9]+$ ]] || (( management_snapshot_port < 1 || management_snapshot_port > 65535 )); then
@@ -519,6 +523,36 @@ telemetry_file_for_case() {
 management_snapshot_file_for_case() {
   local case_name="$1"
   printf '%s/management-snapshots-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
+}
+
+causal_handoff_stage_file_for_case() {
+  local case_name="$1"
+  printf '%s/causal-handoff-stages-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
+}
+
+record_causal_handoff_stage() {
+  local case_name="$1"
+  local phase="$2"
+  local status="$3"
+  local detail="${4:-}"
+  CASE_NAME="$case_name" PHASE="$phase" STATUS="$status" DETAIL="$detail" \
+    python3 - "$(causal_handoff_stage_file_for_case "$case_name")" <<'PY'
+import json
+import os
+import sys
+import time
+
+row = {
+    "case": os.environ["CASE_NAME"],
+    "phase": os.environ["PHASE"],
+    "status": os.environ["STATUS"],
+    "detail": os.environ.get("DETAIL", ""),
+    "unix_time_ns": time.time_ns(),
+    "monotonic_time_ns": time.monotonic_ns(),
+}
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    print(json.dumps(row, sort_keys=True), file=handle)
+PY
 }
 
 netdev_snapshot_file_for_case() {
@@ -903,6 +937,190 @@ run_tcp_download_probe_case() {
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
   append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+}
+
+control_client_path_state() {
+  local underlay="$1"
+  local index="$2"
+  local state="$3"
+  exec_in client "curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' --data '{\"underlay\":\"${underlay}\",\"index\":${index},\"state\":\"${state}\"}' 'http://127.0.0.1:${management_snapshot_port}/control/path'"
+}
+
+run_staged_exact_receipt_handoff_case() {
+  local case_name="$1"
+  if ! flag_enabled "$lab_diagnostics"; then
+    append_skipped_result "$case_name" "tcp" "staged causal handoff requires MPTUNNEL_LAB_DIAGNOSTICS=1"
+    return 0
+  fi
+
+  # This case creates proof authority after both downloads demonstrably own
+  # TCP Service bindings; ordinary mixed startup cannot establish that cause.
+  local management_control=1
+  local staged_binding_count=2
+  local MPTUNNEL_LAB_DIAG_EVENTS="response_quic_capacity_calibration,quic_capacity_receipt,quic_capacity_proof,quic_capacity_probe_retired,response_service_handoff,server_bulk_output_selected"
+  local stage_file started_file out_file err_file status_file pid_file
+  local server_log_offset activation_log_offset telemetry_pid output probe_stderr exit_code
+  local disable_output disable_status transport_client_status transport_server_status
+  local initial_output initial_status restore_client_output restore_client_status
+  local restore_server_output restore_server_status activate_output activate_status
+  local calibration_output calibration_status handoff_output handoff_status
+  local verifier_output verifier_status stage_failed=0
+  stage_file="$(causal_handoff_stage_file_for_case "$case_name")"
+  started_file="/tmp/mptunnel-causal-handoff.started"
+  out_file="/tmp/mptunnel-causal-handoff.out"
+  err_file="/tmp/mptunnel-causal-handoff.err"
+  status_file="/tmp/mptunnel-causal-handoff.status"
+  pid_file="/tmp/mptunnel-causal-handoff.pid"
+  mkdir -p "$result_dir"
+  rm -f "$stage_file"
+
+  # Keep QUIC transport attached while management excludes it from placement.
+  # Physical loss/reconnect belongs to fault rows, not this handoff proof.
+  start_client "$case_name" "$tcp_lowlat $udp_fat"
+  server_log_offset="$(exec_in server "stat -c %s /tmp/mptunnel-server.log")"
+  record_causal_handoff_stage "$case_name" "configured" "ok" \
+    "lowlat_rate=${MPTUNNEL_LAB_LOWLAT_RATE:-80mbit};lowlat_delay=${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms};lowlat_jitter=${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms};lowlat_loss=${MPTUNNEL_LAB_LOWLAT_LOSS:-1.00%};fat_rate=${MPTUNNEL_LAB_FAT_RATE:-500mbit};fat_delay=${MPTUNNEL_LAB_FAT_DELAY:-180ms};fat_jitter=${MPTUNNEL_LAB_FAT_JITTER:-20ms};fat_loss=${MPTUNNEL_LAB_FAT_LOSS:-1.00%};load_seconds=${load_duration_seconds};fixed_bindings=${staged_binding_count};udp_transport=warm_scheduler_disabled;server_log_offset=${server_log_offset};events=${MPTUNNEL_LAB_DIAG_EVENTS}"
+
+  set +e
+  disable_output="$(control_client_path_state udp 0 disabled 2>&1)"
+  disable_status="$?"
+  exec_netem client show >/dev/null 2>&1
+  transport_client_status="$?"
+  exec_netem server show >/dev/null 2>&1
+  transport_server_status="$?"
+  set -e
+  record_causal_handoff_stage "$case_name" "udp_disabled" "$disable_status" "$disable_output"
+  record_causal_handoff_stage "$case_name" "fat_transport_preserved_client" "$transport_client_status" \
+    "$(exec_netem client show 2>&1 || true)"
+  record_causal_handoff_stage "$case_name" "fat_transport_preserved_server" "$transport_server_status" \
+    "$(exec_netem server show 2>&1 || true)"
+  if (( disable_status != 0 || transport_client_status != 0 || transport_server_status != 0 )); then
+    stage_failed=1
+  fi
+
+  exec_in client "rm -f '${started_file}' '${out_file}' '${err_file}' '${status_file}' '${pid_file}'"
+  start_case_telemetry "$case_name"
+  telemetry_pid="$case_telemetry_pid"
+  exec_in client "(timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${staged_binding_count}' --request-lifecycle fixed --started-file '${started_file}' >'${out_file}' 2>'${err_file}'; echo \$? >'${status_file}') & echo \$! >'${pid_file}'"
+  set +e
+  exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
+  if (( $? != 0 )); then
+    stage_failed=1
+  fi
+  initial_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py wait --log /tmp/mptunnel-server.log --after-byte '${server_log_offset}' --event server_bulk_output_selected --field path_underlay=Tcp --field role=Service --field work=OwnerData --distinct-field binding_instance_id --count '${staged_binding_count}' --timeout '${handoff_initial_wait_seconds}'" 2>&1)"
+  initial_status="$?"
+  set -e
+  record_causal_handoff_stage "$case_name" "two_tcp_service_bindings" "$initial_status" "$initial_output"
+  if (( initial_status != 0 )); then
+    stage_failed=1
+  fi
+
+  if (( stage_failed == 0 )); then
+    set +e
+    restore_client_output="$(exec_netem client apply-fat 2>&1)"
+    restore_client_status="$?"
+    restore_server_output="$(exec_netem server apply-fat 2>&1)"
+    restore_server_status="$?"
+    set -e
+    if (( restore_client_status == 0 && restore_server_status == 0 )); then
+      activation_log_offset="$(exec_in server "stat -c %s /tmp/mptunnel-server.log")"
+      set +e
+      activate_output="$(control_client_path_state udp 0 active 2>&1)"
+      activate_status="$?"
+      set -e
+    else
+      activation_log_offset="$server_log_offset"
+      activate_output="skipped because fat-path restore failed"
+      activate_status=1
+    fi
+  else
+    restore_client_output="skipped because the fixed TCP cohort was not established"
+    restore_client_status=1
+    restore_server_output="$restore_client_output"
+    restore_server_status=1
+    activate_output="$restore_client_output"
+    activate_status=1
+    activation_log_offset="$server_log_offset"
+  fi
+  record_causal_handoff_stage "$case_name" "fat_restored_client" "$restore_client_status" \
+    "${restore_client_output}$(exec_netem client show 2>&1 || true)"
+  record_causal_handoff_stage "$case_name" "fat_restored_server" "$restore_server_status" \
+    "${restore_server_output}$(exec_netem server show 2>&1 || true)"
+  record_causal_handoff_stage "$case_name" "udp_activated" "$activate_status" "$activate_output"
+  if (( restore_client_status != 0 || restore_server_status != 0 || activate_status != 0 )); then
+    stage_failed=1
+  fi
+
+  if (( stage_failed == 0 )); then
+    set +e
+    calibration_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py wait --log /tmp/mptunnel-server.log --after-byte '${activation_log_offset}' --event response_quic_capacity_calibration --field phase=started --field path_id=0 --timeout '${handoff_calibration_wait_seconds}'" 2>&1)"
+    calibration_status="$?"
+    set -e
+  else
+    calibration_output='{"status":"fail","reason":"staged transition failed"}'
+    calibration_status=1
+  fi
+  record_causal_handoff_stage "$case_name" "capacity_calibration_started" "$calibration_status" "$calibration_output"
+  if (( calibration_status != 0 )); then
+    stage_failed=1
+  fi
+
+  if (( stage_failed == 0 )); then
+    set +e
+    handoff_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py wait --log /tmp/mptunnel-server.log --after-byte '${server_log_offset}' --event response_service_handoff --field phase=committed --field capacity_proof_authority=exact_receipt --field from_underlay=Tcp --field to_underlay=Udp --timeout '${handoff_wait_seconds}'" 2>&1)"
+    handoff_status="$?"
+    set -e
+  else
+    handoff_output='{"status":"fail","reason":"staged transition failed"}'
+    handoff_status=1
+  fi
+  record_causal_handoff_stage "$case_name" "exact_receipt_handoff" "$handoff_status" "$handoff_output"
+  if (( handoff_status != 0 )); then
+    stage_failed=1
+    exec_in client "kill \$(cat '${pid_file}') >/dev/null 2>&1 || true; echo 125 >'${status_file}'; pkill -TERM -f 'failover_download_probe.py --label ${case_name}' >/dev/null 2>&1 || true" || true
+  fi
+
+  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f '${status_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.2; done; if [ ! -f '${status_file}' ]; then echo 124 >'${status_file}'; fi"
+  stop_case_telemetry "$case_name" "$telemetry_pid"
+  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
+  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
+  exit_code="$(exec_in client "cat '${status_file}' 2>/dev/null || echo 124")"
+
+  set +e
+  verifier_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py verify --log /tmp/mptunnel-server.log --mode exact-receipt --after-byte '${server_log_offset}' --expected-product-bindings '${staged_binding_count}'" 2>&1)"
+  verifier_status="$?"
+  set -e
+  record_causal_handoff_stage "$case_name" "causal_verifier" "$verifier_status" "$verifier_output"
+  if (( verifier_status != 0 )); then
+    stage_failed=1
+  fi
+
+  output="$(ROW="$output" CAUSAL="$verifier_output" STAGE_FAILED="$stage_failed" PROBE_EXIT="$exit_code" STAGE_FILE="$stage_file" python3 - <<'PY'
+import json
+import os
+
+try:
+    row = json.loads(os.environ.get("ROW", ""))
+except json.JSONDecodeError:
+    row = {"case": "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_handoff_restore"}
+try:
+    causal = json.loads(os.environ.get("CAUSAL", ""))
+except json.JSONDecodeError:
+    causal = {"status": "fail", "raw": os.environ.get("CAUSAL", "")}
+try:
+    probe_exit = int(os.environ.get("PROBE_EXIT", "124"))
+except ValueError:
+    probe_exit = 124
+row["causal_handoff"] = causal
+row["causal_handoff_stage_file"] = os.environ["STAGE_FILE"]
+row["probe_exit_code"] = probe_exit
+if os.environ.get("STAGE_FAILED") != "0" or probe_exit != 0 or causal.get("status") != "ok":
+    row["status"] = "fail"
+print(json.dumps(row, sort_keys=True))
+PY
+)"
+  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
+  apply_netem apply
 }
 
 append_upload_probe_result() {
@@ -2592,6 +2810,10 @@ for equal_profile in lowlat balanced fat unconstrained; do
     run_reliable_ideal_download_case "mptunnel_reliable_mixed_multipath_equal_${equal_profile}" "$equal_profile" "$mixed_equal_all"
   fi
 done
+
+if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_handoff_restore"; then
+  run_staged_exact_receipt_handoff_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_handoff_restore"
+fi
 
 if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"; then
   start_client "reliable_mixed_tcp_lowlat_udp_fat" "$tcp_lowlat $udp_fat"

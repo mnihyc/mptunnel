@@ -197,7 +197,7 @@ def download_one_request(args, started, deadline, state, lock):
         buffer = b""
         while b"\r\n\r\n" not in buffer:
             if time.monotonic() >= deadline:
-                return False, None
+                return False, None, "deadline"
             try:
                 chunk = sock.recv(args.chunk_bytes)
             except socket.timeout:
@@ -207,14 +207,14 @@ def download_one_request(args, started, deadline, state, lock):
             buffer += chunk
         status, content_length, body = parse_headers(buffer)
         if not 200 <= status < 400:
-            return False, status
+            return False, status, "http_status"
         bytes_read = 0
         if body:
             bytes_read += len(body)
             record_interval_chunk(started, state, lock, len(body))
         while content_length is None or bytes_read < content_length:
             if time.monotonic() >= deadline:
-                return False, status
+                return False, status, "deadline"
             try:
                 chunk = sock.recv(args.chunk_bytes)
             except socket.timeout:
@@ -223,7 +223,48 @@ def download_one_request(args, started, deadline, state, lock):
                 break
             bytes_read += len(chunk)
             record_interval_chunk(started, state, lock, len(chunk))
-    return content_length is None or bytes_read == content_length, status
+    complete = content_length is None or bytes_read == content_length
+    return complete, status, "complete" if complete else "eof"
+
+
+def run_download_worker(
+    args,
+    started,
+    deadline,
+    state,
+    lock,
+    download_request=download_one_request,
+):
+    """Run one fixed request or replenish requests for a duration cohort."""
+    fixed = args.request_lifecycle == "fixed"
+    while time.monotonic() < deadline:
+        with lock:
+            state["request_attempts_started"] += 1
+        try:
+            complete, status, termination = download_request(
+                args, started, deadline, state, lock
+            )
+            ended_before_deadline = time.monotonic() < deadline
+            with lock:
+                state["requests"] += 1
+                if complete:
+                    state["complete_requests"] += 1
+                elif status is not None:
+                    state["partial_requests"] += 1
+                else:
+                    state["failures"] += 1
+                if fixed and termination != "deadline" and ended_before_deadline:
+                    state["early_terminations"] += 1
+        except Exception:
+            with lock:
+                state["requests"] += 1
+                state["failures"] += 1
+                if fixed and time.monotonic() < deadline:
+                    state["early_terminations"] += 1
+            if not fixed:
+                time.sleep(0.05)
+        if fixed:
+            return
 
 
 def interval_download(args):
@@ -242,9 +283,11 @@ def interval_download(args):
         "interval_seconds": args.interval_seconds,
         "interval_bytes": {},
         "requests": 0,
+        "request_attempts_started": 0,
         "complete_requests": 0,
         "partial_requests": 0,
         "failures": 0,
+        "early_terminations": 0,
     }
     lock = threading.Lock()
 
@@ -257,27 +300,14 @@ def interval_download(args):
         )
         marker_thread.start()
 
-    def worker():
-        while time.monotonic() < deadline:
-            try:
-                complete, status = download_one_request(args, started, deadline, state, lock)
-                with lock:
-                    state["requests"] += 1
-                    if complete:
-                        state["complete_requests"] += 1
-                    elif status is not None:
-                        state["partial_requests"] += 1
-                    else:
-                        state["failures"] += 1
-            except Exception:
-                with lock:
-                    state["requests"] += 1
-                    state["failures"] += 1
-                time.sleep(0.05)
-
+    worker_count = max(1, args.parallel_downloads)
     threads = [
-        threading.Thread(target=worker, daemon=True)
-        for _ in range(max(1, args.parallel_downloads))
+        threading.Thread(
+            target=run_download_worker,
+            args=(args, started, deadline, state, lock),
+            daemon=True,
+        )
+        for _ in range(worker_count)
     ]
     for thread in threads:
         thread.start()
@@ -291,22 +321,37 @@ def interval_download(args):
         bytes_read = state["bytes"]
         failover_after_s = state["failover_after_s"]
         failover_trigger_source = state["failover_trigger_source"]
-    status = "ok" if bytes_read > 0 and state["failures"] == 0 else "loss" if bytes_read > 0 else "fail"
+    replacement_requests = max(0, state["request_attempts_started"] - worker_count)
+    fixed_contract_ok = (
+        state["request_attempts_started"] == worker_count
+        and replacement_requests == 0
+        and state["failures"] == 0
+        and state["early_terminations"] == 0
+    )
+    successful = state["failures"] == 0
+    if args.request_lifecycle == "fixed":
+        successful = successful and fixed_contract_ok
+    status = "ok" if bytes_read > 0 and successful else "loss" if bytes_read > 0 else "fail"
     result = {
         "case": args.label,
         "protocol": args.protocol,
         "status": status,
-        "exit_code": 0 if status != "fail" else 1,
+        "exit_code": 0 if status != "fail" and successful else 1,
         "http_code": 200 if bytes_read > 0 else None,
         "mode": "duration",
+        "request_lifecycle": args.request_lifecycle,
         "load_duration_s": round(load_duration, 6),
-        "parallel_downloads": max(1, args.parallel_downloads),
+        "parallel_downloads": worker_count,
         "time_s": round(elapsed, 6),
         "goodput_mbps": round(bytes_read * 8 / elapsed / 1_000_000, 3) if elapsed > 0 else 0,
         "bytes": bytes_read,
         "content_length": None,
         "complete": bytes_read > 0,
         "requests": state["requests"],
+        "request_attempts_started": state["request_attempts_started"],
+        "target_request_attempts": worker_count if args.request_lifecycle == "fixed" else None,
+        "replacement_requests": replacement_requests,
+        "early_terminations": state["early_terminations"],
         "complete_requests": state["complete_requests"],
         "partial_requests": state["partial_requests"],
         "failed_requests": state["failures"],
@@ -332,6 +377,12 @@ def main():
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--parallel-downloads", type=int, default=1)
+    parser.add_argument(
+        "--request-lifecycle",
+        choices=("duration", "fixed"),
+        default="duration",
+        help="replenish requests until the deadline or make one request per worker",
+    )
     parser.add_argument("--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--started-file")
     parser.add_argument("--failover-marker-file")
@@ -339,8 +390,8 @@ def main():
     try:
         result = interval_download(args)
         print(json.dumps(result, sort_keys=True))
-        if result.get("status") == "fail":
-            return int(result.get("exit_code") or 1)
+        if result.get("exit_code"):
+            return int(result["exit_code"])
     except Exception as exc:
         print(
             json.dumps(

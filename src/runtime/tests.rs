@@ -1,3 +1,4 @@
+use super::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
@@ -2310,6 +2311,11 @@ fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
         Frame::PathProofData {
             path_id: PathId(1),
             proof_id: 1,
+            payload: payload.clone(),
+        },
+        Frame::PathCapacityData {
+            path_id: PathId(1),
+            calibration_id: 1,
             payload,
         },
     ];
@@ -2334,6 +2340,53 @@ fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
         reliable_path_command_writer_run_bytes(&ReliablePathCommand::SendFrame(ack))
             > MuxLimits::default().max_ack_ranges * 16
     );
+}
+
+#[test]
+fn quic_capacity_frames_require_explicit_typed_protocol_roles() {
+    let frames = [
+        (
+            Frame::PathCapacityData {
+                path_id: PathId(3),
+                calibration_id: 9,
+                payload: Bytes::from_static(b"carrier-capacity"),
+            },
+            FlowLane::Throughput,
+            b"carrier-capacity".len(),
+        ),
+        (
+            Frame::PathCapacityFinish {
+                path_id: PathId(3),
+                calibration_id: 9,
+                payload_bytes: 16,
+            },
+            FlowLane::Throughput,
+            0,
+        ),
+        (
+            Frame::PathCapacityReceipt {
+                path_id: PathId(3),
+                calibration_id: 9,
+                received_payload_bytes: 16,
+            },
+            FlowLane::Control,
+            0,
+        ),
+    ];
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    for (frame, expected_lane, expected_pacing_bytes) in frames {
+        assert!(reliable_path_frame_is_quic_capacity_only(&frame));
+        assert_eq!(
+            reliable_path_effective_frame_lane(&frame, FlowLane::Throughput),
+            expected_lane
+        );
+        assert_eq!(frame_pacing_bytes(&frame), expected_pacing_bytes);
+        assert_eq!(reliable_stream_frame_extent(&frame), None);
+        assert!(matches!(
+            commands.try_enqueue_admitted_frame(frame, FlowLane::Throughput),
+            Err(RuntimeError::Protocol(_))
+        ));
+    }
 }
 
 #[test]
@@ -2515,12 +2568,13 @@ fn udp_reliable_stream_uses_adaptive_product_window_below_config_ceiling() {
 
     assert_eq!(tcp_initial, mux_limits.max_stream_window_bytes);
     assert!(udp_initial < mux_limits.max_stream_window_bytes);
-    let udp_min_window = RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES
-        .max((reliable_relay_buffer_len(mux_limits) as u64).saturating_mul(4))
-        .min(mux_limits.max_stream_window_bytes);
     assert_eq!(
         udp_initial,
-        RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.max(udp_min_window)
+        u64::try_from(bulk_service_feed_reservoir_payload_bytes(
+            reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
+            mux_limits,
+        ))
+        .unwrap()
     );
 
     let snapshot = PathSnapshot::new(PathId(7), UnderlayProtocol::Udp, 40.0, 200_000_000.0);

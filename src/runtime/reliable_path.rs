@@ -7,13 +7,13 @@ use super::ack_clock_policy::{
 };
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 // Reliable-path bindings own attachment instances, exact range flights,
 // evidence, and atomic commit. Sender services rank immutable snapshots.
 
 static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(feature = "lab-diagnostics")]
+pub(in crate::runtime) const MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH: u8 = 2;
 static NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
 const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
@@ -26,11 +26,29 @@ fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8 {
     }
 }
 
+mod quic_capacity_probe;
 mod registry;
 mod response_admission;
+mod response_placement;
+mod response_service_handoff;
+mod response_session;
 
+pub(in crate::runtime) use quic_capacity_probe::ResponseQuicCapacityCalibrationRequest;
 pub(in crate::runtime) use registry::*;
 pub(super) use response_admission::*;
+pub(in crate::runtime) use response_placement::*;
+pub(in crate::runtime) use response_service_handoff::{
+    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest,
+};
+#[cfg(test)]
+use response_session::ServerQuicCapacityCalibrationPhase;
+use response_session::ServerResponseFlowRegistration;
+pub(in crate::runtime) use response_session::{
+    QuicCapacityProofCandidate, ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation,
+    ResponseSessionSchedulingSnapshot, ServerPathLaneTracker, ServerRealtimeFlowRegistration,
+    quic_capacity_proof_pin_matches_marker, quic_capacity_receipt_rate_bps,
+    valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
+};
 
 // Ownership boundary:
 // This module owns carrier-neutral reliable stream bindings on the response
@@ -132,6 +150,10 @@ impl ReliablePathStream {
 
     pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         self.output.capacity_notifies()
+    }
+
+    pub(super) fn response_service_handoff_drain_active(&self) -> bool {
+        self.output.response_service_handoff_drain_active()
     }
 
     pub(super) fn set_lane(&mut self, lane: FlowLane) {
@@ -489,6 +511,13 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    fn response_service_handoff_drain_active(&self) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.response_service_handoff_drain_active(),
+        }
+    }
+
     fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
         match self {
             Self::Fixed(fixed) => fixed.enqueue_path_proof().map(Some),
@@ -784,8 +813,11 @@ pub(super) struct ResponseAckClockCalibrationRetirementRequest {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ResponseSourceServiceSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) key: CarrierPathKey,
     pub(super) active_latency_sensitive_flows: u32,
+    pub(super) has_service_feed_evidence: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) has_bulk_rate_evidence: bool,
 }
 
@@ -796,9 +828,17 @@ pub(super) struct ResponseRelayReadSnapshot {
     pub(super) independent_source_staging: bool,
 }
 
+#[cfg(feature = "lab-diagnostics")]
+#[derive(Clone, Copy)]
+struct ResponseServiceHandoffDiagnosticState {
+    model_generation: u64,
+    evaluation_signature: u64,
+    capacity_marker_signature: u64,
+    emitted_at: Instant,
+}
+
 pub(super) struct ResponseStreamBinding {
     session_id: SessionId,
-    #[cfg(feature = "lab-diagnostics")]
     binding_instance_id: u64,
     lane: Mutex<FlowLane>,
     mux_limits: MuxLimits,
@@ -809,6 +849,19 @@ pub(super) struct ResponseStreamBinding {
     // inputs so calibration cannot commit a mixture of old and new views.
     response_model_generation: AtomicU64,
     owner_underlay_history: AtomicU8,
+    // Close publishes before carrier commands so no later scheduler commit can
+    // resurrect response Service ownership after stream retirement begins.
+    response_stream_open: AtomicBool,
+    // A successful carrier-family Service handoff is sticky. Reopening this
+    // decision would turn whole-flow placement into per-epoch path hopping.
+    response_service_handoff_open: AtomicBool,
+    // A failed bounded drain is not retried for this flow; repeated pauses
+    // would convert an optional placement optimization into periodic stalls.
+    response_service_handoff_drain_attempted: AtomicBool,
+    // Lab evaluation is transition/interval scoped so a hot sender loop does
+    // not turn one failed placement gate into one event per product frame.
+    #[cfg(feature = "lab-diagnostics")]
+    response_service_handoff_diagnostic: Mutex<Option<ResponseServiceHandoffDiagnosticState>>,
     outputs: Mutex<ResponseStreamOutputs>,
     request_active_owner: Mutex<Option<CarrierPathKey>>,
     // Historical name: this is the persistent response Service anchor, not
@@ -823,6 +876,11 @@ pub(super) struct ResponseStreamBinding {
 impl Drop for ResponseStreamBinding {
     fn drop(&mut self) {
         self.response_flow_registration.set_active(false);
+        self.lane_tracker
+            .clear_response_service_handoff_drain_for_binding(
+                self.session_id,
+                self.binding_instance_id,
+            );
         let lane = *self
             .lane
             .get_mut()
@@ -835,6 +893,12 @@ impl Drop for ResponseStreamBinding {
             if response_stream_role_reserves_flow_load(entry.role) {
                 self.lane_tracker.detach(self.session_id, entry.key, lane);
             }
+            self.lane_tracker.clear_quic_capacity_calibration(
+                self.session_id,
+                self.binding_instance_id,
+                entry.key,
+                entry.path_instance_id,
+            );
         }
     }
 }
@@ -920,12 +984,11 @@ impl ResponseStreamBinding {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };
         let response_flow_registration =
-            ServerResponseFlowRegistration::new(lane_tracker.clone(), session_id);
+            ServerResponseFlowRegistration::new(lane_tracker.clone(), session_id, key, lane);
         lane_tracker.attach(session_id, key, lane);
         response_flow_registration.set_active(true);
         Arc::new(Self {
             session_id,
-            #[cfg(feature = "lab-diagnostics")]
             binding_instance_id: NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID
                 .fetch_add(1, Ordering::AcqRel),
             lane: Mutex::new(lane),
@@ -935,6 +998,11 @@ impl ResponseStreamBinding {
             next_output_incarnation: AtomicU64::new(2),
             response_model_generation: AtomicU64::new(0),
             owner_underlay_history: AtomicU8::new(response_owner_underlay_seen_bit(underlay)),
+            response_stream_open: AtomicBool::new(true),
+            response_service_handoff_open: AtomicBool::new(true),
+            response_service_handoff_drain_attempted: AtomicBool::new(false),
+            #[cfg(feature = "lab-diagnostics")]
+            response_service_handoff_diagnostic: Mutex::new(None),
             outputs: Mutex::new(ResponseStreamOutputs {
                 entries: vec![ResponseStreamOutputEntry {
                     key,
@@ -947,10 +1015,11 @@ impl ResponseStreamBinding {
                     product_queue_bytes: 0,
                     product_progress_rate_bps: None,
                     delivery_rate_bps: None,
+                    tcp_ack_clock_rate_bps: None,
+                    tcp_product_rate_evidence: None,
                     srtt_ms: None,
                     delivery_samples: 0,
                     owner_data_acked_bytes: 0,
-                    last_delivery_at: None,
                     local_path_metrics: None,
                     peer_path_metrics: None,
                 }],
@@ -1039,6 +1108,7 @@ impl ResponseStreamBinding {
         let mut previous_load_registered = false;
         let mut replaced_closed = false;
         let mut replaced_incarnation = None;
+        let mut replaced_path_instance_id = None;
         let existing_position = outputs.entries.iter().position(|entry| entry.key == key);
         if let Some(position) = existing_position {
             let entry = &mut outputs.entries[position];
@@ -1069,21 +1139,27 @@ impl ResponseStreamBinding {
                         response_stream_role_reserves_flow_load(previous_role);
                     entry.role = response_stream_live_role_update(entry.role, role);
                     let role_changed = entry.role != previous_role;
-                    let role_changed_incarnations = role_changed.then(|| {
+                    let response_state_invalidated =
+                        response_stream_role_change_invalidates_response_state(
+                            previous_role,
+                            entry.role,
+                        );
+                    let response_state_incarnations = response_state_invalidated.then(|| {
                         let previous = entry.incarnation;
                         let current = self.allocate_output_incarnation();
                         (previous, current)
                     });
-                    if role_changed {
-                        entry.incarnation = role_changed_incarnations
-                            .expect("role change allocates an output incarnation")
+                    if response_state_invalidated {
+                        entry.incarnation = response_state_incarnations
+                            .expect("response eligibility change allocates an incarnation")
                             .1;
                         entry.product_progress_rate_bps = None;
                         entry.delivery_rate_bps = None;
+                        entry.tcp_ack_clock_rate_bps = None;
+                        entry.tcp_product_rate_evidence = None;
                         entry.srtt_ms = None;
                         entry.delivery_samples = 0;
                         entry.owner_data_acked_bytes = 0;
-                        entry.last_delivery_at = None;
                         entry.local_path_metrics = None;
                         entry.peer_path_metrics = None;
                     }
@@ -1104,7 +1180,7 @@ impl ResponseStreamBinding {
                         self.sync_response_flow_activity(&outputs);
                     }
                     if let Some((previous_incarnation, current_incarnation)) =
-                        role_changed_incarnations
+                        response_state_incarnations
                     {
                         outputs
                             .ack_clock_calibrations
@@ -1141,8 +1217,9 @@ impl ResponseStreamBinding {
                     if !response_flow_was_active && response_flow_is_active {
                         self.sync_response_flow_activity(&outputs);
                     }
-                    if role_changed {
-                        // Publish the new output role and reset both Subflow
+                    if response_state_invalidated {
+                        // Crossing Repair changes response ownership
+                        // eligibility, so publish the role and reset Subflow
                         // identities at one outputs-lock linearization point.
                         self.reset_subflow_set_with_outputs(&mut outputs);
                     }
@@ -1171,6 +1248,7 @@ impl ResponseStreamBinding {
             if entry.commands.is_closed() {
                 previous_load_registered = response_stream_role_reserves_flow_load(entry.role);
                 replaced_incarnation = Some(entry.incarnation);
+                replaced_path_instance_id = Some(entry.path_instance_id);
                 entry.path_instance_id = path_instance_id;
                 entry.incarnation = self.allocate_output_incarnation();
                 entry.commands = commands;
@@ -1180,10 +1258,11 @@ impl ResponseStreamBinding {
                 entry.product_queue_bytes = 0;
                 entry.product_progress_rate_bps = None;
                 entry.delivery_rate_bps = None;
+                entry.tcp_ack_clock_rate_bps = None;
+                entry.tcp_product_rate_evidence = None;
                 entry.srtt_ms = None;
                 entry.delivery_samples = 0;
                 entry.owner_data_acked_bytes = 0;
-                entry.last_delivery_at = None;
                 entry.local_path_metrics = None;
                 entry.peer_path_metrics = None;
                 replaced_closed = true;
@@ -1221,10 +1300,11 @@ impl ResponseStreamBinding {
                 product_queue_bytes: 0,
                 product_progress_rate_bps: None,
                 delivery_rate_bps: None,
+                tcp_ack_clock_rate_bps: None,
+                tcp_product_rate_evidence: None,
                 srtt_ms: None,
                 delivery_samples: 0,
                 owner_data_acked_bytes: 0,
-                last_delivery_at: None,
                 local_path_metrics: None,
                 peer_path_metrics: None,
             }
@@ -1256,6 +1336,24 @@ impl ResponseStreamBinding {
                 outputs.active_ack_clock_calibration = None;
             }
             self.invalidate_path_flight_evidence(key, incarnation);
+        }
+        if let Some(replaced_path_instance_id) = replaced_path_instance_id {
+            // Output replacement retires this binding's queue, not the shared
+            // carrier instance. Only registry path-registration drop may reset
+            // an exact carrier's bounded attempt count.
+            self.lane_tracker.clear_quic_capacity_calibration(
+                self.session_id,
+                self.binding_instance_id,
+                key,
+                replaced_path_instance_id,
+            );
+            self.lane_tracker
+                .clear_response_service_handoff_drain_for_path(
+                    self.session_id,
+                    self.binding_instance_id,
+                    key,
+                    replaced_path_instance_id,
+                );
         }
         if replaced_closed && role != StreamOpenRole::Active {
             self.clear_ordered_data_owner_if(key);
@@ -1446,6 +1544,8 @@ impl ResponseStreamBinding {
             *current_lane = lane;
             self.lane_tracker
                 .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
+            self.response_flow_registration
+                .change_lane_if_present(previous_lane, lane);
             drop(outputs);
         }
         drop(current_lane);
@@ -1577,13 +1677,14 @@ impl ResponseStreamBinding {
             .map(|entry| {
                 (
                     entry.incarnation,
+                    entry.path_instance_id,
                     response_stream_role_reserves_flow_load(entry.role),
                 )
             });
         outputs
             .entries
             .retain(|entry| entry.key != key || !matches(entry));
-        if let Some((incarnation, load_registered)) = removed {
+        if let Some((incarnation, path_instance_id, load_registered)) = removed {
             if response_flow_was_active && !Self::response_flow_is_active(&outputs) {
                 self.sync_response_flow_activity(&outputs);
             }
@@ -1595,6 +1696,19 @@ impl ResponseStreamBinding {
             if load_registered {
                 self.lane_tracker.detach(self.session_id, key, lane);
             }
+            self.lane_tracker.clear_quic_capacity_calibration(
+                self.session_id,
+                self.binding_instance_id,
+                key,
+                path_instance_id,
+            );
+            self.lane_tracker
+                .clear_response_service_handoff_drain_for_path(
+                    self.session_id,
+                    self.binding_instance_id,
+                    key,
+                    path_instance_id,
+                );
             self.repair_ordered_data_owner_after_output_change(&outputs.entries);
             self.reset_subflow_set_with_outputs(&mut outputs);
             self.clear_request_active_owner_if(key);
@@ -1605,6 +1719,10 @@ impl ResponseStreamBinding {
     }
 
     pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
+        self.release_normalized_acked_ranges_at(ranges, Instant::now());
+    }
+
+    fn release_normalized_acked_ranges_at(&self, ranges: &[OffsetRange], now: Instant) {
         if ranges.is_empty() {
             return;
         }
@@ -1668,7 +1786,6 @@ impl ResponseStreamBinding {
             );
         }
 
-        let now = Instant::now();
         let mut changed = false;
         let mut path_samples =
             HashMap::<(CarrierPathKey, u64), (u64, u64, Instant, Instant)>::new();
@@ -1875,44 +1992,69 @@ impl ResponseStreamBinding {
                 .iter_mut()
                 .find(|entry| entry.key == key && entry.incarnation == output_incarnation)
             {
-                if let Some(sample) =
-                    PathRateSample::new(bytes, now.saturating_duration_since(first_sent_at))
-                {
-                    let sample_bps = sample.rate_bps();
-                    let carrier_app_limited = entry
-                        .local_path_metrics
-                        .is_some_and(|metrics| metrics.metrics.app_limited);
-                    // The terminal ACK stays calibration-owned, but a no-rate
-                    // tombstone must not freeze later ordinary TCP evidence.
-                    let tcp_calibration_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
-                        && (calibration_identity_active
-                            || calibration_update.is_some()
-                            || calibration_snapshot.is_some_and(|calibration| {
-                                calibration.calibrated_rate_bps.is_some()
-                                    || (!calibration.proven && !calibration.retired)
-                            }));
-                    if !tcp_calibration_owns_rate {
-                        entry.product_progress_rate_bps =
-                            Some(match entry.product_progress_rate_bps {
-                                Some(previous) if carrier_app_limited => previous.max(sample_bps),
-                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-                                None => sample_bps,
-                            });
-                        if entry.key.underlay == UnderlayProtocol::Tcp {
-                            entry.delivery_rate_bps = Some(match entry.delivery_rate_bps {
-                                Some(previous) if carrier_app_limited => previous.max(sample_bps),
-                                Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
-                                None => sample_bps,
-                            });
+                let udp_assignment_sample = (entry.key.underlay == UnderlayProtocol::Udp)
+                    .then(|| {
+                        PathRateSample::new(bytes, now.saturating_duration_since(first_sent_at))
+                    })
+                    .flatten();
+                // Flight timestamps mark scheduler assignment, not TCP kernel
+                // dispatch. The first exact ACK establishes the clock; later
+                // binding-local OwnerData bytes use continuous ACK wall time so
+                // callback compression cannot discard the preceding silence.
+                let tcp_ack_clock_sample = if entry.key.underlay == UnderlayProtocol::Tcp {
+                    let evidence = entry
+                        .tcp_product_rate_evidence
+                        .get_or_insert_with(|| ResponseAckClockRateEvidence::new(first_sent_at));
+                    let _ = evidence.observe_with_fresh_bytes(
+                        bytes,
+                        bytes,
+                        first_sent_at,
+                        last_sent_at,
+                        now,
+                    );
+                    evidence.goodput_sample()
+                } else {
+                    None
+                };
+                let carrier_app_limited = entry
+                    .local_path_metrics
+                    .is_some_and(|metrics| metrics.metrics.app_limited);
+                // The terminal ACK stays calibration-owned, but a no-rate
+                // tombstone must not freeze later ordinary TCP evidence.
+                let tcp_calibration_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
+                    && (calibration_identity_active
+                        || calibration_update.is_some()
+                        || calibration_snapshot.is_some_and(|calibration| {
+                            calibration.calibrated_rate_bps.is_some()
+                                || (!calibration.proven && !calibration.retired)
+                        }));
+                if !tcp_calibration_owns_rate {
+                    match (
+                        entry.key.underlay,
+                        tcp_ack_clock_sample,
+                        udp_assignment_sample,
+                    ) {
+                        (UnderlayProtocol::Tcp, Some(sample), _) => {
+                            // The sample already smooths a bounded byte/time
+                            // epoch. Averaging point rates would restore the ACK
+                            // compression bias this ratio removes.
+                            let rate_bps = sample.rate_bps();
+                            entry.tcp_ack_clock_rate_bps = Some(rate_bps);
+                            entry.product_progress_rate_bps = Some(rate_bps);
+                            entry.delivery_rate_bps = Some(rate_bps);
                         }
-                    }
-                    if entry.key.underlay == UnderlayProtocol::Tcp {
-                        let sample_rtt_ms =
-                            now.saturating_duration_since(first_sent_at).as_secs_f64() * 1000.0;
-                        entry.srtt_ms = Some(match entry.srtt_ms {
-                            Some(previous) => previous.mul_add(0.875, sample_rtt_ms * 0.125),
-                            None => sample_rtt_ms,
-                        });
+                        (UnderlayProtocol::Udp, _, Some(sample)) => {
+                            let sample_bps = sample.rate_bps();
+                            entry.product_progress_rate_bps =
+                                Some(match entry.product_progress_rate_bps {
+                                    Some(previous) if carrier_app_limited => {
+                                        previous.max(sample_bps)
+                                    }
+                                    Some(previous) => previous.mul_add(0.75, sample_bps * 0.25),
+                                    None => sample_bps,
+                                });
+                        }
+                        _ => {}
                     }
                 }
                 if entry.key.underlay == UnderlayProtocol::Tcp
@@ -1921,6 +2063,7 @@ impl ResponseStreamBinding {
                 {
                     entry.product_progress_rate_bps = Some(calibrated_rate_bps);
                     entry.delivery_rate_bps = Some(calibrated_rate_bps);
+                    entry.tcp_ack_clock_rate_bps = Some(calibrated_rate_bps);
                 }
             }
             if let Some((
@@ -2147,7 +2290,6 @@ impl ResponseStreamBinding {
             {
                 if hole.end <= ordering_update.contiguous_frontier {
                     entry.delivery_samples = entry.delivery_samples.saturating_add(1);
-                    entry.last_delivery_at = Some(now);
                     changed = true;
                 }
             }
@@ -2158,7 +2300,7 @@ impl ResponseStreamBinding {
             .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         if changed || ordering_update.changed {
-            self.graduate_bulk_proven_response_startup_owner();
+            self.graduate_completed_response_startup_owner();
             // ACK progress updates path evidence and ordering, but Subflow
             // admission credit is epoch state. Recreate it only on a semantic
             // reset or admission-envelope change, not passive membership growth.
@@ -2239,6 +2381,7 @@ impl ResponseStreamBinding {
 
     #[cfg(test)]
     pub(super) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
+        let lane = self.lane();
         let mut outputs = self
             .outputs
             .lock()
@@ -2250,16 +2393,27 @@ impl ResponseStreamBinding {
         if *lead != Some(key) {
             *lead = Some(key);
             self.reset_subflow_set_with_outputs(&mut outputs);
+            self.response_flow_registration
+                .set_service(Some((key, lane)));
             drop(lead);
             drop(outputs);
             self.notify_update();
         }
     }
 
+    #[cfg(test)]
     pub(super) fn commit_ordered_data_owner_for_target(
         &self,
         target: &ResponseSenderPathTarget,
     ) -> bool {
+        self.commit_ordered_data_owner_for_dispatch_target(&target.into())
+    }
+
+    pub(super) fn commit_ordered_data_owner_for_dispatch_target(
+        &self,
+        target: &ResponseDispatchTarget,
+    ) -> bool {
+        let lane = self.lane();
         let mut outputs = self
             .outputs
             .lock()
@@ -2277,6 +2431,9 @@ impl ResponseStreamBinding {
             .ordered_data_owner
             .lock()
             .expect("server reliable stream ordered data owner lock");
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return false;
+        }
         let changed = *lead != Some(target.key);
         if changed {
             *lead = Some(target.key);
@@ -2287,6 +2444,8 @@ impl ResponseStreamBinding {
                 outputs.active_ack_clock_calibration = None;
             }
             self.reset_subflow_set_with_outputs(&mut outputs);
+            self.response_flow_registration
+                .set_service(Some((target.key, lane)));
         }
         drop(lead);
         drop(outputs);
@@ -2301,9 +2460,12 @@ impl ResponseStreamBinding {
             .ordered_data_owner
             .lock()
             .expect("server reliable stream ordered data owner lock");
-        if *lead == Some(key) {
+        let changed = *lead == Some(key);
+        if changed {
             *lead = None;
+            self.response_flow_registration.set_service(None);
         }
+        drop(lead);
     }
 
     fn subflow_set_for(
@@ -2355,14 +2517,51 @@ impl ResponseStreamBinding {
         self.response_model_generation.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn should_emit_response_service_handoff_diagnostic(
+        &self,
+        model_generation: u64,
+        evaluation_signature: u64,
+        capacity_marker_signature: u64,
+        now: Instant,
+    ) -> bool {
+        const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+        let mut previous = self
+            .response_service_handoff_diagnostic
+            .lock()
+            .expect("response Service handoff diagnostic lock");
+        let should_emit = previous.is_none_or(|previous| {
+            previous.evaluation_signature != evaluation_signature
+                || previous.capacity_marker_signature != capacity_marker_signature
+                || (previous.model_generation != model_generation
+                    && now.saturating_duration_since(previous.emitted_at) >= REFRESH_INTERVAL)
+        });
+        if should_emit {
+            *previous = Some(ResponseServiceHandoffDiagnosticState {
+                model_generation,
+                evaluation_signature,
+                capacity_marker_signature,
+                emitted_at: now,
+            });
+        }
+        should_emit
+    }
+
     #[cfg(test)]
     pub(super) fn lane_generation(&self) -> u64 {
         self.lane_tracker.generation(self.session_id)
     }
 
+    #[cfg(test)]
     pub(super) fn lane_generation_and_active_response_flows(&self) -> (u64, u32) {
         self.lane_tracker
             .generation_and_active_response_flows(self.session_id)
+    }
+
+    pub(super) fn response_scheduling_snapshot(&self) -> ResponseSessionSchedulingSnapshot {
+        self.lane_tracker
+            .response_scheduling_snapshot(self.session_id)
     }
 
     #[cfg(test)]
@@ -2529,15 +2728,18 @@ impl ResponseStreamBinding {
         }
     }
 
-    fn graduate_bulk_proven_response_startup_owner(&self) -> bool {
-        let Some(owner) = self
+    fn graduate_completed_response_startup_owner(&self) -> bool {
+        let startup = self
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock")
             .set
             .as_ref()
-            .and_then(FlowSubflowSet::startup_owner_key)
-        else {
+            .and_then(|epoch| {
+                let owner = epoch.startup_owner_key()?;
+                Some((owner, epoch.startup_owner_sealed_sample_bytes(owner)))
+            });
+        let Some((owner, sealed_sample_bytes)) = startup else {
             return false;
         };
         let lane = self.lane();
@@ -2550,10 +2752,25 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock");
         let owner_position = outputs.entries.iter().position(|entry| {
-            entry.key == owner
-                && entry.role == StreamOpenRole::Validation
-                && !entry.commands.is_closed()
-                && server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits)
+            if entry.key != owner
+                || entry.role != StreamOpenRole::Validation
+                || entry.commands.is_closed()
+            {
+                return false;
+            }
+            match entry.key.underlay {
+                // Scheduler assignment is not a TCP send clock. Completing the
+                // finite startup sample proves ownership/reachability and opens
+                // calibration; only a later ACK-to-ACK window publishes rate.
+                UnderlayProtocol::Tcp => {
+                    sealed_sample_bytes.is_some_and(|bytes| entry.owner_data_acked_bytes >= bytes)
+                }
+                // QUIC capacity is carrier-scoped and cannot be inferred from
+                // product STREAM_ACK timing.
+                UnderlayProtocol::Udp => {
+                    server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits)
+                }
+            }
         });
         let Some(owner_position) = owner_position else {
             return false;
@@ -2689,9 +2906,14 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream ordered data owner lock");
         let live_lead = lead.is_some_and(|key| live_entries.iter().any(|entry| entry.key == key));
+        let cleared = !live_lead && lead.is_some();
         if !live_lead {
             *lead = None;
         }
+        if cleared {
+            self.response_flow_registration.set_service(None);
+        }
+        drop(lead);
     }
 
     #[cfg(test)]
@@ -2843,9 +3065,27 @@ impl ResponseStreamBinding {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn try_enqueue_owner_frame_for_target(
         &self,
         target: &ResponseSenderPathTarget,
+        frame: &Frame,
+        lane: FlowLane,
+        subflow_request: Option<ResponseSubflowAdmissionRequest>,
+        calibration_request: Option<ResponseAckClockCalibrationRequest>,
+    ) -> Result<Option<u64>, RuntimeError> {
+        self.try_enqueue_owner_frame_for_dispatch_target(
+            &target.into(),
+            frame,
+            lane,
+            subflow_request,
+            calibration_request,
+        )
+    }
+
+    pub(super) fn try_enqueue_owner_frame_for_dispatch_target(
+        &self,
+        target: &ResponseDispatchTarget,
         frame: &Frame,
         lane: FlowLane,
         subflow_request: Option<ResponseSubflowAdmissionRequest>,
@@ -2863,17 +3103,23 @@ impl ResponseStreamBinding {
 
     fn try_enqueue_owner_frame_for_target_inner(
         &self,
-        target: &ResponseSenderPathTarget,
+        target: &ResponseDispatchTarget,
         frame: &Frame,
         lane: FlowLane,
         subflow_request: Option<ResponseSubflowAdmissionRequest>,
         calibration_request: Option<ResponseAckClockCalibrationRequest>,
         after_subflow_reservation: impl FnOnce(),
     ) -> Result<Option<u64>, RuntimeError> {
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         let target_matches = |entry: &ResponseStreamOutputEntry| {
             entry.key == target.key
                 && entry.incarnation == target.incarnation
@@ -3117,10 +3363,16 @@ impl ResponseStreamBinding {
         frame: &Frame,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
         let target_matches = outputs.entries.iter().any(|entry| {
             entry.key == target.key
                 && entry.incarnation == target.incarnation
@@ -3419,35 +3671,54 @@ impl ResponseStreamBinding {
             .expect("server reliable stream request active owner lock");
         let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
         let now = Instant::now();
+        let response_scheduling = self.lane_tracker.response_path_scheduling_snapshots(
+            self.session_id,
+            outputs
+                .entries
+                .iter()
+                .map(|entry| (entry.key, entry.path_instance_id)),
+        );
         outputs
             .entries
             .iter()
-            .map(|entry| {
+            .zip(response_scheduling)
+            .map(|(entry, response_scheduling)| {
                 let command_pending_bytes = entry.commands.pending_bytes();
                 let calibration_identity = (entry.key, entry.incarnation);
                 let calibration = outputs
                     .ack_clock_calibrations
                     .get(&calibration_identity)
                     .copied();
-                let snapshot = server_bulk_output_snapshot_with_command_pending(
+                let response_snapshot = server_bulk_output_snapshot_with_scheduling(
                     entry,
-                    self.session_id,
                     lane,
-                    &self.lane_tracker,
                     self.mux_limits,
                     now,
                     command_pending_bytes,
+                    response_scheduling,
                 );
+                let snapshot = response_snapshot.path;
+                let is_active = Some(entry.key) == active_key;
+                let has_bulk_rate_evidence =
+                    server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits);
+                let has_service_feed_evidence = has_bulk_rate_evidence
+                    || (is_active
+                        && server_output_has_service_feed_evidence_with_limits(
+                            entry,
+                            self.mux_limits,
+                        ));
                 ResponseSenderPathTarget {
                     #[cfg(feature = "lab-diagnostics")]
                     session_id: self.session_id,
                     #[cfg(feature = "lab-diagnostics")]
                     binding_instance_id: self.binding_instance_id,
                     key: entry.key,
+                    path_instance_id: entry.path_instance_id,
                     incarnation: entry.incarnation,
                     commands: entry.commands.clone(),
                     attachment_role: entry.role,
                     snapshot,
+                    rate_scope: response_snapshot.rate_scope,
                     owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
                     command_pending_bytes,
                     eta_ms: server_bulk_output_eta_ms(
@@ -3458,13 +3729,14 @@ impl ResponseStreamBinding {
                         payload_bytes,
                         self.mux_limits,
                     ),
-                    is_active: Some(entry.key) == active_key,
+                    is_active,
                     is_request_active: Some(entry.key) == request_active_key,
                     has_sender_evidence: server_output_has_sender_evidence(entry),
-                    has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_with_limits(
-                        entry,
-                        self.mux_limits,
-                    ),
+                    has_service_feed_evidence,
+                    has_bulk_rate_evidence,
+                    quic_capacity_proof: server_output_quic_capacity_proof_marker(entry),
+                    quic_capacity_calibration_attempts: response_snapshot
+                        .quic_capacity_calibration_attempts,
                     ack_clock_calibration_eligible: calibration.is_some(),
                     ack_clock_calibration_proven: calibration
                         .is_some_and(|calibration| calibration.proven),
@@ -3519,7 +3791,6 @@ impl ResponseStreamBinding {
         entry.delivery_rate_bps = Some(100_000_000.0);
         entry.delivery_samples = 1;
         entry.owner_data_acked_bytes = reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
-        entry.last_delivery_at = Some(Instant::now());
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
     }
@@ -3543,7 +3814,6 @@ impl ResponseStreamBinding {
         entry.product_progress_rate_bps = Some(rate_bps.max(1.0));
         entry.delivery_rate_bps = Some(rate_bps.max(1.0));
         entry.srtt_ms = Some(srtt_ms.max(1.0));
-        entry.last_delivery_at = Some(Instant::now());
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
     }
@@ -3584,39 +3854,65 @@ impl ResponseStreamBinding {
     }
 
     pub(super) async fn close_stream(&self, stream_id: StreamId) {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .clone();
+        let outputs = {
+            let outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            self.response_stream_open.store(false, Ordering::Release);
+            outputs.entries.clone()
+        };
+        self.response_flow_registration.set_active(false);
+        self.lane_tracker
+            .clear_quic_capacity_calibration_for_binding(self.session_id, self.binding_instance_id);
+        self.lane_tracker
+            .clear_response_service_handoff_drain_for_binding(
+                self.session_id,
+                self.binding_instance_id,
+            );
         for entry in outputs {
             let _ = entry
                 .commands
                 .send_control(ReliablePathCommand::CloseStream(stream_id))
                 .await;
         }
-        if let Ok(mut lead) = self.ordered_data_owner.lock() {
-            *lead = None;
-        }
+        let mut lead = self
+            .ordered_data_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lead = None;
+        self.response_flow_registration.set_service(None);
     }
 
     pub(super) async fn close_stream_ordered(&self, stream_id: StreamId, lane: FlowLane) {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .clone();
+        let outputs = {
+            let outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            self.response_stream_open.store(false, Ordering::Release);
+            outputs.entries.clone()
+        };
+        self.response_flow_registration.set_active(false);
+        self.lane_tracker
+            .clear_quic_capacity_calibration_for_binding(self.session_id, self.binding_instance_id);
+        self.lane_tracker
+            .clear_response_service_handoff_drain_for_binding(
+                self.session_id,
+                self.binding_instance_id,
+            );
         for entry in outputs {
             let _ = entry
                 .commands
                 .send_stream_ordered_close(stream_id, lane)
                 .await;
         }
-        if let Ok(mut lead) = self.ordered_data_owner.lock() {
-            *lead = None;
-        }
+        let mut lead = self
+            .ordered_data_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lead = None;
+        self.response_flow_registration.set_service(None);
     }
 
     fn notify_update(&self) {
@@ -3632,6 +3928,41 @@ impl ResponseStreamBinding {
         source: ServerPathMetricsSource,
     ) {
         self.update_path_metrics_matching(key, Some(path_instance_id), metrics, source);
+    }
+
+    pub(super) fn install_quic_capacity_proof_for_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        metrics: PathMetrics,
+        candidate: QuicCapacityProofCandidate,
+    ) -> bool {
+        self.install_path_metrics_entry_matching(
+            key,
+            Some(path_instance_id),
+            ServerPathMetricsEntry {
+                metrics,
+                source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: Some(candidate),
+            },
+            false,
+        )
+        .0
+    }
+
+    pub(super) fn install_stored_path_metrics_for_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        path_metrics: ServerPathMetricsEntry,
+    ) {
+        self.install_path_metrics_entry_matching(key, Some(path_instance_id), path_metrics, true);
+    }
+
+    pub(super) fn notify_installed_path_metrics(&self) {
+        self.graduate_completed_response_startup_owner();
+        self.notify_update();
     }
 
     #[cfg(test)]
@@ -3651,34 +3982,18 @@ impl ResponseStreamBinding {
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
     ) {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let mut changed = false;
-        for entry in &mut outputs.entries {
-            if entry.key == key
-                && path_instance_id.is_none_or(|instance| entry.path_instance_id == instance)
-            {
-                let path_metrics = Some(ServerPathMetricsEntry { metrics, source });
-                match source {
-                    ServerPathMetricsSource::LocalSender => {
-                        entry.local_path_metrics = path_metrics;
-                    }
-                    ServerPathMetricsSource::PeerHint => {
-                        entry.peer_path_metrics = path_metrics;
-                    }
-                }
-                changed = true;
-            }
-        }
+        let (_, changed) = self.install_path_metrics_entry_matching(
+            key,
+            path_instance_id,
+            ServerPathMetricsEntry {
+                metrics,
+                source,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
+            },
+            true,
+        );
         if changed {
-            self.response_model_generation
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        drop(outputs);
-        if changed {
-            self.graduate_bulk_proven_response_startup_owner();
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_response_path_metrics_attached",
@@ -3699,9 +4014,74 @@ impl ResponseStreamBinding {
                     metrics.data_sample_bytes,
                 ),
             );
-            self.notify_update();
         }
     }
+
+    fn install_path_metrics_entry_matching(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: Option<ServerCarrierPathInstanceId>,
+        mut path_metrics: ServerPathMetricsEntry,
+        notify: bool,
+    ) -> (bool, bool) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let now = Instant::now();
+        let source = path_metrics.source;
+        let metrics = path_metrics.metrics;
+        let explicit_capacity_proof = path_metrics.capacity_proof.is_some();
+        let mut matched = false;
+        let mut changed = false;
+        for entry in &mut outputs.entries {
+            if entry.key == key
+                && path_instance_id.is_none_or(|instance| entry.path_instance_id == instance)
+            {
+                matched = true;
+                let current = match source {
+                    ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
+                    ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
+                };
+                if !explicit_capacity_proof {
+                    path_metrics.capacity_proof = current
+                        .and_then(|previous| previous.capacity_proof)
+                        .filter(|proof| proof.expires_at > now);
+                }
+                let scheduling_changed = current.is_none_or(|previous| {
+                    previous.source != source
+                        || !server_path_metrics_scheduling_equivalent(previous.metrics, metrics)
+                        || previous.capacity_proof != path_metrics.capacity_proof
+                });
+                *current = Some(path_metrics);
+                changed |= scheduling_changed;
+            }
+        }
+        if changed {
+            self.response_model_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        drop(outputs);
+        if changed && notify {
+            self.graduate_completed_response_startup_owner();
+            self.notify_update();
+        }
+        (matched, changed)
+    }
+}
+
+fn server_path_metrics_scheduling_equivalent(
+    mut left: PathMetrics,
+    mut right: PathMetrics,
+) -> bool {
+    // Epoch and age refresh evidence lifetime but do not change a ranking or
+    // admission input. Suppressing that no-op update avoids waking every bound
+    // response stream on each idle QUIC metrics poll.
+    left.metric_epoch = 0;
+    left.metric_age_us = 0;
+    right.metric_epoch = 0;
+    right.metric_age_us = 0;
+    left == right
 }
 
 fn response_stream_live_role_update(
@@ -3714,6 +4094,14 @@ fn response_stream_live_role_update(
         (StreamOpenRole::Repair, _) | (_, StreamOpenRole::Repair) => StreamOpenRole::Repair,
         _ => current,
     }
+}
+
+fn response_stream_role_change_invalidates_response_state(
+    previous: StreamOpenRole,
+    current: StreamOpenRole,
+) -> bool {
+    previous != current
+        && ((previous == StreamOpenRole::Repair) != (current == StreamOpenRole::Repair))
 }
 
 fn response_stream_role_reserves_flow_load(role: StreamOpenRole) -> bool {
@@ -3915,374 +4303,22 @@ pub(super) struct CarrierPathKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::runtime) struct ServerCarrierPathInstanceId(u64);
 
+impl ServerCarrierPathInstanceId {
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> ServerCarrierPathInstanceId {
     ServerCarrierPathInstanceId(NEXT_SERVER_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ServerPathLoadKey {
-    session_id: SessionId,
-    path: CarrierPathKey,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct ServerPathLaneLoad {
-    active_flows: u32,
-    active_latency_sensitive_flows: u32,
-}
-
-impl ServerPathLaneLoad {
-    fn add(&mut self, lane: FlowLane) {
-        self.active_flows = self.active_flows.saturating_add(1);
-        if reliable_relay_expects_interactive_response(lane) {
-            self.active_latency_sensitive_flows =
-                self.active_latency_sensitive_flows.saturating_add(1);
-        }
-    }
-
-    fn remove(&mut self, lane: FlowLane) {
-        self.active_flows = self.active_flows.saturating_sub(1);
-        if reliable_relay_expects_interactive_response(lane) {
-            self.active_latency_sensitive_flows =
-                self.active_latency_sensitive_flows.saturating_sub(1);
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-/// Per-session lane load snapshot for Active response-stream attachments.
-///
-/// The tracker informs scheduling and diagnostics only. It is not a path queue
-/// and cannot reorder product frames after sender-service admission.
-pub(super) struct ServerPathLaneTracker {
-    state: Mutex<ServerPathLaneTrackerState>,
-}
-
-#[derive(Debug, Default)]
-struct ServerPathLaneTrackerState {
-    loads: HashMap<ServerPathLoadKey, ServerPathLaneLoad>,
-    realtime_flows: HashMap<SessionId, u32>,
-    active_response_flows: HashMap<SessionId, u32>,
-    session_references: HashMap<SessionId, u32>,
-    session_generations: HashMap<SessionId, u64>,
-}
-
-impl ServerPathLaneTrackerState {
-    fn bump_generation(&mut self, session_id: SessionId) {
-        let generation = self.session_generations.entry(session_id).or_default();
-        *generation = generation.wrapping_add(1);
-    }
-
-    fn maybe_reclaim_session(&mut self, session_id: SessionId) {
-        let has_references = self
-            .session_references
-            .get(&session_id)
-            .is_some_and(|count| *count > 0);
-        let has_realtime = self
-            .realtime_flows
-            .get(&session_id)
-            .is_some_and(|count| *count > 0);
-        let has_active_response_flows = self
-            .active_response_flows
-            .get(&session_id)
-            .is_some_and(|count| *count > 0);
-        let has_loads = self.loads.keys().any(|key| key.session_id == session_id);
-        if !has_references && !has_realtime && !has_active_response_flows && !has_loads {
-            self.session_generations.remove(&session_id);
-        }
-    }
-}
-
-impl ServerPathLaneTracker {
-    fn attach_session(&self, session_id: SessionId) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let references = state.session_references.entry(session_id).or_default();
-        *references = references.saturating_add(1);
-    }
-
-    fn detach_session(&self, session_id: SessionId) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        if let Some(references) = state.session_references.get_mut(&session_id) {
-            *references = references.saturating_sub(1);
-            if *references == 0 {
-                state.session_references.remove(&session_id);
-            }
-        }
-        state.maybe_reclaim_session(session_id);
-    }
-
-    #[cfg(test)]
-    fn generation(&self, session_id: SessionId) -> u64 {
-        self.state
-            .lock()
-            .expect("server path lane tracker lock")
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn generation_and_active_response_flows(&self, session_id: SessionId) -> (u64, u32) {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        let active_response_flows = state
-            .active_response_flows
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        (generation, active_response_flows)
-    }
-
-    fn with_matching_generation<R>(
-        &self,
-        session_id: SessionId,
-        expected_generation: u64,
-        apply: impl FnOnce() -> R,
-    ) -> Option<R> {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        if generation != expected_generation {
-            return None;
-        }
-        let result = apply();
-        drop(state);
-        Some(result)
-    }
-
-    fn with_matching_generation_and_min_active_response_flows<R>(
-        &self,
-        session_id: SessionId,
-        expected_generation: u64,
-        minimum_active_response_flows: u32,
-        apply: impl FnOnce() -> R,
-    ) -> Option<R> {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        let active_response_flows = state
-            .active_response_flows
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        if generation != expected_generation
-            || active_response_flows < minimum_active_response_flows
-        {
-            return None;
-        }
-        let result = apply();
-        drop(state);
-        Some(result)
-    }
-
-    fn attach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        state
-            .loads
-            .entry(ServerPathLoadKey { session_id, path })
-            .or_default()
-            .add(lane);
-        state.bump_generation(session_id);
-    }
-
-    fn detach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let key = ServerPathLoadKey { session_id, path };
-        let changed = if let Some(load) = state.loads.get_mut(&key) {
-            load.remove(lane);
-            if load.active_flows == 0 {
-                state.loads.remove(&key);
-            }
-            true
-        } else {
-            false
-        };
-        if changed {
-            state.bump_generation(session_id);
-        }
-        state.maybe_reclaim_session(session_id);
-    }
-
-    fn change_lanes(
-        &self,
-        session_id: SessionId,
-        paths: &[CarrierPathKey],
-        from: FlowLane,
-        to: FlowLane,
-    ) {
-        if from == to {
-            return;
-        }
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let mut changed = false;
-        for path in paths {
-            if let Some(load) = state.loads.get_mut(&ServerPathLoadKey {
-                session_id,
-                path: *path,
-            }) {
-                load.remove(from);
-                load.add(to);
-                changed = true;
-            }
-        }
-        if changed {
-            state.bump_generation(session_id);
-        }
-        state.maybe_reclaim_session(session_id);
-    }
-
-    fn attach_realtime_flow(&self, session_id: SessionId) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let count = state.realtime_flows.entry(session_id).or_default();
-        *count = count.saturating_add(1);
-        state.bump_generation(session_id);
-    }
-
-    fn set_response_flow_active(&self, session_id: SessionId, active: bool) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        if active {
-            let count = state.active_response_flows.entry(session_id).or_default();
-            *count = count.saturating_add(1);
-            state.bump_generation(session_id);
-            return;
-        }
-
-        let changed = if let Some(count) = state.active_response_flows.get_mut(&session_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.active_response_flows.remove(&session_id);
-            }
-            true
-        } else {
-            false
-        };
-        if changed {
-            state.bump_generation(session_id);
-        }
-        state.maybe_reclaim_session(session_id);
-    }
-
-    fn detach_realtime_flow(&self, session_id: SessionId) {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let changed = if let Some(count) = state.realtime_flows.get_mut(&session_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.realtime_flows.remove(&session_id);
-            }
-            true
-        } else {
-            false
-        };
-        if changed {
-            state.bump_generation(session_id);
-        }
-        state.maybe_reclaim_session(session_id);
-    }
-
-    fn snapshot(&self, session_id: SessionId, path: CarrierPathKey) -> ServerPathLaneLoad {
-        self.state
-            .lock()
-            .expect("server path lane tracker lock")
-            .loads
-            .get(&ServerPathLoadKey { session_id, path })
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn session_snapshot(&self, session_id: SessionId) -> ServerPathLaneLoad {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let mut total = state
-            .loads
-            .iter()
-            .filter(|(key, _)| key.session_id == session_id)
-            .fold(ServerPathLaneLoad::default(), |mut total, (_, load)| {
-                total.active_flows = total.active_flows.saturating_add(load.active_flows);
-                total.active_latency_sensitive_flows = total
-                    .active_latency_sensitive_flows
-                    .saturating_add(load.active_latency_sensitive_flows);
-                total
-            });
-        let realtime_flows = state.realtime_flows.get(&session_id).copied().unwrap_or(0);
-        total.active_flows = total.active_flows.saturating_add(realtime_flows);
-        total.active_latency_sensitive_flows = total
-            .active_latency_sensitive_flows
-            .saturating_add(realtime_flows);
-        total
-    }
-}
-
-struct ServerResponseFlowRegistration {
-    lane_tracker: Arc<ServerPathLaneTracker>,
-    session_id: SessionId,
-    active: Mutex<bool>,
-}
-
-impl ServerResponseFlowRegistration {
-    fn new(lane_tracker: Arc<ServerPathLaneTracker>, session_id: SessionId) -> Self {
-        lane_tracker.attach_session(session_id);
-        Self {
-            lane_tracker,
-            session_id,
-            active: Mutex::new(false),
-        }
-    }
-
-    fn set_active(&self, active: bool) {
-        let mut current = self
-            .active
-            .lock()
-            .expect("server response flow registration lock");
-        if *current == active {
-            return;
-        }
-        self.lane_tracker
-            .set_response_flow_active(self.session_id, active);
-        *current = active;
-    }
-}
-
-impl Drop for ServerResponseFlowRegistration {
-    fn drop(&mut self) {
-        self.set_active(false);
-        self.lane_tracker.detach_session(self.session_id);
-    }
-}
-
-pub(super) struct ServerRealtimeFlowRegistration {
-    lane_tracker: Arc<ServerPathLaneTracker>,
-    session_id: SessionId,
-}
-
-impl ServerRealtimeFlowRegistration {
-    fn new(lane_tracker: Arc<ServerPathLaneTracker>, session_id: SessionId) -> Self {
-        lane_tracker.attach_realtime_flow(session_id);
-        Self {
-            lane_tracker,
-            session_id,
-        }
-    }
-}
-
-impl Drop for ServerRealtimeFlowRegistration {
-    fn drop(&mut self) {
-        self.lane_tracker.detach_realtime_flow(self.session_id);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::bulk_admission::{
+        ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
         bulk_service_feed_reservoir_payload_bytes,
         reliable_relay_source_staging_owner_tail_headroom,
     };
@@ -4354,7 +4390,1591 @@ mod tests {
         entry.delivery_rate_bps = Some(100_000_000.0);
         entry.delivery_samples = 1;
         entry.owner_data_acked_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
-        entry.last_delivery_at = Some(Instant::now());
+    }
+
+    fn mark_test_quic_output_carrier_bulk_proven(
+        entry: &mut ResponseStreamOutputEntry,
+        mux_limits: MuxLimits,
+    ) {
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+        entry.local_path_metrics = Some(ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::LocalSender,
+            recorded_at: Instant::now(),
+            capacity_proof: None,
+            metrics: PathMetrics {
+                path_id: entry.key.path_id,
+                underlay: UnderlayProtocol::Udp,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: 1,
+                metric_age_us: 0,
+                min_rtt_us: 10_000,
+                srtt_us: 12_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 500_000_000,
+                pacing_rate_bps: 500_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: sample_bytes,
+                inflight_hi_bytes: sample_bytes,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                data_sample_bytes: sample_bytes,
+            },
+        });
+    }
+
+    fn test_quic_capacity_proof(
+        mux_limits: MuxLimits,
+        token: u64,
+        proof_validity: Duration,
+    ) -> QuicCapacityProofCandidate {
+        let proof_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+        let accounting_slack_bytes = (PATH_OPEN_SCORE_BYTES as u64).min(proof_bytes / 8);
+        let proof_elapsed = Duration::from_millis(2);
+        let accepted_at = Instant::now();
+        QuicCapacityProofCandidate {
+            token,
+            train_bytes: proof_bytes,
+            sample_floor_bytes: proof_bytes,
+            accounting_slack_bytes,
+            warmup_bytes: 0,
+            required_proof_bytes: proof_bytes - accounting_slack_bytes,
+            written_bytes: proof_bytes,
+            written_data_frame_count: 1,
+            receipt_confirmed: true,
+            received_bytes: proof_bytes,
+            proof_elapsed,
+            rate_bps: quic_capacity_receipt_rate_bps(proof_bytes, proof_elapsed)
+                .expect("test receipt rate"),
+            accepted_at,
+            expires_at: accepted_at + proof_validity,
+            proof_validity,
+        }
+    }
+
+    fn mark_test_quic_output_receipt_bulk_proven(
+        entry: &mut ResponseStreamOutputEntry,
+        mux_limits: MuxLimits,
+        token: u64,
+        proof_validity: Duration,
+    ) -> QuicCapacityProofCandidate {
+        mark_test_quic_output_carrier_bulk_proven(entry, mux_limits);
+        let proof = test_quic_capacity_proof(mux_limits, token, proof_validity);
+        let path_metrics = entry
+            .local_path_metrics
+            .as_mut()
+            .expect("test QUIC metrics");
+        // Keep receipt proof as the only bulk authority so expiry is observable.
+        path_metrics.metrics.app_limited = true;
+        path_metrics.metrics.has_ack_derived_data_sample = false;
+        path_metrics.metrics.confidence_ppm = 0;
+        path_metrics.metrics.data_sample_count = 0;
+        path_metrics.metrics.data_sample_bytes = 0;
+        path_metrics.capacity_proof = Some(proof);
+        proof
+    }
+
+    #[test]
+    fn quic_capacity_calibration_uses_carrier_bytes_without_product_flight() {
+        let mux_limits = MuxLimits::default();
+        let session_id = SessionId(510);
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(2),
+            second_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker,
+        );
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            candidate.underlay,
+            candidate.path_id,
+            candidate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            mux_limits.max_payload_bytes,
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+
+        let (planner_generation, _) = binding.subflow_state_snapshot();
+        let scheduling = binding.response_scheduling_snapshot();
+        let model_generation = binding.response_model_generation();
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, 64 * 1024)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("UDP Validation target");
+        let train_bytes = mux_limits
+            .max_payload_bytes
+            .saturating_add(PATH_OPEN_SCORE_BYTES);
+        let sample_floor_bytes = train_bytes as u64;
+        let accounting_slack_bytes = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
+        let required_proof_bytes = sample_floor_bytes - accounting_slack_bytes;
+        assert!(binding.try_start_quic_capacity_calibration(
+            &target,
+            ResponseQuicCapacityCalibrationRequest {
+                expected_planner_generation: planner_generation,
+                expected_lane_generation: scheduling.generation,
+                expected_model_generation: model_generation,
+                target: candidate,
+                target_path_instance_id: target.path_instance_id,
+                target_incarnation: target.incarnation,
+                target_pending_bytes: target.command_pending_bytes,
+                train_bytes,
+                sample_floor_bytes,
+                accounting_slack_bytes,
+                fresh_strict_window_bytes: required_proof_bytes,
+                carrier_window_bytes: 0,
+                lease: Duration::from_secs(1),
+                proof_validity: Duration::from_secs(3),
+            },
+        ));
+        let probe = match try_recv_reliable_path_command(&mut candidate_receivers)
+            .expect("capacity probe command")
+        {
+            ReliablePathCommand::SendQuicCapacityProbe(probe) => probe,
+            _ => panic!("expected typed QUIC capacity probe"),
+        };
+        assert_ne!(probe.calibration_id, 0);
+        assert_eq!(probe.path_id, candidate.path_id);
+        assert_eq!(probe.train_payload_bytes, train_bytes as u64);
+        assert_eq!(probe.sample_floor_bytes, sample_floor_bytes);
+        assert_eq!(probe.warmup_carrier_bytes, 0);
+        assert_eq!(probe.required_timed_carrier_bytes, required_proof_bytes);
+        assert!(probe.expires_at > Instant::now());
+        assert!(
+            binding
+                .flights
+                .lock()
+                .expect("test response flight lock")
+                .is_empty(),
+            "carrier capacity bytes must not enter product ownership"
+        );
+        assert_eq!(
+            binding.ordered_data_owner(),
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            })
+        );
+        assert!(
+            binding
+                .response_scheduling_snapshot()
+                .quic_capacity_calibration_reserved
+        );
+        let generic_bulk_metrics = {
+            let mut entry = binding
+                .outputs
+                .lock()
+                .expect("test response outputs lock")
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("UDP capacity candidate")
+                .clone();
+            mark_test_quic_output_carrier_bulk_proven(&mut entry, mux_limits);
+            entry
+                .local_path_metrics
+                .expect("generic local bulk metrics")
+                .metrics
+        };
+        binding.update_path_metrics(
+            candidate,
+            generic_bulk_metrics,
+            ServerPathMetricsSource::LocalSender,
+        );
+        assert!(
+            binding
+                .response_scheduling_snapshot()
+                .quic_capacity_calibration_reserved,
+            "generic path metrics cannot complete a token-owned capacity train"
+        );
+    }
+
+    #[test]
+    fn generic_metrics_preserve_but_do_not_extend_fixed_capacity_proof_deadline() {
+        let mux_limits = MuxLimits::default();
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits(
+            SessionId(521),
+            UnderlayProtocol::Udp,
+            PathId(6),
+            commands,
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        let mut output = first_output_entry(&binding);
+        mark_test_quic_output_carrier_bulk_proven(&mut output, mux_limits);
+        let metrics = output
+            .local_path_metrics
+            .expect("test QUIC metrics")
+            .metrics;
+        let accepted_at = Instant::now();
+        let expires_at = accepted_at + Duration::from_millis(20);
+        let proof_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+        let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(proof_bytes / 8);
+        let required_proof_bytes = proof_bytes - accounting_slack;
+        let proof_elapsed = Duration::from_millis(10);
+        let proof = QuicCapacityProofCandidate {
+            token: 77,
+            train_bytes: proof_bytes,
+            sample_floor_bytes: proof_bytes,
+            accounting_slack_bytes: accounting_slack,
+            warmup_bytes: 0,
+            required_proof_bytes,
+            written_bytes: proof_bytes,
+            written_data_frame_count: RELIABLE_INITIAL_WINDOW_PACKETS as u64,
+            receipt_confirmed: true,
+            received_bytes: proof_bytes,
+            proof_elapsed,
+            rate_bps: quic_capacity_receipt_rate_bps(proof_bytes, proof_elapsed)
+                .expect("valid receipt rate"),
+            accepted_at,
+            expires_at,
+            proof_validity: Duration::from_millis(20),
+        };
+        assert!(binding.install_quic_capacity_proof_for_instance(
+            output.key,
+            output.path_instance_id,
+            metrics,
+            proof,
+        ));
+        binding.update_path_metrics(
+            output.key,
+            PathMetrics {
+                delivery_rate_bps: metrics.delivery_rate_bps / 2,
+                ..metrics
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        assert_eq!(
+            first_output_entry(&binding)
+                .local_path_metrics
+                .and_then(|entry| entry.capacity_proof)
+                .map(|proof| proof.expires_at),
+            Some(expires_at)
+        );
+
+        std::thread::sleep(Duration::from_millis(25));
+        binding.update_path_metrics(
+            output.key,
+            PathMetrics {
+                delivery_rate_bps: metrics.delivery_rate_bps / 3,
+                ..metrics
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        assert!(
+            first_output_entry(&binding)
+                .local_path_metrics
+                .is_some_and(|entry| entry.capacity_proof.is_none()),
+            "an expired fixed proof cannot be resurrected by a generic refresh"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_lease_deadline_is_created_after_admission_and_failure_propagates() {
+        let mux_limits = MuxLimits::default();
+        let session_id = SessionId(519);
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(2),
+            second_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker,
+        );
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+        let candidate_queue = candidate_commands.clone();
+        binding.attach(
+            candidate.underlay,
+            candidate.path_id,
+            candidate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            mux_limits.max_payload_bytes,
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+
+        let (planner_generation, _) = binding.subflow_state_snapshot();
+        let scheduling = binding.response_scheduling_snapshot();
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, 64 * 1024)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("UDP Validation target");
+        let pending_before_train = candidate_queue.pending_bytes();
+        let train_bytes = mux_limits.max_payload_bytes / 2;
+        let sample_floor_bytes = train_bytes as u64;
+        let accounting_slack_bytes = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
+        let required_proof_bytes = sample_floor_bytes - accounting_slack_bytes;
+        let mut deadline_observed_admitted_train = false;
+        assert!(!binding.try_start_quic_capacity_calibration_with_lease(
+            &target,
+            ResponseQuicCapacityCalibrationRequest {
+                expected_planner_generation: planner_generation,
+                expected_lane_generation: scheduling.generation,
+                expected_model_generation: binding.response_model_generation(),
+                target: candidate,
+                target_path_instance_id: target.path_instance_id,
+                target_incarnation: target.incarnation,
+                target_pending_bytes: target.command_pending_bytes,
+                train_bytes,
+                sample_floor_bytes,
+                accounting_slack_bytes,
+                fresh_strict_window_bytes: required_proof_bytes,
+                carrier_window_bytes: 0,
+                lease: Duration::from_secs(1),
+                proof_validity: Duration::from_secs(3),
+            },
+            |_| {
+                deadline_observed_admitted_train =
+                    candidate_queue.pending_bytes() > pending_before_train;
+                Duration::ZERO
+            },
+        ));
+        assert!(deadline_observed_admitted_train);
+        let after_failed_commit = binding.response_scheduling_snapshot();
+        assert!(!after_failed_commit.quic_capacity_calibration_reserved);
+        assert_eq!(
+            after_failed_commit.quic_capacity_calibration_spent_bytes, train_bytes as u64,
+            "an admitted train remains charged even when its lease cannot commit"
+        );
+        assert_eq!(
+            binding
+                .lane_tracker
+                .response_path_scheduling_snapshot(session_id, candidate, target.path_instance_id,)
+                .quic_capacity_calibration_attempts,
+            1
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendQuicCapacityProbe(_))
+        ));
+    }
+
+    #[test]
+    fn quic_capacity_reservation_expires_and_completion_releases_probe_slot() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(510);
+        let path = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(9),
+        };
+        let binding_instance_id = 77;
+        let path_instance_id = next_server_carrier_path_instance_id();
+        let train_bytes = 100;
+        let session_byte_limit = 1_000;
+        tracker.attach_session(session_id);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+
+        let first_generation = tracker.generation(session_id);
+        assert!(tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            first_generation,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            train_bytes,
+            session_byte_limit,
+            1,
+        ));
+        tracker.clear_quic_capacity_calibration(
+            session_id,
+            binding_instance_id + 1,
+            path,
+            path_instance_id,
+        );
+        assert!(
+            tracker
+                .response_scheduling_snapshot(session_id)
+                .quic_capacity_calibration_reserved,
+            "an unrelated binding on the shared carrier path cannot clear the lease"
+        );
+        tracker
+            .state
+            .lock()
+            .expect("test lane tracker lock")
+            .quic_capacity_calibrations
+            .get_mut(&session_id)
+            .expect("first reservation")
+            .phase = ServerQuicCapacityCalibrationPhase::Active {
+            expires_at: Instant::now() - Duration::from_millis(1),
+        };
+        let expired = tracker.response_scheduling_snapshot(session_id);
+        assert!(!expired.quic_capacity_calibration_reserved);
+
+        assert!(tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            expired.generation,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            train_bytes,
+            session_byte_limit,
+            2,
+        ));
+        assert!(tracker.commit_test_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            Duration::from_secs(1),
+            2,
+        ));
+        assert!(tracker.complete_test_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+        ));
+        let completed = tracker.response_scheduling_snapshot(session_id);
+        assert!(
+            !completed.quic_capacity_calibration_reserved,
+            "measured evidence releases serialization for a different candidate"
+        );
+
+        tracker.clear_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+        );
+        let cleared = tracker.response_scheduling_snapshot(session_id);
+        assert!(
+            !tracker.try_reserve_test_quic_capacity_calibration(
+                session_id,
+                cleared.generation,
+                binding_instance_id,
+                path,
+                path_instance_id,
+                train_bytes,
+                session_byte_limit,
+                3,
+            ),
+            "completion releases the slot but not the exact path's two-attempt budget"
+        );
+        let alternate_path_instance_id = next_server_carrier_path_instance_id();
+        assert!(tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            cleared.generation,
+            binding_instance_id,
+            path,
+            alternate_path_instance_id,
+            train_bytes,
+            session_byte_limit,
+            4,
+        ));
+        let alternate = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            alternate.quic_capacity_calibration_spent_bytes,
+            3 * train_bytes
+        );
+    }
+
+    #[test]
+    fn quic_capacity_attempts_are_path_instance_scoped_but_session_bytes_are_shared() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(518);
+        let path = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(9),
+        };
+        let path_instance_id = next_server_carrier_path_instance_id();
+        let replacement_path_instance_id = next_server_carrier_path_instance_id();
+        let session_byte_limit = 250;
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+
+        for (binding_instance_id, token) in [(71, 1), (72, 2)] {
+            assert!(tracker.try_reserve_test_quic_capacity_calibration(
+                session_id,
+                tracker.generation(session_id),
+                binding_instance_id,
+                path,
+                path_instance_id,
+                100,
+                session_byte_limit,
+                token,
+            ));
+            assert!(tracker.commit_test_quic_capacity_calibration(
+                session_id,
+                binding_instance_id,
+                path,
+                path_instance_id,
+                Duration::from_secs(1),
+                token,
+            ));
+            assert!(tracker.complete_test_quic_capacity_calibration(
+                session_id,
+                binding_instance_id,
+                path,
+                path_instance_id,
+            ));
+        }
+
+        let shared_path =
+            tracker.response_path_scheduling_snapshot(session_id, path, path_instance_id);
+        assert_eq!(shared_path.quic_capacity_calibration_attempts, 2);
+        let exhausted_generation = tracker.generation(session_id);
+        assert!(!tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            exhausted_generation,
+            73,
+            path,
+            path_instance_id,
+            1,
+            session_byte_limit,
+            3,
+        ));
+
+        let replacement = tracker.response_path_scheduling_snapshot(
+            session_id,
+            path,
+            replacement_path_instance_id,
+        );
+        assert_eq!(replacement.quic_capacity_calibration_attempts, 0);
+        let before_budget_rejection = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            before_budget_rejection.quic_capacity_calibration_spent_bytes,
+            200
+        );
+        assert!(!before_budget_rejection.quic_capacity_calibration_reserved);
+        assert!(!tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            before_budget_rejection.generation,
+            73,
+            path,
+            replacement_path_instance_id,
+            51,
+            session_byte_limit,
+            4,
+        ));
+
+        let after_budget_rejection = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            after_budget_rejection.generation,
+            before_budget_rejection.generation
+        );
+        assert_eq!(
+            after_budget_rejection.quic_capacity_calibration_spent_bytes,
+            before_budget_rejection.quic_capacity_calibration_spent_bytes
+        );
+        assert!(!after_budget_rejection.quic_capacity_calibration_reserved);
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, path, replacement_path_instance_id,)
+                .quic_capacity_calibration_attempts,
+            0,
+            "a byte-budget rejection must not consume the replacement path's first attempt"
+        );
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, path, path_instance_id)
+                .quic_capacity_calibration_attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn quic_capacity_retirement_bounds_flapping_attempt_keys_without_refunding_spend() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(520);
+        let path = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(9),
+        };
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+
+        for token in 1..=32 {
+            let path_instance_id = next_server_carrier_path_instance_id();
+            assert!(tracker.try_reserve_test_quic_capacity_calibration(
+                session_id,
+                tracker.generation(session_id),
+                71,
+                path,
+                path_instance_id,
+                10,
+                1_000,
+                token,
+            ));
+            assert!(tracker.commit_test_quic_capacity_calibration(
+                session_id,
+                71,
+                path,
+                path_instance_id,
+                Duration::from_secs(1),
+                token,
+            ));
+            if token < 32 {
+                assert!(tracker.complete_test_quic_capacity_calibration(
+                    session_id,
+                    71,
+                    path,
+                    path_instance_id,
+                ));
+            }
+            assert_eq!(
+                tracker
+                    .response_path_scheduling_snapshot(session_id, path, path_instance_id)
+                    .quic_capacity_calibration_attempts,
+                1
+            );
+            tracker.retire_quic_capacity_calibration_path_instance(
+                session_id,
+                path,
+                path_instance_id,
+            );
+            assert!(
+                !tracker
+                    .response_scheduling_snapshot(session_id)
+                    .quic_capacity_calibration_reserved
+            );
+            assert_eq!(
+                tracker
+                    .response_path_scheduling_snapshot(session_id, path, path_instance_id)
+                    .quic_capacity_calibration_attempts,
+                0
+            );
+        }
+
+        let state = tracker.state.lock().expect("test lane tracker lock");
+        assert!(
+            state
+                .quic_capacity_calibration_attempts
+                .keys()
+                .all(|key| key.session_id != session_id)
+        );
+        assert_eq!(
+            state.quic_capacity_calibration_bytes.get(&session_id),
+            Some(&320),
+            "carrier-instance retirement cannot refill the session envelope"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_replacement_only_resets_a_distinct_retired_instance() {
+        let mux_limits = MuxLimits::default();
+        let session_id = SessionId(521);
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(2),
+            second_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let old_instance = next_server_carrier_path_instance_id();
+        let (old_commands, old_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach_with_path_instance(
+                candidate.underlay,
+                candidate.path_id,
+                old_instance,
+                old_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                mux_limits.max_payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            tracker.generation(session_id),
+            binding.binding_instance_id,
+            candidate,
+            old_instance,
+            10,
+            100,
+            1,
+        ));
+        assert!(tracker.commit_test_quic_capacity_calibration(
+            session_id,
+            binding.binding_instance_id,
+            candidate,
+            old_instance,
+            Duration::from_secs(1),
+            1,
+        ));
+        drop(old_receivers);
+
+        let (same_instance_commands, same_instance_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach_with_path_instance(
+                candidate.underlay,
+                candidate.path_id,
+                old_instance,
+                same_instance_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                mux_limits.max_payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::ReplacedClosedOutput
+        );
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, candidate, old_instance)
+                .quic_capacity_calibration_attempts,
+            1,
+            "reopening commands for the same carrier instance cannot reset its allowance"
+        );
+        assert!(
+            !tracker
+                .response_scheduling_snapshot(session_id)
+                .quic_capacity_calibration_reserved,
+            "replacing a dead command queue must release its active serialization lease"
+        );
+        drop(same_instance_receivers);
+
+        let replacement_instance = next_server_carrier_path_instance_id();
+        let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach_with_path_instance(
+                candidate.underlay,
+                candidate.path_id,
+                replacement_instance,
+                replacement_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                mux_limits.max_payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::ReplacedClosedOutput
+        );
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, candidate, old_instance)
+                .quic_capacity_calibration_attempts,
+            1,
+            "binding replacement cannot retire a carrier shared by other streams"
+        );
+        tracker.retire_quic_capacity_calibration_path_instance(session_id, candidate, old_instance);
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, candidate, old_instance)
+                .quic_capacity_calibration_attempts,
+            0,
+            "exact carrier retirement releases its instance-scoped attempt key"
+        );
+        let scheduling = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(scheduling.quic_capacity_calibration_spent_bytes, 10);
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, candidate, replacement_instance)
+                .quic_capacity_calibration_attempts,
+            0
+        );
+    }
+
+    #[test]
+    fn quic_capacity_rollback_is_provisional_token_exact_and_reclaim_clears_ledgers() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(512);
+        let path = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(7),
+        };
+        let path_instance_id = next_server_carrier_path_instance_id();
+        let binding_instance_id = 41;
+        tracker.attach_session(session_id);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+
+        let generation = tracker.generation(session_id);
+        assert!(tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            generation,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            100,
+            1_000,
+            10,
+        ));
+        tracker.rollback_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            9,
+        );
+        let stale_rollback = tracker.response_scheduling_snapshot(session_id);
+        assert!(stale_rollback.quic_capacity_calibration_reserved);
+        assert_eq!(stale_rollback.quic_capacity_calibration_spent_bytes, 100);
+
+        tracker.rollback_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            10,
+        );
+        let rolled_back = tracker.response_scheduling_snapshot(session_id);
+        assert!(!rolled_back.quic_capacity_calibration_reserved);
+        assert_eq!(rolled_back.quic_capacity_calibration_spent_bytes, 0);
+        assert_eq!(
+            tracker
+                .response_path_scheduling_snapshot(session_id, path, path_instance_id)
+                .quic_capacity_calibration_attempts,
+            0
+        );
+
+        assert!(tracker.try_reserve_test_quic_capacity_calibration(
+            session_id,
+            rolled_back.generation,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            100,
+            1_000,
+            11,
+        ));
+        assert!(tracker.commit_test_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            Duration::from_secs(1),
+            11,
+        ));
+        tracker.rollback_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            11,
+        );
+        let admitted = tracker.response_scheduling_snapshot(session_id);
+        assert!(admitted.quic_capacity_calibration_reserved);
+        assert_eq!(admitted.quic_capacity_calibration_spent_bytes, 100);
+        assert!(tracker.complete_test_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+        ));
+        assert_eq!(
+            tracker
+                .response_scheduling_snapshot(session_id)
+                .quic_capacity_calibration_spent_bytes,
+            100,
+            "admitted carrier bytes remain charged after proof"
+        );
+
+        tracker.set_response_flow_active(session_id, false);
+        tracker.set_response_flow_active(session_id, false);
+        tracker.detach_session(session_id);
+        let state = tracker.state.lock().expect("test lane tracker lock");
+        assert!(
+            !state
+                .quic_capacity_calibration_bytes
+                .contains_key(&session_id)
+        );
+        assert!(
+            state
+                .quic_capacity_calibration_attempts
+                .keys()
+                .all(|key| key.session_id != session_id)
+        );
+    }
+
+    #[test]
+    fn response_service_handoff_drain_is_session_serialized() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(513);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let service_instance = next_server_carrier_path_instance_id();
+        let target_instance = next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+
+        let generation = tracker.generation(session_id);
+        assert!(tracker.try_reserve_response_service_handoff_drain(
+            session_id,
+            generation,
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            None,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        let reserved = tracker.response_scheduling_snapshot(session_id);
+        assert!(!tracker.try_reserve_response_service_handoff_drain(
+            session_id,
+            reserved.generation,
+            2,
+            service,
+            service_instance,
+            11,
+            target,
+            target_instance,
+            21,
+            None,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        assert!(!tracker.clear_response_service_handoff_drain_for_binding(session_id, 2));
+        assert!(tracker.clear_response_service_handoff_drain_for_binding(session_id, 1));
+    }
+
+    #[test]
+    fn expired_response_service_handoff_drain_rejects_move_without_changing_loads() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(514);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let service_instance = next_server_carrier_path_instance_id();
+        let target_instance = next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+
+        assert!(tracker.try_reserve_response_service_handoff_drain(
+            session_id,
+            tracker.generation(session_id),
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            None,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        let move_generation = tracker.generation(session_id);
+        tracker
+            .state
+            .lock()
+            .expect("test lane tracker lock")
+            .response_service_handoff_drains
+            .get_mut(&session_id)
+            .expect("reserved handoff drain")
+            .expires_at = Instant::now() - Duration::from_millis(1);
+
+        assert!(!tracker.try_move_response_service_handoff(
+            session_id,
+            move_generation,
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            None,
+            FlowLane::Throughput,
+        ));
+        let scheduling = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            scheduling.service_family_loads,
+            ResponseServiceFamilyLoads::new(2, 0)
+        );
+        assert!(scheduling.response_service_handoff_drain.is_none());
+        assert_eq!(
+            tracker
+                .response_service_snapshot(session_id, service)
+                .active_flows,
+            2
+        );
+        assert_eq!(
+            tracker
+                .response_service_snapshot(session_id, target)
+                .active_flows,
+            0
+        );
+    }
+
+    #[test]
+    fn direct_response_service_handoff_rejects_proof_that_expired_before_atomic_move() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(518);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let service_instance = next_server_carrier_path_instance_id();
+        let target_instance = next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        let mut proof = test_quic_capacity_proof(MuxLimits::default(), 518, Duration::from_secs(1));
+        proof.accepted_at = Instant::now() - Duration::from_secs(2);
+        proof.expires_at = proof.accepted_at + proof.proof_validity;
+
+        assert!(!tracker.try_move_response_service_handoff(
+            session_id,
+            tracker.generation(session_id),
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            Some(proof),
+            FlowLane::Throughput,
+        ));
+        let scheduling = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            scheduling.service_family_loads,
+            ResponseServiceFamilyLoads::new(2, 0)
+        );
+        assert_eq!(
+            tracker
+                .response_service_snapshot(session_id, service)
+                .active_flows,
+            2
+        );
+        assert_eq!(
+            tracker
+                .response_service_snapshot(session_id, target)
+                .active_flows,
+            0
+        );
+    }
+
+    #[test]
+    fn response_service_handoff_drain_requires_every_reserved_identity() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(515);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let service_instance = next_server_carrier_path_instance_id();
+        let target_instance = next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        let proof = test_quic_capacity_proof(MuxLimits::default(), 515, Duration::from_secs(1));
+
+        assert!(tracker.try_reserve_response_service_handoff_drain(
+            session_id,
+            tracker.generation(session_id),
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            Some(proof),
+            Instant::now() + Duration::from_secs(1),
+        ));
+        let generation = tracker.generation(session_id);
+        let wrong_service_instance = next_server_carrier_path_instance_id();
+        let wrong_target_instance = next_server_carrier_path_instance_id();
+
+        for (binding, from_instance, from_incarnation, to_instance, to_incarnation) in [
+            (2, service_instance, 10, target_instance, 20),
+            (1, wrong_service_instance, 10, target_instance, 20),
+            (1, service_instance, 11, target_instance, 20),
+            (1, service_instance, 10, wrong_target_instance, 20),
+            (1, service_instance, 10, target_instance, 21),
+        ] {
+            assert!(!tracker.try_move_response_service_handoff(
+                session_id,
+                generation,
+                binding,
+                service,
+                from_instance,
+                from_incarnation,
+                target,
+                to_instance,
+                to_incarnation,
+                Some(proof),
+                FlowLane::Throughput,
+            ));
+        }
+        assert!(!tracker.try_move_response_service_handoff(
+            session_id,
+            generation,
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            Some(QuicCapacityProofCandidate {
+                token: proof.token.wrapping_add(1),
+                ..proof
+            }),
+            FlowLane::Throughput,
+        ));
+
+        let scheduling = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            scheduling.service_family_loads,
+            ResponseServiceFamilyLoads::new(2, 0)
+        );
+        assert_eq!(
+            scheduling
+                .response_service_handoff_drain
+                .expect("identity mismatch must preserve drain")
+                .binding_instance_id,
+            1
+        );
+    }
+
+    #[test]
+    fn matching_response_service_handoff_drain_moves_one_flow_and_is_consumed() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(516);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let service_instance = next_server_carrier_path_instance_id();
+        let target_instance = next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+
+        assert!(tracker.try_reserve_response_service_handoff_drain(
+            session_id,
+            tracker.generation(session_id),
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            None,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        assert!(tracker.try_move_response_service_handoff(
+            session_id,
+            tracker.generation(session_id),
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            None,
+            FlowLane::Throughput,
+        ));
+
+        let scheduling = tracker.response_scheduling_snapshot(session_id);
+        assert_eq!(
+            scheduling.service_family_loads,
+            ResponseServiceFamilyLoads::new(1, 1)
+        );
+        assert!(scheduling.response_service_handoff_drain.is_none());
+        assert_eq!(
+            tracker
+                .response_service_snapshot(session_id, service)
+                .active_flows,
+            1
+        );
+        assert_eq!(
+            tracker
+                .response_service_snapshot(session_id, target)
+                .active_flows,
+            1
+        );
+    }
+
+    #[test]
+    fn clearing_response_service_handoff_drain_requires_exact_target_path() {
+        let tracker = ServerPathLaneTracker::default();
+        let session_id = SessionId(517);
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let service_instance = next_server_carrier_path_instance_id();
+        let target_instance = next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+        tracker.attach_response_service(session_id, service, FlowLane::Throughput);
+
+        assert!(tracker.try_reserve_response_service_handoff_drain(
+            session_id,
+            tracker.generation(session_id),
+            1,
+            service,
+            service_instance,
+            10,
+            target,
+            target_instance,
+            20,
+            None,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        assert!(!tracker.clear_response_service_handoff_drain_for_path(
+            session_id,
+            2,
+            target,
+            target_instance,
+        ));
+        assert!(!tracker.clear_response_service_handoff_drain_for_path(
+            session_id,
+            1,
+            target,
+            next_server_carrier_path_instance_id(),
+        ));
+        assert!(
+            tracker
+                .response_scheduling_snapshot(session_id)
+                .response_service_handoff_drain
+                .is_some()
+        );
+        assert!(tracker.clear_response_service_handoff_drain_for_path(
+            session_id,
+            1,
+            target,
+            target_instance,
+        ));
+        let scheduling = tracker.response_scheduling_snapshot(session_id);
+        assert!(scheduling.response_service_handoff_drain.is_none());
+        assert_eq!(
+            scheduling.service_family_loads,
+            ResponseServiceFamilyLoads::new(2, 0)
+        );
+    }
+
+    #[test]
+    fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
+        let mux_limits = MuxLimits::default();
+        let session_id = SessionId(511);
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+        let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(2),
+            second_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker,
+        );
+        let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+        binding.attach(
+            candidate.underlay,
+            candidate.path_id,
+            candidate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            mux_limits.max_payload_bytes,
+        );
+        let _ = try_recv_reliable_path_command(&mut candidate_receivers);
+        let proof = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let mut proof = None;
+            for entry in &mut outputs.entries {
+                if entry.key == service {
+                    mark_test_response_output_bulk_proven(entry, mux_limits);
+                } else if entry.key == candidate {
+                    proof = Some(mark_test_quic_output_receipt_bulk_proven(
+                        entry,
+                        mux_limits,
+                        511,
+                        Duration::from_millis(250),
+                    ));
+                }
+            }
+            proof.expect("installed QUIC receipt proof")
+        };
+        let frontier = 4096;
+        binding
+            .ack_ordering
+            .lock()
+            .expect("test response ACK ordering lock")
+            .contiguous_frontier = frontier;
+        let (planner_generation, _) = binding.subflow_state_snapshot();
+        let scheduling = binding.response_scheduling_snapshot();
+        assert_eq!(
+            scheduling.service_family_loads,
+            ResponseServiceFamilyLoads::new(2, 0)
+        );
+        let model_generation = binding.response_model_generation();
+        let targets = binding.sender_path_targets(FlowLane::Throughput, 64 * 1024);
+        let service_target = targets
+            .iter()
+            .find(|target| target.key == service)
+            .expect("TCP Service target")
+            .clone();
+        let candidate_target = targets
+            .iter()
+            .find(|target| target.key == candidate)
+            .expect("measured QUIC target")
+            .clone();
+        let frame = stream_data_frame_at(frontier, 64 * 1024);
+        let request = ResponseServiceHandoffRequest {
+            expected_planner_generation: planner_generation,
+            expected_lane_generation: scheduling.generation,
+            expected_model_generation: model_generation,
+            handoff_frontier: frontier,
+            service,
+            service_path_instance_id: service_target.path_instance_id,
+            service_incarnation: service_target.incarnation,
+            target: candidate,
+            target_path_instance_id: candidate_target.path_instance_id,
+            target_incarnation: candidate_target.incarnation,
+            mode: ResponseServiceHandoffMode::Diversification,
+            target_command_pending_limit_bytes: u64::MAX,
+            capacity_proof: Some(proof),
+        };
+        assert!(matches!(
+            binding.try_enqueue_response_service_handoff(
+                &candidate_target,
+                &frame,
+                FlowLane::Throughput,
+                ResponseServiceHandoffRequest {
+                    expected_model_generation: model_generation.wrapping_sub(1),
+                    ..request
+                },
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert_eq!(binding.ordered_data_owner(), Some(service));
+        assert_eq!(
+            binding.response_scheduling_snapshot().service_family_loads,
+            ResponseServiceFamilyLoads::new(2, 0),
+            "a stale handoff must not reserve or move session Service load"
+        );
+        assert!(binding.try_start_response_service_handoff_drain(
+            &service_target,
+            &candidate_target,
+            FlowLane::Throughput,
+            ResponseServiceHandoffDrainRequest {
+                expected_planner_generation: planner_generation,
+                expected_lane_generation: request.expected_lane_generation,
+                expected_model_generation: model_generation,
+                service,
+                service_path_instance_id: service_target.path_instance_id,
+                service_incarnation: service_target.incarnation,
+                target: candidate,
+                target_path_instance_id: candidate_target.path_instance_id,
+                target_incarnation: candidate_target.incarnation,
+                mode: ResponseServiceHandoffMode::Diversification,
+                capacity_proof: Some(proof),
+                outstanding_owner_bytes: 64 * 1024,
+                lease: Duration::from_secs(1),
+            },
+        ));
+        let drained_scheduling = binding.response_scheduling_snapshot();
+        assert!(drained_scheduling.response_service_handoff_drain.is_some());
+        std::thread::sleep(
+            proof
+                .expires_at
+                .saturating_duration_since(Instant::now())
+                .saturating_add(Duration::from_millis(10)),
+        );
+        assert!(
+            binding
+                .outputs
+                .lock()
+                .expect("test response outputs lock")
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .is_some_and(|entry| {
+                    server_output_quic_capacity_proof_marker(entry) == Some(proof)
+                        && server_output_fresh_quic_capacity_proof(entry).is_none()
+                }),
+            "the raw marker remains observable after ordinary authority expires"
+        );
+        let candidate_target = binding
+            .sender_path_targets(FlowLane::Throughput, 64 * 1024)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("reserved QUIC target after marker expiry");
+        assert!(!candidate_target.has_bulk_rate_evidence);
+        binding
+            .try_enqueue_response_service_handoff(
+                &candidate_target,
+                &frame,
+                FlowLane::Throughput,
+                ResponseServiceHandoffRequest {
+                    expected_lane_generation: drained_scheduling.generation,
+                    ..request
+                },
+            )
+            .expect("exact drained frontier should commit one sticky handoff");
+
+        assert_eq!(binding.ordered_data_owner(), Some(candidate));
+        assert!(!binding.response_service_handoff_open());
+        assert!(
+            binding
+                .response_scheduling_snapshot()
+                .response_service_handoff_drain
+                .is_none(),
+            "the matching drain intent must be consumed with the Service move"
+        );
+        assert_eq!(
+            binding.response_scheduling_snapshot().service_family_loads,
+            ResponseServiceFamilyLoads::new(1, 1)
+        );
+        assert_eq!(
+            binding
+                .lane_tracker
+                .response_service_snapshot(session_id, service)
+                .active_flows,
+            0,
+            "the old Active attachment must not retain response Service pressure"
+        );
+        assert_eq!(
+            binding
+                .lane_tracker
+                .response_service_snapshot(session_id, candidate)
+                .active_flows,
+            1
+        );
+        let moved_targets = binding.sender_path_targets(FlowLane::Throughput, 64 * 1024);
+        assert_eq!(
+            moved_targets
+                .iter()
+                .find(|target| target.key == service)
+                .expect("old TCP attachment")
+                .snapshot
+                .active_flows,
+            0
+        );
+        assert_eq!(
+            moved_targets
+                .iter()
+                .find(|target| target.key == candidate)
+                .expect("new QUIC Service")
+                .snapshot
+                .active_flows,
+            1
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+                offset,
+                ..
+            })) if offset == frontier
+        ));
     }
 
     #[test]
@@ -4732,11 +6352,15 @@ mod tests {
         assert_eq!(source.active_latency_sensitive_flows, 0);
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                after.independent_source_staging,
+                ReliableSourceStagingContext {
+                    independent: after.independent_source_staging,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: true,
+                        has_latency_pressure: source.active_latency_sensitive_flows > 0,
+                        has_feed_evidence: source.has_service_feed_evidence,
+                    }),
+                },
                 FlowLane::Throughput,
-                true,
-                source.active_latency_sensitive_flows > 0,
-                source.has_bulk_rate_evidence,
                 0,
                 0,
                 reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()),
@@ -4768,7 +6392,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_product_confidence_does_not_mature_response_source_staging() {
+    fn udp_product_progress_matures_only_current_service_feed() {
         let service = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(0),
@@ -4802,9 +6426,104 @@ mod tests {
         assert_eq!(send_path.confidence, 1.0);
         assert!(send_path.product_progress_rate_bps.is_some());
         assert!(
-            !source.has_bulk_rate_evidence,
-            "UDP source staging requires local carrier ACK-derived bulk evidence"
+            source.has_service_feed_evidence,
+            "substantial uniquely owned product ACKs may release current-Service staging"
         );
+        assert!(
+            !source.has_bulk_rate_evidence,
+            "product ACK timing must not mint optional QUIC placement authority"
+        );
+    }
+
+    #[test]
+    fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
+        let mux_limits = MuxLimits::default();
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(0),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(42),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+        );
+        let mut entry = first_output_entry(&binding);
+        mark_test_quic_output_carrier_bulk_proven(&mut entry, mux_limits);
+        let metrics = PathMetrics {
+            app_limited: true,
+            ..entry
+                .local_path_metrics
+                .expect("test QUIC sender metrics")
+                .metrics
+        };
+        binding.update_path_metrics(service, metrics, ServerPathMetricsSource::LocalSender);
+
+        let read = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
+        let source = read.source_service.expect("current response Service");
+        assert!(source.has_service_feed_evidence);
+        assert!(
+            !source.has_bulk_rate_evidence,
+            "an app-limited sample must not authorize optional placement"
+        );
+
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .find(|target| target.key == service)
+            .expect("current Service sender target");
+        assert!(target.is_active);
+        assert!(target.has_service_feed_evidence);
+        assert!(!target.has_bulk_rate_evidence);
+
+        let alternate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                alternate.underlay,
+                alternate.path_id,
+                alternate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(mux_limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let mut alternate_entry = binding
+            .outputs
+            .lock()
+            .expect("test response outputs lock")
+            .entries
+            .iter()
+            .find(|entry| entry.key == alternate)
+            .expect("Validation output")
+            .clone();
+        mark_test_quic_output_carrier_bulk_proven(&mut alternate_entry, mux_limits);
+        let alternate_metrics = PathMetrics {
+            app_limited: true,
+            ..alternate_entry
+                .local_path_metrics
+                .expect("alternate QUIC sender metrics")
+                .metrics
+        };
+        binding.update_path_metrics(
+            alternate,
+            alternate_metrics,
+            ServerPathMetricsSource::LocalSender,
+        );
+        let alternate_target = binding
+            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .find(|target| target.key == alternate)
+            .expect("Validation sender target");
+        assert!(!alternate_target.is_active);
+        assert!(!alternate_target.has_service_feed_evidence);
+        assert!(!alternate_target.has_bulk_rate_evidence);
     }
 
     #[test]
@@ -5387,7 +7106,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_stream_ack_can_seed_response_path_rate_when_no_packet_carrier_exists() {
+    fn tcp_first_stream_ack_is_progress_but_not_a_capacity_clock() {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
         let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
 
@@ -5402,8 +7121,202 @@ mod tests {
         assert_eq!(entry.bytes_in_flight, 0);
         assert_eq!(entry.delivery_samples, 1);
         assert_eq!(entry.owner_data_acked_bytes, MIN_RATE_SAMPLE_BYTES);
-        assert!(entry.delivery_rate_bps.is_some());
-        assert!(entry.srtt_ms.is_some());
+        assert!(entry.product_progress_rate_bps.is_none());
+        assert!(entry.delivery_rate_bps.is_none());
+        assert!(entry.tcp_ack_clock_rate_bps.is_none());
+        assert!(entry.srtt_ms.is_none());
+    }
+
+    #[test]
+    fn tcp_ordinary_ack_clock_excludes_assignment_queue_residence() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let window_bytes = PATH_OPEN_SCORE_BYTES;
+        binding.record_owner_flight(key, &stream_data_frame_at(0, window_bytes));
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(window_bytes as u64, window_bytes),
+        );
+        let clock = Instant::now();
+        let first_ack_at = clock + Duration::from_secs(1);
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: 0,
+                end: window_bytes as u64,
+            }],
+            first_ack_at,
+        );
+        let provisional = first_output_entry(&binding);
+        assert!(provisional.tcp_ack_clock_rate_bps.is_none());
+        assert!(provisional.product_progress_rate_bps.is_none());
+        assert!(provisional.delivery_rate_bps.is_none());
+        assert!(provisional.srtt_ms.is_none());
+
+        let second_ack_at = first_ack_at + Duration::from_millis(100);
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: window_bytes as u64,
+                end: (2 * window_bytes) as u64,
+            }],
+            second_ack_at,
+        );
+        let expected_rate = window_bytes as f64 * 8.0 / 0.1;
+        let measured = first_output_entry(&binding);
+        assert_test_rate_close(measured.tcp_ack_clock_rate_bps, expected_rate);
+        assert_test_rate_close(measured.product_progress_rate_bps, expected_rate);
+        assert_test_rate_close(measured.delivery_rate_bps, expected_rate);
+
+        let late_offset = (2 * window_bytes) as u64;
+        binding.record_owner_flight(key, &stream_data_frame_at(late_offset, window_bytes));
+        {
+            let mut flights = binding
+                .flights
+                .lock()
+                .expect("server reliable stream flight lock");
+            flights
+                .get_mut(&late_offset)
+                .expect("late flight")
+                .iter_mut()
+                .for_each(|flight| flight.sent_at = second_ack_at + Duration::from_millis(1));
+        }
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: late_offset,
+                end: late_offset + window_bytes as u64,
+            }],
+            second_ack_at + Duration::from_millis(100),
+        );
+        let after_late_assignment = first_output_entry(&binding);
+        assert_test_rate_close(after_late_assignment.tcp_ack_clock_rate_bps, expected_rate);
+        assert_test_rate_close(after_late_assignment.delivery_rate_bps, expected_rate);
+
+        let late_ack_at = second_ack_at + Duration::from_millis(100);
+        let recovery_offset = late_offset + window_bytes as u64;
+        binding.record_owner_flight(key, &stream_data_frame_at(recovery_offset, window_bytes));
+        {
+            let mut flights = binding
+                .flights
+                .lock()
+                .expect("server reliable stream flight lock");
+            flights
+                .get_mut(&recovery_offset)
+                .expect("recovery flight")
+                .iter_mut()
+                .for_each(|flight| flight.sent_at = late_ack_at - Duration::from_millis(1));
+        }
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: recovery_offset,
+                end: recovery_offset + window_bytes as u64,
+            }],
+            late_ack_at + Duration::from_millis(50),
+        );
+        let recovered_rate = (3 * window_bytes) as f64 * 8.0 / 0.25;
+        let recovered = first_output_entry(&binding);
+        assert_test_rate_close(recovered.tcp_ack_clock_rate_bps, recovered_rate);
+        assert_test_rate_close(recovered.delivery_rate_bps, recovered_rate);
+    }
+
+    #[test]
+    fn tcp_ack_clock_can_reduce_rate_while_carrier_snapshot_is_app_limited() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let window_bytes = PATH_OPEN_SCORE_BYTES;
+        binding.update_path_metrics(
+            key,
+            PathMetrics {
+                path_id: key.path_id,
+                underlay: key.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 20_000,
+                srtt_us: 20_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 100_000_000,
+                pacing_rate_bps: 100_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: window_bytes as u64,
+                inflight_hi_bytes: window_bytes as u64,
+                confidence_ppm: 1_000_000,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs.entries.first_mut().expect("TCP output");
+            entry.tcp_ack_clock_rate_bps = Some(100_000_000.0);
+            entry.product_progress_rate_bps = Some(100_000_000.0);
+            entry.delivery_rate_bps = Some(100_000_000.0);
+        }
+        binding.record_owner_flight(key, &stream_data_frame_at(0, window_bytes));
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(window_bytes as u64, window_bytes),
+        );
+        let first_ack_at = Instant::now() + Duration::from_millis(100);
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: 0,
+                end: window_bytes as u64,
+            }],
+            first_ack_at,
+        );
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: window_bytes as u64,
+                end: (2 * window_bytes) as u64,
+            }],
+            first_ack_at + Duration::from_millis(100),
+        );
+
+        let entry = first_output_entry(&binding);
+        assert!(
+            entry
+                .tcp_ack_clock_rate_bps
+                .is_some_and(|rate| rate < 100_000_000.0),
+            "per-flow TCP ACK evidence must not inherit QUIC's app-limited max filter"
+        );
+    }
+
+    #[test]
+    fn tcp_ack_clock_is_independent_from_global_contiguous_frontier() {
+        let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
+        let window_bytes = PATH_OPEN_SCORE_BYTES;
+        binding.record_owner_flight(key, &stream_data_frame_at(0, window_bytes));
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(window_bytes as u64, window_bytes),
+        );
+        let first_ack_at = Instant::now() + Duration::from_secs(1);
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: window_bytes as u64,
+                end: (2 * window_bytes) as u64,
+            }],
+            first_ack_at,
+        );
+        let hole = first_output_entry(&binding);
+        assert!(hole.tcp_ack_clock_rate_bps.is_none());
+
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: 0,
+                end: window_bytes as u64,
+            }],
+            first_ack_at + Duration::from_millis(100),
+        );
+        let expected_rate = window_bytes as f64 * 8.0 / 0.1;
+        let measured = first_output_entry(&binding);
+        assert_test_rate_close(measured.tcp_ack_clock_rate_bps, expected_rate);
     }
 
     #[test]
@@ -5482,11 +7395,28 @@ mod tests {
             key,
             &stream_data_frame_at(next_offset, MIN_RATE_SAMPLE_BYTES as usize),
         );
-        std::thread::sleep(Duration::from_millis(1));
-        binding.release_normalized_acked_ranges(&[OffsetRange {
-            start: next_offset,
-            end: next_offset + MIN_RATE_SAMPLE_BYTES,
-        }]);
+        binding.record_owner_flight(
+            key,
+            &stream_data_frame_at(
+                next_offset + MIN_RATE_SAMPLE_BYTES,
+                MIN_RATE_SAMPLE_BYTES as usize,
+            ),
+        );
+        let ordinary_ack_at = Instant::now() + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: next_offset,
+                end: next_offset + MIN_RATE_SAMPLE_BYTES,
+            }],
+            ordinary_ack_at,
+        );
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: next_offset + MIN_RATE_SAMPLE_BYTES,
+                end: next_offset + 2 * MIN_RATE_SAMPLE_BYTES,
+            }],
+            ordinary_ack_at + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED,
+        );
         let entry = first_output_entry(&binding);
         assert!(
             entry.delivery_rate_bps.is_some_and(|rate| rate > 1.0),
@@ -5495,7 +7425,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_response_robust_calibration_replaces_poisoned_rate_and_keeps_rtt_updates() {
+    fn tcp_response_robust_calibration_replaces_poisoned_rate_without_fake_rtt() {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
         let identity = {
             let mut outputs = binding.outputs.lock().expect("test response outputs lock");
@@ -5539,6 +7469,7 @@ mod tests {
             .expect("TCP output");
         assert_test_rate_close(entry.product_progress_rate_bps, 110_000_000.0);
         assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
+        assert_test_rate_close(entry.tcp_ack_clock_rate_bps, 110_000_000.0);
         assert_eq!(entry.srtt_ms, Some(10.0));
         drop(outputs);
 
@@ -5560,11 +7491,10 @@ mod tests {
             .expect("TCP output");
         assert_test_rate_close(entry.product_progress_rate_bps, 110_000_000.0);
         assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
-        assert!(
-            entry
-                .srtt_ms
-                .is_some_and(|srtt_ms| (srtt_ms - 10.0).abs() > f64::EPSILON),
-            "RTT observation remains independent from robust rate calibration"
+        assert_eq!(
+            entry.srtt_ms,
+            Some(10.0),
+            "scheduler assignment time is not a TCP dispatch or RTT timestamp"
         );
     }
 
@@ -5729,27 +7659,41 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_unique_owner_acks_graduate_tcp_but_not_udp_without_carrier_evidence() {
+    fn later_owner_ack_window_proves_tcp_but_not_udp_without_carrier_evidence() {
         let sample_bytes = reliable_subflow_startup_sample_limit_bytes(MuxLimits::default());
         let frame_bytes = BBR_MAX_SEND_QUANTUM_BYTES as u64;
         assert_eq!(sample_bytes % frame_bytes, 0);
 
         for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
             let (binding, key) = binding_for_underlay(underlay);
-            for offset in (0..sample_bytes).step_by(BBR_MAX_SEND_QUANTUM_BYTES) {
+            for offset in (0..2 * sample_bytes).step_by(BBR_MAX_SEND_QUANTUM_BYTES) {
                 binding.record_owner_flight(
                     key,
                     &stream_data_frame_at(offset, BBR_MAX_SEND_QUANTUM_BYTES),
                 );
             }
-            std::thread::sleep(Duration::from_millis(1));
-            binding.release_normalized_acked_ranges(&[OffsetRange {
-                start: 0,
-                end: sample_bytes,
-            }]);
+            let first_ack = Instant::now() + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
+            binding.release_normalized_acked_ranges_at(
+                &[OffsetRange {
+                    start: 0,
+                    end: sample_bytes,
+                }],
+                first_ack,
+            );
+            binding.release_normalized_acked_ranges_at(
+                &[OffsetRange {
+                    start: sample_bytes,
+                    end: 2 * sample_bytes,
+                }],
+                first_ack + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED,
+            );
 
             let entry = first_output_entry(&binding);
-            assert_eq!(entry.owner_data_acked_bytes, sample_bytes, "{underlay:?}");
+            assert_eq!(
+                entry.owner_data_acked_bytes,
+                2 * sample_bytes,
+                "{underlay:?}"
+            );
             assert!(entry.product_progress_rate_bps.is_some(), "{underlay:?}");
             assert_eq!(
                 server_output_has_bulk_rate_evidence(&entry),
@@ -5941,17 +7885,19 @@ mod tests {
                 .decision,
             PathAdmissionDecision::AdmitSubflow
         );
-        {
-            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
-            let entry = outputs
-                .entries
-                .iter_mut()
-                .find(|entry| entry.key == candidate)
-                .expect("candidate output");
-            mark_test_response_output_bulk_proven(entry, limits);
-        }
-
-        assert!(binding.graduate_bulk_proven_response_startup_owner());
+        binding.record_owner_flight(candidate, &stream_data_frame(sample_bytes));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: sample_bytes as u64,
+        }]);
+        assert_eq!(
+            binding
+                .subflow_state_snapshot()
+                .1
+                .and_then(|epoch| epoch.startup_owner_key()),
+            None,
+            "a fully ACKed TCP startup sample may graduate without inventing a rate"
+        );
         let candidate_target = binding
             .sender_path_targets(FlowLane::Throughput, 1)
             .into_iter()
@@ -6179,6 +8125,7 @@ mod tests {
         );
         assert_eq!(owner_entry.owner_data_acked_bytes, 0);
         assert_eq!(duplicate_entry.owner_data_acked_bytes, 0);
+        assert!(owner_entry.tcp_product_rate_evidence.is_none());
         assert!(
             entries
                 .ack_clock_calibrations
@@ -6635,12 +8582,25 @@ mod tests {
         }
 
         let ordinary = stream_data_frame_at(4096, MIN_RATE_SAMPLE_BYTES as usize);
+        let later =
+            stream_data_frame_at(4096 + MIN_RATE_SAMPLE_BYTES, MIN_RATE_SAMPLE_BYTES as usize);
         binding.record_owner_flight(candidate, &ordinary);
-        std::thread::sleep(Duration::from_millis(1));
-        binding.release_normalized_acked_ranges(&[OffsetRange {
-            start: 4096,
-            end: 4096 + MIN_RATE_SAMPLE_BYTES,
-        }]);
+        binding.record_owner_flight(candidate, &later);
+        let first_ack = Instant::now() + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: 4096,
+                end: 4096 + MIN_RATE_SAMPLE_BYTES,
+            }],
+            first_ack,
+        );
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: 4096 + MIN_RATE_SAMPLE_BYTES,
+                end: 4096 + 2 * MIN_RATE_SAMPLE_BYTES,
+            }],
+            first_ack + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED,
+        );
         let outputs = binding.outputs.lock().expect("test response outputs lock");
         let entry = outputs
             .entries
@@ -7503,7 +9463,7 @@ mod tests {
         let (resume_tx, resume_rx) = std_mpsc::sync_channel(0);
         let sender = std::thread::spawn(move || {
             binding_for_sender.try_enqueue_owner_frame_for_target_inner(
-                &target,
+                &ResponseDispatchTarget::from(&target),
                 &frame_for_sender,
                 FlowLane::Throughput,
                 Some(request),
@@ -8276,12 +10236,29 @@ mod tests {
             lane_tracker.clone(),
         );
         assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 2);
+        let stale_target = first
+            .sender_path_targets(FlowLane::Throughput, 64 * 1024)
+            .into_iter()
+            .find(|target| target.key == key)
+            .expect("first response Service target");
 
         first.close_stream(StreamId(10)).await;
         assert_eq!(
             lane_tracker.snapshot(session_id, key).active_flows,
             2,
             "enqueuing close does not complete carrier detachment"
+        );
+        assert_eq!(
+            first.response_scheduling_snapshot().service_family_loads,
+            ResponseServiceFamilyLoads::new(1, 0),
+            "close retires product Service ownership independently of attachment cleanup"
+        );
+        assert!(!first.commit_ordered_data_owner_for_target(&stale_target));
+        first.set_lane(FlowLane::Latency);
+        assert_eq!(
+            first.response_scheduling_snapshot().service_family_loads,
+            ResponseServiceFamilyLoads::new(1, 0),
+            "a stale owner commit or lane change cannot resurrect closed Service load"
         );
 
         first.detach(key, &first_commands_for_detach);
@@ -8538,6 +10515,94 @@ mod tests {
     }
 
     #[test]
+    fn validation_to_active_preserves_response_identity_evidence_and_subflow_epoch() {
+        let limits = MuxLimits::default();
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(limits) as usize;
+        let (binding, service) = binding_for_underlay(UnderlayProtocol::Udp);
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                commands.clone(),
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        let startup_input = SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            read_gap: Duration::ZERO,
+            owner_bytes: sample_bytes,
+            optional_overhead_bytes: 0,
+        };
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    startup_input,
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        let incarnation = {
+            let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == candidate)
+                .expect("Validation output");
+            mark_test_quic_output_carrier_bulk_proven(entry, limits);
+            entry.incarnation
+        };
+        let (planner_generation, epoch) = binding.subflow_state_snapshot();
+        assert_eq!(
+            epoch.as_ref().and_then(FlowSubflowSet::startup_owner_key),
+            Some(candidate)
+        );
+
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Active,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::RoleChanged
+        );
+
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("promoted response output");
+        assert_eq!(target.incarnation, incarnation);
+        assert!(target.has_bulk_rate_evidence);
+        let (after_generation, after_epoch) = binding.subflow_state_snapshot();
+        assert_eq!(after_generation, planner_generation);
+        assert_eq!(
+            after_epoch.and_then(|epoch| epoch.startup_owner_key()),
+            Some(candidate),
+            "request-role promotion cannot erase paid-for response membership"
+        );
+    }
+
+    #[test]
     fn late_record_from_pre_role_change_plan_is_not_path_proving() {
         let (binding, _) = binding_for_underlay(UnderlayProtocol::Tcp);
         let key = CarrierPathKey {
@@ -8736,7 +10801,7 @@ mod tests {
     }
 
     #[test]
-    fn response_peer_hint_rate_survives_local_proof_liveness_metrics() {
+    fn response_peer_hint_yields_to_durable_local_quic_estimate() {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Udp);
         let mut peer_hint = PathMetrics {
             path_id: key.path_id,
@@ -8798,6 +10863,25 @@ mod tests {
             updated.srtt_ms, 20.0,
             "local liveness RTT must not be erased by peer hint refresh"
         );
+
+        let durable_local = PathMetrics {
+            metric_epoch: metric_epoch_now(),
+            delivery_rate_bps: 500_000,
+            pacing_rate_bps: 500_000,
+            app_limited: true,
+            has_ack_derived_data_sample: true,
+            data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            data_sample_bytes: reliable_subflow_startup_sample_limit_bytes(MuxLimits::default()),
+            ..local_proof
+        };
+        binding.update_path_metrics(key, durable_local, ServerPathMetricsSource::LocalSender);
+        let local_estimate = binding
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("path remains attached");
+        assert_eq!(local_estimate.delivery_rate_bps, 500_000.0);
+        assert!(local_estimate.app_limited);
+        let entry = first_output_entry(&binding);
+        assert!(!server_output_has_bulk_rate_evidence(&entry));
     }
 
     #[test]
@@ -8838,15 +10922,27 @@ mod tests {
         assert_eq!(before_ack.delivery_rate_bps, 500_000_000.0);
 
         let frame = stream_data_frame(MIN_RATE_SAMPLE_BYTES as usize);
+        let later = stream_data_frame_at(MIN_RATE_SAMPLE_BYTES, MIN_RATE_SAMPLE_BYTES as usize);
         binding.record_owner_flight(key, &frame);
-        std::thread::sleep(Duration::from_millis(20));
-        binding.release_normalized_acked_ranges(&[OffsetRange {
-            start: 0,
-            end: reliable_stream_frame_payload_bytes(&frame) as u64,
-        }]);
+        binding.record_owner_flight(key, &later);
+        let first_ack = Instant::now() + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: 0,
+                end: reliable_stream_frame_payload_bytes(&frame) as u64,
+            }],
+            first_ack,
+        );
+        binding.release_normalized_acked_ranges_at(
+            &[OffsetRange {
+                start: MIN_RATE_SAMPLE_BYTES,
+                end: 2 * MIN_RATE_SAMPLE_BYTES,
+            }],
+            first_ack + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED,
+        );
 
         let entry = first_output_entry(&binding);
-        assert_eq!(entry.delivery_samples, 1);
+        assert_eq!(entry.delivery_samples, 2);
         assert!(
             entry.delivery_rate_bps.unwrap_or(f64::INFINITY) < 500_000_000.0,
             "the test must create a low product progress sample"

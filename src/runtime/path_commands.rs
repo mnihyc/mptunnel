@@ -1,6 +1,10 @@
 use super::reliable_path::ReliablePathStream;
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+// Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or
+// QUIC writers. Control keeps independent capacity; a typed QUIC probe remains
+// one data-lane command so its token and frozen proof contract cannot split.
 
 const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
     FlowLane::Control,
@@ -11,23 +15,74 @@ const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
 
 #[derive(Clone)]
 pub(super) struct ReliablePathCommandSender {
-    control: mpsc::Sender<ReliablePathCommand>,
-    priority: mpsc::Sender<ReliablePathCommand>,
-    data: mpsc::Sender<ReliablePathCommand>,
+    control: mpsc::Sender<QueuedReliablePathCommand>,
+    priority: mpsc::Sender<QueuedReliablePathCommand>,
+    data: mpsc::Sender<QueuedReliablePathCommand>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
 }
 
 pub(super) struct ReliablePathCommandReceivers {
-    control: mpsc::Receiver<ReliablePathCommand>,
-    priority: mpsc::Receiver<ReliablePathCommand>,
-    data: mpsc::Receiver<ReliablePathCommand>,
+    control: mpsc::Receiver<QueuedReliablePathCommand>,
+    priority: mpsc::Receiver<QueuedReliablePathCommand>,
+    data: mpsc::Receiver<QueuedReliablePathCommand>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
+    dequeued_unreleased_bytes: AtomicU64,
 }
 
 #[derive(Default)]
 struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     capacity_released: Arc<Notify>,
+}
+
+struct QueuedReliablePathCommand {
+    command: Option<ReliablePathCommand>,
+    accounted_bytes: usize,
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+}
+
+impl QueuedReliablePathCommand {
+    fn new(
+        command: ReliablePathCommand,
+        accounted_bytes: usize,
+        metrics: Arc<ReliablePathCommandQueueMetrics>,
+    ) -> Self {
+        Self {
+            command: Some(command),
+            accounted_bytes,
+            metrics,
+        }
+    }
+
+    fn into_parts(mut self) -> (ReliablePathCommand, usize) {
+        // Dequeue transfers the byte charge to the receiver. It remains visible
+        // until the writer hands the command to carrier/product accounting.
+        let accounted_bytes = self.accounted_bytes;
+        self.accounted_bytes = 0;
+        (
+            self.command.take().expect("queued reliable path command"),
+            accounted_bytes,
+        )
+    }
+
+    fn into_rejected_command(mut self) -> ReliablePathCommand {
+        if self.accounted_bytes > 0 {
+            self.metrics.release_pending_bytes(self.accounted_bytes);
+        }
+        self.accounted_bytes = 0;
+        self.command.take().expect("queued reliable path command")
+    }
+}
+
+impl Drop for QueuedReliablePathCommand {
+    fn drop(&mut self) {
+        if let Some(ReliablePathCommand::SendQuicCapacityProbe(probe)) = self.command.as_ref() {
+            probe.ticket.cancel();
+        }
+        if self.accounted_bytes > 0 {
+            self.metrics.release_pending_bytes(self.accounted_bytes);
+        }
+    }
 }
 
 impl ReliablePathCommandQueueMetrics {
@@ -37,7 +92,13 @@ impl ReliablePathCommandQueueMetrics {
     }
 
     fn release_pending_bytes(&self, bytes: usize) {
-        let bytes = bytes as u64;
+        self.release_pending_bytes_u64(bytes as u64);
+    }
+
+    fn release_pending_bytes_u64(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         let _ = self
             .pending_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -53,13 +114,37 @@ impl ReliablePathCommandQueueMetrics {
 }
 
 impl ReliablePathCommandReceivers {
+    fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
+        let (command, accounted_bytes) = command.into_parts();
+        self.dequeued_unreleased_bytes
+            .fetch_add(accounted_bytes as u64, Ordering::Relaxed);
+        command
+    }
+
     pub(super) fn release_pending_command_bytes(&self, bytes: usize) {
-        self.metrics.release_pending_bytes(bytes);
+        let requested = bytes as u64;
+        let previous = self
+            .dequeued_unreleased_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(requested))
+            })
+            .expect("dequeued byte update always succeeds");
+        self.metrics
+            .release_pending_bytes_u64(previous.min(requested));
     }
 
     #[cfg(feature = "lab-diagnostics")]
     pub(super) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()
+    }
+}
+
+impl Drop for ReliablePathCommandReceivers {
+    fn drop(&mut self) {
+        // Queued envelopes reconcile themselves. This covers a command already
+        // removed from mpsc when a writer exits through an async error path.
+        let outstanding = self.dequeued_unreleased_bytes.swap(0, Ordering::Relaxed);
+        self.metrics.release_pending_bytes_u64(outstanding);
     }
 }
 
@@ -74,7 +159,15 @@ impl ReliablePathCommandSender {
         let stream_id = reliable_path_command_stream_id(&command);
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
-        let result = self.control.send(command).await;
+        let result = self
+            .control
+            .send(QueuedReliablePathCommand::new(
+                command,
+                0,
+                self.metrics.clone(),
+            ))
+            .await
+            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()));
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
@@ -104,7 +197,14 @@ impl ReliablePathCommandSender {
         let queue = &self.data;
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
-        let result = queue.send(command).await;
+        let result = queue
+            .send(QueuedReliablePathCommand::new(
+                command,
+                0,
+                self.metrics.clone(),
+            ))
+            .await
+            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()));
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
@@ -131,6 +231,53 @@ impl ReliablePathCommandSender {
         self.try_enqueue_admitted_frame_with_effective_lane(frame, lane, None)
     }
 
+    /// Admits one complete QUIC capacity epoch as one queue item.
+    ///
+    /// Keeping the frozen proof contract beside the train prevents ordinary
+    /// frame batching from losing its token or mixing product data into it.
+    pub(super) fn try_enqueue_quic_capacity_probe(
+        &self,
+        probe: QuicCapacityProbeCommand,
+    ) -> Result<(), RuntimeError> {
+        let pending_bytes = usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX);
+        #[cfg(feature = "lab-diagnostics")]
+        let calibration_id = probe.calibration_id;
+        let result = match self.data.try_reserve() {
+            Ok(permit) => {
+                self.metrics.add_pending_bytes(pending_bytes);
+                permit.send(QueuedReliablePathCommand::new(
+                    ReliablePathCommand::SendQuicCapacityProbe(probe),
+                    pending_bytes,
+                    self.metrics.clone(),
+                ));
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(RuntimeError::SenderServiceBlocked)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(RuntimeError::ReliablePathSessionClosed)
+            }
+        };
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_command_queue_send",
+            format_args!(
+                "queue=data command_kind=quic_capacity_probe stream_id=0 lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result={} calibration_id={}",
+                FlowLane::Throughput,
+                FlowLane::Throughput,
+                pending_bytes,
+                match &result {
+                    Ok(()) => "queued",
+                    Err(RuntimeError::SenderServiceBlocked) => "blocked",
+                    Err(_) => "closed",
+                },
+                calibration_id,
+            ),
+        );
+        result
+    }
+
     pub(super) fn try_enqueue_stream_ordered_frame(
         &self,
         frame: Frame,
@@ -149,6 +296,11 @@ impl ReliablePathCommandSender {
         lane: FlowLane,
         effective_lane_override: Option<FlowLane>,
     ) -> Result<(), RuntimeError> {
+        if reliable_path_frame_is_quic_capacity_only(&frame) {
+            return Err(RuntimeError::Protocol(
+                "PATH_CAPACITY_* requires an explicit typed QUIC protocol role",
+            ));
+        }
         let bytes = frame_pacing_bytes(&frame);
         let effective_lane = effective_lane_override
             .unwrap_or_else(|| reliable_path_effective_frame_lane(&frame, lane));
@@ -164,7 +316,11 @@ impl ReliablePathCommandSender {
         let result = match queue.try_reserve() {
             Ok(permit) => {
                 self.metrics.add_pending_bytes(bytes);
-                permit.send(ReliablePathCommand::SendFrame(frame));
+                permit.send(QueuedReliablePathCommand::new(
+                    ReliablePathCommand::SendFrame(frame),
+                    bytes,
+                    self.metrics.clone(),
+                ));
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -253,10 +409,23 @@ pub(super) fn reliable_path_stream_ordered_queue_lane() -> FlowLane {
 
 pub(super) fn reliable_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane) -> FlowLane {
     match frame {
-        Frame::StreamData { .. } => stream_lane,
+        Frame::StreamData { .. }
+        | Frame::PathCapacityData { .. }
+        | Frame::PathCapacityFinish { .. } => stream_lane,
         Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } => FlowLane::RealtimeDatagram,
         _ => FlowLane::Control,
     }
+}
+
+/// Capacity protocol records belong to the typed QUIC epoch transaction, never
+/// to carrier-neutral frame admission. Keep future finish/receipt kinds here.
+pub(super) fn reliable_path_frame_is_quic_capacity_only(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::PathCapacityData { .. }
+            | Frame::PathCapacityFinish { .. }
+            | Frame::PathCapacityReceipt { .. }
+    )
 }
 
 pub(super) fn reliable_path_command_channels(
@@ -279,6 +448,7 @@ pub(super) fn reliable_path_command_channels(
             priority: priority_rx,
             data: data_rx,
             metrics,
+            dequeued_unreleased_bytes: AtomicU64::new(0),
         },
     )
 }
@@ -302,7 +472,7 @@ pub(super) async fn recv_reliable_path_command(
     let control_may_recv = path_command_receiver_may_recv(&receivers.control);
     let priority_may_recv = path_command_receiver_may_recv(&receivers.priority);
     let data_may_recv = path_command_receiver_may_recv(&receivers.data);
-    match (control_may_recv, priority_may_recv, data_may_recv) {
+    let command = match (control_may_recv, priority_may_recv, data_may_recv) {
         (true, true, true) => {
             tokio::select! {
                 biased;
@@ -336,13 +506,20 @@ pub(super) async fn recv_reliable_path_command(
         (false, true, false) => receivers.priority.recv().await,
         (false, false, true) => receivers.data.recv().await,
         (false, false, false) => None,
-    }
+    };
+    command.map(|command| receivers.take_queued_command(command))
 }
 
 pub(super) fn try_recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
-    recv_ready_priority_command(receivers).or_else(|| receivers.data.try_recv().ok())
+    recv_ready_priority_command(receivers).or_else(|| {
+        receivers
+            .data
+            .try_recv()
+            .ok()
+            .map(|command| receivers.take_queued_command(command))
+    })
 }
 
 pub(super) fn try_recv_reliable_path_priority_command(
@@ -498,14 +675,21 @@ fn recv_ready_priority_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
     if let Ok(command) = receivers.control.try_recv() {
-        return Some(command);
+        return Some(receivers.take_queued_command(command));
     }
-    receivers.priority.try_recv().ok()
+    receivers
+        .priority
+        .try_recv()
+        .ok()
+        .map(|command| receivers.take_queued_command(command))
 }
 
 pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand) -> usize {
     match command {
         ReliablePathCommand::SendFrame(frame) => frame_pacing_bytes(frame),
+        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+            usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
+        }
         ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 0,
     }
 }
@@ -515,6 +699,11 @@ pub(super) fn reliable_path_command_writer_run_bytes(command: &ReliablePathComma
         ReliablePathCommand::SendFrame(frame) => {
             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
         }
+        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+            usize::try_from(probe.train_payload_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1)
+        }
         ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 1,
     }
 }
@@ -523,6 +712,7 @@ pub(super) fn reliable_path_command_writer_run_bytes(command: &ReliablePathComma
 fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> StreamId {
     match command {
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
+        ReliablePathCommand::SendQuicCapacityProbe(_) => StreamId(0),
         ReliablePathCommand::OpenStream { stream_id, .. }
         | ReliablePathCommand::CloseStream(stream_id) => *stream_id,
     }
@@ -542,6 +732,137 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> StreamId {
     }
 }
 
+#[derive(Debug)]
+struct QuicCapacityProbeCommandTicketState {
+    resolution: AtomicU8,
+    resolved: tokio::sync::Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuicCapacityProbeCommandResolution {
+    Current = 0,
+    Cancelled = 1,
+    Published = 2,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QuicCapacityProbeCommandTicket {
+    state: Arc<QuicCapacityProbeCommandTicketState>,
+}
+
+impl QuicCapacityProbeCommandTicket {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Arc::new(QuicCapacityProbeCommandTicketState {
+                resolution: AtomicU8::new(QuicCapacityProbeCommandResolution::Current as u8),
+                resolved: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    pub(super) fn resolution(&self) -> QuicCapacityProbeCommandResolution {
+        match self.state.resolution.load(Ordering::Acquire) {
+            value if value == QuicCapacityProbeCommandResolution::Current as u8 => {
+                QuicCapacityProbeCommandResolution::Current
+            }
+            value if value == QuicCapacityProbeCommandResolution::Cancelled as u8 => {
+                QuicCapacityProbeCommandResolution::Cancelled
+            }
+            value if value == QuicCapacityProbeCommandResolution::Published as u8 => {
+                QuicCapacityProbeCommandResolution::Published
+            }
+            _ => unreachable!("invalid QUIC capacity command ticket resolution"),
+        }
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        self.resolution() == QuicCapacityProbeCommandResolution::Current
+    }
+
+    fn resolve(&self, resolution: QuicCapacityProbeCommandResolution) -> bool {
+        debug_assert_ne!(resolution, QuicCapacityProbeCommandResolution::Current);
+        let resolved = self
+            .state
+            .resolution
+            .compare_exchange(
+                QuicCapacityProbeCommandResolution::Current as u8,
+                resolution as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if resolved {
+            self.state.resolved.notify_waiters();
+        }
+        resolved
+    }
+
+    pub(super) fn cancel(&self) -> bool {
+        self.resolve(QuicCapacityProbeCommandResolution::Cancelled)
+    }
+
+    pub(super) fn publish(&self) -> bool {
+        self.resolve(QuicCapacityProbeCommandResolution::Published)
+    }
+
+    pub(super) async fn resolved(&self) -> QuicCapacityProbeCommandResolution {
+        loop {
+            let resolution = self.resolution();
+            if resolution != QuicCapacityProbeCommandResolution::Current {
+                return resolution;
+            }
+            let notified = self.state.resolved.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let resolution = self.resolution();
+            if resolution != QuicCapacityProbeCommandResolution::Current {
+                return resolution;
+            }
+            notified.await;
+        }
+    }
+
+    pub(super) async fn cancelled(&self) {
+        if self.resolved().await == QuicCapacityProbeCommandResolution::Cancelled {
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct QuicCapacityProbeCommand {
+    // The command channel is binding-local; retain the ID for cross-layer lab
+    // correlation without making the carrier reach into response ownership.
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(super) binding_instance_id: u64,
+    pub(super) path_id: PathId,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) calibration_id: u64,
+    pub(super) train_payload_bytes: u64,
+    pub(super) sample_floor_bytes: u64,
+    pub(super) warmup_carrier_bytes: u64,
+    pub(super) required_timed_carrier_bytes: u64,
+    pub(super) proof_validity: std::time::Duration,
+    pub(super) expires_at: std::time::Instant,
+    pub(super) ticket: QuicCapacityProbeCommandTicket,
+    pub(super) cancel_on_drop: bool,
+}
+
+impl QuicCapacityProbeCommand {
+    pub(super) fn disarm_drop_cancellation(&mut self) {
+        self.cancel_on_drop = false;
+    }
+}
+
+impl Drop for QuicCapacityProbeCommand {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.ticket.cancel();
+        }
+    }
+}
+
 pub(super) enum ReliablePathCommand {
     OpenStream {
         stream_id: StreamId,
@@ -554,6 +875,9 @@ pub(super) enum ReliablePathCommand {
         response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
     },
     SendFrame(Frame),
+    // TCP writers reject this carrier-specific command. The shared scheduler
+    // only owns admission; UDP/QUIC owns how the epoch is encoded and measured.
+    SendQuicCapacityProbe(QuicCapacityProbeCommand),
     CloseStream(StreamId),
 }
 
@@ -562,6 +886,7 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
     match command {
         ReliablePathCommand::OpenStream { .. } => "open_stream",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
+        ReliablePathCommand::SendQuicCapacityProbe(_) => "quic_capacity_probe",
         ReliablePathCommand::CloseStream(_) => "close_stream",
     }
 }
@@ -584,6 +909,9 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::PathMtuAck { .. } => "path_mtu_ack",
         Frame::PathProofData { .. } => "path_proof_data",
         Frame::PathProofAck { .. } => "path_proof_ack",
+        Frame::PathCapacityData { .. } => "path_capacity_data",
+        Frame::PathCapacityFinish { .. } => "path_capacity_finish",
+        Frame::PathCapacityReceipt { .. } => "path_capacity_receipt",
         Frame::OpenStream { .. } => "open_stream",
         Frame::StreamData { .. } => "stream_data",
         Frame::StreamAck { .. } => "stream_ack",

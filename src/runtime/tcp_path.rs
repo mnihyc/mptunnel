@@ -474,6 +474,14 @@ async fn handle_connected_client_tcp_command_run(
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         match command {
+            ReliablePathCommand::SendFrame(frame)
+                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client TCP path received QUIC capacity data",
+                ));
+            }
             ReliablePathCommand::SendFrame(frame) => {
                 let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                 pending_frames.push(frame);
@@ -485,6 +493,13 @@ async fn handle_connected_client_tcp_command_run(
                     break;
                 }
                 continue;
+            }
+            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+                probe.ticket.cancel();
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client TCP path received QUIC capacity command",
+                ));
             }
             command => {
                 flush_client_tcp_frame_batch(
@@ -741,6 +756,9 @@ async fn handle_disconnected_client_tcp_command(
                 }
             }
         }
+        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+            probe.ticket.cancel();
+        }
         ReliablePathCommand::SendFrame(_) | ReliablePathCommand::CloseStream(_) => {}
     }
 }
@@ -780,6 +798,13 @@ async fn handle_connected_client_tcp_command(
             record_client_tcp_path_outbound_activity(connection, mux_limits);
             Ok(())
         }
+        ReliablePathCommand::SendFrame(frame)
+            if reliable_path_frame_is_quic_capacity_only(&frame) =>
+        {
+            Err(RuntimeError::Protocol(
+                "client TCP path received QUIC capacity data",
+            ))
+        }
         ReliablePathCommand::SendFrame(frame) => {
             connection.writer.write_frame(&frame).await?;
             connection.path_proofs.record_sent_frame(&frame);
@@ -788,6 +813,12 @@ async fn handle_connected_client_tcp_command(
             }
             record_client_tcp_path_outbound_activity(connection, mux_limits);
             Ok(())
+        }
+        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+            probe.ticket.cancel();
+            Err(RuntimeError::Protocol(
+                "client TCP path received QUIC capacity command",
+            ))
         }
         ReliablePathCommand::CloseStream(stream_id) => {
             streams.remove(&stream_id);

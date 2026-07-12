@@ -1,4 +1,8 @@
 use super::super::bulk_admission::bulk_service_horizon_payload_bytes;
+use super::response_placement::ResponseRateScope;
+use super::response_session::{
+    ServerResponsePathSchedulingSnapshot, valid_quic_capacity_proof_candidate_at,
+};
 use super::*;
 
 // Despite the historical filename, this module owns response path evidence,
@@ -8,6 +12,10 @@ use super::*;
 
 const RESPONSE_ACK_CLOCK_STAGE_RATE_WINDOW: usize = 5;
 const RESPONSE_ACK_CLOCK_MIN_ROBUST_RATE_SAMPLES: usize = 3;
+// Product ACKs can arrive in callback bursts after sitting in a control queue.
+// Integrate across that burst instead of treating each callback as a clock.
+pub(super) const RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED: Duration = Duration::from_millis(100);
+const RESPONSE_ACK_CLOCK_GOODPUT_MAX_ELAPSED: Duration = Duration::from_secs(2);
 
 /// One carrier output attached to a response stream.
 ///
@@ -27,6 +35,12 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) product_queue_bytes: u64,
     pub(super) product_progress_rate_bps: Option<f64>,
     pub(super) delivery_rate_bps: Option<f64>,
+    /// TCP per-flow goodput from exact OwnerData ACKs. It is not carrier
+    /// capacity; assignment-time evidence never publishes a rate or RTT.
+    pub(super) tcp_ack_clock_rate_bps: Option<f64>,
+    /// Per-output ACK clock; product ordering timestamps can be advanced when a
+    /// different path closes a hole and therefore cannot own this boundary.
+    pub(super) tcp_product_rate_evidence: Option<ResponseAckClockRateEvidence>,
     pub(super) srtt_ms: Option<f64>,
     pub(super) delivery_samples: u32,
     /// Cumulative uniquely owned product bytes ACKed on this output.
@@ -34,7 +48,6 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// The flight ledger increments this only for unambiguous `OwnerData`;
     /// duplicated `RepairData` never contributes.
     pub(super) owner_data_acked_bytes: u64,
-    pub(super) last_delivery_at: Option<Instant>,
     pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
     pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
 }
@@ -53,6 +66,9 @@ pub(in crate::runtime) struct ResponseAckClockRateEvidence {
     pending_first_sent_at: Instant,
     pending_last_sent_at: Instant,
     previous_window_acked_at: Option<Instant>,
+    goodput_last_acked_at: Option<Instant>,
+    goodput_bytes: u64,
+    goodput_elapsed: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,7 +93,37 @@ impl ResponseAckClockRateEvidence {
             pending_first_sent_at: first_sent_at,
             pending_last_sent_at: first_sent_at,
             previous_window_acked_at: None,
+            goodput_last_acked_at: None,
+            goodput_bytes: 0,
+            goodput_elapsed: Duration::ZERO,
         }
+    }
+
+    fn record_goodput_progress(&mut self, bytes: u64, acked_at: Instant) {
+        let Some(previous_acked_at) = self.goodput_last_acked_at.replace(acked_at) else {
+            // The first product ACK can include arbitrary assignment residence.
+            return;
+        };
+        let elapsed = acked_at.saturating_duration_since(previous_acked_at);
+        if elapsed > RESPONSE_ACK_CLOCK_GOODPUT_MAX_ELAPSED {
+            // A long idle/stall starts a new causal epoch instead of poisoning
+            // resumed bulk traffic with stale wall time.
+            self.goodput_bytes = 0;
+            self.goodput_elapsed = Duration::ZERO;
+            return;
+        }
+        self.goodput_bytes = self.goodput_bytes.saturating_add(bytes);
+        self.goodput_elapsed = self.goodput_elapsed.saturating_add(elapsed);
+        while self.goodput_elapsed > RESPONSE_ACK_CLOCK_GOODPUT_MAX_ELAPSED {
+            self.goodput_bytes = self.goodput_bytes.div_ceil(2);
+            self.goodput_elapsed /= 2;
+        }
+    }
+
+    pub(super) fn goodput_sample(&self) -> Option<PathRateSample> {
+        (self.goodput_elapsed >= RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED)
+            .then(|| PathRateSample::new(self.goodput_bytes, self.goodput_elapsed))
+            .flatten()
     }
 
     #[cfg(test)]
@@ -99,6 +145,7 @@ impl ResponseAckClockRateEvidence {
         last_sent_at: Instant,
         acked_at: Instant,
     ) -> ResponseAckClockRateEvidenceUpdate {
+        self.record_goodput_progress(bytes, acked_at);
         if self.pending_bytes == 0 {
             self.pending_first_sent_at = first_sent_at;
             self.pending_last_sent_at = last_sent_at;
@@ -419,10 +466,12 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) binding_instance_id: u64,
     pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) path_instance_id: ServerCarrierPathInstanceId,
     pub(in crate::runtime) incarnation: u64,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) attachment_role: StreamOpenRole,
     pub(in crate::runtime) snapshot: PathSnapshot,
+    pub(in crate::runtime) rate_scope: ResponseRateScope,
     pub(in crate::runtime) owner_data_in_flight_bytes: u64,
     /// Once-captured command pressure used by both projection and commit
     /// revalidation; equality is a value fingerprint, not a queue generation.
@@ -433,13 +482,58 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     /// Request-side Active is independent from response Service ownership.
     pub(in crate::runtime) is_request_active: bool,
     pub(in crate::runtime) has_sender_evidence: bool,
+    /// Current-Service feed may use unique product ACK progress or durable
+    /// app-limited carrier ACK progress; optional paths still require strict
+    /// bulk-rate evidence below.
+    pub(in crate::runtime) has_service_feed_evidence: bool,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
+    /// Raw receipt marker; handoff may pin it without renewing global freshness.
+    pub(in crate::runtime) quic_capacity_proof: Option<QuicCapacityProofCandidate>,
+    pub(in crate::runtime) quic_capacity_calibration_attempts: u8,
     pub(in crate::runtime) ack_clock_calibration_eligible: bool,
     pub(in crate::runtime) ack_clock_calibration_proven: bool,
     pub(in crate::runtime) ack_clock_calibration_spent_bytes: u64,
     pub(in crate::runtime) ack_clock_calibration_credit_limit_bytes: u64,
     pub(in crate::runtime) ack_clock_calibration_max_limit_bytes: u64,
     pub(in crate::runtime) ack_clock_calibration_active: bool,
+}
+
+/// Compact identity retained after path ranking. Model snapshots and
+/// calibration state are intentionally dropped before the per-frame emit path.
+#[derive(Clone)]
+pub(in crate::runtime) struct ResponseDispatchTarget {
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) incarnation: u64,
+    pub(in crate::runtime) commands: ReliablePathCommandSender,
+    pub(in crate::runtime) attachment_role: StreamOpenRole,
+    pub(in crate::runtime) has_bulk_rate_evidence: bool,
+}
+
+impl From<ResponseSenderPathTarget> for ResponseDispatchTarget {
+    fn from(target: ResponseSenderPathTarget) -> Self {
+        Self {
+            key: target.key,
+            path_instance_id: target.path_instance_id,
+            incarnation: target.incarnation,
+            commands: target.commands,
+            attachment_role: target.attachment_role,
+            has_bulk_rate_evidence: target.has_bulk_rate_evidence,
+        }
+    }
+}
+
+impl From<&ResponseSenderPathTarget> for ResponseDispatchTarget {
+    fn from(target: &ResponseSenderPathTarget) -> Self {
+        Self {
+            key: target.key,
+            path_instance_id: target.path_instance_id,
+            incarnation: target.incarnation,
+            commands: target.commands.clone(),
+            attachment_role: target.attachment_role,
+            has_bulk_rate_evidence: target.has_bulk_rate_evidence,
+        }
+    }
 }
 
 /// Product byte range currently assigned to a carrier path.
@@ -601,6 +695,12 @@ pub(in crate::runtime) enum ServerPathMetricsSource {
 pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(super) metrics: PathMetrics,
     pub(super) source: ServerPathMetricsSource,
+    // Metric age is measured at the source; residence time closes the gap when
+    // the local idle publisher is delayed after this snapshot is installed.
+    pub(super) recorded_at: Instant,
+    // Only the exact capacity transaction creates this marker. Ordinary metric
+    // refreshes may carry it to the fixed deadline but cannot mint a new proof.
+    pub(super) capacity_proof: Option<QuicCapacityProofCandidate>,
 }
 
 fn server_output_local_path_metrics(
@@ -711,12 +811,14 @@ impl ResponseStreamOutputs {
                         .map(|path| path.active_latency_sensitive_flows)
                         .unwrap_or_else(|| {
                             lane_tracker
-                                .snapshot(session_id, key)
+                                .response_service_snapshot(session_id, key)
                                 .active_latency_sensitive_flows
                         });
                     ResponseSourceServiceSnapshot {
                         key,
                         active_latency_sensitive_flows,
+                        has_service_feed_evidence:
+                            server_output_has_service_feed_evidence_with_limits(entry, mux_limits),
                         has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_with_limits(
                             entry, mux_limits,
                         ),
@@ -730,6 +832,13 @@ impl ResponseStreamOutputs {
                 && response_outputs_have_live_mixed_owner_underlays(&self.entries),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseBulkOutputSnapshot {
+    pub(super) path: PathSnapshot,
+    pub(super) rate_scope: ResponseRateScope,
+    pub(super) quic_capacity_calibration_attempts: u8,
 }
 
 pub(super) fn server_bulk_output_snapshot(
@@ -749,6 +858,7 @@ pub(super) fn server_bulk_output_snapshot(
         now,
         entry.commands.pending_bytes(),
     )
+    .path
 }
 
 pub(super) fn server_bulk_output_snapshot_with_command_pending(
@@ -759,7 +869,31 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
     mux_limits: MuxLimits,
     now: Instant,
     command_pending_bytes: u64,
-) -> PathSnapshot {
+) -> ResponseBulkOutputSnapshot {
+    let response_scheduling = lane_tracker.response_path_scheduling_snapshot(
+        session_id,
+        entry.key,
+        entry.path_instance_id,
+    );
+    server_bulk_output_snapshot_with_scheduling(
+        entry,
+        lane,
+        mux_limits,
+        now,
+        command_pending_bytes,
+        response_scheduling,
+    )
+}
+
+/// Combines output-local evidence with one caller-batched scheduling record.
+pub(super) fn server_bulk_output_snapshot_with_scheduling(
+    entry: &ResponseStreamOutputEntry,
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+    now: Instant,
+    command_pending_bytes: u64,
+    response_scheduling: ServerResponsePathSchedulingSnapshot,
+) -> ResponseBulkOutputSnapshot {
     let local_carrier_metrics = server_output_local_path_metrics(entry);
     let peer_hint_metrics = (entry.delivery_samples == 0)
         .then_some(entry.peer_path_metrics)
@@ -784,7 +918,6 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
             f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
         })
         .clamp(0.0, 1.0);
-    let model_rate_bps = bulk_rate_metrics.map(server_path_metrics_rate_bps);
     let peer_hint_rate_bps = peer_hint_metrics
         .filter(|path_metrics| !path_metrics.metrics.app_limited)
         .map(server_path_metrics_rate_bps);
@@ -792,28 +925,56 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
         .then_some(entry.product_progress_rate_bps)
         .flatten()
         .filter(|_| entry.delivery_samples > 0);
-    let prior_rate_bps = model_rate_bps
-        .or(peer_hint_rate_bps)
-        .or(product_owner_rate_bps)
-        .unwrap_or_else(|| default_path_rate_bps(entry.key.underlay));
-    let rate_bps = match (
+    // QUIC keeps its carrier bandwidth estimate after placement proof expires.
+    // Use that estimate for pacing/ETA, while `bulk_rate_metrics` remains the
+    // separate authority that may admit or move a whole product flow.
+    let udp_carrier_estimate_bps = if entry.key.underlay == UnderlayProtocol::Udp {
+        local_carrier_metrics
+            .filter(|path_metrics| server_udp_path_metrics_has_durable_rate_estimate(*path_metrics))
+            .map(server_path_metrics_estimate_rate_bps)
+    } else {
+        None
+    };
+    let model_rate_bps = bulk_rate_metrics
+        .map(server_path_metrics_rate_bps)
+        .or(udp_carrier_estimate_bps);
+    let (prior_rate_bps, prior_rate_scope) = if let Some(rate_bps) = model_rate_bps {
+        (rate_bps, ResponseRateScope::PathCapacity)
+    } else if let Some(rate_bps) = peer_hint_rate_bps {
+        (rate_bps, ResponseRateScope::PathCapacity)
+    } else if let Some(rate_bps) = product_owner_rate_bps {
+        (rate_bps, ResponseRateScope::PerFlowGoodput)
+    } else {
+        (
+            default_path_rate_bps(entry.key.underlay),
+            ResponseRateScope::PathCapacity,
+        )
+    };
+    let (rate_bps, rate_scope) = match (
         entry.key.underlay,
         bulk_rate_metrics,
         entry.delivery_rate_bps,
         product_owner_rate_bps,
     ) {
-        (_, Some(path_metrics), _, _) => Some(server_path_metrics_rate_bps(path_metrics)),
+        (_, Some(path_metrics), _, _) => (
+            server_path_metrics_rate_bps(path_metrics),
+            ResponseRateScope::PathCapacity,
+        ),
+        (UnderlayProtocol::Udp, None, _, _) => (prior_rate_bps, prior_rate_scope),
         (UnderlayProtocol::Tcp, None, Some(rate), _)
             if !super::product_delivery_samples_override_startup_prior(entry.delivery_samples) =>
         {
-            Some(rate.max(prior_rate_bps))
+            if rate >= prior_rate_bps {
+                (rate, ResponseRateScope::PerFlowGoodput)
+            } else {
+                (prior_rate_bps, prior_rate_scope)
+            }
         }
-        (_, None, Some(rate), _) => Some(rate),
-        (_, None, None, Some(rate)) => Some(rate),
-        (_, None, None, None) => None,
-    }
-    .unwrap_or(prior_rate_bps)
-    .max(1.0);
+        (UnderlayProtocol::Tcp, None, Some(rate), _) => (rate, ResponseRateScope::PerFlowGoodput),
+        (_, None, None, Some(rate)) => (rate, ResponseRateScope::PerFlowGoodput),
+        (_, None, None, None) => (prior_rate_bps, prior_rate_scope),
+    };
+    let rate_bps = rate_bps.max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
     if let Some(path_metrics) = liveness_metrics {
         snapshot.min_rtt_ms = f64::from(path_metrics.metrics.min_rtt_us.max(1)) / 1000.0;
@@ -852,8 +1013,11 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
         }
     };
     snapshot.confidence = server_output_confidence(entry, now);
-    let lane_load = lane_tracker.snapshot(session_id, entry.key);
-    let session_lane_load = lane_tracker.session_snapshot(session_id);
+    // Response pressure follows product Service ownership. Control-plane Active
+    // attachment roles intentionally remain unchanged across a whole-flow
+    // handoff and therefore cannot describe the carrier doing response work.
+    let lane_load = response_scheduling.path_load;
+    let session_lane_load = response_scheduling.session_load;
     snapshot.active_flows = lane_load.active_flows;
     snapshot.active_latency_sensitive_flows = lane_load.active_latency_sensitive_flows;
     snapshot.session_active_latency_sensitive_flows =
@@ -869,7 +1033,11 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
             latency_headroom.saturating_mul(u64::from(lane_load.active_latency_sensitive_flows));
         snapshot.queue_bytes = snapshot.queue_bytes.saturating_add(protected_queue);
     }
-    snapshot
+    ResponseBulkOutputSnapshot {
+        path: snapshot,
+        rate_scope,
+        quic_capacity_calibration_attempts: response_scheduling.quic_capacity_calibration_attempts,
+    }
 }
 
 pub(in crate::runtime) fn server_bulk_output_eta_ms(
@@ -933,17 +1101,33 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
     let delivery_confidence =
         (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
     let metric_confidence = match server_output_local_path_metrics(entry) {
-        Some(ServerPathMetricsEntry {
-            source: ServerPathMetricsSource::LocalSender,
-            metrics,
-        }) if metrics.has_ack_derived_data_sample || metrics.confidence_ppm > 0 => {
+        Some(
+            path_metrics @ ServerPathMetricsEntry {
+                source: ServerPathMetricsSource::LocalSender,
+                metrics,
+                ..
+            },
+        ) if metrics.has_ack_derived_data_sample
+            || metrics.confidence_ppm > 0
+            || server_quic_capacity_proof(path_metrics).is_some() =>
+        {
+            let capacity_proof = server_quic_capacity_proof(path_metrics);
+            if let Some(proof) = capacity_proof {
+                // Receipt bytes are exact token evidence. Encoder record count
+                // is an integrity check, not a QUIC packet-sample population.
+                let receipt_confidence = (proof.received_bytes as f64
+                    / proof.sample_floor_bytes.max(1) as f64)
+                    .clamp(0.0, 1.0);
+                return delivery_confidence.max(receipt_confidence).clamp(0.0, 1.0);
+            }
             let source_confidence =
                 f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
-            let sample_floor = server_path_metrics_bulk_sample_floor_bytes(metrics).max(1) as f64;
-            let byte_confidence = (metrics.data_sample_bytes as f64 / sample_floor).clamp(0.0, 1.0);
-            let count_confidence = (f64::from(metrics.data_sample_count)
-                / confidence_sample_denominator())
-            .clamp(0.0, 1.0);
+            let sample_bytes = metrics.data_sample_bytes;
+            let sample_count = u64::from(metrics.data_sample_count);
+            let sample_floor = server_path_metrics_bulk_sample_floor_bytes(metrics).max(1);
+            let byte_confidence = (sample_bytes as f64 / sample_floor as f64).clamp(0.0, 1.0);
+            let count_confidence =
+                (sample_count as f64 / confidence_sample_denominator()).clamp(0.0, 1.0);
             let sample_confidence = byte_confidence.min(count_confidence);
             if metrics.has_ack_derived_data_sample {
                 source_confidence * sample_confidence
@@ -960,8 +1144,31 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
     delivery_confidence.max(metric_confidence).clamp(0.0, 1.0)
 }
 
+fn server_quic_capacity_proof(
+    path_metrics: ServerPathMetricsEntry,
+) -> Option<QuicCapacityProofCandidate> {
+    let proof = path_metrics.capacity_proof?;
+    (path_metrics.source == ServerPathMetricsSource::LocalSender
+        && path_metrics.metrics.underlay == UnderlayProtocol::Udp
+        && valid_quic_capacity_proof_candidate_at(proof, Instant::now()))
+    .then_some(proof)
+}
+
 fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
-    path_metrics.metrics.delivery_rate_bps.max(1) as f64
+    server_quic_capacity_proof(path_metrics).map_or_else(
+        || path_metrics.metrics.delivery_rate_bps.max(1) as f64,
+        |proof| proof.rate_bps.max(1) as f64,
+    )
+}
+
+fn server_path_metrics_estimate_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
+    path_metrics
+        .capacity_proof
+        .filter(|proof| well_formed_quic_capacity_proof_candidate(*proof))
+        .map_or_else(
+            || path_metrics.metrics.delivery_rate_bps.max(1) as f64,
+            |proof| proof.rate_bps.max(1) as f64,
+        )
 }
 
 fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
@@ -983,10 +1190,48 @@ fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
     }
 }
 
-fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
+fn server_udp_path_metrics_has_durable_rate_estimate(path_metrics: ServerPathMetricsEntry) -> bool {
+    if path_metrics.source != ServerPathMetricsSource::LocalSender
+        || path_metrics.metrics.underlay != UnderlayProtocol::Udp
+    {
+        return false;
+    }
+    if path_metrics
+        .capacity_proof
+        .is_some_and(well_formed_quic_capacity_proof_candidate)
+    {
+        return true;
+    }
     let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
     let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+    path_metrics.metrics.has_ack_derived_data_sample
+        && path_metrics.metrics.data_sample_count > 0
+        && path_metrics
+            .metrics
+            .data_sample_bytes
+            .saturating_add(packet_accounting_slack)
+            >= sample_floor
+}
+
+fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
+    if server_quic_capacity_proof(path_metrics).is_some() {
+        return true;
+    }
+    let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
+    let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+    let effective_metric_age = Duration::from_micros(u64::from(path_metrics.metrics.metric_age_us))
+        .saturating_add(Instant::now().saturating_duration_since(path_metrics.recorded_at));
+    let udp_bulk_proof_is_eligible = path_metrics.metrics.underlay != UnderlayProtocol::Udp
+        || (!path_metrics.metrics.app_limited
+            && effective_metric_age
+                < quic_bulk_proof_freshness_horizon(
+                    Duration::from_micros(u64::from(path_metrics.metrics.srtt_us.max(1))),
+                    Duration::from_micros(u64::from(path_metrics.metrics.rttvar_us)),
+                ));
     path_metrics.source == ServerPathMetricsSource::LocalSender
+        // Source expiry is authoritative; age is defense in depth if an idle
+        // refresh is delayed or reordered before response admission runs.
+        && udp_bulk_proof_is_eligible
         && path_metrics.metrics.has_ack_derived_data_sample
         && path_metrics.metrics.data_sample_count > 0
         && path_metrics
@@ -1022,6 +1267,16 @@ pub(in crate::runtime) fn reliable_subflow_startup_sample_limit_bytes(
         .min(configured_envelope)
 }
 
+pub(in crate::runtime) fn reliable_quic_capacity_calibration_session_limit_bytes(
+    mux_limits: MuxLimits,
+) -> u64 {
+    (mux_limits.max_path_flight_bytes as u64)
+        .min(mux_limits.max_repair_bytes as u64)
+        .min(mux_limits.max_reorder_bytes as u64)
+        .min(mux_limits.max_stream_window_bytes)
+        .max(1)
+}
+
 pub(in crate::runtime) fn server_output_has_sender_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {
@@ -1034,7 +1289,7 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
         )
 }
 
-pub(in crate::runtime) fn server_output_has_product_bulk_rate_evidence(
+pub(in crate::runtime) fn server_output_has_durable_product_progress(
     entry: &ResponseStreamOutputEntry,
     mux_limits: MuxLimits,
 ) -> bool {
@@ -1065,10 +1320,44 @@ pub(in crate::runtime) fn server_output_has_bulk_rate_evidence_with_limits(
     match entry.key.underlay {
         UnderlayProtocol::Udp => has_local_carrier_bulk,
         UnderlayProtocol::Tcp => {
-            has_local_carrier_bulk
-                || server_output_has_product_bulk_rate_evidence(entry, mux_limits)
+            has_local_carrier_bulk || server_output_has_durable_product_progress(entry, mux_limits)
         }
     }
+}
+
+pub(in crate::runtime) fn server_output_has_service_feed_evidence_with_limits(
+    entry: &ResponseStreamOutputEntry,
+    mux_limits: MuxLimits,
+) -> bool {
+    match entry.key.underlay {
+        UnderlayProtocol::Udp => {
+            server_output_has_durable_product_progress(entry, mux_limits)
+                || matches!(
+                    server_output_local_path_metrics(entry),
+                    Some(path_metrics) if server_udp_path_metrics_has_durable_rate_estimate(path_metrics)
+                )
+        }
+        UnderlayProtocol::Tcp => {
+            server_output_has_bulk_rate_evidence_with_limits(entry, mux_limits)
+        }
+    }
+}
+
+pub(super) fn server_output_quic_capacity_proof_marker(
+    entry: &ResponseStreamOutputEntry,
+) -> Option<QuicCapacityProofCandidate> {
+    server_output_local_path_metrics(entry)
+        .filter(|path_metrics| {
+            path_metrics.source == ServerPathMetricsSource::LocalSender
+                && path_metrics.metrics.underlay == UnderlayProtocol::Udp
+        })
+        .and_then(|path_metrics| path_metrics.capacity_proof)
+}
+
+pub(super) fn server_output_fresh_quic_capacity_proof(
+    entry: &ResponseStreamOutputEntry,
+) -> Option<QuicCapacityProofCandidate> {
+    server_output_local_path_metrics(entry).and_then(server_quic_capacity_proof)
 }
 
 pub(in crate::runtime) fn record_server_sender_decision(
@@ -1235,6 +1524,83 @@ mod tests {
             ),
             "one pre-ACK send cannot make a mostly post-ACK window causal"
         );
+    }
+
+    #[test]
+    fn response_ack_clock_goodput_is_invariant_to_callback_compression() {
+        let bytes = 64 * 1024;
+        let started_at = Instant::now();
+        let mut even = ResponseAckClockRateEvidence::new(started_at);
+        let mut compressed = ResponseAckClockRateEvidence::new(started_at);
+
+        // The first exact ACK establishes the per-output time boundary.
+        let _ = even.observe(bytes, started_at, started_at, started_at);
+        let _ = compressed.observe(bytes, started_at, started_at, started_at);
+
+        let even_step = Duration::from_micros(104_858);
+        let _ = even.observe(bytes, started_at, started_at, started_at + even_step);
+        let _ = even.observe(bytes, started_at, started_at, started_at + even_step * 2);
+
+        // The same bytes arrive after one long control-queue delay followed by
+        // a 1 ms callback tail. The long interval must remain in the ratio.
+        let _ = compressed.observe(
+            bytes,
+            started_at,
+            started_at,
+            started_at + Duration::from_micros(208_716),
+        );
+        let _ = compressed.observe(
+            bytes,
+            started_at,
+            started_at,
+            started_at + Duration::from_micros(209_716),
+        );
+
+        let even_rate = even.goodput_sample().expect("even goodput").rate_bps();
+        let compressed_rate = compressed
+            .goodput_sample()
+            .expect("compressed goodput")
+            .rate_bps();
+        let relative_error = (even_rate - compressed_rate).abs() / even_rate;
+        assert!(relative_error < 0.001, "{even_rate} vs {compressed_rate}");
+        assert!(compressed_rate < 5_100_000.0);
+    }
+
+    #[test]
+    fn response_ack_clock_goodput_keeps_elapsed_for_mixed_assignment_window() {
+        let bytes = 64 * 1024;
+        let started_at = Instant::now();
+        let mut evidence = ResponseAckClockRateEvidence::new(started_at);
+        let _ = evidence.observe(bytes, started_at, started_at, started_at);
+
+        let mixed_acked_at = started_at + Duration::from_millis(200);
+        let mixed = evidence.observe(
+            bytes,
+            started_at + Duration::from_millis(1),
+            started_at + Duration::from_millis(1),
+            mixed_acked_at,
+        );
+        assert!(matches!(
+            mixed,
+            ResponseAckClockRateEvidenceUpdate::Proven { sample: None, .. }
+        ));
+        let mixed_rate = evidence
+            .goodput_sample()
+            .expect("mixed window still has causal goodput")
+            .rate_bps();
+
+        let _ = evidence.observe(
+            bytes,
+            started_at,
+            started_at,
+            mixed_acked_at + Duration::from_millis(1),
+        );
+        let tail_rate = evidence
+            .goodput_sample()
+            .expect("compressed tail goodput")
+            .rate_bps();
+        assert!(tail_rate < 5_300_000.0, "compressed tail was {tail_rate}");
+        assert!(tail_rate > mixed_rate);
     }
 
     #[test]
@@ -1878,10 +2244,11 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 1,
             owner_data_acked_bytes: 0,
-            last_delivery_at: Some(Instant::now()),
             local_path_metrics: None,
             peer_path_metrics: None,
         };
@@ -1915,14 +2282,17 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: Some(product_rate),
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 1,
             owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(
                 MuxLimits::default(),
             ),
-            last_delivery_at: Some(Instant::now()),
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -1954,6 +2324,10 @@ mod tests {
         };
 
         assert!(!server_output_has_bulk_rate_evidence(&entry));
+        assert!(
+            server_output_has_service_feed_evidence_with_limits(&entry, MuxLimits::default()),
+            "unique product ACK progress may release the current QUIC Service feed without replacing carrier rate"
+        );
         let snapshot = server_bulk_output_snapshot(
             &entry,
             SessionId(78),
@@ -1996,10 +2370,11 @@ mod tests {
                 product_queue_bytes: 0,
                 product_progress_rate_bps: Some(80_000_000.0),
                 delivery_rate_bps: (underlay == UnderlayProtocol::Tcp).then_some(80_000_000.0),
+                tcp_ack_clock_rate_bps: None,
+                tcp_product_rate_evidence: None,
                 srtt_ms: Some(40.0),
                 delivery_samples: 1,
                 owner_data_acked_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
-                last_delivery_at: Some(Instant::now()),
                 local_path_metrics: None,
                 peer_path_metrics: None,
             };
@@ -2057,12 +2432,15 @@ mod tests {
                 product_queue_bytes: 0,
                 product_progress_rate_bps: None,
                 delivery_rate_bps: None,
+                tcp_ack_clock_rate_bps: None,
+                tcp_product_rate_evidence: None,
                 srtt_ms: None,
                 delivery_samples: 0,
                 owner_data_acked_bytes: 0,
-                last_delivery_at: None,
                 local_path_metrics: Some(ServerPathMetricsEntry {
                     source: ServerPathMetricsSource::LocalSender,
+                    recorded_at: Instant::now(),
+                    capacity_proof: None,
                     metrics,
                 }),
                 peer_path_metrics: None,
@@ -2106,13 +2484,213 @@ mod tests {
     }
 
     #[test]
-    fn udp_bulk_rate_evidence_survives_later_app_limited_metric_poll() {
+    fn aged_udp_metric_loses_handoff_rights_but_keeps_sender_reachability() {
+        let metrics = PathMetrics {
+            path_id: PathId(22),
+            underlay: UnderlayProtocol::Udp,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 20_000,
+            srtt_us: 20_000,
+            rttvar_us: 5_000,
+            jitter_us: 5_000,
+            delivery_rate_bps: 200_000_000,
+            pacing_rate_bps: 200_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+            inflight_hi_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+            confidence_ppm: 1_000_000,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 32,
+            data_sample_bytes: 4 * PATH_OPEN_SCORE_BYTES as u64,
+        };
+        let freshness_horizon = quic_bulk_proof_freshness_horizon(
+            Duration::from_micros(u64::from(metrics.srtt_us)),
+            Duration::from_micros(u64::from(metrics.rttvar_us)),
+        );
+        let local = |metrics| ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::LocalSender,
+            metrics,
+            recorded_at: Instant::now(),
+            capacity_proof: None,
+        };
+
+        let mut fresh = metrics;
+        fresh.metric_age_us =
+            u32::try_from((freshness_horizon - QUIC_TIMER_GRANULARITY).as_micros())
+                .expect("test freshness horizon");
+        assert!(server_path_metrics_has_bulk_rate_evidence(local(fresh)));
+
+        let mut aged = metrics;
+        aged.metric_age_us =
+            u32::try_from(freshness_horizon.as_micros()).expect("test freshness horizon");
+        let aged = local(aged);
+        assert!(!server_path_metrics_has_bulk_rate_evidence(aged));
+        assert!(server_path_metrics_has_sender_evidence(aged));
+
+        let delayed_idle_refresh = ServerPathMetricsEntry {
+            source: ServerPathMetricsSource::LocalSender,
+            metrics,
+            recorded_at: Instant::now() - freshness_horizon,
+            capacity_proof: None,
+        };
+        assert!(!server_path_metrics_has_bulk_rate_evidence(
+            delayed_idle_refresh
+        ));
+        assert!(server_path_metrics_has_sender_evidence(
+            delayed_idle_refresh
+        ));
+    }
+
+    #[test]
+    fn accepted_quic_capacity_marker_uses_frozen_floor_rate_and_deadline() {
+        let sample_floor = reliable_subflow_startup_sample_limit_bytes(MuxLimits::default());
+        let accepted_at = Instant::now();
+        let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+        let required_proof_bytes = sample_floor - accounting_slack;
+        let proof_elapsed = Duration::from_millis(10);
+        let candidate = QuicCapacityProofCandidate {
+            token: 31,
+            train_bytes: sample_floor,
+            sample_floor_bytes: sample_floor,
+            accounting_slack_bytes: accounting_slack,
+            warmup_bytes: 0,
+            required_proof_bytes,
+            written_bytes: sample_floor,
+            written_data_frame_count: 32,
+            receipt_confirmed: true,
+            received_bytes: sample_floor,
+            proof_elapsed,
+            rate_bps: quic_capacity_receipt_rate_bps(sample_floor, proof_elapsed)
+                .expect("valid receipt rate"),
+            accepted_at,
+            expires_at: accepted_at + Duration::from_secs(1),
+            proof_validity: Duration::from_secs(1),
+        };
+        let metrics = PathMetrics {
+            path_id: PathId(23),
+            underlay: UnderlayProtocol::Udp,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: u32::MAX,
+            min_rtt_us: 20_000,
+            srtt_us: 1,
+            rttvar_us: 0,
+            jitter_us: 0,
+            delivery_rate_bps: 1,
+            pacing_rate_bps: 1,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 1,
+            inflight_hi_bytes: 1,
+            confidence_ppm: 1_000_000,
+            app_limited: true,
+            has_ack_derived_data_sample: false,
+            data_sample_count: 0,
+            data_sample_bytes: 0,
+        };
+        let accepted = ServerPathMetricsEntry {
+            metrics,
+            source: ServerPathMetricsSource::LocalSender,
+            recorded_at: accepted_at,
+            capacity_proof: Some(candidate),
+        };
+        assert!(server_path_metrics_has_bulk_rate_evidence(accepted));
+        assert_eq!(
+            server_path_metrics_rate_bps(accepted),
+            candidate.rate_bps as f64
+        );
+        let (commands, _receivers) = reliable_path_command_channels(8);
+        let output = ResponseStreamOutputEntry {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Udp,
+                path_id: metrics.path_id,
+            },
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: 1,
+            commands,
+            role: StreamOpenRole::Validation,
+            owner_data_in_flight_bytes: 0,
+            bytes_in_flight: 0,
+            product_queue_bytes: 0,
+            product_progress_rate_bps: None,
+            delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
+            srtt_ms: None,
+            delivery_samples: 0,
+            owner_data_acked_bytes: 0,
+            local_path_metrics: Some(accepted),
+            peer_path_metrics: None,
+        };
+        assert_eq!(
+            server_output_confidence(&output, Instant::now()),
+            1.0,
+            "exact receipt bytes establish confidence without generic ACK samples"
+        );
+        let lane_tracker = ServerPathLaneTracker::default();
+        let accepted_snapshot = server_bulk_output_snapshot(
+            &output,
+            SessionId(77),
+            FlowLane::Throughput,
+            &lane_tracker,
+            MuxLimits::default(),
+            Instant::now(),
+        );
+        assert_eq!(
+            accepted_snapshot.delivery_rate_bps,
+            candidate.rate_bps as f64
+        );
+
+        let expired = ServerPathMetricsEntry {
+            capacity_proof: Some(QuicCapacityProofCandidate {
+                accepted_at: accepted_at - Duration::from_secs(2),
+                expires_at: accepted_at - Duration::from_secs(1),
+                ..candidate
+            }),
+            ..accepted
+        };
+        assert!(!server_path_metrics_has_bulk_rate_evidence(expired));
+        assert_eq!(
+            server_path_metrics_estimate_rate_bps(expired),
+            candidate.rate_bps as f64
+        );
+        let mut expired_output = output;
+        expired_output.local_path_metrics = Some(expired);
+        let expired_snapshot = server_bulk_output_snapshot(
+            &expired_output,
+            SessionId(77),
+            FlowLane::Throughput,
+            &lane_tracker,
+            MuxLimits::default(),
+            Instant::now(),
+        );
+        assert_eq!(
+            expired_snapshot.delivery_rate_bps,
+            candidate.rate_bps as f64
+        );
+        assert!(!server_output_has_bulk_rate_evidence(&expired_output));
+    }
+
+    #[test]
+    fn udp_bulk_rate_evidence_requires_source_fresh_non_app_limited_state() {
         let (commands, _receivers) = reliable_path_command_channels(8);
         let key = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(0),
         };
-        let entry = ResponseStreamOutputEntry {
+        let mut entry = ResponseStreamOutputEntry {
             key,
             path_instance_id: next_server_carrier_path_instance_id(),
             incarnation: 1,
@@ -2123,12 +2701,15 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: Some(500_000_000.0),
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
-            last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2160,8 +2741,37 @@ mod tests {
         };
 
         assert!(
+            !server_output_has_bulk_rate_evidence(&entry),
+            "the QUIC tracker keeps fresh historical proof non-app-limited; a published app-limited state cannot authorize placement"
+        );
+        assert!(
+            server_output_has_service_feed_evidence_with_limits(&entry, MuxLimits::default()),
+            "a substantial local ACK-derived QUIC sample may feed its current Service while native QUIC still owns cwnd and pacing"
+        );
+        assert!(server_output_has_sender_evidence(&entry));
+        let snapshot = server_bulk_output_snapshot(
+            &entry,
+            SessionId(77),
+            FlowLane::Throughput,
+            &ServerPathLaneTracker::default(),
+            MuxLimits::default(),
+            Instant::now(),
+        );
+        assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
+        assert!(
+            !server_output_has_bulk_rate_evidence(&entry),
+            "retaining a QUIC bandwidth estimate must not mint placement authority"
+        );
+
+        entry
+            .local_path_metrics
+            .as_mut()
+            .expect("local QUIC sender metrics")
+            .metrics
+            .app_limited = false;
+        assert!(
             server_output_has_bulk_rate_evidence(&entry),
-            "a later app-limited metrics poll must not erase existing non-app-limited QUIC bulk evidence"
+            "the same full-volume sample becomes optional-path proof only after the carrier reports non-app-limited delivery"
         );
     }
 
@@ -2183,12 +2793,15 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
-            last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2263,12 +2876,15 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
-            last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2322,12 +2938,15 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
-            last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2400,12 +3019,15 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
-            last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2461,12 +3083,15 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
-            last_delivery_at: None,
             local_path_metrics: Some(ServerPathMetricsEntry {
                 source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2488,7 +3113,7 @@ mod tests {
                     inflight_limit_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
                     inflight_hi_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
                     confidence_ppm: 1_000_000,
-                    app_limited: true,
+                    app_limited: false,
                     has_ack_derived_data_sample: true,
                     data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
                     data_sample_bytes: sample_floor.saturating_sub(TRANSPORT_MSS_BYTES as u64),
@@ -2521,12 +3146,13 @@ mod tests {
             product_queue_bytes: 0,
             product_progress_rate_bps: Some(prior_rate / 10.0),
             delivery_rate_bps: Some(prior_rate / 10.0),
+            tcp_ack_clock_rate_bps: None,
+            tcp_product_rate_evidence: None,
             srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(
                 MuxLimits::default(),
             ),
-            last_delivery_at: Some(Instant::now()),
             local_path_metrics: None,
             peer_path_metrics: None,
         };

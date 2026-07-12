@@ -110,9 +110,9 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::StreamData { payload, .. } | Frame::DatagramData { payload, .. } => {
             payload.len().saturating_add(32)
         }
-        Frame::PathMtuProbe { payload, .. } | Frame::PathProofData { payload, .. } => {
-            payload.len().saturating_add(16)
-        }
+        Frame::PathMtuProbe { payload, .. }
+        | Frame::PathProofData { payload, .. }
+        | Frame::PathCapacityData { payload, .. } => payload.len().saturating_add(16),
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::OpenStream { .. } => 128,
         _ => 64,
@@ -330,6 +330,38 @@ fn encode_payload(
             put_u64(out, *proof_id);
             put_u32(out, *payload_bytes);
             Ok(FrameKind::PathProofAck)
+        }
+        Frame::PathCapacityData {
+            path_id,
+            calibration_id,
+            payload,
+        } => {
+            encode_payload_bytes_len(payload.len(), limits)?;
+            put_u16(out, path_id.0);
+            put_u64(out, *calibration_id);
+            put_u32(out, payload.len() as u32);
+            out.extend_from_slice(payload);
+            Ok(FrameKind::PathCapacityData)
+        }
+        Frame::PathCapacityFinish {
+            path_id,
+            calibration_id,
+            payload_bytes,
+        } => {
+            put_u16(out, path_id.0);
+            put_u64(out, *calibration_id);
+            put_u64(out, *payload_bytes);
+            Ok(FrameKind::PathCapacityFinish)
+        }
+        Frame::PathCapacityReceipt {
+            path_id,
+            calibration_id,
+            received_payload_bytes,
+        } => {
+            put_u16(out, path_id.0);
+            put_u64(out, *calibration_id);
+            put_u64(out, *received_payload_bytes);
+            Ok(FrameKind::PathCapacityReceipt)
         }
         Frame::OpenStream {
             stream_id,
@@ -553,6 +585,26 @@ fn decode_payload(
             path_id: PathId(reader.get_u16()?),
             proof_id: reader.get_u64()?,
             payload_bytes: reader.get_u32()?,
+        }),
+        FrameKind::PathCapacityData => {
+            let path_id = PathId(reader.get_u16()?);
+            let calibration_id = reader.get_u64()?;
+            let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
+            Ok(Frame::PathCapacityData {
+                path_id,
+                calibration_id,
+                payload,
+            })
+        }
+        FrameKind::PathCapacityFinish => Ok(Frame::PathCapacityFinish {
+            path_id: PathId(reader.get_u16()?),
+            calibration_id: reader.get_u64()?,
+            payload_bytes: reader.get_u64()?,
+        }),
+        FrameKind::PathCapacityReceipt => Ok(Frame::PathCapacityReceipt {
+            path_id: PathId(reader.get_u16()?),
+            calibration_id: reader.get_u64()?,
+            received_payload_bytes: reader.get_u64()?,
         }),
         FrameKind::OpenStream => Ok(Frame::OpenStream {
             stream_id: StreamId(reader.get_u64()?),
@@ -1167,6 +1219,9 @@ enum FrameKind {
     StreamDetach = 30,
     PathProofData = 31,
     PathProofAck = 32,
+    PathCapacityData = 33,
+    PathCapacityFinish = 34,
+    PathCapacityReceipt = 35,
 }
 
 impl FrameKind {
@@ -1203,6 +1258,9 @@ impl FrameKind {
             30 => Ok(Self::StreamDetach),
             31 => Ok(Self::PathProofData),
             32 => Ok(Self::PathProofAck),
+            33 => Ok(Self::PathCapacityData),
+            34 => Ok(Self::PathCapacityFinish),
+            35 => Ok(Self::PathCapacityReceipt),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1633,6 +1691,25 @@ mod tests {
         round_trip(Frame::RxRateHint {
             path_id: PathId(3),
             hint: RateHint::BitsPerSecond(300_000_000),
+        });
+    }
+
+    #[test]
+    fn path_capacity_protocol_round_trips_without_product_stream_identity() {
+        round_trip(Frame::PathCapacityData {
+            path_id: PathId(7),
+            calibration_id: 42,
+            payload: Bytes::from_static(b"native-quic-capacity-sample"),
+        });
+        round_trip(Frame::PathCapacityFinish {
+            path_id: PathId(7),
+            calibration_id: 42,
+            payload_bytes: 27,
+        });
+        round_trip(Frame::PathCapacityReceipt {
+            path_id: PathId(7),
+            calibration_id: 42,
+            received_payload_bytes: 27,
         });
     }
 

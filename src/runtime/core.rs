@@ -746,13 +746,12 @@ impl ClientPathHealthRecord {
             self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
             self.carrier_rttvar_ms = Some(metrics.rttvar.as_secs_f64() * 1000.0);
         }
-        if metrics.delivery_sample_count > 0 {
-            self.carrier_delivery_rate_bps = Some(metrics.delivery_rate_bps.max(1.0));
-            self.carrier_delivery_samples =
-                u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX);
-            self.carrier_delivery_sample_bytes = metrics.delivery_sample_bytes;
-            self.carrier_last_delivery_at = metrics.last_delivery_sample_at;
-        }
+        self.carrier_delivery_rate_bps =
+            (metrics.delivery_sample_count > 0).then_some(metrics.delivery_rate_bps.max(1.0));
+        self.carrier_delivery_samples =
+            u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX);
+        self.carrier_delivery_sample_bytes = metrics.delivery_sample_bytes;
+        self.carrier_last_delivery_at = metrics.last_delivery_sample_at;
         if metrics.ack_derived_data_seen {
             self.carrier_ack_derived_data_seen = true;
         }

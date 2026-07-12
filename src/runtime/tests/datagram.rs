@@ -1197,6 +1197,15 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             delivery_sample_count: 0,
             delivery_sample_bytes: 0,
             last_delivery_sample_at: None,
+            bulk_proof_expires_at: None,
+            latest_delivery_sample_bytes: 0,
+            latest_delivery_sample_count: 0,
+            latest_carrier_ack_elapsed: None,
+            latest_rate_sample_elapsed: None,
+            capacity_proof_candidate: None,
+            capacity_probe: None,
+            #[cfg(feature = "lab-diagnostics")]
+            ack_poll: QuicAckPollDiagnostics::default(),
         });
     }
 
@@ -1231,6 +1240,15 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             delivery_sample_count: 2,
             delivery_sample_bytes: 512 * 1024,
             last_delivery_sample_at: Some(now),
+            bulk_proof_expires_at: None,
+            latest_delivery_sample_bytes: 512 * 1024,
+            latest_delivery_sample_count: 2,
+            latest_carrier_ack_elapsed: Some(Duration::from_millis(20)),
+            latest_rate_sample_elapsed: Some(Duration::from_millis(20)),
+            capacity_proof_candidate: None,
+            capacity_probe: None,
+            #[cfg(feature = "lab-diagnostics")]
+            ack_poll: QuicAckPollDiagnostics::default(),
         });
     }
 

@@ -76,6 +76,13 @@ pub(super) fn transport_pto_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
     srtt + (rttvar * 4).max(QUIC_TIMER_GRANULARITY) + QUIC_MAX_ACK_DELAY
 }
 
+pub(super) fn quic_bulk_proof_freshness_horizon(srtt: Duration, rttvar: Duration) -> Duration {
+    // A rate proof loses placement rights at the same three-PTO boundary where
+    // QUIC declares persistent congestion; reachability evidence is separate.
+    transport_pto_from_ms(srtt.as_secs_f64() * 1000.0, rttvar.as_secs_f64() * 1000.0)
+        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+}
+
 pub(super) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
     path.map(|path| {
         let srtt_ms = path.srtt_ms.max(1.0);

@@ -5,6 +5,10 @@ use std::time::Duration;
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 
+// Raw UDP socket setup only. The QUIC carrier consumes UDP below mptunnel,
+// while application DatagramData forwarding lives in runtime target workers;
+// neither protocol's scheduling or reliability policy belongs here.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpConnectOptions {
     pub source_ip: Option<IpAddr>,

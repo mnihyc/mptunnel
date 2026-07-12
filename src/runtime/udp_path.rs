@@ -2,6 +2,11 @@ use super::*;
 use tokio::net::lookup_host;
 use tokio::sync::Mutex as AsyncMutex;
 
+// QUIC-backed carrier runtime for paths whose underlay is UDP. It owns
+// connection reuse, retry, carrier frame I/O, and native QUIC evidence; product
+// offsets, response ownership, and cross-carrier ranking stay in reliable_path
+// and sender_service. Application UDP target flows are handled separately.
+
 #[derive(Clone)]
 pub(super) struct ClientUdpPathSessionHandle {
     runtime: ClientUdpPathSessionRuntime,
@@ -136,20 +141,95 @@ struct UdpPathMetricTracker {
 
 #[derive(Debug, Default)]
 struct QuicPathMetricTracker {
-    last_product_data_written_bytes: u64,
-    product_data_pending_ack_bytes: u64,
-    last_observed_at: Option<Instant>,
+    last_delivery_evidence_written_bytes: u64,
+    delivery_evidence_pending_ack_bytes: u64,
     delivery_rate_bps: Option<f64>,
     ack_derived_data_seen: bool,
+    pending_non_app_limited_sample_bytes: u64,
+    pending_non_app_limited_sample_count: u64,
+    pending_non_app_limited_sample_elapsed: Duration,
     delivery_sample_count: u64,
     delivery_sample_bytes: u64,
     last_delivery_sample_at: Option<Instant>,
+    bulk_proof_expires_at: Option<Instant>,
+    // Carrier snapshots are cumulative and sticky. Remember registry acceptance,
+    // not observation, so a transient publication race may retry the same token.
+    last_accepted_capacity_probe_token: Option<u64>,
+    pending_capacity_proof_candidate: Option<QuicCapacityProofCandidate>,
     min_rtt: Option<Duration>,
+}
+
+// Capacity records share one ordered QUIC stream. Tracking one bounded epoch
+// makes Finish an exact receipt boundary without allocating the train itself.
+#[derive(Debug)]
+struct QuicCapacityReceiveTracker {
+    active: Option<(u64, u64)>,
+    limit_bytes: u64,
+}
+
+impl QuicCapacityReceiveTracker {
+    fn new(limit_bytes: u64) -> Self {
+        Self {
+            active: None,
+            limit_bytes: limit_bytes.max(1),
+        }
+    }
+
+    fn record_data(&mut self, token: u64, payload_bytes: usize) -> Result<(), RuntimeError> {
+        if token == 0 || payload_bytes == 0 {
+            return Err(RuntimeError::Protocol("invalid QUIC capacity data"));
+        }
+        let payload_bytes = payload_bytes as u64;
+        match self.active {
+            Some((active_token, received_bytes)) if active_token == token => {
+                let received_bytes = received_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or(RuntimeError::Protocol("QUIC capacity receipt overflow"))?;
+                if received_bytes > self.limit_bytes {
+                    return Err(RuntimeError::Protocol(
+                        "QUIC capacity data exceeds the session envelope",
+                    ));
+                }
+                self.active = Some((token, received_bytes));
+            }
+            None if payload_bytes <= self.limit_bytes => self.active = Some((token, payload_bytes)),
+            None => {
+                return Err(RuntimeError::Protocol(
+                    "QUIC capacity data exceeds the session envelope",
+                ));
+            }
+            Some(_) => {
+                return Err(RuntimeError::Protocol(
+                    "interleaved QUIC capacity calibration tokens",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, token: u64, declared_bytes: u64) -> Result<u64, RuntimeError> {
+        let Some((active_token, received_bytes)) = self.active.take() else {
+            return Err(RuntimeError::Protocol(
+                "QUIC capacity finish has no data epoch",
+            ));
+        };
+        if token == 0
+            || token != active_token
+            || declared_bytes == 0
+            || declared_bytes != received_bytes
+        {
+            return Err(RuntimeError::Protocol(
+                "QUIC capacity finish does not match received data",
+            ));
+        }
+        Ok(received_bytes)
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct UdpPathSendStream {
     stream: quic_carrier::SendStream,
+    connection: UdpPathConnection,
 }
 
 #[derive(Debug)]
@@ -211,7 +291,10 @@ impl UdpPathConnection {
     async fn open_bi(&self) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
         let (send, recv) = self.connection.open_bi().await?;
         Ok((
-            UdpPathSendStream { stream: send },
+            UdpPathSendStream {
+                stream: send,
+                connection: self.clone(),
+            },
             UdpPathRecvStream { stream: recv },
         ))
     }
@@ -219,7 +302,10 @@ impl UdpPathConnection {
     async fn accept_bi(&self) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
         let (send, recv) = self.connection.accept_bi().await?;
         Ok((
-            UdpPathSendStream { stream: send },
+            UdpPathSendStream {
+                stream: send,
+                connection: self.clone(),
+            },
             UdpPathRecvStream { stream: recv },
         ))
     }
@@ -228,8 +314,34 @@ impl UdpPathConnection {
         self.connection.close();
     }
 
+    fn capacity_probe_active(&self) -> bool {
+        self.connection.capacity_probe_active()
+    }
+
+    async fn wait_for_capacity_probe_release(&self) {
+        self.connection.wait_for_capacity_probe_release().await;
+    }
+
     fn is_closed(&self) -> bool {
         self.connection.is_closed()
+    }
+
+    fn retire_capacity_probe(&self, token: u64) -> bool {
+        self.connection.retire_capacity_probe(token)
+    }
+
+    fn cancel_capacity_probe(&self, token: u64) -> bool {
+        self.connection.cancel_capacity_probe(token)
+    }
+
+    fn confirm_capacity_probe_receipt(
+        &self,
+        token: u64,
+        received_payload_bytes: u64,
+        received_at: Instant,
+    ) -> bool {
+        self.connection
+            .confirm_capacity_probe_receipt(token, received_payload_bytes, received_at)
     }
 
     async fn tx_metrics(
@@ -244,25 +356,172 @@ impl UdpPathConnection {
 }
 
 impl QuicPathMetricTracker {
+    fn expire_stale_bulk_proof(&mut self, now: Instant) {
+        let proof_is_stale = self
+            .bulk_proof_expires_at
+            .is_some_and(|expires_at| now >= expires_at);
+        if !proof_is_stale {
+            return;
+        }
+
+        // The deadline owns placement authority, not estimator history. Keep
+        // the measured rate/sample state for scheduling; `app_limited` and age
+        // prevent it from silently renewing the expired right.
+        self.bulk_proof_expires_at = None;
+    }
+
+    fn capacity_proof_candidate(
+        &mut self,
+        probe: Option<quic_carrier::CapacityProbeMetrics>,
+        now: Instant,
+    ) -> Option<QuicCapacityProofCandidate> {
+        let probe = probe?;
+        if self.last_accepted_capacity_probe_token == Some(probe.token) {
+            return None;
+        }
+        // Receipt and a committed write atomically terminalize the carrier
+        // epoch. Accepting the same fields in a nonterminal phase hides a broken
+        // carrier transition rather than preserving useful proof.
+        if probe.phase != quic_carrier::CapacityProbePhase::Proven {
+            return None;
+        }
+        if let Some(candidate) = self
+            .pending_capacity_proof_candidate
+            .filter(|candidate| candidate.token == probe.token)
+        {
+            return (now < candidate.expires_at).then_some(candidate);
+        }
+        if !probe.write_committed
+            || probe.train_payload_bytes == 0
+            || probe.written_payload_bytes != probe.train_payload_bytes
+            || probe.written_data_frame_count == 0
+            || probe.required_timed_carrier_bytes == 0
+            || probe.required_timed_carrier_bytes
+                != probe.sample_floor_bytes.saturating_sub(
+                    (PATH_OPEN_SCORE_BYTES as u64).min(probe.sample_floor_bytes / 8),
+                )
+            || probe.sample_floor_bytes > probe.train_payload_bytes
+            || probe
+                .warmup_carrier_bytes
+                .saturating_add(probe.required_timed_carrier_bytes)
+                > probe.train_payload_bytes
+            || probe.proof_validity.is_zero()
+            || probe.receipt_received_payload_bytes != probe.train_payload_bytes
+        {
+            return None;
+        }
+        let receipt_at = probe.receipt_at?;
+        if probe.proved_at != Some(receipt_at) || receipt_at >= probe.expires_at {
+            return None;
+        }
+        let receipt_elapsed = probe.receipt_elapsed.filter(|elapsed| !elapsed.is_zero())?;
+        // Receipt time owns both the service interval and proof lifetime.
+        // Use its full cold-start interval: subtracting an RTT can create an
+        // unstable near-zero denominator, while native timing keeps changing.
+        let proof_elapsed = receipt_elapsed.max(QUIC_TIMER_GRANULARITY);
+        let expires_at = receipt_at.checked_add(probe.proof_validity)?;
+        if now >= expires_at {
+            return None;
+        }
+        let rate_bps = quic_capacity_receipt_rate_bps(probe.train_payload_bytes, proof_elapsed)?;
+        let candidate = QuicCapacityProofCandidate {
+            token: probe.token,
+            train_bytes: probe.train_payload_bytes,
+            sample_floor_bytes: probe.sample_floor_bytes,
+            accounting_slack_bytes: probe
+                .sample_floor_bytes
+                .saturating_sub(probe.required_timed_carrier_bytes),
+            warmup_bytes: probe.warmup_carrier_bytes,
+            required_proof_bytes: probe.required_timed_carrier_bytes,
+            written_bytes: probe.written_payload_bytes,
+            written_data_frame_count: probe.written_data_frame_count,
+            receipt_confirmed: true,
+            received_bytes: probe.receipt_received_payload_bytes,
+            proof_elapsed,
+            rate_bps,
+            accepted_at: receipt_at,
+            expires_at,
+            proof_validity: probe.proof_validity,
+        };
+        // Freeze rate and freshness on first sight. Repeated registry attempts
+        // reuse this exact candidate instead of extending a delayed proof.
+        self.pending_capacity_proof_candidate = Some(candidate);
+        (now < expires_at).then_some(candidate)
+    }
+
+    fn accept_capacity_proof(
+        &mut self,
+        _metrics: &mut UdpPathMetrics,
+        candidate: QuicCapacityProofCandidate,
+    ) {
+        debug_assert_ne!(
+            self.last_accepted_capacity_probe_token,
+            Some(candidate.token)
+        );
+        self.last_accepted_capacity_probe_token = Some(candidate.token);
+        self.pending_capacity_proof_candidate = None;
+    }
+
+    fn terminal_capacity_probe_to_retire(
+        &self,
+        probe: Option<quic_carrier::CapacityProbeMetrics>,
+        now: Instant,
+    ) -> Option<u64> {
+        let probe = probe?;
+        match probe.phase {
+            quic_carrier::CapacityProbePhase::Expired
+            | quic_carrier::CapacityProbePhase::Aborted => Some(probe.token),
+            quic_carrier::CapacityProbePhase::Proven => {
+                if self.last_accepted_capacity_probe_token == Some(probe.token) {
+                    return Some(probe.token);
+                }
+                match self.pending_capacity_proof_candidate {
+                    Some(candidate) if candidate.token == probe.token => {
+                        (now >= candidate.expires_at).then_some(probe.token)
+                    }
+                    // A terminal snapshot that cannot form a proof must not
+                    // retain the exclusive carrier epoch indefinitely.
+                    _ => Some(probe.token),
+                }
+            }
+            quic_carrier::CapacityProbePhase::Writing
+            | quic_carrier::CapacityProbePhase::Measuring
+            | quic_carrier::CapacityProbePhase::ProvenDraining => None,
+        }
+    }
+
+    fn retire_capacity_candidate(&mut self, token: u64) {
+        if self
+            .pending_capacity_proof_candidate
+            .is_some_and(|candidate| candidate.token == token)
+        {
+            self.pending_capacity_proof_candidate = None;
+        }
+    }
+
     fn observe(
         &mut self,
         stats: quinn::ConnectionStats,
         congestion: quic_carrier::CongestionMetrics,
         direction: u8,
     ) -> UdpPathMetrics {
-        let now = Instant::now();
-        let elapsed = self
-            .last_observed_at
-            .map(|seen| now.saturating_duration_since(seen))
-            .unwrap_or_default();
-        self.last_observed_at = Some(now);
-        let product_data_delta = congestion
-            .product_data_written_bytes
-            .saturating_sub(self.last_product_data_written_bytes);
-        self.last_product_data_written_bytes = congestion.product_data_written_bytes;
-        self.product_data_pending_ack_bytes = self
-            .product_data_pending_ack_bytes
-            .saturating_add(product_data_delta);
+        self.observe_at(stats, congestion, direction, Instant::now())
+    }
+
+    fn observe_at(
+        &mut self,
+        stats: quinn::ConnectionStats,
+        congestion: quic_carrier::CongestionMetrics,
+        direction: u8,
+        now: Instant,
+    ) -> UdpPathMetrics {
+        let delivery_evidence_delta = congestion
+            .delivery_evidence_written_bytes
+            .saturating_sub(self.last_delivery_evidence_written_bytes);
+        self.last_delivery_evidence_written_bytes = congestion.delivery_evidence_written_bytes;
+        self.delivery_evidence_pending_ack_bytes = self
+            .delivery_evidence_pending_ack_bytes
+            .saturating_add(delivery_evidence_delta);
 
         if stats.path.rtt > Duration::ZERO {
             self.min_rtt = Some(
@@ -271,7 +530,10 @@ impl QuicPathMetricTracker {
             );
         }
         let rtt = stats.path.rtt.max(QUIC_TIMER_GRANULARITY);
+        let rttvar = rtt / 4;
         let min_rtt = self.min_rtt.unwrap_or(rtt);
+        let bulk_proof_freshness_horizon = quic_bulk_proof_freshness_horizon(rtt, rttvar);
+        self.expire_stale_bulk_proof(now);
         let congestion_window = congestion.congestion_window.max(stats.path.cwnd);
         let carrier_capacity_known = congestion.pacing_rate_bps.is_some() || congestion_window > 0;
         let bytes_in_flight = congestion.bytes_in_flight.unwrap_or(0);
@@ -311,80 +573,185 @@ impl QuicPathMetricTracker {
         };
 
         let newly_acked_bytes = congestion.newly_acked_bytes.unwrap_or(0);
-        let product_data_pending_before_ack = self.product_data_pending_ack_bytes;
-        let product_newly_acked_bytes = newly_acked_bytes.min(product_data_pending_before_ack);
-        let product_data_ack_context = product_newly_acked_bytes > 0;
-        let mut app_limited = congestion.app_limited || !product_data_ack_context;
-        if product_newly_acked_bytes > 0 {
+        let non_app_limited_acked_bytes = congestion
+            .non_app_limited_acked_bytes
+            .unwrap_or(0)
+            .min(newly_acked_bytes);
+        let timed_non_app_limited_acked_bytes = congestion
+            .timed_non_app_limited_acked_bytes
+            .unwrap_or(0)
+            .min(non_app_limited_acked_bytes);
+        let delivery_evidence_pending_before_ack = self.delivery_evidence_pending_ack_bytes;
+        let delivery_evidence_newly_acked_bytes =
+            newly_acked_bytes.min(delivery_evidence_pending_before_ack);
+        let timed_non_app_limited_delivery_evidence_bytes =
+            timed_non_app_limited_acked_bytes.min(delivery_evidence_newly_acked_bytes);
+        let carrier_ack_elapsed = congestion
+            .non_app_limited_ack_elapsed
+            .filter(|elapsed| !elapsed.is_zero());
+        let timed_non_app_limited_evidence =
+            carrier_ack_elapsed.is_some() && timed_non_app_limited_delivery_evidence_bytes > 0;
+        // A first/compressed zero-span ACK batch proves reachability but has no
+        // carrier-clock denominator and therefore cannot enter the rate model.
+        if delivery_evidence_newly_acked_bytes > 0 {
             self.ack_derived_data_seen = true;
-            self.product_data_pending_ack_bytes = self
-                .product_data_pending_ack_bytes
-                .saturating_sub(product_newly_acked_bytes);
+            self.delivery_evidence_pending_ack_bytes = self
+                .delivery_evidence_pending_ack_bytes
+                .saturating_sub(delivery_evidence_newly_acked_bytes);
         }
-        // `product_data_pending_ack_bytes` is the part of the product stream that
-        // mptunnel has handed to Quinn but has not yet observed as carrier-ACKed.
-        // Quinn's write future completes when bytes are accepted into QUIC's
-        // stream/send buffers, not when they leave the connection. Treat that
-        // backlog as carrier queue debt, otherwise the product scheduler can
-        // overfill QUIC by tens of MiB while believing the path is empty.
+        // Generic evidence counts product payload only. The connection-wide
+        // pending/flight counters still include an exclusive capacity train so
+        // scheduling cannot treat carrier debt as an empty path.
         let carrier_committed_bytes = self
-            .product_data_pending_ack_bytes
-            .saturating_add(congestion.pending_bytes)
+            .delivery_evidence_pending_ack_bytes
+            .max(congestion.pending_bytes)
             .max(bytes_in_flight);
 
         let confidence_sample_floor = QUIC_INITIAL_WINDOW_PACKETS as u64;
-        if product_newly_acked_bytes > 0 && !congestion.app_limited {
-            let sample_elapsed = elapsed.max(QUIC_TIMER_GRANULARITY);
-            let sample_rate =
-                (product_newly_acked_bytes as f64 * 8.0 / sample_elapsed.as_secs_f64()).max(1.0);
+        let capacity_sample_cap = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES.saturating_div(2);
+        let preconfidence_publish_floor = evidence_inflight_hi
+            .max(PATH_OPEN_SCORE_BYTES as u64)
+            .min(capacity_sample_cap);
+        let durable_bulk_sample_floor = evidence_inflight_hi
+            .max((PATH_OPEN_SCORE_BYTES as u64).saturating_mul(4))
+            .min(capacity_sample_cap);
+        let mut publishable_sample_bytes = if timed_non_app_limited_evidence {
+            timed_non_app_limited_delivery_evidence_bytes
+        } else {
+            0
+        };
+        let mut publishable_sample_count = timed_non_app_limited_evidence
+            .then_some(congestion.timed_non_app_limited_delivery_sample_count)
+            .unwrap_or(0)
+            .max(u64::from(publishable_sample_bytes > 0));
+        let mut publishable_sample_elapsed = carrier_ack_elapsed.unwrap_or_default();
+        if publishable_sample_bytes > 0 {
+            self.pending_non_app_limited_sample_bytes = self
+                .pending_non_app_limited_sample_bytes
+                .saturating_add(publishable_sample_bytes);
+            self.pending_non_app_limited_sample_count = self
+                .pending_non_app_limited_sample_count
+                .saturating_add(publishable_sample_count);
+            self.pending_non_app_limited_sample_elapsed = self
+                .pending_non_app_limited_sample_elapsed
+                .saturating_add(publishable_sample_elapsed);
+            let publish_floor = if self.delivery_sample_count == 0 {
+                preconfidence_publish_floor
+            } else {
+                durable_bulk_sample_floor
+            };
+            if self.pending_non_app_limited_sample_bytes < publish_floor {
+                publishable_sample_bytes = 0;
+                if self.delivery_evidence_pending_ack_bytes == 0 {
+                    if self.delivery_sample_count > 0 {
+                        let next_sample_bytes = self
+                            .delivery_sample_bytes
+                            .saturating_add(self.pending_non_app_limited_sample_bytes);
+                        let candidate_sample_count = self
+                            .delivery_sample_count
+                            .saturating_add(self.pending_non_app_limited_sample_count);
+                        let confidence_has_byte_volume = next_sample_bytes
+                            >= evidence_inflight_hi.max(PATH_OPEN_SCORE_BYTES as u64);
+                        self.delivery_sample_count = if self.delivery_sample_count
+                            < confidence_sample_floor
+                            && candidate_sample_count >= confidence_sample_floor
+                            && !confidence_has_byte_volume
+                        {
+                            confidence_sample_floor.saturating_sub(1)
+                        } else {
+                            candidate_sample_count
+                        };
+                        self.delivery_sample_bytes = next_sample_bytes;
+                    }
+                    self.pending_non_app_limited_sample_bytes = 0;
+                    self.pending_non_app_limited_sample_count = 0;
+                    self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+                }
+            } else {
+                publishable_sample_bytes = self.pending_non_app_limited_sample_bytes;
+                publishable_sample_count = self.pending_non_app_limited_sample_count;
+                publishable_sample_elapsed = self.pending_non_app_limited_sample_elapsed;
+                self.pending_non_app_limited_sample_bytes = 0;
+                self.pending_non_app_limited_sample_count = 0;
+                self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+            }
+        } else if publishable_sample_bytes == 0 && self.delivery_evidence_pending_ack_bytes == 0 {
+            self.pending_non_app_limited_sample_bytes = 0;
+            self.pending_non_app_limited_sample_count = 0;
+            self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+        }
+
+        let mut latest_delivery_sample_bytes = 0;
+        let mut latest_delivery_sample_count = 0;
+        let mut latest_carrier_ack_elapsed = None;
+        let mut latest_rate_sample_elapsed = None;
+        if publishable_sample_bytes > 0 {
+            latest_delivery_sample_bytes = publishable_sample_bytes;
+            latest_delivery_sample_count = publishable_sample_count;
+            latest_carrier_ack_elapsed = Some(publishable_sample_elapsed);
+            publishable_sample_elapsed = publishable_sample_elapsed.max(QUIC_TIMER_GRANULARITY);
+            latest_rate_sample_elapsed = Some(publishable_sample_elapsed);
+            let sample_rate = (publishable_sample_bytes as f64 * 8.0
+                / publishable_sample_elapsed.as_secs_f64())
+            .max(1.0);
             let delivery_evidence_floor = if self.delivery_sample_count == 0 {
-                evidence_inflight_hi.max(PATH_OPEN_SCORE_BYTES as u64)
+                preconfidence_publish_floor
             } else {
                 evidence_inflight_hi
             };
-            let sample_is_app_limited = product_newly_acked_bytes < delivery_evidence_floor
-                && self.delivery_sample_count == 0;
-            app_limited = sample_is_app_limited;
-            if !sample_is_app_limited {
-                let estimated_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
-                let current_rate = if self.delivery_sample_count < confidence_sample_floor {
-                    estimated_rate.max(fallback_rate)
-                } else {
-                    estimated_rate
-                };
-                let bounded_sample = sample_rate.min(current_rate * BBR_DEFAULT_CWND_GAIN);
-                let previous_sample_count = self.delivery_sample_count;
-                let candidate_sample_count = self
-                    .delivery_sample_count
-                    .saturating_add(congestion.delivery_sample_count.max(1));
-                let next_sample_bytes = self
-                    .delivery_sample_bytes
-                    .saturating_add(product_newly_acked_bytes);
-                let confidence_has_byte_volume =
-                    next_sample_bytes >= delivery_evidence_floor.max(PATH_OPEN_SCORE_BYTES as u64);
-                let next_sample_count = if previous_sample_count < confidence_sample_floor
-                    && candidate_sample_count >= confidence_sample_floor
-                    && !confidence_has_byte_volume
-                {
-                    confidence_sample_floor.saturating_sub(1)
-                } else {
-                    candidate_sample_count
-                };
-                let establishes_measured_rate = previous_sample_count < confidence_sample_floor
-                    && next_sample_count >= confidence_sample_floor;
-                self.delivery_sample_count = next_sample_count;
-                self.delivery_sample_bytes = next_sample_bytes;
+            let previous_sample_count = self.delivery_sample_count;
+            let next_sample_bytes = self
+                .delivery_sample_bytes
+                .saturating_add(publishable_sample_bytes);
+            // Carrier-timed fragments are aggregated into full transport
+            // windows, so poll boundaries cannot create or refresh a proof.
+            let refreshes_bulk_proof = publishable_sample_bytes >= durable_bulk_sample_floor;
+            let estimated_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
+            let current_rate = if self.delivery_sample_count < confidence_sample_floor {
+                estimated_rate.max(fallback_rate)
+            } else {
+                estimated_rate
+            };
+            let bounded_sample = sample_rate.min(current_rate * BBR_DEFAULT_CWND_GAIN);
+            let candidate_sample_count = self
+                .delivery_sample_count
+                .saturating_add(publishable_sample_count);
+            let confidence_has_byte_volume =
+                next_sample_bytes >= delivery_evidence_floor.max(PATH_OPEN_SCORE_BYTES as u64);
+            let next_sample_count = if previous_sample_count < confidence_sample_floor
+                && candidate_sample_count >= confidence_sample_floor
+                && !confidence_has_byte_volume
+            {
+                confidence_sample_floor.saturating_sub(1)
+            } else {
+                candidate_sample_count
+            };
+            let establishes_measured_rate = previous_sample_count < confidence_sample_floor
+                && next_sample_count >= confidence_sample_floor;
+            self.delivery_sample_count = next_sample_count;
+            self.delivery_sample_bytes = next_sample_bytes;
+            if refreshes_bulk_proof {
                 self.last_delivery_sample_at = Some(now);
+                self.bulk_proof_expires_at = now.checked_add(bulk_proof_freshness_horizon);
                 self.delivery_rate_bps = Some(match self.delivery_rate_bps {
                     Some(_) | None if establishes_measured_rate => bounded_sample,
                     Some(previous) if bounded_sample > previous => {
                         previous.mul_add(0.25, bounded_sample * 0.75)
                     }
-                    Some(previous) => previous,
+                    // A stale overestimate can misplace a whole response flow,
+                    // so full lower windows get the same 75% new-sample weight.
+                    Some(previous) => previous.mul_add(0.25, bounded_sample * 0.75),
                     None => bounded_sample,
                 });
             }
         }
+
+        let bulk_proof_is_fresh = self
+            .bulk_proof_expires_at
+            .is_some_and(|expires_at| now < expires_at);
+        // Bulk eligibility follows a recent full transport window; an idle
+        // connection retains ACK reachability without retaining placement.
+        let app_limited = !bulk_proof_is_fresh;
 
         let estimated_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
         let delivery_rate_bps = if self.delivery_sample_count < confidence_sample_floor {
@@ -395,10 +762,12 @@ impl QuicPathMetricTracker {
         let pacing_rate_bps = usable_pacing_rate
             .unwrap_or(delivery_rate_bps)
             .max(delivery_rate_bps);
+        let capacity_proof_candidate =
+            self.capacity_proof_candidate(congestion.capacity_probe, now);
         UdpPathMetrics {
             direction,
             srtt: rtt,
-            rttvar: rtt / 4,
+            rttvar,
             min_rtt,
             min_rtt_observed: stats.path.rtt > Duration::ZERO,
             delivery_rate_bps,
@@ -413,6 +782,31 @@ impl QuicPathMetricTracker {
             delivery_sample_count: self.delivery_sample_count,
             delivery_sample_bytes: self.delivery_sample_bytes,
             last_delivery_sample_at: self.last_delivery_sample_at,
+            bulk_proof_expires_at: self.bulk_proof_expires_at,
+            latest_delivery_sample_bytes,
+            latest_delivery_sample_count,
+            latest_carrier_ack_elapsed,
+            latest_rate_sample_elapsed,
+            capacity_proof_candidate,
+            capacity_probe: congestion.capacity_probe,
+            #[cfg(feature = "lab-diagnostics")]
+            ack_poll: QuicAckPollDiagnostics {
+                newly_acked_bytes,
+                non_app_limited_acked_bytes,
+                timed_non_app_limited_acked_bytes,
+                ack_elapsed: carrier_ack_elapsed.unwrap_or_default(),
+                delivery_sample_count: congestion.delivery_sample_count,
+                non_app_limited_sample_count: congestion.non_app_limited_delivery_sample_count,
+                timed_non_app_limited_sample_count: congestion
+                    .timed_non_app_limited_delivery_sample_count,
+                carrier_app_limited: congestion.app_limited,
+                delivery_evidence_written_delta: delivery_evidence_delta,
+                delivery_evidence_newly_acked_bytes,
+                delivery_evidence_pending_ack_bytes: self.delivery_evidence_pending_ack_bytes,
+                pending_sample_bytes: self.pending_non_app_limited_sample_bytes,
+                pending_sample_count: self.pending_non_app_limited_sample_count,
+                pending_sample_elapsed: self.pending_non_app_limited_sample_elapsed,
+            },
         }
     }
 }
@@ -440,6 +834,82 @@ async fn udp_path_write_frames(
 ) -> Result<(), RuntimeError> {
     quic_carrier::write_frames(&mut send.stream, frames, codec_limits).await?;
     Ok(())
+}
+
+async fn udp_path_write_capacity_probe(
+    send: &mut UdpPathSendStream,
+    probe: &QuicCapacityProbeCommand,
+    codec_limits: CodecLimits,
+    mux_limits: MuxLimits,
+) -> Result<(), RuntimeError> {
+    // Only this entry point can turn a carrier-neutral command into a QUIC ACK
+    // epoch; ordinary frame batching must never absorb capacity payloads.
+    quic_carrier::write_capacity_probe(
+        &mut send.stream,
+        probe.path_id,
+        quic_carrier::CapacityProbeSpec {
+            token: probe.calibration_id,
+            train_payload_bytes: probe.train_payload_bytes,
+            sample_floor_bytes: probe.sample_floor_bytes,
+            warmup_carrier_bytes: probe.warmup_carrier_bytes,
+            required_timed_carrier_bytes: probe.required_timed_carrier_bytes,
+            proof_validity: probe.proof_validity,
+            expires_at: probe.expires_at,
+        },
+        mux_limits.max_payload_bytes,
+        codec_limits,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn udp_path_write_capacity_receipt(
+    send: &mut UdpPathSendStream,
+    path_id: PathId,
+    calibration_id: u64,
+    received_payload_bytes: u64,
+    codec_limits: CodecLimits,
+) -> Result<(), RuntimeError> {
+    quic_carrier::write_capacity_receipt(
+        &mut send.stream,
+        path_id,
+        calibration_id,
+        received_payload_bytes,
+        codec_limits,
+    )
+    .await?;
+    Ok(())
+}
+
+fn quic_capacity_command_drop_reason(
+    probe: &QuicCapacityProbeCommand,
+    now: Instant,
+) -> Option<&'static str> {
+    if !probe.ticket.is_current() {
+        Some("ownership_invalidated")
+    } else if now >= probe.expires_at {
+        Some("deadline_elapsed_before_start")
+    } else {
+        None
+    }
+}
+
+fn quic_capacity_start_rejection_reason(err: &RuntimeError) -> Option<&'static str> {
+    match err {
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::InvalidCapacityProbe) => {
+            Some("invalid_specification")
+        }
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::CapacityProbeBusy) => {
+            Some("carrier_epoch_busy")
+        }
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::CapacityProbeNotIdle) => {
+            Some("carrier_not_idle")
+        }
+        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::CapacityProbeExpired) => {
+            Some("carrier_deadline_elapsed")
+        }
+        _ => None,
+    }
 }
 
 async fn flush_udp_frame_batch(
@@ -523,6 +993,19 @@ fn spawn_client_udp_path_metrics(
 }
 
 fn quic_path_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
+    if metrics.capacity_probe.is_some_and(|probe| {
+        matches!(
+            probe.phase,
+            quic_carrier::CapacityProbePhase::Writing
+                | quic_carrier::CapacityProbePhase::Measuring
+                | quic_carrier::CapacityProbePhase::ProvenDraining
+                | quic_carrier::CapacityProbePhase::Proven
+        )
+    }) {
+        // Receipt and retirement are short-lived control transitions. Poll at
+        // quarter RTT, bounded by timer precision and QUIC's max ACK delay.
+        return (metrics.srtt / 4).clamp(QUIC_TIMER_GRANULARITY, QUIC_MAX_ACK_DELAY);
+    }
     if metrics.app_limited {
         transport_pto_from_ms(
             metrics.srtt.as_secs_f64() * 1000.0,
@@ -785,6 +1268,9 @@ async fn run_client_udp_stream(
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
+    let mut capacity_receive = QuicCapacityReceiveTracker::new(
+        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+    );
     let path_id = PathId(path_index as u16);
     loop {
         let command_may_recv = !reliable_path_receivers_closed(&commands);
@@ -853,6 +1339,81 @@ async fn run_client_udp_stream(
                         {
                             record.mark_path_proof_success(observation);
                         }
+                    }
+                    Some(Ok(Frame::PathCapacityData {
+                        path_id: capacity_path_id,
+                        calibration_id,
+                        payload,
+                    })) => {
+                        if capacity_path_id != path_id
+                            || capacity_receive
+                                .record_data(calibration_id, payload.len())
+                                .is_err()
+                        {
+                            let _ = frames.send(Err(RuntimeError::Protocol(
+                                "invalid QUIC capacity data epoch",
+                            ))).await;
+                            return;
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "quic_capacity_data_received",
+                            format_args!(
+                                "role=client path_id={} stream_id={} calibration_id={} payload_bytes={}",
+                                path_id.0,
+                                stream_id.0,
+                                calibration_id,
+                                payload.len(),
+                            ),
+                        );
+                    }
+                    Some(Ok(Frame::PathCapacityFinish {
+                        path_id: capacity_path_id,
+                        calibration_id,
+                        payload_bytes,
+                    })) => {
+                        if capacity_path_id != path_id {
+                            let _ = frames.send(Err(RuntimeError::Protocol(
+                                "QUIC capacity finish path mismatch",
+                            ))).await;
+                            return;
+                        }
+                        let received_payload_bytes = match capacity_receive
+                            .finish(calibration_id, payload_bytes)
+                        {
+                            Ok(bytes) => bytes,
+                            Err(err) => {
+                                let _ = frames.send(Err(err)).await;
+                                return;
+                            }
+                        };
+                        if let Err(err) = udp_path_write_capacity_receipt(
+                            &mut send,
+                            path_id,
+                            calibration_id,
+                            received_payload_bytes,
+                            codec_limits,
+                        ).await {
+                            let _ = frames.send(Err(err)).await;
+                            return;
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "quic_capacity_receipt",
+                            format_args!(
+                                "role=client phase=sent path_id={} stream_id={} calibration_id={} received_payload_bytes={}",
+                                path_id.0,
+                                stream_id.0,
+                                calibration_id,
+                                received_payload_bytes,
+                            ),
+                        );
+                    }
+                    Some(Ok(Frame::PathCapacityReceipt { .. })) => {
+                        let _ = frames.send(Err(RuntimeError::Protocol(
+                            "client QUIC path received server capacity receipt",
+                        ))).await;
+                        return;
                     }
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
@@ -999,6 +1560,14 @@ async fn drain_client_udp_stream_commands(
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
+            ReliablePathCommand::SendFrame(frame)
+                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client QUIC path received an untyped capacity frame",
+                ));
+            }
             ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
@@ -1031,6 +1600,13 @@ async fn drain_client_udp_stream_commands(
                     return Ok(false);
                 }
                 continue;
+            }
+            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+                probe.ticket.cancel();
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client QUIC path received server response capacity command",
+                ));
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
                 flush_udp_frame_batch_with_path_proofs(
@@ -1145,20 +1721,149 @@ fn spawn_server_quic_path_metrics(
 ) {
     tokio::spawn(async move {
         let path_id = path_registration.path_id();
+        #[cfg(feature = "lab-diagnostics")]
+        let path_instance_id = path_registration.path_instance_id();
+        #[cfg(feature = "lab-diagnostics")]
+        let session_id = path_registration.session_id();
         let mut tracker = UdpPathMetricTracker::default();
+        #[cfg(feature = "lab-diagnostics")]
+        let mut last_metrics_poll_at = None;
         loop {
             if connection.is_closed() {
                 return;
             }
-            let Some(metrics) = connection.tx_metrics(&mut tracker, 2).await else {
+            let Some(mut metrics) = connection.tx_metrics(&mut tracker, 2).await else {
                 tokio::time::sleep(default_transport_pto()).await;
                 continue;
             };
-            if quic_path_metrics_should_publish_local_sender(metrics) {
-                context.reliable_streams.record_local_path_metrics(
-                    &path_registration,
-                    path_metrics_from_quic_path(path_id, metrics),
+            #[cfg(feature = "lab-diagnostics")]
+            let metrics_poll_at = Instant::now();
+            #[cfg(feature = "lab-diagnostics")]
+            let poll_elapsed = last_metrics_poll_at
+                .replace(metrics_poll_at)
+                .map(|previous| metrics_poll_at.saturating_duration_since(previous))
+                .unwrap_or_default();
+            #[cfg(feature = "lab-diagnostics")]
+            log_quic_ack_poll_diagnostics(
+                session_id,
+                path_id,
+                path_instance_id,
+                metrics,
+                poll_elapsed,
+            );
+
+            let capacity_proof_accepted = metrics.capacity_proof_candidate.is_some_and(|candidate| {
+                let proof_metrics = path_metrics_from_quic_capacity_proof(
+                    path_id,
+                    metrics,
+                    candidate,
                 );
+                if context.reliable_streams.record_local_quic_capacity_proof(
+                    &path_registration,
+                    proof_metrics,
+                    candidate,
+                ) {
+                    tracker.quic.accept_capacity_proof(&mut metrics, candidate);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "quic_capacity_proof",
+                        format_args!(
+                            "phase=accepted session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} written_data_frame_count={} received_bytes={} proof_elapsed_us={} rate_bps={} proof_validity_ms={}",
+                            session_id.0,
+                            path_id.0,
+                            path_instance_id.as_u64(),
+                            candidate.token,
+                            candidate.train_bytes,
+                            candidate.sample_floor_bytes,
+                            candidate.warmup_bytes,
+                            candidate.required_proof_bytes,
+                            candidate.written_data_frame_count,
+                            candidate.received_bytes,
+                            candidate.proof_elapsed.as_micros(),
+                            candidate.rate_bps,
+                            candidate.proof_validity.as_millis(),
+                        ),
+                    );
+                    true
+                } else {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "quic_capacity_proof",
+                        format_args!(
+                            "phase=rejected session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} written_data_frame_count={} received_bytes={} proof_elapsed_us={} rate_bps={}",
+                            session_id.0,
+                            path_id.0,
+                            path_instance_id.as_u64(),
+                            candidate.token,
+                            candidate.train_bytes,
+                            candidate.sample_floor_bytes,
+                            candidate.warmup_bytes,
+                            candidate.required_proof_bytes,
+                            candidate.written_data_frame_count,
+                            candidate.received_bytes,
+                            candidate.proof_elapsed.as_micros(),
+                            candidate.rate_bps,
+                        ),
+                    );
+                    false
+                }
+            });
+            if let Some(token) = tracker
+                .quic
+                .terminal_capacity_probe_to_retire(metrics.capacity_probe, Instant::now())
+            {
+                let _retired = connection.retire_capacity_probe(token);
+                tracker.quic.retire_capacity_candidate(token);
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "quic_capacity_probe_retired",
+                    format_args!(
+                        "session_id={} path_id={} path_instance_id={} calibration_id={} proof_accepted={} carrier_retired={}",
+                        session_id.0,
+                        path_id.0,
+                        path_instance_id.as_u64(),
+                        token,
+                        capacity_proof_accepted,
+                        _retired,
+                    ),
+                );
+            }
+            if quic_path_metrics_should_publish_local_sender(metrics) {
+                #[cfg(feature = "lab-diagnostics")]
+                if let (Some(carrier_elapsed), Some(rate_elapsed)) = (
+                    metrics.latest_carrier_ack_elapsed,
+                    metrics.latest_rate_sample_elapsed,
+                ) {
+                    let raw_rate_bps = (metrics.latest_delivery_sample_bytes as f64 * 8.0
+                        / rate_elapsed.as_secs_f64())
+                    .round() as u64;
+                    lab_diagnostic(
+                        "quic_carrier_rate_sample",
+                        format_args!(
+                            "session_id={} path_id={} path_instance_id={} direction={} rate_source=quic_send_ack_max sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
+                            session_id.0,
+                            path_id.0,
+                            path_instance_id.as_u64(),
+                            metrics.direction,
+                            metrics.latest_delivery_sample_bytes,
+                            metrics.latest_delivery_sample_count,
+                            carrier_elapsed.as_micros(),
+                            rate_elapsed.as_micros(),
+                            raw_rate_bps,
+                            metrics.delivery_rate_bps.round() as u64,
+                            poll_elapsed.as_micros(),
+                            metrics.delivery_sample_count,
+                            metrics.delivery_sample_bytes,
+                            metrics.app_limited,
+                        ),
+                    );
+                }
+                if !capacity_proof_accepted {
+                    context.reliable_streams.record_local_path_metrics(
+                        &path_registration,
+                        path_metrics_from_quic_path(path_id, metrics),
+                    );
+                }
             }
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
@@ -1167,6 +1872,117 @@ fn spawn_server_quic_path_metrics(
 
 fn quic_path_metrics_should_publish_local_sender(metrics: UdpPathMetrics) -> bool {
     metrics.delivery_sample_count > 0 || metrics.ack_derived_data_seen
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn log_quic_ack_poll_diagnostics(
+    session_id: SessionId,
+    path_id: PathId,
+    path_instance_id: ServerCarrierPathInstanceId,
+    metrics: UdpPathMetrics,
+    poll_elapsed: Duration,
+) {
+    let ack = metrics.ack_poll;
+    if ack.newly_acked_bytes > 0
+        || ack.delivery_evidence_written_delta > 0
+        || ack.pending_sample_bytes > 0
+        || metrics.capacity_probe.is_some()
+    {
+        lab_diagnostic(
+            "quic_carrier_ack_poll",
+            format_args!(
+                "session_id={} path_id={} path_instance_id={} direction={} poll_elapsed_us={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
+                session_id.0,
+                path_id.0,
+                path_instance_id.as_u64(),
+                metrics.direction,
+                poll_elapsed.as_micros(),
+                ack.newly_acked_bytes,
+                ack.non_app_limited_acked_bytes,
+                ack.timed_non_app_limited_acked_bytes,
+                ack.ack_elapsed.as_micros(),
+                ack.delivery_sample_count,
+                ack.non_app_limited_sample_count,
+                ack.timed_non_app_limited_sample_count,
+                ack.carrier_app_limited,
+                ack.delivery_evidence_written_delta,
+                ack.delivery_evidence_newly_acked_bytes,
+                ack.delivery_evidence_pending_ack_bytes,
+                ack.pending_sample_bytes,
+                ack.pending_sample_count,
+                ack.pending_sample_elapsed.as_micros(),
+                metrics
+                    .bulk_proof_expires_at
+                    .map(|expires_at| expires_at
+                        .saturating_duration_since(Instant::now())
+                        .as_micros())
+                    .unwrap_or(0),
+            ),
+        );
+    }
+    if let Some(probe) = metrics.capacity_probe {
+        let now = Instant::now();
+        lab_diagnostic(
+            "quic_capacity_ack_poll",
+            format_args!(
+                "session_id={} path_id={} path_instance_id={} direction={} calibration_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
+                session_id.0,
+                path_id.0,
+                path_instance_id.as_u64(),
+                metrics.direction,
+                probe.token,
+                probe.phase,
+                probe.write_committed,
+                probe.train_payload_bytes,
+                probe.written_payload_bytes,
+                probe.written_data_frame_count,
+                probe.sample_floor_bytes,
+                probe.warmup_carrier_bytes,
+                probe.required_timed_carrier_bytes,
+                probe.started_clean,
+                probe.total_acked_carrier_bytes,
+                probe.total_ack_sample_count,
+                probe.warmup_acked_carrier_bytes,
+                probe.warmup_ack_sample_count,
+                probe.measurement_acked_carrier_bytes,
+                probe.measurement_ack_sample_count,
+                probe.timed_measurement_acked_carrier_bytes,
+                probe.timed_measurement_ack_sample_count,
+                probe.app_limited_acked_carrier_bytes,
+                probe.app_limited_ack_sample_count,
+                probe
+                    .timed_measurement_ack_elapsed
+                    .unwrap_or_default()
+                    .as_micros(),
+                probe
+                    .native_proved_at
+                    .map(|proved_at| now.saturating_duration_since(proved_at).as_micros())
+                    .unwrap_or(0),
+                probe.receipt_received_payload_bytes,
+                probe.receipt_elapsed.unwrap_or_default().as_micros(),
+                probe.receipt_rtt.unwrap_or_default().as_micros(),
+                probe
+                    .receipt_at
+                    .map(|receipt_at| now.saturating_duration_since(receipt_at).as_micros())
+                    .unwrap_or(0),
+                probe.last_authoritative_in_flight.unwrap_or(0),
+                probe
+                    .last_authoritative_in_flight_at
+                    .map(|observed_at| now.saturating_duration_since(observed_at).as_micros())
+                    .unwrap_or(0),
+                probe.last_authoritative_sent_watermark.unwrap_or(0),
+                probe.receipt_frozen_sent_watermark.unwrap_or(0),
+                probe.current_sent_watermark,
+                probe.proof_validity.as_millis(),
+                probe
+                    .proved_at
+                    .map(|proved_at| now.saturating_duration_since(proved_at).as_micros())
+                    .unwrap_or(0),
+                probe.expires_at.saturating_duration_since(now).as_micros(),
+                metrics.capacity_proof_candidate.is_some(),
+            ),
+        );
+    }
 }
 
 fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> PathMetrics {
@@ -1211,6 +2027,14 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
         data_sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
         data_sample_bytes: metrics.delivery_sample_bytes,
     }
+}
+
+fn path_metrics_from_quic_capacity_proof(
+    path_id: PathId,
+    metrics: UdpPathMetrics,
+    _candidate: QuicCapacityProofCandidate,
+) -> PathMetrics {
+    path_metrics_from_quic_path(path_id, metrics)
 }
 
 fn duration_to_micros_u32(duration: Duration) -> u32 {
@@ -1527,6 +2351,44 @@ struct ServerUdpReliableStreamLoop {
     commands_rx: ReliablePathCommandReceivers,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn confirm_server_quic_capacity_receipt(
+    send: &UdpPathSendStream,
+    _session_id: SessionId,
+    path_id: PathId,
+    _path_instance_id: ServerCarrierPathInstanceId,
+    _stream_id: StreamId,
+    receipt_path_id: PathId,
+    calibration_id: u64,
+    received_payload_bytes: u64,
+) -> Result<(), RuntimeError> {
+    if receipt_path_id != path_id
+        || calibration_id == 0
+        || received_payload_bytes == 0
+        || !send.connection.confirm_capacity_probe_receipt(
+            calibration_id,
+            received_payload_bytes,
+            Instant::now(),
+        )
+    {
+        return Err(RuntimeError::Protocol("invalid QUIC capacity receipt"));
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "quic_capacity_receipt",
+        format_args!(
+            "role=server phase=confirmed session_id={} path_id={} path_instance_id={} stream_id={} calibration_id={} received_payload_bytes={}",
+            _session_id.0,
+            path_id.0,
+            _path_instance_id.as_u64(),
+            _stream_id.0,
+            calibration_id,
+            received_payload_bytes,
+        ),
+    );
+    Ok(())
+}
+
 async fn run_server_udp_reliable_stream_loop(
     mut send: UdpPathSendStream,
     recv: UdpPathRecvStream,
@@ -1545,17 +2407,72 @@ async fn run_server_udp_reliable_stream_loop(
         commands_tx,
         mut commands_rx,
     } = stream_context;
-    let mut carrier_frames = spawn_quic_path_reader(
-        recv,
-        context.codec_limits,
-        udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits),
-    );
+    let carrier_frame_queue =
+        udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
+    let mut carrier_frames =
+        spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
+    let mut deferred_capacity_frames = std::collections::VecDeque::<Frame>::new();
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
 
     loop {
-        let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
-        if let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx) {
+        // Receipt confirmation releases the connection-wide writer gate. This
+        // task owns that receipt, so awaiting any ordinary write here would
+        // self-deadlock until the probe fail-closed the whole QUIC connection.
+        if send.connection.capacity_probe_active() {
+            let release_connection = send.connection.clone();
+            tokio::select! {
+                biased;
+                frame = carrier_frames.recv() => {
+                    match frame {
+                        Some(Ok(Frame::PathCapacityReceipt {
+                            path_id: receipt_path_id,
+                            calibration_id,
+                            received_payload_bytes,
+                        })) => {
+                            confirm_server_quic_capacity_receipt(
+                                &send,
+                                session_id,
+                                path_id,
+                                path_registration.path_instance_id(),
+                                stream_id,
+                                receipt_path_id,
+                                calibration_id,
+                                received_payload_bytes,
+                            )?;
+                        }
+                        Some(Ok(frame)) => {
+                            if deferred_capacity_frames.len() >= carrier_frame_queue {
+                                return Err(RuntimeError::Protocol(
+                                    "QUIC capacity receipt defer queue exceeded",
+                                ));
+                            }
+                            deferred_capacity_frames.push_back(frame);
+                        }
+                        Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => {
+                            context.reliable_streams.detach_path(
+                                session_id,
+                                stream_id,
+                                UnderlayProtocol::Udp,
+                                path_id,
+                                &commands_tx,
+                            );
+                            return Ok(());
+                        }
+                        Some(Err(err)) => return Err(err),
+                    }
+                }
+                _ = release_connection.wait_for_capacity_probe_release() => {}
+            }
+            continue;
+        }
+
+        let replaying_capacity_frame = !deferred_capacity_frames.is_empty();
+        let command_may_recv =
+            !replaying_capacity_frame && !reliable_path_receivers_closed(&commands_rx);
+        if !replaying_capacity_frame
+            && let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx)
+        {
             let result = drain_server_udp_reliable_commands(
                 command,
                 &mut commands_rx,
@@ -1564,6 +2481,7 @@ async fn run_server_udp_reliable_stream_loop(
                 session_id,
                 stream_id,
                 path_id,
+                path_registration.path_instance_id(),
                 &commands_tx,
                 &mut pending_frames,
                 &mut path_proofs,
@@ -1574,9 +2492,15 @@ async fn run_server_udp_reliable_stream_loop(
             }
             continue;
         }
+        let replay_frame = deferred_capacity_frames.pop_front();
         tokio::select! {
             biased;
-            frame = carrier_frames.recv() => {
+            frame = async {
+                match replay_frame {
+                    Some(frame) => Some(Ok::<Frame, RuntimeError>(frame)),
+                    None => carrier_frames.recv().await,
+                }
+            } => {
                 match frame {
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
@@ -1721,6 +2645,27 @@ async fn run_server_udp_reliable_stream_loop(
                             );
                         }
                     }
+                    Some(Ok(Frame::PathCapacityReceipt {
+                        path_id: receipt_path_id,
+                        calibration_id,
+                        received_payload_bytes,
+                    })) => {
+                        confirm_server_quic_capacity_receipt(
+                            &send,
+                            session_id,
+                            path_id,
+                            path_registration.path_instance_id(),
+                            stream_id,
+                            receipt_path_id,
+                            calibration_id,
+                            received_payload_bytes,
+                        )?;
+                    }
+                    Some(Ok(Frame::PathCapacityData { .. } | Frame::PathCapacityFinish { .. })) => {
+                        return Err(RuntimeError::Protocol(
+                            "server QUIC path received client response-capacity output",
+                        ));
+                    }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
                         log_unexpected_stream_relay_frame(
@@ -1742,7 +2687,9 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Err(err)) => return Err(err),
                 }
-                if let Some(command) = try_recv_reliable_path_command(&mut commands_rx) {
+                if !send.connection.capacity_probe_active()
+                    && let Some(command) = try_recv_reliable_path_command(&mut commands_rx)
+                {
                     let result = drain_server_udp_reliable_commands(
                         command,
                         &mut commands_rx,
@@ -1750,11 +2697,12 @@ async fn run_server_udp_reliable_stream_loop(
                         &context,
                         session_id,
                         stream_id,
-                            path_id,
-                            &commands_tx,
-                            &mut pending_frames,
-                            &mut path_proofs,
-                        )
+                        path_id,
+                        path_registration.path_instance_id(),
+                        &commands_tx,
+                        &mut pending_frames,
+                        &mut path_proofs,
+                    )
                     .await?;
                     if result {
                         return Ok(());
@@ -1772,6 +2720,7 @@ async fn run_server_udp_reliable_stream_loop(
                             session_id,
                             stream_id,
                             path_id,
+                            path_registration.path_instance_id(),
                             &commands_tx,
                             &mut pending_frames,
                             &mut path_proofs,
@@ -1795,6 +2744,7 @@ async fn drain_server_udp_reliable_commands(
     session_id: SessionId,
     stream_id: StreamId,
     path_id: PathId,
+    path_instance_id: ServerCarrierPathInstanceId,
     commands_tx: &ReliablePathCommandSender,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,
@@ -1854,6 +2804,14 @@ async fn drain_server_udp_reliable_commands(
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
+            ReliablePathCommand::SendFrame(frame)
+                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC path received an untyped capacity frame",
+                ));
+            }
             ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
@@ -1887,6 +2845,128 @@ async fn drain_server_udp_reliable_commands(
                     return Ok(false);
                 }
                 continue;
+            }
+            ReliablePathCommand::SendQuicCapacityProbe(mut probe) => {
+                if probe.path_id != path_id || probe.path_instance_id != path_instance_id {
+                    probe.ticket.cancel();
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "server QUIC capacity command path does not match writer",
+                    ));
+                }
+                flush_udp_frame_batch_with_path_proofs(
+                    send,
+                    pending_frames,
+                    context.codec_limits,
+                    path_proofs,
+                )
+                .await?;
+                if let Some(_reason) = quic_capacity_command_drop_reason(&probe, Instant::now()) {
+                    probe.ticket.cancel();
+                    commands.release_pending_command_bytes(pending_bytes);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "response_quic_capacity_calibration",
+                        format_args!(
+                            "phase=command_dropped reason={} session_id={} binding_instance_id={} underlay=Udp path_id={} path_instance_id={} calibration_id={} train_bytes={}",
+                            _reason,
+                            session_id.0,
+                            probe.binding_instance_id,
+                            path_id.0,
+                            probe.path_instance_id.as_u64(),
+                            probe.calibration_id,
+                            probe.train_payload_bytes,
+                        ),
+                    );
+                    return Ok(false);
+                }
+                let result = {
+                    let write = udp_path_write_capacity_probe(
+                        send,
+                        &probe,
+                        context.codec_limits,
+                        context.mux_limits,
+                    );
+                    tokio::pin!(write);
+                    tokio::select! {
+                        biased;
+                        _ = probe.ticket.cancelled() => None,
+                        result = &mut write => Some(result),
+                    }
+                };
+                commands.release_pending_command_bytes(pending_bytes);
+                let Some(result) = result else {
+                    let _ = send.connection.cancel_capacity_probe(probe.calibration_id);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "response_quic_capacity_calibration",
+                        format_args!(
+                            "phase=command_cancelled reason=ownership_invalidated_during_write session_id={} binding_instance_id={} underlay=Udp path_id={} path_instance_id={} calibration_id={} train_bytes={}",
+                            session_id.0,
+                            probe.binding_instance_id,
+                            path_id.0,
+                            probe.path_instance_id.as_u64(),
+                            probe.calibration_id,
+                            probe.train_payload_bytes,
+                        ),
+                    );
+                    return Ok(false);
+                };
+                if let Err(err) = result {
+                    if let Some(_reason) = quic_capacity_start_rejection_reason(&err) {
+                        probe.ticket.cancel();
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "response_quic_capacity_calibration",
+                            format_args!(
+                                "phase=command_rejected reason={} session_id={} binding_instance_id={} underlay=Udp path_id={} path_instance_id={} calibration_id={} train_bytes={}",
+                                _reason,
+                                session_id.0,
+                                probe.binding_instance_id,
+                                path_id.0,
+                                probe.path_instance_id.as_u64(),
+                                probe.calibration_id,
+                                probe.train_payload_bytes,
+                            ),
+                        );
+                        return Ok(false);
+                    }
+                    return Err(err);
+                }
+                // The carrier epoch now owns cancellation. Before this point,
+                // dropping a dequeued command must invalidate its session lease.
+                probe.disarm_drop_cancellation();
+                let cancellation_connection = send.connection.clone();
+                let cancellation_ticket = probe.ticket.clone();
+                let cancellation_token = probe.calibration_id;
+                tokio::spawn(async move {
+                    if cancellation_ticket.resolved().await
+                        == QuicCapacityProbeCommandResolution::Cancelled
+                    {
+                        let _ = cancellation_connection.cancel_capacity_probe(cancellation_token);
+                    }
+                });
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "path_writer_drain",
+                    format_args!(
+                        "role=server underlay=Udp path_id={} stream_id={} sent_items={} sent_bytes={} byte_budget={} item_budget={} pending_bytes_after={} elapsed_us={} hit_byte_budget={} hit_item_budget={} capacity_probe=true calibration_id={}",
+                        path_id.0,
+                        stream_id.0,
+                        sent_items.saturating_add(1),
+                        sent_bytes.saturating_add(writer_run_bytes),
+                        byte_budget,
+                        item_budget,
+                        commands.pending_bytes(),
+                        drain_started.elapsed().as_micros(),
+                        true,
+                        false,
+                        probe.calibration_id,
+                    ),
+                );
+                // End the run at the epoch boundary. A later dequeue may block
+                // on the carrier gate, but cannot enter this write transaction.
+                return Ok(false);
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
                 flush_udp_frame_batch_with_path_proofs(
@@ -2163,6 +3243,14 @@ async fn drain_server_udp_datagram_commands(
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
+            ReliablePathCommand::SendFrame(frame)
+                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC datagram writer received capacity data",
+                ));
+            }
             ReliablePathCommand::SendFrame(frame) => {
                 if let Frame::DatagramClose { flow_id } = frame {
                     flows.retain(|flow| flow.flow_id != flow_id);
@@ -2191,6 +3279,13 @@ async fn drain_server_udp_datagram_commands(
                     return Ok(false);
                 }
                 continue;
+            }
+            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+                probe.ticket.cancel();
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC datagram writer received reliable capacity command",
+                ));
             }
             ReliablePathCommand::CloseStream(_) => {
                 flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
@@ -2463,29 +3558,147 @@ mod tests {
             loss_ppm: None,
             ecn_ppm: None,
             newly_acked_bytes: None,
-            product_data_written_bytes: 0,
+            non_app_limited_acked_bytes: None,
+            timed_non_app_limited_acked_bytes: None,
+            non_app_limited_ack_elapsed: None,
+            delivery_evidence_written_bytes: 0,
             delivery_sample_count: 0,
+            non_app_limited_delivery_sample_count: 0,
+            timed_non_app_limited_delivery_sample_count: 0,
             app_limited: true,
+            capacity_probe: None,
         }
     }
 
-    fn with_product_data_written(
+    fn with_delivery_evidence_written(
         mut metrics: quic_carrier::CongestionMetrics,
         bytes: u64,
     ) -> quic_carrier::CongestionMetrics {
-        metrics.product_data_written_bytes = bytes;
+        metrics.delivery_evidence_written_bytes = bytes;
         metrics
     }
 
     fn with_acked_bytes(
-        mut metrics: quic_carrier::CongestionMetrics,
+        metrics: quic_carrier::CongestionMetrics,
         bytes: u64,
         sample_count: u64,
     ) -> quic_carrier::CongestionMetrics {
+        with_acked_bytes_elapsed(metrics, bytes, sample_count, Duration::from_millis(100))
+    }
+
+    fn with_acked_bytes_elapsed(
+        mut metrics: quic_carrier::CongestionMetrics,
+        bytes: u64,
+        sample_count: u64,
+        elapsed: Duration,
+    ) -> quic_carrier::CongestionMetrics {
         metrics.newly_acked_bytes = Some(bytes);
+        metrics.non_app_limited_acked_bytes = Some(bytes);
+        metrics.timed_non_app_limited_acked_bytes = (!elapsed.is_zero()).then_some(bytes);
+        metrics.non_app_limited_ack_elapsed = (!elapsed.is_zero()).then_some(elapsed);
         metrics.delivery_sample_count = sample_count;
+        metrics.non_app_limited_delivery_sample_count = sample_count;
+        metrics.timed_non_app_limited_delivery_sample_count =
+            if elapsed.is_zero() { 0 } else { sample_count };
         metrics.app_limited = false;
         metrics
+    }
+
+    fn capacity_probe_metrics(
+        token: u64,
+        now: Instant,
+        warmup_bytes: u64,
+        required_bytes: u64,
+        timed_bytes: u64,
+        timed_count: u64,
+        timed_elapsed: Option<Duration>,
+    ) -> quic_carrier::CapacityProbeMetrics {
+        let sample_floor_bytes = required_bytes.saturating_add(PATH_OPEN_SCORE_BYTES as u64);
+        let train_payload_bytes = warmup_bytes
+            .saturating_add(required_bytes)
+            .max(sample_floor_bytes);
+        let receipt_elapsed = Duration::from_millis(80);
+        quic_carrier::CapacityProbeMetrics {
+            token,
+            train_payload_bytes,
+            sample_floor_bytes,
+            warmup_carrier_bytes: warmup_bytes,
+            required_timed_carrier_bytes: required_bytes,
+            expires_at: now + Duration::from_secs(5),
+            phase: quic_carrier::CapacityProbePhase::Proven,
+            started_clean: false,
+            write_committed: true,
+            written_payload_bytes: train_payload_bytes,
+            written_data_frame_count: train_payload_bytes.div_ceil(64 * 1024),
+            total_acked_carrier_bytes: train_payload_bytes,
+            total_ack_sample_count: timed_count.saturating_add(u64::from(warmup_bytes > 0)),
+            warmup_acked_carrier_bytes: warmup_bytes,
+            warmup_ack_sample_count: u64::from(warmup_bytes > 0),
+            measurement_acked_carrier_bytes: train_payload_bytes.saturating_sub(warmup_bytes),
+            measurement_ack_sample_count: timed_count,
+            timed_measurement_acked_carrier_bytes: timed_bytes,
+            timed_measurement_ack_sample_count: timed_count,
+            app_limited_acked_carrier_bytes: timed_bytes,
+            app_limited_ack_sample_count: timed_count,
+            timed_measurement_ack_elapsed: timed_elapsed,
+            native_proved_at: timed_elapsed.map(|_| now),
+            proved_at: Some(now),
+            proof_validity: Duration::from_secs(3),
+            receipt_received_payload_bytes: train_payload_bytes,
+            receipt_elapsed: Some(receipt_elapsed),
+            receipt_rtt: Some(Duration::from_millis(20)),
+            receipt_at: Some(now),
+            last_authoritative_in_flight: Some(0),
+            last_authoritative_in_flight_at: Some(now),
+            last_authoritative_sent_watermark: Some(train_payload_bytes),
+            receipt_frozen_sent_watermark: Some(train_payload_bytes),
+            current_sent_watermark: train_payload_bytes,
+        }
+    }
+
+    fn with_capacity_probe(
+        mut metrics: quic_carrier::CongestionMetrics,
+        probe: quic_carrier::CapacityProbeMetrics,
+    ) -> quic_carrier::CongestionMetrics {
+        metrics.capacity_probe = Some(probe);
+        metrics
+    }
+
+    #[test]
+    fn quic_capacity_receive_tracker_accepts_only_exact_bounded_epoch() {
+        let mut tracker = QuicCapacityReceiveTracker::new(1024);
+
+        tracker.record_data(7, 400).expect("first record");
+        tracker.record_data(7, 624).expect("second record");
+        assert_eq!(tracker.finish(7, 1024).expect("exact finish"), 1024);
+    }
+
+    #[test]
+    fn quic_capacity_receive_tracker_rejects_over_limit_and_interleaving() {
+        let mut over_limit = QuicCapacityReceiveTracker::new(1024);
+        over_limit.record_data(7, 900).expect("first record");
+        assert!(matches!(
+            over_limit.record_data(7, 125),
+            Err(RuntimeError::Protocol(_))
+        ));
+
+        let mut interleaved = QuicCapacityReceiveTracker::new(1024);
+        interleaved.record_data(7, 400).expect("first token");
+        assert!(matches!(
+            interleaved.record_data(8, 400),
+            Err(RuntimeError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn quic_capacity_receive_tracker_rejects_mismatched_finish() {
+        let mut tracker = QuicCapacityReceiveTracker::new(1024);
+        tracker.record_data(7, 400).expect("data record");
+
+        assert!(matches!(
+            tracker.finish(8, 400),
+            Err(RuntimeError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -2527,13 +3740,11 @@ mod tests {
         assert_eq!(startup.delivery_sample_count, 0);
         assert_eq!(startup.delivery_rate_bps.round() as u64, 500_000_000);
         assert_eq!(startup.inflight_hi, 4 * 1024 * 1024);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
         stats.frame_rx.acks = 4;
         let measured = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 8 * 1024 * 1024),
+                with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
                 8 * 1024 * 1024,
                 4,
             ),
@@ -2544,6 +3755,143 @@ mod tests {
         assert!(measured.delivery_rate_bps > 0.0);
         assert!(measured.last_delivery_sample_at.is_some());
         assert!(!measured.app_limited);
+    }
+
+    #[test]
+    fn quic_delivery_rate_uses_carrier_ack_elapsed_not_metrics_poll_phase() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let base = Instant::now();
+        let mut fast_poll = QuicPathMetricTracker::default();
+        let mut slow_poll = QuicPathMetricTracker::default();
+        let _ = fast_poll.observe_at(stats, congestion, 2, base);
+        let _ = slow_poll.observe_at(stats, congestion, 2, base);
+        let ack = with_acked_bytes_elapsed(
+            with_delivery_evidence_written(congestion, sample_bytes),
+            sample_bytes,
+            QUIC_INITIAL_WINDOW_PACKETS as u64,
+            Duration::from_millis(20),
+        );
+
+        let fast = fast_poll.observe_at(stats, ack, 2, base + Duration::from_millis(10));
+        let slow = slow_poll.observe_at(stats, ack, 2, base + Duration::from_millis(500));
+
+        assert_eq!(
+            fast.delivery_rate_bps.round() as u64,
+            slow.delivery_rate_bps.round() as u64,
+            "scheduler poll phase must not enter the carrier delivery-rate denominator"
+        );
+        assert_eq!(
+            fast.delivery_rate_bps.round() as u64,
+            (sample_bytes as f64 * 8.0 / 0.020).round() as u64
+        );
+    }
+
+    #[test]
+    fn quic_zero_span_ack_batch_proves_reachability_without_rate() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(200);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let mut tracker = QuicPathMetricTracker::default();
+        let startup = tracker.observe(stats, congestion, 2);
+
+        let untimed = tracker.observe(
+            stats,
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+                Duration::ZERO,
+            ),
+            2,
+        );
+
+        assert!(untimed.ack_derived_data_seen);
+        assert_eq!(untimed.delivery_sample_bytes, 0);
+        assert_eq!(untimed.delivery_sample_count, 0);
+        assert_eq!(untimed.delivery_rate_bps, startup.delivery_rate_bps);
+        assert!(untimed.app_limited);
+    }
+
+    #[test]
+    fn quic_combined_poll_excludes_untimed_ack_bytes_from_rate() {
+        let timed_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let total_bytes = timed_bytes * 2;
+        let congestion = quic_congestion(timed_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = timed_bytes;
+        stats.path.current_mtu = 1400;
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe(stats, congestion, 2);
+
+        let mut combined = with_delivery_evidence_written(congestion, total_bytes);
+        combined.newly_acked_bytes = Some(total_bytes);
+        combined.non_app_limited_acked_bytes = Some(total_bytes);
+        combined.timed_non_app_limited_acked_bytes = Some(timed_bytes);
+        combined.non_app_limited_ack_elapsed = Some(Duration::from_millis(20));
+        combined.delivery_sample_count = (QUIC_INITIAL_WINDOW_PACKETS * 2) as u64;
+        combined.non_app_limited_delivery_sample_count = (QUIC_INITIAL_WINDOW_PACKETS * 2) as u64;
+        combined.timed_non_app_limited_delivery_sample_count = QUIC_INITIAL_WINDOW_PACKETS as u64;
+        combined.app_limited = false;
+
+        let measured = tracker.observe(stats, combined, 2);
+
+        assert!(measured.ack_derived_data_seen);
+        assert_eq!(measured.delivery_sample_bytes, timed_bytes);
+        assert_eq!(
+            measured.delivery_rate_bps.round() as u64,
+            (timed_bytes as f64 * 8.0 / 0.020).round() as u64,
+            "untimed reachability ACKs must not enter a timed rate numerator"
+        );
+    }
+
+    #[test]
+    fn quic_split_ack_polls_sum_carrier_elapsed_before_one_timer_clamp() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let chunk_bytes = sample_bytes / 2;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe(stats, congestion, 2);
+
+        let first = tracker.observe(
+            stats,
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                chunk_bytes,
+                (QUIC_INITIAL_WINDOW_PACKETS / 2) as u64,
+                Duration::from_millis(20),
+            ),
+            2,
+        );
+        assert_eq!(first.delivery_sample_count, 0);
+        let measured = tracker.observe(
+            stats,
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                chunk_bytes,
+                (QUIC_INITIAL_WINDOW_PACKETS / 2) as u64,
+                Duration::from_millis(30),
+            ),
+            2,
+        );
+
+        assert_eq!(measured.delivery_sample_bytes, sample_bytes);
+        assert_eq!(
+            measured.delivery_rate_bps.round() as u64,
+            (sample_bytes as f64 * 8.0 / 0.050).round() as u64
+        );
     }
 
     #[test]
@@ -2572,11 +3920,9 @@ mod tests {
         stats.path.cwnd = 4 * 1024 * 1024;
         stats.path.current_mtu = 1400;
         let _ = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
         let tx_only = tracker.quic.observe(
             stats,
-            with_product_data_written(congestion, 8 * 1024 * 1024),
+            with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
             2,
         );
 
@@ -2597,7 +3943,7 @@ mod tests {
 
         let queued = tracker.quic.observe(
             stats,
-            with_product_data_written(congestion, 8 * 1024 * 1024),
+            with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
             2,
         );
         assert_eq!(queued.bytes_in_flight, 0);
@@ -2608,7 +3954,7 @@ mod tests {
         let partially_acked = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 8 * 1024 * 1024),
+                with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
                 2 * 1024 * 1024,
                 1,
             ),
@@ -2637,6 +3983,15 @@ mod tests {
             delivery_sample_count: 0,
             delivery_sample_bytes: 0,
             last_delivery_sample_at: None,
+            bulk_proof_expires_at: None,
+            latest_delivery_sample_bytes: 0,
+            latest_delivery_sample_count: 0,
+            latest_carrier_ack_elapsed: None,
+            latest_rate_sample_elapsed: None,
+            capacity_proof_candidate: None,
+            capacity_probe: None,
+            #[cfg(feature = "lab-diagnostics")]
+            ack_poll: QuicAckPollDiagnostics::default(),
         };
 
         let path_metrics = path_metrics_from_quic_path(PathId(7), metrics);
@@ -2657,12 +4012,10 @@ mod tests {
         stats.path.rtt = Duration::from_millis(50);
 
         let _ = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(500));
         stats.frame_rx.acks = 1;
         let unknown_capacity = tracker.quic.observe(
             stats,
-            with_acked_bytes(with_product_data_written(congestion, 4096), 4096, 1),
+            with_acked_bytes(with_delivery_evidence_written(congestion, 4096), 4096, 1),
             2,
         );
 
@@ -2689,13 +4042,11 @@ mod tests {
         assert!(startup.last_delivery_sample_at.is_none());
         assert_eq!(startup.delivery_rate_bps.round() as u64, udp_startup_rate);
         assert_eq!(startup.pacing_rate_bps.round() as u64, udp_startup_rate);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(500));
         stats.frame_rx.acks = 1;
         let app_limited =
             tracker
                 .quic
-                .observe(stats, with_product_data_written(congestion, 4096), 2);
+                .observe(stats, with_delivery_evidence_written(congestion, 4096), 2);
 
         assert_eq!(app_limited.delivery_sample_count, 0);
         assert!(app_limited.last_delivery_sample_at.is_none());
@@ -2739,13 +4090,11 @@ mod tests {
         stats.path.cwnd = 4 * 1024 * 1024;
         stats.path.current_mtu = 1400;
         let _ = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
         stats.frame_rx.acks = 1;
         let app_limited = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 32 * 1024),
+                with_delivery_evidence_written(congestion, 32 * 1024),
                 32 * 1024,
                 1,
             ),
@@ -2777,15 +4126,14 @@ mod tests {
         stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
         stats.path.current_mtu = 1400;
         let startup = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
         stats.frame_rx.acks = 1;
         let measured = tracker.quic.observe(
             stats,
-            with_acked_bytes(
-                with_product_data_written(congestion, PATH_OPEN_SCORE_BYTES as u64),
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(congestion, PATH_OPEN_SCORE_BYTES as u64),
                 PATH_OPEN_SCORE_BYTES as u64,
                 1,
+                Duration::from_millis(1000),
             ),
             2,
         );
@@ -2799,6 +4147,622 @@ mod tests {
     }
 
     #[test]
+    fn quic_poll_retains_non_app_limited_ack_bytes_after_later_idle_ack() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let sample_bytes = 256 * 1024_u64;
+        let congestion = quic_congestion(PATH_OPEN_SCORE_BYTES as u64, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
+        stats.path.current_mtu = 1400;
+        let _ = tracker.quic.observe(stats, congestion, 2);
+        let mut polled = with_acked_bytes(
+            with_delivery_evidence_written(congestion, sample_bytes),
+            sample_bytes,
+            QUIC_INITIAL_WINDOW_PACKETS as u64,
+        );
+        polled.app_limited = true;
+        let measured = tracker.quic.observe(stats, polled, 2);
+
+        assert_eq!(measured.delivery_sample_bytes, sample_bytes);
+        assert!(measured.delivery_sample_count >= QUIC_INITIAL_WINDOW_PACKETS as u64);
+        assert!(
+            !measured.app_limited,
+            "a later idle ACK flag must not erase non-app-limited bytes accumulated before the metrics poll"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_evidence_accumulates_across_small_ack_polls() {
+        let mut tracker = UdpPathMetricTracker::default();
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let chunk_bytes = sample_bytes / 8;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let _ = tracker.quic.observe(stats, congestion, 2);
+
+        let mut measured = None;
+        for _ in 0..8 {
+            measured = Some(tracker.quic.observe(
+                stats,
+                with_acked_bytes(
+                    with_delivery_evidence_written(congestion, sample_bytes),
+                    chunk_bytes,
+                    2,
+                ),
+                2,
+            ));
+        }
+        let measured = measured.expect("split calibration sample");
+        assert_eq!(measured.delivery_sample_bytes, sample_bytes);
+        assert!(!measured.app_limited);
+
+        let idle = tracker.quic.observe(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes),
+            2,
+        );
+        assert!(
+            !idle.app_limited,
+            "an idle metrics poll inside the 3-PTO horizon must preserve capacity evidence"
+        );
+    }
+
+    #[test]
+    fn quic_app_limited_capacity_probe_emits_candidate_without_generic_proof() {
+        let now = Instant::now();
+        let required_bytes = 240 * 1024_u64;
+        let mut congestion = quic_congestion(256 * 1024, Some(100_000_000));
+        congestion.app_limited = true;
+        congestion = with_capacity_probe(
+            congestion,
+            capacity_probe_metrics(
+                41,
+                now,
+                0,
+                required_bytes,
+                required_bytes,
+                32,
+                Some(Duration::from_millis(40)),
+            ),
+        );
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = 256 * 1024;
+        stats.path.current_mtu = 1400;
+        let mut tracker = QuicPathMetricTracker::default();
+
+        let observed = tracker.observe_at(stats, congestion, 2, now);
+        let candidate = observed
+            .capacity_proof_candidate
+            .expect("receiver-confirmed capacity token");
+
+        assert_eq!(candidate.token, 41);
+        assert!(candidate.receipt_confirmed);
+        assert_eq!(candidate.received_bytes, candidate.train_bytes);
+        assert_eq!(candidate.proof_elapsed, Duration::from_millis(80));
+        assert!(candidate.written_data_frame_count > 0);
+        assert!(observed.app_limited);
+        assert_eq!(observed.delivery_sample_count, 0);
+        assert_eq!(observed.delivery_sample_bytes, 0);
+        assert!(observed.bulk_proof_expires_at.is_none());
+    }
+
+    #[test]
+    fn quic_capacity_receipt_publishes_after_terminalization_and_freezes_rate() {
+        let now = Instant::now();
+        let required_bytes = 240 * 1024_u64;
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = 256 * 1024;
+        stats.path.current_mtu = 1400;
+        let base = quic_congestion(256 * 1024, Some(100_000_000));
+        let mut probe = capacity_probe_metrics(
+            42,
+            now,
+            0,
+            required_bytes,
+            required_bytes,
+            32,
+            Some(Duration::from_millis(40)),
+        );
+        probe.phase = quic_carrier::CapacityProbePhase::Proven;
+        probe.last_authoritative_in_flight = Some(0);
+        probe.last_authoritative_sent_watermark = Some(10_000);
+        probe.receipt_frozen_sent_watermark = Some(11_200);
+        probe.current_sent_watermark = 11_200;
+        let mut tracker = QuicPathMetricTracker::default();
+
+        let measured = tracker.observe_at(stats, with_capacity_probe(base, probe), 2, now);
+        let candidate = measured
+            .capacity_proof_candidate
+            .expect("terminal exact receipt publishes independently of native cleanup");
+        assert_eq!(candidate.proof_elapsed, Duration::from_millis(80));
+        assert_eq!(candidate.accepted_at, now);
+        assert_eq!(candidate.expires_at, now + candidate.proof_validity);
+        assert_eq!(
+            candidate.rate_bps,
+            quic_capacity_receipt_rate_bps(candidate.train_bytes, candidate.proof_elapsed)
+                .expect("receipt rate")
+        );
+
+        probe.phase = quic_carrier::CapacityProbePhase::Proven;
+        probe.timed_measurement_ack_elapsed = Some(Duration::from_secs(2));
+        probe.current_sent_watermark = 12_400;
+        let later = tracker.observe_at(
+            stats,
+            with_capacity_probe(base, probe),
+            2,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(later.capacity_proof_candidate, Some(candidate));
+
+        let mut late_tracker = QuicPathMetricTracker::default();
+        let independently_observed = late_tracker.observe_at(
+            stats,
+            with_capacity_probe(base, probe),
+            2,
+            now + Duration::from_millis(20),
+        );
+        assert_eq!(
+            independently_observed.capacity_proof_candidate,
+            Some(candidate)
+        );
+    }
+
+    #[test]
+    fn quic_capacity_candidate_accepts_only_receipted_publishable_phases() {
+        let now = Instant::now();
+        let required_bytes = 240 * 1024_u64;
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = 256 * 1024;
+        stats.path.current_mtu = 1400;
+        let base = quic_congestion(256 * 1024, Some(100_000_000));
+
+        let proven = QuicPathMetricTracker::default().observe_at(
+            stats,
+            with_capacity_probe(
+                base,
+                capacity_probe_metrics(43, now, 0, required_bytes, 0, 0, None),
+            ),
+            2,
+            now,
+        );
+        assert!(proven.capacity_proof_candidate.is_some());
+        for phase in [
+            quic_carrier::CapacityProbePhase::Writing,
+            quic_carrier::CapacityProbePhase::Measuring,
+            quic_carrier::CapacityProbePhase::ProvenDraining,
+            quic_carrier::CapacityProbePhase::Expired,
+            quic_carrier::CapacityProbePhase::Aborted,
+        ] {
+            let mut probe = capacity_probe_metrics(44, now, 0, required_bytes, 0, 0, None);
+            probe.phase = phase;
+            let observed = QuicPathMetricTracker::default().observe_at(
+                stats,
+                with_capacity_probe(base, probe),
+                2,
+                now,
+            );
+            assert!(
+                observed.capacity_proof_candidate.is_none(),
+                "phase {phase:?} cannot publish receipt authority"
+            );
+        }
+    }
+
+    #[test]
+    fn quic_active_capacity_probe_uses_bounded_quarter_rtt_poll_cadence() {
+        let now = Instant::now();
+        let required_bytes = 240 * 1024_u64;
+        let metrics_for = |phase, rtt: Duration| {
+            let mut stats = quinn::ConnectionStats::default();
+            stats.path.rtt = rtt;
+            stats.path.cwnd = 256 * 1024;
+            stats.path.current_mtu = 1400;
+            let mut probe = capacity_probe_metrics(45, now, 0, required_bytes, 0, 0, None);
+            probe.phase = phase;
+            QuicPathMetricTracker::default().observe_at(
+                stats,
+                with_capacity_probe(quic_congestion(256 * 1024, None), probe),
+                2,
+                now,
+            )
+        };
+
+        for phase in [
+            quic_carrier::CapacityProbePhase::Writing,
+            quic_carrier::CapacityProbePhase::Measuring,
+            quic_carrier::CapacityProbePhase::ProvenDraining,
+            quic_carrier::CapacityProbePhase::Proven,
+        ] {
+            assert_eq!(
+                quic_path_metrics_poll_interval(metrics_for(phase, Duration::from_millis(80))),
+                Duration::from_millis(20),
+                "phase {phase:?} must be polled faster than idle PTO cadence"
+            );
+        }
+        assert_eq!(
+            quic_path_metrics_poll_interval(metrics_for(
+                quic_carrier::CapacityProbePhase::Proven,
+                Duration::from_millis(400),
+            )),
+            QUIC_MAX_ACK_DELAY
+        );
+        assert_eq!(
+            quic_path_metrics_poll_interval(metrics_for(
+                quic_carrier::CapacityProbePhase::Measuring,
+                Duration::from_millis(2),
+            )),
+            QUIC_TIMER_GRANULARITY
+        );
+        let expired = metrics_for(
+            quic_carrier::CapacityProbePhase::Expired,
+            Duration::from_millis(80),
+        );
+        assert!(quic_path_metrics_poll_interval(expired) > Duration::from_millis(20));
+    }
+
+    #[test]
+    fn quic_capacity_probe_requires_exact_full_train_receipt() {
+        let now = Instant::now();
+        let warmup_bytes = 384 * 1024_u64;
+        let required_bytes = 240 * 1024_u64;
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = 512 * 1024;
+        stats.path.current_mtu = 1400;
+        let base = quic_congestion(512 * 1024, Some(100_000_000));
+        let mut tracker = QuicPathMetricTracker::default();
+
+        let mut incomplete_receipt =
+            capacity_probe_metrics(51, now, warmup_bytes, required_bytes, 0, 0, None);
+        incomplete_receipt.receipt_received_payload_bytes =
+            incomplete_receipt.train_payload_bytes - 1;
+        let below_floor =
+            tracker.observe_at(stats, with_capacity_probe(base, incomplete_receipt), 2, now);
+        assert!(below_floor.capacity_proof_candidate.is_none());
+
+        let proven = tracker.observe_at(
+            stats,
+            with_capacity_probe(
+                base,
+                capacity_probe_metrics(51, now, warmup_bytes, required_bytes, 0, 0, None),
+            ),
+            2,
+            now + Duration::from_millis(1),
+        );
+        let candidate = proven
+            .capacity_proof_candidate
+            .expect("exact receiver-confirmed train");
+        assert_eq!(candidate.warmup_bytes, warmup_bytes);
+        assert_eq!(candidate.received_bytes, candidate.train_bytes);
+        assert_eq!(candidate.required_proof_bytes, required_bytes);
+    }
+
+    #[test]
+    fn quic_capacity_receipt_candidate_is_sticky_and_frozen() {
+        let now = Instant::now();
+        let required_bytes = 240 * 1024_u64;
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = 256 * 1024;
+        stats.path.current_mtu = 1400;
+        let base = quic_congestion(256 * 1024, Some(100_000_000));
+        let mut tracker = QuicPathMetricTracker::default();
+        let probe = |token, elapsed| {
+            with_capacity_probe(
+                base,
+                capacity_probe_metrics(token, now, 0, required_bytes, required_bytes, 32, elapsed),
+            )
+        };
+
+        let received = tracker.observe_at(stats, probe(61, None), 2, now);
+        let accepted = received
+            .capacity_proof_candidate
+            .expect("receipt does not depend on a native ACK span");
+        let mut retried = tracker.observe_at(
+            stats,
+            probe(61, Some(Duration::from_millis(40))),
+            2,
+            now + Duration::from_millis(2),
+        );
+        let retried_candidate = retried
+            .capacity_proof_candidate
+            .expect("transient rejection must retain sticky token");
+        assert_eq!(retried_candidate.token, accepted.token);
+        tracker.accept_capacity_proof(&mut retried, retried_candidate);
+        let frozen_deadline = retried_candidate.expires_at;
+        assert_eq!(
+            frozen_deadline,
+            retried_candidate.accepted_at + retried_candidate.proof_validity
+        );
+        let sticky = tracker.observe_at(
+            stats,
+            probe(61, Some(Duration::from_millis(40))),
+            2,
+            now + Duration::from_millis(3),
+        );
+        assert!(sticky.capacity_proof_candidate.is_none());
+        assert!(sticky.bulk_proof_expires_at.is_none());
+        let expired_sticky = tracker.observe_at(
+            stats,
+            probe(61, Some(Duration::from_millis(40))),
+            2,
+            frozen_deadline,
+        );
+        assert!(expired_sticky.app_limited);
+        assert!(expired_sticky.capacity_proof_candidate.is_none());
+        let rollover_at = frozen_deadline + Duration::from_millis(1);
+        let rollover = tracker.observe_at(
+            stats,
+            with_capacity_probe(
+                base,
+                capacity_probe_metrics(
+                    62,
+                    rollover_at,
+                    0,
+                    required_bytes,
+                    required_bytes,
+                    32,
+                    Some(Duration::from_millis(40)),
+                ),
+            ),
+            2,
+            rollover_at,
+        );
+        assert_eq!(
+            rollover.capacity_proof_candidate.map(|proof| proof.token),
+            Some(62)
+        );
+    }
+
+    #[test]
+    fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let congestion = quic_congestion(sample_bytes, Some(100_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(400);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let base = Instant::now();
+        let proof_at = base + Duration::from_millis(1);
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe_at(stats, congestion, 2, base);
+        let proven = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+            ),
+            2,
+            proof_at,
+        );
+        let frozen_deadline = proven
+            .bulk_proof_expires_at
+            .expect("accepted proof deadline");
+
+        stats.path.rtt = Duration::from_millis(20);
+        let smaller_horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
+        assert!(proof_at + smaller_horizon < frozen_deadline);
+        let still_fresh = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes),
+            2,
+            proof_at + smaller_horizon,
+        );
+        assert!(!still_fresh.app_limited);
+        assert_eq!(still_fresh.bulk_proof_expires_at, Some(frozen_deadline));
+
+        let expired = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes),
+            2,
+            frozen_deadline,
+        );
+        assert!(expired.app_limited);
+        assert!(expired.bulk_proof_expires_at.is_none());
+    }
+
+    #[test]
+    fn quic_expired_proof_preserves_new_pending_sample() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let fragment_bytes = sample_bytes / 8;
+        let congestion = quic_congestion(sample_bytes, Some(100_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let base = Instant::now();
+        let proof_at = base + Duration::from_millis(1);
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe_at(stats, congestion, 2, base);
+        let proven = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+            ),
+            2,
+            proof_at,
+        );
+        let deadline = proven.bulk_proof_expires_at.expect("proof deadline");
+        let written_bytes = sample_bytes.saturating_mul(3);
+        let _ = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, written_bytes),
+                fragment_bytes,
+                2,
+            ),
+            2,
+            deadline - QUIC_TIMER_GRANULARITY,
+        );
+        assert_eq!(tracker.pending_non_app_limited_sample_bytes, fragment_bytes);
+
+        let expired = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, written_bytes),
+            2,
+            deadline,
+        );
+        assert!(expired.app_limited);
+        assert_eq!(tracker.pending_non_app_limited_sample_bytes, fragment_bytes);
+        assert_eq!(tracker.pending_non_app_limited_sample_count, 2);
+        assert!(!tracker.pending_non_app_limited_sample_elapsed.is_zero());
+    }
+
+    #[test]
+    fn quic_bulk_proof_is_fresh_inside_persistent_congestion_horizon() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let base = Instant::now();
+        let proof_at = base + Duration::from_millis(1);
+        let horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe_at(stats, congestion, 2, base);
+        let proven = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+            ),
+            2,
+            proof_at,
+        );
+
+        assert!(!proven.app_limited);
+        let fresh = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes),
+            2,
+            proof_at + horizon - QUIC_TIMER_GRANULARITY,
+        );
+        assert_eq!(fresh.delivery_sample_count, proven.delivery_sample_count);
+        assert_eq!(fresh.delivery_sample_bytes, proven.delivery_sample_bytes);
+        assert!(!fresh.app_limited);
+    }
+
+    #[test]
+    fn quic_aged_bulk_proof_expires_without_erasing_ack_reachability() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let base = Instant::now();
+        let proof_at = base + Duration::from_millis(1);
+        let horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe_at(stats, congestion, 2, base);
+        let proven = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+            ),
+            2,
+            proof_at,
+        );
+        assert!(proven.ack_derived_data_seen);
+
+        let aged = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes),
+            2,
+            proof_at + horizon,
+        );
+        assert!(aged.ack_derived_data_seen);
+        assert_eq!(aged.delivery_rate_bps, proven.delivery_rate_bps);
+        assert_eq!(aged.delivery_sample_count, proven.delivery_sample_count);
+        assert_eq!(aged.delivery_sample_bytes, proven.delivery_sample_bytes);
+        assert_eq!(aged.last_delivery_sample_at, proven.last_delivery_sample_at);
+        assert!(aged.bulk_proof_expires_at.is_none());
+        assert!(aged.app_limited);
+    }
+
+    #[test]
+    fn quic_reproved_bulk_rights_are_not_permanently_sticky() {
+        let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
+        let congestion = quic_congestion(sample_bytes, Some(500_000_000));
+        let mut stats = quinn::ConnectionStats::default();
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.cwnd = sample_bytes;
+        stats.path.current_mtu = 1400;
+        let base = Instant::now();
+        let first_proof_at = base + Duration::from_millis(1);
+        let horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
+        let mut tracker = QuicPathMetricTracker::default();
+        let _ = tracker.observe_at(stats, congestion, 2, base);
+        let _ = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, sample_bytes),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+            ),
+            2,
+            first_proof_at,
+        );
+        let _ = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes),
+            2,
+            first_proof_at + horizon,
+        );
+
+        let second_proof_at = first_proof_at + horizon + QUIC_TIMER_GRANULARITY;
+        let reproved = tracker.observe_at(
+            stats,
+            with_acked_bytes(
+                with_delivery_evidence_written(congestion, sample_bytes * 2),
+                sample_bytes,
+                QUIC_INITIAL_WINDOW_PACKETS as u64,
+            ),
+            2,
+            second_proof_at,
+        );
+        assert!(!reproved.app_limited);
+        assert!(reproved.delivery_sample_count > 0);
+
+        let aged_again = tracker.observe_at(
+            stats,
+            with_delivery_evidence_written(congestion, sample_bytes * 2),
+            2,
+            second_proof_at + horizon,
+        );
+        assert!(aged_again.app_limited);
+        assert_eq!(aged_again.delivery_rate_bps, reproved.delivery_rate_bps);
+        assert_eq!(
+            aged_again.delivery_sample_count,
+            reproved.delivery_sample_count
+        );
+        assert_eq!(
+            aged_again.delivery_sample_bytes,
+            reproved.delivery_sample_bytes
+        );
+        assert_eq!(
+            aged_again.last_delivery_sample_at,
+            reproved.last_delivery_sample_at
+        );
+        assert!(aged_again.bulk_proof_expires_at.is_none());
+        assert!(aged_again.ack_derived_data_seen);
+    }
+
+    #[test]
     fn quic_first_confident_sample_replaces_optimistic_startup_prior() {
         let mut tracker = UdpPathMetricTracker::default();
         let congestion = quic_congestion(PATH_OPEN_SCORE_BYTES as u64, Some(500_000_000));
@@ -2807,13 +4771,11 @@ mod tests {
         stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
         stats.path.current_mtu = 1400;
         let startup = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
         stats.frame_rx.acks = 1;
         let first_quantum = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, PATH_OPEN_SCORE_BYTES as u64),
+                with_delivery_evidence_written(congestion, PATH_OPEN_SCORE_BYTES as u64),
                 PATH_OPEN_SCORE_BYTES as u64,
                 1,
             ),
@@ -2823,17 +4785,17 @@ mod tests {
         assert_eq!(first_quantum.delivery_rate_bps, startup.delivery_rate_bps);
 
         let measured_bytes = 2 * 1024 * 1024_u64;
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(200));
         stats.frame_rx.acks += 9;
         let confident = tracker.quic.observe(
             stats,
-            with_acked_bytes(
-                with_product_data_written(
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(
                     congestion,
                     PATH_OPEN_SCORE_BYTES as u64 + measured_bytes,
                 ),
                 measured_bytes,
                 9,
+                Duration::from_millis(200),
             ),
             2,
         );
@@ -2863,14 +4825,14 @@ mod tests {
         let startup = tracker.quic.observe(stats, congestion, 2);
 
         let fast_sample_bytes = 64 * 1024_u64;
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1));
         stats.frame_rx.acks = 1;
         let preconfidence = tracker.quic.observe(
             stats,
-            with_acked_bytes(
-                with_product_data_written(congestion, fast_sample_bytes),
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(congestion, fast_sample_bytes),
                 fast_sample_bytes,
                 1,
+                Duration::from_millis(1),
             ),
             2,
         );
@@ -2881,17 +4843,17 @@ mod tests {
         );
 
         let measured_bytes = 2 * 1024 * 1024_u64;
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(200));
         stats.frame_rx.acks += 9;
         let confident = tracker.quic.observe(
             stats,
-            with_acked_bytes(
-                with_product_data_written(
+            with_acked_bytes_elapsed(
+                with_delivery_evidence_written(
                     congestion,
                     fast_sample_bytes.saturating_add(measured_bytes),
                 ),
                 measured_bytes,
                 9,
+                Duration::from_millis(200),
             ),
             2,
         );
@@ -2919,12 +4881,10 @@ mod tests {
         stats.path.cwnd = startup_cwnd;
         stats.path.current_mtu = 1400;
         let startup = tracker.quic.observe(stats, startup_congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
         let first = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(startup_congestion, startup_cwnd),
+                with_delivery_evidence_written(startup_congestion, startup_cwnd),
                 startup_cwnd,
                 1,
             ),
@@ -2936,11 +4896,10 @@ mod tests {
         let tiny_followup = 9 * 1024_u64;
         let grown_congestion = quic_congestion(grown_cwnd, Some(500_000_000));
         stats.path.cwnd = grown_cwnd;
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
         let count_only = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(
+                with_delivery_evidence_written(
                     grown_congestion,
                     startup_cwnd.saturating_add(tiny_followup),
                 ),
@@ -2955,12 +4914,10 @@ mod tests {
             "sample count alone cannot graduate below the current carrier flight evidence floor"
         );
         assert_eq!(count_only.delivery_rate_bps, startup.delivery_rate_bps);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(100));
         let byte_confident = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(
+                with_delivery_evidence_written(
                     grown_congestion,
                     startup_cwnd
                         .saturating_add(tiny_followup)
@@ -2987,13 +4944,11 @@ mod tests {
         stats.path.cwnd = 4 * 1024 * 1024;
         stats.path.current_mtu = 1400;
         let _ = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
         stats.frame_rx.acks = 1;
         let app_limited = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 32 * 1024),
+                with_delivery_evidence_written(congestion, 32 * 1024),
                 32 * 1024,
                 1,
             ),
@@ -3028,6 +4983,15 @@ mod tests {
             delivery_sample_count: 0,
             delivery_sample_bytes: 0,
             last_delivery_sample_at: None,
+            bulk_proof_expires_at: None,
+            latest_delivery_sample_bytes: 0,
+            latest_delivery_sample_count: 0,
+            latest_carrier_ack_elapsed: None,
+            latest_rate_sample_elapsed: None,
+            capacity_proof_candidate: None,
+            capacity_probe: None,
+            #[cfg(feature = "lab-diagnostics")]
+            ack_poll: QuicAckPollDiagnostics::default(),
         };
 
         assert!(quic_path_metrics_should_publish_local_sender(metrics));
@@ -3047,17 +5011,16 @@ mod tests {
         stats.path.current_mtu = 1400;
         let _ = tracker.quic.observe(stats, congestion, 2);
 
-        let sent_without_ack =
-            tracker
-                .quic
-                .observe(stats, with_product_data_written(congestion, 32 * 1024), 2);
+        let sent_without_ack = tracker.quic.observe(
+            stats,
+            with_delivery_evidence_written(congestion, 32 * 1024),
+            2,
+        );
         assert!(!sent_without_ack.ack_derived_data_seen);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1000));
         let ack_after_send = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 32 * 1024),
+                with_delivery_evidence_written(congestion, 32 * 1024),
                 32 * 1024,
                 1,
             ),
@@ -3081,13 +5044,11 @@ mod tests {
         stats.path.cwnd = 4 * 1024 * 1024;
         stats.path.current_mtu = 1400;
         let startup = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(1));
         stats.frame_rx.acks = 64;
         let measured = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 64 * 1024 * 1024),
+                with_delivery_evidence_written(congestion, 64 * 1024 * 1024),
                 64 * 1024 * 1024,
                 64,
             ),
@@ -3099,7 +5060,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_lower_full_sample_does_not_directly_reduce_bulk_rate_model() {
+    fn quic_lower_full_sample_smoothly_reduces_bulk_rate_model() {
         let mut tracker = UdpPathMetricTracker::default();
         let congestion = quic_congestion(512 * 1024, Some(100_000_000));
         let mut stats = quinn::ConnectionStats::default();
@@ -3107,29 +5068,25 @@ mod tests {
         stats.path.cwnd = 512 * 1024;
         stats.path.current_mtu = 1400;
         let _ = tracker.quic.observe(stats, congestion, 2);
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(50));
         stats.udp_tx.bytes = 8 * 1024 * 1024;
         stats.frame_tx.stream = 512;
         stats.frame_rx.acks = 16;
         let raised = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 8 * 1024 * 1024),
+                with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
                 8 * 1024 * 1024,
                 16,
             ),
             2,
         );
-
-        tracker.quic.last_observed_at = Some(Instant::now() - Duration::from_millis(500));
         stats.udp_tx.bytes += 512 * 1024;
         stats.frame_tx.stream += 512;
         stats.frame_rx.acks += 16;
         let after_low = tracker.quic.observe(
             stats,
             with_acked_bytes(
-                with_product_data_written(congestion, 8 * 1024 * 1024 + 512 * 1024),
+                with_delivery_evidence_written(congestion, 8 * 1024 * 1024 + 512 * 1024),
                 512 * 1024,
                 16,
             ),
@@ -3137,6 +5094,15 @@ mod tests {
         );
 
         assert_eq!(after_low.delivery_sample_count, 32);
-        assert_eq!(after_low.delivery_rate_bps, raised.delivery_rate_bps);
+        let low_sample_rate = 512.0 * 1024.0 * 8.0 / 0.100;
+        assert!(after_low.delivery_rate_bps < raised.delivery_rate_bps);
+        assert!(after_low.delivery_rate_bps > low_sample_rate);
+        assert!(after_low.delivery_rate_bps <= raised.delivery_rate_bps * 0.5);
+        assert_eq!(
+            after_low.delivery_rate_bps,
+            raised
+                .delivery_rate_bps
+                .mul_add(0.25, low_sample_rate * 0.75)
+        );
     }
 }

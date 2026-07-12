@@ -101,7 +101,7 @@ impl ServerCarrierPathRegistration {
         self.inner.path_instance_id
     }
 
-    fn session_id(&self) -> SessionId {
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
         self.inner.session_id
     }
 
@@ -126,6 +126,7 @@ impl Drop for ServerCarrierPathRegistrationInner {
             self.path_id,
             self.path_instance_id,
         );
+        self.registry.lane_tracker.detach_session(self.session_id);
     }
 }
 
@@ -186,6 +187,9 @@ impl ServerReliableStreamRegistry {
         path_id: PathId,
     ) -> ServerCarrierPathRegistration {
         let path_instance_id = next_server_carrier_path_instance_id();
+        // Carrier lifetime, not response-stream occupancy, bounds cumulative
+        // per-session discovery spend across zero-stream gaps.
+        self.lane_tracker.attach_session(session_id);
         self.active_path_instances
             .lock()
             .expect("server active path instance lock")
@@ -216,6 +220,11 @@ impl ServerReliableStreamRegistry {
             .lock()
             .expect("server path metrics lock")
             .remove(&(session_id, underlay, path_id, path_instance_id));
+        let key = CarrierPathKey { underlay, path_id };
+        // Retire the carrier-scoped reservation before stream detach can consume
+        // it as a generic binding cancellation.
+        self.lane_tracker
+            .retire_quic_capacity_calibration_path_instance(session_id, key, path_instance_id);
         let bindings = {
             let streams = self
                 .streams
@@ -228,7 +237,6 @@ impl ServerReliableStreamRegistry {
                 })
                 .collect::<Vec<_>>()
         };
-        let key = CarrierPathKey { underlay, path_id };
         for binding in bindings {
             binding.detach_path_instance(key, path_instance_id);
         }
@@ -262,16 +270,20 @@ impl ServerReliableStreamRegistry {
         let underlay = path_registration.underlay();
         let path_id = path_registration.path_id();
         let path_instance_id = path_registration.path_instance_id();
-        let initial_metrics = initial_metrics
-            .map(|metrics| ServerPathMetricsEntry {
-                metrics,
-                source: ServerPathMetricsSource::LocalSender,
-            })
-            .or_else(|| self.stored_path_metrics(session_id, underlay, path_id, path_instance_id));
         let mut streams = self
             .streams
             .lock()
             .expect("server reliable stream registry lock");
+        // Resolve stored proof after taking the stream membership lock. A path
+        // proof published while this opener waited must be inherited rather
+        // than missed by a stale pre-lock metrics copy.
+        let initial_metrics = self.initial_path_metrics(
+            session_id,
+            underlay,
+            path_id,
+            path_instance_id,
+            initial_metrics,
+        );
         if let Some(entry) = streams.get_mut(&(session_id, stream_id)) {
             if entry.target != *target {
                 return Err(RuntimeError::Protocol(
@@ -311,14 +323,15 @@ impl ServerReliableStreamRegistry {
                 );
                 return Ok(ServerReliableStreamOpen::DuplicateLiveIgnored);
             }
-            if attach_outcome == ResponseStreamAttachOutcome::Attached
-                && let Some(metrics) = initial_metrics
+            if !matches!(
+                attach_outcome,
+                ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
+            ) && let Some(metrics) = initial_metrics
             {
-                entry.binding.update_path_metrics_for_instance(
+                entry.binding.install_stored_path_metrics_for_instance(
                     CarrierPathKey { underlay, path_id },
                     path_instance_id,
-                    metrics.metrics,
-                    metrics.source,
+                    metrics,
                 );
             }
             #[cfg(feature = "lab-diagnostics")]
@@ -382,11 +395,10 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
         );
         if let Some(metrics) = initial_metrics {
-            binding.update_path_metrics_for_instance(
+            binding.install_stored_path_metrics_for_instance(
                 CarrierPathKey { underlay, path_id },
                 path_instance_id,
-                metrics.metrics,
-                metrics.source,
+                metrics,
             );
         }
         streams.insert(
@@ -443,6 +455,102 @@ impl ServerReliableStreamRegistry {
         );
     }
 
+    /// Publishes a carrier proof only after its exact session reservation has
+    /// accepted the frozen train specification. Generic metrics cannot call it.
+    pub(in crate::runtime) fn record_local_quic_capacity_proof(
+        &self,
+        path_registration: &ServerCarrierPathRegistration,
+        mut metrics: PathMetrics,
+        candidate: QuicCapacityProofCandidate,
+    ) -> bool {
+        if !path_registration.belongs_to(self)
+            || path_registration.underlay() != UnderlayProtocol::Udp
+            || metrics.underlay != UnderlayProtocol::Udp
+            || metrics.direction != PathMetricDirection::ServerToClient
+        {
+            return false;
+        }
+        let session_id = path_registration.session_id();
+        let path_id = path_registration.path_id();
+        let path_instance_id = path_registration.path_instance_id();
+        let instance_key = (session_id, UnderlayProtocol::Udp, path_id, path_instance_id);
+        // Holding instance membership fences carrier retirement across the
+        // accept/commit/publish/finalize transaction without holding lane state.
+        let active_path_instances = self
+            .active_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if !active_path_instances.contains(&instance_key) {
+            return false;
+        }
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id,
+        };
+        let Some(ticket) = self.lane_tracker.try_accept_quic_capacity_proof(
+            session_id,
+            key,
+            path_instance_id,
+            candidate,
+        ) else {
+            return false;
+        };
+        if self
+            .lane_tracker
+            .commit_quic_capacity_proof(ticket)
+            .is_none()
+        {
+            return false;
+        }
+
+        metrics.path_id = path_id;
+        let entry = ServerPathMetricsEntry {
+            metrics,
+            source: ServerPathMetricsSource::LocalSender,
+            recorded_at: Instant::now(),
+            capacity_proof: Some(candidate),
+        };
+        self.path_metrics
+            .lock()
+            .expect("server path metrics lock")
+            .insert(instance_key, entry);
+
+        let bindings = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            streams
+                .iter()
+                .filter_map(|((entry_session_id, _), entry)| {
+                    (*entry_session_id == session_id).then_some(entry.binding.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let installed = bindings
+            .iter()
+            .filter_map(|binding| {
+                binding
+                    .install_quic_capacity_proof_for_instance(
+                        key,
+                        path_instance_id,
+                        metrics,
+                        candidate,
+                    )
+                    .then_some(binding.clone())
+            })
+            .collect::<Vec<_>>();
+
+        self.lane_tracker
+            .finish_quic_capacity_proof_publication(ticket)
+            .expect("committed capacity proof publication must finish");
+        drop(active_path_instances);
+        for binding in installed {
+            binding.notify_installed_path_metrics();
+        }
+        true
+    }
+
     fn record_path_metrics_with_source(
         &self,
         path_registration: &ServerCarrierPathRegistration,
@@ -465,11 +573,26 @@ impl ServerReliableStreamRegistry {
             return;
         }
         let metrics = PathMetrics { path_id, ..metrics };
-        let entry = ServerPathMetricsEntry { metrics, source };
-        self.path_metrics
-            .lock()
-            .expect("server path metrics lock")
-            .insert(instance_key, entry);
+        let mut path_metrics = self.path_metrics.lock().expect("server path metrics lock");
+        let previous = path_metrics.get(&instance_key).copied();
+        let capacity_proof = previous
+            .and_then(|previous| previous.capacity_proof)
+            .filter(|proof| proof.expires_at > Instant::now());
+        let entry = ServerPathMetricsEntry {
+            metrics,
+            source,
+            recorded_at: Instant::now(),
+            capacity_proof,
+        };
+        // One registry slot cannot represent both directions. Preserve local
+        // sender authority for future attachments; peer hints still update each
+        // live binding's independent peer slot below.
+        if source == ServerPathMetricsSource::LocalSender
+            || previous.is_none_or(|entry| entry.source != ServerPathMetricsSource::LocalSender)
+        {
+            path_metrics.insert(instance_key, entry);
+        }
+        drop(path_metrics);
         drop(active_path_instances);
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
@@ -509,6 +632,26 @@ impl ServerReliableStreamRegistry {
         }
     }
 
+    fn initial_path_metrics(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        path_instance_id: ServerCarrierPathInstanceId,
+        initial_metrics: Option<PathMetrics>,
+    ) -> Option<ServerPathMetricsEntry> {
+        let stored = self.stored_path_metrics(session_id, underlay, path_id, path_instance_id);
+        match initial_metrics {
+            Some(metrics) => Some(ServerPathMetricsEntry {
+                metrics: PathMetrics { path_id, ..metrics },
+                source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: stored.and_then(|entry| entry.capacity_proof),
+            }),
+            None => stored,
+        }
+    }
+
     fn stored_path_metrics(
         &self,
         session_id: SessionId,
@@ -521,6 +664,15 @@ impl ServerReliableStreamRegistry {
             .expect("server path metrics lock")
             .get(&(session_id, underlay, path_id, path_instance_id))
             .copied()
+            .map(|mut entry| {
+                if entry
+                    .capacity_proof
+                    .is_some_and(|proof| proof.expires_at <= Instant::now())
+                {
+                    entry.capacity_proof = None;
+                }
+                entry
+            })
     }
 
     pub(in crate::runtime) fn detach_path(
@@ -606,5 +758,151 @@ impl ServerReliableStreamRegistry {
 impl Default for ServerReliableStreamRegistry {
     fn default() -> Self {
         Self::new(ResourceLimits::default().max_streams)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn receipt_test_metrics(path_id: PathId) -> PathMetrics {
+        PathMetrics {
+            path_id,
+            underlay: UnderlayProtocol::Udp,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 20_000,
+            srtt_us: 20_000,
+            rttvar_us: 1_000,
+            jitter_us: 0,
+            delivery_rate_bps: 1,
+            pacing_rate_bps: 1,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 100,
+            inflight_hi_bytes: 100,
+            confidence_ppm: 0,
+            app_limited: true,
+            has_ack_derived_data_sample: false,
+            data_sample_count: 0,
+            data_sample_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn late_open_and_closed_output_replacement_inherit_capacity_receipt() {
+        let registry = Arc::new(ServerReliableStreamRegistry::new(16));
+        let session_id = SessionId(701);
+        let stream_id = StreamId(9);
+        let path_id = PathId(3);
+        let registration =
+            registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+        let path_instance_id = registration.path_instance_id();
+        let metrics = receipt_test_metrics(path_id);
+        let accepted_at = Instant::now();
+        let candidate = QuicCapacityProofCandidate {
+            token: 41,
+            train_bytes: 100,
+            sample_floor_bytes: 100,
+            accounting_slack_bytes: 12,
+            warmup_bytes: 0,
+            required_proof_bytes: 88,
+            written_bytes: 100,
+            written_data_frame_count: 1,
+            receipt_confirmed: true,
+            received_bytes: 100,
+            proof_elapsed: Duration::from_millis(10),
+            rate_bps: 80_000,
+            accepted_at,
+            expires_at: accepted_at + Duration::from_secs(1),
+            proof_validity: Duration::from_secs(1),
+        };
+        registry
+            .path_metrics
+            .lock()
+            .expect("test path metrics lock")
+            .insert(
+                (session_id, UnderlayProtocol::Udp, path_id, path_instance_id),
+                ServerPathMetricsEntry {
+                    metrics,
+                    source: ServerPathMetricsSource::LocalSender,
+                    recorded_at: Instant::now(),
+                    capacity_proof: Some(candidate),
+                },
+            );
+
+        let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+        let (commands, first_receivers) = reliable_path_command_channels(8);
+        let stream = match registry
+            .open_or_attach(
+                ServerReliableStreamOpenRequest {
+                    session_id,
+                    stream_id,
+                    target: &target,
+                    lane: FlowLane::Throughput,
+                    attachment: ServerReliablePathAttachment {
+                        path_registration: registration.clone(),
+                        commands,
+                        max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                        role: StreamOpenRole::Active,
+                        initial_metrics: Some(metrics),
+                    },
+                },
+                MuxLimits::default(),
+                16,
+            )
+            .expect("open response stream")
+        {
+            ServerReliableStreamOpen::New(stream) => stream,
+            _ => panic!("expected new response stream"),
+        };
+        let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+            panic!("expected switchable response binding");
+        };
+        let inherited = binding
+            .sender_path_targets(FlowLane::Throughput, 1)
+            .into_iter()
+            .find(|target| target.key.path_id == path_id)
+            .expect("inherited receipt target");
+        assert!(inherited.has_bulk_rate_evidence);
+        assert_eq!(inherited.snapshot.confidence, 1.0);
+
+        drop(first_receivers);
+        let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+        assert!(matches!(
+            registry
+                .open_or_attach(
+                    ServerReliableStreamOpenRequest {
+                        session_id,
+                        stream_id,
+                        target: &target,
+                        lane: FlowLane::Throughput,
+                        attachment: ServerReliablePathAttachment {
+                            path_registration: registration.clone(),
+                            commands: replacement_commands,
+                            max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                            role: StreamOpenRole::Active,
+                            initial_metrics: Some(metrics),
+                        },
+                    },
+                    MuxLimits::default(),
+                    16,
+                )
+                .expect("replace closed response output"),
+            ServerReliableStreamOpen::Existing
+        ));
+        let replacement = binding
+            .sender_path_targets(FlowLane::Throughput, 1)
+            .into_iter()
+            .find(|target| target.key.path_id == path_id)
+            .expect("replacement receipt target");
+        assert!(replacement.has_bulk_rate_evidence);
+        assert_eq!(replacement.snapshot.confidence, 1.0);
     }
 }

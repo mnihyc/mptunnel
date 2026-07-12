@@ -3,9 +3,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from failover_download_probe import (
     read_failover_marker_elapsed,
+    run_download_worker,
     watch_failover_marker,
 )
 
@@ -43,6 +45,62 @@ class FailoverDownloadMarkerTests(unittest.TestCase):
             self.assertIsNone(read_failover_marker_elapsed(marker, 1.0))
             marker.write_text("invalid\n", encoding="ascii")
             self.assertIsNone(read_failover_marker_elapsed(marker, 1.0))
+
+
+class FixedRequestLifecycleTests(unittest.TestCase):
+    def state(self):
+        return {
+            "request_attempts_started": 0,
+            "requests": 0,
+            "complete_requests": 0,
+            "partial_requests": 0,
+            "failures": 0,
+            "early_terminations": 0,
+        }
+
+    def test_fixed_lifecycle_never_replaces_an_early_request(self):
+        calls = []
+
+        def early_eof(*_args):
+            calls.append(True)
+            return False, 200, "eof"
+
+        state = self.state()
+        lock = threading.Lock()
+        started = time.monotonic()
+        run_download_worker(
+            SimpleNamespace(request_lifecycle="fixed"),
+            started,
+            started + 60,
+            state,
+            lock,
+            download_request=early_eof,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(state["request_attempts_started"], 1)
+        self.assertEqual(state["partial_requests"], 1)
+        self.assertEqual(state["early_terminations"], 1)
+
+    def test_fixed_lifecycle_accepts_a_request_held_until_deadline(self):
+        def deadline(*_args):
+            return False, 200, "deadline"
+
+        state = self.state()
+        lock = threading.Lock()
+        started = time.monotonic()
+        run_download_worker(
+            SimpleNamespace(request_lifecycle="fixed"),
+            started,
+            started + 60,
+            state,
+            lock,
+            download_request=deadline,
+        )
+
+        self.assertEqual(state["request_attempts_started"], 1)
+        self.assertEqual(state["partial_requests"], 1)
+        self.assertEqual(state["early_terminations"], 0)
 
 
 if __name__ == "__main__":

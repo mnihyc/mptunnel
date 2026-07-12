@@ -132,6 +132,18 @@ handed bytes to its local target socket, not that the target application
 consumed them, so target-side kernel buffering can still exceed
 receiver-observed application bytes during a fixed-duration test.
 
+A QUIC bulk response initially advertises a derived product receive window
+(4 MiB with default limits) instead of immediately advertising the configured
+64 MiB envelope. The bootstrap is derived from the product quantum and resource
+envelopes; it is not the QUIC congestion window. Either substantial uniquely
+owned product `STREAM_ACK` progress or a durable local carrier ACK-derived DATA
+estimate may graduate the current QUIC Service's source and emission staging;
+the carrier estimate may be app-limited. Neither authority is carrier capacity
+proof, and same-path latency pressure still prevents graduation. Optional
+Subflows, capacity ranking, and handoff require strict non-app-limited carrier
+proof. TCP and QUIC keep separate recovery, pacing, and flow-control loops below
+this unified product policy.
+
 For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
 `max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together
 instead of only raising the frame or read chunk. For a memory-constrained local

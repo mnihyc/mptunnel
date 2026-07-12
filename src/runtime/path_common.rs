@@ -1,5 +1,9 @@
 use super::*;
 
+// Shared target-side helpers, despite the historical module name. These workers
+// talk to application UDP sockets and return frames through any reliable
+// carrier; they do not implement the QUIC/UDP underlay or multipath ownership.
+
 const UDP_DATAGRAM_RECV_BUFFER_BYTES: usize = u16::MAX as usize;
 
 pub(super) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
@@ -181,6 +185,9 @@ pub(super) fn frame_kind_name(frame: &Frame) -> &'static str {
         Frame::PathMtuAck { .. } => "PATH_MTU_ACK",
         Frame::PathProofData { .. } => "PATH_PROOF_DATA",
         Frame::PathProofAck { .. } => "PATH_PROOF_ACK",
+        Frame::PathCapacityData { .. } => "PATH_CAPACITY_DATA",
+        Frame::PathCapacityFinish { .. } => "PATH_CAPACITY_FINISH",
+        Frame::PathCapacityReceipt { .. } => "PATH_CAPACITY_RECEIPT",
         Frame::OpenStream { .. } => "OPEN_STREAM",
         Frame::StreamData { .. } => "STREAM_DATA",
         Frame::StreamAck { .. } => "STREAM_ACK",
@@ -224,6 +231,32 @@ fn frame_subject(frame: &Frame) -> String {
         | Frame::PathProofData { path_id, .. }
         | Frame::PathProofAck { path_id, .. }
         | Frame::RxRateHint { path_id, .. } => format!("path_id={}", path_id.0),
+        Frame::PathCapacityData {
+            path_id,
+            calibration_id,
+            payload,
+        } => format!(
+            "path_id={} calibration_id={} payload_len={}",
+            path_id.0,
+            calibration_id,
+            payload.len()
+        ),
+        Frame::PathCapacityFinish {
+            path_id,
+            calibration_id,
+            payload_bytes,
+        } => format!(
+            "path_id={} calibration_id={} payload_bytes={}",
+            path_id.0, calibration_id, payload_bytes
+        ),
+        Frame::PathCapacityReceipt {
+            path_id,
+            calibration_id,
+            received_payload_bytes,
+        } => format!(
+            "path_id={} calibration_id={} received_payload_bytes={}",
+            path_id.0, calibration_id, received_payload_bytes
+        ),
         Frame::PathStatus {
             path_id, status, ..
         } => format!("path_id={} status={status:?}", path_id.0),

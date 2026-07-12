@@ -1,7 +1,10 @@
-use super::bulk_admission::reliable_relay_source_staging_owner_tail_headroom;
+use super::bulk_admission::{
+    ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
+    bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
+};
 #[cfg(test)]
 use super::bulk_admission::{
-    bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
+    bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
 };
 use super::*;
 
@@ -28,7 +31,9 @@ pub(super) async fn send_sender_service_attach_control_frames(
 
 pub(super) fn frame_pacing_bytes(frame: &Frame) -> usize {
     match frame {
-        Frame::StreamData { payload, .. } => payload.len().max(1),
+        Frame::StreamData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
+            payload.len().max(1)
+        }
         Frame::StreamFin { .. }
         | Frame::StreamAck { .. }
         | Frame::StreamMaxData { .. }
@@ -522,9 +527,16 @@ fn reliable_stream_advertised_window_from_underlay(
     if !lane.is_bulk() {
         return startup_window;
     }
+    let bulk_bootstrap_window = u64::try_from(bulk_service_feed_reservoir_payload_bytes(
+        reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
+        mux_limits,
+    ))
+    .unwrap_or(u64::MAX)
+    .max(startup_window)
+    .min(configured);
 
     let Some(path) = path else {
-        return startup_window;
+        return bulk_bootstrap_window;
     };
 
     let bdp_window = (reliable_path_product_bdp_bytes(path) * RELIABLE_UDP_BULK_BDP_GAIN)
@@ -538,7 +550,7 @@ fn reliable_stream_advertised_window_from_underlay(
 
     bdp_window
         .max(carrier_window)
-        .max(startup_window)
+        .max(bulk_bootstrap_window)
         .min(configured)
 }
 
@@ -1853,24 +1865,21 @@ where
         response_sender.publish_queue_bytes(&path_stream);
         let payload_hint = relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes);
-        let (
-            send_path_snapshot,
-            source_service_is_live,
-            source_service_has_latency_pressure,
-            source_staging_has_feed_evidence,
-            independent_source_staging,
-        ) = match &path_stream.output {
+        let (send_path_snapshot, source_staging_context) = match &path_stream.output {
             ReliablePathStreamOutput::Switchable(binding) => {
                 let read = binding.relay_read_snapshot(relay_lane, payload_hint);
-                let source_service = read.source_service;
-                let source_service_key = source_service.map(|service| service.key);
                 (
                     read.send_path,
-                    source_service_key.is_some(),
-                    source_service
-                        .is_some_and(|service| service.active_latency_sensitive_flows > 0),
-                    source_service.is_some_and(|service| service.has_bulk_rate_evidence),
-                    read.independent_source_staging,
+                    ReliableSourceStagingContext {
+                        independent: read.independent_source_staging,
+                        service: read.source_service.map(|service| {
+                            ReliableSourceServiceStagingContext {
+                                allows_product_envelope: true,
+                                has_latency_pressure: service.active_latency_sensitive_flows > 0,
+                                has_feed_evidence: service.has_service_feed_evidence,
+                            }
+                        }),
+                    },
                 )
             }
             ReliablePathStreamOutput::Fixed(_) => {
@@ -1880,12 +1889,17 @@ where
                 // canonical carrier-specific bulk predicate above.
                 (
                     path,
-                    path.is_some(),
-                    path.is_some_and(|snapshot| snapshot.active_latency_sensitive_flows > 0),
-                    path.is_some_and(|snapshot| {
-                        snapshot.product_progress_rate_bps.is_some() && snapshot.confidence >= 1.0
-                    }),
-                    false,
+                    ReliableSourceStagingContext {
+                        independent: false,
+                        service: path.map(|snapshot| ReliableSourceServiceStagingContext {
+                            // Fixed request-side outputs do not expose response
+                            // owner cardinality; retain bounded staging.
+                            allows_product_envelope: false,
+                            has_latency_pressure: snapshot.active_latency_sensitive_flows > 0,
+                            has_feed_evidence: snapshot.product_progress_rate_bps.is_some()
+                                && snapshot.confidence >= 1.0,
+                        }),
+                    },
                 )
             }
         };
@@ -1957,11 +1971,8 @@ where
             mux_limits,
         );
         let owner_tail_read_headroom = reliable_relay_source_staging_owner_tail_headroom(
-            independent_source_staging,
+            source_staging_context,
             relay_lane,
-            source_service_is_live,
-            source_service_has_latency_pressure,
-            source_staging_has_feed_evidence,
             ordered_owner_debt_bytes,
             response_sender.data_bytes(),
             reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
@@ -1975,13 +1986,13 @@ where
             .min(latency_owner_credit)
             .min(owner_tail_read_headroom);
         #[cfg(feature = "lab-diagnostics")]
-        if independent_source_staging && !reported_former_source_staging_block {
+        if source_staging_context.independent && !reported_former_source_staging_block {
             let former_owner_tail_read_headroom = reliable_relay_source_staging_owner_tail_headroom(
-                false,
+                ReliableSourceStagingContext {
+                    independent: false,
+                    ..source_staging_context
+                },
                 relay_lane,
-                source_service_is_live,
-                source_service_has_latency_pressure,
-                source_staging_has_feed_evidence,
                 ordered_owner_debt_bytes,
                 response_sender.data_bytes(),
                 reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
@@ -2087,11 +2098,15 @@ where
             Vec::new()
         };
         let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
+        let drain_allows_bounded_source_staging =
+            response_sender.drain_allows_bounded_source_staging(&path_stream, queued_send_blocked);
+        let queued_send_blocks_source_read =
+            queued_send_blocked && !drain_allows_bounded_source_staging;
         let can_read_by_flow = source_read_ceiling > 0
             && owner_tail_read_headroom > 0
             && response_sender.can_read_product_source(
                 local_open,
-                queued_send_blocked,
+                queued_send_blocks_source_read,
                 &send_stream,
                 mux_limits,
                 sender_queue_limit,
@@ -2880,11 +2895,8 @@ where
                     {
                         let owner_tail_read_headroom =
                             reliable_relay_source_staging_owner_tail_headroom(
-                                independent_source_staging,
+                                source_staging_context,
                                 relay_lane,
-                                source_service_is_live,
-                                source_service_has_latency_pressure,
-                                source_staging_has_feed_evidence,
                                 ordered_owner_debt_bytes,
                                 response_sender.data_bytes(),
                                 reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
@@ -3305,7 +3317,7 @@ mod tests {
     }
 
     #[test]
-    fn coupled_source_staging_keeps_the_existing_owner_tail_reservoir() {
+    fn fixed_source_staging_keeps_the_existing_owner_tail_reservoir() {
         let mux_limits = MuxLimits::default();
         let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
@@ -3313,17 +3325,55 @@ mod tests {
 
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                false,
+                ReliableSourceStagingContext {
+                    independent: false,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: false,
+                        has_latency_pressure: false,
+                        has_feed_evidence: true,
+                    }),
+                },
                 FlowLane::Throughput,
-                true,
-                false,
-                true,
                 horizon,
                 0,
                 payload,
                 mux_limits,
             ),
             reservoir.saturating_sub(horizon),
+        );
+    }
+
+    #[test]
+    fn proven_response_source_staging_uses_the_configured_product_envelope() {
+        let mut mux_limits = MuxLimits::default();
+        mux_limits.max_path_flight_bytes = 12 * 1024 * 1024;
+        mux_limits.max_reorder_bytes = 16 * 1024 * 1024;
+        mux_limits.max_stream_window_bytes = 20 * 1024 * 1024;
+        let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let owner_tail = 3 * 1024 * 1024;
+        let raw_queue = payload;
+        let envelope = bulk_service_product_envelope_payload_bytes(payload, mux_limits);
+
+        assert_eq!(
+            reliable_relay_source_staging_owner_tail_headroom(
+                ReliableSourceStagingContext {
+                    independent: false,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: true,
+                        has_latency_pressure: false,
+                        has_feed_evidence: true,
+                    }),
+                },
+                FlowLane::Throughput,
+                owner_tail,
+                raw_queue,
+                payload,
+                mux_limits,
+            ),
+            envelope
+                .saturating_sub(owner_tail)
+                .saturating_sub(raw_queue),
+            "a proven coupled response may fill its configured product envelope"
         );
     }
 
@@ -3335,11 +3385,15 @@ mod tests {
 
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                false,
+                ReliableSourceStagingContext {
+                    independent: false,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: true,
+                        has_latency_pressure: true,
+                        has_feed_evidence: true,
+                    }),
+                },
                 FlowLane::Throughput,
-                true,
-                true,
-                true,
                 horizon,
                 0,
                 payload,
@@ -3357,11 +3411,11 @@ mod tests {
 
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                true,
+                ReliableSourceStagingContext {
+                    independent: true,
+                    service: None,
+                },
                 FlowLane::Throughput,
-                false,
-                false,
-                false,
                 usize::MAX,
                 0,
                 payload,
@@ -3372,11 +3426,11 @@ mod tests {
         );
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                true,
+                ReliableSourceStagingContext {
+                    independent: true,
+                    service: None,
+                },
                 FlowLane::Throughput,
-                false,
-                false,
-                false,
                 usize::MAX,
                 horizon,
                 payload,
@@ -3396,11 +3450,15 @@ mod tests {
 
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                true,
+                ReliableSourceStagingContext {
+                    independent: true,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: true,
+                        has_latency_pressure: false,
+                        has_feed_evidence: true,
+                    }),
+                },
                 FlowLane::Throughput,
-                true,
-                false,
-                true,
                 usize::MAX,
                 horizon,
                 payload,
@@ -3419,11 +3477,15 @@ mod tests {
 
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                true,
+                ReliableSourceStagingContext {
+                    independent: true,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: true,
+                        has_latency_pressure: true,
+                        has_feed_evidence: true,
+                    }),
+                },
                 FlowLane::Throughput,
-                true,
-                true,
-                true,
                 usize::MAX,
                 horizon.saturating_sub(payload),
                 payload,
@@ -3438,22 +3500,26 @@ mod tests {
     fn full_confidence_progress_does_not_unlock_source_staging_without_bulk_evidence() {
         let mux_limits = MuxLimits::default();
         let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
+        let reservoir = bulk_service_feed_reservoir_payload_bytes(payload, mux_limits);
 
         assert_eq!(
             reliable_relay_source_staging_owner_tail_headroom(
-                true,
+                ReliableSourceStagingContext {
+                    independent: false,
+                    service: Some(ReliableSourceServiceStagingContext {
+                        allows_product_envelope: true,
+                        has_latency_pressure: false,
+                        has_feed_evidence: false,
+                    }),
+                },
                 FlowLane::Throughput,
-                true,
-                false,
-                false,
-                usize::MAX,
+                0,
                 0,
                 payload,
                 mux_limits,
             ),
-            horizon,
-            "product progress is not the carrier-specific bulk proof required to unlock the Service reservoir"
+            reservoir,
+            "product progress may bootstrap the bounded feed reservoir but cannot unlock the product envelope"
         );
     }
 

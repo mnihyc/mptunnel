@@ -347,6 +347,23 @@ pub enum Frame {
         proof_id: u64,
         payload_bytes: u32,
     },
+    // Capacity calibration is carrier traffic with an exact ordered receipt;
+    // it never consumes or acknowledges product stream offsets.
+    PathCapacityData {
+        path_id: PathId,
+        calibration_id: u64,
+        payload: Bytes,
+    },
+    PathCapacityFinish {
+        path_id: PathId,
+        calibration_id: u64,
+        payload_bytes: u64,
+    },
+    PathCapacityReceipt {
+        path_id: PathId,
+        calibration_id: u64,
+        received_payload_bytes: u64,
+    },
     OpenStream {
         stream_id: StreamId,
         target: TargetAddr,

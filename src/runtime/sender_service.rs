@@ -1,3 +1,8 @@
+#[cfg(feature = "lab-diagnostics")]
+mod response_service_handoff_diagnostics;
+
+#[cfg(feature = "lab-diagnostics")]
+use self::response_service_handoff_diagnostics::lab_response_service_handoff_evaluation;
 use super::ack_clock_policy::{
     TcpAckClockCalibrationOpportunity, reliable_tcp_ack_clock_calibration_opportunity,
 };
@@ -14,7 +19,7 @@ use super::bulk_admission::{
     bulk_service_horizon_payload_bytes,
 };
 use super::response_ownership::{
-    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseTcpReservoir,
+    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
 };
 use super::*;
 
@@ -1118,8 +1123,9 @@ enum ResponseDataDispatchTarget {
     Fixed(Arc<FixedReliablePathOutput>),
     Switchable {
         binding: Arc<ResponseStreamBinding>,
-        target: ResponseSenderPathTarget,
+        target: ResponseDispatchTarget,
         role: PathRuntimeRole,
+        service_handoff_commit: Option<ResponseServiceHandoffCommit>,
         subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
         ack_clock_calibration_commit: Option<ResponseAckClockCalibrationCommit>,
     },
@@ -1164,6 +1170,21 @@ struct ResponseSubflowAdmissionCommit {
 }
 
 #[derive(Clone, Copy)]
+struct ResponseServiceHandoffCommit {
+    planner_generation: u64,
+    lane_generation: u64,
+    model_generation: u64,
+    handoff_frontier: u64,
+    service: CarrierPathKey,
+    service_path_instance_id: ServerCarrierPathInstanceId,
+    service_incarnation: u64,
+    target_path_instance_id: ServerCarrierPathInstanceId,
+    mode: ResponseServiceHandoffMode,
+    target_command_pending_limit_bytes: u64,
+    capacity_proof: Option<QuicCapacityProofCandidate>,
+}
+
+#[derive(Clone, Copy)]
 struct ResponseAckClockCalibrationCommit {
     planner_generation: u64,
     lane_generation: u64,
@@ -1194,6 +1215,7 @@ struct ResponseAckClockCalibrationRetirementIntent {
 struct ResponseSelectedDataTarget {
     target: ResponseSenderPathTarget,
     admission: PathAdmission,
+    service_handoff_commit: Option<ResponseServiceHandoffCommit>,
     subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
     ack_clock_calibration_commit: Option<ResponseAckClockCalibrationCommit>,
 }
@@ -1299,10 +1321,23 @@ fn response_target_is_startup_same_underlay_subflow_candidate(
     let projected_ordering_debt = ordered_tail_debt
         .max(candidate_committed)
         .saturating_add(payload_bytes as u64);
+    let service_bulk_flows = service
+        .snapshot
+        .active_flows
+        .saturating_sub(service.snapshot.active_latency_sensitive_flows);
+    let target_bulk_flows = target
+        .snapshot
+        .active_flows
+        .saturating_sub(target.snapshot.active_latency_sensitive_flows);
 
     service.key == service_key
         && service.is_active
         && service.has_bulk_rate_evidence
+        // Startup OwnerData creates ordered debt on an unmeasured path. Spend
+        // it only to relieve real Service contention, never merely because a
+        // second response exists elsewhere in the session.
+        && service_bulk_flows > 1
+        && service_bulk_flows > target_bulk_flows
         && service.snapshot.active_latency_sensitive_flows == 0
         && service.snapshot.session_active_latency_sensitive_flows == 0
         && target.snapshot.active_latency_sensitive_flows == 0
@@ -1314,6 +1349,446 @@ fn response_target_is_startup_same_underlay_subflow_candidate(
         && target.has_sender_evidence
         && !target.has_bulk_rate_evidence
         && projected_ordering_debt <= product_envelope
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseQuicCapacityCalibrationGeometry {
+    train_bytes: usize,
+    fits_session_envelope: bool,
+    sample_floor_bytes: u64,
+    accounting_slack_bytes: u64,
+    fresh_strict_window_bytes: u64,
+    carrier_window_bytes: u64,
+}
+
+fn response_quic_capacity_calibration_geometry(
+    target: &ResponseSenderPathTarget,
+    mux_limits: MuxLimits,
+) -> ResponseQuicCapacityCalibrationGeometry {
+    let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+    let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+    let fresh_strict_window = sample_floor.saturating_sub(packet_accounting_slack).max(1);
+    let carrier_window = target
+        .snapshot
+        .inflight_limit_bytes
+        .max(target.snapshot.bytes_in_flight);
+    let session_envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    let required_train = carrier_window.checked_add(fresh_strict_window);
+    let fits_session_envelope = required_train
+        .map(|bytes| bytes.max(sample_floor))
+        .is_some_and(|bytes| bytes <= session_envelope);
+    let train_bytes = usize::try_from(
+        required_train
+            .unwrap_or(u64::MAX)
+            .max(sample_floor)
+            .min(session_envelope),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    ResponseQuicCapacityCalibrationGeometry {
+        train_bytes,
+        fits_session_envelope,
+        sample_floor_bytes: sample_floor,
+        accounting_slack_bytes: packet_accounting_slack,
+        fresh_strict_window_bytes: fresh_strict_window,
+        carrier_window_bytes: carrier_window,
+    }
+}
+
+#[cfg(test)]
+fn response_quic_capacity_calibration_train_bytes(
+    target: &ResponseSenderPathTarget,
+    mux_limits: MuxLimits,
+) -> usize {
+    response_quic_capacity_calibration_geometry(target, mux_limits).train_bytes
+}
+
+fn response_quic_capacity_calibration_lease(
+    target: &ResponseSenderPathTarget,
+    train_bytes: usize,
+) -> Duration {
+    let pto = transport_pto_from_snapshot(Some(target.snapshot));
+    let pacing_rate_bps = target
+        .snapshot
+        .pacing_rate_bps
+        .max(target.snapshot.delivery_rate_bps)
+        .max(1.0);
+    let transmit_eta = Duration::from_secs_f64(train_bytes as f64 * 8.0 / pacing_rate_bps);
+    // A healthy BBR startup grows within the persistent-congestion horizon.
+    // Waiting longer would serialize useful retries behind a stale cold rate;
+    // one additional PTO covers ACK/recovery after the bounded feed horizon.
+    transmit_eta
+        .min(pto.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD))
+        .saturating_add(pto)
+        .max(Duration::from_secs(1))
+}
+
+fn response_quic_capacity_proof_validity(target: &ResponseSenderPathTarget) -> Duration {
+    let srtt = Duration::from_secs_f64((target.snapshot.srtt_ms.max(1.0)) / 1_000.0);
+    let rttvar = Duration::from_secs_f64((target.snapshot.jitter_ms.max(1.0)) / 1_000.0);
+    quic_bulk_proof_freshness_horizon(srtt, rttvar)
+}
+
+#[cfg(any(test, feature = "lab-diagnostics"))]
+fn response_service_handoff_preserves_fair_share(
+    service: &ResponseSenderPathTarget,
+    target: &ResponseSenderPathTarget,
+) -> bool {
+    // Sticky placement compares one moved flow; only aggregate carrier rates
+    // are divided because TCP product ACK clocks already measure a flow share.
+    response_service_fair_share_bps(service, false) <= response_service_fair_share_bps(target, true)
+}
+
+fn response_service_fair_share_bps(target: &ResponseSenderPathTarget, adds_flow: bool) -> f64 {
+    response_rate_fair_share_bps(target.snapshot, target.rate_scope, adds_flow)
+}
+
+fn response_service_handoff_mode_for_targets(
+    service: &ResponseSenderPathTarget,
+    target: &ResponseSenderPathTarget,
+    family_loads: ResponseServiceFamilyLoads,
+) -> Option<ResponseServiceHandoffMode> {
+    response_service_handoff_mode(
+        service.key.underlay,
+        response_service_fair_share_bps(service, false),
+        target.key.underlay,
+        response_service_fair_share_bps(target, true),
+        family_loads,
+    )
+}
+
+fn response_service_handoff_target_view(
+    target: &ResponseSenderPathTarget,
+    service_key: CarrierPathKey,
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    reservation: Option<ResponseServiceHandoffDrainReservation>,
+    now: Instant,
+) -> Option<ResponseSenderPathTarget> {
+    let mut target = target.clone();
+    let Some(reservation) = reservation else {
+        return Some(target);
+    };
+    if now >= reservation.expires_at
+        || reservation.target != target.key
+        || reservation.target_path_instance_id != target.path_instance_id
+        || reservation.target_incarnation != target.incarnation
+    {
+        return None;
+    }
+    let raw_capacity_proof = target.quic_capacity_proof;
+    // A drain freezes the authority chosen at reservation time. Clear an
+    // unrelated raw marker when this transaction deliberately uses generic
+    // carrier evidence instead of receipt authority.
+    target.quic_capacity_proof = reservation.capacity_proof;
+    if let Some(proof) = reservation.capacity_proof {
+        if target.key.underlay != UnderlayProtocol::Udp {
+            return None;
+        }
+        if !quic_capacity_proof_pin_matches_marker(proof, raw_capacity_proof, now) {
+            return None;
+        }
+        // The ordinary marker still expires; only this transaction view retains it.
+        target.has_bulk_rate_evidence = true;
+        target.snapshot.delivery_rate_bps = proof.rate_bps.max(1) as f64;
+        target.rate_scope = ResponseRateScope::PathCapacity;
+        target.snapshot.confidence = target.snapshot.confidence.max(
+            (proof.received_bytes as f64 / proof.sample_floor_bytes.max(1) as f64).clamp(0.0, 1.0),
+        );
+        target.eta_ms = server_bulk_output_eta_ms(
+            target.key,
+            target.snapshot,
+            Some(service_key),
+            lane,
+            payload_bytes,
+            mux_limits,
+        );
+    }
+    Some(target)
+}
+
+fn response_service_handoff_start_capacity_proof(
+    target: &ResponseSenderPathTarget,
+    now: Instant,
+) -> Option<QuicCapacityProofCandidate> {
+    (target.key.underlay == UnderlayProtocol::Udp)
+        .then_some(target.quic_capacity_proof)
+        .flatten()
+        .filter(|proof| valid_quic_capacity_proof_candidate_at(*proof, now))
+}
+
+#[derive(Clone)]
+struct ResponseServiceHandoffCandidate {
+    service: ResponseSenderPathTarget,
+    target: ResponseSenderPathTarget,
+    mode: ResponseServiceHandoffMode,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_response_service_handoff_candidate(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    ordered_data_owner: Option<CarrierPathKey>,
+    service_family_loads: ResponseServiceFamilyLoads,
+    required_reservation: Option<ResponseServiceHandoffDrainReservation>,
+) -> Option<ResponseServiceHandoffCandidate> {
+    if !lane.is_bulk() {
+        return None;
+    }
+    let service_key = ordered_data_owner?;
+    let service = targets.iter().find(|target| target.key == service_key)?;
+    if required_reservation.is_some_and(|reservation| {
+        reservation.service != service.key
+            || reservation.service_path_instance_id != service.path_instance_id
+            || reservation.service_incarnation != service.incarnation
+    }) {
+        return None;
+    }
+    if !service.is_active
+        || !service.has_bulk_rate_evidence
+        || service.snapshot.active_latency_sensitive_flows > 0
+        || service.snapshot.session_active_latency_sensitive_flows > 0
+    {
+        return None;
+    }
+    let now = Instant::now();
+    let target = targets
+        .iter()
+        .filter_map(|target| {
+            response_service_handoff_target_view(
+                target,
+                service.key,
+                lane,
+                payload_bytes,
+                mux_limits,
+                required_reservation,
+                now,
+            )
+        })
+        .filter(|target| {
+            target.key.underlay != service.key.underlay
+                && target.attachment_role == StreamOpenRole::Validation
+                && !target.is_active
+                && target.has_bulk_rate_evidence
+                && target.owner_data_in_flight_bytes == 0
+                && target.snapshot.product_bytes_in_flight == 0
+                && target.snapshot.active_latency_sensitive_flows == 0
+                && target.snapshot.session_active_latency_sensitive_flows == 0
+                && response_service_handoff_mode_for_targets(service, target, service_family_loads)
+                    .is_some()
+                && target.commands.can_enqueue_lane_now(lane)
+                && response_owner_bulk_model_suppression(
+                    target,
+                    ResponseBulkLead {
+                        key: service.key,
+                        snapshot: service.snapshot,
+                        eta_ms: service.eta_ms,
+                    },
+                    None,
+                    0,
+                    payload_bytes,
+                    mux_limits,
+                    BulkAdmissionRole::AdditionalCrossUnderlay,
+                )
+                .is_none()
+                && response_target_has_emission_credit(target, lane, payload_bytes, mux_limits)
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+                .then_with(|| left.incarnation.cmp(&right.incarnation))
+        })?;
+    let mode = response_service_handoff_mode_for_targets(service, &target, service_family_loads)?;
+    Some(ResponseServiceHandoffCandidate {
+        service: service.clone(),
+        target,
+        mode,
+    })
+}
+
+fn select_response_quic_capacity_calibration_target(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    ordered_data_owner: Option<CarrierPathKey>,
+    service_family_loads: ResponseServiceFamilyLoads,
+    mux_limits: MuxLimits,
+    remaining_probe_bytes: u64,
+) -> Option<ResponseSenderPathTarget> {
+    if !lane.is_bulk() {
+        return None;
+    }
+    let service_key = ordered_data_owner?;
+    let service = targets.iter().find(|target| target.key == service_key)?;
+    if service.key.underlay != UnderlayProtocol::Tcp
+        || !service.is_active
+        || !service.has_bulk_rate_evidence
+        || service.snapshot.active_latency_sensitive_flows > 0
+        || service.snapshot.session_active_latency_sensitive_flows > 0
+        || service_family_loads.for_underlay(UnderlayProtocol::Tcp)
+            < service_family_loads
+                .for_underlay(UnderlayProtocol::Udp)
+                .saturating_add(2)
+    {
+        return None;
+    }
+    if targets.iter().any(|target| {
+        target.key.underlay == UnderlayProtocol::Udp
+            && target.has_bulk_rate_evidence
+            && response_service_handoff_mode_for_targets(service, target, service_family_loads)
+                .is_some()
+    }) {
+        // A measured target that already clears the placement gate should drain
+        // toward handoff; probing a second path would add optional traffic only.
+        return None;
+    }
+    targets
+        .iter()
+        .filter(|target| {
+            target.key.underlay == UnderlayProtocol::Udp
+                && target.attachment_role == StreamOpenRole::Validation
+                && !target.is_active
+                && target.has_sender_evidence
+                && !target.has_bulk_rate_evidence
+                && target.quic_capacity_calibration_attempts
+                    < MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH
+                && target.command_pending_bytes == 0
+                && target.snapshot.queue_bytes == 0
+                && target.snapshot.bytes_in_flight == 0
+                && target.snapshot.active_latency_sensitive_flows == 0
+                && target.snapshot.session_active_latency_sensitive_flows == 0
+                && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
+                && {
+                    let geometry = response_quic_capacity_calibration_geometry(target, mux_limits);
+                    geometry.fits_session_envelope
+                        && geometry.train_bytes as u64 <= remaining_probe_bytes
+                }
+        })
+        // Attachment order must not consume discovery opportunity: sample each
+        // exact reachable path once before spending a second attempt on one.
+        .min_by(|left, right| {
+            (left.quic_capacity_calibration_attempts != 0)
+                .cmp(&(right.quic_capacity_calibration_attempts != 0))
+                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+                .then_with(|| left.incarnation.cmp(&right.incarnation))
+        })
+        .cloned()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_response_service_handoff_target(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    lower_flights: &[CarrierPathFlightDebt],
+    ordered_data_owner: Option<CarrierPathKey>,
+    ordered_owner_debt_bytes: usize,
+    service_family_loads: ResponseServiceFamilyLoads,
+    handoff_frontier: u64,
+    required_reservation: Option<ResponseServiceHandoffDrainReservation>,
+) -> Option<ResponseSelectedDataTarget> {
+    if !lane.is_bulk() || ordered_owner_debt_bytes > 0 || !lower_flights.is_empty() {
+        return None;
+    }
+    let candidate = select_response_service_handoff_candidate(
+        targets,
+        lane,
+        payload_bytes,
+        mux_limits,
+        ordered_data_owner,
+        service_family_loads,
+        required_reservation,
+    )?;
+    let service = candidate.service;
+    let target = candidate.target;
+    let target_command_pending_limit_bytes = u64::try_from(
+        response_target_emission_credit_bytes(&target, lane, payload_bytes, mux_limits)
+            .saturating_sub(payload_bytes),
+    )
+    .unwrap_or(u64::MAX);
+    debug_assert!(target.commands.pending_bytes() <= target_command_pending_limit_bytes);
+
+    Some(ResponseSelectedDataTarget {
+        target: target.clone(),
+        admission: PathAdmission::service(),
+        service_handoff_commit: Some(ResponseServiceHandoffCommit {
+            planner_generation: 0,
+            lane_generation: 0,
+            model_generation: 0,
+            handoff_frontier,
+            service: service.key,
+            service_path_instance_id: service.path_instance_id,
+            service_incarnation: service.incarnation,
+            target_path_instance_id: target.path_instance_id,
+            mode: candidate.mode,
+            target_command_pending_limit_bytes,
+            capacity_proof: required_reservation
+                .map(|reservation| reservation.capacity_proof)
+                .unwrap_or_else(|| {
+                    response_service_handoff_start_capacity_proof(&target, Instant::now())
+                }),
+        }),
+        subflow_set_commit: None,
+        ack_clock_calibration_commit: None,
+    })
+}
+
+fn response_service_handoff_drain_matches_candidate(
+    binding_instance_id: u64,
+    reservation: ResponseServiceHandoffDrainReservation,
+    candidate: &ResponseServiceHandoffCandidate,
+) -> bool {
+    reservation.binding_instance_id == binding_instance_id
+        && reservation.service == candidate.service.key
+        && reservation.service_path_instance_id == candidate.service.path_instance_id
+        && reservation.service_incarnation == candidate.service.incarnation
+        && reservation.target == candidate.target.key
+        && reservation.target_path_instance_id == candidate.target.path_instance_id
+        && reservation.target_incarnation == candidate.target.incarnation
+        && reservation.capacity_proof == candidate.target.quic_capacity_proof
+}
+
+fn response_service_handoff_drain_matches_selection(
+    binding_instance_id: u64,
+    reservation: ResponseServiceHandoffDrainReservation,
+    selection: &ResponseSelectedDataTarget,
+) -> bool {
+    let Some(commit) = selection.service_handoff_commit else {
+        return false;
+    };
+    reservation.binding_instance_id == binding_instance_id
+        && reservation.service == commit.service
+        && reservation.service_path_instance_id == commit.service_path_instance_id
+        && reservation.service_incarnation == commit.service_incarnation
+        && reservation.target == selection.target.key
+        && reservation.target_path_instance_id == commit.target_path_instance_id
+        && reservation.target_incarnation == selection.target.incarnation
+        && reservation.capacity_proof == commit.capacity_proof
+}
+
+fn response_service_handoff_drain_lease(
+    service: &ResponseSenderPathTarget,
+    outstanding_owner_bytes: u64,
+) -> Duration {
+    let rate_bps = response_service_fair_share_bps(service, false)
+        .max(default_path_rate_bps(service.key.underlay))
+        .max(1.0);
+    let transmit_seconds = outstanding_owner_bytes as f64 * 8.0 / rate_bps;
+    let transmit_eta = Duration::from_secs_f64(transmit_seconds);
+    let recovery_margin = transport_pto_from_snapshot(Some(service.snapshot))
+        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+    // Fresh assignment pauses while already-owned bytes continue draining. Size
+    // the lease from this binding's share; a five-second cap made a default
+    // 2 MiB window impossible to move on a healthy 1 Mbit/s path.
+    transmit_eta
+        .saturating_add(recovery_margin)
+        .max(Duration::from_secs(1))
+        .min(Duration::from_secs(60))
 }
 
 fn select_response_ack_clock_calibration_target(
@@ -1485,6 +1960,7 @@ fn select_response_ack_clock_calibration_target(
         .map(|target| ResponseSelectedDataTarget {
             target: target.clone(),
             admission: PathAdmission::subflow_owner(PathRuntimeRole::Subflow),
+            service_handoff_commit: None,
             subflow_set_commit: None,
             ack_clock_calibration_commit: Some(ResponseAckClockCalibrationCommit {
                 planner_generation: 0,
@@ -2536,6 +3012,7 @@ fn admit_response_data_target(
     Some(ResponseSelectedDataTarget {
         target: target.clone(),
         admission,
+        service_handoff_commit: None,
         subflow_set_commit,
         ack_clock_calibration_commit: None,
     })
@@ -2638,6 +3115,7 @@ fn select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
         .map(|target| ResponseSelectedDataTarget {
             target,
             admission: PathAdmission::service(),
+            service_handoff_commit: None,
             subflow_set_commit: None,
             ack_clock_calibration_commit: None,
         });
@@ -2977,12 +3455,19 @@ fn select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
     }
     // Service admission establishes the reservoir precondition. Each remaining
     // candidate produces one admission-model result with either ordinary debt
-    // or the TCP-only ownership-aware view.
+    // or the same-family ownership-aware view.
     // A calibration stage needs isolated product ACK coverage. Keep ordinary
-    // TCP reservoir work out until its exact flights drain; Service remains the
-    // fallback and the carrier-specific controller continues draining below.
-    let tcp_reservoir = (!tcp_calibration_serialized && effective_lower_owner.is_none())
-        .then(|| response_tcp_reservoir_policy(&admitted, ordered_tail, payload_bytes, mux_limits))
+    // same-family reservoir work out until its exact flights drain; Service
+    // remains the fallback and each carrier controller continues below.
+    let same_family_reservoir = (!tcp_calibration_serialized && effective_lower_owner.is_none())
+        .then(|| {
+            response_same_family_reservoir_policy(
+                &admitted,
+                ordered_tail,
+                payload_bytes,
+                mux_limits,
+            )
+        })
         .flatten();
     for target in candidate_targets
         .iter()
@@ -2990,11 +3475,13 @@ fn select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
         .filter(|target| target.key != service_key)
     {
         let ordering_debt = response_ordering_debt_bytes(lower_flights, target.key);
-        let candidate_debt = tcp_reservoir
-            .filter(|reservoir| response_target_is_tcp_reservoir_candidate(*reservoir, target))
+        let candidate_debt = same_family_reservoir
+            .filter(|reservoir| {
+                response_target_is_same_family_reservoir_candidate(*reservoir, target)
+            })
             .map_or_else(
                 || ordered_tail.for_candidate(target.key),
-                |reservoir| response_tcp_reservoir_candidate_debt(reservoir, target),
+                |reservoir| response_same_family_reservoir_candidate_debt(reservoir, target),
             );
         if let Some(selected) = admit_response_data_target(
             target,
@@ -3006,6 +3493,18 @@ fn select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
         ) {
             admitted.push(selected);
         }
+    }
+    if let Some(reservoir) = same_family_reservoir
+        && let Some(subflow_target) =
+            response_same_family_reservoir_subflow_target(&admitted, reservoir)
+    {
+        #[cfg(feature = "lab-diagnostics")]
+        lab_response_bulk_output_selected(
+            "same_family_subflow_reservoir",
+            &subflow_target,
+            payload_bytes,
+        );
+        return Some(subflow_target);
     }
     if let Some(startup) = admitted
         .iter()
@@ -3025,13 +3524,6 @@ fn select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
         #[cfg(feature = "lab-diagnostics")]
         lab_response_bulk_output_selected("startup_sample", &startup, payload_bytes);
         return Some(startup);
-    }
-    if let Some(reservoir) = tcp_reservoir
-        && let Some(subflow_target) = response_tcp_reservoir_subflow_target(&admitted, reservoir)
-    {
-        #[cfg(feature = "lab-diagnostics")]
-        lab_response_bulk_output_selected("tcp_subflow_reservoir", &subflow_target, payload_bytes);
-        return Some(subflow_target);
     }
     if let Some(service_target) = response_feedable_service_owner_target(&admitted) {
         #[cfg(feature = "lab-diagnostics")]
@@ -3122,15 +3614,14 @@ fn response_feedable_service_owner_target(
         .cloned()
 }
 
-fn response_tcp_reservoir_policy(
+fn response_same_family_reservoir_policy(
     admitted: &[ResponseSelectedDataTarget],
     ordered_tail: ResponseOrderedTail,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-) -> Option<ResponseTcpReservoir> {
+) -> Option<ResponseSameFamilyReservoir> {
     let service = response_feedable_service_owner_target(admitted)?;
-    if service.target.key.underlay != UnderlayProtocol::Tcp
-        || !service.target.is_active
+    if !service.target.is_active
         || !service.target.has_bulk_rate_evidence
         || service.target.snapshot.active_latency_sensitive_flows > 0
         || service
@@ -3145,7 +3636,7 @@ fn response_tcp_reservoir_policy(
     let service_assigned = service.target.owner_data_in_flight_bytes;
     let feed_reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits);
 
-    ResponseTcpReservoir::new(
+    ResponseSameFamilyReservoir::new(
         service.target.key,
         ordered_tail,
         service_assigned,
@@ -3155,20 +3646,20 @@ fn response_tcp_reservoir_policy(
     )
 }
 
-fn response_target_is_tcp_reservoir_candidate(
-    reservoir: ResponseTcpReservoir,
+fn response_target_is_same_family_reservoir_candidate(
+    reservoir: ResponseSameFamilyReservoir,
     target: &ResponseSenderPathTarget,
 ) -> bool {
     target.key != reservoir.service()
-        && target.key.underlay == UnderlayProtocol::Tcp
+        && target.key.underlay == reservoir.service().underlay
         && !target.is_active
         && target.has_bulk_rate_evidence
         && target.snapshot.active_latency_sensitive_flows == 0
         && target.snapshot.session_active_latency_sensitive_flows == 0
 }
 
-fn response_tcp_reservoir_candidate_debt(
-    reservoir: ResponseTcpReservoir,
+fn response_same_family_reservoir_candidate_debt(
+    reservoir: ResponseSameFamilyReservoir,
     target: &ResponseSenderPathTarget,
 ) -> ResponseCandidateTailDebt {
     // The global tail contains unique OwnerData. Subtract only this candidate's
@@ -3177,19 +3668,27 @@ fn response_tcp_reservoir_candidate_debt(
     reservoir.for_candidate(target.key, target.owner_data_in_flight_bytes)
 }
 
-fn response_tcp_reservoir_subflow_target(
+fn response_same_family_reservoir_subflow_target(
     admitted: &[ResponseSelectedDataTarget],
-    reservoir: ResponseTcpReservoir,
+    reservoir: ResponseSameFamilyReservoir,
 ) -> Option<ResponseSelectedDataTarget> {
-    // The single-family source reader already caps total ordered tail plus raw
-    // staging at the Service feed reservoir. Keep the first horizon on Service,
-    // then let one already-admitted measured TCP Subflow use the remaining
-    // reservoir instead of waiting for the full Service envelope to back up.
+    // This reservoir independently bounds cross-path ordering exposure inside
+    // the larger source envelope. Keep the first horizon on Service, then let
+    // one measured same-family Subflow use the remaining bounded partition.
+    let service = admitted
+        .iter()
+        .find(|selected| selected.target.key == reservoir.service())?;
     admitted
         .iter()
         .filter(|selected| {
             selected.admission.role == PathRuntimeRole::Subflow
-                && response_target_is_tcp_reservoir_candidate(reservoir, &selected.target)
+                && response_target_is_same_family_reservoir_candidate(reservoir, &selected.target)
+                // Separate QUIC connections own independent congestion
+                // controllers. Crossing into an equally loaded connection
+                // only creates product reordering; require real load relief.
+                && (selected.target.key.underlay != UnderlayProtocol::Udp
+                    || response_target_active_bulk_flows(&service.target)
+                        > response_target_active_bulk_flows(&selected.target))
                 && selected
                     .subflow_set_commit
                     .is_some_and(|commit| commit.service == reservoir.service())
@@ -3205,6 +3704,13 @@ fn response_tcp_reservoir_subflow_target(
                 .then_with(|| carrier_path_key_order(left.target.key, right.target.key))
         })
         .cloned()
+}
+
+fn response_target_active_bulk_flows(target: &ResponseSenderPathTarget) -> u32 {
+    target
+        .snapshot
+        .active_flows
+        .saturating_sub(target.snapshot.active_latency_sensitive_flows)
 }
 
 fn response_target_has_emission_credit(
@@ -3253,8 +3759,12 @@ fn response_service_emission_credit_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    if !target.has_bulk_rate_evidence {
-        return response_service_startup_emission_credit_bytes(payload_bytes, mux_limits);
+    if !target.has_service_feed_evidence {
+        return response_service_startup_emission_credit_bytes(
+            target.key.underlay,
+            payload_bytes,
+            mux_limits,
+        );
     }
     if target.snapshot.active_latency_sensitive_flows > 0 {
         return usize::try_from(bulk_latency_pressure_service_feed_window_bytes(
@@ -3300,10 +3810,15 @@ fn response_target_emission_credit_bytes(
 }
 
 fn response_service_startup_emission_credit_bytes(
+    underlay: UnderlayProtocol,
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+    if underlay == UnderlayProtocol::Udp {
+        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
+    } else {
+        bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
+    }
 }
 
 fn response_quic_carrier_feed_credit_bytes(
@@ -3373,12 +3888,209 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
             let mut may_resnapshot_after_retirement = true;
             loop {
                 let (planner_generation, subflow_set) = binding.subflow_state_snapshot();
-                let (lane_generation, active_response_flows) =
-                    binding.lane_generation_and_active_response_flows();
+                let session_scheduling = binding.response_scheduling_snapshot();
+                let lane_generation = session_scheduling.generation;
+                let active_response_flows = session_scheduling.active_response_flows;
                 let model_generation = binding.response_model_generation();
                 let lower_flights = binding.lower_flights_before_offset(next_offset);
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
+                let capacity_session_limit =
+                    reliable_quic_capacity_calibration_session_limit_bytes(binding.mux_limits());
+                let remaining_capacity_probe_bytes = capacity_session_limit
+                    .saturating_sub(session_scheduling.quic_capacity_calibration_spent_bytes);
+                if !session_scheduling.quic_capacity_calibration_reserved
+                    && session_scheduling.response_service_handoff_drain.is_none()
+                    && session_scheduling
+                        .service_family_loads
+                        .needs_diversification()
+                    && let Some(target) = select_response_quic_capacity_calibration_target(
+                        &targets,
+                        relay_lane,
+                        ordered_data_owner,
+                        session_scheduling.service_family_loads,
+                        binding.mux_limits(),
+                        remaining_capacity_probe_bytes,
+                    )
+                    && {
+                        let geometry = response_quic_capacity_calibration_geometry(
+                            &target,
+                            binding.mux_limits(),
+                        );
+                        let train_bytes = geometry.train_bytes;
+                        let lease = response_quic_capacity_calibration_lease(&target, train_bytes);
+                        binding.try_start_quic_capacity_calibration(
+                            &target,
+                            ResponseQuicCapacityCalibrationRequest {
+                                expected_planner_generation: planner_generation,
+                                expected_lane_generation: lane_generation,
+                                expected_model_generation: model_generation,
+                                target: target.key,
+                                target_path_instance_id: target.path_instance_id,
+                                target_incarnation: target.incarnation,
+                                target_pending_bytes: target.command_pending_bytes,
+                                train_bytes,
+                                sample_floor_bytes: geometry.sample_floor_bytes,
+                                accounting_slack_bytes: geometry.accounting_slack_bytes,
+                                fresh_strict_window_bytes: geometry.fresh_strict_window_bytes,
+                                carrier_window_bytes: geometry.carrier_window_bytes,
+                                proof_validity: response_quic_capacity_proof_validity(&target),
+                                lease,
+                            },
+                        )
+                    }
+                {
+                    // Reservation and command admission change the session and
+                    // response-model generations. Replan ordinary OwnerData.
+                    continue;
+                }
+                let binding_instance_id = binding.binding_instance_id();
+                let current_drain = session_scheduling
+                    .response_service_handoff_drain
+                    .filter(|reservation| reservation.binding_instance_id == binding_instance_id);
+                let another_binding_is_draining = session_scheduling
+                    .response_service_handoff_drain
+                    .is_some_and(|reservation| {
+                        reservation.binding_instance_id != binding_instance_id
+                    });
+                let handoff_open = binding.response_service_handoff_open();
+                let startup_owner_active = subflow_set
+                    .as_ref()
+                    .and_then(FlowSubflowSet::startup_owner_key)
+                    .is_some();
+                let calibration_active = targets
+                    .iter()
+                    .any(|target| target.ack_clock_calibration_active);
+                let handoff_context_ready =
+                    handoff_open && !startup_owner_active && !calibration_active;
+                #[cfg(feature = "lab-diagnostics")]
+                lab_response_service_handoff_evaluation(
+                    binding,
+                    &targets,
+                    relay_lane,
+                    payload_bytes,
+                    binding.mux_limits(),
+                    &lower_flights,
+                    ordered_data_owner,
+                    ordered_owner_debt_bytes,
+                    session_scheduling.service_family_loads,
+                    current_drain,
+                    handoff_open,
+                    startup_owner_active,
+                    calibration_active,
+                    another_binding_is_draining,
+                    planner_generation,
+                    lane_generation,
+                    model_generation,
+                );
+                if handoff_context_ready
+                    && !another_binding_is_draining
+                    && let Some(mut selected) = select_response_service_handoff_target(
+                        &targets,
+                        relay_lane,
+                        payload_bytes,
+                        binding.mux_limits(),
+                        &lower_flights,
+                        ordered_data_owner,
+                        ordered_owner_debt_bytes,
+                        session_scheduling.service_family_loads,
+                        next_offset,
+                        current_drain,
+                    )
+                {
+                    debug_assert!(current_drain.is_none_or(|reservation| {
+                        response_service_handoff_drain_matches_selection(
+                            binding_instance_id,
+                            reservation,
+                            &selected,
+                        )
+                    }));
+                    let commit = selected
+                        .service_handoff_commit
+                        .as_mut()
+                        .expect("response Service handoff selection has a commit");
+                    commit.planner_generation = planner_generation;
+                    commit.lane_generation = lane_generation;
+                    commit.model_generation = model_generation;
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_response_bulk_output_selected("service_handoff", &selected, payload_bytes);
+                    return Ok(ResponseDataDispatchPlan {
+                        primary: ResponseDataDispatchTarget::Switchable {
+                            binding: binding.clone(),
+                            target: selected.target.into(),
+                            role: PathRuntimeRole::Service,
+                            service_handoff_commit: selected.service_handoff_commit,
+                            subflow_set_commit: None,
+                            ack_clock_calibration_commit: None,
+                        },
+                    });
+                }
+                let handoff_candidate = (handoff_context_ready && !another_binding_is_draining)
+                    .then(|| {
+                        select_response_service_handoff_candidate(
+                            &targets,
+                            relay_lane,
+                            payload_bytes,
+                            binding.mux_limits(),
+                            ordered_data_owner,
+                            session_scheduling.service_family_loads,
+                            current_drain,
+                        )
+                    })
+                    .flatten();
+                if let Some(reservation) = current_drain {
+                    if handoff_candidate.as_ref().is_some_and(|candidate| {
+                        response_service_handoff_drain_matches_candidate(
+                            binding_instance_id,
+                            reservation,
+                            candidate,
+                        )
+                    }) {
+                        // Only this binding pauses fresh OwnerData. Control and
+                        // critical repair still preempt the blocked data lane.
+                        return Err(RuntimeError::SenderServiceBlocked);
+                    }
+                    binding.cancel_response_service_handoff_drain("eligibility_regressed");
+                    continue;
+                }
+                if let Some(candidate) = handoff_candidate {
+                    let lower_flight_bytes = lower_flights
+                        .iter()
+                        .fold(0u64, |total, flight| total.saturating_add(flight.bytes));
+                    let outstanding_owner_bytes = u64::try_from(ordered_owner_debt_bytes)
+                        .unwrap_or(u64::MAX)
+                        .max(lower_flight_bytes)
+                        .max(candidate.service.owner_data_in_flight_bytes);
+                    let lease = response_service_handoff_drain_lease(
+                        &candidate.service,
+                        outstanding_owner_bytes,
+                    );
+                    if binding.try_start_response_service_handoff_drain(
+                        &candidate.service,
+                        &candidate.target,
+                        relay_lane,
+                        ResponseServiceHandoffDrainRequest {
+                            expected_planner_generation: planner_generation,
+                            expected_lane_generation: lane_generation,
+                            expected_model_generation: model_generation,
+                            service: candidate.service.key,
+                            service_path_instance_id: candidate.service.path_instance_id,
+                            service_incarnation: candidate.service.incarnation,
+                            target: candidate.target.key,
+                            target_path_instance_id: candidate.target.path_instance_id,
+                            target_incarnation: candidate.target.incarnation,
+                            mode: candidate.mode,
+                            capacity_proof: response_service_handoff_start_capacity_proof(
+                                &candidate.target,
+                                Instant::now(),
+                            ),
+                            outstanding_owner_bytes,
+                            lease,
+                        },
+                    ) {
+                        return Err(RuntimeError::SenderServiceBlocked);
+                    }
+                }
                 let mut retirement_intents = Vec::new();
                 let selected =
                     select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
@@ -3453,8 +4165,9 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
                 return Ok(ResponseDataDispatchPlan {
                     primary: ResponseDataDispatchTarget::Switchable {
                         binding: binding.clone(),
-                        target,
+                        target: target.into(),
                         role,
+                        service_handoff_commit: selected.service_handoff_commit,
                         subflow_set_commit: selected.subflow_set_commit,
                         ack_clock_calibration_commit: selected.ack_clock_calibration_commit,
                     },
@@ -3638,6 +4351,7 @@ async fn emit_planned_response_data_frame(
             binding,
             target,
             role,
+            service_handoff_commit,
             subflow_set_commit,
             ack_clock_calibration_commit,
         } => {
@@ -3664,13 +4378,41 @@ async fn emit_planned_response_data_frame(
                     requires_multi_flow_start: commit.requires_multi_flow_start,
                 });
             let calibrating = calibration_request.is_some();
-            match binding.try_enqueue_owner_frame_for_target(
-                &target,
-                &frame,
-                lane,
-                subflow_request,
-                calibration_request,
-            ) {
+            let handoff = service_handoff_commit.is_some();
+            let enqueue_result = if let Some(commit) = service_handoff_commit {
+                binding
+                    .try_enqueue_response_service_handoff_for_dispatch(
+                        &target,
+                        &frame,
+                        lane,
+                        ResponseServiceHandoffRequest {
+                            expected_planner_generation: commit.planner_generation,
+                            expected_lane_generation: commit.lane_generation,
+                            expected_model_generation: commit.model_generation,
+                            handoff_frontier: commit.handoff_frontier,
+                            service: commit.service,
+                            service_path_instance_id: commit.service_path_instance_id,
+                            service_incarnation: commit.service_incarnation,
+                            target: target.key,
+                            target_path_instance_id: commit.target_path_instance_id,
+                            target_incarnation: target.incarnation,
+                            mode: commit.mode,
+                            target_command_pending_limit_bytes: commit
+                                .target_command_pending_limit_bytes,
+                            capacity_proof: commit.capacity_proof,
+                        },
+                    )
+                    .map(|()| None)
+            } else {
+                binding.try_enqueue_owner_frame_for_dispatch_target(
+                    &target,
+                    &frame,
+                    lane,
+                    subflow_request,
+                    calibration_request,
+                )
+            };
+            match enqueue_result {
                 Ok(_) => {}
                 Err(RuntimeError::SenderServiceBlocked) => {
                     return Err(RuntimeError::SenderServiceBlocked);
@@ -3681,9 +4423,10 @@ async fn emit_planned_response_data_frame(
                 }
             }
             if role == PathRuntimeRole::Service {
-                let _ = binding.commit_ordered_data_owner_for_target(&target);
+                let _ = binding.commit_ordered_data_owner_for_dispatch_target(&target);
             }
             let decision_reason = match role {
+                PathRuntimeRole::Service if handoff => "data_service_handoff",
                 PathRuntimeRole::Service => "data_service",
                 PathRuntimeRole::Subflow if calibrating => "data_subflow_ack_clock_calibration",
                 PathRuntimeRole::Subflow => "data_subflow",
@@ -3773,14 +4516,20 @@ async fn emit_response_frame_from_sender_service(
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
+                let dispatch_target = ResponseDispatchTarget::from(&target);
                 let send_result = if matches!(frame, Frame::StreamData { .. }) {
                     if repair {
                         binding
                             .try_enqueue_repair_frame_for_target(&target, &frame, lane)
                             .map(|()| None)
                     } else {
-                        binding
-                            .try_enqueue_owner_frame_for_target(&target, &frame, lane, None, None)
+                        binding.try_enqueue_owner_frame_for_dispatch_target(
+                            &dispatch_target,
+                            &frame,
+                            lane,
+                            None,
+                            None,
+                        )
                     }
                 } else {
                     send_sender_service_frame_to_carrier(
@@ -3796,7 +4545,9 @@ async fn emit_response_frame_from_sender_service(
                     Ok(_) => {
                         if matches!(frame, Frame::StreamData { .. }) {
                             if !repair {
-                                let _ = binding.commit_ordered_data_owner_for_target(&target);
+                                let _ = binding.commit_ordered_data_owner_for_dispatch_target(
+                                    &dispatch_target,
+                                );
                             }
                         }
                         record_server_sender_decision(
@@ -4029,6 +4780,22 @@ impl ServerResponseSenderService {
 
     pub(super) fn queued_send_ready(&self) -> bool {
         self.queue.front().is_some()
+    }
+
+    pub(super) fn front_is_data(&self) -> bool {
+        self.queue
+            .front()
+            .is_some_and(|(_, work)| matches!(&work.kind, ReliableRelayQueuedWorkKind::Data(_)))
+    }
+
+    pub(super) fn drain_allows_bounded_source_staging(
+        &self,
+        path_stream: &ReliablePathStream,
+        queued_send_blocked: bool,
+    ) -> bool {
+        queued_send_blocked
+            && self.front_is_data()
+            && path_stream.response_service_handoff_drain_active()
     }
 
     pub(super) fn front_has_carrier_credit_with_ordered_owner_debt(
@@ -7030,6 +7797,7 @@ mod tests {
                 underlay,
                 path_id: PathId(path_id),
             },
+            path_instance_id: next_server_carrier_path_instance_id(),
             incarnation: u64::from(path_id) + 1,
             commands,
             attachment_role: if is_active {
@@ -7038,19 +7806,189 @@ mod tests {
                 StreamOpenRole::Validation
             },
             snapshot,
+            rate_scope: ResponseRateScope::PathCapacity,
             owner_data_in_flight_bytes: bytes_in_flight,
             command_pending_bytes: 0,
             eta_ms,
             is_active,
             is_request_active: is_active,
             has_sender_evidence: true,
+            has_service_feed_evidence: true,
             has_bulk_rate_evidence: true,
+            quic_capacity_proof: None,
+            quic_capacity_calibration_attempts: 0,
             ack_clock_calibration_eligible: false,
             ack_clock_calibration_proven: false,
             ack_clock_calibration_spent_bytes: 0,
             ack_clock_calibration_credit_limit_bytes: 0,
             ack_clock_calibration_max_limit_bytes: 0,
             ack_clock_calibration_active: false,
+        }
+    }
+
+    #[test]
+    fn response_dispatch_plan_drops_ranked_snapshot_state() {
+        let ranked = std::mem::size_of::<ResponseSenderPathTarget>();
+        let dispatch = std::mem::size_of::<ResponseDispatchTarget>();
+        let plan = std::mem::size_of::<ResponseDataDispatchTarget>();
+
+        assert!(dispatch < ranked, "dispatch={dispatch} ranked={ranked}");
+        assert!(
+            plan <= 512,
+            "the per-frame plan must not regain full scheduler snapshots: {plan} bytes"
+        );
+    }
+
+    struct ResponseServiceHandoffDrainFixture {
+        binding: Arc<ResponseStreamBinding>,
+        other_binding: Arc<ResponseStreamBinding>,
+        stream: ReliablePathStream,
+        other_stream: ReliablePathStream,
+        service: CarrierPathKey,
+        target: CarrierPathKey,
+        other_service: CarrierPathKey,
+        _service_receivers: ReliablePathCommandReceivers,
+        target_receivers: ReliablePathCommandReceivers,
+        _other_service_receivers: ReliablePathCommandReceivers,
+    }
+
+    fn response_service_handoff_drain_fixture() -> ResponseServiceHandoffDrainFixture {
+        response_service_handoff_drain_fixture_with_other_service(UnderlayProtocol::Tcp)
+    }
+
+    fn response_service_handoff_drain_fixture_with_other_service(
+        other_underlay: UnderlayProtocol,
+    ) -> ResponseServiceHandoffDrainFixture {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let session_id = SessionId(192);
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let target = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(1),
+        };
+        let other_service = CarrierPathKey {
+            underlay: other_underlay,
+            path_id: if other_underlay == UnderlayProtocol::Udp {
+                target.path_id
+            } else {
+                PathId(2)
+            },
+        };
+        let (service_commands, service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker.clone(),
+        );
+        let (other_service_commands, other_service_receivers) = reliable_path_command_channels(8);
+        let other_binding = ResponseStreamBinding::new_with_limits_and_tracker(
+            session_id,
+            other_service.underlay,
+            other_service.path_id,
+            other_service_commands,
+            FlowLane::Throughput,
+            mux_limits,
+            tracker,
+        );
+        let (target_commands, mut target_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                target.underlay,
+                target.path_id,
+                target_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                payload_bytes,
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut target_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+        ));
+        binding.mark_output_bulk_proven_for_test(service);
+        other_binding.mark_output_bulk_proven_for_test(other_service);
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+        binding.update_path_metrics(
+            target,
+            PathMetrics {
+                path_id: target.path_id,
+                underlay: target.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 10_000,
+                srtt_us: 12_000,
+                rttvar_us: 1_000,
+                jitter_us: 1_000,
+                delivery_rate_bps: 500_000_000,
+                pacing_rate_bps: 500_000_000,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: sample_bytes,
+                inflight_hi_bytes: sample_bytes,
+                confidence_ppm: 1_000_000,
+                app_limited: false,
+                has_ack_derived_data_sample: true,
+                data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                data_sample_bytes: sample_bytes,
+            },
+            ServerPathMetricsSource::LocalSender,
+        );
+        let expected_family_loads = if other_underlay == UnderlayProtocol::Udp {
+            ResponseServiceFamilyLoads::new(1, 1)
+        } else {
+            ResponseServiceFamilyLoads::new(2, 0)
+        };
+        assert_eq!(
+            binding.response_scheduling_snapshot().service_family_loads,
+            expected_family_loads
+        );
+
+        let (_frames_tx, frames_rx) = mpsc::channel(1);
+        let stream = ReliablePathStream {
+            stream_id: StreamId(192),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: service.underlay,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(binding.clone()),
+            frames: frames_rx,
+        };
+        let (_other_frames_tx, other_frames_rx) = mpsc::channel(1);
+        let other_stream = ReliablePathStream {
+            stream_id: StreamId(193),
+            max_offset: u64::MAX,
+            lane: FlowLane::Throughput,
+            underlay: other_service.underlay,
+            max_frame_payload_bytes: payload_bytes,
+            output: ReliablePathStreamOutput::Switchable(other_binding.clone()),
+            frames: other_frames_rx,
+        };
+        ResponseServiceHandoffDrainFixture {
+            binding,
+            other_binding,
+            stream,
+            other_stream,
+            service,
+            target,
+            other_service,
+            _service_receivers: service_receivers,
+            target_receivers,
+            _other_service_receivers: other_service_receivers,
         }
     }
 
@@ -9326,6 +10264,15 @@ mod tests {
                 delivery_sample_count: 1,
                 delivery_sample_bytes: 4 * 1024 * 1024,
                 last_delivery_sample_at: Some(Instant::now()),
+                bulk_proof_expires_at: None,
+                latest_delivery_sample_bytes: 4 * 1024 * 1024,
+                latest_delivery_sample_count: 1,
+                latest_carrier_ack_elapsed: Some(Duration::from_millis(20)),
+                latest_rate_sample_elapsed: Some(Duration::from_millis(20)),
+                capacity_proof_candidate: None,
+                capacity_probe: None,
+                #[cfg(feature = "lab-diagnostics")]
+                ack_poll: QuicAckPollDiagnostics::default(),
             });
         let (service_commands, mut service_rx) = reliable_path_command_channels(16);
         let mut remotes = ReliableRelayRemoteSet::new(
@@ -10779,17 +11726,22 @@ mod tests {
                 underlay: UnderlayProtocol::Udp,
                 path_id: PathId(0),
             },
+            path_instance_id: next_server_carrier_path_instance_id(),
             incarnation: 1,
             commands,
             attachment_role: StreamOpenRole::Active,
             snapshot,
+            rate_scope: ResponseRateScope::PathCapacity,
             owner_data_in_flight_bytes: 0,
             command_pending_bytes: 0,
             eta_ms: 1.0,
             is_active: true,
             is_request_active: true,
             has_sender_evidence: true,
+            has_service_feed_evidence: true,
             has_bulk_rate_evidence: true,
+            quic_capacity_proof: None,
+            quic_capacity_calibration_attempts: 0,
             ack_clock_calibration_eligible: false,
             ack_clock_calibration_proven: false,
             ack_clock_calibration_spent_bytes: 0,
@@ -10873,6 +11825,7 @@ mod tests {
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let mut active = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
         active.has_sender_evidence = false;
+        active.has_service_feed_evidence = false;
         active.has_bulk_rate_evidence = false;
 
         let credit = response_target_emission_credit_bytes(
@@ -10901,6 +11854,56 @@ mod tests {
                 mux_limits,
             ),
             "startup credit bounds cumulative assigned flight, not only the draining writer queue"
+        );
+    }
+
+    #[test]
+    fn active_quic_response_owner_bootstraps_with_bounded_feed_reservoir() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut active =
+            response_target(0, UnderlayProtocol::Udp, 360.0, 0, 16 * 1024 * 1024, true);
+        active.has_sender_evidence = true;
+        active.has_service_feed_evidence = false;
+        active.has_bulk_rate_evidence = false;
+
+        let credit = response_target_emission_credit_bytes(
+            &active,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+
+        assert_eq!(
+            credit,
+            bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits),
+            "QUIC needs a durable ACK-derived sample before the full product envelope"
+        );
+        assert!(
+            credit
+                < bulk_active_service_product_envelope_bytes(
+                    active.snapshot,
+                    payload_bytes,
+                    mux_limits,
+                ) as usize
+        );
+
+        active.has_service_feed_evidence = true;
+        let mature_feed_credit = response_target_emission_credit_bytes(
+            &active,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+        );
+        assert_eq!(
+            mature_feed_credit,
+            bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits)
+                as usize,
+            "durable current-Service QUIC ACK progress unlocks the product envelope"
+        );
+        assert!(
+            !active.has_bulk_rate_evidence,
+            "current-Service feed evidence must not grant optional Subflow or handoff authority"
         );
     }
 
@@ -10987,7 +11990,7 @@ mod tests {
     fn quic_proof_success_path_gets_bounded_bulk_only_startup_sampling() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let active = response_target(
+        let mut active = response_target(
             0,
             UnderlayProtocol::Udp,
             1.0,
@@ -10995,6 +11998,7 @@ mod tests {
             4 * payload_bytes as u64,
             true,
         );
+        active.snapshot.active_flows = 2;
         let mut proof_success = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
         proof_success.snapshot.delivery_rate_bps = default_path_rate_bps(UnderlayProtocol::Udp);
         proof_success.snapshot.pacing_rate_bps = proof_success.snapshot.delivery_rate_bps;
@@ -11027,7 +12031,7 @@ mod tests {
     fn proof_path_owner_sampling_is_explicit_subflow_not_service_migration() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let active = response_target(
+        let mut active = response_target(
             0,
             UnderlayProtocol::Udp,
             1.0,
@@ -11035,6 +12039,7 @@ mod tests {
             4 * payload_bytes as u64,
             true,
         );
+        active.snapshot.active_flows = 2;
         let mut proof_success = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
         proof_success.has_sender_evidence = true;
         proof_success.has_bulk_rate_evidence = false;
@@ -11334,8 +12339,6 @@ mod tests {
     fn unproven_liveness_service_failover_respects_startup_assigned_credit() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let startup_credit =
-            response_service_startup_emission_credit_bytes(payload_bytes, mux_limits);
         let mut failover = response_target(
             1,
             UnderlayProtocol::Tcp,
@@ -11344,6 +12347,12 @@ mod tests {
             4 * payload_bytes as u64,
             false,
         );
+        let startup_credit = response_service_startup_emission_credit_bytes(
+            failover.key.underlay,
+            payload_bytes,
+            mux_limits,
+        );
+        failover.has_service_feed_evidence = false;
         failover.has_bulk_rate_evidence = false;
         failover.snapshot.product_bytes_in_flight =
             startup_credit.saturating_sub(payload_bytes) as u64;
@@ -11485,7 +12494,11 @@ mod tests {
         .unwrap();
         assert!(
             mature_credit
-                > response_service_startup_emission_credit_bytes(payload_bytes, mux_limits),
+                > response_service_startup_emission_credit_bytes(
+                    failover.key.underlay,
+                    payload_bytes,
+                    mux_limits,
+                ),
             "fixture requires a mature product envelope larger than startup credit"
         );
         assert_eq!(mature_credit, full_envelope);
@@ -12195,6 +13208,7 @@ mod tests {
             true,
         );
         active.has_bulk_rate_evidence = true;
+        active.snapshot.active_flows = 2;
         let mut ack_data_only = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
         ack_data_only.has_bulk_rate_evidence = false;
         ack_data_only.has_sender_evidence = true;
@@ -12679,8 +13693,9 @@ mod tests {
         let bulk_first = ResponseDataDispatchPlan {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding: binding.clone(),
-                target: target.clone(),
+                target: target.clone().into(),
                 role: PathRuntimeRole::Service,
+                service_handoff_commit: None,
                 subflow_set_commit: None,
                 ack_clock_calibration_commit: None,
             },
@@ -12688,8 +13703,9 @@ mod tests {
         let latency_second = ResponseDataDispatchPlan {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding,
-                target,
+                target: target.into(),
                 role: PathRuntimeRole::Service,
+                service_handoff_commit: None,
                 subflow_set_commit: None,
                 ack_clock_calibration_commit: None,
             },
@@ -12823,7 +13839,7 @@ mod tests {
     fn proof_only_validation_candidate_gets_explicit_startup_admission() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let active = response_target(
+        let mut active = response_target(
             0,
             UnderlayProtocol::Udp,
             100.0,
@@ -12831,6 +13847,7 @@ mod tests {
             4 * payload_bytes as u64,
             true,
         );
+        active.snapshot.active_flows = 2;
         let mut proof_only = response_target(
             1,
             UnderlayProtocol::Udp,
@@ -13036,7 +14053,7 @@ mod tests {
         let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
             SessionId(88),
             UnderlayProtocol::Udp,
-            PathId(2),
+            service.path_id,
             second_flow_commands,
             FlowLane::Throughput,
             mux_limits,
@@ -13181,8 +14198,9 @@ mod tests {
             ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding: binding.clone(),
-                    target: target.clone(),
+                    target: target.clone().into(),
                     role: PathRuntimeRole::Subflow,
+                    service_handoff_commit: None,
                     subflow_set_commit: Some(commit),
                     ack_clock_calibration_commit: None,
                 },
@@ -13199,8 +14217,9 @@ mod tests {
             ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding,
-                    target,
+                    target: target.into(),
                     role: PathRuntimeRole::Subflow,
+                    service_handoff_commit: None,
                     subflow_set_commit: Some(commit),
                     ack_clock_calibration_commit: None,
                 },
@@ -13317,8 +14336,9 @@ mod tests {
             ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding: binding.clone(),
-                    target: target.clone(),
+                    target: target.clone().into(),
                     role: PathRuntimeRole::Subflow,
+                    service_handoff_commit: None,
                     subflow_set_commit: Some(stale_commit),
                     ack_clock_calibration_commit: None,
                 },
@@ -13338,8 +14358,9 @@ mod tests {
             ResponseDataDispatchPlan {
                 primary: ResponseDataDispatchTarget::Switchable {
                     binding,
-                    target,
+                    target: target.into(),
                     role: PathRuntimeRole::Subflow,
+                    service_handoff_commit: None,
                     subflow_set_commit: Some(ResponseSubflowAdmissionCommit {
                         planner_generation: fresh_planner_generation,
                         ..stale_commit
@@ -14199,17 +15220,22 @@ mod tests {
                 underlay: UnderlayProtocol::Tcp,
                 path_id: PathId(1),
             },
+            path_instance_id: next_server_carrier_path_instance_id(),
             incarnation: 1,
             commands: service_commands,
             attachment_role: StreamOpenRole::Active,
             snapshot: service_snapshot,
+            rate_scope: ResponseRateScope::PathCapacity,
             owner_data_in_flight_bytes: 0,
             command_pending_bytes: 0,
             eta_ms: 50.0,
             is_active: true,
             is_request_active: true,
             has_sender_evidence: true,
+            has_service_feed_evidence: true,
             has_bulk_rate_evidence: true,
+            quic_capacity_proof: None,
+            quic_capacity_calibration_attempts: 0,
             ack_clock_calibration_eligible: false,
             ack_clock_calibration_proven: false,
             ack_clock_calibration_spent_bytes: 0,
@@ -14481,6 +15507,124 @@ mod tests {
     }
 
     #[test]
+    fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            25.0,
+            service_horizon as u64,
+            mux_limits.max_path_flight_bytes as u64,
+            true,
+        );
+        service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+        service.snapshot.active_flows = 2;
+        service.owner_data_in_flight_bytes = service_horizon as u64;
+        let mut measured_subflow = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        measured_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
+        measured_subflow.snapshot.srtt_ms = 80.0;
+        measured_subflow.snapshot.min_rtt_ms = 80.0;
+        measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
+        measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
+        measured_subflow.snapshot.app_limited = false;
+        let mut unmeasured = response_target(
+            2,
+            UnderlayProtocol::Udp,
+            1.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        unmeasured.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), measured_subflow.clone(), unmeasured],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            service_horizon,
+            None,
+        )
+        .expect("a measured QUIC Subflow should use the bounded same-family partition");
+
+        assert_eq!(selected.target.key, measured_subflow.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        assert_eq!(
+            selected.subflow_set_commit.map(|commit| commit.service),
+            Some(service.key),
+            "measured QUIC overflow remains bound to the current Service"
+        );
+
+        let feed_reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits);
+        let exhausted = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), measured_subflow],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            feed_reservoir,
+            None,
+        )
+        .expect("Service remains the fallback at the ordering-reservoir boundary");
+        assert_eq!(exhausted.target.key, service.key);
+        assert_eq!(exhausted.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn measured_quic_subflow_does_not_cross_into_equal_path_load() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
+        let mut service = response_target(
+            0,
+            UnderlayProtocol::Udp,
+            25.0,
+            service_horizon as u64,
+            mux_limits.max_path_flight_bytes as u64,
+            true,
+        );
+        service.owner_data_in_flight_bytes = service_horizon as u64;
+        service.snapshot.active_flows = 1;
+        let mut measured_subflow = response_target(
+            1,
+            UnderlayProtocol::Udp,
+            5.0,
+            0,
+            mux_limits.max_path_flight_bytes as u64,
+            false,
+        );
+        measured_subflow.snapshot.active_flows = 1;
+        measured_subflow.snapshot.app_limited = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), measured_subflow],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            service_horizon,
+            None,
+        )
+        .expect("the balanced QUIC Service should remain dispatchable");
+
+        assert_eq!(selected.target.key, service.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
     fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -14556,7 +15700,7 @@ mod tests {
         candidate.owner_data_in_flight_bytes = candidate_owner_bytes;
         candidate.snapshot.queue_bytes = (3 * 1024 * 1024) as u64;
         let tail = ResponseOrderedTail::new(Some(service.key), service_horizon + overflow);
-        let reservoir = ResponseTcpReservoir::new(
+        let reservoir = ResponseSameFamilyReservoir::new(
             service.key,
             tail,
             service_horizon as u64,
@@ -14566,7 +15710,7 @@ mod tests {
         )
         .expect("global reservoir has credit");
 
-        let debt = response_tcp_reservoir_candidate_debt(reservoir, &candidate);
+        let debt = response_same_family_reservoir_candidate_debt(reservoir, &candidate);
         assert_eq!(
             debt.external_bytes(),
             (overflow - candidate_owner_bytes as usize) as u64
@@ -15475,7 +16619,8 @@ mod tests {
         mux_limits.max_reorder_bytes = 2 * 1024 * 1024;
         mux_limits.max_stream_window_bytes = 2 * 1024 * 1024;
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        let service = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 2 * 1024 * 1024, true);
+        let mut service = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 2 * 1024 * 1024, true);
+        service.snapshot.active_flows = 2;
         let mut candidate =
             response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 2 * 1024 * 1024, false);
         let committed = 2 * 1024 * 1024 - payload_bytes as u64;
@@ -16041,6 +17186,7 @@ mod tests {
         service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
         service.has_sender_evidence = true;
         service.has_bulk_rate_evidence = true;
+        service.snapshot.active_flows = 2;
         let mut startup_subflow =
             response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
         startup_subflow.has_sender_evidence = true;
@@ -16071,39 +17217,108 @@ mod tests {
     }
 
     #[test]
-    fn bulk_only_live_service_tail_admits_bounded_same_underlay_startup_sampling() {
+    fn bulk_only_live_tcp_service_tail_admits_bounded_same_underlay_startup_sampling() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-        for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
-            let mut service = response_target(0, underlay, 25.0, 0, 16 * 1024 * 1024, true);
-            service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-            service.has_sender_evidence = true;
-            service.has_bulk_rate_evidence = true;
-            let mut startup_subflow = response_target(1, underlay, 5.0, 0, 16 * 1024 * 1024, false);
-            startup_subflow.has_sender_evidence = true;
-            startup_subflow.has_bulk_rate_evidence = false;
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.has_sender_evidence = true;
+        service.has_bulk_rate_evidence = true;
+        service.snapshot.active_flows = 2;
+        let mut startup_subflow =
+            response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
+        startup_subflow.has_sender_evidence = true;
+        startup_subflow.has_bulk_rate_evidence = false;
 
-            let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
-                &[service.clone(), startup_subflow.clone()],
-                FlowLane::Throughput,
-                payload_bytes,
-                mux_limits,
-                &[],
-                Some(service.key),
-                payload_bytes,
-                None,
-            )
-            .expect("bulk-only startup sampling should remain dispatchable behind a live Service suffix");
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), startup_subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            payload_bytes,
+            None,
+        )
+        .expect(
+            "bounded TCP startup sampling should remain dispatchable behind a live Service suffix",
+        );
 
-            assert_eq!(selected.target.key, startup_subflow.key, "{underlay:?}");
-            assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
-            assert!(
-                selected
-                    .subflow_set_commit
-                    .is_some_and(|commit| commit.input.startup_owner_allowed),
-                "{underlay:?} startup sampling must be explicit and ledger-bounded"
-            );
-        }
+        assert_eq!(selected.target.key, startup_subflow.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        assert!(
+            selected
+                .subflow_set_commit
+                .is_some_and(|commit| commit.input.startup_owner_allowed),
+            "TCP startup sampling must be explicit and ledger-bounded"
+        );
+    }
+
+    #[test]
+    fn quic_service_uses_bounded_startup_when_no_measured_subflow_exists() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.has_sender_evidence = true;
+        service.has_bulk_rate_evidence = true;
+        service.snapshot.active_flows = 2;
+        let mut startup_subflow =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        startup_subflow.has_sender_evidence = true;
+        startup_subflow.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
+            &[service.clone(), startup_subflow.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            payload_bytes,
+            None,
+        )
+        .expect("one unmeasured QUIC path should receive bounded startup work");
+
+        assert_eq!(selected.target.key, startup_subflow.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        assert!(
+            selected
+                .subflow_set_commit
+                .is_some_and(|commit| commit.input.startup_owner_allowed)
+        );
+    }
+
+    #[test]
+    fn sole_quic_service_does_not_sample_an_unloaded_path() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.snapshot.active_flows = 1;
+        let mut validation =
+            response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        validation.has_bulk_rate_evidence = false;
+
+        let selected = select_response_sender_data_target_with_ordered_debt_inner(
+            &[service.clone(), validation],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            payload_bytes,
+            None,
+            true,
+        )
+        .expect("the uncontended Service should remain dispatchable");
+
+        assert_eq!(selected.target.key, service.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+        assert!(selected.subflow_set_commit.is_none());
     }
 
     #[test]
@@ -16169,6 +17384,7 @@ mod tests {
         let mut service =
             response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
         service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.snapshot.active_flows = 2;
         let service_key = service.key;
         let mut validation =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
@@ -16221,6 +17437,7 @@ mod tests {
         let mut service =
             response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
         service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+        service.snapshot.active_flows = 2;
         let mut validation =
             response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
         validation.has_bulk_rate_evidence = false;
@@ -17001,7 +18218,8 @@ mod tests {
 
     #[test]
     fn bulk_only_tcp_sender_evidence_admits_startup_subflow_not_service() {
-        let owner = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut owner = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        owner.snapshot.active_flows = 2;
         let mut lower_eta_alternate =
             response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
         lower_eta_alternate.has_sender_evidence = true;
@@ -17033,6 +18251,875 @@ mod tests {
                 .subflow_set_commit
                 .is_some_and(|commit| commit.input.startup_owner_allowed),
             "startup Subflow admission must be explicit and bounded"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_calibration_requires_reachable_underloaded_family() {
+        let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        udp.has_bulk_rate_evidence = false;
+
+        assert_eq!(
+            select_response_quic_capacity_calibration_target(
+                &[service.clone(), udp.clone()],
+                FlowLane::Throughput,
+                Some(service.key),
+                ResponseServiceFamilyLoads::new(2, 0),
+                MuxLimits::default(),
+                reliable_quic_capacity_calibration_session_limit_bytes(MuxLimits::default()),
+            )
+            .map(|target| target.key),
+            Some(udp.key),
+            "a native QUIC sample may break the proof cycle without product offsets"
+        );
+        assert!(
+            select_response_quic_capacity_calibration_target(
+                &[service.clone(), udp.clone()],
+                FlowLane::Throughput,
+                Some(service.key),
+                ResponseServiceFamilyLoads::new(1, 1),
+                MuxLimits::default(),
+                reliable_quic_capacity_calibration_session_limit_bytes(MuxLimits::default()),
+            )
+            .is_none(),
+            "balanced Service families need no optional carrier calibration"
+        );
+        udp.has_sender_evidence = false;
+        assert!(
+            select_response_quic_capacity_calibration_target(
+                &[service, udp],
+                FlowLane::Throughput,
+                Some(CarrierPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    path_id: PathId(0),
+                }),
+                ResponseServiceFamilyLoads::new(2, 0),
+                MuxLimits::default(),
+                reliable_quic_capacity_calibration_session_limit_bytes(MuxLimits::default()),
+            )
+            .is_none(),
+            "capacity traffic must not replace path reachability proof"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_calibration_prefers_fresh_path_before_retry() {
+        let mux_limits = MuxLimits::default();
+        let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut retry = response_target(1, UnderlayProtocol::Udp, 1.0, 0, 16 * 1024 * 1024, false);
+        retry.has_bulk_rate_evidence = false;
+        retry.quic_capacity_calibration_attempts = 1;
+        let mut fresh =
+            response_target(2, UnderlayProtocol::Udp, 100.0, 0, 16 * 1024 * 1024, false);
+        fresh.has_bulk_rate_evidence = false;
+
+        let selected = select_response_quic_capacity_calibration_target(
+            &[service.clone(), retry, fresh.clone()],
+            FlowLane::Throughput,
+            Some(service.key),
+            ResponseServiceFamilyLoads::new(2, 0),
+            mux_limits,
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        )
+        .expect("at least one reachable UDP path should remain probeable");
+
+        assert_eq!(
+            selected.key, fresh.key,
+            "an unattempted path must be sampled before a lower-ETA retry"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_calibration_filters_path_at_attempt_limit() {
+        let mux_limits = MuxLimits::default();
+        let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut exhausted =
+            response_target(1, UnderlayProtocol::Udp, 1.0, 0, 16 * 1024 * 1024, false);
+        exhausted.has_bulk_rate_evidence = false;
+        exhausted.quic_capacity_calibration_attempts =
+            MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH;
+
+        assert!(
+            select_response_quic_capacity_calibration_target(
+                &[service.clone(), exhausted],
+                FlowLane::Throughput,
+                Some(service.key),
+                ResponseServiceFamilyLoads::new(2, 0),
+                mux_limits,
+                reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            )
+            .is_none(),
+            "a path must not exceed its exact-path calibration attempt limit"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_calibration_uses_smaller_retry_when_fresh_train_does_not_fit() {
+        let mux_limits = MuxLimits::default();
+        let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
+        let mut retry = response_target(1, UnderlayProtocol::Udp, 50.0, 0, 1, false);
+        retry.has_bulk_rate_evidence = false;
+        retry.quic_capacity_calibration_attempts = 1;
+        let mut fresh = response_target(2, UnderlayProtocol::Udp, 1.0, 0, session_limit, false);
+        fresh.has_bulk_rate_evidence = false;
+
+        let retry_train = response_quic_capacity_calibration_train_bytes(&retry, mux_limits) as u64;
+        let fresh_train = response_quic_capacity_calibration_train_bytes(&fresh, mux_limits) as u64;
+        assert!(
+            !response_quic_capacity_calibration_geometry(&fresh, mux_limits).fits_session_envelope,
+            "a clamped train cannot silently change its frozen warmup/proof geometry"
+        );
+        assert!(
+            retry_train < fresh_train,
+            "the test needs a retry train that fits below the fresh path's live window"
+        );
+
+        let selected = select_response_quic_capacity_calibration_target(
+            &[service.clone(), retry.clone(), fresh],
+            FlowLane::Throughput,
+            Some(service.key),
+            ResponseServiceFamilyLoads::new(2, 0),
+            mux_limits,
+            retry_train,
+        )
+        .expect("the smaller retry should fit the remaining session envelope");
+
+        assert_eq!(
+            selected.key, retry.key,
+            "a too-large fresh train must not hide a retry that still fits the remaining budget"
+        );
+    }
+
+    #[test]
+    fn quic_capacity_retry_fills_live_window_plus_fresh_proof_window() {
+        let mux_limits = MuxLimits::default();
+        let mut udp = response_target(3, UnderlayProtocol::Udp, 390.0, 0, 798_666, false);
+        udp.snapshot.pacing_rate_bps = 5_530_000.0;
+        udp.snapshot.delivery_rate_bps = 153_000.0;
+
+        assert_eq!(
+            response_quic_capacity_calibration_train_bytes(&udp, mux_limits),
+            1_046_210,
+            "v21's grown window needs one fresh strict-proof window, not another fixed 256 KiB"
+        );
+        assert!(
+            response_quic_capacity_calibration_lease(&udp, 1_046_210)
+                >= transport_pto_from_snapshot(Some(udp.snapshot)),
+            "the admitted train lease must cover at least one recovery horizon"
+        );
+
+        udp.snapshot.inflight_limit_bytes = u64::MAX;
+        assert!(
+            !response_quic_capacity_calibration_geometry(&udp, mux_limits).fits_session_envelope,
+            "a live window larger than the resource envelope is ineligible, not repeatedly reservable"
+        );
+        assert_eq!(
+            response_quic_capacity_calibration_train_bytes(&udp, mux_limits) as u64,
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            "a single train cannot exceed the session carrier envelope"
+        );
+    }
+
+    #[test]
+    fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.active_flows = 2;
+        let udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+
+        let selected = select_response_service_handoff_target(
+            &[service.clone(), udp.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            ResponseServiceFamilyLoads::new(2, 0),
+            4096,
+            None,
+        )
+        .expect("measured underloaded family should receive one whole flow");
+        assert_eq!(selected.target.key, udp.key);
+        assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+        assert_eq!(
+            selected
+                .service_handoff_commit
+                .map(|commit| commit.handoff_frontier),
+            Some(4096)
+        );
+
+        assert!(
+            select_response_service_handoff_target(
+                &[service.clone(), udp.clone()],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                Some(service.key),
+                1,
+                ResponseServiceFamilyLoads::new(2, 0),
+                4096,
+                None,
+            )
+            .is_none(),
+            "any unresolved product tail blocks carrier-family handoff"
+        );
+        let balanced_gain = select_response_service_handoff_target(
+            &[service, udp],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            }),
+            0,
+            ResponseServiceFamilyLoads::new(1, 1),
+            4096,
+            None,
+        )
+        .expect("a balanced family may still move one flow for a two-fold projected gain");
+        assert_eq!(balanced_gain.admission.role, PathRuntimeRole::Service);
+    }
+
+    #[test]
+    fn balanced_service_handoff_requires_two_x_projected_gain() {
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        service.rate_scope = ResponseRateScope::PerFlowGoodput;
+        service.snapshot.delivery_rate_bps = 60_000_000.0;
+        let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        udp.snapshot.delivery_rate_bps = 100_000_000.0;
+
+        assert_eq!(
+            response_service_handoff_mode_for_targets(
+                &service,
+                &udp,
+                ResponseServiceFamilyLoads::new(1, 1),
+            ),
+            None,
+            "a modest gain must not churn sticky Service ownership"
+        );
+        service.snapshot.delivery_rate_bps = 50_000_000.0;
+        assert_eq!(
+            response_service_handoff_mode_for_targets(
+                &service,
+                &udp,
+                ResponseServiceFamilyLoads::new(1, 1),
+            ),
+            Some(ResponseServiceHandoffMode::PerformanceOverride),
+            "a two-fold projected gain survives one additional equal-share flow"
+        );
+    }
+
+    #[test]
+    fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        service.rate_scope = ResponseRateScope::PerFlowGoodput;
+        service.snapshot.delivery_rate_bps = 1_000_000.0;
+        let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
+        udp.commands = udp_commands;
+        udp.snapshot.delivery_rate_bps = 100_000_000.0;
+        udp.snapshot.active_flows = 1;
+        udp.commands
+            .try_enqueue_stream_ordered_frame(
+                client_data_frame_for_test(StreamId(999), 0, 1),
+                FlowLane::Throughput,
+            )
+            .expect("shared target carrier accepts unrelated queued work");
+        udp.command_pending_bytes = udp.commands.pending_bytes();
+        udp.snapshot.queue_bytes = udp.command_pending_bytes;
+        udp.snapshot.bytes_in_flight = 1;
+        assert!(udp.command_pending_bytes > 0);
+        assert_eq!(udp.owner_data_in_flight_bytes, 0);
+        assert_eq!(udp.snapshot.product_bytes_in_flight, 0);
+
+        let selected = select_response_service_handoff_target(
+            &[service.clone(), udp.clone()],
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            ResponseServiceFamilyLoads::new(1, 1),
+            4096,
+            None,
+        )
+        .expect("another binding's carrier pressure must not masquerade as this binding's debt");
+        assert_eq!(selected.target.key, udp.key);
+    }
+
+    #[test]
+    fn response_service_handoff_drain_blocks_only_its_own_binding() {
+        let fixture = response_service_handoff_drain_fixture();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+
+        assert!(matches!(
+            plan_response_data_dispatch_with_ordered_debt_impl(
+                &fixture.stream,
+                FlowLane::Throughput,
+                payload_bytes as u64,
+                payload_bytes,
+                payload_bytes,
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        let mut sender = ServerResponseSenderService::new(SessionId(191), fixture.stream.stream_id);
+        sender.enqueue_data_for_lane(Bytes::from(vec![0x5a; payload_bytes]), FlowLane::Throughput);
+        assert!(
+            sender.drain_allows_bounded_source_staging(&fixture.stream, true),
+            "a drain blocks offset assignment, not bounded raw target read-ahead"
+        );
+        let reservation = fixture
+            .binding
+            .response_scheduling_snapshot()
+            .response_service_handoff_drain
+            .expect("the eligible flow should own the session drain intent");
+        assert_eq!(
+            reservation.binding_instance_id,
+            fixture.binding.binding_instance_id()
+        );
+        assert_eq!(reservation.service, fixture.service);
+        assert_eq!(reservation.target, fixture.target);
+        assert!(matches!(
+            plan_response_data_dispatch_with_ordered_debt_impl(
+                &fixture.stream,
+                FlowLane::Throughput,
+                payload_bytes as u64,
+                payload_bytes,
+                payload_bytes,
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+
+        let other_plan = plan_response_data_dispatch(
+            &fixture.other_stream,
+            FlowLane::Throughput,
+            0,
+            payload_bytes,
+        )
+        .expect("another binding must keep planning ordinary OwnerData");
+        assert_eq!(other_plan.primary_key(), Some(fixture.other_service));
+        assert_eq!(
+            fixture.other_binding.ordered_data_owner(),
+            Some(fixture.other_service),
+            "a session drain is serialization for handoff, not a session-wide data pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit() {
+        let mut fixture = response_service_handoff_drain_fixture();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let frontier = payload_bytes as u64;
+        let service_target = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.service)
+            .expect("TCP Service target");
+        let old_owner_frame = Frame::StreamData {
+            stream_id: fixture.stream.stream_id,
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x61; payload_bytes]),
+        };
+        fixture
+            .binding
+            .record_owner_flight_for_target(&service_target, &old_owner_frame);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                plan_response_data_dispatch_with_ordered_debt_impl(
+                    &fixture.stream,
+                    FlowLane::Throughput,
+                    frontier,
+                    payload_bytes,
+                    payload_bytes,
+                ),
+                Err(RuntimeError::SenderServiceBlocked)
+            ));
+        }
+        assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.service));
+        assert!(
+            try_recv_reliable_path_command(&mut fixture.target_receivers).is_none(),
+            "the paused raw payload must not consume its offset or enter the target queue"
+        );
+
+        fixture.binding.release_normalized_acked_ranges(&[
+            OffsetRange::new(0, frontier).expect("old owner ACK range")
+        ]);
+        let plan = plan_response_data_dispatch_with_ordered_debt_impl(
+            &fixture.stream,
+            FlowLane::Throughput,
+            frontier,
+            payload_bytes,
+            0,
+        )
+        .expect("the identical raw offset should become the clear-frontier handoff frame");
+        assert_eq!(plan.primary_key(), Some(fixture.target));
+        assert!(matches!(
+            &plan.primary,
+            ResponseDataDispatchTarget::Switchable {
+                service_handoff_commit: Some(ResponseServiceHandoffCommit {
+                    handoff_frontier,
+                    ..
+                }),
+                ..
+            } if *handoff_frontier == frontier
+        ));
+
+        let handoff_frame = Frame::StreamData {
+            stream_id: fixture.stream.stream_id,
+            offset: frontier,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from(vec![0x62; payload_bytes]),
+        };
+        let outcome = emit_planned_response_data_frame(
+            &fixture.stream,
+            plan,
+            handoff_frame,
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("the first post-drain raw payload should atomically move Service");
+        assert_eq!(outcome.selected_path, Some(fixture.target));
+        assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.target));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut fixture.target_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { offset, .. }))
+                if offset == frontier
+        ));
+    }
+
+    #[tokio::test]
+    async fn balanced_performance_override_commits_full_handoff_transaction() {
+        let mut fixture =
+            response_service_handoff_drain_fixture_with_other_service(UnderlayProtocol::Udp);
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let frontier = payload_bytes as u64;
+        fixture
+            .binding
+            .set_output_product_model_for_test(fixture.service, 1_000_000.0, 20.0);
+        let service_target = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.service)
+            .expect("slow TCP Service target");
+        fixture.binding.record_owner_flight_for_target(
+            &service_target,
+            &client_data_frame_for_test(fixture.stream.stream_id, 0, payload_bytes),
+        );
+
+        assert!(matches!(
+            plan_response_data_dispatch_with_ordered_debt_impl(
+                &fixture.stream,
+                FlowLane::Throughput,
+                frontier,
+                payload_bytes,
+                payload_bytes,
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        fixture.binding.release_normalized_acked_ranges(&[
+            OffsetRange::new(0, frontier).expect("old owner ACK range")
+        ]);
+        let plan = plan_response_data_dispatch_with_ordered_debt_impl(
+            &fixture.stream,
+            FlowLane::Throughput,
+            frontier,
+            payload_bytes,
+            0,
+        )
+        .expect("balanced slow TCP should move to the measured fast QUIC carrier");
+        assert!(matches!(
+            &plan.primary,
+            ResponseDataDispatchTarget::Switchable {
+                service_handoff_commit: Some(ResponseServiceHandoffCommit {
+                    mode: ResponseServiceHandoffMode::PerformanceOverride,
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        let outcome = emit_planned_response_data_frame(
+            &fixture.stream,
+            plan,
+            client_data_frame_for_test(fixture.stream.stream_id, frontier, payload_bytes),
+            FlowLane::Throughput,
+        )
+        .await
+        .expect("the balanced performance override should commit atomically");
+        assert_eq!(outcome.selected_path, Some(fixture.target));
+        assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.target));
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut fixture.target_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::StreamData { offset, .. }))
+                if offset == frontier
+        ));
+    }
+
+    #[tokio::test]
+    async fn handoff_commit_rejects_shared_queue_growth_beyond_ranked_credit() {
+        let fixture = response_service_handoff_drain_fixture();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+        let frontier = payload_bytes as u64;
+        let service_target = fixture
+            .binding
+            .sender_path_targets(FlowLane::Throughput, payload_bytes)
+            .into_iter()
+            .find(|target| target.key == fixture.service)
+            .expect("TCP Service target");
+        fixture.binding.record_owner_flight_for_target(
+            &service_target,
+            &client_data_frame_for_test(fixture.stream.stream_id, 0, payload_bytes),
+        );
+        assert!(matches!(
+            plan_response_data_dispatch_with_ordered_debt_impl(
+                &fixture.stream,
+                FlowLane::Throughput,
+                frontier,
+                payload_bytes,
+                payload_bytes,
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        fixture.binding.release_normalized_acked_ranges(&[
+            OffsetRange::new(0, frontier).expect("old owner ACK range")
+        ]);
+        let plan = plan_response_data_dispatch_with_ordered_debt_impl(
+            &fixture.stream,
+            FlowLane::Throughput,
+            frontier,
+            payload_bytes,
+            0,
+        )
+        .expect("clear frontier should produce a bounded handoff commit");
+        let (target_commands, pending_limit) = match &plan.primary {
+            ResponseDataDispatchTarget::Switchable {
+                target,
+                service_handoff_commit: Some(commit),
+                ..
+            } => (
+                target.commands.clone(),
+                commit.target_command_pending_limit_bytes,
+            ),
+            _ => panic!("expected switchable handoff plan"),
+        };
+        let excess_bytes = usize::try_from(pending_limit.saturating_add(1))
+            .expect("test credit fits process memory");
+        target_commands
+            .try_enqueue_stream_ordered_frame(
+                client_data_frame_for_test(StreamId(999), 0, excess_bytes),
+                FlowLane::Throughput,
+            )
+            .expect("unrelated shared work races with the planned commit");
+
+        let result = emit_planned_response_data_frame(
+            &fixture.stream,
+            plan,
+            client_data_frame_for_test(fixture.stream.stream_id, frontier, payload_bytes),
+            FlowLane::Throughput,
+        )
+        .await;
+        assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
+        assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.service));
+        assert!(
+            fixture
+                .binding
+                .response_scheduling_snapshot()
+                .response_service_handoff_drain
+                .is_none(),
+            "a credit-regressed transaction must release its session reservation"
+        );
+    }
+
+    #[test]
+    fn service_handoff_rejects_lower_projected_fair_share() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.active_flows = 1;
+        service.snapshot.delivery_rate_bps = 500_000_000.0;
+        let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        udp.snapshot.delivery_rate_bps = 100_000_000.0;
+
+        assert!(
+            select_response_service_handoff_target(
+                &[service.clone(), udp],
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                Some(service.key),
+                0,
+                ResponseServiceFamilyLoads::new(2, 0),
+                4096,
+                None,
+            )
+            .is_none(),
+            "low RTT cannot justify a sticky move to a much slower carrier"
+        );
+    }
+
+    #[test]
+    fn generic_evidence_drain_clears_unpinned_expired_receipt_marker() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.delivery_rate_bps = 1_000_000.0;
+        let mut target = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let now = Instant::now();
+        let accepted_at = now
+            .checked_sub(Duration::from_secs(2))
+            .expect("test clock supports short subtraction");
+        target.quic_capacity_proof = Some(QuicCapacityProofCandidate {
+            token: 8,
+            train_bytes: 1024,
+            sample_floor_bytes: 1024,
+            accounting_slack_bytes: 128,
+            warmup_bytes: 128,
+            required_proof_bytes: 896,
+            written_bytes: 1024,
+            written_data_frame_count: 1,
+            receipt_confirmed: true,
+            received_bytes: 1024,
+            proof_elapsed: Duration::from_millis(1),
+            rate_bps: 8_192_000,
+            accepted_at,
+            expires_at: accepted_at + Duration::from_secs(1),
+            proof_validity: Duration::from_secs(1),
+        });
+        target.has_bulk_rate_evidence = true;
+        let reservation = ResponseServiceHandoffDrainReservation {
+            binding_instance_id: 8,
+            service: service.key,
+            service_path_instance_id: service.path_instance_id,
+            service_incarnation: service.incarnation,
+            target: target.key,
+            target_path_instance_id: target.path_instance_id,
+            target_incarnation: target.incarnation,
+            capacity_proof: None,
+            expires_at: now + Duration::from_secs(1),
+        };
+
+        let effective = response_service_handoff_target_view(
+            &target,
+            service.key,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            Some(reservation),
+            now,
+        )
+        .expect("the exact generic-evidence drain target");
+        assert!(effective.has_bulk_rate_evidence);
+        assert_eq!(effective.quic_capacity_proof, None);
+        assert!(response_service_handoff_drain_matches_candidate(
+            reservation.binding_instance_id,
+            reservation,
+            &ResponseServiceHandoffCandidate {
+                service,
+                target: effective,
+                mode: ResponseServiceHandoffMode::Diversification,
+            },
+        ));
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    #[test]
+    fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let mut service =
+            response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
+        service.snapshot.delivery_rate_bps = 1_000_000.0;
+        let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
+        let now = Instant::now();
+        let accepted_at = now
+            .checked_sub(Duration::from_secs(2))
+            .expect("test clock supports short subtraction");
+        udp.quic_capacity_proof = Some(QuicCapacityProofCandidate {
+            token: 7,
+            train_bytes: 1024,
+            sample_floor_bytes: 1024,
+            accounting_slack_bytes: 128,
+            warmup_bytes: 128,
+            required_proof_bytes: 896,
+            written_bytes: 1024,
+            written_data_frame_count: 1,
+            receipt_confirmed: true,
+            received_bytes: 1024,
+            proof_elapsed: Duration::from_millis(1),
+            rate_bps: 8_192_000,
+            accepted_at,
+            expires_at: accepted_at + Duration::from_secs(1),
+            proof_validity: Duration::from_secs(1),
+        });
+        udp.has_bulk_rate_evidence = false;
+        let targets = [service.clone(), udp.clone()];
+        let expired = response_service_handoff_diagnostics::evaluate_response_service_handoff(
+            &targets,
+            FlowLane::Throughput,
+            payload_bytes,
+            mux_limits,
+            &[],
+            Some(service.key),
+            0,
+            ResponseServiceFamilyLoads::new(2, 0),
+            None,
+            true,
+            false,
+            false,
+            false,
+            now,
+        );
+        assert_eq!(expired.first_failed_gate, "target_proof_expired");
+
+        let proof = udp.quic_capacity_proof.expect("raw expired marker");
+        let reservation = ResponseServiceHandoffDrainReservation {
+            binding_instance_id: 7,
+            service: service.key,
+            service_path_instance_id: service.path_instance_id,
+            service_incarnation: service.incarnation,
+            target: udp.key,
+            target_path_instance_id: udp.path_instance_id,
+            target_incarnation: udp.incarnation,
+            capacity_proof: Some(proof),
+            expires_at: now + Duration::from_secs(1),
+        };
+        let effective =
+            response_service_handoff_diagnostics::response_service_handoff_diagnostic_target_view(
+                &service,
+                &udp,
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                Some(reservation),
+                now,
+            )
+            .expect("diagnostic must retain the exact bounded proof view");
+        assert!(!udp.has_bulk_rate_evidence, "raw marker is expired");
+        assert!(
+            effective.has_bulk_rate_evidence,
+            "pinned view remains authoritative"
+        );
+        assert_eq!(effective.quic_capacity_proof, Some(proof));
+        assert_eq!(effective.snapshot.delivery_rate_bps, proof.rate_bps as f64);
+        assert!(response_service_handoff_preserves_fair_share(
+            &service, &effective
+        ));
+
+        udp.has_bulk_rate_evidence = true;
+        udp.quic_capacity_proof = udp
+            .quic_capacity_proof
+            .map(|proof| QuicCapacityProofCandidate {
+                accepted_at: now,
+                expires_at: now + Duration::from_secs(1),
+                ..proof
+            });
+        let targets = [service.clone(), udp];
+        let blocked_frontier =
+            response_service_handoff_diagnostics::evaluate_response_service_handoff(
+                &targets,
+                FlowLane::Throughput,
+                payload_bytes,
+                mux_limits,
+                &[],
+                Some(service.key),
+                payload_bytes,
+                ResponseServiceFamilyLoads::new(2, 0),
+                None,
+                true,
+                false,
+                false,
+                false,
+                now,
+            );
+        assert_eq!(blocked_frontier.first_failed_gate, "frontier_not_clear");
+        assert!(response_service_handoff_preserves_fair_share(
+            blocked_frontier.service.expect("diagnostic Service"),
+            blocked_frontier.target.expect("diagnostic target"),
+        ));
+    }
+
+    #[test]
+    fn service_handoff_fair_share_respects_rate_scope() {
+        let mut tcp = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 16 * 1024 * 1024, true);
+        tcp.snapshot.delivery_rate_bps = 100_000_000.0;
+        tcp.snapshot.active_flows = 2;
+        let mut udp = response_target(1, UnderlayProtocol::Udp, 80.0, 0, 16 * 1024 * 1024, false);
+        udp.snapshot.delivery_rate_bps = 80_000_000.0;
+        udp.snapshot.active_flows = 0;
+
+        tcp.rate_scope = ResponseRateScope::PathCapacity;
+        assert!(response_service_handoff_preserves_fair_share(&tcp, &udp));
+        tcp.rate_scope = ResponseRateScope::PerFlowGoodput;
+        assert!(
+            !response_service_handoff_preserves_fair_share(&tcp, &udp),
+            "a 100 Mbps per-flow TCP observation must not be divided a second time"
+        );
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    #[test]
+    fn family_or_gain_diagnostic_ignores_shared_carrier_churn() {
+        let mux_limits = MuxLimits::default();
+        let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
+        let service = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 16 * 1024 * 1024, true);
+        let udp = response_target(1, UnderlayProtocol::Udp, 180.0, 0, 16 * 1024 * 1024, false);
+        let mut targets = [service, udp];
+        let service_family_loads = ResponseServiceFamilyLoads::new(1, 1);
+        let now = Instant::now();
+        let signature = |targets: &[ResponseSenderPathTarget]| {
+            let evaluation =
+                response_service_handoff_diagnostics::evaluate_response_service_handoff(
+                    targets,
+                    FlowLane::Throughput,
+                    payload_bytes,
+                    mux_limits,
+                    &[],
+                    Some(targets[0].key),
+                    0,
+                    service_family_loads,
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                    now,
+                );
+            assert_eq!(evaluation.first_failed_gate, "family_or_gain");
+            response_service_handoff_diagnostics::response_service_handoff_evaluation_signature(
+                evaluation,
+                service_family_loads,
+            )
+        };
+
+        let before = signature(&targets);
+        targets[1].snapshot.bytes_in_flight = payload_bytes as u64;
+        targets[1].snapshot.queue_bytes = payload_bytes as u64;
+        targets[1].eta_ms = 1_000_000.0;
+        let after = signature(&targets);
+
+        assert_eq!(
+            before, after,
+            "shared carrier pressure cannot change a family/gain policy decision"
         );
     }
 

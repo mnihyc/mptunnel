@@ -626,6 +626,14 @@ async fn drain_server_tcp_path_commands(
             datagram_flows.retain(|flow| flow.flow_id != *flow_id);
         }
         match command {
+            ReliablePathCommand::SendFrame(frame)
+                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            {
+                commands_rx.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server TCP path received QUIC capacity data",
+                ));
+            }
             ReliablePathCommand::SendFrame(frame) => {
                 let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                 pending_frames.push(frame);
@@ -637,6 +645,13 @@ async fn drain_server_tcp_path_commands(
                     break;
                 }
                 continue;
+            }
+            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+                probe.ticket.cancel();
+                commands_rx.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server TCP path received QUIC capacity command",
+                ));
             }
             command => {
                 if !server_write_tcp_path_frame_batch(writer, pending_frames, path_proofs).await? {
@@ -728,6 +743,13 @@ pub(super) async fn handle_server_tcp_path_command(
     flush_after_frame: bool,
 ) -> Result<bool, RuntimeError> {
     match command {
+        ReliablePathCommand::SendFrame(frame)
+            if reliable_path_frame_is_quic_capacity_only(&frame) =>
+        {
+            Err(RuntimeError::Protocol(
+                "server TCP path received QUIC capacity data",
+            ))
+        }
         ReliablePathCommand::SendFrame(frame) => {
             server_write_tcp_path_frame_maybe_flush(writer, &frame, flush_after_frame).await
         }
@@ -759,6 +781,12 @@ pub(super) async fn handle_server_tcp_path_command(
         ReliablePathCommand::OpenStream { .. } => Err(RuntimeError::Protocol(
             "server TCP path received client open command",
         )),
+        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+            probe.ticket.cancel();
+            Err(RuntimeError::Protocol(
+                "server TCP path received QUIC capacity command",
+            ))
+        }
     }
 }
 

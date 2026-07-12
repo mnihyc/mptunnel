@@ -84,6 +84,103 @@ from UDP/QUIC carrier metrics. TCP calibration events record the binding-local
 cumulative spent credit, current and resource ceilings, stage authorization,
 prior ACK, and earliest/latest sampled send times. The binding ID is required
 because concurrent response streams can share session and path identities.
+
+The staged exact-receipt handoff case uses two fixed HTTP requests and rejects
+replacement bindings. It first observes two TCP Service bindings, keeps the
+already-attached UDP transport scheduler-disabled, then reactivates it and
+requires calibration, receipt, proof, retirement, drain, and commit identities
+to match. Physical blackhole and reconnection behavior is intentionally left to
+the fault cases so transport recovery cannot masquerade as placement evidence.
+
+Mixed response diagnostics emit `response_quic_capacity_calibration` for the
+bounded non-product QUIC train, `quic_capacity_receipt` for exact peer receipt,
+`quic_capacity_proof` for registry acceptance, `quic_carrier_ack_poll` and
+`quic_capacity_ack_poll` for provisional native observations and receipt/native
+cleanup ordering,
+`quic_capacity_probe_retired` for terminal cleanup, and
+`response_service_handoff` for bounded drain and exact whole-flow commit
+phases. Include those events in the diagnostic allowlist and correlate by
+session, token, path, and exact path instance. For every ordinary carrier
+sample, verify `raw_rate_bps ~= sample_bytes * 8_000_000 / sample_elapsed_us`
+and `sample_elapsed_us = max(carrier_elapsed_us, 1000)`. `poll_elapsed_us` is a
+control comparison and MUST NOT be the denominator. `published_rate_bps` is the
+bounded/smoothed model, not the raw observation. For optional UDP Subflow or
+capacity admission, only timed non-app-limited bytes and samples may reach the
+strict bulk floor. The current QUIC Service has a narrower feed-only exception:
+either substantial uniquely owned product `STREAM_ACK` progress or a durable
+local carrier ACK-derived DATA estimate may unlock source and emission staging;
+the latter may be app-limited. Neither authority publishes optional capacity,
+admits another Subflow, or authorizes a handoff, and same-path latency pressure
+still prevents graduation. A deliberate capacity epoch is
+different: it gates other application writers and requires exact full-train
+`PATH_CAPACITY_FINISH`/`PATH_CAPACITY_RECEIPT` ordering.
+Packet ACKs remain connection-aggregate and diagnostic; they cannot establish
+token ownership. Pre-existing cross-stream work is allowed only because it
+lengthens receipt time and lowers the available-rate estimate. The exact target
+sample must retain its planning-time frozen three-PTO
+bulk-proof deadline through drain and commit; falling RTT must not shorten it,
+and durable ACK reachability alone is insufficient.
+
+`PATH_CAPACITY_DATA` owns no stream offset and receives no `STREAM_ACK`, so do
+not count it as mixed unique-data aggregation. A committed handoff is the
+causal event that changes response Service-family ownership. The calibration
+event reports the sample floor, accounting slack, fresh strict window, live
+carrier window, train bytes, frame count, and lease. Require
+`lease_committed=true` and verify
+`train = max(sample floor, carrier window + fresh window)` and separately
+require `train <= session limit`, with
+`fresh window = sample floor - accounting slack`. A clamped over-limit geometry
+is invalid and MUST NOT repeatedly outrank a smaller fitting retry. Token completion requires
+exact written and received bytes equal to the frozen whole train, a nonzero
+written record count, and a nonzero receipt-derived proof interval; provisional
+native ACK bytes are diagnostics only. Verify
+`proof_elapsed = max(1000 us, receipt_elapsed)`. Native timing and receipt RTT
+remain ordering diagnostics and do not mutate this frozen denominator. The raw
+capacity rate uses the whole train:
+`rate_bps ~= train_bytes * 8_000_000 / proof_elapsed_us`. The attempt deadline
+and proof-validity interval are separate: accepted time is the carrier receipt
+time and proof expiry is accepted time plus the frozen validity interval. A
+later live congestion window or RTT cannot change the contract. Within one session, eligible
+fitting unattempted path instances should appear before a retry. Each exact
+session/path/path-instance may start at most twice, every whole train must fit
+the one cumulative non-refilling session envelope, and completed, expired,
+proven, detached, or closed attempts remain charged. Only an exact failed
+provisional enqueue may roll back its reservation.
+
+Under sustained source feed, causal placement proof may include
+`phase=drain_started` followed by `phase=committed` for the same session,
+binding, exact source instance/incarnation, and exact target
+instance/incarnation. Both events report `handoff_mode` and proof authority.
+`Diversification` requires a source-family lead of at least two and a no-worse
+projected share; `PerformanceOverride` requires a two-fold projected gain even
+when families are balanced. TCP product rate is already per-flow goodput, while
+carrier-scoped TCP/QUIC rate is divided by projected bulk-flow count. During the
+bounded one-shot drain,
+fresh `OwnerData` stops only for the selected binding; control, ACK/credit,
+correctness-critical repair, and other bindings remain live. Offset-free source
+staging remains within the existing bounded source-feed/sender-queue reservoir
+while that binding's queued Data front is blocked. `phase=drain_cancelled` means
+expiry or revalidation rejected the move and must not be counted as a handoff.
+A commit without an exact frontier, or continued fresh OwnerData on the selected
+binding between matching drain and commit events, is a failed ownership model.
+Shared carrier queue/BIF from other bindings may remain nonzero, but this
+binding's exact owner/product flight must be zero and live pending bytes must stay
+inside the ranked commit bound. Require one
+`server_bulk_output_selected reason=service_handoff` for the committed frame.
+
+Keep three handoff rows separate. The staged `2:0` row disables and blackholes
+UDP until two distinct TCP Service bindings emit OwnerData, restores both fat-path
+qdiscs, then activates UDP and requires typed train -> receipt -> proof -> drain ->
+commit order. The native slow-TCP/fast-QUIC `1:1` row proves
+`PerformanceOverride` onto an already-busy carrier without another optional
+train. The reversed fast-TCP/slow-QUIC row is a negative control and must not emit
+a TCP-to-QUIC override. Persist the resolved netem/resource profile, management
+state changes, and both restore-command results with each staged artifact.
+
+Diagnostics alter CPU and trace I/O, so their goodput is not a clean comparison.
+After causal acceptance, repeat representative TCP, QUIC, mixed, inverse, and
+unconstrained cases with diagnostics and path hints disabled.
+
 A stage-authorizing sample requires a fully spent current stage, every sampled
 send before the prior ACK, and its earliest send after stage authorization. A
 mixed pre/post-ACK or pre-authorization window is not stage evidence.
@@ -119,22 +216,35 @@ cumulative spend remains the authoritative credit counter. A proven calibration
 identity remains fenced from generic ownership until its exact calibration
 flights drain.
 
-After that TCP-only serial fence clears, diagnostics may emit
-`server_bulk_output_selected reason=tcp_subflow_reservoir`. This is ordinary
-measured ownership, not more calibration: the exact mature TCP Service already
-holds at least its derived Service horizon, the selected target is an admitted
-same-TCP `Subflow` bound to that Service epoch, neither path/session has latency
-pressure, and projected ordered tail remains inside the existing feed
-reservoir. UDP/QUIC never uses this reason. Interpret the event together with
-per-interface counters; selection count alone does not prove useful capacity.
-The v26 matched diagnostic emitted 147 such 64 KiB decisions (9,633,792 B) and
-kept its final 5-second application windows near 95-96 Mbps versus v23's
+Outside any active TCP calibration fence, diagnostics may emit
+`server_bulk_output_selected reason=same_family_subflow_reservoir`. This is
+ordinary measured ownership, not more calibration: the exact mature Service
+already holds at least its derived Service horizon, the selected target is an
+admitted same-underlay `Subflow` bound to that Service epoch, neither
+path/session has latency pressure, and projected ordered tail remains inside
+the existing feed reservoir. TCP uses strict product-ACK evidence; QUIC uses
+strict non-app-limited local carrier ACK evidence and native emission credit.
+Neither substantial product progress nor the app-limited carrier estimate used
+by the weaker QUIC Service-feed predicate can select this reason.
+Interpret the event together with per-interface counters; selection count alone
+does not prove useful capacity. The v26 matched
+diagnostic used the former TCP-specific event name and emitted 147 such 64 KiB
+decisions (9,633,792 B), then kept its final 5-second application windows near
+95-96 Mbps versus v23's
 post-calibration 80 Mbps collapse, but differing Service anchors and diagnostic
 CPU make that corroborating causal evidence rather than a clean throughput
 claim. The matched endpoint-only, noninstrumented 45-second release pair is the
 performance result: v25 delivered 492,276,216 B at 87.263 Mbps and v27 delivered
 835,492,784 B at 148.032 Mbps, both with zero failures and
 `performance_comparable=true`.
+
+With default limits and a 64 KiB bulk quantum, the derived feed reservoir is
+4 MiB. A one-flow QUIC plateau at approximately that much product data per RTT
+is therefore evidence that bounded bootstrap staging or initial
+`STREAM_MAX_DATA` remains active; it is not a measured QUIC congestion window
+and does not prove a 4 MiB carrier capacity limit. Compare subsequent product
+`STREAM_ACK` or carrier ACK-derived feed graduation separately from strict
+optional-path bulk proof.
 
 ### Evidence cohorts
 

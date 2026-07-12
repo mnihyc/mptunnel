@@ -1218,10 +1218,137 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
     assert_eq!(
         tx.pending_bytes(),
         expected,
-        "dequeue alone must not hide writer backlog from admission"
+        "dequeue transfers debt to the writer until carrier/product accounting owns it"
     );
     rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
     assert_eq!(tx.pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn dropping_receiver_releases_already_dequeued_command_debt() {
+    let (tx, mut rx) = reliable_path_command_channels(2);
+    let frame = Frame::StreamData {
+        stream_id: StreamId(14),
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"held-by-writer"),
+    };
+    let expected = frame_pacing_bytes(&frame) as u64;
+    tx.try_enqueue_admitted_frame(frame, FlowLane::Throughput)
+        .expect("queue frame");
+    let _held = recv_reliable_path_command(&mut rx)
+        .await
+        .expect("dequeue frame");
+    assert_eq!(tx.pending_bytes(), expected);
+
+    drop(rx);
+
+    assert_eq!(tx.pending_bytes(), 0);
+}
+
+#[tokio::test]
+async fn abandoned_quic_capacity_command_releases_queue_debt_and_ticket() {
+    let (tx, rx) = reliable_path_command_channels(2);
+    let ticket = QuicCapacityProbeCommandTicket::new();
+    let train_payload_bytes = 512 * 1024_u64;
+    tx.try_enqueue_quic_capacity_probe(QuicCapacityProbeCommand {
+        binding_instance_id: 11,
+        path_id: PathId(3),
+        path_instance_id: next_server_carrier_path_instance_id(),
+        calibration_id: 17,
+        train_payload_bytes,
+        sample_floor_bytes: 256 * 1024,
+        warmup_carrier_bytes: 256 * 1024,
+        required_timed_carrier_bytes: 224 * 1024,
+        proof_validity: Duration::from_secs(3),
+        expires_at: Instant::now() + Duration::from_secs(1),
+        ticket: ticket.clone(),
+        cancel_on_drop: true,
+    })
+    .expect("queue QUIC capacity probe");
+    assert_eq!(tx.pending_bytes(), train_payload_bytes);
+
+    drop(rx);
+
+    assert_eq!(tx.pending_bytes(), 0);
+    assert!(!ticket.is_current());
+    assert_eq!(
+        ticket.resolution(),
+        QuicCapacityProbeCommandResolution::Cancelled
+    );
+    let resolution = tokio::time::timeout(Duration::from_millis(100), ticket.resolved())
+        .await
+        .expect("an already-invalid ticket must be observable without a lost wakeup");
+    assert_eq!(resolution, QuicCapacityProbeCommandResolution::Cancelled);
+}
+
+#[tokio::test]
+async fn dequeued_quic_capacity_command_drop_cancels_ticket_and_receiver_debt() {
+    let (tx, mut rx) = reliable_path_command_channels(2);
+    let ticket = QuicCapacityProbeCommandTicket::new();
+    let train_payload_bytes = 512 * 1024_u64;
+    tx.try_enqueue_quic_capacity_probe(QuicCapacityProbeCommand {
+        binding_instance_id: 12,
+        path_id: PathId(4),
+        path_instance_id: next_server_carrier_path_instance_id(),
+        calibration_id: 18,
+        train_payload_bytes,
+        sample_floor_bytes: 256 * 1024,
+        warmup_carrier_bytes: 256 * 1024,
+        required_timed_carrier_bytes: 224 * 1024,
+        proof_validity: Duration::from_secs(3),
+        expires_at: Instant::now() + Duration::from_secs(1),
+        ticket: ticket.clone(),
+        cancel_on_drop: true,
+    })
+    .expect("queue QUIC capacity probe");
+
+    let command = recv_reliable_path_command(&mut rx)
+        .await
+        .expect("dequeue QUIC capacity probe");
+    assert_eq!(tx.pending_bytes(), train_payload_bytes);
+    drop(rx);
+    assert_eq!(tx.pending_bytes(), 0);
+    assert!(ticket.is_current());
+
+    drop(command);
+    assert_eq!(
+        ticket.resolution(),
+        QuicCapacityProbeCommandResolution::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn published_quic_capacity_ticket_wakes_resolution_without_cancelling() {
+    let ticket = QuicCapacityProbeCommandTicket::new();
+    assert!(ticket.publish());
+    assert_eq!(
+        ticket.resolved().await,
+        QuicCapacityProbeCommandResolution::Published
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), ticket.cancelled())
+            .await
+            .is_err(),
+        "publication must wake cleanup without becoming carrier cancellation"
+    );
+    assert!(!ticket.cancel());
+}
+
+#[tokio::test]
+async fn cancelled_quic_capacity_ticket_wakes_carrier_cancellation() {
+    let ticket = QuicCapacityProbeCommandTicket::new();
+    let waiter = ticket.clone();
+    let resolved = tokio::spawn(async move { waiter.resolved().await });
+    assert!(ticket.cancel());
+    assert_eq!(
+        resolved.await.expect("ticket resolution task"),
+        QuicCapacityProbeCommandResolution::Cancelled
+    );
+    tokio::time::timeout(Duration::from_millis(10), ticket.cancelled())
+        .await
+        .expect("cancelled ticket must wake carrier cancellation");
+    assert!(!ticket.publish());
 }
 
 #[tokio::test]

@@ -1,5 +1,4 @@
 use super::CarrierPathKey;
-use crate::protocol::UnderlayProtocol;
 
 // Product offsets are shared across every response carrier, but carrier flight
 // is not. This module keeps that ownership arithmetic separate from path
@@ -57,13 +56,13 @@ impl ResponseCandidateTailDebt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResponseTcpReservoir {
+pub(super) struct ResponseSameFamilyReservoir {
     service: CarrierPathKey,
     tail: ResponseOrderedTail,
     protected_service_bytes: u64,
 }
 
-impl ResponseTcpReservoir {
+impl ResponseSameFamilyReservoir {
     pub(super) fn new(
         service: CarrierPathKey,
         tail: ResponseOrderedTail,
@@ -72,7 +71,6 @@ impl ResponseTcpReservoir {
         feed_reservoir_bytes: usize,
         payload_bytes: usize,
     ) -> Option<Self> {
-        debug_assert_eq!(service.underlay, UnderlayProtocol::Tcp);
         let protected_service_bytes = protected_service_bytes as u64;
         if service_assigned_bytes < protected_service_bytes
             || tail.projected_union_bytes(service_assigned_bytes, payload_bytes)
@@ -97,7 +95,7 @@ impl ResponseTcpReservoir {
         candidate_owner_bytes: u64,
     ) -> ResponseCandidateTailDebt {
         debug_assert_ne!(candidate, self.service);
-        debug_assert_eq!(candidate.underlay, UnderlayProtocol::Tcp);
+        debug_assert_eq!(candidate.underlay, self.service.underlay);
         // The Service horizon is charged once to the global reservoir. The
         // remaining tail and candidate OwnerData are overlapping unique-product
         // views. Repair copies stay outside this subtraction and remain charged
@@ -137,12 +135,12 @@ mod tests {
     }
 
     #[test]
-    fn tcp_reservoir_partitions_candidate_flight_by_union() {
+    fn same_family_reservoir_partitions_candidate_flight_by_union() {
         let service = key(0);
         let candidate = key(1);
         let horizon = 2 * 1024 * 1024;
         let tail = ResponseOrderedTail::new(Some(service), horizon + 512 * 1024);
-        let reservoir = ResponseTcpReservoir::new(
+        let reservoir = ResponseSameFamilyReservoir::new(
             service,
             tail,
             horizon as u64,
@@ -160,12 +158,12 @@ mod tests {
     }
 
     #[test]
-    fn tcp_reservoir_keeps_global_feed_cap_authoritative() {
+    fn same_family_reservoir_keeps_global_feed_cap_authoritative() {
         let service = key(0);
         let tail = ResponseOrderedTail::new(Some(service), 4 * 1024 * 1024);
 
         assert!(
-            ResponseTcpReservoir::new(
+            ResponseSameFamilyReservoir::new(
                 service,
                 tail,
                 2 * 1024 * 1024,

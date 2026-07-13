@@ -4,6 +4,8 @@ pub(super) async fn handle_server_path(
     stream: TcpStream,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
+    #[cfg(target_os = "linux")]
+    let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
     let mut framed = EncryptedFramedStream::with_cipher_suite(
         stream,
         context.security.secret.as_bytes(),
@@ -83,6 +85,10 @@ pub(super) async fn handle_server_path(
         }
         return Err(RuntimeError::Encrypted(err));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(metrics) = tcp_metrics.as_mut() {
+        metrics.begin_epoch();
+    }
 
     let (reader, mut writer) = framed.split()?;
     let mut path_frames =
@@ -94,12 +100,21 @@ pub(super) async fn handle_server_path(
     let mut draining = false;
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
+    let mut tcp_capacity_probe = None::<PendingTcpCapacityProbe>;
 
     loop {
         let Some(event) = recv_server_tcp_path_event(&mut path_frames, &mut commands_rx).await?
         else {
             return Ok(());
         };
+        #[cfg(target_os = "linux")]
+        if let Some(metrics) = tcp_metrics.as_mut().and_then(|publisher| {
+            publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, false)
+        }) {
+            context
+                .reliable_streams
+                .record_local_path_metrics(&path_registration, metrics);
+        }
         match event {
             ServerTcpPathEvent::Command(command) => {
                 let keep_running = drain_server_tcp_path_commands(
@@ -112,12 +127,14 @@ pub(super) async fn handle_server_path(
                     ServerTcpPathCommandContext {
                         session_id,
                         path_id,
+                        path_instance_id: path_registration.path_instance_id(),
                         commands_tx: &commands_tx,
                         draining,
                         active_datagram_flows: 0,
                     },
                     &mut pending_frames,
                     &mut path_proofs,
+                    &mut tcp_capacity_probe,
                 )
                 .await?;
                 if !keep_running {
@@ -512,6 +529,127 @@ pub(super) async fn handle_server_path(
                                 .record_local_path_metrics(&path_registration, metrics);
                         }
                     }
+                    Frame::PathCapacityReceipt {
+                        path_id: receipt_path_id,
+                        calibration_id,
+                        received_payload_bytes,
+                    } if receipt_path_id == path_id => {
+                        let Some(pending) = tcp_capacity_probe.take() else {
+                            return Err(RuntimeError::Protocol(
+                                "TCP capacity receipt has no active epoch",
+                            ));
+                        };
+                        if pending.probe.path_instance_id != path_registration.path_instance_id()
+                            || pending.probe.calibration_id != calibration_id
+                            || pending.probe.train_payload_bytes != received_payload_bytes
+                        {
+                            return Err(RuntimeError::Protocol(
+                                "TCP capacity receipt does not match active epoch",
+                            ));
+                        }
+                        if Instant::now() >= pending.probe.expires_at {
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "response_tcp_capacity_probe",
+                                format_args!(
+                                    "phase=rejected reason=expired_before_receipt session_id={} path_id={} path_instance_id={} calibration_id={}",
+                                    session_id.0,
+                                    path_id.0,
+                                    path_registration.path_instance_id().as_u64(),
+                                    calibration_id,
+                                ),
+                            );
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            let elapsed = pending.started_at.elapsed();
+                            let receipt_rate_bps =
+                                tcp_capacity_receipt_rate_bps(received_payload_bytes, elapsed)
+                                    .ok_or(RuntimeError::Protocol(
+                                        "TCP capacity receipt has invalid timing",
+                                    ))?;
+                            let Some(mut metrics) = tcp_metrics.as_mut().and_then(|publisher| {
+                                publisher.maybe_observe(
+                                    path_id,
+                                    PathMetricDirection::ServerToClient,
+                                    true,
+                                )
+                            }) else {
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "response_tcp_capacity_probe",
+                                    format_args!(
+                                        "phase=rejected reason=native_metrics_unavailable session_id={} path_id={} path_instance_id={} calibration_id={}",
+                                        session_id.0,
+                                        path_id.0,
+                                        path_registration.path_instance_id().as_u64(),
+                                        calibration_id,
+                                    ),
+                                );
+                                continue;
+                            };
+                            let rate_bps = tcp_capacity_authoritative_rate_bps(
+                                receipt_rate_bps,
+                                metrics.delivery_rate_bps,
+                                metrics.pacing_rate_bps,
+                            );
+                            metrics.delivery_rate_bps = rate_bps;
+                            metrics.pacing_rate_bps = rate_bps;
+                            metrics.has_ack_derived_data_sample = true;
+                            metrics.data_sample_count = metrics.data_sample_count.max(1);
+                            metrics.data_sample_bytes =
+                                metrics.data_sample_bytes.max(received_payload_bytes);
+                            metrics.confidence_ppm = 1_000_000;
+                            let accepted_at = Instant::now();
+                            let validity = tcp_capacity_proof_validity(metrics);
+                            let candidate = TcpCapacityProofCandidate {
+                                token: calibration_id,
+                                train_bytes: pending.probe.train_payload_bytes,
+                                received_bytes: received_payload_bytes,
+                                proof_elapsed: elapsed,
+                                receipt_rate_bps,
+                                rate_bps,
+                                accepted_at,
+                                expires_at: accepted_at
+                                    .checked_add(validity)
+                                    .unwrap_or(accepted_at),
+                            };
+                            if !context.reliable_streams.record_local_tcp_capacity_proof(
+                                &path_registration,
+                                metrics,
+                                candidate,
+                            ) {
+                                return Err(RuntimeError::Protocol(
+                                    "TCP capacity proof publication was rejected",
+                                ));
+                            }
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "response_tcp_capacity_probe",
+                                format_args!(
+                                    "phase=confirmed session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} elapsed_ms={} receipt_rate_mbps={:.3} native_rate_mbps={:.3}",
+                                    session_id.0,
+                                    path_id.0,
+                                    path_registration.path_instance_id().as_u64(),
+                                    calibration_id,
+                                    received_payload_bytes,
+                                    elapsed.as_millis(),
+                                    receipt_rate_bps as f64 / 1_000_000.0,
+                                    rate_bps as f64 / 1_000_000.0,
+                                ),
+                            );
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        return Err(RuntimeError::Protocol(
+                            "TCP capacity receipt is unsupported on this platform",
+                        ));
+                    }
+                    Frame::PathCapacityData { .. } | Frame::PathCapacityFinish { .. } => {
+                        return Err(RuntimeError::Protocol(
+                            "server TCP path received capacity train data",
+                        ));
+                    }
                     Frame::PathMetrics { metrics } if metrics.path_id == path_id => {
                         context
                             .reliable_streams
@@ -555,12 +693,14 @@ pub(super) async fn handle_server_path(
                         ServerTcpPathCommandContext {
                             session_id,
                             path_id,
+                            path_instance_id: path_registration.path_instance_id(),
                             commands_tx: &commands_tx,
                             draining,
                             active_datagram_flows: 0,
                         },
                         &mut pending_frames,
                         &mut path_proofs,
+                        &mut tcp_capacity_probe,
                     )
                     .await?;
                     if !keep_running {
@@ -575,9 +715,15 @@ pub(super) async fn handle_server_path(
 pub(super) struct ServerTcpPathCommandContext<'a> {
     session_id: SessionId,
     path_id: PathId,
+    path_instance_id: ServerCarrierPathInstanceId,
     commands_tx: &'a ReliablePathCommandSender,
     draining: bool,
     active_datagram_flows: usize,
+}
+
+struct PendingTcpCapacityProbe {
+    probe: TcpCapacityProbeCommand,
+    started_at: Instant,
 }
 
 async fn drain_server_tcp_path_commands(
@@ -590,6 +736,7 @@ async fn drain_server_tcp_path_commands(
     command_context: ServerTcpPathCommandContext<'_>,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,
+    tcp_capacity_probe: &mut Option<PendingTcpCapacityProbe>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
@@ -627,11 +774,11 @@ async fn drain_server_tcp_path_commands(
         }
         match command {
             ReliablePathCommand::SendFrame(frame)
-                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+                if reliable_path_frame_requires_capacity_command(&frame) =>
             {
                 commands_rx.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
-                    "server TCP path received QUIC capacity data",
+                    "server TCP path received an untyped capacity frame",
                 ));
             }
             ReliablePathCommand::SendFrame(frame) => {
@@ -652,6 +799,51 @@ async fn drain_server_tcp_path_commands(
                 return Err(RuntimeError::Protocol(
                     "server TCP path received QUIC capacity command",
                 ));
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+                if probe.path_id != command_context.path_id
+                    || probe.path_instance_id != command_context.path_instance_id
+                    || probe.train_payload_bytes < probe.sample_floor_bytes
+                    || tcp_capacity_probe.is_some()
+                {
+                    commands_rx.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "server TCP capacity command does not match idle writer",
+                    ));
+                }
+                if !server_write_tcp_path_frame_batch(writer, pending_frames, path_proofs).await? {
+                    return Ok(false);
+                }
+                if Instant::now() >= probe.expires_at {
+                    commands_rx.release_pending_command_bytes(pending_bytes);
+                    return Ok(true);
+                }
+                let started_at = Instant::now();
+                let wrote = server_write_tcp_capacity_probe(
+                    writer,
+                    &probe,
+                    context.mux_limits.max_payload_bytes,
+                )
+                .await?;
+                commands_rx.release_pending_command_bytes(pending_bytes);
+                if !wrote {
+                    return Ok(false);
+                }
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "response_tcp_capacity_probe",
+                    format_args!(
+                        "phase=sent session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={}",
+                        command_context.session_id.0,
+                        command_context.path_id.0,
+                        probe.path_instance_id.as_u64(),
+                        probe.calibration_id,
+                        probe.train_payload_bytes,
+                        probe.sample_floor_bytes,
+                    ),
+                );
+                *tcp_capacity_probe = Some(PendingTcpCapacityProbe { probe, started_at });
+                return Ok(true);
             }
             command => {
                 if !server_write_tcp_path_frame_batch(writer, pending_frames, path_proofs).await? {
@@ -734,6 +926,41 @@ async fn server_write_tcp_path_frame_batch(
     }
 }
 
+async fn server_write_tcp_capacity_probe(
+    writer: &mut EncryptedTcpWriter,
+    probe: &TcpCapacityProbeCommand,
+    max_payload_bytes: usize,
+) -> Result<bool, RuntimeError> {
+    let frame_payload_bytes = max_payload_bytes.max(1) as u64;
+    let mut remaining = probe.train_payload_bytes;
+    while remaining > 0 {
+        let payload_bytes = remaining.min(frame_payload_bytes) as usize;
+        if !server_write_tcp_path_frame_maybe_flush(
+            writer,
+            &Frame::PathCapacityData {
+                path_id: probe.path_id,
+                calibration_id: probe.calibration_id,
+                payload: Bytes::from(vec![0u8; payload_bytes]),
+            },
+            false,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        remaining = remaining.saturating_sub(payload_bytes as u64);
+    }
+    server_write_tcp_path_frame(
+        writer,
+        &Frame::PathCapacityFinish {
+            path_id: probe.path_id,
+            calibration_id: probe.calibration_id,
+            payload_bytes: probe.train_payload_bytes,
+        },
+    )
+    .await
+}
+
 pub(super) async fn handle_server_tcp_path_command(
     command: ReliablePathCommand,
     writer: &mut EncryptedTcpWriter,
@@ -744,10 +971,10 @@ pub(super) async fn handle_server_tcp_path_command(
 ) -> Result<bool, RuntimeError> {
     match command {
         ReliablePathCommand::SendFrame(frame)
-            if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            if reliable_path_frame_requires_capacity_command(&frame) =>
         {
             Err(RuntimeError::Protocol(
-                "server TCP path received QUIC capacity data",
+                "server TCP path received an untyped capacity frame",
             ))
         }
         ReliablePathCommand::SendFrame(frame) => {
@@ -787,6 +1014,9 @@ pub(super) async fn handle_server_tcp_path_command(
                 "server TCP path received QUIC capacity command",
             ))
         }
+        ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
+            "server TCP capacity command bypassed typed writer transaction",
+        )),
     }
 }
 

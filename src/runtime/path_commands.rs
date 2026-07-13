@@ -1,9 +1,9 @@
 use super::reliable_path::ReliablePathStream;
 use super::*;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 // Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or
-// QUIC writers. Control keeps independent capacity; a typed QUIC probe remains
+// QUIC writers. Control keeps independent capacity; a typed carrier probe remains
 // one data-lane command so its token and frozen proof contract cannot split.
 
 const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
@@ -29,10 +29,32 @@ pub(super) struct ReliablePathCommandReceivers {
     dequeued_unreleased_bytes: AtomicU64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     capacity_released: Arc<Notify>,
+    tcp_capacity_probe: TcpCapacityProbeLeaseState,
+}
+
+#[derive(Debug, Default)]
+struct TcpCapacityProbeLeaseState {
+    active: AtomicBool,
+    attempts: AtomicU8,
+}
+
+#[derive(Debug)]
+pub(super) struct TcpCapacityProbeLease {
+    state: Arc<ReliablePathCommandQueueMetrics>,
+}
+
+impl Drop for TcpCapacityProbeLease {
+    fn drop(&mut self) {
+        self.state
+            .tcp_capacity_probe
+            .active
+            .store(false, Ordering::Release);
+        self.state.capacity_released.notify_waiters();
+    }
 }
 
 struct QueuedReliablePathCommand {
@@ -110,6 +132,33 @@ impl ReliablePathCommandQueueMetrics {
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
     fn pending_bytes(&self) -> u64 {
         self.pending_bytes.load(Ordering::Relaxed)
+    }
+
+    fn try_reserve_tcp_capacity_probe(
+        self: &Arc<Self>,
+    ) -> Result<TcpCapacityProbeLease, RuntimeError> {
+        if self
+            .tcp_capacity_probe
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        let attempt = self.tcp_capacity_probe.attempts.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |attempts| (attempts == 0).then_some(1),
+        );
+        if attempt.is_err() {
+            self.tcp_capacity_probe
+                .active
+                .store(false, Ordering::Release);
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        Ok(TcpCapacityProbeLease {
+            state: Arc::clone(self),
+        })
     }
 }
 
@@ -278,6 +327,68 @@ impl ReliablePathCommandSender {
         result
     }
 
+    /// Reserves one offset-free capacity epoch for this exact TCP carrier.
+    pub(super) fn try_enqueue_tcp_capacity_probe(
+        &self,
+        request: TcpCapacityProbeRequest,
+    ) -> Result<u64, RuntimeError> {
+        let permit = match self.data.try_reserve() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(RuntimeError::ReliablePathSessionClosed);
+            }
+        };
+        // Only admitted queue ownership spends this exact-carrier attempt.
+        let lease = self.metrics.try_reserve_tcp_capacity_probe()?;
+        let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
+        let calibration_id = NEXT_TCP_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
+        let probe = TcpCapacityProbeCommand {
+            path_id: request.path_id,
+            path_instance_id: request.path_instance_id,
+            calibration_id,
+            train_payload_bytes: request.train_payload_bytes,
+            sample_floor_bytes: request.sample_floor_bytes,
+            expires_at: request.expires_at,
+            _lease: lease,
+        };
+        self.metrics.add_pending_bytes(pending_bytes);
+        permit.send(QueuedReliablePathCommand::new(
+            ReliablePathCommand::SendTcpCapacityProbe(probe),
+            pending_bytes,
+            self.metrics.clone(),
+        ));
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_command_queue_send",
+            format_args!(
+                "queue=data command_kind=tcp_capacity_probe stream_id=0 lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued calibration_id={}",
+                FlowLane::Throughput,
+                FlowLane::Throughput,
+                pending_bytes,
+                calibration_id,
+            ),
+        );
+        Ok(calibration_id)
+    }
+
+    pub(super) fn tcp_capacity_probe_attempted(&self) -> bool {
+        self.metrics
+            .tcp_capacity_probe
+            .attempts
+            .load(Ordering::Acquire)
+            > 0
+    }
+
+    pub(super) fn tcp_capacity_probe_active(&self) -> bool {
+        self.metrics
+            .tcp_capacity_probe
+            .active
+            .load(Ordering::Acquire)
+    }
+
     pub(super) fn try_enqueue_stream_ordered_frame(
         &self,
         frame: Frame,
@@ -296,9 +407,9 @@ impl ReliablePathCommandSender {
         lane: FlowLane,
         effective_lane_override: Option<FlowLane>,
     ) -> Result<(), RuntimeError> {
-        if reliable_path_frame_is_quic_capacity_only(&frame) {
+        if reliable_path_frame_requires_capacity_command(&frame) {
             return Err(RuntimeError::Protocol(
-                "PATH_CAPACITY_* requires an explicit typed QUIC protocol role",
+                "PATH_CAPACITY_* requires an explicit typed carrier command",
             ));
         }
         let bytes = frame_pacing_bytes(&frame);
@@ -417,9 +528,8 @@ pub(super) fn reliable_path_effective_frame_lane(frame: &Frame, stream_lane: Flo
     }
 }
 
-/// Capacity protocol records belong to the typed QUIC epoch transaction, never
-/// to carrier-neutral frame admission. Keep future finish/receipt kinds here.
-pub(super) fn reliable_path_frame_is_quic_capacity_only(frame: &Frame) -> bool {
+/// Capacity records use shared wire frames but carrier-specific commands and proof authority.
+pub(super) fn reliable_path_frame_requires_capacity_command(frame: &Frame) -> bool {
     matches!(
         frame,
         Frame::PathCapacityData { .. }
@@ -690,6 +800,9 @@ pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand)
         ReliablePathCommand::SendQuicCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }
+        ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+            usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
+        }
         ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 0,
     }
 }
@@ -704,6 +817,11 @@ pub(super) fn reliable_path_command_writer_run_bytes(command: &ReliablePathComma
                 .unwrap_or(usize::MAX)
                 .max(1)
         }
+        ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+            usize::try_from(probe.train_payload_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1)
+        }
         ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 1,
     }
 }
@@ -713,6 +831,7 @@ fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> StreamId {
     match command {
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
         ReliablePathCommand::SendQuicCapacityProbe(_) => StreamId(0),
+        ReliablePathCommand::SendTcpCapacityProbe(_) => StreamId(0),
         ReliablePathCommand::OpenStream { stream_id, .. }
         | ReliablePathCommand::CloseStream(stream_id) => *stream_id,
     }
@@ -849,6 +968,29 @@ pub(super) struct QuicCapacityProbeCommand {
     pub(super) cancel_on_drop: bool,
 }
 
+static NEXT_TCP_CAPACITY_CALIBRATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TcpCapacityProbeRequest {
+    pub(super) path_id: PathId,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) train_payload_bytes: u64,
+    pub(super) sample_floor_bytes: u64,
+    pub(super) expires_at: Instant,
+}
+
+#[derive(Debug)]
+pub(super) struct TcpCapacityProbeCommand {
+    pub(super) path_id: PathId,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) calibration_id: u64,
+    pub(super) train_payload_bytes: u64,
+    pub(super) sample_floor_bytes: u64,
+    pub(super) expires_at: Instant,
+    // Dropping the command or completed epoch releases exact-carrier admission.
+    pub(super) _lease: TcpCapacityProbeLease,
+}
+
 impl QuicCapacityProbeCommand {
     pub(super) fn disarm_drop_cancellation(&mut self) {
         self.cancel_on_drop = false;
@@ -878,6 +1020,8 @@ pub(super) enum ReliablePathCommand {
     // TCP writers reject this carrier-specific command. The shared scheduler
     // only owns admission; UDP/QUIC owns how the epoch is encoded and measured.
     SendQuicCapacityProbe(QuicCapacityProbeCommand),
+    // TCP owns receipt timing and native socket evidence independently of QUIC.
+    SendTcpCapacityProbe(TcpCapacityProbeCommand),
     CloseStream(StreamId),
 }
 
@@ -887,6 +1031,7 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
         ReliablePathCommand::OpenStream { .. } => "open_stream",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
         ReliablePathCommand::SendQuicCapacityProbe(_) => "quic_capacity_probe",
+        ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",
         ReliablePathCommand::CloseStream(_) => "close_stream",
     }
 }
@@ -928,5 +1073,56 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::MaxConnectionData { .. } => "max_connection_data",
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tcp_probe_request(path_id: PathId) -> TcpCapacityProbeRequest {
+        TcpCapacityProbeRequest {
+            path_id,
+            path_instance_id: next_server_carrier_path_instance_id(),
+            train_payload_bytes: 2 * 1024 * 1024,
+            sample_floor_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
+            expires_at: Instant::now() + Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn tcp_capacity_attempt_is_spent_only_after_queue_admission() {
+        let (commands, mut receivers) = reliable_path_command_channels(1);
+        commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamData {
+                    stream_id: StreamId(1),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"queued"),
+                },
+                reliable_path_stream_ordered_queue_lane(),
+            )
+            .expect("fill data queue");
+        assert!(matches!(
+            commands.try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2))),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
+        assert!(!commands.tcp_capacity_probe_attempted());
+
+        let queued = try_recv_reliable_path_command(&mut receivers).expect("queued ping");
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&queued));
+        drop(queued);
+        commands
+            .try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2)))
+            .expect("admit exact carrier probe");
+        assert!(commands.tcp_capacity_probe_attempted());
+        assert!(commands.tcp_capacity_probe_active());
+        drop(try_recv_reliable_path_command(&mut receivers).expect("queued probe"));
+        assert!(!commands.tcp_capacity_probe_active());
+        assert!(matches!(
+            commands.try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2))),
+            Err(RuntimeError::SenderServiceBlocked)
+        ));
     }
 }

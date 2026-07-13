@@ -224,6 +224,18 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   usable continuous sample atomically replace that prior with per-flow goodput;
   ACK callbacks alone do not advance the count. QUIC does not use either TCP
   clock.
+- Linux TCP carriers duplicate the exact authenticated socket descriptor before
+  framing and poll the UAPI `TCP_INFO` prefix in that carrier task. Passive
+  samples publish RTT, cwnd, delivery, pacing, loss, and queue pressure, but
+  never claim product bytes. A one-shot, offset-free train and exact receipt
+  may temporarily authorize that TCP instance for bulk placement. Native
+  delivery uplift is capped at 2x receipt rate; pacing is never proof. TCP and
+  QUIC share bounded capacity wire records while retaining separate typed commands,
+  controllers, proof validity, and recovery behavior.
+- Ordered product recovery is connection-level. After one blocking TCP owner
+  PTO, mptunnel may reinject at most one modeled owner flight on another path,
+  capped by the shared feed reservoir. QUIC packet recovery remains native and
+  its product repair stays one bounded quantum.
 - Thresholds must be protocol/resource bounds or derived from live metrics.
   Lab-specific constants must not become steady-state product policy.
 

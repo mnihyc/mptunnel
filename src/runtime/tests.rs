@@ -2430,7 +2430,7 @@ fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
 }
 
 #[test]
-fn quic_capacity_frames_require_explicit_typed_protocol_roles() {
+fn capacity_frames_require_explicit_typed_carrier_commands() {
     let frames = [
         (
             Frame::PathCapacityData {
@@ -2462,7 +2462,7 @@ fn quic_capacity_frames_require_explicit_typed_protocol_roles() {
     ];
     let (commands, _receivers) = reliable_path_command_channels(1);
     for (frame, expected_lane, expected_pacing_bytes) in frames {
-        assert!(reliable_path_frame_is_quic_capacity_only(&frame));
+        assert!(reliable_path_frame_requires_capacity_command(&frame));
         assert_eq!(
             reliable_path_effective_frame_lane(&frame, FlowLane::Throughput),
             expected_lane

@@ -4236,6 +4236,29 @@ impl ResponseStreamBinding {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: Some(candidate),
+                tcp_capacity_proof: None,
+            },
+            false,
+        )
+        .0
+    }
+
+    pub(super) fn install_tcp_capacity_proof_for_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        metrics: PathMetrics,
+        candidate: TcpCapacityProofCandidate,
+    ) -> bool {
+        self.install_path_metrics_entry_matching(
+            key,
+            Some(path_instance_id),
+            ServerPathMetricsEntry {
+                metrics,
+                source: ServerPathMetricsSource::LocalSender,
+                recorded_at: Instant::now(),
+                capacity_proof: None,
+                tcp_capacity_proof: Some(candidate),
             },
             false,
         )
@@ -4281,6 +4304,7 @@ impl ResponseStreamBinding {
                 source,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
             },
             true,
         );
@@ -4322,7 +4346,8 @@ impl ResponseStreamBinding {
         let now = Instant::now();
         let source = path_metrics.source;
         let metrics = path_metrics.metrics;
-        let explicit_capacity_proof = path_metrics.capacity_proof.is_some();
+        let explicit_quic_capacity_proof = path_metrics.capacity_proof.is_some();
+        let explicit_tcp_capacity_proof = path_metrics.tcp_capacity_proof.is_some();
         let mut matched = false;
         let mut changed = false;
         for entry in &mut outputs.entries {
@@ -4334,15 +4359,21 @@ impl ResponseStreamBinding {
                     ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
                     ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
                 };
-                if !explicit_capacity_proof {
+                if !explicit_quic_capacity_proof {
                     path_metrics.capacity_proof = current
                         .and_then(|previous| previous.capacity_proof)
+                        .filter(|proof| proof.expires_at > now);
+                }
+                if !explicit_tcp_capacity_proof {
+                    path_metrics.tcp_capacity_proof = current
+                        .and_then(|previous| previous.tcp_capacity_proof)
                         .filter(|proof| proof.expires_at > now);
                 }
                 let scheduling_changed = current.is_none_or(|previous| {
                     previous.source != source
                         || !server_path_metrics_scheduling_equivalent(previous.metrics, metrics)
                         || previous.capacity_proof != path_metrics.capacity_proof
+                        || previous.tcp_capacity_proof != path_metrics.tcp_capacity_proof
                 });
                 *current = Some(path_metrics);
                 changed |= scheduling_changed;
@@ -4692,6 +4723,7 @@ mod tests {
             source: ServerPathMetricsSource::LocalSender,
             recorded_at: Instant::now(),
             capacity_proof: None,
+            tcp_capacity_proof: None,
             metrics: PathMetrics {
                 path_id: entry.key.path_id,
                 underlay: UnderlayProtocol::Udp,

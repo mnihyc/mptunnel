@@ -159,73 +159,6 @@ struct QuicPathMetricTracker {
     min_rtt: Option<Duration>,
 }
 
-// Capacity records share one ordered QUIC stream. Tracking one bounded epoch
-// makes Finish an exact receipt boundary without allocating the train itself.
-#[derive(Debug)]
-struct QuicCapacityReceiveTracker {
-    active: Option<(u64, u64)>,
-    limit_bytes: u64,
-}
-
-impl QuicCapacityReceiveTracker {
-    fn new(limit_bytes: u64) -> Self {
-        Self {
-            active: None,
-            limit_bytes: limit_bytes.max(1),
-        }
-    }
-
-    fn record_data(&mut self, token: u64, payload_bytes: usize) -> Result<(), RuntimeError> {
-        if token == 0 || payload_bytes == 0 {
-            return Err(RuntimeError::Protocol("invalid QUIC capacity data"));
-        }
-        let payload_bytes = payload_bytes as u64;
-        match self.active {
-            Some((active_token, received_bytes)) if active_token == token => {
-                let received_bytes = received_bytes
-                    .checked_add(payload_bytes)
-                    .ok_or(RuntimeError::Protocol("QUIC capacity receipt overflow"))?;
-                if received_bytes > self.limit_bytes {
-                    return Err(RuntimeError::Protocol(
-                        "QUIC capacity data exceeds the session envelope",
-                    ));
-                }
-                self.active = Some((token, received_bytes));
-            }
-            None if payload_bytes <= self.limit_bytes => self.active = Some((token, payload_bytes)),
-            None => {
-                return Err(RuntimeError::Protocol(
-                    "QUIC capacity data exceeds the session envelope",
-                ));
-            }
-            Some(_) => {
-                return Err(RuntimeError::Protocol(
-                    "interleaved QUIC capacity calibration tokens",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self, token: u64, declared_bytes: u64) -> Result<u64, RuntimeError> {
-        let Some((active_token, received_bytes)) = self.active.take() else {
-            return Err(RuntimeError::Protocol(
-                "QUIC capacity finish has no data epoch",
-            ));
-        };
-        if token == 0
-            || token != active_token
-            || declared_bytes == 0
-            || declared_bytes != received_bytes
-        {
-            return Err(RuntimeError::Protocol(
-                "QUIC capacity finish does not match received data",
-            ));
-        }
-        Ok(received_bytes)
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct UdpPathSendStream {
     stream: quic_carrier::SendStream,
@@ -1268,7 +1201,7 @@ async fn run_client_udp_stream(
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
-    let mut capacity_receive = QuicCapacityReceiveTracker::new(
+    let mut capacity_receive = CapacityReceiveTracker::new(
         reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
     );
     let path_id = PathId(path_index as u16);
@@ -1561,7 +1494,7 @@ async fn drain_client_udp_stream_commands(
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
-                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+                if reliable_path_frame_requires_capacity_command(&frame) =>
             {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
@@ -1606,6 +1539,12 @@ async fn drain_client_udp_stream_commands(
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "client QUIC path received server response capacity command",
+                ));
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(_) => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client QUIC path received TCP capacity command",
                 ));
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
@@ -2805,7 +2744,7 @@ async fn drain_server_udp_reliable_commands(
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
-                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+                if reliable_path_frame_requires_capacity_command(&frame) =>
             {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
@@ -2967,6 +2906,12 @@ async fn drain_server_udp_reliable_commands(
                 // End the run at the epoch boundary. A later dequeue may block
                 // on the carrier gate, but cannot enter this write transaction.
                 return Ok(false);
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(_) => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC path received TCP capacity command",
+                ));
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
                 flush_udp_frame_batch_with_path_proofs(
@@ -3244,7 +3189,7 @@ async fn drain_server_udp_datagram_commands(
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
-                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+                if reliable_path_frame_requires_capacity_command(&frame) =>
             {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
@@ -3285,6 +3230,12 @@ async fn drain_server_udp_datagram_commands(
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received reliable capacity command",
+                ));
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(_) => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC datagram writer received TCP capacity command",
                 ));
             }
             ReliablePathCommand::CloseStream(_) => {
@@ -3662,43 +3613,6 @@ mod tests {
     ) -> quic_carrier::CongestionMetrics {
         metrics.capacity_probe = Some(probe);
         metrics
-    }
-
-    #[test]
-    fn quic_capacity_receive_tracker_accepts_only_exact_bounded_epoch() {
-        let mut tracker = QuicCapacityReceiveTracker::new(1024);
-
-        tracker.record_data(7, 400).expect("first record");
-        tracker.record_data(7, 624).expect("second record");
-        assert_eq!(tracker.finish(7, 1024).expect("exact finish"), 1024);
-    }
-
-    #[test]
-    fn quic_capacity_receive_tracker_rejects_over_limit_and_interleaving() {
-        let mut over_limit = QuicCapacityReceiveTracker::new(1024);
-        over_limit.record_data(7, 900).expect("first record");
-        assert!(matches!(
-            over_limit.record_data(7, 125),
-            Err(RuntimeError::Protocol(_))
-        ));
-
-        let mut interleaved = QuicCapacityReceiveTracker::new(1024);
-        interleaved.record_data(7, 400).expect("first token");
-        assert!(matches!(
-            interleaved.record_data(8, 400),
-            Err(RuntimeError::Protocol(_))
-        ));
-    }
-
-    #[test]
-    fn quic_capacity_receive_tracker_rejects_mismatched_finish() {
-        let mut tracker = QuicCapacityReceiveTracker::new(1024);
-        tracker.record_data(7, 400).expect("data record");
-
-        assert!(matches!(
-            tracker.finish(8, 400),
-            Err(RuntimeError::Protocol(_))
-        ));
     }
 
     #[test]

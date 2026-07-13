@@ -218,17 +218,18 @@ paired ratio rather than cross-epoch absolute rates. Server CPU, peak memory,
 and maximum gap remain higher at 9.398/2.462%, 208.8/134.6 MB, and
 0.599/0.494 seconds for multipath/single.
 
-The default heterogeneous Iteration 129 guard remains below the adjacent best
-single path: 104.531 versus 110.489 Mbps. It is faster and smoother than the
-closest preserved one-flow heterogeneous runs, but uses only lowlat and
-balanced materially. Do not enable later cold paths merely by copying Service
-rate into their completion projection. Iterations 131-134 tried that and were
-rejected after producing 0.525-1.269 second read gaps; the later clean/mitigated
-Iterations 132-134 remain at 0.791-1.269 seconds. A safe next step is
-Linux TCP_INFO sampling at the exact server carrier instance, published through
-the existing direction-correct local `PathMetrics`; upload/client telemetry is
-a separate boundary because throughput and latency TCP sessions must not be
-collapsed into one path record.
+The Linux TCP carrier now samples `TCP_INFO` from the exact authenticated server
+socket. Passive samples are pressure/liveness only; only the typed offset-free
+receipt can temporarily authorize optional bulk placement. Native delivery is
+capped at 2x receipt rate and pacing never becomes capacity authority. Final
+Iteration 153 reaches 172.853 Mbps versus 84.992 Mbps single (`2.034x`); its
+0.504 second gap is a boundary miss, while the Iteration 154 repeat reaches
+182.917 Mbps with a 0.368 second gap. Do not restore the rejected source-only
+cap from Iteration 150: it starved the blocked prefix and fell to `0.844x`.
+TCP prefix recovery instead reinjects one modeled owner flight after one PTO,
+bounded by the feed reservoir. Fat-path recruitment remains inconsistent.
+Upload/client telemetry remains separate because throughput and latency TCP
+sessions must not be collapsed into one path record.
 
 Iteration 135 confirms that the accepted completion gate blocks an obviously
 slow candidate before the Service prior is installed. With lowlat at

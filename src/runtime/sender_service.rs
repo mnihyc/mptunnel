@@ -1814,6 +1814,67 @@ fn select_response_quic_capacity_calibration_target(
         .cloned()
 }
 
+#[cfg(target_os = "linux")]
+fn select_response_tcp_capacity_probe_target(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    ordered_data_owner: Option<CarrierPathKey>,
+    mux_limits: MuxLimits,
+) -> Option<(ResponseSenderPathTarget, u64)> {
+    if !lane.is_bulk() {
+        return None;
+    }
+    let service_key = ordered_data_owner?;
+    let service = targets.iter().find(|target| target.key == service_key)?;
+    if service.key.underlay != UnderlayProtocol::Tcp
+        || !service.is_active
+        || !service.has_bulk_rate_evidence
+        || service.snapshot.active_latency_sensitive_flows > 0
+        || service.snapshot.session_active_latency_sensitive_flows > 0
+    {
+        return None;
+    }
+    // Preserve the accepted first bounded product bootstrap. Carrier-only
+    // discovery begins only when one optional same-family path has graduated.
+    if !targets.iter().any(|target| {
+        target.key != service_key
+            && target.key.underlay == UnderlayProtocol::Tcp
+            && !target.is_active
+            && target.has_bulk_rate_evidence
+    }) {
+        return None;
+    }
+    let envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+    let train_bytes = (2 * 1024 * 1024u64).min(envelope).max(sample_floor).max(1);
+    targets
+        .iter()
+        .filter(|target| {
+            target.key != service_key
+                && target.key.underlay == UnderlayProtocol::Tcp
+                && target.attachment_role == StreamOpenRole::Validation
+                && !target.is_active
+                && target.has_sender_evidence
+                && !target.has_bulk_rate_evidence
+                && !target.commands.tcp_capacity_probe_attempted()
+                && !target.commands.tcp_capacity_probe_active()
+                && target.command_pending_bytes == 0
+                && target.snapshot.queue_bytes == 0
+                && target.snapshot.bytes_in_flight == 0
+                && target.snapshot.active_latency_sensitive_flows == 0
+                && target.snapshot.session_active_latency_sensitive_flows == 0
+                && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+                .then_with(|| left.incarnation.cmp(&right.incarnation))
+        })
+        .cloned()
+        .map(|target| (target, train_bytes))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_response_service_handoff_target(
     targets: &[ResponseSenderPathTarget],
@@ -3855,11 +3916,11 @@ fn response_same_family_reservoir_policy(
     }
     let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
     let service_assigned = service.target.owner_data_in_flight_bytes;
-    // Same-family proven paths may drain a bulk backlog concurrently. Bound the
-    // shared ordered tail by the existing product/reorder envelope; the Service
-    // horizon remains protected and per-path admission still enforces carrier
-    // flight, completion, and repair constraints.
-    let ordered_reservoir = bulk_service_product_envelope_payload_bytes(payload_bytes, mux_limits);
+    // Same-family proven paths may drain a bulk backlog concurrently, but a
+    // full resource envelope can become tens of MiB of receiver-prefix debt.
+    // The BBR-shaped feed reservoir preserves aggregation headroom while
+    // keeping cross-path ownership close enough for latency-sensitive takeover.
+    let ordered_reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits);
 
     ResponseSameFamilyReservoir::new(
         service.target.key,
@@ -4120,6 +4181,44 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
                 let lower_flights = binding.lower_flights_before_offset(next_offset);
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
+                #[cfg(target_os = "linux")]
+                if let Some((target, train_bytes)) = select_response_tcp_capacity_probe_target(
+                    &targets,
+                    relay_lane,
+                    ordered_data_owner,
+                    binding.mux_limits(),
+                ) && let Some(expires_at) = Instant::now().checked_add(Duration::from_secs(20))
+                    && let Ok(calibration_id) =
+                        target
+                            .commands
+                            .try_enqueue_tcp_capacity_probe(TcpCapacityProbeRequest {
+                                path_id: target.key.path_id,
+                                path_instance_id: target.path_instance_id,
+                                train_payload_bytes: train_bytes,
+                                sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(
+                                    binding.mux_limits(),
+                                ),
+                                expires_at,
+                            })
+                {
+                    #[cfg(not(feature = "lab-diagnostics"))]
+                    let _ = calibration_id;
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "response_tcp_capacity_probe",
+                        format_args!(
+                            "phase=started session_id={} binding_instance_id={} path_id={} path_instance_id={} incarnation={} calibration_id={} train_bytes={}",
+                            target.session_id.0,
+                            target.binding_instance_id,
+                            target.key.path_id.0,
+                            target.path_instance_id.as_u64(),
+                            target.incarnation,
+                            calibration_id,
+                            train_bytes,
+                        ),
+                    );
+                    continue;
+                }
                 let capacity_session_limit =
                     reliable_quic_capacity_calibration_session_limit_bytes(binding.mux_limits());
                 let remaining_capacity_probe_bytes = capacity_session_limit
@@ -8737,6 +8836,61 @@ mod tests {
             ack_clock_calibration_max_limit_bytes: 0,
             ack_clock_calibration_active: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_capacity_probe_starts_only_after_first_optional_subflow_graduates() {
+        let mux_limits = MuxLimits::default();
+        let service = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 64 * 1024, true);
+        let mut measured = response_target(1, UnderlayProtocol::Tcp, 80.0, 0, 64 * 1024, false);
+        let mut cold = response_target(2, UnderlayProtocol::Tcp, 160.0, 0, 64 * 1024, false);
+        measured.has_bulk_rate_evidence = false;
+        cold.has_bulk_rate_evidence = false;
+        let (cold_commands, _cold_receivers) = reliable_path_command_channels(4);
+        cold.commands = cold_commands;
+
+        assert!(
+            select_response_tcp_capacity_probe_target(
+                &[service.clone(), measured.clone(), cold.clone()],
+                FlowLane::Throughput,
+                Some(service.key),
+                mux_limits,
+            )
+            .is_none()
+        );
+
+        measured.has_bulk_rate_evidence = true;
+        let (selected, train_bytes) = select_response_tcp_capacity_probe_target(
+            &[service.clone(), measured.clone(), cold.clone()],
+            FlowLane::Throughput,
+            Some(service.key),
+            mux_limits,
+        )
+        .expect("graduated optional path opens carrier-only discovery");
+        assert_eq!(selected.key, cold.key);
+        assert_eq!(train_bytes, 2 * 1024 * 1024);
+        cold.commands
+            .try_enqueue_tcp_capacity_probe(TcpCapacityProbeRequest {
+                path_id: cold.key.path_id,
+                path_instance_id: cold.path_instance_id,
+                train_payload_bytes: train_bytes,
+                sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(mux_limits),
+                expires_at: Instant::now() + Duration::from_secs(1),
+            })
+            .expect("reserve cold carrier");
+        assert!(
+            select_response_tcp_capacity_probe_target(
+                &[service, measured, cold],
+                FlowLane::Throughput,
+                Some(CarrierPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    path_id: PathId(0),
+                }),
+                mux_limits,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -16941,7 +17095,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_tcp_subflow_uses_product_reservoir_beyond_service_horizon() {
+    fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
         let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
@@ -17026,9 +17180,9 @@ mod tests {
             product_reservoir / 2,
             None,
         )
-        .expect("a measured path that finishes before the Service backlog should aggregate");
-        assert_eq!(backlog_selection.target.key, backlog_subflow.key);
-        assert_eq!(backlog_selection.admission.role, PathRuntimeRole::Subflow);
+        .expect("Service remains feedable when cross-path prefix debt is capped");
+        assert_eq!(backlog_selection.target.key, service.key);
+        assert_eq!(backlog_selection.admission.role, PathRuntimeRole::Service);
 
         service.snapshot.product_bytes_in_flight = product_reservoir as u64;
         service.owner_data_in_flight_bytes = product_reservoir as u64;

@@ -576,6 +576,32 @@ Multipath reaches 182.247 Mbps versus 182.777 Mbps single, with 0.251/0.247
 second maximum gaps. Optional interfaces remain control-only, proving the
 completion gate rejects clearly slower candidates before prior installation.
 
+Iterations 136-154 close the next Linux TCP evidence and recovery loop.
+`TCP_INFO` is captured from the exact post-authentication carrier and an
+offset-free 2 MiB train can publish one short-lived, receipt-bound capacity
+proof after the first optional TCP Subflow is already proven. Iteration 148
+shows why throughput alone is insufficient: 188.259 versus 116.412 Mbps
+(`1.617x`), but a 0.821 second read gap and client reorder growth. Iteration 149
+confirms up to 33.1 MiB receive holes and 52.1 MiB ordered debt while CPU is
+idle. A source-only reservoir cap was rejected in Iteration 150 after falling
+to 87.487 versus 103.719 Mbps and worsening the gap to 1.086 seconds.
+
+Iteration 151 couples the bounded model to TCP recovery: after one owner PTO,
+reinject up to one modeled TCP flight, capped by the feed reservoir. Its clean
+pair reaches 195.262 versus 101.808 Mbps (`1.918x`) with a 0.361 second gap, but
+a final authority audit rejects its use of unbounded native pacing as delivered
+capacity. Iteration 152 retains the slow-optional guard at 184.054 Mbps and
+0.169 seconds, with 99.94% of traffic on the healthy Service path.
+
+Final Iterations 153/154 cap native delivery uplift at 2x the exact receipt and
+exclude pacing from capacity authority. The matched pair reaches 172.853 versus
+84.992 Mbps (`2.034x`) with a 0.504 second gap; the clean repeat reaches 182.917
+Mbps with a 0.368 second gap. Lowlat, balanced, and mild are material in both,
+but fat changes from 4.13% to control-only. This is useful three-path
+aggregation, not ideal stable five-path aggregation. These rows prove current
+Linux TCP download behavior, not QUIC, mixed-carrier, upload, failover, TUN,
+real-Internet, or external baseline superiority.
+
 ## Interpreting Results
 
 The deterministic benchmark gates in `lab/benchmarks/` are useful manual regression checks, but they are model results. The Docker lab is the minimum comparison surface before claiming real performance improvement because it compares raw paths, single-path mptunnel, multipath mptunnel, UDP behavior, and a forced path failure under the same emulated network.

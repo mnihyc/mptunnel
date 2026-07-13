@@ -163,6 +163,7 @@ pub(super) struct ClientTcpPathConnection {
     pub(super) next_heartbeat_at: tokio::time::Instant,
     pub(super) pending_heartbeat: Option<(u64, tokio::time::Instant)>,
     pub(super) path_proofs: PathProofTracker,
+    pub(super) capacity_receive: CapacityReceiveTracker,
 }
 
 pub(super) type EncryptedTcpReader = EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
@@ -475,11 +476,11 @@ async fn handle_connected_client_tcp_command_run(
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         match command {
             ReliablePathCommand::SendFrame(frame)
-                if reliable_path_frame_is_quic_capacity_only(&frame) =>
+                if reliable_path_frame_requires_capacity_command(&frame) =>
             {
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
-                    "client TCP path received QUIC capacity data",
+                    "client TCP path received an untyped capacity frame",
                 ));
             }
             ReliablePathCommand::SendFrame(frame) => {
@@ -499,6 +500,12 @@ async fn handle_connected_client_tcp_command_run(
                 commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "client TCP path received QUIC capacity command",
+                ));
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(_) => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client TCP path received server capacity command",
                 ));
             }
             command => {
@@ -759,6 +766,7 @@ async fn handle_disconnected_client_tcp_command(
         ReliablePathCommand::SendQuicCapacityProbe(probe) => {
             probe.ticket.cancel();
         }
+        ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::SendFrame(_) | ReliablePathCommand::CloseStream(_) => {}
     }
 }
@@ -799,10 +807,10 @@ async fn handle_connected_client_tcp_command(
             Ok(())
         }
         ReliablePathCommand::SendFrame(frame)
-            if reliable_path_frame_is_quic_capacity_only(&frame) =>
+            if reliable_path_frame_requires_capacity_command(&frame) =>
         {
             Err(RuntimeError::Protocol(
-                "client TCP path received QUIC capacity data",
+                "client TCP path received an untyped capacity frame",
             ))
         }
         ReliablePathCommand::SendFrame(frame) => {
@@ -820,6 +828,9 @@ async fn handle_connected_client_tcp_command(
                 "client TCP path received QUIC capacity command",
             ))
         }
+        ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
+            "client TCP path received server capacity command",
+        )),
         ReliablePathCommand::CloseStream(stream_id) => {
             streams.remove(&stream_id);
             closed_streams.insert(stream_id);
@@ -908,6 +919,9 @@ pub(super) async fn connect_client_tcp_path(
             next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
             pending_heartbeat: None,
             path_proofs: PathProofTracker::default(),
+            capacity_receive: CapacityReceiveTracker::new(
+                reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            ),
         })
     };
     tokio::time::timeout_at(open_deadline, connect)
@@ -1166,6 +1180,43 @@ async fn handle_client_tcp_path_frame(
             }
             Ok(())
         }
+        Frame::PathCapacityData {
+            path_id: capacity_path_id,
+            calibration_id,
+            payload,
+        } if capacity_path_id == path_id => connection
+            .capacity_receive
+            .record_data(calibration_id, payload.len()),
+        Frame::PathCapacityFinish {
+            path_id: capacity_path_id,
+            calibration_id,
+            payload_bytes,
+        } if capacity_path_id == path_id => {
+            let received_payload_bytes = connection
+                .capacity_receive
+                .finish(calibration_id, payload_bytes)?;
+            connection
+                .writer
+                .write_frame(&Frame::PathCapacityReceipt {
+                    path_id,
+                    calibration_id,
+                    received_payload_bytes,
+                })
+                .await?;
+            connection.writer.flush().await?;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "tcp_capacity_receipt",
+                format_args!(
+                    "role=client phase=sent path_id={} calibration_id={} received_payload_bytes={}",
+                    path_id.0, calibration_id, received_payload_bytes,
+                ),
+            );
+            Ok(())
+        }
+        Frame::PathCapacityReceipt { .. } => Err(RuntimeError::Protocol(
+            "client TCP path received server capacity receipt",
+        )),
         Frame::Pong { nonce } => {
             let Some((pending_nonce, _)) = connection.pending_heartbeat.as_ref() else {
                 return Err(RuntimeError::Protocol(

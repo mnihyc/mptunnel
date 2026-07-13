@@ -1,11 +1,10 @@
 use super::bulk_admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
-    reliable_relay_source_staging_owner_tail_headroom,
+    bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
 };
 #[cfg(test)]
 use super::bulk_admission::{
-    bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
-    bulk_service_product_envelope_payload_bytes,
+    bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
 };
 use super::*;
 
@@ -974,6 +973,28 @@ pub(super) fn reliable_critical_tail_repair_limit_bytes(
         .min(resource_cap)
 }
 
+fn reliable_live_owner_tail_repair_limit_bytes(
+    path: Option<PathSnapshot>,
+    owner_underlay: Option<UnderlayProtocol>,
+    lane: FlowLane,
+    repair_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let base_limit = adaptive_reliable_relay_repair_bytes(path, lane, mux_limits);
+    let event_limit = if owner_underlay == Some(UnderlayProtocol::Tcp) && lane.is_bulk() {
+        // TCP recovery remains socket-local. After one owner PTO, reinject one
+        // bounded modeled flight so a product prefix is not repaired 64 KiB at a time.
+        adaptive_reliable_relay_inflight_bytes(path, lane, mux_limits)
+            .min(bulk_service_feed_reservoir_payload_bytes(
+                base_limit, mux_limits,
+            ))
+            .max(base_limit)
+    } else {
+        base_limit
+    };
+    reliable_critical_tail_repair_limit_bytes(event_limit, repair_debt_bytes, mux_limits)
+}
+
 pub(super) fn reliable_persistent_ack_gap_repair_limit_bytes(
     path: Option<PathSnapshot>,
     owner_underlay: Option<UnderlayProtocol>,
@@ -1539,8 +1560,10 @@ fn enqueue_reliable_tail_repair(
             )
             && path_stream.has_multipath_repair_alternative()
         {
-            let tail_limit = reliable_critical_tail_repair_limit_bytes(
-                base_repair_limit,
+            let tail_limit = reliable_live_owner_tail_repair_limit_bytes(
+                tail_repair_path_snapshot,
+                path_stream.tail_repair_owner_underlay(last_send_ack_frontier),
+                relay_lane,
                 send_stream.repair_bytes(),
                 mux_limits,
             );
@@ -4185,6 +4208,45 @@ mod tests {
         assert_eq!(
             repair_limit, base_limit,
             "persistent ACK-gap repair may bypass optional budget, but one event repairs only one bounded quantum"
+        );
+    }
+
+    #[test]
+    fn live_tcp_bulk_tail_repair_uses_one_bounded_owner_flight() {
+        let limits = MuxLimits::default();
+        let path = PathSnapshot::new(PathId(3), UnderlayProtocol::Tcp, 180.0, 500_000_000.0);
+        let base = adaptive_reliable_relay_repair_bytes(Some(path), FlowLane::Throughput, limits);
+        let repair_debt = limits.max_repair_bytes;
+        let repair_limit = reliable_live_owner_tail_repair_limit_bytes(
+            Some(path),
+            Some(UnderlayProtocol::Tcp),
+            FlowLane::Throughput,
+            repair_debt,
+            limits,
+        );
+
+        assert!(repair_limit > base);
+        assert!(
+            repair_limit <= bulk_service_feed_reservoir_payload_bytes(base, limits),
+            "one-PTO TCP reinjection must remain inside the ordered feed reservoir"
+        );
+    }
+
+    #[test]
+    fn live_quic_tail_repair_remains_one_product_quantum() {
+        let limits = MuxLimits::default();
+        let path = PathSnapshot::new(PathId(3), UnderlayProtocol::Udp, 180.0, 500_000_000.0);
+        let base = adaptive_reliable_relay_repair_bytes(Some(path), FlowLane::Throughput, limits);
+        assert_eq!(
+            reliable_live_owner_tail_repair_limit_bytes(
+                Some(path),
+                Some(UnderlayProtocol::Udp),
+                FlowLane::Throughput,
+                limits.max_repair_bytes,
+                limits,
+            ),
+            base,
+            "QUIC keeps packet recovery below the shared product repair boundary"
         );
     }
 

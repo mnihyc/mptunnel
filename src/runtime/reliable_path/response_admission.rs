@@ -713,6 +713,8 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
     // Only the exact capacity transaction creates this marker. Ordinary metric
     // refreshes may carry it to the fixed deadline but cannot mint a new proof.
     pub(super) capacity_proof: Option<QuicCapacityProofCandidate>,
+    // TCP uses an independent receiver receipt plus exact socket telemetry.
+    pub(super) tcp_capacity_proof: Option<TcpCapacityProofCandidate>,
 }
 
 fn server_output_local_path_metrics(
@@ -1129,7 +1131,8 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
             },
         ) if metrics.has_ack_derived_data_sample
             || metrics.confidence_ppm > 0
-            || server_quic_capacity_proof(path_metrics).is_some() =>
+            || server_quic_capacity_proof(path_metrics).is_some()
+            || server_tcp_capacity_proof(path_metrics).is_some() =>
         {
             let capacity_proof = server_quic_capacity_proof(path_metrics);
             if let Some(proof) = capacity_proof {
@@ -1138,6 +1141,11 @@ fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) ->
                 let receipt_confidence = (proof.received_bytes as f64
                     / proof.sample_floor_bytes.max(1) as f64)
                     .clamp(0.0, 1.0);
+                return delivery_confidence.max(receipt_confidence).clamp(0.0, 1.0);
+            }
+            if let Some(proof) = server_tcp_capacity_proof(path_metrics) {
+                let receipt_confidence =
+                    (proof.received_bytes as f64 / proof.train_bytes.max(1) as f64).clamp(0.0, 1.0);
                 return delivery_confidence.max(receipt_confidence).clamp(0.0, 1.0);
             }
             let source_confidence =
@@ -1174,11 +1182,23 @@ fn server_quic_capacity_proof(
     .then_some(proof)
 }
 
+fn server_tcp_capacity_proof(
+    path_metrics: ServerPathMetricsEntry,
+) -> Option<TcpCapacityProofCandidate> {
+    let proof = path_metrics.tcp_capacity_proof?;
+    (path_metrics.source == ServerPathMetricsSource::LocalSender
+        && path_metrics.metrics.underlay == UnderlayProtocol::Tcp
+        && valid_tcp_capacity_proof_candidate_at(proof, Instant::now()))
+    .then_some(proof)
+}
+
 fn server_path_metrics_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
-    server_quic_capacity_proof(path_metrics).map_or_else(
-        || path_metrics.metrics.delivery_rate_bps.max(1) as f64,
-        |proof| proof.rate_bps.max(1) as f64,
-    )
+    server_quic_capacity_proof(path_metrics)
+        .map(|proof| proof.rate_bps.max(1) as f64)
+        .or_else(|| {
+            server_tcp_capacity_proof(path_metrics).map(|proof| proof.rate_bps.max(1) as f64)
+        })
+        .unwrap_or_else(|| path_metrics.metrics.delivery_rate_bps.max(1) as f64)
 }
 
 fn server_path_metrics_estimate_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
@@ -1234,16 +1254,18 @@ fn server_udp_path_metrics_has_durable_rate_estimate(path_metrics: ServerPathMet
 }
 
 fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEntry) -> bool {
-    if server_quic_capacity_proof(path_metrics).is_some() {
+    if server_quic_capacity_proof(path_metrics).is_some()
+        || server_tcp_capacity_proof(path_metrics).is_some()
+    {
         return true;
     }
     let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
     let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
     let effective_metric_age = Duration::from_micros(u64::from(path_metrics.metrics.metric_age_us))
         .saturating_add(Instant::now().saturating_duration_since(path_metrics.recorded_at));
-    let udp_bulk_proof_is_eligible = path_metrics.metrics.underlay != UnderlayProtocol::Udp
-        || (!path_metrics.metrics.app_limited
-            && effective_metric_age
+    let native_bulk_proof_is_eligible = !path_metrics.metrics.app_limited
+        && (path_metrics.metrics.underlay != UnderlayProtocol::Udp
+            || effective_metric_age
                 < quic_bulk_proof_freshness_horizon(
                     Duration::from_micros(u64::from(path_metrics.metrics.srtt_us.max(1))),
                     Duration::from_micros(u64::from(path_metrics.metrics.rttvar_us)),
@@ -1251,7 +1273,7 @@ fn server_path_metrics_has_bulk_rate_evidence(path_metrics: ServerPathMetricsEnt
     path_metrics.source == ServerPathMetricsSource::LocalSender
         // Source expiry is authoritative; age is defense in depth if an idle
         // refresh is delayed or reordered before response admission runs.
-        && udp_bulk_proof_is_eligible
+        && native_bulk_proof_is_eligible
         && path_metrics.metrics.has_ack_derived_data_sample
         && path_metrics.metrics.data_sample_count > 0
         && path_metrics
@@ -1317,10 +1339,8 @@ pub(in crate::runtime) fn server_output_accepts_service_capacity_prior(
 ) -> bool {
     entry.key.underlay == UnderlayProtocol::Tcp
         && !product_delivery_samples_override_startup_prior(entry.delivery_samples)
-        && !entry.local_path_metrics.is_some_and(|metrics| {
-            metrics.source == ServerPathMetricsSource::LocalSender
-                && metrics.metrics.has_ack_derived_data_sample
-        })
+        && !server_output_local_path_metrics(entry)
+            .is_some_and(server_path_metrics_has_bulk_rate_evidence)
         && entry.peer_path_metrics.is_some_and(|metrics| {
             metrics.source == ServerPathMetricsSource::PeerHint
                 && metrics.metrics.app_limited
@@ -2343,6 +2363,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2514,6 +2535,7 @@ mod tests {
                     source: ServerPathMetricsSource::LocalSender,
                     recorded_at: Instant::now(),
                     capacity_proof: None,
+                    tcp_capacity_proof: None,
                     metrics,
                 }),
                 peer_path_metrics: None,
@@ -2593,6 +2615,7 @@ mod tests {
             metrics,
             recorded_at: Instant::now(),
             capacity_proof: None,
+            tcp_capacity_proof: None,
         };
 
         let mut fresh = metrics;
@@ -2613,6 +2636,7 @@ mod tests {
             metrics,
             recorded_at: Instant::now() - freshness_horizon,
             capacity_proof: None,
+            tcp_capacity_proof: None,
         };
         assert!(!server_path_metrics_has_bulk_rate_evidence(
             delayed_idle_refresh
@@ -2678,6 +2702,7 @@ mod tests {
             source: ServerPathMetricsSource::LocalSender,
             recorded_at: accepted_at,
             capacity_proof: Some(candidate),
+            tcp_capacity_proof: None,
         };
         assert!(server_path_metrics_has_bulk_rate_evidence(accepted));
         assert_eq!(
@@ -2785,6 +2810,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2878,6 +2904,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -2962,6 +2989,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -3025,6 +3053,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -3107,6 +3136,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,
@@ -3172,6 +3202,7 @@ mod tests {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: None,
+                tcp_capacity_proof: None,
                 metrics: PathMetrics {
                     path_id: key.path_id,
                     underlay: key.underlay,

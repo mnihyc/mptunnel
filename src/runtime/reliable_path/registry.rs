@@ -509,6 +509,7 @@ impl ServerReliableStreamRegistry {
             source: ServerPathMetricsSource::LocalSender,
             recorded_at: Instant::now(),
             capacity_proof: Some(candidate),
+            tcp_capacity_proof: None,
         };
         self.path_metrics
             .lock()
@@ -551,6 +552,96 @@ impl ServerReliableStreamRegistry {
         true
     }
 
+    /// Publishes one receiver-confirmed TCP train for the exact live socket.
+    pub(in crate::runtime) fn record_local_tcp_capacity_proof(
+        &self,
+        path_registration: &ServerCarrierPathRegistration,
+        mut metrics: PathMetrics,
+        candidate: TcpCapacityProofCandidate,
+    ) -> bool {
+        if !path_registration.belongs_to(self)
+            || path_registration.underlay() != UnderlayProtocol::Tcp
+            || metrics.underlay != UnderlayProtocol::Tcp
+            || metrics.direction != PathMetricDirection::ServerToClient
+            || !valid_tcp_capacity_proof_candidate_at(candidate, Instant::now())
+        {
+            return false;
+        }
+        let session_id = path_registration.session_id();
+        let path_id = path_registration.path_id();
+        let path_instance_id = path_registration.path_instance_id();
+        let instance_key = (session_id, UnderlayProtocol::Tcp, path_id, path_instance_id);
+        let active_path_instances = self
+            .active_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if !active_path_instances.contains(&instance_key) {
+            return false;
+        }
+        metrics.path_id = path_id;
+        let entry = ServerPathMetricsEntry {
+            metrics,
+            source: ServerPathMetricsSource::LocalSender,
+            recorded_at: Instant::now(),
+            capacity_proof: None,
+            tcp_capacity_proof: Some(candidate),
+        };
+        self.path_metrics
+            .lock()
+            .expect("server path metrics lock")
+            .insert(instance_key, entry);
+        drop(active_path_instances);
+
+        let key = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id,
+        };
+        let bindings = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            streams
+                .iter()
+                .filter_map(|((entry_session_id, _), entry)| {
+                    (*entry_session_id == session_id).then_some(entry.binding.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let installed = bindings
+            .iter()
+            .filter(|binding| {
+                binding.install_tcp_capacity_proof_for_instance(
+                    key,
+                    path_instance_id,
+                    metrics,
+                    candidate,
+                )
+            })
+            .count();
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = installed;
+        for binding in bindings {
+            binding.notify_installed_path_metrics();
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "response_tcp_capacity_probe",
+            format_args!(
+                "phase=published session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} receipt_rate_mbps={:.3} rate_mbps={:.3} bindings={}",
+                session_id.0,
+                path_id.0,
+                path_instance_id.as_u64(),
+                candidate.token,
+                candidate.train_bytes,
+                candidate.receipt_rate_bps as f64 / 1_000_000.0,
+                candidate.rate_bps as f64 / 1_000_000.0,
+                installed,
+            ),
+        );
+        true
+    }
+
     fn record_path_metrics_with_source(
         &self,
         path_registration: &ServerCarrierPathRegistration,
@@ -578,11 +669,15 @@ impl ServerReliableStreamRegistry {
         let capacity_proof = previous
             .and_then(|previous| previous.capacity_proof)
             .filter(|proof| proof.expires_at > Instant::now());
+        let tcp_capacity_proof = previous
+            .and_then(|previous| previous.tcp_capacity_proof)
+            .filter(|proof| proof.expires_at > Instant::now());
         let entry = ServerPathMetricsEntry {
             metrics,
             source,
             recorded_at: Instant::now(),
             capacity_proof,
+            tcp_capacity_proof,
         };
         // One registry slot cannot represent both directions. Preserve local
         // sender authority for future attachments; peer hints still update each
@@ -647,6 +742,7 @@ impl ServerReliableStreamRegistry {
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
                 capacity_proof: stored.and_then(|entry| entry.capacity_proof),
+                tcp_capacity_proof: stored.and_then(|entry| entry.tcp_capacity_proof),
             }),
             None => stored,
         }
@@ -670,6 +766,12 @@ impl ServerReliableStreamRegistry {
                     .is_some_and(|proof| proof.expires_at <= Instant::now())
                 {
                     entry.capacity_proof = None;
+                }
+                if entry
+                    .tcp_capacity_proof
+                    .is_some_and(|proof| proof.expires_at <= Instant::now())
+                {
+                    entry.tcp_capacity_proof = None;
                 }
                 entry
             })
@@ -834,6 +936,7 @@ mod tests {
                     source: ServerPathMetricsSource::LocalSender,
                     recorded_at: Instant::now(),
                     capacity_proof: Some(candidate),
+                    tcp_capacity_proof: None,
                 },
             );
 

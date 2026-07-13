@@ -1,5 +1,6 @@
 mod ack_clock_policy;
 mod bulk_admission;
+mod capacity_receipt;
 mod core;
 mod datagram;
 mod error;
@@ -21,6 +22,7 @@ mod response_ownership;
 mod sender_service;
 mod server_runtime;
 mod server_tcp;
+mod tcp_metrics;
 mod tcp_path;
 mod tun_l4;
 mod udp_metrics;
@@ -35,6 +37,7 @@ pub use error::RuntimeError;
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::*;
+use capacity_receipt::*;
 use core::*;
 use datagram::*;
 use ingress_runtime::*;
@@ -55,6 +58,7 @@ use sender_service::*;
 #[cfg(test)]
 use server_runtime::run_server;
 use server_tcp::*;
+use tcp_metrics::*;
 use tcp_path::*;
 use tun_l4::*;
 use udp_metrics::*;

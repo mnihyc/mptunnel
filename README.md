@@ -114,8 +114,18 @@ fat path at control-only traffic. This is still 41.5-42.1% above the closest
 preserved one-flow heterogeneous results, so it is an unresolved capacity gap,
 not a silently accepted regression. Attempts to serially sample later cold TCP
 paths were rejected: they made fat-path traffic material but increased maximum
-read gap to 0.525-1.269 seconds. Solving this safely requires native per-socket
-TCP carrier evidence or a non-ordering probe, not another Service-rate guess.
+read gap to 0.525-1.269 seconds. Iterations 136-154 instead add exact Linux
+per-socket TCP evidence and an offset-free capacity receipt. Passive `TCP_INFO`
+remains liveness/pressure evidence only; a typed receipt is required before it
+can authorize bulk placement. Native delivery may lift the receipt by at most
+the existing 2x BBR cwnd gain; pacing alone is never capacity authority. The
+final Iteration 153 pair reaches 172.853 Mbps versus 84.992 Mbps single, or
+2.034x. Its 0.504 second gap is a disclosed boundary miss; the clean Iteration
+154 repeat reaches 182.917 Mbps with a 0.368 second gap. Both use lowlat,
+balanced, and mild materially, while the 500 Mbps fat path remains
+inconsistently recruited. One-PTO TCP prefix reinjection is bounded to one
+modeled owner flight and the shared feed reservoir. QUIC keeps native loss
+recovery and its existing one-quantum product repair.
 The Iteration 135 negative guard puts one 200 Mbps low-latency Service beside
 four 50 Mbps, 420 ms, 10%-loss optional paths. Multipath stays at 182.247 Mbps
 versus 182.777 Mbps single, with 0.251/0.247 second maximum gaps, while every

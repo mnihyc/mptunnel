@@ -214,9 +214,11 @@ impl ResponseStreamBinding {
             return false;
         };
         let probe = super::QuicCapacityProbeCommand {
-            binding_instance_id: self.binding_instance_id,
+            owner: super::QuicCapacityProbeOwner::Response {
+                binding_instance_id: self.binding_instance_id,
+                path_instance_id: request.target_path_instance_id,
+            },
             path_id: request.target.path_id,
-            path_instance_id: request.target_path_instance_id,
             calibration_id,
             train_payload_bytes: request.train_bytes as u64,
             sample_floor_bytes: request.sample_floor_bytes,

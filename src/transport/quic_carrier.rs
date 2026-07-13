@@ -232,19 +232,16 @@ struct CapacityProbeEpoch {
     started_at: Instant,
     write_started_at: Option<Instant>,
     receiver_confirmed: bool,
-    batch_measurement_acked_carrier_bytes: u64,
-    batch_measurement_ack_sample_count: u64,
-    batch_earliest_sent: Option<Instant>,
-    batch_latest_sent: Option<Instant>,
-    last_ack: Option<Instant>,
-    sent_high_watermark: Option<Instant>,
+    measurement_start_sent: Option<Instant>,
+    measurement_latest_sent: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct CapacityAckQuarantine {
     token: u64,
     sent_at_or_after: Instant,
-    sent_before: Instant,
+    probe_sent_before: Instant,
+    expires_at: Instant,
 }
 
 struct OrdinaryWriteGuard {
@@ -436,7 +433,7 @@ impl QuicCarrierTelemetry {
             .expect("QUIC capacity ACK quarantine lock");
         if current
             .as_ref()
-            .is_some_and(|quarantine| now < quarantine.sent_before)
+            .is_some_and(|quarantine| now < quarantine.expires_at)
         {
             return true;
         }
@@ -453,7 +450,7 @@ impl QuicCarrierTelemetry {
         receipt_at: Instant,
         proof_validity: Duration,
     ) -> bool {
-        let Some(sent_before) = receipt_at.checked_add(proof_validity) else {
+        let Some(expires_at) = receipt_at.checked_add(proof_validity) else {
             return false;
         };
         let mut current = self
@@ -461,14 +458,15 @@ impl QuicCarrierTelemetry {
             .lock()
             .expect("QUIC capacity ACK quarantine lock");
         if current.as_ref().is_some_and(|quarantine| {
-            quarantine.token != token && receipt_at < quarantine.sent_before
+            quarantine.token != token && receipt_at < quarantine.expires_at
         }) {
             return false;
         }
         *current = Some(CapacityAckQuarantine {
             token,
             sent_at_or_after,
-            sent_before,
+            probe_sent_before: receipt_at,
+            expires_at,
         });
         self.capacity_ack_quarantine_active
             .store(true, Ordering::Release);
@@ -488,13 +486,13 @@ impl QuicCarrierTelemetry {
                 .store(false, Ordering::Release);
             return false;
         };
-        if now >= quarantine.sent_before {
+        if now >= quarantine.expires_at {
             current.take();
             self.capacity_ack_quarantine_active
                 .store(false, Ordering::Release);
             return false;
         }
-        sent >= quarantine.sent_at_or_after && sent < quarantine.sent_before
+        sent >= quarantine.sent_at_or_after && sent < quarantine.probe_sent_before
     }
 
     fn capacity_probe_metrics(spec: CapacityProbeSpec) -> CapacityProbeMetrics {
@@ -686,12 +684,8 @@ impl QuicCarrierTelemetry {
             started_at: Instant::now(),
             write_started_at: None,
             receiver_confirmed: false,
-            batch_measurement_acked_carrier_bytes: 0,
-            batch_measurement_ack_sample_count: 0,
-            batch_earliest_sent: None,
-            batch_latest_sent: None,
-            last_ack: None,
-            sent_high_watermark: None,
+            measurement_start_sent: None,
+            measurement_latest_sent: None,
         });
         Ok(())
     }
@@ -852,6 +846,9 @@ impl QuicCarrierTelemetry {
                 .saturating_add(warmup_bytes);
             probe.metrics.warmup_ack_sample_count =
                 probe.metrics.warmup_ack_sample_count.saturating_add(1);
+            if probe.metrics.warmup_acked_carrier_bytes >= probe.metrics.warmup_carrier_bytes {
+                probe.measurement_start_sent = Some(sent);
+            }
         }
         let measurement_bytes = accepted_bytes.saturating_sub(warmup_bytes);
         if measurement_bytes > 0 {
@@ -861,22 +858,17 @@ impl QuicCarrierTelemetry {
                 .saturating_add(measurement_bytes);
             probe.metrics.measurement_ack_sample_count =
                 probe.metrics.measurement_ack_sample_count.saturating_add(1);
-            probe.batch_measurement_acked_carrier_bytes = probe
-                .batch_measurement_acked_carrier_bytes
-                .saturating_add(measurement_bytes);
-            probe.batch_measurement_ack_sample_count =
-                probe.batch_measurement_ack_sample_count.saturating_add(1);
+            probe.measurement_start_sent = Some(
+                probe
+                    .measurement_start_sent
+                    .map_or(sent, |start| start.min(sent)),
+            );
+            probe.measurement_latest_sent = Some(
+                probe
+                    .measurement_latest_sent
+                    .map_or(sent, |latest| latest.max(sent)),
+            );
         }
-        probe.batch_earliest_sent = Some(
-            probe
-                .batch_earliest_sent
-                .map_or(sent, |earliest| earliest.min(sent)),
-        );
-        probe.batch_latest_sent = Some(
-            probe
-                .batch_latest_sent
-                .map_or(sent, |latest| latest.max(sent)),
-        );
         true
     }
 
@@ -905,58 +897,22 @@ impl QuicCarrierTelemetry {
         probe.metrics.last_authoritative_in_flight_at = Some(now);
         probe.metrics.last_authoritative_sent_watermark =
             Some(self.sent_bytes.load(Ordering::Acquire));
-        let batch_sent_range = probe.batch_earliest_sent.zip(probe.batch_latest_sent);
-        let elapsed = batch_sent_range.and_then(|(earliest_sent, latest_sent)| {
-            let within_batch_send_elapsed = latest_sent.saturating_duration_since(earliest_sent);
-            let elapsed = match (probe.last_ack, probe.sent_high_watermark) {
-                (Some(previous_ack), Some(sent_high_watermark)) => now
-                    .saturating_duration_since(previous_ack)
-                    .max(latest_sent.saturating_duration_since(sent_high_watermark))
-                    .max(within_batch_send_elapsed),
-                _ => within_batch_send_elapsed,
-            };
-            (!elapsed.is_zero()).then_some(elapsed)
-        });
-        if probe.batch_measurement_acked_carrier_bytes > 0
-            && let Some(elapsed) = elapsed
+        if let Some(elapsed) = probe
+            .measurement_start_sent
+            .zip(probe.measurement_latest_sent)
+            .map(|(start, latest)| latest.saturating_duration_since(start))
+            .filter(|elapsed| !elapsed.is_zero())
         {
-            let timed_bytes = probe.batch_measurement_acked_carrier_bytes.min(
-                probe
-                    .metrics
-                    .required_timed_carrier_bytes
-                    .saturating_sub(probe.metrics.timed_measurement_acked_carrier_bytes),
-            );
-            probe.metrics.timed_measurement_acked_carrier_bytes = probe
-                .metrics
-                .timed_measurement_acked_carrier_bytes
-                .saturating_add(timed_bytes);
-            if timed_bytes > 0 {
-                probe.metrics.timed_measurement_ack_sample_count = probe
-                    .metrics
-                    .timed_measurement_ack_sample_count
-                    .saturating_add(probe.batch_measurement_ack_sample_count);
-                probe.metrics.timed_measurement_ack_elapsed = Some(
-                    probe
-                        .metrics
-                        .timed_measurement_ack_elapsed
-                        .unwrap_or_default()
-                        .saturating_add(elapsed),
-                );
-            }
-        }
-        probe.batch_measurement_acked_carrier_bytes = 0;
-        probe.batch_measurement_ack_sample_count = 0;
-        probe.batch_earliest_sent = None;
-        probe.batch_latest_sent = None;
-        if let Some((_, latest_sent)) = batch_sent_range {
-            probe.last_ack = Some(now);
-            probe.sent_high_watermark = Some(
-                probe
-                    .sent_high_watermark
-                    .map_or(latest_sent, |high_watermark| {
-                        high_watermark.max(latest_sent)
-                    }),
-            );
+            // The epoch retains bytes from zero-span callback batches. A later
+            // paced timestamp makes the whole bounded window measurable once,
+            // instead of randomly discarding part of the train per callback.
+            // The numerator covers the same full measurement span as the
+            // denominator; the required byte count is only the proof floor.
+            probe.metrics.timed_measurement_acked_carrier_bytes =
+                probe.metrics.measurement_acked_carrier_bytes;
+            probe.metrics.timed_measurement_ack_sample_count =
+                probe.metrics.measurement_ack_sample_count;
+            probe.metrics.timed_measurement_ack_elapsed = Some(elapsed);
         }
 
         if probe.metrics.native_proved_at.is_none()
@@ -1858,7 +1814,11 @@ pub async fn write_capacity_receipt(
     if token == 0 || received_payload_bytes == 0 {
         return Err(QuicCarrierError::InvalidCapacityProbe);
     }
-    let _ordinary_write = send.telemetry.enter_ordinary_writer().await;
+    // A receipt is part of the peer's typed capacity transaction, not an
+    // ordinary/product write. It must remain writable while this endpoint has
+    // its own simultaneous probe active, or two directions can deadlock while
+    // each waits for the other's receipt. Receipt bytes are never delivery
+    // evidence and are covered by the probe accounting slack.
     if send
         .telemetry
         .capacity_fail_close_requested
@@ -2663,7 +2623,10 @@ mod tests {
         controller.finish_ack_telemetry(base + Duration::from_millis(110), 0, false);
         telemetry.finish_capacity_ack_batch(base + Duration::from_millis(110), 0);
         let timed = telemetry.snapshot().capacity_probe.expect("timed probe");
-        assert_eq!(timed.timed_measurement_acked_carrier_bytes, 100);
+        assert_eq!(
+            timed.timed_measurement_acked_carrier_bytes,
+            timed.measurement_acked_carrier_bytes
+        );
         assert_eq!(
             timed.timed_measurement_ack_elapsed,
             Some(Duration::from_millis(10))
@@ -2683,6 +2646,42 @@ mod tests {
                 .phase,
             CapacityProbePhase::Proven
         );
+    }
+
+    #[tokio::test]
+    async fn quic_capacity_probe_measurement_epoch_retains_zero_span_batches() {
+        let base = Instant::now();
+        let (_controller, telemetry) = test_instrumented_controller(base);
+        let spec = CapacityProbeSpec {
+            train_payload_bytes: 400,
+            sample_floor_bytes: 300,
+            warmup_carrier_bytes: 100,
+            required_timed_carrier_bytes: 250,
+            ..test_capacity_probe_spec(base)
+        };
+        install_test_capacity_probe(&telemetry, spec).await;
+
+        for (ack_ms, sent_ms) in [(100, 1), (110, 11), (120, 11), (130, 21)] {
+            assert!(telemetry.accumulate_capacity_ack(
+                base + Duration::from_millis(ack_ms),
+                base + Duration::from_millis(sent_ms),
+                100,
+                true,
+            ));
+            telemetry.finish_capacity_ack_batch(base + Duration::from_millis(ack_ms), 0);
+        }
+
+        let probe = telemetry.snapshot().capacity_probe.expect("capacity epoch");
+        assert_eq!(probe.measurement_acked_carrier_bytes, 300);
+        assert_eq!(
+            probe.timed_measurement_acked_carrier_bytes,
+            probe.measurement_acked_carrier_bytes
+        );
+        assert_eq!(
+            probe.timed_measurement_ack_elapsed,
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(probe.phase, CapacityProbePhase::ProvenDraining);
     }
 
     #[tokio::test]
@@ -2921,6 +2920,17 @@ mod tests {
         let quarantined = telemetry.snapshot();
         assert_eq!(quarantined.newly_acked_bytes, None);
         assert_eq!(quarantined.non_app_limited_acked_bytes, None);
+
+        controller.route_ack_telemetry(
+            receipt_at + Duration::from_millis(2),
+            receipt_at + Duration::from_millis(1),
+            88,
+            false,
+        );
+        controller.finish_ack_telemetry(receipt_at + Duration::from_millis(2), 0, false);
+        let immediate_product = telemetry.snapshot();
+        assert_eq!(immediate_product.newly_acked_bytes, Some(88));
+        assert_eq!(immediate_product.non_app_limited_acked_bytes, Some(88));
 
         let quarantine_end = receipt_at + spec.proof_validity;
         controller.route_ack_telemetry(

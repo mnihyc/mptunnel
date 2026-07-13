@@ -243,6 +243,20 @@ impl ReliablePathStreamHandle {
         self.output.enqueue_stream_ordered_path_proof(lane)
     }
 
+    pub(super) fn try_enqueue_request_quic_capacity_probe(
+        &self,
+        probe: QuicCapacityProbeCommand,
+    ) -> Result<(), RuntimeError> {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => {
+                fixed.commands().try_enqueue_quic_capacity_probe(probe)
+            }
+            ReliablePathStreamOutput::Switchable(_) => Err(RuntimeError::Protocol(
+                "request QUIC capacity probe requires a fixed client output",
+            )),
+        }
+    }
+
     pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         self.output.can_enqueue_frame_now(frame, lane)
     }

@@ -248,11 +248,16 @@ the carrier estimate may be app-limited. Neither authority is carrier capacity
 proof, and same-path latency pressure still prevents graduation. Optional
 Subflows, capacity ranking, and handoff require strict non-app-limited carrier
 proof. A request-side QUIC Validation attachment additionally requires its exact
-fresh path proof and a native packet-ACK sample produced after attachment. An
-idle one-flow candidate therefore does not bootstrap from product data; a
-concurrent flow may establish reusable carrier evidence. TCP and QUIC keep
-separate recovery, pacing, and flow-control loops below this unified product
-policy.
+fresh path proof. Sustained one-flow bulk demand may run one serialized,
+session-bounded carrier-only capacity train; the exact relay instance must then
+ACK the fixed post-proof product floor from bytes sent after acceptance and
+before expiry. The train's QUIC ACKs own rate and pacing, while product ACKs own
+only durable ordered admission. Probe packets are quarantined from ordinary
+capacity evidence by their send time through the peer receipt boundary;
+ordinary packets sent afterward are eligible immediately. A completed
+handoff's numeric rate prior expires independently of its durable ordered-use
+state so later native evidence can correct it. TCP and QUIC keep separate
+recovery, pacing, and flow-control loops below this unified product policy.
 
 For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
 `max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together

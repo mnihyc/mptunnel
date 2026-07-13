@@ -391,8 +391,9 @@ instance, grows only from exact unambiguous same-family `OwnerData` ACK turnover
 within that Service PTO, and resets on an exact ordered-Service handoff. This
 product window never supplies carrier rate, pacing, or congestion authority.
 The bounded request Validation startup, ordered receipt, and follow-on
-ACK-clock calibration described below are TCP-only; QUIC request Subflows
-require fresh post-attachment, non-app-limited native packet-ACK evidence.
+ACK-clock calibration described below are TCP-only. QUIC request Subflows use a
+separate carrier-only capacity train and an exact post-proof product-ACK
+handoff; product ACK timing never becomes QUIC capacity evidence.
 Fresh TCP request startup and fresh zero-spend calibration also require at least
 two active logical bulk request flows whose exact committed Service is TCP.
 Demand is request-direction-specific and must include present queued or
@@ -449,10 +450,17 @@ pipe-sized probe. A configured candidate retains its own capacity hint.
 That prior is scheduling credit, not candidate capacity evidence. The
 candidate's own continuous exact product-ACK model replaces it after ten exact
 candidate samples. A QUIC request path receives no product startup sample,
-ordered receipt calibration, or TCP product-ACK proof; optional ownership
-requires exact fresh post-attachment non-app-limited native packet-ACK evidence
-and native emission credit. Bulk lower-frontier owners remain bounded by an
-adaptive approximately `2 * BDP` reorder envelope, while latency pressure keeps
+ordered receipt calibration, or TCP product-ACK rate proof. Instead, one
+session-serialized, non-refilling `PATH_CAPACITY_*` train measures the exact
+Validation carrier without product offsets. A fenced native tail or exact
+receipt lower bound grants bounded approximately `2 * BDP` product authority.
+The same stream-local relay instance must then ACK one fixed post-proof product
+floor before expiry; only bytes sent after proof acceptance qualify, and those
+ACK bytes confirm ordered ownership without estimating QUIC rate. Completed
+ordered ownership is durable, but its numeric carrier prior is fresh for only
+one proof-validity horizon after completion; newer native evidence may then
+correct it without waiting for another full product window. Expiry or
+data-plane replacement removes an incomplete handoff. Latency pressure keeps
 the smaller preemptible Service horizon.
 
 Response-side discovery has a separate directional gate: one active sustained

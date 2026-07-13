@@ -107,6 +107,20 @@ impl Drop for QueuedReliablePathCommand {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuicCapacityProbeOwner {
+    /// Client request discovery is scoped to the exact logical attachment.
+    Request {
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+    },
+    /// Server response discovery is scoped to the response binding instance.
+    Response {
+        binding_instance_id: u64,
+        path_instance_id: ServerCarrierPathInstanceId,
+    },
+}
+
 impl ReliablePathCommandQueueMetrics {
     fn add_pending_bytes(&self, bytes: usize) {
         self.pending_bytes
@@ -953,12 +967,11 @@ impl QuicCapacityProbeCommandTicket {
 
 #[derive(Debug)]
 pub(super) struct QuicCapacityProbeCommand {
-    // The command channel is binding-local; retain the ID for cross-layer lab
-    // correlation without making the carrier reach into response ownership.
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(super) binding_instance_id: u64,
+    // The command channel is attachment-local. This identity is only a stale
+    // ownership fence and lab correlation key; QUIC never interprets product
+    // stream or response-binding semantics.
+    pub(super) owner: QuicCapacityProbeOwner,
     pub(super) path_id: PathId,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
     pub(super) calibration_id: u64,
     pub(super) train_payload_bytes: u64,
     pub(super) sample_floor_bytes: u64,

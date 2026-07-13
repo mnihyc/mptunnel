@@ -18,7 +18,7 @@ use super::udp_metrics::UdpPathMetrics;
 use super::udp_path::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 // RFC 9002's recommended QUIC initial congestion window is based on ten max
@@ -308,6 +308,9 @@ pub struct ClientPathContext {
     // TCP exploration is amortized by distinct TCP-Service request flows, not
     // by path attachments or QUIC traffic in the same product session.
     active_tcp_service_request_bulk_flows: Arc<AtomicU32>,
+    // Request-side QUIC capacity discovery is one carrier-only epoch per MPP
+    // session. It is deliberately independent of TCP and product ACK clocks.
+    request_quic_capacity_probe: Arc<RequestQuicCapacityProbeSession>,
     // Path-model ownership: health records are evidence snapshots consumed by
     // schedulers; they must not own product bytes or carrier queues.
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
@@ -315,6 +318,72 @@ pub struct ClientPathContext {
     pub(super) mux_limits: MuxLimits,
     #[cfg(test)]
     pub(super) proxy_auth: ProxyAuthConfig,
+}
+
+#[derive(Debug, Default)]
+struct RequestQuicCapacityProbeSession {
+    active_token: AtomicU64,
+    spent_bytes: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(super) struct RequestQuicCapacityProbeLease {
+    session: Arc<RequestQuicCapacityProbeSession>,
+    health: Arc<Mutex<ClientPathHealth>>,
+    path_index: usize,
+    token: u64,
+    bytes: u64,
+    committed: bool,
+}
+
+impl RequestQuicCapacityProbeLease {
+    pub(super) fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RequestQuicCapacityProbeLease {
+    fn drop(&mut self) {
+        if let Some(record) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(self.path_index)
+        {
+            if record
+                .request_quic_capacity_probe
+                .as_ref()
+                .is_some_and(|reservation| reservation.token == self.token)
+                && let Some(reservation) = record.request_quic_capacity_probe.take()
+            {
+                reservation.ticket.cancel();
+            }
+            if record
+                .request_quic_capacity_product_handoff
+                .is_some_and(|handoff| handoff.token == self.token && !handoff.complete)
+            {
+                record.request_quic_capacity_product_handoff = None;
+                if record
+                    .quic_capacity_proof
+                    .is_some_and(|proof| proof.candidate.token == self.token)
+                {
+                    record.quic_capacity_proof = None;
+                }
+            }
+        }
+        if !self.committed {
+            self.session
+                .spent_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+        let _ = self.session.active_token.compare_exchange(
+            self.token,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 /// Cancellation-safe ownership of one logical flow's shared path load.
@@ -440,12 +509,93 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) carrier_last_delivery_at: Option<Instant>,
     pub(super) carrier_app_limited: bool,
     pub(super) carrier_ack_derived_data_seen: bool,
+    request_quic_capacity_probe: Option<RequestQuicCapacityProbeReservation>,
+    quic_capacity_proof: Option<RequestQuicCapacityProof>,
+    request_quic_capacity_product_handoff: Option<RequestQuicCapacityProductHandoff>,
     pub(super) path_proof_success: bool,
     path_proof_generation: u64,
     path_proof_valid_after: Instant,
     successful_path_proofs: HashMap<u64, SuccessfulPathProof>,
     successful_path_proof_order: VecDeque<u64>,
     successful_path_proof_limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RequestQuicCapacityProbeReservation {
+    stream_id: StreamId,
+    path_instance: RelayPathInstance,
+    token: u64,
+    valid_after: Instant,
+    expires_at: Instant,
+    publication_expires_at: Instant,
+    train_bytes: u64,
+    ticket: QuicCapacityProbeCommandTicket,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestQuicCapacityProof {
+    candidate: QuicCapacityProofCandidate,
+    rate_bps: u64,
+    rate_sample_bytes: u64,
+}
+
+/// Bridges one exact QUIC carrier proof into ordinary stream-ACK ownership.
+/// Carrier bytes size the path; only post-proof product ACKs make it durable.
+#[derive(Debug, Clone, Copy)]
+struct RequestQuicCapacityProductHandoff {
+    stream_id: StreamId,
+    path_instance: RelayPathInstance,
+    token: u64,
+    acked_product_bytes: u64,
+    required_product_sample_bytes: u64,
+    rate_bps: u64,
+    rate_sample_bytes: u64,
+    accepted_at: Instant,
+    expires_at: Instant,
+    complete: bool,
+    rate_prior_expires_at: Option<Instant>,
+}
+
+impl RequestQuicCapacityProductHandoff {
+    fn record_product_ack(
+        &mut self,
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+        bytes: usize,
+        sent_at: Instant,
+        acked_at: Instant,
+    ) {
+        if stream_id != self.stream_id
+            || path_instance != self.path_instance
+            || self.complete
+            || sent_at < self.accepted_at
+            || acked_at >= self.expires_at
+        {
+            return;
+        }
+        self.acked_product_bytes = self.acked_product_bytes.saturating_add(bytes as u64);
+        if self.acked_product_bytes >= self.required_product_sample_bytes {
+            self.complete = true;
+            let proof_validity = self.expires_at.saturating_duration_since(self.accepted_at);
+            self.rate_prior_expires_at = acked_at
+                .checked_add(proof_validity)
+                .or(Some(self.expires_at));
+        }
+    }
+
+    fn rate_prior_fresh(&self, now: Instant) -> bool {
+        self.complete
+            && self
+                .rate_prior_expires_at
+                .is_some_and(|expires_at| now < expires_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestQuicCapacityProductHandoffState {
+    Absent,
+    Pending,
+    Complete,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -487,6 +637,9 @@ impl Default for ClientPathHealthRecord {
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
+            request_quic_capacity_probe: None,
+            quic_capacity_proof: None,
+            request_quic_capacity_product_handoff: None,
             path_proof_success: false,
             path_proof_generation: 0,
             path_proof_valid_after: Instant::now(),
@@ -503,6 +656,405 @@ impl ClientPathHealthRecord {
             successful_path_proof_limit: limit.max(1),
             ..Self::default()
         }
+    }
+
+    pub(super) fn accept_request_quic_capacity_proof(
+        &mut self,
+        candidate: QuicCapacityProofCandidate,
+        probe: quic_carrier::CapacityProbeMetrics,
+        now: Instant,
+    ) -> Option<(u64, u64, bool)> {
+        let reservation = self.request_quic_capacity_probe.as_ref()?;
+        if candidate.token != reservation.token
+            || probe.token != candidate.token
+            || candidate.train_bytes != reservation.train_bytes
+            || candidate.accepted_at < reservation.valid_after
+            || candidate.accepted_at >= reservation.expires_at
+            || now >= candidate.expires_at
+        {
+            return None;
+        }
+        let reservation = self.request_quic_capacity_probe.take()?;
+        // Publish the command transaction before exposing its proof. A
+        // concurrent sender cancellation must leave neither state visible.
+        if !reservation.ticket.publish() {
+            return None;
+        }
+        let native_rate = probe
+            .timed_measurement_ack_elapsed
+            .filter(|elapsed| !elapsed.is_zero())
+            .filter(|_| {
+                probe.timed_measurement_acked_carrier_bytes >= probe.required_timed_carrier_bytes
+            })
+            .map(|elapsed| {
+                (probe.timed_measurement_acked_carrier_bytes as f64 * 8.0 / elapsed.as_secs_f64())
+                    .round()
+                    .max(1.0) as u64
+            });
+        let native_tail_rate = native_rate.is_some();
+        let rate_bps = native_rate
+            .unwrap_or(candidate.rate_bps)
+            .max(candidate.rate_bps);
+        let rate_sample_bytes = native_rate
+            .map(|_| probe.timed_measurement_acked_carrier_bytes)
+            .unwrap_or(candidate.train_bytes);
+        self.quic_capacity_proof = Some(RequestQuicCapacityProof {
+            candidate,
+            rate_bps,
+            rate_sample_bytes,
+        });
+        self.request_quic_capacity_product_handoff = Some(RequestQuicCapacityProductHandoff {
+            stream_id: reservation.stream_id,
+            path_instance: reservation.path_instance,
+            token: candidate.token,
+            acked_product_bytes: 0,
+            required_product_sample_bytes: candidate.required_proof_bytes,
+            rate_bps,
+            rate_sample_bytes,
+            accepted_at: candidate.accepted_at,
+            expires_at: candidate.expires_at,
+            complete: false,
+            rate_prior_expires_at: None,
+        });
+        Some((rate_bps, rate_sample_bytes, native_tail_rate))
+    }
+
+    fn record_request_quic_capacity_product_ack(
+        &mut self,
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+        bytes: usize,
+        sent_at: Instant,
+        acked_at: Instant,
+    ) -> Option<u64> {
+        if let Some(handoff) = self.request_quic_capacity_product_handoff.as_mut() {
+            handoff.record_product_ack(stream_id, path_instance, bytes, sent_at, acked_at);
+            return handoff.complete.then_some(handoff.token);
+        }
+        None
+    }
+
+    fn has_durable_native_carrier_window(&self) -> bool {
+        self.carrier_delivery_rate_bps.is_some()
+            && self.carrier_ack_derived_data_seen
+            && self.carrier_delivery_samples > 0
+            && !self.carrier_app_limited
+            && self.carrier_delivery_sample_bytes
+                >= self
+                    .carrier_inflight_limit_bytes
+                    .max(BBR_MAX_SEND_QUANTUM_BYTES as u64)
+                    .max(PATH_OPEN_SCORE_BYTES as u64)
+    }
+
+    fn request_quic_capacity_product_handoff_state(
+        &self,
+        token: u64,
+    ) -> RequestQuicCapacityProductHandoffState {
+        match self.request_quic_capacity_product_handoff {
+            Some(handoff) if handoff.token == token && handoff.complete => {
+                RequestQuicCapacityProductHandoffState::Complete
+            }
+            Some(handoff) if handoff.token == token => {
+                RequestQuicCapacityProductHandoffState::Pending
+            }
+            _ => RequestQuicCapacityProductHandoffState::Absent,
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_quic_capacity_product_handoff_tests {
+    use super::*;
+
+    fn proof_candidate(
+        token: u64,
+        accepted_at: Instant,
+        expires_at: Instant,
+        required_proof_bytes: u64,
+    ) -> QuicCapacityProofCandidate {
+        QuicCapacityProofCandidate {
+            token,
+            train_bytes: 16 * 1024 * 1024,
+            sample_floor_bytes: required_proof_bytes + PATH_OPEN_SCORE_BYTES as u64,
+            accounting_slack_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            warmup_bytes: 15 * 1024 * 1024,
+            required_proof_bytes,
+            written_bytes: 16 * 1024 * 1024,
+            written_data_frame_count: 16,
+            receipt_confirmed: true,
+            received_bytes: 16 * 1024 * 1024,
+            proof_elapsed: Duration::from_millis(900),
+            rate_bps: 117_000_000,
+            accepted_at,
+            expires_at,
+            proof_validity: expires_at.saturating_duration_since(accepted_at),
+        }
+    }
+
+    fn install_handoff(
+        record: &mut ClientPathHealthRecord,
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+        token: u64,
+        accepted_at: Instant,
+        expires_at: Instant,
+        required_product_sample_bytes: u64,
+    ) {
+        let candidate = proof_candidate(
+            token,
+            accepted_at,
+            expires_at,
+            required_product_sample_bytes,
+        );
+        record.quic_capacity_proof = Some(RequestQuicCapacityProof {
+            candidate,
+            rate_bps: 117_000_000,
+            rate_sample_bytes: required_product_sample_bytes,
+        });
+        record.request_quic_capacity_product_handoff = Some(RequestQuicCapacityProductHandoff {
+            stream_id,
+            path_instance,
+            token,
+            acked_product_bytes: 0,
+            required_product_sample_bytes,
+            rate_bps: 117_000_000,
+            rate_sample_bytes: required_product_sample_bytes,
+            accepted_at,
+            expires_at,
+            complete: false,
+            rate_prior_expires_at: None,
+        });
+    }
+
+    fn udp_path_instance(index: usize, id: u64) -> RelayPathInstance {
+        RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index,
+            },
+            id,
+        }
+    }
+
+    #[test]
+    fn exact_post_proof_product_floor_survives_carrier_proof_expiry() {
+        let accepted_at = Instant::now();
+        let expires_at = accepted_at + Duration::from_secs(2);
+        let required = 247_544;
+        let final_fragment = MIN_RATE_SAMPLE_BYTES;
+        let stream_id = StreamId(71);
+        let path_instance = udp_path_instance(2, 17);
+        let mut record = ClientPathHealthRecord::default();
+        install_handoff(
+            &mut record,
+            stream_id,
+            path_instance,
+            41,
+            accepted_at,
+            expires_at,
+            required,
+        );
+
+        let before_expiry = expires_at - Duration::from_nanos(1);
+        record.record_request_quic_capacity_product_ack(
+            StreamId(72),
+            path_instance,
+            required as usize,
+            accepted_at,
+            before_expiry,
+        );
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            udp_path_instance(2, 18),
+            required as usize,
+            accepted_at,
+            before_expiry,
+        );
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            required as usize,
+            accepted_at - Duration::from_nanos(1),
+            before_expiry,
+        );
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            (required - final_fragment) as usize,
+            accepted_at,
+            before_expiry,
+        );
+        assert_eq!(
+            record.request_quic_capacity_product_handoff_state(41),
+            RequestQuicCapacityProductHandoffState::Pending
+        );
+
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            final_fragment as usize,
+            accepted_at,
+            before_expiry,
+        );
+        assert_eq!(
+            record.request_quic_capacity_product_handoff_state(41),
+            RequestQuicCapacityProductHandoffState::Complete
+        );
+
+        let observation = record.observe(expires_at);
+        assert!(!observation.explicit_carrier_capacity_proof);
+        assert!(observation.quic_capacity_product_handoff_complete);
+        assert!(observation.product_delivery_rate_bps.is_none());
+        assert_eq!(observation.carrier_delivery_rate_bps, Some(117_000_000.0));
+        assert_eq!(
+            record.request_quic_capacity_product_handoff_state(41),
+            RequestQuicCapacityProductHandoffState::Complete
+        );
+
+        record.mark_data_plane_failure(Instant::now(), false);
+        assert_eq!(
+            record.request_quic_capacity_product_handoff_state(41),
+            RequestQuicCapacityProductHandoffState::Absent
+        );
+    }
+
+    #[test]
+    fn incomplete_product_handoff_expires_with_its_carrier_proof() {
+        let accepted_at = Instant::now();
+        let expires_at = accepted_at + Duration::from_secs(2);
+        let required = 247_544;
+        let stream_id = StreamId(72);
+        let path_instance = udp_path_instance(3, 19);
+        let mut record = ClientPathHealthRecord::default();
+        install_handoff(
+            &mut record,
+            stream_id,
+            path_instance,
+            42,
+            accepted_at,
+            expires_at,
+            required,
+        );
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            (required - 1) as usize,
+            accepted_at,
+            expires_at - Duration::from_nanos(1),
+        );
+        // Expiry is an exclusive fence even when the final ACK races observation.
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            1,
+            accepted_at,
+            expires_at,
+        );
+        assert_eq!(
+            record.request_quic_capacity_product_handoff_state(42),
+            RequestQuicCapacityProductHandoffState::Pending
+        );
+
+        let observation = record.observe(expires_at);
+        assert!(!observation.explicit_carrier_capacity_proof);
+        assert!(!observation.quic_capacity_product_handoff_complete);
+        assert_eq!(
+            record.request_quic_capacity_product_handoff_state(42),
+            RequestQuicCapacityProductHandoffState::Absent
+        );
+    }
+
+    #[test]
+    fn completed_handoff_yields_at_the_durable_native_window_floor() {
+        let accepted_at = Instant::now();
+        let expires_at = accepted_at + Duration::from_secs(2);
+        let required = 247_544;
+        let stream_id = StreamId(73);
+        let path_instance = udp_path_instance(4, 20);
+        let mut record = ClientPathHealthRecord::default();
+        install_handoff(
+            &mut record,
+            stream_id,
+            path_instance,
+            43,
+            accepted_at,
+            expires_at,
+            required,
+        );
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            required as usize,
+            accepted_at,
+            expires_at - Duration::from_nanos(1),
+        );
+
+        let native_window = 4 * 1024 * 1024;
+        let native_rate_bps = 400_000_000.0;
+        record.carrier_delivery_rate_bps = Some(native_rate_bps);
+        record.carrier_delivery_samples = 1;
+        record.carrier_ack_derived_data_seen = true;
+        record.carrier_app_limited = false;
+        record.carrier_inflight_limit_bytes = native_window;
+        record.carrier_delivery_sample_bytes = native_window - 1;
+
+        let below_floor = record.observe(expires_at);
+        assert!(below_floor.quic_capacity_product_handoff_complete);
+        assert_eq!(below_floor.carrier_delivery_rate_bps, Some(117_000_000.0));
+
+        record.carrier_delivery_sample_bytes = native_window;
+        let at_floor = record.observe(expires_at);
+        assert!(at_floor.quic_capacity_product_handoff_complete);
+        assert_eq!(at_floor.carrier_delivery_rate_bps, Some(native_rate_bps));
+    }
+
+    #[test]
+    fn completed_handoff_rate_prior_expires_without_erasing_product_progress() {
+        let accepted_at = Instant::now();
+        let expires_at = accepted_at + Duration::from_secs(2);
+        let completed_at = accepted_at + Duration::from_secs(1);
+        let required = 247_544;
+        let stream_id = StreamId(74);
+        let path_instance = udp_path_instance(5, 21);
+        let mut record = ClientPathHealthRecord::default();
+        install_handoff(
+            &mut record,
+            stream_id,
+            path_instance,
+            44,
+            accepted_at,
+            expires_at,
+            required,
+        );
+        record.record_request_quic_capacity_product_ack(
+            stream_id,
+            path_instance,
+            required as usize,
+            accepted_at,
+            completed_at,
+        );
+        let native_window = 4 * 1024 * 1024;
+        let corrected_native_rate = 50_000_000.0;
+        record.carrier_delivery_rate_bps = Some(corrected_native_rate);
+        record.carrier_delivery_samples = 1;
+        record.carrier_ack_derived_data_seen = true;
+        record.carrier_app_limited = false;
+        record.carrier_inflight_limit_bytes = native_window;
+        record.carrier_delivery_sample_bytes = native_window - 1;
+
+        let proof_expired = record.observe(expires_at);
+        assert!(proof_expired.quic_capacity_product_handoff_complete);
+        assert!(proof_expired.quic_capacity_rate_prior_fresh);
+        assert_eq!(proof_expired.carrier_delivery_rate_bps, Some(117_000_000.0));
+
+        let prior_expires_at = completed_at + Duration::from_secs(2);
+        let prior_expired = record.observe(prior_expires_at);
+        assert!(prior_expired.quic_capacity_product_handoff_complete);
+        assert!(!prior_expired.quic_capacity_rate_prior_fresh);
+        assert_eq!(
+            prior_expired.carrier_delivery_rate_bps,
+            Some(corrected_native_rate)
+        );
     }
 }
 
@@ -535,6 +1087,9 @@ pub(super) struct ClientPathObservation {
     pub(super) carrier_last_delivery_at: Option<Instant>,
     pub(super) carrier_app_limited: bool,
     pub(super) carrier_ack_derived_data_seen: bool,
+    pub(super) explicit_carrier_capacity_proof: bool,
+    pub(super) quic_capacity_product_handoff_complete: bool,
+    pub(super) quic_capacity_rate_prior_fresh: bool,
     pub(super) path_proof_success: bool,
 }
 
@@ -568,6 +1123,9 @@ impl Default for ClientPathObservation {
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
+            explicit_carrier_capacity_proof: false,
+            quic_capacity_product_handoff_complete: false,
+            quic_capacity_rate_prior_fresh: false,
             path_proof_success: false,
         }
     }
@@ -601,6 +1159,28 @@ fn paths_have_sender_delivery_evidence(
 
 impl ClientPathHealthRecord {
     pub(super) fn observe(&mut self, now: Instant) -> ClientPathObservation {
+        if self
+            .request_quic_capacity_probe
+            .as_ref()
+            .is_some_and(|reservation| {
+                !reservation.ticket.is_current() || now >= reservation.publication_expires_at
+            })
+            && let Some(reservation) = self.request_quic_capacity_probe.take()
+        {
+            reservation.ticket.cancel();
+        }
+        if let Some(expired_token) = self
+            .quic_capacity_proof
+            .and_then(|proof| (now >= proof.candidate.expires_at).then_some(proof.candidate.token))
+        {
+            self.quic_capacity_proof = None;
+            if self
+                .request_quic_capacity_product_handoff
+                .is_some_and(|handoff| handoff.token == expired_token && !handoff.complete)
+            {
+                self.request_quic_capacity_product_handoff = None;
+            }
+        }
         if self.manual_disabled {
             return ClientPathObservation {
                 state: SchedulerPathState::Failed,
@@ -630,6 +1210,9 @@ impl ClientPathHealthRecord {
                 carrier_last_delivery_at: self.carrier_last_delivery_at,
                 carrier_app_limited: self.carrier_app_limited,
                 carrier_ack_derived_data_seen: self.carrier_ack_derived_data_seen,
+                explicit_carrier_capacity_proof: false,
+                quic_capacity_product_handoff_complete: false,
+                quic_capacity_rate_prior_fresh: false,
                 path_proof_success: self.path_proof_success,
             };
         }
@@ -639,6 +1222,17 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
+        let proof = self.quic_capacity_proof;
+        let complete_handoff = self
+            .request_quic_capacity_product_handoff
+            .filter(|handoff| handoff.complete);
+        // Once stream ACKs complete the handoff, prefer their product model
+        // until a full native carrier window supplies a replacement estimate.
+        let handoff_capacity_prior = complete_handoff.filter(|handoff| {
+            proof.is_none()
+                && handoff.rate_prior_fresh(now)
+                && !self.has_durable_native_carrier_window()
+        });
         ClientPathObservation {
             state: self.state,
             manual_disabled: false,
@@ -658,15 +1252,37 @@ impl ClientPathHealthRecord {
             relay_queue_bytes: self.relay_queue_bytes,
             carrier_srtt_ms: self.carrier_srtt_ms,
             carrier_rttvar_ms: self.carrier_rttvar_ms,
-            carrier_delivery_rate_bps: self.carrier_delivery_rate_bps,
+            carrier_delivery_rate_bps: proof
+                .map(|proof| proof.rate_bps as f64)
+                .or_else(|| handoff_capacity_prior.map(|handoff| handoff.rate_bps as f64))
+                .or(self.carrier_delivery_rate_bps),
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_queue_bytes: self.carrier_queue_bytes,
             carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
-            carrier_delivery_samples: self.carrier_delivery_samples,
-            carrier_delivery_sample_bytes: self.carrier_delivery_sample_bytes,
-            carrier_last_delivery_at: self.carrier_last_delivery_at,
-            carrier_app_limited: self.carrier_app_limited,
-            carrier_ack_derived_data_seen: self.carrier_ack_derived_data_seen,
+            carrier_delivery_samples: if proof.is_some() || handoff_capacity_prior.is_some() {
+                self.carrier_delivery_samples.max(1)
+            } else {
+                self.carrier_delivery_samples
+            },
+            carrier_delivery_sample_bytes: proof
+                .map(|proof| proof.rate_sample_bytes)
+                .or_else(|| handoff_capacity_prior.map(|handoff| handoff.rate_sample_bytes))
+                .map_or(self.carrier_delivery_sample_bytes, |sample_bytes| {
+                    self.carrier_delivery_sample_bytes.max(sample_bytes)
+                }),
+            carrier_last_delivery_at: proof
+                .map(|proof| proof.candidate.accepted_at)
+                .or_else(|| handoff_capacity_prior.map(|handoff| handoff.accepted_at))
+                .or(self.carrier_last_delivery_at),
+            carrier_app_limited: proof.is_none()
+                && handoff_capacity_prior.is_none()
+                && self.carrier_app_limited,
+            carrier_ack_derived_data_seen: proof.is_some()
+                || handoff_capacity_prior.is_some()
+                || self.carrier_ack_derived_data_seen,
+            explicit_carrier_capacity_proof: proof.is_some(),
+            quic_capacity_product_handoff_complete: complete_handoff.is_some(),
+            quic_capacity_rate_prior_fresh: handoff_capacity_prior.is_some(),
             path_proof_success: self.path_proof_success,
         }
     }
@@ -899,6 +1515,11 @@ impl ClientPathHealthRecord {
         self.carrier_last_delivery_at = None;
         self.carrier_app_limited = true;
         self.carrier_ack_derived_data_seen = false;
+        if let Some(reservation) = self.request_quic_capacity_probe.take() {
+            reservation.ticket.cancel();
+        }
+        self.quic_capacity_proof = None;
+        self.request_quic_capacity_product_handoff = None;
         self.invalidate_path_proofs();
         if has_schedulable_alternative {
             self.state = SchedulerPathState::Failed;
@@ -1047,6 +1668,180 @@ pub(super) fn path_join_replay_cache_capacity(max_streams: usize) -> usize {
 }
 
 impl ClientPathContext {
+    pub(super) fn configured_relay_path_count(&self, underlay: UnderlayProtocol) -> usize {
+        match underlay {
+            UnderlayProtocol::Tcp => self.tcp_paths.len(),
+            UnderlayProtocol::Udp => self.udp_paths.len(),
+        }
+    }
+
+    pub(super) fn request_quic_capacity_probe_remaining_bytes(&self) -> u64 {
+        reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits).saturating_sub(
+            self.request_quic_capacity_probe
+                .spent_bytes
+                .load(Ordering::Acquire),
+        )
+    }
+
+    pub(super) fn try_reserve_request_quic_capacity_probe(
+        &self,
+        stream_id: StreamId,
+        path_index: usize,
+        path_instance: RelayPathInstance,
+        token: u64,
+        train_bytes: u64,
+        valid_after: Instant,
+        expires_at: Instant,
+        proof_validity: Duration,
+        ticket: QuicCapacityProbeCommandTicket,
+    ) -> Option<RequestQuicCapacityProbeLease> {
+        let now = Instant::now();
+        let publication_expires_at = expires_at.checked_add(proof_validity)?;
+        if path_instance.key.underlay != UnderlayProtocol::Udp
+            || path_instance.key.index != path_index
+            || token == 0
+            || train_bytes == 0
+            || proof_validity.is_zero()
+            || expires_at <= now
+        {
+            return None;
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        let active_token = self
+            .request_quic_capacity_probe
+            .active_token
+            .load(Ordering::Acquire);
+        if active_token != 0 {
+            let transaction_live = health.udp.iter_mut().any(|record| {
+                let _ = record.observe(now);
+                if record
+                    .request_quic_capacity_probe
+                    .as_ref()
+                    .is_some_and(|reservation| {
+                        reservation.token == active_token && !reservation.ticket.is_current()
+                    })
+                {
+                    record.request_quic_capacity_probe = None;
+                }
+                record
+                    .request_quic_capacity_probe
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.token == active_token)
+                    || record
+                        .request_quic_capacity_product_handoff
+                        .is_some_and(|handoff| handoff.token == active_token && !handoff.complete)
+            });
+            if !transaction_live {
+                let _ = self
+                    .request_quic_capacity_probe
+                    .active_token
+                    .compare_exchange(active_token, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
+        if self
+            .request_quic_capacity_probe
+            .active_token
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let limit = reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits);
+        if self
+            .request_quic_capacity_probe
+            .spent_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+                spent.checked_add(train_bytes).filter(|next| *next <= limit)
+            })
+            .is_err()
+        {
+            let _ = self
+                .request_quic_capacity_probe
+                .active_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        }
+        let Some(record) = health.udp.get_mut(path_index) else {
+            self.request_quic_capacity_probe
+                .spent_bytes
+                .fetch_sub(train_bytes, Ordering::AcqRel);
+            let _ = self
+                .request_quic_capacity_probe
+                .active_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        };
+        if record.request_quic_capacity_probe.is_some() {
+            self.request_quic_capacity_probe
+                .spent_bytes
+                .fetch_sub(train_bytes, Ordering::AcqRel);
+            let _ = self
+                .request_quic_capacity_probe
+                .active_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        }
+        record.request_quic_capacity_probe = Some(RequestQuicCapacityProbeReservation {
+            stream_id,
+            path_instance,
+            token,
+            valid_after,
+            expires_at,
+            publication_expires_at,
+            train_bytes,
+            ticket,
+        });
+        drop(health);
+        Some(RequestQuicCapacityProbeLease {
+            session: self.request_quic_capacity_probe.clone(),
+            health: self.health.clone(),
+            path_index,
+            token,
+            bytes: train_bytes,
+            committed: false,
+        })
+    }
+
+    pub(super) fn request_quic_capacity_probe_proven(&self, path_index: usize, token: u64) -> bool {
+        let now = Instant::now();
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(path_index)
+            .is_some_and(|record| {
+                let _ = record.observe(now);
+                record.quic_capacity_proof.is_some_and(|proof| {
+                    proof.candidate.token == token && now < proof.candidate.expires_at
+                })
+            })
+    }
+
+    pub(super) fn request_quic_capacity_product_handoff_state(
+        &self,
+        path_index: usize,
+        token: u64,
+    ) -> RequestQuicCapacityProductHandoffState {
+        let now = Instant::now();
+        let state = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .udp
+            .get_mut(path_index)
+            .map_or(RequestQuicCapacityProductHandoffState::Absent, |record| {
+                let _ = record.observe(now);
+                record.request_quic_capacity_product_handoff_state(token)
+            });
+        if state != RequestQuicCapacityProductHandoffState::Pending {
+            let _ = self
+                .request_quic_capacity_probe
+                .active_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+        state
+    }
+
     #[cfg(test)]
     pub fn new(
         paths: Vec<PathSpec>,
@@ -1185,6 +1980,7 @@ impl ClientPathContext {
             udp_sessions: Arc::new(udp_sessions),
             next_reliable_stream_id: Arc::new(Mutex::new(0)),
             active_tcp_service_request_bulk_flows: Arc::new(AtomicU32::new(0)),
+            request_quic_capacity_probe: Arc::new(RequestQuicCapacityProbeSession::default()),
             health,
             codec_limits,
             mux_limits,
@@ -2205,6 +3001,50 @@ impl ClientPathContext {
         };
         if let Some(current) = records.get_mut(index) {
             current.release_relay_inflight(bytes);
+        }
+    }
+
+    pub(super) fn record_relay_path_product_ack(
+        &self,
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+        bytes: usize,
+        sent_at: Instant,
+        acked_at: Instant,
+    ) {
+        if bytes == 0 || path_instance.key.underlay != UnderlayProtocol::Udp {
+            return;
+        }
+        if self
+            .request_quic_capacity_probe
+            .active_token
+            .load(Ordering::Acquire)
+            == 0
+        {
+            // Every QUIC owner ACK reaches this hook. Without an active probe
+            // transaction there is no handoff state, so avoid the health lock.
+            return;
+        }
+        let completed_token = {
+            let mut health = self.health.lock().expect("client path health lock");
+            health
+                .udp
+                .get_mut(path_instance.key.index)
+                .and_then(|current| {
+                    current.record_request_quic_capacity_product_ack(
+                        stream_id,
+                        path_instance,
+                        bytes,
+                        sent_at,
+                        acked_at,
+                    )
+                })
+        };
+        if let Some(token) = completed_token {
+            let _ = self
+                .request_quic_capacity_probe
+                .active_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 

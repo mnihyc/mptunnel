@@ -803,6 +803,10 @@ async fn udp_path_write_capacity_receipt(
     received_payload_bytes: u64,
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
+    // Let QUIC emit the delayed terminal ACK before the application receipt.
+    // Otherwise the receipt may overtake transport telemetry and make identical
+    // probes alternate between native rate and cold-start average.
+    tokio::time::sleep(QUIC_MAX_ACK_DELAY.saturating_add(QUIC_TIMER_GRANULARITY)).await;
     quic_carrier::write_capacity_receipt(
         &mut send.stream,
         path_id,
@@ -903,15 +907,34 @@ fn spawn_client_udp_path_metrics(
 ) {
     tokio::spawn(async move {
         let mut tracker = UdpPathMetricTracker::default();
+        #[cfg(feature = "lab-diagnostics")]
+        let mut last_metrics_poll_at = None;
         loop {
             if connection.is_closed() {
                 return;
             }
-            let Some(metrics) = connection.tx_metrics(&mut tracker, 1).await else {
+            let Some(mut metrics) = connection.tx_metrics(&mut tracker, 1).await else {
                 tokio::time::sleep(default_transport_pto()).await;
                 continue;
             };
-            if let Some(record) = runtime
+            let capacity_candidate = metrics.capacity_proof_candidate;
+            let capacity_probe = metrics.capacity_probe;
+            #[cfg(feature = "lab-diagnostics")]
+            let metrics_poll_at = Instant::now();
+            #[cfg(feature = "lab-diagnostics")]
+            let poll_elapsed = last_metrics_poll_at
+                .replace(metrics_poll_at)
+                .map(|previous| metrics_poll_at.saturating_duration_since(previous))
+                .unwrap_or_default();
+            #[cfg(feature = "lab-diagnostics")]
+            log_quic_ack_poll_diagnostics(
+                runtime.session_id,
+                PathId(runtime.path_index as u16),
+                0,
+                metrics,
+                poll_elapsed,
+            );
+            let published_proof = if let Some(record) = runtime
                 .health
                 .lock()
                 .expect("client QUIC UDP path health lock")
@@ -919,6 +942,41 @@ fn spawn_client_udp_path_metrics(
                 .get_mut(runtime.path_index)
             {
                 record.mark_quic_path_metrics(metrics);
+                capacity_candidate
+                    .zip(capacity_probe)
+                    .and_then(|(candidate, probe)| {
+                        record.accept_request_quic_capacity_proof(candidate, probe, Instant::now())
+                    })
+            } else {
+                None
+            };
+            if let (Some(candidate), Some((_rate_bps, _rate_sample_bytes, _native_tail_rate))) =
+                (capacity_candidate, published_proof)
+            {
+                tracker.quic.accept_capacity_proof(&mut metrics, candidate);
+                let _retired = connection.retire_capacity_probe(candidate.token);
+                tracker.quic.retire_capacity_candidate(candidate.token);
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "request_quic_capacity_proof",
+                    format_args!(
+                        "phase=published session_id={} path_index={} calibration_id={} train_bytes={} receipt_rate_bps={} published_rate_bps={} rate_sample_bytes={} rate_source={} proof_validity_ms={} carrier_retired={}",
+                        runtime.session_id.0,
+                        runtime.path_index,
+                        candidate.token,
+                        candidate.train_bytes,
+                        candidate.rate_bps,
+                        _rate_bps,
+                        _rate_sample_bytes,
+                        if _native_tail_rate {
+                            "native_tail"
+                        } else {
+                            "receipt_lower_bound"
+                        },
+                        candidate.proof_validity.as_millis(),
+                        _retired,
+                    ),
+                );
             }
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
@@ -1199,6 +1257,7 @@ async fn run_client_udp_stream(
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
+    let mut deferred_capacity_frames = std::collections::VecDeque::<Frame>::new();
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
     let mut capacity_receive = CapacityReceiveTracker::new(
@@ -1206,6 +1265,108 @@ async fn run_client_udp_stream(
     );
     let path_id = PathId(path_index as u16);
     loop {
+        if send.connection.capacity_probe_active() {
+            let release_connection = send.connection.clone();
+            tokio::select! {
+                biased;
+                frame = carrier_frames.recv() => {
+                    match frame {
+                        Some(Ok(Frame::PathCapacityReceipt {
+                            path_id: receipt_path_id,
+                            calibration_id,
+                            received_payload_bytes,
+                        })) => {
+                            if receipt_path_id != path_id
+                                || !send.connection.confirm_capacity_probe_receipt(
+                                    calibration_id,
+                                    received_payload_bytes,
+                                    Instant::now(),
+                                )
+                            {
+                                let _ = frames.send(Err(RuntimeError::Protocol(
+                                    "invalid client QUIC capacity receipt",
+                                ))).await;
+                                return;
+                            }
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "request_quic_capacity_receipt",
+                                format_args!(
+                                    "phase=confirmed path_id={} stream_id={} calibration_id={} received_payload_bytes={}",
+                                    path_id.0, stream_id.0, calibration_id, received_payload_bytes,
+                                ),
+                            );
+                        }
+                        Some(Ok(Frame::PathCapacityData {
+                            path_id: capacity_path_id,
+                            calibration_id,
+                            payload,
+                        })) => {
+                            if capacity_path_id != path_id
+                                || capacity_receive
+                                    .record_data(calibration_id, payload.len())
+                                    .is_err()
+                            {
+                                let _ = frames.send(Err(RuntimeError::Protocol(
+                                    "invalid simultaneous client QUIC capacity data",
+                                ))).await;
+                                return;
+                            }
+                        }
+                        Some(Ok(Frame::PathCapacityFinish {
+                            path_id: capacity_path_id,
+                            calibration_id,
+                            payload_bytes,
+                        })) => {
+                            if capacity_path_id != path_id {
+                                let _ = frames.send(Err(RuntimeError::Protocol(
+                                    "simultaneous client QUIC capacity finish path mismatch",
+                                ))).await;
+                                return;
+                            }
+                            let received_payload_bytes = match capacity_receive
+                                .finish(calibration_id, payload_bytes)
+                            {
+                                Ok(bytes) => bytes,
+                                Err(err) => {
+                                    let _ = frames.send(Err(err)).await;
+                                    return;
+                                }
+                            };
+                            if let Err(err) = udp_path_write_capacity_receipt(
+                                &mut send,
+                                path_id,
+                                calibration_id,
+                                received_payload_bytes,
+                                codec_limits,
+                            ).await {
+                                let _ = frames.send(Err(err)).await;
+                                return;
+                            }
+                        }
+                        Some(Ok(frame)) => {
+                            if deferred_capacity_frames.len() >= reader_queue_size {
+                                let _ = frames.send(Err(RuntimeError::Protocol(
+                                    "client QUIC capacity receipt defer queue exceeded",
+                                ))).await;
+                                return;
+                            }
+                            deferred_capacity_frames.push_back(frame);
+                        }
+                        Some(Err(err)) => {
+                            let _ = frames.send(Err(err)).await;
+                            return;
+                        }
+                        None => {
+                            let _ = frames.send(Err(RuntimeError::ReliablePathSessionClosed)).await;
+                            return;
+                        }
+                    }
+                }
+                _ = release_connection.wait_for_capacity_probe_release() => {}
+            }
+            continue;
+        }
         let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
             let _ = udp_path_finish_stream(&mut send);
@@ -1235,7 +1396,12 @@ async fn run_client_udp_stream(
         }
         tokio::select! {
             biased;
-            frame = carrier_frames.recv() => {
+            frame = async {
+                match deferred_capacity_frames.pop_front() {
+                    Some(frame) => Some(Ok::<Frame, RuntimeError>(frame)),
+                    None => carrier_frames.recv().await,
+                }
+            } => {
                 match frame {
                     Some(Ok(Frame::Ping { nonce })) => {
                         if let Err(err) = udp_path_write_frame(&mut send, &Frame::Pong { nonce }, codec_limits).await {
@@ -1534,12 +1700,86 @@ async fn drain_client_udp_stream_commands(
                 }
                 continue;
             }
-            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
-                probe.ticket.cancel();
+            ReliablePathCommand::SendQuicCapacityProbe(mut probe) => {
+                let QuicCapacityProbeOwner::Request {
+                    stream_id: owner_stream_id,
+                    path_instance,
+                } = probe.owner
+                else {
+                    probe.ticket.cancel();
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "client QUIC path received server response capacity command",
+                    ));
+                };
+                if owner_stream_id != stream_id
+                    || path_instance.key.underlay != UnderlayProtocol::Udp
+                    || path_instance.key.index != usize::from(probe.path_id.0)
+                {
+                    probe.ticket.cancel();
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "client QUIC capacity command owner does not match writer",
+                    ));
+                }
+                flush_udp_frame_batch_with_path_proofs(
+                    send,
+                    pending_frames,
+                    codec_limits,
+                    path_proofs,
+                )
+                .await?;
+                if quic_capacity_command_drop_reason(&probe, Instant::now()).is_some() {
+                    probe.ticket.cancel();
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Ok(false);
+                }
+                let result = {
+                    let write =
+                        udp_path_write_capacity_probe(send, &probe, codec_limits, mux_limits);
+                    tokio::pin!(write);
+                    tokio::select! {
+                        biased;
+                        _ = probe.ticket.cancelled() => None,
+                        result = &mut write => Some(result),
+                    }
+                };
                 commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "client QUIC path received server response capacity command",
-                ));
+                let Some(result) = result else {
+                    let _ = send.connection.cancel_capacity_probe(probe.calibration_id);
+                    return Ok(false);
+                };
+                if let Err(err) = result {
+                    if quic_capacity_start_rejection_reason(&err).is_some() {
+                        probe.ticket.cancel();
+                        return Ok(false);
+                    }
+                    return Err(err);
+                }
+                probe.disarm_drop_cancellation();
+                let cancellation_connection = send.connection.clone();
+                let cancellation_ticket = probe.ticket.clone();
+                let cancellation_token = probe.calibration_id;
+                tokio::spawn(async move {
+                    if cancellation_ticket.resolved().await
+                        == QuicCapacityProbeCommandResolution::Cancelled
+                    {
+                        let _ = cancellation_connection.cancel_capacity_probe(cancellation_token);
+                    }
+                });
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "request_quic_capacity_calibration",
+                    format_args!(
+                        "phase=written stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={}",
+                        stream_id.0,
+                        path_instance.key.index,
+                        path_instance.id,
+                        probe.calibration_id,
+                        probe.train_payload_bytes,
+                    ),
+                );
+                return Ok(false);
             }
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
                 commands.release_pending_command_bytes(pending_bytes);
@@ -1686,7 +1926,7 @@ fn spawn_server_quic_path_metrics(
             log_quic_ack_poll_diagnostics(
                 session_id,
                 path_id,
-                path_instance_id,
+                path_instance_id.as_u64(),
                 metrics,
                 poll_elapsed,
             );
@@ -1817,7 +2057,7 @@ fn quic_path_metrics_should_publish_local_sender(metrics: UdpPathMetrics) -> boo
 fn log_quic_ack_poll_diagnostics(
     session_id: SessionId,
     path_id: PathId,
-    path_instance_id: ServerCarrierPathInstanceId,
+    path_instance_id: u64,
     metrics: UdpPathMetrics,
     poll_elapsed: Duration,
 ) {
@@ -1833,7 +2073,7 @@ fn log_quic_ack_poll_diagnostics(
                 "session_id={} path_id={} path_instance_id={} direction={} poll_elapsed_us={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
                 session_id.0,
                 path_id.0,
-                path_instance_id.as_u64(),
+                path_instance_id,
                 metrics.direction,
                 poll_elapsed.as_micros(),
                 ack.newly_acked_bytes,
@@ -1867,7 +2107,7 @@ fn log_quic_ack_poll_diagnostics(
                 "session_id={} path_id={} path_instance_id={} direction={} calibration_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
                 session_id.0,
                 path_id.0,
-                path_instance_id.as_u64(),
+                path_instance_id,
                 metrics.direction,
                 probe.token,
                 probe.phase,
@@ -2353,6 +2593,9 @@ async fn run_server_udp_reliable_stream_loop(
     let mut deferred_capacity_frames = std::collections::VecDeque::<Frame>::new();
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
+    let mut capacity_receive = CapacityReceiveTracker::new(
+        reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+    );
 
     loop {
         // Receipt confirmation releases the connection-wide writer gate. This
@@ -2379,6 +2622,41 @@ async fn run_server_udp_reliable_stream_loop(
                                 calibration_id,
                                 received_payload_bytes,
                             )?;
+                        }
+                        Some(Ok(Frame::PathCapacityData {
+                            path_id: capacity_path_id,
+                            calibration_id,
+                            payload,
+                        })) => {
+                            if capacity_path_id != path_id
+                                || capacity_receive
+                                    .record_data(calibration_id, payload.len())
+                                    .is_err()
+                            {
+                                return Err(RuntimeError::Protocol(
+                                    "invalid simultaneous server QUIC capacity data",
+                                ));
+                            }
+                        }
+                        Some(Ok(Frame::PathCapacityFinish {
+                            path_id: capacity_path_id,
+                            calibration_id,
+                            payload_bytes,
+                        })) => {
+                            if capacity_path_id != path_id {
+                                return Err(RuntimeError::Protocol(
+                                    "simultaneous server QUIC capacity finish path mismatch",
+                                ));
+                            }
+                            let received_payload_bytes =
+                                capacity_receive.finish(calibration_id, payload_bytes)?;
+                            udp_path_write_capacity_receipt(
+                                &mut send,
+                                path_id,
+                                calibration_id,
+                                received_payload_bytes,
+                                context.codec_limits,
+                            ).await?;
                         }
                         Some(Ok(frame)) => {
                             if deferred_capacity_frames.len() >= carrier_frame_queue {
@@ -2600,10 +2878,53 @@ async fn run_server_udp_reliable_stream_loop(
                             received_payload_bytes,
                         )?;
                     }
-                    Some(Ok(Frame::PathCapacityData { .. } | Frame::PathCapacityFinish { .. })) => {
-                        return Err(RuntimeError::Protocol(
-                            "server QUIC path received client response-capacity output",
-                        ));
+                    Some(Ok(Frame::PathCapacityData {
+                        path_id: capacity_path_id,
+                        calibration_id,
+                        payload,
+                    })) => {
+                        if capacity_path_id != path_id
+                            || capacity_receive
+                                .record_data(calibration_id, payload.len())
+                                .is_err()
+                        {
+                            return Err(RuntimeError::Protocol(
+                                "invalid server QUIC request capacity data epoch",
+                            ));
+                        }
+                    }
+                    Some(Ok(Frame::PathCapacityFinish {
+                        path_id: capacity_path_id,
+                        calibration_id,
+                        payload_bytes,
+                    })) => {
+                        if capacity_path_id != path_id {
+                            return Err(RuntimeError::Protocol(
+                                "server QUIC request capacity finish path mismatch",
+                            ));
+                        }
+                        let received_payload_bytes =
+                            capacity_receive.finish(calibration_id, payload_bytes)?;
+                        udp_path_write_capacity_receipt(
+                            &mut send,
+                            path_id,
+                            calibration_id,
+                            received_payload_bytes,
+                            context.codec_limits,
+                        ).await?;
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "request_quic_capacity_receipt",
+                            format_args!(
+                                "phase=sent session_id={} path_id={} path_instance_id={} stream_id={} calibration_id={} received_payload_bytes={}",
+                                session_id.0,
+                                path_id.0,
+                                path_registration.path_instance_id().as_u64(),
+                                stream_id.0,
+                                calibration_id,
+                                received_payload_bytes,
+                            ),
+                        );
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
@@ -2786,7 +3107,18 @@ async fn drain_server_udp_reliable_commands(
                 continue;
             }
             ReliablePathCommand::SendQuicCapacityProbe(mut probe) => {
-                if probe.path_id != path_id || probe.path_instance_id != path_instance_id {
+                let QuicCapacityProbeOwner::Response {
+                    binding_instance_id: _binding_instance_id,
+                    path_instance_id: owner_path_instance_id,
+                } = probe.owner
+                else {
+                    probe.ticket.cancel();
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "server QUIC path received client request capacity command",
+                    ));
+                };
+                if probe.path_id != path_id || owner_path_instance_id != path_instance_id {
                     probe.ticket.cancel();
                     commands.release_pending_command_bytes(pending_bytes);
                     return Err(RuntimeError::Protocol(
@@ -2810,9 +3142,9 @@ async fn drain_server_udp_reliable_commands(
                             "phase=command_dropped reason={} session_id={} binding_instance_id={} underlay=Udp path_id={} path_instance_id={} calibration_id={} train_bytes={}",
                             _reason,
                             session_id.0,
-                            probe.binding_instance_id,
+                            _binding_instance_id,
                             path_id.0,
-                            probe.path_instance_id.as_u64(),
+                            owner_path_instance_id.as_u64(),
                             probe.calibration_id,
                             probe.train_payload_bytes,
                         ),
@@ -2842,9 +3174,9 @@ async fn drain_server_udp_reliable_commands(
                         format_args!(
                             "phase=command_cancelled reason=ownership_invalidated_during_write session_id={} binding_instance_id={} underlay=Udp path_id={} path_instance_id={} calibration_id={} train_bytes={}",
                             session_id.0,
-                            probe.binding_instance_id,
+                            _binding_instance_id,
                             path_id.0,
-                            probe.path_instance_id.as_u64(),
+                            owner_path_instance_id.as_u64(),
                             probe.calibration_id,
                             probe.train_payload_bytes,
                         ),
@@ -2861,9 +3193,9 @@ async fn drain_server_udp_reliable_commands(
                                 "phase=command_rejected reason={} session_id={} binding_instance_id={} underlay=Udp path_id={} path_instance_id={} calibration_id={} train_bytes={}",
                                 _reason,
                                 session_id.0,
-                                probe.binding_instance_id,
+                                _binding_instance_id,
                                 path_id.0,
-                                probe.path_instance_id.as_u64(),
+                                owner_path_instance_id.as_u64(),
                                 probe.calibration_id,
                                 probe.train_payload_bytes,
                             ),

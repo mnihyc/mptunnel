@@ -648,6 +648,26 @@ fn bulk_candidate_within_reorder_budget(
     role: BulkAdmissionRole,
     stream_ordering_debt_bytes: u64,
 ) -> bool {
+    if role == BulkAdmissionRole::AdditionalSameUnderlay {
+        // Per-path product authority and receiver reorder memory are distinct
+        // resources. Foreign lower offsets consume only the stream envelope;
+        // this candidate's own unique bytes still need local QUIC/TCP credit.
+        let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
+        if !bulk_quantum_granular_limit_allows(
+            candidate_product_debt,
+            payload_bytes,
+            bulk_same_underlay_product_authority_bytes(candidate, payload_bytes, mux_limits),
+            role,
+        ) {
+            return false;
+        }
+        return bulk_quantum_granular_limit_allows(
+            candidate_product_debt.saturating_add(stream_ordering_debt_bytes),
+            payload_bytes,
+            bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits),
+            role,
+        );
+    }
     let admission_budget = bulk_admission_reorder_budget_bytes_for_ordering_debt(
         candidate,
         payload_bytes,
@@ -826,7 +846,7 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
             reorder_budget
         }
         BulkAdmissionRole::AdditionalSameUnderlay => {
-            bulk_same_underlay_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
+            bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits)
         }
         BulkAdmissionRole::AdditionalCrossUnderlay => {
             bulk_effective_reorder_budget_bytes(candidate, payload_bytes, mux_limits)
@@ -834,7 +854,13 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
     }
 }
 
-fn bulk_same_underlay_reorder_budget_bytes(
+fn bulk_stream_reorder_envelope_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
+    (mux_limits.max_reorder_bytes as u64)
+        .min(mux_limits.max_stream_window_bytes)
+        .max(payload_bytes as u64)
+}
+
+fn bulk_same_underlay_product_authority_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
@@ -845,9 +871,7 @@ fn bulk_same_underlay_reorder_budget_bytes(
         // 2*BDP here makes a healthy Service prefix permanently lock out an
         // empty candidate. The inflight gate already bounds this candidate;
         // this gate owns the aggregate stream/receiver reorder resource.
-        return (mux_limits.max_reorder_bytes as u64)
-            .min(mux_limits.max_stream_window_bytes)
-            .max(payload_bytes as u64);
+        return bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits);
     }
     let delivery_rate_inflight_target = bulk_bbr_inflight_bytes(bulk_rate_bdp_bytes(
         candidate.delivery_rate_bps,
@@ -1748,19 +1772,19 @@ mod tests {
     }
 
     #[test]
-    fn high_confidence_quic_window_needs_product_progress_before_expanding_reorder_budget() {
+    fn high_confidence_quic_window_needs_product_progress_before_expanding_product_authority() {
         let mux_limits = MuxLimits::default();
         let payload_bytes = 64 * 1024;
         let mut proof_only = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 360.0, mbps(18.0));
         proof_only.pacing_rate_bps = mbps(500.0);
 
         let receipt_rate_inflight_target =
-            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits);
+            bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits);
         assert_eq!(receipt_rate_inflight_target, 1_620_000);
 
         proof_only.inflight_limit_bytes = 7 * 1024 * 1024;
         assert_eq!(
-            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
             receipt_rate_inflight_target,
             "strict carrier pacing is not product authority with or without a native window"
         );
@@ -1768,7 +1792,7 @@ mod tests {
 
         proof_only.confidence = 0.1;
         assert_eq!(
-            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
             proof_only.inflight_limit_bytes,
             "the explicit startup epoch retains its native-window allowance"
         );
@@ -1776,7 +1800,7 @@ mod tests {
         proof_only.confidence = 1.0;
         proof_only.product_progress_rate_bps = Some(mbps(18.0));
         assert_eq!(
-            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
             receipt_rate_inflight_target,
             "one exact product ACK is not yet durable window authority"
         );
@@ -1784,9 +1808,55 @@ mod tests {
         proof_only.has_durable_product_progress = true;
         proof_only.product_progress_rate_bps = None;
         assert_eq!(
-            bulk_same_underlay_reorder_budget_bytes(proof_only, payload_bytes, mux_limits),
+            bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
             proof_only.inflight_limit_bytes,
             "durable product bytes may couple the native window without a point rate"
+        );
+    }
+
+    #[test]
+    fn quic_same_underlay_separates_candidate_credit_from_stream_reorder_envelope() {
+        let mux_limits = MuxLimits {
+            max_path_flight_bytes: 64 * 1024 * 1024,
+            max_reorder_bytes: 64 * 1024 * 1024,
+            max_stream_window_bytes: 64 * 1024 * 1024,
+            ..MuxLimits::default()
+        };
+        let payload_bytes = 64 * 1024;
+        let mut proof_only = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(18.3));
+        proof_only.confidence = 0.2;
+        proof_only.inflight_limit_bytes = 8_835_877;
+
+        assert!(bulk_candidate_within_reorder_budget(
+            proof_only,
+            payload_bytes,
+            mux_limits,
+            BulkAdmissionRole::AdditionalSameUnderlay,
+            16_580_396,
+        ));
+
+        proof_only.product_bytes_in_flight = proof_only.inflight_limit_bytes;
+        assert!(
+            !bulk_candidate_within_reorder_budget(
+                proof_only,
+                payload_bytes,
+                mux_limits,
+                BulkAdmissionRole::AdditionalSameUnderlay,
+                0,
+            ),
+            "foreign debt no longer consumes local credit, but candidate-owned bytes still do"
+        );
+
+        proof_only.product_bytes_in_flight = 0;
+        assert!(
+            !bulk_candidate_within_reorder_budget(
+                proof_only,
+                payload_bytes,
+                mux_limits,
+                BulkAdmissionRole::AdditionalSameUnderlay,
+                mux_limits.max_reorder_bytes as u64,
+            ),
+            "local credit does not permit the aggregate receive hole to exceed its stream envelope"
         );
     }
 

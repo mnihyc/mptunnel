@@ -42,16 +42,20 @@ contract as same-family multipath placement.
 - `src/runtime/core.rs`: owns the session-shared TCP-Service request-flow count
   and its cancellation-safe registration lifetime. One active request stream
   with present work contributes once only while its exact Service is TCP; path
-  attachment load and QUIC-Service demand are different ledgers.
+  attachment load and QUIC-Service demand are different ledgers. It also owns
+  request-side QUIC probe spend and the exact carrier-proof to product-ACK
+  handoff; neither ledger publishes product rate.
 - `src/runtime/relay_striping.rs`: owns TCP request startup, exact-owner
   graduation, and product-ACK calibration admission. It consumes the frozen
   exact calibration owner/target plus logical-flow and path evidence but does
   not redefine any of them.
 - `src/runtime/sender_service.rs`: owns request-local exact calibration identity,
   frozen target/spend rollback, causal ACK boundaries, and the continuous
-  per-flow ACK model. It also ranks immutable response-path snapshots and
-  proposes work. It must not mutate carrier recovery state or claim product
-  offsets before the reliable-path commit.
+  per-flow ACK model. It serializes request QUIC proof/handoff epochs and counts
+  exact owner ACK bytes without using them as QUIC rate samples. It also ranks
+  immutable response-path snapshots and proposes work. It must not mutate
+  carrier recovery state or claim product offsets before the reliable-path
+  commit.
 - `src/runtime/reliable_path.rs`: owns product stream attachments, exact range
   flights, ordering debt, and atomic response placement commits.
 - `src/runtime/reliable_path/response_admission.rs`: owns response path evidence,
@@ -111,6 +115,30 @@ QUIC capacity proof is a transaction:
    generic product evidence through that expiry without blocking new writes.
 6. Commit the exact lease before publishing the marker everywhere, resolve
    publication separately from cancellation, then retire public token metrics.
+
+Request-direction discovery uses the symmetric record transaction but keeps a
+separate ownership handoff. Its token owns the session slot, stream, relay
+instance, train budget, attempt deadline, and publication ticket. Receipt time,
+not delayed metrics publication, must precede the attempt deadline; reservation
+cleanup retains that eligible receipt for one proof-validity horizon so the
+publication boundary cannot race it. Publishing the ticket is part of proof
+acceptance, and exact-token cleanup cannot clear a successor session.
+
+A fenced native tail rate grants only bounded carrier-sized product authority.
+The same stream-local relay instance must then ACK one fixed product floor from
+bytes sent at or after proof acceptance, and the ACK itself must precede proof
+expiry. Completion preserves durable ordered ownership and serializes the next
+train. Its numeric rate prior remains fresh for one proof-validity horizon after
+completion, after which new native evidence may correct it. Expiry, cancellation,
+or association failure erases an incomplete handoff. Product ACK bytes prove
+ordered use only; QUIC packet ACKs still own capacity, pacing, and recovery.
+
+Native QUIC measurement uses every carrier byte in the timed measurement epoch
+as its numerator; the required byte count is only a proof floor. Delayed ACKs
+for probe packets remain excluded by sent time from ordinary carrier evidence,
+but the exclusion cutoff is the peer receipt time. The quarantine record lives
+until proof expiry only to catch delayed probe-era ACKs, so ordinary packets
+sent after receipt become eligible immediately.
 
 Raw capacity Data/Finish/Receipt records are not generic `SendFrame` work. Data
 and Finish are legal only inside the typed server-to-client QUIC probe command;
@@ -193,9 +221,10 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   at which point its own model replaces that prior. A configured candidate
   retains its own capacity hint. This avoids serial probe work stalling the only
   data-bearing upload while still giving kernel TCP enough bounded exploration
-  credit to leave slow start. QUIC stays outside product-ACK calibration and
-  requires attributable post-attachment native packet-ACK evidence. One-flow
-  request optional-path aggregation remains unproven for both carrier families.
+  credit to leave slow start. QUIC stays outside product-ACK rate calibration:
+  one serialized carrier-only train establishes capacity, then exact
+  post-proof product ACKs establish durable ownership. TCP and QUIC keep
+  independent proof clocks below the shared product window.
 - Response discovery is directional and permits one active sustained bulk
   response to spend the first bounded same-family startup sample. That first
   sample is the non-circular discovery bootstrap. After one measured Subflow

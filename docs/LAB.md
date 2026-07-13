@@ -96,6 +96,20 @@ requires calibration, receipt, proof, retirement, drain, and commit identities
 to match. Physical blackhole and reconnection behavior is intentionally left to
 the fault cases so transport recovery cannot masquerade as placement evidence.
 
+Request-direction QUIC discovery emits `request_quic_capacity_calibration`,
+`request_quic_capacity_receipt`, and `request_quic_capacity_proof`. Require one
+`native_tail` or disclosed receipt-lower-bound publication, matching
+`graduated`, and then `handoff_complete` before expiry. A later train must not
+start while that handoff is pending. Correlate exact post-proof `path_model`
+owner ACKs by path instance; do not reinterpret their elapsed time as QUIC
+capacity. The first ordinary ACK for a packet sent after receipt must be
+eligible before `receipt + proof_validity`; a delayed ACK for a packet sent
+before receipt must remain excluded. The native-tail numerator must cover the
+full timed carrier epoch rather than only the minimum proof floor. A successful
+upload must also carry ordinary bytes beyond the train on that path. Record the
+receipt, proof, first qualifying ACK, handoff, and old-quarantine-cutoff times
+so a throughput change has a causal accounting boundary.
+
 Mixed response diagnostics emit `response_quic_capacity_calibration` for the
 bounded non-product QUIC train, `quic_capacity_receipt` for exact peer receipt,
 `quic_capacity_proof` for registry acceptance, `quic_carrier_ack_poll` and
@@ -646,6 +660,41 @@ external baselines. Resource efficiency remains non-ideal: Iteration 162 server
 CPU and peak memory are 9.870%/198.4 MB multipath versus 2.492%/119.2 MB single,
 and the Iteration 164 server peak rises to 299.5 MB, above the manual 256 MiB
 target.
+
+## Request QUIC Upload Evidence
+
+Iterations 166-185 establish a request-side QUIC capacity transaction without
+using product ACK timing as carrier rate. The accepted Iteration 185 release row
+is complete and exact at 177.501 Mbps with a 0.834 second maximum delivery gap,
+but it has no adjacent single-path control. A later audit found that the ACK
+quarantine used `receipt + proof_validity` as both its retention deadline and
+packet sent-time cutoff. It therefore excluded ordinary post-receipt packets,
+not just delayed ACKs for probe-era packets.
+
+Diagnostic Iteration 186 proves the corrected boundary. Receipt, proof, first
+ordinary candidate ACK, and exact product handoff occur at 4.819, 4.837, 5.206,
+and 5.935 seconds. The old cutoff would have been 6.984 seconds. Candidate ACKs
+release 8,911,084 bytes before handoff, so post-receipt evidence is admitted
+immediately while the quarantine record remains alive to reject delayed
+pre-receipt packets. Its 181.221 Mbps row has diagnostics enabled and is not a
+release throughput result.
+
+Clean Iteration 187 uses the default fat-link jitter of 20 ms. It reaches
+186.731 Mbps multipath versus 117.398 Mbps adjacent single (`1.590x`), with
+1.059 versus 1.232 second maximum delivery gaps. The multipath result is also
+5.20% above Iteration 185. Three physical paths carry material bytes.
+
+Iteration 188 separately repeats the historical equal-fat geometry with every
+path explicitly set to 500 Mbps, 180 ms, 1 ms jitter, and zero loss. It reaches
+194.231 Mbps multipath versus 172.262 Mbps adjacent single (`1.128x`) and a
+0.841 versus 1.730 second gap. The single control's bounded Iteration 189 repeat
+reaches 192.112 Mbps, proving that the 172.262 Mbps row was not a persistent
+code downgrade. Report the same-build single range rather than averaging it
+away: multipath exceeds the strongest repeat by only `1.011x`, so stable
+single-flow superiority is not yet proven. A no-candidate topology guard and an
+inactive-token ACK guard remove optional-discovery health locks from the common
+single-path hot path; deterministic tests prove those paths do not acquire the
+health mutex.
 
 ## Interpreting Results
 

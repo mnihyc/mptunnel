@@ -209,6 +209,22 @@ struct RequestAckClockCalibrationRollback {
     previous_target: Option<u64>,
 }
 
+#[derive(Debug)]
+struct RequestQuicCapacityCalibration {
+    target: RelayPathInstance,
+    token: u64,
+    publication_expires_at: Instant,
+    graduated: bool,
+    ticket: QuicCapacityProbeCommandTicket,
+    _lease: RequestQuicCapacityProbeLease,
+}
+
+impl Drop for RequestQuicCapacityCalibration {
+    fn drop(&mut self) {
+        self.ticket.cancel();
+    }
+}
+
 impl RelayPathSendSelection {
     fn new(position: usize, data_role: Option<PathRuntimeRole>) -> Self {
         Self {
@@ -371,6 +387,8 @@ pub(super) struct RelaySenderService {
     request_ack_clock_calibration_bytes: HashMap<RelayPathInstance, u64>,
     request_ack_clock_calibration_targets: HashMap<RelayPathInstance, u64>,
     request_ack_clock_calibration_owner: Option<RequestAckClockCalibrationOwner>,
+    request_quic_capacity_calibration: Option<RequestQuicCapacityCalibration>,
+    request_quic_capacity_attempted_paths: HashSet<usize>,
     request_graduated_subflows: HashSet<RelayPathInstance>,
     request_attempted_subflows: HashSet<RelayPathInstance>,
     request_membership_generation: Option<u64>,
@@ -1495,6 +1513,112 @@ struct ResponseQuicCapacityCalibrationGeometry {
     carrier_window_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestQuicCapacityCalibrationGeometry {
+    train_bytes: u64,
+    sample_floor_bytes: u64,
+    accounting_slack_bytes: u64,
+    timing_slack_bytes: u64,
+    desired_warmup_carrier_bytes: u64,
+    warmup_carrier_bytes: u64,
+    required_timed_carrier_bytes: u64,
+    service_rate_bps: u64,
+    service_product_flight_bytes: u64,
+}
+
+fn quic_capacity_timing_slack_bytes() -> u64 {
+    // The measurement epoch carries zero-span callback bytes forward; one
+    // pacing quantum still keeps distinct packet timestamps behind its floor.
+    BBR_MAX_SEND_QUANTUM_BYTES as u64
+}
+
+fn request_quic_capacity_calibration_geometry(
+    service: PathSnapshot,
+    candidate: PathSnapshot,
+    service_rate_bps: f64,
+    mux_limits: MuxLimits,
+    train_envelope_bytes: u64,
+) -> Option<RequestQuicCapacityCalibrationGeometry> {
+    // A cold QUIC carrier must grow far enough to compete with the live
+    // Service before its final timed window can represent bulk capacity.
+    if !service_rate_bps.is_finite() || service_rate_bps <= 0.0 {
+        return None;
+    }
+    let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+    let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+    let required_timed_carrier_bytes = sample_floor.saturating_sub(accounting_slack).max(1);
+    let timing_slack_bytes = quic_capacity_timing_slack_bytes();
+    let measurement_window_bytes = required_timed_carrier_bytes.checked_add(timing_slack_bytes)?;
+    let competing_rate_bdp =
+        (service_rate_bps / 8.0 * candidate.srtt_ms.max(1.0) / 1_000.0).ceil() as u64;
+    let competing_rate_pipe = ((competing_rate_bdp as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64;
+    let competing_product_pipe =
+        ((service.product_bytes_in_flight as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64;
+    let desired_warmup_carrier_bytes = candidate
+        .inflight_limit_bytes
+        .max(candidate.bytes_in_flight)
+        .max(competing_rate_pipe)
+        .max(competing_product_pipe);
+    let train_envelope_bytes = train_envelope_bytes.min(
+        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+    );
+    let warmup_carrier_bytes = desired_warmup_carrier_bytes
+        .min(train_envelope_bytes.checked_sub(measurement_window_bytes)?);
+    if warmup_carrier_bytes
+        < candidate
+            .inflight_limit_bytes
+            .max(candidate.bytes_in_flight)
+    {
+        return None;
+    }
+    // Keep one pacing quantum of trailing measurement credit. The application
+    // receipt can race the final delayed transport ACK; untimed/late bytes must
+    // not consume the strict window before earlier timed ACKs reach the poller.
+    let train_bytes = warmup_carrier_bytes.checked_add(measurement_window_bytes)?;
+    if train_bytes > train_envelope_bytes {
+        return None;
+    }
+    Some(RequestQuicCapacityCalibrationGeometry {
+        train_bytes: train_bytes.max(sample_floor),
+        sample_floor_bytes: sample_floor,
+        accounting_slack_bytes: accounting_slack,
+        timing_slack_bytes,
+        desired_warmup_carrier_bytes,
+        warmup_carrier_bytes,
+        required_timed_carrier_bytes,
+        service_rate_bps: service_rate_bps.ceil() as u64,
+        service_product_flight_bytes: service.product_bytes_in_flight,
+    })
+}
+
+fn request_quic_capacity_slow_start_rounds(train_bytes: u64) -> u32 {
+    let mut rounds = 1_u32;
+    let mut window_bytes = PATH_OPEN_SCORE_BYTES as u64;
+    let mut cumulative_bytes = window_bytes;
+    while cumulative_bytes < train_bytes {
+        window_bytes = window_bytes.saturating_mul(2);
+        cumulative_bytes = cumulative_bytes.saturating_add(window_bytes);
+        rounds = rounds.saturating_add(1);
+        if cumulative_bytes == u64::MAX {
+            break;
+        }
+    }
+    rounds
+}
+
+fn request_quic_capacity_calibration_lease(candidate: PathSnapshot, train_bytes: u64) -> Duration {
+    let pto = transport_pto_from_snapshot(Some(candidate));
+    let srtt = Duration::from_secs_f64(candidate.srtt_ms.max(1.0) / 1_000.0);
+    // The train intentionally starts on a cold QUIC congestion controller.
+    // Budget the ACK-clock rounds needed to grow the RFC 9002 initial window;
+    // half a PTO protects an RTT estimate that still comes from path proof.
+    let modeled_round_trip = srtt.max(pto.div_f64(2.0));
+    modeled_round_trip
+        .saturating_mul(request_quic_capacity_slow_start_rounds(train_bytes))
+        .saturating_add(pto)
+        .max(Duration::from_secs(1))
+}
+
 fn response_quic_capacity_calibration_geometry(
     target: &ResponseSenderPathTarget,
     mux_limits: MuxLimits,
@@ -1502,12 +1626,15 @@ fn response_quic_capacity_calibration_geometry(
     let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
     let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
     let fresh_strict_window = sample_floor.saturating_sub(packet_accounting_slack).max(1);
+    let timing_slack = quic_capacity_timing_slack_bytes();
     let carrier_window = target
         .snapshot
         .inflight_limit_bytes
         .max(target.snapshot.bytes_in_flight);
     let session_envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
-    let required_train = carrier_window.checked_add(fresh_strict_window);
+    let required_train = carrier_window
+        .checked_add(fresh_strict_window)
+        .and_then(|bytes| bytes.checked_add(timing_slack));
     let fits_session_envelope = required_train
         .map(|bytes| bytes.max(sample_floor))
         .is_some_and(|bytes| bytes <= session_envelope);
@@ -5605,6 +5732,8 @@ impl RelaySenderService {
             request_ack_clock_calibration_bytes: HashMap::new(),
             request_ack_clock_calibration_targets: HashMap::new(),
             request_ack_clock_calibration_owner: None,
+            request_quic_capacity_calibration: None,
+            request_quic_capacity_attempted_paths: HashSet::new(),
             request_graduated_subflows: HashSet::new(),
             request_attempted_subflows: HashSet::new(),
             request_membership_generation: None,
@@ -6393,6 +6522,7 @@ impl RelaySenderService {
         }
         self.reconcile_request_subflow_set(context, remotes);
         if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
+            self.try_start_request_quic_capacity_calibration(context, remotes, lane);
             let payload_bytes = reliable_stream_frame_payload_bytes(frame);
             let sealed_owner = self.request_subflow_set.as_mut().and_then(|epoch| {
                 let owner = epoch.startup_owner_key()?;
@@ -6721,6 +6851,90 @@ impl RelaySenderService {
                 .retain(|instance, _| live_instances.contains(instance));
             self.request_membership_generation = Some(membership_generation);
         }
+        let now = Instant::now();
+        if self
+            .request_quic_capacity_calibration
+            .as_ref()
+            .is_some_and(|calibration| !remotes.contains_path_instance(calibration.target))
+        {
+            self.request_quic_capacity_calibration = None;
+        }
+        // A proof accepted at the train deadline remains authoritative for its
+        // own proof lifetime, even if sender reconciliation runs just after it.
+        let graduated = self
+            .request_quic_capacity_calibration
+            .as_ref()
+            .filter(|calibration| !calibration.graduated)
+            .filter(|calibration| {
+                context.request_quic_capacity_probe_proven(
+                    calibration.target.key.index,
+                    calibration.token,
+                )
+            })
+            .map(|calibration| (calibration.target, calibration.token));
+        if let Some((_target, _token)) = graduated {
+            if let Some(calibration) = self.request_quic_capacity_calibration.as_mut() {
+                calibration.graduated = true;
+            }
+            self.request_graduated_subflows.insert(_target);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "request_quic_capacity_calibration",
+                format_args!(
+                    "phase=graduated stream_id={} path_index={} instance_id={} calibration_id={}",
+                    self.stream_id.0, _target.key.index, _target.id, _token,
+                ),
+            );
+        }
+        if self
+            .request_quic_capacity_calibration
+            .as_ref()
+            .is_some_and(|calibration| {
+                !calibration.graduated && now >= calibration.publication_expires_at
+            })
+        {
+            self.request_quic_capacity_calibration = None;
+        }
+        let handoff = self
+            .request_quic_capacity_calibration
+            .as_ref()
+            .filter(|calibration| calibration.graduated)
+            .map(|calibration| {
+                (
+                    calibration.target,
+                    calibration.token,
+                    context.request_quic_capacity_product_handoff_state(
+                        calibration.target.key.index,
+                        calibration.token,
+                    ),
+                )
+            });
+        if let Some((_target, _token, state)) = handoff
+            && state != RequestQuicCapacityProductHandoffState::Pending
+        {
+            if state == RequestQuicCapacityProductHandoffState::Absent {
+                // Ephemeral proof credit is transactional: an incomplete or
+                // failed handoff cannot leave the Validation path owner-capable.
+                self.request_graduated_subflows.remove(&_target);
+            }
+            self.request_quic_capacity_calibration = None;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "request_quic_capacity_calibration",
+                format_args!(
+                    "phase={} stream_id={} path_index={} instance_id={} calibration_id={}",
+                    match state {
+                        RequestQuicCapacityProductHandoffState::Complete => "handoff_complete",
+                        RequestQuicCapacityProductHandoffState::Absent => "handoff_expired",
+                        RequestQuicCapacityProductHandoffState::Pending => unreachable!(),
+                    },
+                    self.stream_id.0,
+                    _target.key.index,
+                    _target.id,
+                    _token,
+                ),
+            );
+        }
         if self
             .request_ack_clock_calibration_owner
             .is_some_and(|owner| {
@@ -6886,6 +7100,202 @@ impl RelaySenderService {
                 ),
             );
         }
+    }
+
+    fn try_start_request_quic_capacity_calibration(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        lane: FlowLane,
+    ) {
+        if !lane.is_bulk() || self.request_quic_capacity_calibration.is_some() {
+            return;
+        }
+        let has_unattempted_udp_candidate = remotes.paths.iter().any(|path| {
+            let instance = path.instance();
+            path.placement == RelayPathPlacement::Validation
+                && instance.key.underlay == UnderlayProtocol::Udp
+                && !self
+                    .request_quic_capacity_attempted_paths
+                    .contains(&instance.key.index)
+                && !self.request_graduated_subflows.contains(&instance)
+        });
+        if !has_unattempted_udp_candidate || context.reliable_relay_has_latency_pressure() {
+            // Bulk sends call this repeatedly. Topology can reject the common
+            // single-path/completed case without touching session health.
+            return;
+        }
+        let Some(service_path) = self.ordered_data_owner_instance.and_then(|service| {
+            (service.key.underlay == UnderlayProtocol::Udp).then(|| {
+                remotes.paths.iter().find(|path| {
+                    path.instance() == service && path.placement == RelayPathPlacement::Active
+                })
+            })?
+        }) else {
+            return;
+        };
+        let service = service_path.instance();
+        let Some(service_snapshot) = context.reliable_path_snapshot(service.key) else {
+            return;
+        };
+        if service_snapshot.active_latency_sensitive_flows > 0
+            || service_snapshot.session_active_latency_sensitive_flows > 0
+        {
+            return;
+        }
+        if service_snapshot.product_bytes_in_flight
+            < reliable_subflow_startup_sample_limit_bytes(context.mux_limits)
+        {
+            return;
+        }
+        let Some(path) = remotes
+            .paths
+            .iter()
+            .filter(|path| {
+                let instance = path.instance();
+                let snapshot = context.reliable_path_snapshot(instance.key);
+                path.placement == RelayPathPlacement::Validation
+                    && instance.key.underlay == UnderlayProtocol::Udp
+                    && !self
+                        .request_quic_capacity_attempted_paths
+                        .contains(&instance.key.index)
+                    && !self.request_graduated_subflows.contains(&instance)
+                    && path.path_proof_id.is_some_and(|proof_id| {
+                        context.relay_path_has_fresh_proof(
+                            instance.key.underlay,
+                            instance.key.index,
+                            proof_id,
+                            path.attached_at,
+                        )
+                    })
+                    && !context.relay_path_has_native_bulk_model_evidence_since(
+                        instance.key.underlay,
+                        instance.key.index,
+                        path.attached_at,
+                    )
+                    && snapshot.is_some_and(|snapshot| {
+                        snapshot.bytes_in_flight == 0
+                            && snapshot.queue_bytes == 0
+                            && snapshot.product_bytes_in_flight == 0
+                            && snapshot.product_queue_bytes == 0
+                    })
+                    && path
+                        .stream
+                        .can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, lane)
+            })
+            .min_by_key(|path| context.relay_path_config_ordinal(path.key()))
+        else {
+            return;
+        };
+        let Some(snapshot) = context.reliable_path_snapshot(path.key()) else {
+            return;
+        };
+        let remaining_candidates = context
+            .configured_relay_path_count(UnderlayProtocol::Udp)
+            .saturating_sub(1)
+            .saturating_sub(self.request_quic_capacity_attempted_paths.len())
+            .max(1) as u64;
+        let train_envelope_bytes = context
+            .request_quic_capacity_probe_remaining_bytes()
+            .checked_div(remaining_candidates)
+            .unwrap_or(0);
+        let Some(geometry) = request_quic_capacity_calibration_geometry(
+            service_snapshot,
+            snapshot,
+            service_snapshot.delivery_rate_bps,
+            context.mux_limits,
+            train_envelope_bytes,
+        ) else {
+            return;
+        };
+        let train_payload_bytes = geometry.train_bytes;
+        static NEXT_REQUEST_QUIC_CAPACITY_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let token =
+            NEXT_REQUEST_QUIC_CAPACITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ticket = QuicCapacityProbeCommandTicket::new();
+        let lease_duration = request_quic_capacity_calibration_lease(snapshot, train_payload_bytes);
+        let Some(expires_at) = Instant::now().checked_add(lease_duration) else {
+            return;
+        };
+        let proof_validity = quic_bulk_proof_freshness_horizon(
+            Duration::from_secs_f64(snapshot.srtt_ms.max(1.0) / 1_000.0),
+            Duration::from_secs_f64(snapshot.jitter_ms.max(1.0) / 1_000.0),
+        );
+        let Some(publication_expires_at) = expires_at.checked_add(proof_validity) else {
+            return;
+        };
+        let instance = path.instance();
+        let Some(mut lease) = context.try_reserve_request_quic_capacity_probe(
+            self.stream_id,
+            instance.key.index,
+            instance,
+            token,
+            train_payload_bytes,
+            path.attached_at,
+            expires_at,
+            proof_validity,
+            ticket.clone(),
+        ) else {
+            return;
+        };
+        let probe = QuicCapacityProbeCommand {
+            owner: QuicCapacityProbeOwner::Request {
+                stream_id: self.stream_id,
+                path_instance: instance,
+            },
+            path_id: PathId(instance.key.index as u16),
+            calibration_id: token,
+            train_payload_bytes,
+            sample_floor_bytes: geometry.sample_floor_bytes,
+            warmup_carrier_bytes: geometry.warmup_carrier_bytes,
+            required_timed_carrier_bytes: geometry.required_timed_carrier_bytes,
+            proof_validity,
+            expires_at,
+            ticket: ticket.clone(),
+            cancel_on_drop: true,
+        };
+        if path
+            .stream
+            .try_enqueue_request_quic_capacity_probe(probe)
+            .is_err()
+        {
+            return;
+        }
+        lease.commit();
+        self.request_quic_capacity_attempted_paths
+            .insert(instance.key.index);
+        self.request_quic_capacity_calibration = Some(RequestQuicCapacityCalibration {
+            target: instance,
+            token,
+            publication_expires_at,
+            graduated: false,
+            ticket,
+            _lease: lease,
+        });
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "request_quic_capacity_calibration",
+            format_args!(
+                "phase=started stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_envelope_bytes={} sample_floor_bytes={} accounting_slack_bytes={} timing_slack_bytes={} desired_warmup_bytes={} warmup_bytes={} required_proof_bytes={} service_rate_bps={} service_product_flight_bytes={} slow_start_rounds={} lease_ms={}",
+                self.stream_id.0,
+                instance.key.index,
+                instance.id,
+                token,
+                train_payload_bytes,
+                train_envelope_bytes,
+                geometry.sample_floor_bytes,
+                geometry.accounting_slack_bytes,
+                geometry.timing_slack_bytes,
+                geometry.desired_warmup_carrier_bytes,
+                geometry.warmup_carrier_bytes,
+                geometry.required_timed_carrier_bytes,
+                geometry.service_rate_bps,
+                geometry.service_product_flight_bytes,
+                request_quic_capacity_slow_start_rounds(train_payload_bytes),
+                lease_duration.as_millis(),
+            ),
+        );
     }
 
     fn reserve_request_startup_subflow(
@@ -7092,6 +7502,13 @@ impl RelaySenderService {
                 release.bytes,
             );
             if release.path_proving {
+                context.record_relay_path_product_ack(
+                    self.stream_id,
+                    release.instance,
+                    release.bytes,
+                    release.sent_at,
+                    acked_at,
+                );
                 if let Some(progress) = owner_progress
                     .iter_mut()
                     .find(|progress| progress.instance == release.instance)
@@ -7928,6 +8345,19 @@ mod tests {
         lab_assert_server_sender_service_balanced, lab_diag_test_guard,
         lab_sender_service_counts_for_test,
     };
+
+    fn poison_client_path_health_for_test(context: &ClientPathContext) {
+        let health = Arc::clone(&context.health);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = health.lock().expect("path health lock");
+                panic!("poison path health for a no-lock fast-path assertion");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(context.health.is_poisoned());
+    }
 
     #[test]
     fn request_tcp_rate_uses_representative_coverage_for_service_and_candidate() {
@@ -9456,6 +9886,145 @@ mod tests {
             ResourceLimits::default(),
         )
         .expect("context")
+    }
+
+    fn reserve_request_quic_capacity_calibration_for_test(
+        sender: &mut RelaySenderService,
+        context: &ClientPathContext,
+        target: RelayPathInstance,
+        valid_after: Instant,
+        train_deadline: Instant,
+        accepted_at: Instant,
+        proof_validity: Duration,
+    ) -> (
+        QuicCapacityProofCandidate,
+        crate::transport::quic_carrier::CapacityProbeMetrics,
+    ) {
+        let token = sender.stream_id.0.saturating_add(1_000);
+        let train_bytes = (PATH_OPEN_SCORE_BYTES * 2) as u64;
+        let required_proof_bytes = PATH_OPEN_SCORE_BYTES as u64;
+        let ticket = QuicCapacityProbeCommandTicket::new();
+        let mut lease = context
+            .try_reserve_request_quic_capacity_probe(
+                sender.stream_id,
+                target.key.index,
+                target,
+                token,
+                train_bytes,
+                valid_after,
+                train_deadline,
+                proof_validity,
+                ticket.clone(),
+            )
+            .expect("reserve request QUIC capacity probe");
+        lease.commit();
+        let expires_at = accepted_at + proof_validity;
+        let candidate = QuicCapacityProofCandidate {
+            token,
+            train_bytes,
+            sample_floor_bytes: train_bytes,
+            accounting_slack_bytes: train_bytes - required_proof_bytes,
+            warmup_bytes: train_bytes - required_proof_bytes,
+            required_proof_bytes,
+            written_bytes: train_bytes,
+            written_data_frame_count: 2,
+            receipt_confirmed: true,
+            received_bytes: train_bytes,
+            proof_elapsed: Duration::from_millis(10),
+            rate_bps: train_bytes * 800,
+            accepted_at,
+            expires_at,
+            proof_validity,
+        };
+        let probe = crate::transport::quic_carrier::CapacityProbeMetrics {
+            token,
+            train_payload_bytes: train_bytes,
+            sample_floor_bytes: train_bytes,
+            warmup_carrier_bytes: train_bytes - required_proof_bytes,
+            required_timed_carrier_bytes: required_proof_bytes,
+            expires_at: train_deadline,
+            phase: crate::transport::quic_carrier::CapacityProbePhase::Proven,
+            started_clean: true,
+            write_committed: true,
+            written_payload_bytes: train_bytes,
+            written_data_frame_count: 2,
+            total_acked_carrier_bytes: train_bytes,
+            total_ack_sample_count: 2,
+            warmup_acked_carrier_bytes: train_bytes - required_proof_bytes,
+            warmup_ack_sample_count: 1,
+            measurement_acked_carrier_bytes: required_proof_bytes,
+            measurement_ack_sample_count: 1,
+            timed_measurement_acked_carrier_bytes: required_proof_bytes,
+            timed_measurement_ack_sample_count: 1,
+            app_limited_acked_carrier_bytes: 0,
+            app_limited_ack_sample_count: 0,
+            timed_measurement_ack_elapsed: Some(Duration::from_millis(10)),
+            native_proved_at: Some(accepted_at),
+            proved_at: Some(accepted_at),
+            proof_validity,
+            receipt_received_payload_bytes: train_bytes,
+            receipt_elapsed: Some(Duration::from_millis(10)),
+            receipt_rtt: Some(Duration::from_millis(5)),
+            receipt_at: Some(accepted_at),
+            last_authoritative_in_flight: Some(0),
+            last_authoritative_in_flight_at: Some(accepted_at),
+            last_authoritative_sent_watermark: Some(train_bytes),
+            receipt_frozen_sent_watermark: Some(train_bytes),
+            current_sent_watermark: train_bytes,
+        };
+        sender.request_quic_capacity_calibration = Some(RequestQuicCapacityCalibration {
+            target,
+            token,
+            publication_expires_at: train_deadline + proof_validity,
+            graduated: false,
+            ticket,
+            _lease: lease,
+        });
+        (candidate, probe)
+    }
+
+    fn publish_request_quic_capacity_calibration_for_test(
+        sender: &RelaySenderService,
+        context: &ClientPathContext,
+        target: RelayPathInstance,
+        candidate: QuicCapacityProofCandidate,
+        probe: crate::transport::quic_carrier::CapacityProbeMetrics,
+    ) {
+        context.health.lock().expect("path health lock").udp[target.key.index]
+            .accept_request_quic_capacity_proof(candidate, probe, Instant::now())
+            .expect("accept request QUIC capacity proof");
+        assert_eq!(
+            sender
+                .request_quic_capacity_calibration
+                .as_ref()
+                .expect("request QUIC calibration")
+                .ticket
+                .resolution(),
+            QuicCapacityProbeCommandResolution::Published
+        );
+    }
+
+    fn install_request_quic_capacity_calibration_for_test(
+        sender: &mut RelaySenderService,
+        context: &ClientPathContext,
+        target: RelayPathInstance,
+        valid_after: Instant,
+        train_deadline: Instant,
+        proof_validity: Duration,
+    ) -> QuicCapacityProofCandidate {
+        let (candidate, probe) = reserve_request_quic_capacity_calibration_for_test(
+            sender,
+            context,
+            target,
+            valid_after,
+            train_deadline,
+            Instant::now(),
+            proof_validity,
+        );
+        publish_request_quic_capacity_calibration_for_test(
+            sender, context, target, candidate, probe,
+        );
+        candidate
     }
 
     fn active_request_bulk_flow_registrations(
@@ -11608,6 +12177,479 @@ mod tests {
                 .and_then(FlowSubflowSet::startup_owner_key),
             None,
             "a defensive UDP product-startup epoch is discarded instead of becoming QUIC carrier evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
+        let stream_id = StreamId(201);
+        let context = client_test_context_with_paths(&[
+            "udp://127.0.0.1:10321?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10322?srtt-ms=10&rate-mbps=500",
+        ]);
+        let (service_commands, _service_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                service_commands,
+            ),
+            8,
+        );
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(8);
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            1,
+            candidate_commands,
+        ));
+        consume_client_validation_proof_for_test(&mut candidate_rx);
+        let candidate_path = remotes
+            .paths
+            .iter()
+            .find(|path| path.placement == RelayPathPlacement::Validation)
+            .expect("Validation candidate");
+        let candidate_instance = candidate_path.instance();
+        let attached_at = candidate_path.attached_at;
+        let service_path = remotes
+            .paths
+            .iter()
+            .find(|path| path.placement == RelayPathPlacement::Active)
+            .expect("Active Service");
+        let service_instance = service_path.instance();
+        let service_attached_at = service_path.attached_at;
+        let train_deadline = Instant::now() + Duration::from_millis(40);
+        let mut sender = RelaySenderService::new(stream_id);
+        let (proof, probe) = reserve_request_quic_capacity_calibration_for_test(
+            &mut sender,
+            &context,
+            candidate_instance,
+            attached_at,
+            train_deadline,
+            train_deadline - Duration::from_nanos(1),
+            Duration::from_secs(2),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        sender.reconcile_request_subflow_set(&context, &remotes);
+        assert!(!context.request_quic_capacity_probe_proven(1, proof.token));
+        assert!(
+            sender
+                .request_quic_capacity_calibration
+                .as_ref()
+                .is_some_and(|calibration| {
+                    !calibration.graduated && calibration.ticket.is_current()
+                })
+        );
+        publish_request_quic_capacity_calibration_for_test(
+            &sender,
+            &context,
+            candidate_instance,
+            proof,
+            probe,
+        );
+        assert!(context.request_quic_capacity_probe_proven(1, proof.token));
+        sender.reconcile_request_subflow_set(&context, &remotes);
+        assert!(
+            sender
+                .request_graduated_subflows
+                .contains(&candidate_instance)
+        );
+        assert!(
+            sender
+                .request_quic_capacity_calibration
+                .as_ref()
+                .is_some_and(|calibration| calibration.graduated)
+        );
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(1, proof.token),
+            RequestQuicCapacityProductHandoffState::Pending
+        );
+
+        let ack_range = OffsetRange::new(0, proof.required_proof_bytes).expect("ACK range");
+        let foreign_stream_id = StreamId(202);
+        let foreign_frame =
+            client_data_frame_for_test(foreign_stream_id, 0, proof.required_proof_bytes as usize);
+        let mut foreign_sender = RelaySenderService::new(foreign_stream_id);
+        foreign_sender
+            .flights
+            .record_owner_frame_instance(candidate_instance, &foreign_frame);
+        foreign_sender.release_normalized_acked_ranges(&context, &[ack_range]);
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(1, proof.token),
+            RequestQuicCapacityProductHandoffState::Pending,
+            "a colliding stream-local path instance cannot satisfy the owner handoff"
+        );
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(204),
+                    service_instance.key.index,
+                    service_instance,
+                    9_000,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    service_attached_at,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_none(),
+            "a pending product handoff still serializes the next carrier train"
+        );
+
+        let owner_frame =
+            client_data_frame_for_test(stream_id, 0, proof.required_proof_bytes as usize);
+        sender
+            .flights
+            .record_owner_frame_instance(candidate_instance, &owner_frame);
+        sender.release_normalized_acked_ranges(&context, &[ack_range]);
+        let next_ticket = QuicCapacityProbeCommandTicket::new();
+        let next_lease = context
+            .try_reserve_request_quic_capacity_probe(
+                StreamId(204),
+                service_instance.key.index,
+                service_instance,
+                9_001,
+                PATH_OPEN_SCORE_BYTES as u64,
+                service_attached_at,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+                next_ticket,
+            )
+            .expect("completion releases session ownership without another owner send");
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(1, proof.token),
+            RequestQuicCapacityProductHandoffState::Complete
+        );
+        sender.reconcile_request_subflow_set(&context, &remotes);
+        assert!(sender.request_quic_capacity_calibration.is_none());
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(1, proof.token),
+            RequestQuicCapacityProductHandoffState::Complete
+        );
+        assert!(
+            sender
+                .request_graduated_subflows
+                .contains(&candidate_instance)
+        );
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(205),
+                    service_instance.key.index,
+                    service_instance,
+                    9_002,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    service_attached_at,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_none(),
+            "dropping the old owner lease cannot clear a newer token"
+        );
+        drop(next_lease);
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(205),
+                    service_instance.key.index,
+                    service_instance,
+                    9_002,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    service_attached_at,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn dropping_request_quic_owner_revokes_pending_handoff() {
+        let stream_id = StreamId(206);
+        let context =
+            client_test_context_with_paths(&["udp://127.0.0.1:10325?srtt-ms=20&rate-mbps=500"]);
+        let target = RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            id: 1,
+        };
+        let mut sender = RelaySenderService::new(stream_id);
+        let proof = install_request_quic_capacity_calibration_for_test(
+            &mut sender,
+            &context,
+            target,
+            Instant::now() - Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(0, proof.token),
+            RequestQuicCapacityProductHandoffState::Pending
+        );
+
+        sender.request_quic_capacity_calibration = None;
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(0, proof.token),
+            RequestQuicCapacityProductHandoffState::Absent
+        );
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(207),
+                    0,
+                    target,
+                    9_003,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    Instant::now() - Duration::from_millis(1),
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_quic_single_path_skips_health_lock() {
+        let stream_id = StreamId(208);
+        let context =
+            client_test_context_with_paths(&["udp://127.0.0.1:10328?srtt-ms=20&rate-mbps=500"]);
+        let (service_commands, _service_rx) = reliable_path_command_channels(8);
+        let remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                service_commands,
+            ),
+            8,
+        );
+        let service = remotes.active_path_instance().expect("Active Service");
+        let mut sender = RelaySenderService::new(stream_id);
+        sender.ordered_data_owner = Some(service.key);
+        sender.ordered_data_owner_instance = Some(service);
+        poison_client_path_health_for_test(&context);
+
+        sender.try_start_request_quic_capacity_calibration(
+            &context,
+            &remotes,
+            FlowLane::Throughput,
+        );
+
+        assert!(sender.request_quic_capacity_calibration.is_none());
+    }
+
+    #[test]
+    fn request_quic_product_ack_without_transaction_skips_health_lock() {
+        let context =
+            client_test_context_with_paths(&["udp://127.0.0.1:10329?srtt-ms=20&rate-mbps=500"]);
+        poison_client_path_health_for_test(&context);
+        let now = Instant::now();
+
+        context.record_relay_path_product_ack(
+            StreamId(209),
+            RelayPathInstance {
+                key: RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index: 0,
+                },
+                id: 1,
+            },
+            PATH_OPEN_SCORE_BYTES,
+            now,
+            now + Duration::from_millis(1),
+        );
+    }
+
+    #[tokio::test]
+    async fn request_quic_train_waits_for_candidate_latency_pressure_to_clear() {
+        let stream_id = StreamId(210);
+        let context = client_test_context_with_paths(&[
+            "udp://127.0.0.1:10326?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10327?srtt-ms=10&rate-mbps=500",
+        ]);
+        let (service_commands, _service_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                service_commands,
+            ),
+            8,
+        );
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(8);
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            1,
+            candidate_commands,
+        ));
+        consume_client_validation_proof_for_test(&mut candidate_rx);
+        let service = remotes.active_path_instance().expect("Active Service");
+        let candidate = remotes
+            .paths
+            .iter()
+            .find(|path| path.placement == RelayPathPlacement::Validation)
+            .expect("Validation candidate")
+            .instance();
+        mark_client_validation_proof_fresh_for_test(
+            &context,
+            &remotes,
+            candidate,
+            Duration::from_millis(10),
+        );
+        seed_client_bulk_evidence_for_test(&context, service.key);
+        context.health.lock().expect("path health lock").udp[service.key.index]
+            .relay_bytes_in_flight =
+            reliable_subflow_startup_sample_limit_bytes(context.mux_limits);
+        context.health.lock().expect("path health lock").udp[candidate.key.index]
+            .reserve_load(FlowLane::Latency);
+
+        let mut sender = RelaySenderService::new(stream_id);
+        sender.ordered_data_owner = Some(service.key);
+        sender.ordered_data_owner_instance = Some(service);
+        sender.try_start_request_quic_capacity_calibration(
+            &context,
+            &remotes,
+            FlowLane::Throughput,
+        );
+        assert!(sender.request_quic_capacity_calibration.is_none());
+        assert!(sender.request_quic_capacity_attempted_paths.is_empty());
+
+        context.health.lock().expect("path health lock").udp[candidate.key.index]
+            .release_load(FlowLane::Latency);
+        sender.try_start_request_quic_capacity_calibration(
+            &context,
+            &remotes,
+            FlowLane::Throughput,
+        );
+        assert!(sender.request_quic_capacity_calibration.is_some());
+        assert!(matches!(
+            try_recv_reliable_path_command(&mut candidate_rx),
+            Some(ReliablePathCommand::SendQuicCapacityProbe(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
+        let stream_id = StreamId(203);
+        let context = client_test_context_with_paths(&[
+            "udp://127.0.0.1:10323?srtt-ms=20&rate-mbps=500",
+            "udp://127.0.0.1:10324?srtt-ms=10&rate-mbps=500",
+        ]);
+        let (service_commands, _service_rx) = reliable_path_command_channels(8);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            opened_test_relay_stream_with_underlay(
+                stream_id,
+                UnderlayProtocol::Udp,
+                0,
+                service_commands,
+            ),
+            8,
+        );
+        let (candidate_commands, mut candidate_rx) = reliable_path_command_channels(8);
+        remotes.attach_for_validation(opened_test_relay_stream_with_underlay(
+            stream_id,
+            UnderlayProtocol::Udp,
+            1,
+            candidate_commands,
+        ));
+        consume_client_validation_proof_for_test(&mut candidate_rx);
+        let candidate_path = remotes
+            .paths
+            .iter()
+            .find(|path| path.placement == RelayPathPlacement::Validation)
+            .expect("Validation candidate");
+        let candidate_instance = candidate_path.instance();
+        let attached_at = candidate_path.attached_at;
+        let service_path = remotes
+            .paths
+            .iter()
+            .find(|path| path.placement == RelayPathPlacement::Active)
+            .expect("Active Service");
+        let service_instance = service_path.instance();
+        let service_attached_at = service_path.attached_at;
+        let train_deadline = Instant::now() + Duration::from_millis(40);
+        let mut sender = RelaySenderService::new(stream_id);
+        let proof = install_request_quic_capacity_calibration_for_test(
+            &mut sender,
+            &context,
+            candidate_instance,
+            attached_at,
+            train_deadline,
+            Duration::from_secs(2),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        sender.reconcile_request_subflow_set(&context, &remotes);
+        assert!(
+            sender
+                .request_graduated_subflows
+                .contains(&candidate_instance)
+        );
+        let _ = context.health.lock().expect("path health lock").udp[1].observe(proof.expires_at);
+        let next_lease = context
+            .try_reserve_request_quic_capacity_probe(
+                StreamId(208),
+                service_instance.key.index,
+                service_instance,
+                9_004,
+                PATH_OPEN_SCORE_BYTES as u64,
+                service_attached_at,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+                QuicCapacityProbeCommandTicket::new(),
+            )
+            .expect("an expired idle handoff is reclaimed by the next reservation");
+        sender.reconcile_request_subflow_set(&context, &remotes);
+
+        assert!(sender.request_quic_capacity_calibration.is_none());
+        assert!(
+            !sender
+                .request_graduated_subflows
+                .contains(&candidate_instance)
+        );
+        assert_eq!(
+            context.request_quic_capacity_product_handoff_state(1, proof.token),
+            RequestQuicCapacityProductHandoffState::Absent
+        );
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(209),
+                    service_instance.key.index,
+                    service_instance,
+                    9_005,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    service_attached_at,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_none()
+        );
+        drop(next_lease);
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(209),
+                    service_instance.key.index,
+                    service_instance,
+                    9_005,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    service_attached_at,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_some()
         );
     }
 
@@ -20306,6 +21348,95 @@ mod tests {
     }
 
     #[test]
+    fn request_quic_capacity_geometry_models_the_competing_service_pipe() {
+        let mux_limits = MuxLimits::default();
+        let mut service = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 180.0, 100_000_000.0);
+        service.product_bytes_in_flight = 3_000_000;
+        let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
+        candidate.inflight_limit_bytes = 262_144;
+
+        let geometry = request_quic_capacity_calibration_geometry(
+            service,
+            candidate,
+            100_000_000.0,
+            mux_limits,
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        )
+        .expect("the competing pipe should fit the default session envelope");
+
+        assert_eq!(geometry.warmup_carrier_bytes, 6_000_000);
+        assert_eq!(geometry.desired_warmup_carrier_bytes, 6_000_000);
+        assert_eq!(geometry.service_rate_bps, 100_000_000);
+        assert_eq!(geometry.service_product_flight_bytes, 3_000_000);
+        assert_eq!(
+            geometry.train_bytes,
+            geometry
+                .warmup_carrier_bytes
+                .saturating_add(geometry.required_timed_carrier_bytes)
+                .saturating_add(geometry.timing_slack_bytes),
+            "the strict window retains a full callback-batching guard after cold-start warmup"
+        );
+        assert_eq!(
+            geometry.accounting_slack_bytes,
+            PATH_OPEN_SCORE_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn request_quic_capacity_geometry_requires_measured_rate_and_budget() {
+        let mux_limits = MuxLimits::default();
+        let mut service = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 180.0, 100_000_000.0);
+        let candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
+
+        assert!(
+            request_quic_capacity_calibration_geometry(
+                service,
+                candidate,
+                f64::NAN,
+                mux_limits,
+                reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            )
+            .is_none(),
+            "an invalid carrier rate must not size capacity traffic"
+        );
+
+        service.product_bytes_in_flight =
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+        let bounded = request_quic_capacity_calibration_geometry(
+            service,
+            candidate,
+            100_000_000.0,
+            mux_limits,
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        )
+        .expect("a bounded train can still test capacity below a larger competing pipe");
+        assert_eq!(
+            bounded.train_bytes,
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits)
+        );
+        assert!(bounded.desired_warmup_carrier_bytes > bounded.warmup_carrier_bytes);
+    }
+
+    #[test]
+    fn request_quic_capacity_lease_covers_cold_congestion_window_growth() {
+        let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
+        candidate.jitter_ms = 90.0;
+        let train_bytes = 8_553_080;
+        let rounds = request_quic_capacity_slow_start_rounds(train_bytes);
+        let pto = transport_pto_from_snapshot(Some(candidate));
+        let modeled_round_trip = Duration::from_millis(180).max(pto.div_f64(BBR_DEFAULT_CWND_GAIN));
+
+        assert_eq!(rounds, 10);
+        assert!(
+            request_quic_capacity_calibration_lease(candidate, train_bytes)
+                >= modeled_round_trip
+                    .saturating_mul(rounds)
+                    .saturating_add(pto),
+            "a competing-pipe train must not inherit the smaller startup-sample deadline"
+        );
+    }
+
+    #[test]
     fn quic_capacity_calibration_prefers_fresh_path_before_retry() {
         let mux_limits = MuxLimits::default();
         let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
@@ -20403,11 +21534,11 @@ mod tests {
 
         assert_eq!(
             response_quic_capacity_calibration_train_bytes(&udp, mux_limits),
-            1_046_210,
-            "v21's grown window needs one fresh strict-proof window, not another fixed 256 KiB"
+            1_111_746,
+            "the grown window needs one strict-proof window plus one pacing guard"
         );
         assert!(
-            response_quic_capacity_calibration_lease(&udp, 1_046_210)
+            response_quic_capacity_calibration_lease(&udp, 1_111_746)
                 >= transport_pto_from_snapshot(Some(udp.snapshot)),
             "the admitted train lease must cover at least one recovery horizon"
         );

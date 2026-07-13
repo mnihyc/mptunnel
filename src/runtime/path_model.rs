@@ -761,6 +761,13 @@ pub(super) fn path_model_srtt_ms(path: &PathSpec, observation: ClientPathObserva
 }
 
 pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
+    if (observation.explicit_carrier_capacity_proof || observation.quic_capacity_rate_prior_fresh)
+        && observation.carrier_delivery_rate_bps.is_some()
+    {
+        // One fresh fenced train represents a full multi-packet sample, not
+        // one ordinary ACK. Product handoff durability is modeled separately.
+        return 1.0;
+    }
     let delivery_confidence = (f64::from(
         observation
             .delivery_samples
@@ -896,12 +903,13 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
 pub(super) fn bulk_candidate_has_native_carrier_rate_evidence(
     observation: ClientPathObservation,
 ) -> bool {
-    observation.carrier_delivery_rate_bps.is_some()
-        && observation.carrier_ack_derived_data_seen
-        && observation.carrier_delivery_samples > 0
-        && !observation.carrier_app_limited
-        && observation.carrier_delivery_sample_bytes
-            >= client_path_observation_bulk_sample_floor_bytes(observation)
+    (observation.explicit_carrier_capacity_proof && observation.carrier_delivery_rate_bps.is_some())
+        || (observation.carrier_delivery_rate_bps.is_some()
+            && observation.carrier_ack_derived_data_seen
+            && observation.carrier_delivery_samples > 0
+            && !observation.carrier_app_limited
+            && observation.carrier_delivery_sample_bytes
+                >= client_path_observation_bulk_sample_floor_bytes(observation))
 }
 
 pub(super) fn bulk_candidate_has_fresh_native_carrier_rate_evidence(
@@ -935,9 +943,10 @@ fn client_path_observation_has_durable_product_progress(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    reliable_product_delivery_samples(path, observation) > 0
-        && observation.product_delivery_sample_bytes
-            >= client_path_observation_bulk_sample_floor_bytes(observation)
+    (path.underlay == UnderlayProtocol::Udp && observation.quic_capacity_product_handoff_complete)
+        || (reliable_product_delivery_samples(path, observation) > 0
+            && observation.product_delivery_sample_bytes
+                >= client_path_observation_bulk_sample_floor_bytes(observation))
 }
 
 pub(super) fn bulk_candidate_has_sender_delivery_evidence(
@@ -1146,5 +1155,36 @@ mod tests {
             now - Duration::from_secs(20),
             now,
         ));
+    }
+
+    #[test]
+    fn explicit_capacity_proof_does_not_inherit_the_grown_native_sample_floor() {
+        let proof = ClientPathObservation {
+            carrier_delivery_rate_bps: Some(117_000_000.0),
+            carrier_inflight_limit_bytes: 16 * 1024 * 1024,
+            carrier_delivery_samples: 1,
+            carrier_delivery_sample_bytes: 247_544,
+            carrier_app_limited: false,
+            carrier_ack_derived_data_seen: true,
+            explicit_carrier_capacity_proof: true,
+            ..ClientPathObservation::default()
+        };
+
+        assert!(bulk_candidate_has_native_carrier_rate_evidence(proof));
+        assert_eq!(path_model_confidence(proof), 1.0);
+        assert!(
+            !bulk_candidate_has_native_carrier_rate_evidence(ClientPathObservation {
+                explicit_carrier_capacity_proof: false,
+                ..proof
+            }),
+            "generic rolling ACK evidence still requires coverage of its live carrier window"
+        );
+        assert!(
+            path_model_confidence(ClientPathObservation {
+                explicit_carrier_capacity_proof: false,
+                ..proof
+            }) < 1.0,
+            "one ordinary aggregate sample must not inherit capacity-train confidence"
+        );
     }
 }

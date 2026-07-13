@@ -873,6 +873,30 @@ fn client_snapshot_graduates_product_progress_only_at_bulk_sample_floor() {
     assert!(!point_rate.has_durable_product_progress);
     assert!(!bulk_candidate_has_bulk_rate_evidence(&path, observation));
 
+    let handed_off_observation = ClientPathObservation {
+        carrier_delivery_rate_bps: Some(117_000_000.0),
+        carrier_delivery_samples: 1,
+        carrier_delivery_sample_bytes: sample_floor - 1,
+        carrier_ack_derived_data_seen: true,
+        quic_capacity_product_handoff_complete: true,
+        quic_capacity_rate_prior_fresh: true,
+        ..ClientPathObservation::default()
+    };
+    let handed_off = path_snapshot(&path, 0, handed_off_observation);
+    assert!(handed_off.has_durable_product_progress);
+    assert!(bulk_candidate_has_bulk_rate_evidence(
+        &path,
+        handed_off_observation
+    ));
+    assert_eq!(path_model_confidence(handed_off_observation), 1.0);
+
+    let stale_rate_prior = ClientPathObservation {
+        quic_capacity_rate_prior_fresh: false,
+        ..handed_off_observation
+    };
+    assert!(path_snapshot(&path, 0, stale_rate_prior).has_durable_product_progress);
+    assert!(path_model_confidence(stale_rate_prior) < 1.0);
+
     observation.product_delivery_sample_bytes = sample_floor;
     let durable = path_snapshot(&path, 0, observation);
     assert!(durable.has_durable_product_progress);
@@ -901,6 +925,7 @@ fn data_plane_failure_invalidates_durable_product_and_native_window_authority() 
     assert_eq!(after_failure.product_delivery_sample_bytes, 0);
     assert!(after_failure.carrier_delivery_rate_bps.is_none());
     assert_eq!(after_failure.carrier_inflight_limit_bytes, 0);
+    assert!(!after_failure.quic_capacity_product_handoff_complete);
     assert!(!path_snapshot(&path, 0, after_failure).has_durable_product_progress);
 }
 

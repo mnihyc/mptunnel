@@ -1253,9 +1253,11 @@ async fn abandoned_quic_capacity_command_releases_queue_debt_and_ticket() {
     let ticket = QuicCapacityProbeCommandTicket::new();
     let train_payload_bytes = 512 * 1024_u64;
     tx.try_enqueue_quic_capacity_probe(QuicCapacityProbeCommand {
-        binding_instance_id: 11,
+        owner: QuicCapacityProbeOwner::Response {
+            binding_instance_id: 11,
+            path_instance_id: next_server_carrier_path_instance_id(),
+        },
         path_id: PathId(3),
-        path_instance_id: next_server_carrier_path_instance_id(),
         calibration_id: 17,
         train_payload_bytes,
         sample_floor_bytes: 256 * 1024,
@@ -1289,9 +1291,11 @@ async fn dequeued_quic_capacity_command_drop_cancels_ticket_and_receiver_debt() 
     let ticket = QuicCapacityProbeCommandTicket::new();
     let train_payload_bytes = 512 * 1024_u64;
     tx.try_enqueue_quic_capacity_probe(QuicCapacityProbeCommand {
-        binding_instance_id: 12,
+        owner: QuicCapacityProbeOwner::Response {
+            binding_instance_id: 12,
+            path_instance_id: next_server_carrier_path_instance_id(),
+        },
         path_id: PathId(4),
-        path_instance_id: next_server_carrier_path_instance_id(),
         calibration_id: 18,
         train_payload_bytes,
         sample_floor_bytes: 256 * 1024,

@@ -76,9 +76,10 @@ Mbps, 2.078x that detached single-path control. These rows prove current TCP
 response aggregation in this shaped cohort, including one-flow optional-path
 use; they do not prove QUIC, mixed-carrier, heterogeneous, failover,
 real-Internet, or current MPTCP/Hysteria2 results.
-The result is not ideal: overall one-flow gain is only 1.139-1.182x, absolute
-goodput remains below one nominal 500 Mbps path, and matched container samples
-show materially higher CPU and memory for multipath.
+Those initial results were not ideal: overall one-flow gain was only
+1.139-1.182x, absolute goodput remained below one nominal 500 Mbps path, and
+matched container samples showed materially higher CPU and memory for
+multipath.
 
 A final ownership audit found that Service could assign beyond the reservoir
 assumed by TCP calibration opportunity. The corrected final binary bounds total
@@ -88,8 +89,38 @@ Iteration 124 reaches 319.401 Mbps overall and 561.482 Mbps in the final window;
 against the adjacent Iteration 122 single control at 301.301/439.178 Mbps, this
 is 1.060x/1.278x. The unsafe pre-cap A/B reaches 346.852/459.599 Mbps. Thus the
 correction gives up 7.9% overall but improves late delivery 22.2% and uses the
-alternate path more materially. Its early calibration cost remains an explicit
-optimization target, not an ideal result.
+alternate path more materially. Iteration 126 then proved the remaining cost:
+one endpoint-only candidate serialized 4.46 MiB of staged calibration from
+5.3-8.8 seconds and published only a 19.6 Mbps capacity prior on a nominal
+500 Mbps path. Iteration 127 replaces that redundant phase with the typed
+Service opportunity prior; the matched causal row improves from 110.189 to
+175.841 Mbps, with no calibration event and ordinary alternate ownership
+beginning immediately after startup drain.
+
+The final diagnostics-disabled Iteration 128 pair reaches 236.774 Mbps
+multipath against 112.274 Mbps single, or 2.109x overall and 2.368x in the
+final three seconds. The adjacent single confirms another slow host epoch, so
+the ratio and phase shape are authoritative rather than comparison with old
+absolute rates. The two material server paths carry 75.5% and 24.5% of bytes.
+This closes the silent early-throughput downgrade, but resource and gap cost
+remain non-ideal: average server CPU is 9.398% versus 2.462%, peak server memory
+is 208.8 versus 134.6 MB, and maximum read gap is 0.599 versus 0.494 seconds.
+
+The separate default heterogeneous Iteration 129 guard is not ideal. Multipath
+reaches 104.531 Mbps versus the adjacent 500 Mbps-path single at 110.489 Mbps,
+or 0.946x, although first body and maximum read gap improve from 1.428/0.845 to
+0.170/0.203 seconds. It aggregates low-latency and balanced paths but leaves the
+fat path at control-only traffic. This is still 41.5-42.1% above the closest
+preserved one-flow heterogeneous results, so it is an unresolved capacity gap,
+not a silently accepted regression. Attempts to serially sample later cold TCP
+paths were rejected: they made fat-path traffic material but increased maximum
+read gap to 0.525-1.269 seconds. Solving this safely requires native per-socket
+TCP carrier evidence or a non-ordering probe, not another Service-rate guess.
+The Iteration 135 negative guard puts one 200 Mbps low-latency Service beside
+four 50 Mbps, 420 ms, 10%-loss optional paths. Multipath stays at 182.247 Mbps
+versus 182.777 Mbps single, with 0.251/0.247 second maximum gaps, while every
+slow optional remains control-only. Thus the current startup completion gate
+prevents a clearly slower candidate from receiving the borrowed prior.
 
 ## Config File
 
@@ -422,13 +453,17 @@ sample within the current Service backlog reservoir; an already-bound exact
 startup epoch may finish. This prevents serial cold candidates from inserting a
 slow ordered prefix.
 
-After startup flight drains, TCP may run one exact-instance staged product-ACK
-calibration. Its credit is cumulative and non-refilling; strict causal windows
-grow the authorized ceiling only within path-flight, repair, reorder, and stream
-resources. Qualifying aggregates publish a robust median after exact drain as a
-typed path-capacity prior. Ten completed ordinary exact-ACK windows plus a usable
-continuous delivery sample then replace that prior atomically with per-flow
-goodput. Fragmented callbacks do not count as windows, and the calibration clock
+After startup flight drains, endpoint-only TCP with no independent carrier
+evidence inherits the proven same-family Service rate as a temporary typed
+path-capacity prior and enters ordinary bounded Subflow admission. Ten completed
+ordinary exact-ACK windows plus a usable continuous delivery sample replace it
+atomically with per-flow goodput. Configured or independently measured paths
+preserve their own evidence and may run one exact-instance staged product-ACK
+fallback calibration. Its credit is cumulative and non-refilling; strict causal
+windows grow the authorized ceiling only within path-flight, repair, reorder,
+and stream resources. Qualifying aggregates publish a robust median after exact
+drain as the same typed path-capacity prior. Fragmented callbacks do not count
+as windows, and the calibration clock
 is reset so provisional capacity cannot silently become permanent per-flow
 evidence. Service ownership does not move during calibration, and failed enqueue
 rolls back the exact reservation. While its exact prefix remains outstanding,

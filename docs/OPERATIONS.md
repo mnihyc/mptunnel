@@ -178,10 +178,13 @@ bulk response may spend the first bounded same-family startup sample. Once a
 measured response Subflow exists, a later cold candidate must project completion
 of its whole startup sample inside the current Service backlog reservoir; a
 sample already bound to an exact epoch may drain. The robust TCP calibration
-median becomes a typed path-capacity prior after exact drain. It is replaced,
-not blended, only after ten completed ordinary exact-ACK windows and a usable
-continuous per-flow sample. Fragmented callbacks do not count as windows, and
-QUIC continues to require native carrier evidence.
+median is now a fallback for configured or independently measured candidates.
+Endpoint-only TCP instead installs the proven same-family Service opportunity
+as a temporary typed path-capacity prior after exact drain and moves to ordinary
+bounded Subflow work. Either prior is replaced, not blended, only after ten
+completed ordinary exact-ACK windows and a usable continuous per-flow sample.
+Fragmented callbacks do not count as windows, and QUIC continues to require
+native carrier evidence.
 
 Iterations 118 and 119 are the initial clean one-flow TCP download controls on
 five 500 Mbps, 180 ms, 1 ms-jitter, zero-loss paths. Multipath reached 273.437
@@ -200,10 +203,38 @@ that prefix plus one Service feed reservoir, clamped to the product envelope;
 Service queue/native flight already included in ETA is not counted twice.
 Iteration 124 reaches 319.401 Mbps overall and 561.482 Mbps final-three-seconds
 against the adjacent 301.301/439.178 Mbps single control. The unsafe pre-cap A/B
-is 346.852/459.599 Mbps. Operators should therefore expect a current stability
-tradeoff: bounded calibration costs 7.9% overall in this run but improves late
+is 346.852/459.599 Mbps. At that point the stability
+tradeoff was explicit: bounded calibration cost 7.9% overall but improved late
 delivery 22.2%. This is an open performance issue, not permission to remove the
 ownership bound.
+
+Iterations 126-128 resolve that early cost for endpoint-only TCP without
+removing the ownership bound. The causal pair eliminates the 5.3-8.8 second,
+4.46 MiB exclusive stage and improves diagnostic goodput from 110.189 to
+175.841 Mbps. The clean adjacent pair reaches 236.774 Mbps multipath versus
+112.274 Mbps single, or 2.109x overall and 2.368x late, with 75.5/24.5% material
+path shares. The adjacent single is much slower than Iteration 122, so use the
+paired ratio rather than cross-epoch absolute rates. Server CPU, peak memory,
+and maximum gap remain higher at 9.398/2.462%, 208.8/134.6 MB, and
+0.599/0.494 seconds for multipath/single.
+
+The default heterogeneous Iteration 129 guard remains below the adjacent best
+single path: 104.531 versus 110.489 Mbps. It is faster and smoother than the
+closest preserved one-flow heterogeneous runs, but uses only lowlat and
+balanced materially. Do not enable later cold paths merely by copying Service
+rate into their completion projection. Iterations 131-134 tried that and were
+rejected after producing 0.525-1.269 second read gaps; the later clean/mitigated
+Iterations 132-134 remain at 0.791-1.269 seconds. A safe next step is
+Linux TCP_INFO sampling at the exact server carrier instance, published through
+the existing direction-correct local `PathMetrics`; upload/client telemetry is
+a separate boundary because throughput and latency TCP sessions must not be
+collapsed into one path record.
+
+Iteration 135 confirms that the accepted completion gate blocks an obviously
+slow candidate before the Service prior is installed. With lowlat at
+200 Mbps/20 ms and four optionals at 50 Mbps/420 ms/10% loss, multipath/single
+is 182.247/182.777 Mbps and maximum gap is 0.251/0.247 seconds; optional path
+traffic is control-only.
 
 A QUIC bulk stream advertises the configured product receive window, 64 MiB by
 default. This is receiver-memory authority, not the QUIC congestion window or

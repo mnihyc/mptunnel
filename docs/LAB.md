@@ -84,6 +84,10 @@ from UDP/QUIC carrier metrics. TCP calibration events record the binding-local
 cumulative spent credit, current and resource ceilings, stage authorization,
 prior ACK, and earliest/latest sampled send times. The binding ID is required
 because concurrent response streams can share session and path identities.
+`response_tcp_capacity_prior phase=service_opportunity` records the endpoint-only
+fast path that skips exclusive calibration after exact startup drain. Correlate
+it with the absence of a same-identity `response_ack_clock_calibration` event
+and with later ordinary `same_family_subflow_reservoir` selections.
 
 The staged exact-receipt handoff case uses two fixed HTTP requests and rejects
 replacement bindings. It first observes two TCP Service bindings, keeps the
@@ -533,6 +537,44 @@ the unsafe A/B, bounded ownership changes -7.9% overall, +22.2% late, and
 1.060x overall and 1.278x late. This is retained as a necessary stability model
 correction, not an ideal performance result: reducing safe early calibration
 cost without restoring speculative tail growth is the next TCP response issue.
+
+Iterations 126-128 close that specific issue without weakening the reservoir.
+The matched one-flow diagnostic shows the old endpoint-only path spending
+4,456,448 exclusive calibration bytes from about 5.3 through 8.8 seconds and
+publishing only 19.586 Mbps. The successor emits one
+`response_tcp_capacity_prior`, zero calibration events, and 710 ordinary
+same-family reservoir selections; goodput rises from 110.189 to 175.841 Mbps,
+while `[6,9)` rises from 121.635 to 272.280 Mbps. The clean Iteration 128 pair
+uses one logical flow, no diagnostics, and the same 18-second profile. It reaches
+236.774 Mbps multipath versus 112.274 Mbps single, or 2.109x overall and 2.368x
+in the final three seconds. Two paths carry 75.5/24.5% of material server bytes.
+The slow adjacent single is another host epoch warning, so do not compare these
+absolute rates directly with Iteration 124. Remaining non-ideal costs are
+9.398/2.462% average server CPU, 208.8/134.6 MB peak server memory, and
+0.599/0.494 seconds maximum read gap for multipath/single.
+
+Iteration 129 is the separate one-flow default heterogeneous guard. It reaches
+104.531 Mbps multipath versus 110.489 Mbps on the adjacent fat single path,
+with first body 0.170/1.428 seconds and maximum read gap 0.203/0.845 seconds.
+Server interface counters attribute 61.7% of material multipath bytes to lowlat
+and 38.2% to balanced; fat remains control-only. Closest preserved one-flow
+heterogeneous rows are only 73.540-73.887 Mbps, so the result is an improvement
+but still fails the best-single aggregation objective.
+
+Iterations 131-134 are rejected causal experiments, not performance baselines.
+Sequential later-path startup makes mild-loss and fat traffic material, but its
+ordered 256 KiB samples create 0.525-1.269 second read gaps; Iterations 132-134
+remain at 0.791-1.269 seconds even after adding a prefix-horizon and one-PTO
+admission margin. The sender ETA is therefore not a receiver-prefix deadline.
+Current code retains the Iteration 129 behavior until native TCP carrier evidence
+or a non-ordering probe can distinguish useful cold paths without placing
+product offsets behind them.
+
+Iteration 135 is the negative Service-prior guard. It shapes lowlat at
+200 Mbps/20 ms/0.1% loss and every optional path at 50 Mbps/420 ms/10% loss.
+Multipath reaches 182.247 Mbps versus 182.777 Mbps single, with 0.251/0.247
+second maximum gaps. Optional interfaces remain control-only, proving the
+completion gate rejects clearly slower candidates before prior installation.
 
 ## Interpreting Results
 

@@ -1058,7 +1058,7 @@ impl ResponseStreamBinding {
                     delivery_rate_bps: None,
                     tcp_ack_clock_rate_bps: None,
                     tcp_product_rate_evidence: None,
-                    tcp_calibration_prior: None,
+                    tcp_capacity_prior: None,
                     srtt_ms: None,
                     delivery_samples: 0,
                     owner_data_acked_bytes: 0,
@@ -1199,7 +1199,7 @@ impl ResponseStreamBinding {
                         entry.delivery_rate_bps = None;
                         entry.tcp_ack_clock_rate_bps = None;
                         entry.tcp_product_rate_evidence = None;
-                        entry.tcp_calibration_prior = None;
+                        entry.tcp_capacity_prior = None;
                         entry.srtt_ms = None;
                         entry.delivery_samples = 0;
                         entry.owner_data_acked_bytes = 0;
@@ -1303,7 +1303,7 @@ impl ResponseStreamBinding {
                 entry.delivery_rate_bps = None;
                 entry.tcp_ack_clock_rate_bps = None;
                 entry.tcp_product_rate_evidence = None;
-                entry.tcp_calibration_prior = None;
+                entry.tcp_capacity_prior = None;
                 entry.srtt_ms = None;
                 entry.delivery_samples = 0;
                 entry.owner_data_acked_bytes = 0;
@@ -1346,7 +1346,7 @@ impl ResponseStreamBinding {
                 delivery_rate_bps: None,
                 tcp_ack_clock_rate_bps: None,
                 tcp_product_rate_evidence: None,
-                tcp_calibration_prior: None,
+                tcp_capacity_prior: None,
                 srtt_ms: None,
                 delivery_samples: 0,
                 owner_data_acked_bytes: 0,
@@ -2070,32 +2070,32 @@ impl ResponseStreamBinding {
                     .is_some_and(|metrics| metrics.metrics.app_limited);
                 let calibrated_rate_bps =
                     calibration_snapshot.and_then(|calibration| calibration.calibrated_rate_bps);
-                let mut ordinary_tcp_rate_replaces_calibration = false;
+                let mut ordinary_tcp_rate_replaces_capacity_prior = false;
                 if entry.key.underlay == UnderlayProtocol::Tcp
                     && !calibration_identity_active
                     && calibration_update.is_none()
                     && tcp_ack_clock_window_complete
-                    && let Some(prior) = entry.tcp_calibration_prior.as_mut()
+                    && let Some(prior) = entry.tcp_capacity_prior.as_mut()
                 {
                     prior.ordinary_windows = prior.ordinary_windows.saturating_add(1);
-                    ordinary_tcp_rate_replaces_calibration =
+                    ordinary_tcp_rate_replaces_capacity_prior =
                         product_delivery_samples_override_startup_prior(prior.ordinary_windows)
                             && tcp_ack_clock_sample.is_some();
                 }
-                if ordinary_tcp_rate_replaces_calibration {
-                    entry.tcp_calibration_prior = None;
+                if ordinary_tcp_rate_replaces_capacity_prior {
+                    entry.tcp_capacity_prior = None;
                 }
-                // The terminal ACK stays calibration-owned. A robust bounded
-                // result remains only a startup prior until a fresh ordinary
+                // A terminal calibration ACK remains exclusive, while either
+                // capacity-prior source stays temporary until a fresh ordinary
                 // exact-ACK epoch reaches the normal evidence threshold.
-                let tcp_calibration_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
+                let tcp_measurement_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
                     && (calibration_identity_active
                         || calibration_update.is_some()
-                        || entry.tcp_calibration_prior.is_some()
+                        || entry.tcp_capacity_prior.is_some()
                         || calibration_snapshot.is_some_and(|calibration| {
                             !calibration.proven && !calibration.retired
                         }));
-                if !tcp_calibration_owns_rate {
+                if !tcp_measurement_owns_rate {
                     match (
                         entry.key.underlay,
                         tcp_ack_clock_sample,
@@ -2352,13 +2352,13 @@ impl ResponseStreamBinding {
                     // ACK clock that will eventually replace its startup prior.
                     entry.tcp_product_rate_evidence = None;
                     entry.tcp_ack_clock_rate_bps = None;
-                    entry.tcp_calibration_prior = transition_snapshot
+                    entry.tcp_capacity_prior = transition_snapshot
                         .and_then(|state| state.calibrated_rate_bps)
-                        .map(|rate_bps| TcpResponseCalibrationPrior {
+                        .map(|rate_bps| TcpResponseCapacityPrior {
                             rate_bps,
                             ordinary_windows: 0,
                         });
-                    if let Some(prior) = entry.tcp_calibration_prior {
+                    if let Some(prior) = entry.tcp_capacity_prior {
                         entry.product_progress_rate_bps = Some(prior.rate_bps);
                         entry.delivery_rate_bps = Some(prior.rate_bps);
                     }
@@ -2847,7 +2847,8 @@ impl ResponseStreamBinding {
             match entry.key.underlay {
                 // Scheduler assignment is not a TCP send clock. Completing the
                 // finite startup sample proves ownership/reachability and opens
-                // calibration; only a later ACK-to-ACK window publishes rate.
+                // prior selection or fallback measurement; only an exact ACK
+                // clock may replace either temporary capacity value.
                 UnderlayProtocol::Tcp => {
                     sealed_sample_bytes.is_some_and(|bytes| entry.owner_data_acked_bytes >= bytes)
                 }
@@ -2877,6 +2878,7 @@ impl ResponseStreamBinding {
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
+        let service_key = state.set.as_ref().map(FlowSubflowSet::service_key);
         let graduated = state
             .set
             .as_mut()
@@ -2887,32 +2889,96 @@ impl ResponseStreamBinding {
                 outputs.entries[owner_position].incarnation,
             );
             if owner_identity.0.underlay == UnderlayProtocol::Tcp {
-                let calibration_snapshot = server_bulk_output_snapshot(
+                let service_capacity_prior_bps = if server_output_accepts_service_capacity_prior(
                     &outputs.entries[owner_position],
-                    self.session_id,
-                    lane,
-                    &self.lane_tracker,
-                    self.mux_limits,
-                    Instant::now(),
-                );
-                let initial_limit = reliable_tcp_ack_clock_calibration_initial_limit_bytes(
-                    calibration_snapshot,
-                    self.mux_limits,
-                );
-                let max_limit = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
-                if initial_limit > 0 && max_limit >= initial_limit {
-                    let coverage_floor =
-                        reliable_ack_clock_calibration_rate_coverage_floor_bytes(self.mux_limits);
-                    outputs
-                        .ack_clock_calibrations
-                        .entry(owner_identity)
-                        .or_insert_with(|| {
-                            ResponseAckClockCalibrationState::new_with_rate_coverage_floor(
-                                initial_limit,
-                                max_limit,
-                                coverage_floor,
-                            )
-                        });
+                ) {
+                    service_key.and_then(|service_key| {
+                        outputs
+                            .entries
+                            .iter()
+                            .find(|entry| {
+                                entry.key == service_key
+                                    && entry.key.underlay == owner_identity.0.underlay
+                                    && entry.role != StreamOpenRole::Repair
+                                    && !entry.commands.is_closed()
+                                    && server_output_has_bulk_rate_evidence_with_limits(
+                                        entry,
+                                        self.mux_limits,
+                                    )
+                            })
+                            .map(|service| {
+                                server_bulk_output_snapshot(
+                                    service,
+                                    self.session_id,
+                                    lane,
+                                    &self.lane_tracker,
+                                    self.mux_limits,
+                                    Instant::now(),
+                                )
+                                .delivery_rate_bps
+                            })
+                    })
+                } else {
+                    None
+                };
+                if let Some(rate_bps) = service_capacity_prior_bps {
+                    // The exact startup sample already proved reachability and
+                    // bounded ownership. Endpoint-only TCP has no independent
+                    // carrier hint to preserve, so ordinary shared work can use
+                    // the same typed Service opportunity that admitted a
+                    // calibration seed. A fresh exact-ACK epoch replaces it.
+                    let entry = &mut outputs.entries[owner_position];
+                    entry.tcp_product_rate_evidence = None;
+                    entry.tcp_ack_clock_rate_bps = None;
+                    entry.tcp_capacity_prior = Some(TcpResponseCapacityPrior {
+                        rate_bps,
+                        ordinary_windows: 0,
+                    });
+                    entry.product_progress_rate_bps = Some(rate_bps);
+                    entry.delivery_rate_bps = Some(rate_bps);
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "response_tcp_capacity_prior",
+                        format_args!(
+                            "phase=service_opportunity session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} rate_bps={}",
+                            self.session_id.0,
+                            self.binding_instance_id,
+                            owner_identity.0.underlay,
+                            owner_identity.0.path_id.0,
+                            owner_identity.1,
+                            rate_bps,
+                        ),
+                    );
+                } else {
+                    let calibration_snapshot = server_bulk_output_snapshot(
+                        &outputs.entries[owner_position],
+                        self.session_id,
+                        lane,
+                        &self.lane_tracker,
+                        self.mux_limits,
+                        Instant::now(),
+                    );
+                    let initial_limit = reliable_tcp_ack_clock_calibration_initial_limit_bytes(
+                        calibration_snapshot,
+                        self.mux_limits,
+                    );
+                    let max_limit = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
+                    if initial_limit > 0 && max_limit >= initial_limit {
+                        let coverage_floor =
+                            reliable_ack_clock_calibration_rate_coverage_floor_bytes(
+                                self.mux_limits,
+                            );
+                        outputs
+                            .ack_clock_calibrations
+                            .entry(owner_identity)
+                            .or_insert_with(|| {
+                                ResponseAckClockCalibrationState::new_with_rate_coverage_floor(
+                                    initial_limit,
+                                    max_limit,
+                                    coverage_floor,
+                                )
+                            });
+                    }
                 }
             }
             // Preserve the epoch and its measured members, but invalidate any
@@ -3920,18 +3986,8 @@ impl ResponseStreamBinding {
                             entry,
                             self.mux_limits,
                         ));
-                let endpoint_only_service_prior_eligible = entry.key.underlay
-                    == UnderlayProtocol::Tcp
-                    && !product_delivery_samples_override_startup_prior(entry.delivery_samples)
-                    && !entry.local_path_metrics.is_some_and(|metrics| {
-                        metrics.source == ServerPathMetricsSource::LocalSender
-                            && metrics.metrics.has_ack_derived_data_sample
-                    })
-                    && entry.peer_path_metrics.is_some_and(|metrics| {
-                        metrics.source == ServerPathMetricsSource::PeerHint
-                            && metrics.metrics.app_limited
-                            && !metrics.metrics.has_ack_derived_data_sample
-                    });
+                let endpoint_only_service_prior_eligible =
+                    server_output_accepts_service_capacity_prior(entry);
                 #[cfg(feature = "lab-diagnostics")]
                 self.lab_response_service_feed_state(
                     entry,
@@ -7625,7 +7681,7 @@ mod tests {
         assert_eq!(outputs.active_ack_clock_calibration, None);
         assert!(entry.tcp_product_rate_evidence.is_none());
         assert!(entry.tcp_ack_clock_rate_bps.is_none());
-        assert!(entry.tcp_calibration_prior.is_none());
+        assert!(entry.tcp_capacity_prior.is_none());
         drop(outputs);
 
         let next_offset = (2 * window_bytes) as u64;
@@ -7712,9 +7768,7 @@ mod tests {
         assert!(entry.tcp_ack_clock_rate_bps.is_none());
         assert_eq!(entry.srtt_ms, Some(10.0));
         assert!(entry.tcp_product_rate_evidence.is_none());
-        let prior = entry
-            .tcp_calibration_prior
-            .expect("robust calibration prior");
+        let prior = entry.tcp_capacity_prior.expect("robust capacity prior");
         assert_test_rate_close(Some(prior.rate_bps), 110_000_000.0);
         assert_eq!(prior.ordinary_windows, 0);
         assert_eq!(outputs.active_ack_clock_calibration, None);
@@ -7751,8 +7805,8 @@ mod tests {
         let entry = first_output_entry(&binding);
         assert_eq!(
             entry
-                .tcp_calibration_prior
-                .expect("fragmented ACKs retain calibration prior")
+                .tcp_capacity_prior
+                .expect("fragmented ACKs retain capacity prior")
                 .ordinary_windows,
             0,
             "callbacks smaller than one exact ACK window are not evidence samples"
@@ -7784,12 +7838,12 @@ mod tests {
             .iter()
             .find(|entry| (entry.key, entry.incarnation) == identity)
             .expect("TCP output");
-        assert!(entry.tcp_calibration_prior.is_none());
+        assert!(entry.tcp_capacity_prior.is_none());
         assert!(
             entry
                 .delivery_rate_bps
                 .is_some_and(|rate_bps| rate_bps < 110_000_000.0),
-            "mature ordinary exact-ACK evidence must replace the bounded calibration prior"
+            "mature ordinary exact-ACK evidence must replace the bounded capacity prior"
         );
         assert_eq!(entry.product_progress_rate_bps, entry.delivery_rate_bps);
         assert_eq!(entry.tcp_ack_clock_rate_bps, entry.delivery_rate_bps);
@@ -8139,6 +8193,166 @@ mod tests {
                 .and_then(|epoch| epoch.startup_owner_key()),
             Some(second)
         );
+    }
+
+    #[test]
+    fn endpoint_only_tcp_startup_uses_service_capacity_prior_without_exclusive_calibration() {
+        let limits = MuxLimits::default();
+        let sample_bytes = reliable_subflow_startup_sample_limit_bytes(limits) as usize;
+        let service = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(0),
+        };
+        let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+        let binding = ResponseStreamBinding::new(
+            SessionId(42),
+            service.underlay,
+            service.path_id,
+            service_commands,
+            FlowLane::Throughput,
+        );
+        let candidate = CarrierPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            path_id: PathId(1),
+        };
+        let (candidate_commands, _candidate_receivers) = reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                candidate.underlay,
+                candidate.path_id,
+                candidate_commands,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                reliable_relay_buffer_len(limits),
+            ),
+            ResponseStreamAttachOutcome::Attached
+        );
+        binding.mark_output_bulk_proven_for_test(service);
+        binding.update_path_metrics(
+            candidate,
+            PathMetrics {
+                path_id: candidate.path_id,
+                underlay: candidate.underlay,
+                direction: PathMetricDirection::ServerToClient,
+                metric_epoch: metric_epoch_now(),
+                metric_age_us: 0,
+                min_rtt_us: 333_000,
+                srtt_us: 333_000,
+                rttvar_us: 0,
+                jitter_us: 0,
+                delivery_rate_bps: 1,
+                pacing_rate_bps: 1,
+                loss_ppm: 0,
+                ecn_ppm: 0,
+                loss_observed: false,
+                ecn_observed: false,
+                bytes_in_flight: 0,
+                queue_bytes: 0,
+                inflight_limit_bytes: 0,
+                inflight_hi_bytes: 0,
+                confidence_ppm: 0,
+                app_limited: true,
+                has_ack_derived_data_sample: false,
+                data_sample_count: 0,
+                data_sample_bytes: 0,
+            },
+            ServerPathMetricsSource::PeerHint,
+        );
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            let service_entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == service)
+                .expect("Service output");
+            let candidate_entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("candidate output");
+            assert!(server_output_has_bulk_rate_evidence_with_limits(
+                service_entry,
+                limits
+            ));
+            assert!(server_output_accepts_service_capacity_prior(
+                candidate_entry
+            ));
+        }
+        assert_eq!(
+            binding
+                .commit_subflow_owner_admission(
+                    service,
+                    sample_bytes,
+                    0,
+                    Duration::ZERO,
+                    SubflowAdmissionInput {
+                        key: candidate,
+                        bulk_rate_proven: false,
+                        startup_owner_allowed: true,
+                        frontier_clear: true,
+                        completion_improves: false,
+                        observed_goodput_non_degrading: true,
+                        read_gap: Duration::ZERO,
+                        owner_bytes: sample_bytes,
+                        optional_overhead_bytes: 0,
+                    },
+                )
+                .decision,
+            PathAdmissionDecision::AdmitSubflow
+        );
+        binding.record_owner_flight(candidate, &stream_data_frame(sample_bytes));
+        std::thread::sleep(Duration::from_millis(1));
+        binding.release_normalized_acked_ranges(&[OffsetRange {
+            start: 0,
+            end: sample_bytes as u64,
+        }]);
+        assert_eq!(
+            binding
+                .subflow_state_snapshot()
+                .1
+                .and_then(|epoch| epoch.startup_owner_key()),
+            None,
+            "exact startup drain must graduate before installing a capacity prior"
+        );
+
+        {
+            let outputs = binding.outputs.lock().expect("test response outputs lock");
+            let entry = outputs
+                .entries
+                .iter()
+                .find(|entry| entry.key == candidate)
+                .expect("graduated candidate output");
+            assert!(
+                server_output_accepts_service_capacity_prior(entry),
+                "post-startup eligibility: delivery_samples={} local_ack={} peer_app_limited={} peer_ack={} calibrations={}",
+                entry.delivery_samples,
+                entry
+                    .local_path_metrics
+                    .is_some_and(|metrics| metrics.metrics.has_ack_derived_data_sample),
+                entry
+                    .peer_path_metrics
+                    .is_some_and(|metrics| metrics.metrics.app_limited),
+                entry
+                    .peer_path_metrics
+                    .is_some_and(|metrics| metrics.metrics.has_ack_derived_data_sample),
+                outputs.ack_clock_calibrations.len(),
+            );
+            let prior = entry
+                .tcp_capacity_prior
+                .expect("Service opportunity capacity prior");
+            assert_test_rate_close(Some(prior.rate_bps), 100_000_000.0);
+            assert_eq!(prior.ordinary_windows, 0);
+            assert!(outputs.ack_clock_calibrations.is_empty());
+        }
+        let target = binding
+            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .into_iter()
+            .find(|target| target.key == candidate)
+            .expect("graduated endpoint-only candidate");
+        assert!(target.has_bulk_rate_evidence);
+        assert!(!target.ack_clock_calibration_eligible);
+        assert_eq!(target.snapshot.rate_scope, PathRateScope::PathCapacity);
+        assert_test_rate_close(Some(target.snapshot.delivery_rate_bps), 100_000_000.0);
     }
 
     #[test]

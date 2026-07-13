@@ -144,9 +144,28 @@ earlier delivery rather than a hidden aggregate loss. The single control changes
 
 This evidence proves multi-flow TCP aggregation for that upload cohort and
 guards against silently accepting a same-condition regression. It does not
-prove one-flow optional-path aggregation, QUIC or mixed-carrier aggregation,
-real-Internet performance, failover, or superiority over a current matched
-MPTCP or Hysteria2 baseline. Those remain independent evidence tracks.
+prove one-flow request-side optional-path aggregation, QUIC or mixed-carrier
+aggregation, real-Internet performance, failover, or superiority over a current
+matched MPTCP or Hysteria2 baseline. Those remain independent evidence tracks.
+
+The current response-direction control is Iteration 128: one logical flow under
+the same shaped five-path profile reaches 236.774 Mbps multipath versus
+112.274 Mbps single, or 2.109x overall and 2.368x in `[15,18)`, with 75.5/24.5%
+material server path shares. Iterations 126/127 causally show that endpoint-only
+startup now moves directly to ordinary bounded ownership under a temporary
+Service opportunity prior instead of paying a 5.3-8.8 second exclusive
+calibration. This proves shaped equal-fat one-flow TCP response aggregation,
+not QUIC, mixed carriers, faults, real Internet, TUN, or external baseline
+superiority. CPU, memory, and maximum-gap cost remain non-ideal. The separate
+default heterogeneous Iteration 129 guard reaches only 104.531 Mbps multipath
+versus 110.489 Mbps best single. It improves materially over preserved one-flow
+history but leaves the fat path unused. Later cold-path ordered sampling was
+rejected after creating 0.525-1.269 second read gaps; native TCP carrier evidence
+remains required before claiming heterogeneous aggregation.
+Iteration 135 separately verifies the negative admission boundary: with one
+200 Mbps, 20 ms Service and four 50 Mbps, 420 ms, 10%-loss candidates,
+multipath/single is 182.247/182.777 Mbps with 0.251/0.247 second maximum gaps,
+and the slow candidates remain control-only.
 
 ## 2. Terminology
 
@@ -480,8 +499,11 @@ candidates likewise remain Probe or Standby and the Service remains
 preemptible.
 Response startup-slot graduation requires the sampled candidate's exact
 `OwnerData` flight to drain. For TCP, the completely ACKed sealed startup sample
-proves exact-path reachability and opens bounded ACK-clock calibration; its first
-assignment-to-ACK interval MUST NOT publish capacity. For QUIC UDP, product ACK
+proves exact-path reachability. An eligible endpoint-only candidate installs a
+temporary typed Service capacity prior and begins a fresh ordinary exact-ACK
+epoch; a configured or independently measured candidate opens bounded fallback
+ACK-clock calibration. The first assignment-to-ACK interval MUST NOT publish
+candidate capacity. For QUIC UDP, product ACK
 progress alone is insufficient and the local carrier ACK controller MUST publish
 bulk-rate evidence. Graduation preserves the Service anchor and sampled
 membership, invalidates stale planner snapshots, and releases only the exclusive
@@ -1258,7 +1280,7 @@ their origin is explicit and they do not become hidden modes.
 | TCP request ACK-clock calibration | After TCP request startup graduation and exact startup-flight drain, one explicit exact Validation instance owns a cumulative, non-refilling target frozen at claim time; the default resource-clamped target is 2 MiB. Only exact candidate `OwnerData` sent after the sealed-data ACK or ordered-receipt ACK boundary can complete the causal proof. Failed enqueue restores owner, target, and spend; an exhausted exact owner serializes later candidates until proof or exact-instance lifecycle termination. Exact ownership may let an endpoint-only candidate provisionally borrow the Service per-flow rate and derived pipe for scheduling, but the candidate's own continuous exact product-ACK model replaces that prior after ten exact candidate samples. A configured candidate retains its own hint. QUIC is excluded | TCP lacks a path-local packet ACK controller, so a finite exact-owner product ACK epoch establishes attribution without pretending to control kernel TCP. Service seeding avoids asking a 2 MiB proof to fill a high-BDP pipe before TCP leaves slow start | A moving BDP-sized target may never finish; inferred ownership may interleave candidates; receipt-only boundaries can miss valid ACK order; one early underfilled sample can permanently collapse the candidate model; borrowed Service rate mistaken for proof can fabricate capacity | Freeze the exact instance and target atomically, accept either exact causal startup boundary, retain the 2 MiB default proof and all resource/debt/pressure gates, and keep endpoint-only Service seeding explicitly provisional until ten exact candidate samples. Never feed TCP product ACK timing into QUIC's native controller |
 | QUIC response capacity train | With two or more bulk response flows and a measured TCP Service-family lead of at least two, one exact reachable, unmeasured UDP Validation path may receive a typed `PATH_CAPACITY_DATA` train followed by same-stream `PATH_CAPACITY_FINISH`; the peer returns exact `PATH_CAPACITY_RECEIPT`. Train bytes are `max(startup sample floor, live QUIC inflight window + one fresh strict-proof window)` and must fit a separate cumulative session capacity envelope. Each exact session/path/path-instance gets at most two attempts; eligible fitting fresh keys rank before retries. Ordinary connection writers wait behind the token gate, but a globally empty Quinn queue is not assumed. Full-train receipt owns proof, freezes its full receipt-interval rate and lifetime, and releases the carrier gate; native ACK/BIF timing remains diagnostic. Bulk rights receive one proof lifetime frozen from the planning snapshot | QUIC owns packet delivery, congestion, loss, pacing, and flow control below carrier-neutral response ownership; an ordered token receipt attributes the finite train without borrowing TCP proof semantics or pretending aggregate packet ACKs carry frame identity | Treating buffer acceptance, product ACK progress, aggregate ACK bytes, stale proof, or a moving live floor as capacity can fabricate or erase proof; refunded attempts can exceed the declared budget; partial writes can leak late ACKs into ordinary evidence | Prefer unattempted fitting paths, reserve one typed command provisionally, exact-match token/path-instance/frozen geometry/validity, require exact written and received train bytes, and retain session serialization through registry publication. Publication resolves the command ticket without cancelling the carrier; failures remain cancellation. Fail-close indeterminate writes and never create product flight or ownership |
 | Cross-family response Service placement | A measured target in an underloaded family may receive one sticky whole response flow at an exact clear frontier. When sustained feed prevents that frontier, one session-serialized, per-binding one-shot bounded drain pauses fresh `OwnerData` only on the selected binding; other bindings, control, ACK/credit, and critical repair continue, while offset-free staging remains within the existing bounded source reservoir | MPTCP/MPQUIC connection-level placement plus ECF/BLEST ordering safety, applied above separate TCP and QUIC recovery engines | Count-only balancing can permanently move a 500 Mbps flow to a lower-RTT 100 Mbps carrier; per-frame migration creates cross-family HOL debt; waiting passively for a frontier under continuous feed makes safe placement unreachable | Keep family count as the need signal and measured fair share as the gain signal. Commit one atomic binding/session ownership transaction after exact identity/model revalidation; cancel the drain on expiry or projected fair-share regression. Attachment role and response Service load remain separate |
-| TCP response ACK-clock calibration | After response startup graduation, one exact TCP Validation instance receives cumulative, non-refilling initial credit `I = min(resource ceiling, Service horizon, max(one send quantum, 2 * candidate BDP))`. For one measurement stage let `B` be spend at authorization, `L` the cumulative ceiling, `A=L-B` fresh capacity, `W` fresh bytes ACKed in first/noncausal/mixed windows, `E` strict causal fresh evidence, and `F=min(resource-clamped Service horizon, max(path-proof floor, Service horizon/2))`. Only `E` enters the rate aggregate. When fully spent, `A-W<F` tops up the same stage to `min(resource ceiling, max(2L, B+W+F))` without resetting `B`, `W`, `E`, or provenance; `A-W>=F` waits until `E>=F` or exact drain. Three accepted aggregates publish their median and end exclusive calibration. After exact flight drain the median is a typed path-capacity prior; ten completed ordinary exact-ACK windows plus a usable continuous sample atomically replace it as per-flow goodput. Service ownership never moves, exact commits remain binding-local, and UDP/QUIC is excluded | TCP lacks QUIC's local packet ACK controller; staged product ACK-clock sampling is mptunnel policy for estimating a response path without granting the full resource envelope from a hint | A path-sized seed can be safe but too small to publish; an exact-`F` stage cannot yield `F` strict bytes because its first window establishes the clock; fixed `2F` is still insufficient when ACKs coalesce more than `F`; resetting after each reachability growth repeats that loss; ACK refill is unbounded; mixed-stage or ACK-compressed windows can fabricate rates; max-filtering makes high artifacts permanent; counting fragmented callbacks or retaining the calibration clock can make a provisional rate permanent; applying product ACK timing to QUIC corrupts carrier evidence | Keep cumulative spend monotonic and distinguish bounded delivery-ACK turnover from strict rate proof. Attribute only fresh mixed-window bytes to `W`, top up the same stage only enough to restore reachable strict capacity, infer missing `W` at exact drain, and terminate without a rate at the hard envelope. Aggregate only strict current-stage windows, apply timer granularity once, publish the three-stage median without max-filtering, stop before another exclusive stage, use exact two-pass residual commits, fence the binding-local identity through flight drain, reset the ordinary ACK epoch, retain Service, and leave QUIC packet ACK congestion/pacing authoritative |
+| TCP response capacity prior and fallback ACK-clock calibration | After exact response-startup drain, endpoint-only TCP with no independent carrier ACK/hint may inherit the proven same-family Service rate as a typed path-capacity prior. It enters ordinary bounded Subflow ownership immediately; ten completed ordinary exact-ACK windows plus a usable continuous sample atomically replace the prior as per-flow goodput. If that Service prior is ineligible, one exact TCP Validation instance may instead use cumulative staged calibration with initial credit `I = min(resource ceiling, Service horizon, max(one send quantum, 2 * candidate BDP))`. For one fallback stage let `B` be spend at authorization, `L` the cumulative ceiling, `A=L-B`, `W` noncausal fresh ACKed bytes, `E` strict causal fresh evidence, and `F=min(resource-clamped Service horizon, max(path-proof floor, Service horizon/2))`. Three accepted aggregates publish their median as the same typed prior after exact drain. Service ownership never moves, exact commits remain binding-local, and UDP/QUIC is excluded | TCP lacks QUIC's local packet ACK controller, but the exact startup sample already proves endpoint-only reachability and bounded ownership. Reusing the bounded Service opportunity avoids a redundant exclusive measurement transport while ordinary exact ACKs supply path-local correction. Staged calibration remains fallback policy where independent evidence must be preserved | Treating the Service prior as permanent capacity can fabricate a path model; mandatory staged calibration can serialize several MiB, underfill a high-BDP path, and still publish a low rate; mixed or compressed windows can fabricate fallback rates; applying product ACK timing to QUIC corrupts carrier evidence | Type the borrowed value only as temporary path capacity, reset the candidate's ordinary ACK epoch at installation, retain the ten-window takeover, and keep all ordinary completion/reorder/inflight gates. For fallback calibration, retain cumulative spend, strict current-stage aggregation, one timer floor, median publication, exact residual commits, and the binding-local fence through flight drain. Leave QUIC packet ACK congestion/pacing authoritative |
 | Fresh TCP calibration opportunity | Before the first response calibration byte, response policy projects the whole seed against one bounded Service feed reservoir behind that lower prefix and clamps their sum to the product resource envelope; an unsafe response identity may retire only after coherent revalidation. Fresh request calibration permits no path-wide completion-estimate veto until request-direction, provenance-bound authority exists. One active bulk response flow may start same-family response calibration, while request calibration requires two active logical bulk request flows with exact committed TCP Service ownership and present request work; reverse bytes, idle completed uploads, and QUIC-Service flows never count. Request calibration additionally requires the exact sealed-data or ordered-receipt causal boundary and atomically claims one exact instance with its frozen target. Exact begun response calibration may finish after response-demand churn; an unstarted identity becomes dormant and blocks only itself | MPTCP ECF/BLEST ordered-completion reasoning above kernel TCP; mptunnel keeps QUIC carrier ACK control separate | Unconditional probing creates HOL stalls; canceling begun work strands offsets; dormant binding-wide serialization wastes proven capacity; recomputing a request target or owner after claim weakens rollback and ACK attribution | Keep response completion projection and its prefix-plus-Service reservoir enforced until ACK progress, apply no path-wide request completion veto before request-direction provenance authority, retain every independent safety gate and begun exact ownership serial until drain, freeze request owner and target through rollback-safe enqueue, and leave dormant Service/other measured work open; retirement remains response-policy-specific |
 | Inflight target | BDP * BBR cwnd gain, send quantum, and MinPipeCwnd under configured flight envelope; latency/realtime lanes use the smaller preemptive target | BBR inflight model and product lane priority | Too low underfeeds; too high queues | Keep adaptive from live BDP/queue/loss/carrier evidence |
 | Stability/backlog factors | Shrink by loss/jitter/queue/backlog relative to BDP with floor derived from MinPipeCwnd or send quantum divided by BDP | Congestion-sensitive adaptation; floor is no longer a fixed fraction | Over-shrinking can create low-rate loops | Keep adaptive; diagnostics must show shrink reason |
@@ -5631,9 +5653,18 @@ For response-side sampling, the current startup key likewise remains exclusive
 until its OwnerData flight drains and canonical bulk proof exists. TCP may use
 unambiguous OwnerData ACK rate; QUIC requires local carrier ACK-derived bulk
 metrics. Graduation retains the measured member and Service key, increments the
-planner generation, and preserves the Service owner. Before another unproven
-response candidate may consume a separate startup sample, one graduated TCP
-candidate at a time may use staged exact-instance ACK-clock calibration. Its
+planner generation, and preserves the Service owner. When the TCP candidate is
+endpoint-only, has no local carrier ACK sample, and retains only an app-limited
+peer hint, graduation MUST install the current proven same-family Service rate
+as a temporary typed path-capacity prior. It MUST reset the candidate's ordinary
+ACK epoch, MUST NOT create an exclusive calibration identity, and MUST let the
+existing measured-Subflow completion, inflight, and reorder gates bound ordinary
+ownership. Ten completed ordinary exact-ACK windows plus a usable continuous
+sample replace that prior as per-flow goodput. A configured or independently
+measured candidate MUST preserve its own evidence and uses the fallback below.
+Before another unproven response candidate may consume a separate startup
+sample, one such graduated TCP fallback candidate at a time may use staged
+exact-instance ACK-clock calibration. Its
 initial cumulative credit is the smaller of the resource-clamped Service
 horizon and a two-BDP candidate window, with a one-send-quantum floor; it never
 refills. Starting a fresh stage requires at least one active direction-relevant
@@ -5663,11 +5694,11 @@ MUST stop when the global ordered tail reaches `R`; ACK progress may reopen the
 remaining projected credit. Raw offset-free staging may remain bounded by its
 separate source-memory policy, but it MUST NOT assign later product offsets past
 the completion reservoir assumed by admission.
-Growth does not wait for rate-publication readiness. Strict windows form one
+Fallback growth does not wait for rate-publication readiness. Strict windows form one
 byte/raw-time aggregate per stage; only aggregates covering at least half the
 resource-clamped Service horizon, with a path-proof floor, enter the bounded
 stage-rate buffer. Startup rate remains before three aggregates, then
-the median overwrites the old rate without max-filtering and becomes a typed
+the median overwrites the old rate without max-filtering and becomes the same typed
 path-capacity prior after exact calibration flight drains. A fresh ordinary
 exact-ACK epoch replaces it as per-flow goodput only after ten completed windows
 and one usable continuous sample. UDP/QUIC candidates
@@ -6914,7 +6945,9 @@ select_response_owner_path(stream, work):
         if epoch.candidate.cumulative_owner_bytes >= epoch.candidate.sample_budget:
             close_epoch_sampling_and_resume_service_without_owner_transfer(epoch)
         return stream.service_path if service_admission_allows(work) else no_path
-    calibration = exact_live_graduated_TCP_response_calibration_candidate(stream)
+    # Eligible endpoint-only TCP installs a temporary Service capacity prior
+    # at exact startup drain and enters ordinary bounded Subflow admission.
+    calibration = exact_live_graduated_TCP_response_fallback_calibration(stream)
     if calibration exists:
         assert stream.service_path did not change
         if calibration.spent_bytes == 0 and not calibration.is_active:

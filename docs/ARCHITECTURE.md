@@ -203,11 +203,15 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   within the current Service completion reservoir; an already-started exact
   epoch may finish. This prevents serial cold samples from inserting a slow
   ordered prefix while retaining one-flow download aggregation.
-- A TCP calibration opportunity may borrow Service rate only for its bounded
-  projection. While the exact calibration prefix is serialized, Service owner
-  assignment stops when total ordered tail reaches that prefix plus one Service
-  feed reservoir, clamped to the product envelope, until ACK progress releases
-  credit. Offset-free raw staging does not weaken this ownership limit.
+- After exact response startup drain, endpoint-only TCP may retain the proven
+  same-family Service opportunity as a temporary typed capacity prior and move
+  directly to ordinary bounded Subflow work. Ten ordinary exact-ACK windows
+  replace it with per-flow goodput. Configured or independently measured paths
+  keep staged exact calibration as fallback. While a fallback prefix is
+  serialized, Service owner assignment stops when total ordered tail reaches
+  that prefix plus one Service feed reservoir, clamped to the product envelope,
+  until ACK progress releases credit. Offset-free raw staging does not weaken
+  this ownership limit.
 - Encode large probe trains incrementally. Do not allocate a vector containing
   every frame or copy the complete train solely for queue admission.
 - Treat time sources explicitly. Carrier ACK timing, scheduler poll timing, and
@@ -215,10 +219,11 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
 - TCP response goodput counts only exact binding-local `OwnerData`. Its first
   product ACK establishes the clock; later bytes use a bounded ratio of bytes
   to continuous ACK wall time so callback bursts cannot discard their silence.
-  A completed exclusive calibration may install its robust rate only as a typed
-  path-capacity prior. Ten completed ordinary exact-ACK windows plus a usable
-  continuous sample atomically replace that prior with per-flow goodput; ACK
-  callbacks alone do not advance the count. QUIC does not use either TCP clock.
+  A bounded Service opportunity or completed exclusive fallback may install a
+  typed path-capacity prior. Ten completed ordinary exact-ACK windows plus a
+  usable continuous sample atomically replace that prior with per-flow goodput;
+  ACK callbacks alone do not advance the count. QUIC does not use either TCP
+  clock.
 - Thresholds must be protocol/resource bounds or derived from live metrics.
   Lab-specific constants must not become steady-state product policy.
 
@@ -251,6 +256,35 @@ final TCP ownership/calibration model did not silently trade away the retained
 multi-flow aggregation result. It does not prove one-flow striping, QUIC or
 mixed-carrier aggregation, real-Internet performance, failover, or current
 MPTCP/Hysteria2 superiority.
+
+The current accepted same-condition TCP response result is Iteration 128. Its
+diagnostics-disabled one-flow 18-second pair reaches 236.774 Mbps multipath
+against 112.274 Mbps single, or 2.109x overall and 2.368x in the final three
+seconds; two paths carry 75.5/24.5% of material server bytes. The adjacent slow
+single is the host-epoch control, so this result supersedes the earlier 1.060x
+normalized gain without claiming an absolute wire ceiling. Iterations 126/127
+causally show why: removing a 5.3-8.8 second exclusive endpoint-only
+calibration raises diagnostic goodput 59.6% and starts ordinary alternate work
+immediately after exact startup drain. Server CPU, memory, and gap cost remain
+non-ideal, and QUIC, mixed-carrier, fault, real-Internet, TUN, and
+external-baseline cohorts remain unproven by this row.
+
+The separate Iteration 129 heterogeneous guard reaches 104.531 Mbps multipath
+versus 110.489 Mbps on the adjacent fat single path. It improves substantially
+over preserved one-flow history and reduces first-body/read-gap latency, but
+only low-latency and balanced paths carry material bytes. Iterations 131-134
+proved that serially giving later cold TCP paths ordered startup ownership is
+not the answer: fat-path use becomes material, but read gaps reach
+0.525-1.269 seconds. Those experiments were rejected. The missing boundary is
+carrier-native TCP capacity evidence; product ordering must not be used as a
+surrogate probe clock. QUIC already owns equivalent evidence in its native
+packet-ACK controller and remains separate.
+
+Iteration 135 verifies the negative boundary with one 200 Mbps, 20 ms Service
+and four 50 Mbps, 420 ms, 10%-loss optional paths. Multipath/single is
+182.247/182.777 Mbps with 0.251/0.247 second maximum gaps, and all slow
+optionals remain control-only. The startup completion gate therefore prevents a
+clearly worse candidate from receiving the temporary Service prior.
 
 The staged TCP-to-QUIC placement row keeps an attached UDP transport warm while
 management excludes it from scheduling. This isolates proof and ownership from

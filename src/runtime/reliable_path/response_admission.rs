@@ -41,9 +41,10 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// Per-output ACK clock; product ordering timestamps can be advanced when a
     /// different path closes a hole and therefore cannot own this boundary.
     pub(super) tcp_product_rate_evidence: Option<ResponseAckClockRateEvidence>,
-    /// Exclusive calibration estimates carrier capacity; ordinary per-flow
-    /// ACK evidence must mature in a separate epoch before replacing it.
-    pub(super) tcp_calibration_prior: Option<TcpResponseCalibrationPrior>,
+    /// Temporary carrier-capacity estimate. It may come from a bounded Service
+    /// opportunity or exclusive calibration; ordinary exact-ACK evidence must
+    /// mature in a separate epoch before replacing it.
+    pub(super) tcp_capacity_prior: Option<TcpResponseCapacityPrior>,
     pub(super) srtt_ms: Option<f64>,
     pub(super) delivery_samples: u32,
     /// Cumulative uniquely owned product bytes ACKed on this output.
@@ -56,7 +57,7 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct TcpResponseCalibrationPrior {
+pub(in crate::runtime) struct TcpResponseCapacityPrior {
     pub(super) rate_bps: f64,
     pub(super) ordinary_windows: u32,
 }
@@ -971,10 +972,10 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
             ResponseRateScope::PathCapacity,
         ),
         (UnderlayProtocol::Udp, None, _, _) => (prior_rate_bps, prior_rate_scope),
-        (UnderlayProtocol::Tcp, None, _, _) if entry.tcp_calibration_prior.is_some() => (
+        (UnderlayProtocol::Tcp, None, _, _) if entry.tcp_capacity_prior.is_some() => (
             entry
-                .tcp_calibration_prior
-                .expect("guarded TCP calibration prior")
+                .tcp_capacity_prior
+                .expect("guarded TCP capacity prior")
                 .rate_bps,
             ResponseRateScope::PathCapacity,
         ),
@@ -1306,6 +1307,25 @@ pub(in crate::runtime) fn server_output_has_sender_evidence(
             server_output_local_path_metrics(entry),
             Some(path_metrics) if server_path_metrics_has_sender_evidence(path_metrics)
         )
+}
+
+/// Endpoint-only TCP has no carrier hint worth preserving. After an exact
+/// startup sample, it may temporarily inherit the proven Service opportunity
+/// instead of running a second exclusive measurement transport.
+pub(in crate::runtime) fn server_output_accepts_service_capacity_prior(
+    entry: &ResponseStreamOutputEntry,
+) -> bool {
+    entry.key.underlay == UnderlayProtocol::Tcp
+        && !product_delivery_samples_override_startup_prior(entry.delivery_samples)
+        && !entry.local_path_metrics.is_some_and(|metrics| {
+            metrics.source == ServerPathMetricsSource::LocalSender
+                && metrics.metrics.has_ack_derived_data_sample
+        })
+        && entry.peer_path_metrics.is_some_and(|metrics| {
+            metrics.source == ServerPathMetricsSource::PeerHint
+                && metrics.metrics.app_limited
+                && !metrics.metrics.has_ack_derived_data_sample
+        })
 }
 
 pub(in crate::runtime) fn server_output_has_durable_product_progress(
@@ -2274,7 +2294,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 1,
             owner_data_acked_bytes: 0,
@@ -2313,7 +2333,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 1,
             owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(
@@ -2419,7 +2439,7 @@ mod tests {
                 delivery_rate_bps: (underlay == UnderlayProtocol::Tcp).then_some(80_000_000.0),
                 tcp_ack_clock_rate_bps: None,
                 tcp_product_rate_evidence: None,
-                tcp_calibration_prior: None,
+                tcp_capacity_prior: None,
                 srtt_ms: Some(40.0),
                 delivery_samples: 1,
                 owner_data_acked_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
@@ -2486,7 +2506,7 @@ mod tests {
                 delivery_rate_bps: None,
                 tcp_ack_clock_rate_bps: None,
                 tcp_product_rate_evidence: None,
-                tcp_calibration_prior: None,
+                tcp_capacity_prior: None,
                 srtt_ms: None,
                 delivery_samples: 0,
                 owner_data_acked_bytes: 0,
@@ -2681,7 +2701,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -2757,7 +2777,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -2850,7 +2870,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -2934,7 +2954,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -2997,7 +3017,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -3079,7 +3099,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -3144,7 +3164,7 @@ mod tests {
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: None,
             delivery_samples: 0,
             owner_data_acked_bytes: 0,
@@ -3208,7 +3228,7 @@ mod tests {
             delivery_rate_bps: Some(prior_rate / 10.0),
             tcp_ack_clock_rate_bps: None,
             tcp_product_rate_evidence: None,
-            tcp_calibration_prior: None,
+            tcp_capacity_prior: None,
             srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(

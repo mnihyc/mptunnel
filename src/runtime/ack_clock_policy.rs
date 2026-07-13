@@ -1,6 +1,6 @@
 use super::bulk_admission::{
     BulkExplorationCompletionProjection, bulk_candidate_pipe_bytes,
-    bulk_exploration_completion_projection, bulk_service_horizon_payload_bytes,
+    bulk_service_horizon_payload_bytes, bulk_tcp_calibration_completion_projection,
 };
 use super::prelude::*;
 use super::{BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
@@ -42,7 +42,7 @@ pub(super) fn reliable_tcp_ack_clock_calibration_opportunity(
 ) -> TcpAckClockCalibrationOpportunity {
     debug_assert_eq!(service_snapshot.underlay, UnderlayProtocol::Tcp);
     debug_assert_eq!(candidate_snapshot.underlay, UnderlayProtocol::Tcp);
-    let projection = bulk_exploration_completion_projection(
+    let projection = bulk_tcp_calibration_completion_projection(
         service_snapshot,
         service_eta_ms,
         candidate_snapshot,

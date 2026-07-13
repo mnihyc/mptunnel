@@ -153,8 +153,10 @@ binding, exact source instance/incarnation, and exact target
 instance/incarnation. Both events report `handoff_mode` and proof authority.
 `Diversification` requires a source-family lead of at least two and a no-worse
 projected share; `PerformanceOverride` requires a two-fold projected gain even
-when families are balanced. TCP product rate is already per-flow goodput, while
-carrier-scoped TCP/QUIC rate is divided by projected bulk-flow count. During the
+when families are balanced. Ordinary TCP product ACK-clock evidence is per-flow
+goodput and is not divided. A drained response-calibration median is typed path
+capacity and is divided by projected bulk-flow count until mature ordinary
+evidence replaces it, as is carrier-scoped TCP/QUIC rate. During the
 bounded one-shot drain,
 fresh `OwnerData` stops only for the selected binding; control, ACK/credit,
 correctness-critical repair, and other bindings remain live. Offset-free source
@@ -195,9 +197,10 @@ which is 1 MiB with the default 2 MiB initial credit. Under-covered evidence
 still grows or proves the stage, then resets without publishing. Diagnostic
 events expose the current sample bytes/elapsed, aggregate bytes/elapsed,
 coverage floor, acceptance decision, and aggregate rate. Before three accepted
-stage aggregates, the candidate retains its startup rate; from three onward,
-publish the rolling median by overwriting the prior product/delivery rate, even
-when lower. Do not
+stage aggregates, the candidate retains its startup rate. At three, the rolling
+median ends exclusive calibration; after exact flight drain it becomes a typed
+path-capacity prior, even when lower. Ten completed ordinary exact-ACK windows
+plus a usable continuous sample atomically replace it as per-flow goodput. Do not
 report a maximum or upward-only filter as calibrated capacity because ACK
 compression can create multi-gigabit sub-millisecond samples. UDP/QUIC product
 ACK timing never proves this TCP calibration because the local QUIC ACK
@@ -222,7 +225,8 @@ ordinary measured ownership, not more calibration: the exact mature Service
 already holds at least its derived Service horizon, the selected target is an
 admitted same-underlay `Subflow` bound to that Service epoch, neither
 path/session has latency pressure, and projected ordered tail remains inside
-the existing feed reservoir. TCP uses strict product-ACK evidence; QUIC uses
+the configured product/reorder/stream reservoir. TCP uses strict product-ACK
+evidence; QUIC uses
 strict non-app-limited local carrier ACK evidence and native emission credit.
 Neither substantial product progress nor the app-limited carrier estimate used
 by the weaker QUIC Service-feed predicate can select this reason.
@@ -270,13 +274,16 @@ native cwnd missed the carrier pacing input: iteration 48 still assigned about
 7.2 MiB and reached 101.949 Mbps. Bounded Service refills in iteration 49
 reached only 58.955 Mbps and collapsed to about 1 Mbps late. These instrumented
 diagnostics are causal evidence, not release-comparable throughput rows. The
-one-flow product/probe policies were therefore removed. Retain only the general
+one-flow product/probe policies tested in that iteration were therefore removed.
+Current code later retained a bounded one-active-response same-family startup
+epoch with serialized later-candidate completion gating; this historical cohort
+is not proof of current QUIC effectiveness. Retain only the general
 conclusions: an exact startup epoch owner may continue its own non-refilling
 lower frontier to the declared cap, and a high-confidence additional
 same-underlay QUIC path without durable product progress uses a BBR-style
 `2 * delivery-rate BDP` product inflight target instead of carrier pacing or
-cwnd. The latter invariant is unit-model verified; no rejected one-flow
-mechanism remains enabled to claim a release throughput gain from it.
+cwnd. The latter invariant is unit-model verified; the current bounded startup
+mechanism still requires its own clean QUIC effectiveness cohort.
 
 ### Evidence cohorts
 
@@ -467,6 +474,65 @@ Manual cleanup:
 ```bash
 docker compose -f lab/docker-compose.yml down --remove-orphans
 ```
+
+### Current TCP response evidence
+
+Iterations 110-121 isolate the equal-fat TCP download model on five 500 Mbps,
+180 ms, 1 ms-jitter, zero-loss paths with an 18-second measurement. Diagnostic
+rows 114-117 are causal only: they exposed a calibration prior that could remain
+frozen, an unconditional Service-first decision that ignored the complete
+backlog, and a later cold startup sample that inserted a slow ordered prefix.
+They are not throughput comparisons.
+
+Clean Iterations 118 and 119 use one logical response flow. Their multipath rows
+reach 273.437 and 263.841 Mbps against matched single rows of 231.267 and
+231.579 Mbps: 1.182x and 1.139x overall. Final-window goodput is 524.809 and
+534.497 Mbps, or 1.477x and 1.488x the matched singles. The optional path carries
+about 153 MB and 140 MB, so this is delivered aggregation rather than selection
+activity alone.
+
+Historical Iteration 111 had a 300.167 Mbps single row. To avoid silently
+accepting the apparent current drop, Iteration 120 rebuilt detached commit
+`7fa7789` and reran the exact current one-flow single profile; it reached
+235.147 Mbps, matching the current 231.579 Mbps row within 1.6%. The absolute
+drop is therefore current host/lab drift, not a regression introduced by this
+change. Iteration 121 retains the two-flow guard at 488.684 Mbps overall and
+802.335 Mbps late; normalized to the detached current-host single it is 2.078x.
+The historical Iteration 110 ratio was 602.366 / 300.619 = 2.004x, so normalized
+aggregation did not degrade even though absolute host throughput changed.
+
+The retained cost is not ideal. Multipath server peak memory is 178.5 and
+185.9 MB versus 126.1 and 141.2 MB for the matched singles, increases of 41.5%
+and 31.6%. Average server CPU is 6.77% versus 3.19% and 11.19% versus 3.90%, or
+2.12x and 2.87x. Client peak memory is about 2.60x and 2.67x its controls, and
+the two-flow server peaks at 299.5 MB. Overall one-flow goodput remains only
+263.8-273.4 Mbps, below one nominal 500 Mbps path. Final-window rates above
+500 Mbps are buffered delivery support metrics, not wire-rate claims.
+
+These results prove only shaped equal-fat TCP response aggregation. QUIC,
+mixed-carrier, heterogeneous, fault/failover, real-Internet, TUN, and matched
+MPTCP/Hysteria2 comparisons remain separate unproven cohorts.
+
+The final audit follow-up is Iterations 122-124. Review found that the synthetic
+Service-rate calibration opportunity projected a bounded follow-up reservoir,
+but Service assignment could continue to the full product envelope while the
+lower calibration prefix remained outstanding. It also found that completion
+ETA added the whole product tail after queue/native-flight bytes already present
+in Service ETA. The final model subtracts that overlap and bounds total ordered
+tail at `calibration prefix + Service feed reservoir`, clamped to the product
+envelope. The prefix itself is missing lower data; only later Service bytes
+occupy receiver reorder memory.
+
+Iteration 122 supplies the adjacent current-host single control at 301.301 Mbps
+overall, 439.178 Mbps final-three-seconds, and 0.721 s maximum gap. The exact
+unsafe pre-cap A/B reaches 346.852/459.599 Mbps with a 0.428 s gap and only
+17.8% of material server path bytes on the alternate. Final Iteration 124 reaches
+319.401/561.482 Mbps with a 0.501 s gap and 35.3% on the alternate. Relative to
+the unsafe A/B, bounded ownership changes -7.9% overall, +22.2% late, and
++0.073 s maximum gap. Relative to the adjacent single, final aggregation is
+1.060x overall and 1.278x late. This is retained as a necessary stability model
+correction, not an ideal performance result: reducing safe early calibration
+cost without restoring speculative tail growth is the next TCP response issue.
 
 ## Interpreting Results
 

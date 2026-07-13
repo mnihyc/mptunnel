@@ -64,6 +64,33 @@ multi-flow TCP aggregation for this upload cohort; they do not prove one-flow
 optional-path aggregation, QUIC or mixed-carrier aggregation, failover, or a
 current MPTCP/Hysteria2 baseline comparison.
 
+The initial matched clean TCP download result is Iterations 118-121. With one
+logical response flow over the same five-path 500 Mbps, 180 ms, 1 ms-jitter,
+zero-loss profile, multipath reached 273.437 and 263.841 Mbps in two clean runs,
+or 1.182x and 1.139x their matched single-path controls; final-window ratios
+were 1.477x and 1.488x. A detached `7fa7789` control reached 235.147 Mbps under
+the current host conditions, matching the current 231.579 Mbps single-path row
+and attributing the lower absolute rate versus historical Iteration 111 to lab
+or host drift rather than this code change. The two-flow guard reached 488.684
+Mbps, 2.078x that detached single-path control. These rows prove current TCP
+response aggregation in this shaped cohort, including one-flow optional-path
+use; they do not prove QUIC, mixed-carrier, heterogeneous, failover,
+real-Internet, or current MPTCP/Hysteria2 results.
+The result is not ideal: overall one-flow gain is only 1.139-1.182x, absolute
+goodput remains below one nominal 500 Mbps path, and matched container samples
+show materially higher CPU and memory for multipath.
+
+A final ownership audit found that Service could assign beyond the reservoir
+assumed by TCP calibration opportunity. The corrected final binary bounds total
+ordered tail by the exact calibration prefix plus one Service feed reservoir and
+does not double-count queue/native flight already present in Service ETA.
+Iteration 124 reaches 319.401 Mbps overall and 561.482 Mbps in the final window;
+against the adjacent Iteration 122 single control at 301.301/439.178 Mbps, this
+is 1.060x/1.278x. The unsafe pre-cap A/B reaches 346.852/459.599 Mbps. Thus the
+correction gives up 7.9% overall but improves late delivery 22.2% and uses the
+alternate path more materially. Its early calibration cost remains an explicit
+optimization target, not an ideal result.
+
 ## Config File
 
 Starting `mptunnel` without arguments loads `./config.toml`. Use `--config PATH` or `-c PATH` to select another file, and use `--config PATH --check-config` to validate a file without starting listeners. The TOML file is role-free and V2Ray-style: `[[inbounds]]` accept traffic, `[[outbounds]]` forward it, every entry can have a `tag`, and `protocol = "mpp"` is the mptunnel protocol itself.
@@ -387,11 +414,54 @@ and native emission credit. Bulk lower-frontier owners remain bounded by an
 adaptive approximately `2 * BDP` reorder envelope, while latency pressure keeps
 the smaller preemptible Service horizon.
 
-Response-side startup sampling retains its separate two-active-response-flow gate. After its OwnerData flight drains, the current response startup owner releases the exclusive slot only from direction-correct bulk proof: TCP may use its exact unambiguous product ACK rate, while QUIC UDP still requires local carrier ACK-derived evidence. Graduation preserves Service ownership and sampled membership. A graduated TCP response candidate then receives an exact-instance staged ACK-clock calibration: cumulative spent credit never refills, starts at a 2 MiB service horizon, and doubles its authorized cumulative ceiling only after the current stage is fully spent and a strictly causal later ACK window has every sampled send preceding the prior ACK and its earliest send no earlier than that stage's authorization, up to the path-flight, repair, reorder, and stream-window resource ceiling. Credit growth remains independent from rate publication. Within each stage, all strict current-stage ACK windows contribute bytes and raw ACK-to-ACK elapsed time to one aggregate; timer granularity is applied once to the aggregate, not once per ACK callback. At stage authorization, that aggregate enters the rolling five-stage rate window only when its coverage reaches half the initial credit, 1 MiB by default and clamped to the initial resource limit; an under-covered causal sample may still grow or prove the stage without publishing a rate. The startup rate remains in force until three qualifying stage aggregates exist, after which their median overwrites the prior rate instead of max-filtering ACK-compressed bursts. When an exact active TCP calibration stage has less credit left than the normal response chunk, two-pass planning first tries that residual size and emits the smaller product frame only if the result carries the exact calibration commit; otherwise it discards the first pass and gives Service the normal chunk. Product-flight and carrier-queue counters are overlapping views and use union-style debt accounting, while cumulative calibration spend remains exact. The Service owner does not move during calibration, failed enqueue rolls back its reservation, and the exact active fence remains through proof until the candidate's calibration flights drain before the serial slot or ordinary ownership advances. Once that TCP calibration fence clears, a mature single-family response Service keeps the first derived Service horizon of assigned union debt; an already-admitted, strictly measured same-underlay Subflow may use the remainder of the existing feed reservoir while total ordered tail stays within it. This soft overflow never changes the Service identity, remains subject to ECF, BDP, reorder, command-credit, exact-epoch, and latency-pressure gates, and falls back to Service when no candidate passes. TCP and QUIC share this product ownership policy but remain separate transport families: TCP optional-path proof comes from strict product ACK evidence, while QUIC optional-path proof requires strict non-app-limited local carrier ACK evidence and native emission credit. The current QUIC Service alone may treat either substantial uniquely owned product `STREAM_ACK` progress or a durable local carrier ACK-derived DATA estimate as feed evidence; the carrier estimate may be app-limited. Neither authority is carrier capacity proof, but either may let bounded source and emission staging graduate when same-path latency pressure is absent, without admitting an optional Subflow or authorizing handoff. Before feed evidence, switchable same-family source staging and QUIC Service emission use the derived feed reservoir, 4 MiB with defaults; that bounded source/emission bootstrap is not a carrier congestion window. Bulk TCP and QUIC `STREAM_MAX_DATA` instead advertise the configured receiver-memory window independently of path proof. TCP product-ACK calibration and residual framing remain TCP-specific; the generalized same-family reservoir includes QUIC under its native carrier controller.
+Response-side discovery has a separate directional gate: one active sustained
+bulk response may spend the first bounded same-family startup sample. That first
+candidate is the non-circular discovery bootstrap. After one measured Subflow
+exists, every later fresh candidate must project completion of its whole startup
+sample within the current Service backlog reservoir; an already-bound exact
+startup epoch may finish. This prevents serial cold candidates from inserting a
+slow ordered prefix.
+
+After startup flight drains, TCP may run one exact-instance staged product-ACK
+calibration. Its credit is cumulative and non-refilling; strict causal windows
+grow the authorized ceiling only within path-flight, repair, reorder, and stream
+resources. Qualifying aggregates publish a robust median after exact drain as a
+typed path-capacity prior. Ten completed ordinary exact-ACK windows plus a usable
+continuous delivery sample then replace that prior atomically with per-flow
+goodput. Fragmented callbacks do not count as windows, and the calibration clock
+is reset so provisional capacity cannot silently become permanent per-flow
+evidence. Service ownership does not move during calibration, and failed enqueue
+rolls back the exact reservation. While its exact prefix remains outstanding,
+total ordered assignment cannot exceed that prefix plus one bounded Service feed
+reservoir, clamped to the product resource envelope.
+
+For sustained backlog, a measured same-underlay Subflow may share the configured
+product/reorder/stream envelope while the first Service horizon stays protected.
+Completion admission compares against the complete Service-assigned backlog;
+receiver reorder exposure separately excludes Service-assigned and candidate
+bytes. Per-path BDP, inflight, repair, command-credit, epoch, and latency gates
+remain mandatory. TCP and QUIC share this carrier-neutral ownership reservoir but
+not proof: TCP uses strict product-ACK evidence, while QUIC requires strict
+non-app-limited native carrier ACK evidence and native emission credit. QUIC
+Service feed evidence and its bounded 4 MiB pre-evidence source/emission staging
+do not prove an optional path. Each carrier retains its own congestion control,
+pacing, flow control, and recovery.
 
 When a client is launched with both `tcp://` and `udp://` endpoint paths, mixed underlay is treated as its own Auto track. The same product ownership, ordering, admission, and bounded-repair ledger unifies TCP-underlay reliable streams and QUIC UDP reliable streams, while each family keeps its own ACK clock, congestion control, pacing, flow control, and liveness rules. Auto may move an ordered reliable stream across TCP and QUIC UDP paths only from direction-correct measured capacity, exact clear-frontier ownership, queue/debt, and completion evidence; configured ETA hints can rank validation but cannot authorize that move. After promotion, ordinary repair stays with the current carrier subflow set until that subflow set fails or is exhausted. UDP/QUIC receive progress is periodically replayed after established progress; TCP multipath replays progress only while reorder debt exists, and each replay timer follows the request-side Active carrier. A persistent bulk ACK gap exactly owned by TCP may repair one modeled service flight on one selected distinct output with live bulk-model evidence, bounded by approximately `2 * BDP`, the selected output's remaining service-flight headroom, gap debt, repair, path-flight, and queue resources. The queued event stays bound to that exact attachment or output incarnation rather than migrating frame by frame to a differently modeled path. If that identity detaches, is replaced, or cannot drain before the persistent-gap deadline, its remaining queued batch is cancelled so a later authoritative gap replay can select and size a fresh output. An unproven output, UDP/QUIC owner, or latency work retains one smaller bounded repair event. This avoids blind same-stream TCP+UDP striping while still allowing mixed-carrier recovery and measured cooperative aggregation without adding a manual transmission mode.
 
-For multi-flow response sessions, carrier-neutral response ownership stays above carrier-specific proof and emission. The current bootstrap is directional: when a measured active TCP Service family leads UDP by at least two flows and has no latency pressure, one reachable, unmeasured QUIC Validation path may receive a bounded `PATH_CAPACITY_DATA` train. TCP keeps exact product-owner/ACK-clock calibration. QUIC instead gates ordinary connection writers, emits the typed train as bounded records followed by `PATH_CAPACITY_FINISH`, and requires the peer to return an exact same-stream `PATH_CAPACITY_RECEIPT`. Quinn ACK timing remains provisional carrier diagnostics because its callbacks are connection-aggregate and cannot identify a stream or calibration token. Receipt of the full declared train is the capacity authority; it freezes the conservative full sender-to-receipt rate interval and placement expiry, publishes independently of later native ACK telemetry, and releases the carrier writer gate. A separate sent-time quarantine excludes probe-era and early post-receipt ACKs from generic product evidence through that expiry without blocking new writes. Pre-existing cross-stream traffic can only lengthen the receipt interval and lower the measured available rate. The typed command freezes `calibration_id`, sample floor, accounting slack, live carrier window, proof-validity duration, and attempt deadline. A completed marker is installed only after exact token/path-instance/session validation, and its three-PTO placement lifetime is frozen from the planning snapshot rather than recomputed from later RTT. Every attempt uses the exact `max(sample floor, live carrier window + fresh strict-proof window)` geometry and must fit the cumulative session envelope. Eligible fitting unattempted paths rank ahead of retries, each exact session/path/path-instance may attempt at most twice, and one session may hold only one probe or handoff drain. Failed provisional command admission rolls back only its exact reservation; publication resolves the command ticket without turning it into carrier cancellation, while expiry, detach, and close remain cancellation. An indeterminate partial, cancelled, or expired QUIC carrier write fail-closes that exact connection before its epoch can be reused.
+Separately from one-active-response same-family discovery, the cross-family QUIC
+capacity train remains a multi-flow mechanism. When a measured active TCP
+Service family leads UDP by at least two flows and has no latency pressure, one
+reachable, unmeasured QUIC Validation path may receive a bounded
+`PATH_CAPACITY_DATA` train. TCP keeps exact product-owner/ACK-clock calibration.
+QUIC instead gates ordinary connection writers, emits typed bounded records and
+`PATH_CAPACITY_FINISH`, and requires an exact same-stream
+`PATH_CAPACITY_RECEIPT`. Full-train receipt owns proof; connection-aggregate
+Quinn ACK timing remains diagnostic. The command freezes token, path instance,
+byte geometry, validity, and deadline, uses a cumulative non-refilling session
+envelope, and permits at most two attempts per exact path instance. Publication
+resolves the command ticket; partial, cancelled, expired, or indeterminate writes
+fail-close that exact connection before its epoch can be reused.
 
 A measured target can receive one sticky whole-flow Service handoff only when its projected per-flow capacity is non-degrading. If sustained source feed prevents a clear frontier, the session may reserve one bounded, one-shot drain for one exact response binding. That binding pauses only fresh `OwnerData`; control, ACK/credit, correctness-critical repair, and other bindings continue. Offset-free raw staging continues only within the existing bounded source-feed/sender-queue reservoir while that binding's queued Data front is blocked. The handoff commits at the resulting exact frontier after identity and model revalidation, or the drain cancels on expiry or projected fair-share regression. This is flow placement across separate TCP and QUIC recovery engines, not per-frame cross-carrier striping.
 

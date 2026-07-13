@@ -215,10 +215,35 @@ pub(super) fn bulk_exploration_completion_projection(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> BulkExplorationCompletionProjection {
-    let candidate_followup_bytes = exploration_bytes.saturating_sub(payload_bytes as u64);
     let service_reservoir_bytes =
         bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits) as u64;
     let service_followup_bytes = service_reservoir_bytes.saturating_sub(exploration_bytes);
+    let candidate_followup_bytes = exploration_bytes.saturating_sub(payload_bytes as u64);
+    BulkExplorationCompletionProjection {
+        candidate_completion_ms: candidate_eta_ms.max(0.0)
+            + bulk_bytes_tx_ms(candidate_snapshot, candidate_followup_bytes),
+        service_reservoir_horizon_ms: service_eta_ms.max(0.0)
+            + bulk_bytes_tx_ms(service_snapshot, service_followup_bytes),
+        exploration_bytes,
+        service_followup_bytes,
+    }
+}
+
+pub(super) fn bulk_tcp_calibration_completion_projection(
+    service_snapshot: PathSnapshot,
+    service_eta_ms: f64,
+    candidate_snapshot: PathSnapshot,
+    candidate_eta_ms: f64,
+    exploration_bytes: u64,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+) -> BulkExplorationCompletionProjection {
+    // Calibration follows an exact proven startup prefix. Those missing lower
+    // bytes do not occupy receiver reorder memory; later Service bytes do. Keep
+    // one full bounded Service reservoir behind the calibration prefix.
+    let service_followup_bytes =
+        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits) as u64;
+    let candidate_followup_bytes = exploration_bytes.saturating_sub(payload_bytes as u64);
     BulkExplorationCompletionProjection {
         candidate_completion_ms: candidate_eta_ms.max(0.0)
             + bulk_bytes_tx_ms(candidate_snapshot, candidate_followup_bytes),
@@ -322,10 +347,21 @@ pub(super) fn bulk_candidate_admission_suppression(
 pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     check: BulkAdmissionCheck,
 ) -> Option<&'static str> {
+    bulk_candidate_admission_suppression_with_completion_backlog(
+        check,
+        check.stream_ordering_debt_bytes,
+    )
+}
+
+pub(super) fn bulk_candidate_admission_suppression_with_completion_backlog(
+    check: BulkAdmissionCheck,
+    completion_backlog_bytes: u64,
+) -> Option<&'static str> {
     if let Some(reason) = bulk_cross_underlay_completion_suppression(check) {
         return Some(reason);
     }
-    if let Some(reason) = bulk_same_underlay_completion_suppression(check) {
+    if let Some(reason) = bulk_same_underlay_completion_suppression(check, completion_backlog_bytes)
+    {
         return Some(reason);
     }
     if !bulk_candidate_within_inflight_limit(check) {
@@ -357,16 +393,35 @@ pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     None
 }
 
-fn bulk_same_underlay_completion_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
+fn bulk_same_underlay_completion_suppression(
+    check: BulkAdmissionCheck,
+    completion_backlog_bytes: u64,
+) -> Option<&'static str> {
     if check.role != BulkAdmissionRole::AdditionalSameUnderlay {
         return None;
     }
     if !bulk_same_underlay_requires_completion_gain(check.candidate_snapshot) {
         return None;
     }
-    let lead_next_quantum_eta_ms =
-        check.best_eta_ms + bulk_payload_tx_ms(check.best_snapshot, check.payload_bytes);
-    if check.candidate_eta_ms > lead_next_quantum_eta_ms {
+    // For a full bulk backlog, compare the candidate with Service draining the
+    // lower ordered tail, not only with Service's next quantum. This is the ECF
+    // completion boundary: a candidate that finishes before those earlier bytes
+    // adds capacity without extending the receive hole. A clear/small frontier
+    // retains the strict next-quantum rule.
+    // Service ETA already includes its command queue and, for QUIC, native
+    // carrier flight. Subtract those overlapping views from the product tail
+    // before adding backlog transmission time.
+    let service_modeled_debt_bytes = check
+        .best_snapshot
+        .queue_bytes
+        .saturating_add(check.best_snapshot.product_queue_bytes)
+        .saturating_add(check.best_snapshot.bytes_in_flight);
+    let service_followup_bytes = completion_backlog_bytes
+        .saturating_sub(service_modeled_debt_bytes)
+        .max(check.payload_bytes as u64);
+    let service_completion_eta_ms =
+        check.best_eta_ms + bulk_bytes_tx_ms(check.best_snapshot, service_followup_bytes);
+    if check.candidate_eta_ms > service_completion_eta_ms {
         return Some("same_underlay_no_completion_gain");
     }
     None
@@ -2429,6 +2484,61 @@ mod tests {
                 stream_ordering_debt_bytes: 0,
             }),
             Some("same_underlay_no_completion_gain")
+        );
+    }
+
+    #[test]
+    fn bulk_backlog_admits_same_underlay_path_that_finishes_before_service_tail() {
+        let mut lead = candidate(0, 400.0, 360.0, 400.0);
+        let mut extra = candidate(1, 800.0, 360.0, 200.0);
+        lead.snapshot.confidence = 1.0;
+        extra.snapshot.confidence = 1.0;
+        extra.snapshot.app_limited = false;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_completion_backlog(
+                BulkAdmissionCheck {
+                    best_snapshot: lead.snapshot,
+                    best_eta_ms: lead.eta_ms,
+                    candidate_snapshot: extra.snapshot,
+                    candidate_eta_ms: extra.eta_ms,
+                    payload_bytes: 64 * 1024,
+                    mux_limits: MuxLimits::default(),
+                    role: BulkAdmissionRole::AdditionalSameUnderlay,
+                    stream_ordering_debt_bytes: 0,
+                },
+                32 * 1024 * 1024,
+            ),
+            None,
+            "a proven path that completes before the lower Service backlog adds bulk capacity without extending the hole"
+        );
+    }
+
+    #[test]
+    fn bulk_backlog_does_not_double_count_service_carrier_flight() {
+        let mut lead = candidate(0, 735.0, 360.0, 400.0);
+        let mut extra = candidate(1, 1_100.0, 360.0, 200.0);
+        lead.snapshot.confidence = 1.0;
+        lead.snapshot.bytes_in_flight = 16 * 1024 * 1024;
+        extra.snapshot.confidence = 1.0;
+        extra.snapshot.app_limited = false;
+
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_completion_backlog(
+                BulkAdmissionCheck {
+                    best_snapshot: lead.snapshot,
+                    best_eta_ms: lead.eta_ms,
+                    candidate_snapshot: extra.snapshot,
+                    candidate_eta_ms: extra.eta_ms,
+                    payload_bytes: 64 * 1024,
+                    mux_limits: MuxLimits::default(),
+                    role: BulkAdmissionRole::AdditionalSameUnderlay,
+                    stream_ordering_debt_bytes: 0,
+                },
+                32 * 1024 * 1024,
+            ),
+            Some("same_underlay_no_completion_gain"),
+            "carrier flight already present in Service ETA cannot extend the completion deadline twice"
         );
     }
 

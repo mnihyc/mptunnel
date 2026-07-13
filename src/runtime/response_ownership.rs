@@ -59,7 +59,7 @@ impl ResponseCandidateTailDebt {
 pub(super) struct ResponseSameFamilyReservoir {
     service: CarrierPathKey,
     tail: ResponseOrderedTail,
-    protected_service_bytes: u64,
+    service_assigned_bytes: u64,
 }
 
 impl ResponseSameFamilyReservoir {
@@ -68,20 +68,20 @@ impl ResponseSameFamilyReservoir {
         tail: ResponseOrderedTail,
         service_assigned_bytes: u64,
         protected_service_bytes: usize,
-        feed_reservoir_bytes: usize,
+        ordered_reservoir_bytes: usize,
         payload_bytes: usize,
     ) -> Option<Self> {
         let protected_service_bytes = protected_service_bytes as u64;
         if service_assigned_bytes < protected_service_bytes
             || tail.projected_union_bytes(service_assigned_bytes, payload_bytes)
-                > feed_reservoir_bytes as u64
+                > ordered_reservoir_bytes as u64
         {
             return None;
         }
         Some(Self {
             service,
             tail,
-            protected_service_bytes,
+            service_assigned_bytes,
         })
     }
 
@@ -103,7 +103,7 @@ impl ResponseSameFamilyReservoir {
         let external_bytes = self
             .tail
             .bytes
-            .saturating_sub(self.protected_service_bytes)
+            .saturating_sub(self.service_assigned_bytes)
             .saturating_sub(candidate_owner_bytes);
         ResponseCandidateTailDebt {
             global_bytes: self.tail.bytes,
@@ -154,11 +154,11 @@ mod tests {
         let external = reservoir
             .for_candidate(candidate, candidate_flight)
             .external_bytes();
-        assert_eq!(candidate_flight as u64 + external, 512 * 1024);
+        assert_eq!(candidate_flight + external, 512 * 1024);
     }
 
     #[test]
-    fn same_family_reservoir_keeps_global_feed_cap_authoritative() {
+    fn same_family_reservoir_keeps_global_ordered_cap_authoritative() {
         let service = key(0);
         let tail = ResponseOrderedTail::new(Some(service), 4 * 1024 * 1024);
 

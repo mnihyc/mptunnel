@@ -173,6 +173,38 @@ on a final burst. The single control changes -0.32%, +0.56%, and +3.53%. Do not 
 row to one-flow aggregation, QUIC, mixed carriers, real Internet, failover, or
 current MPTCP/Hysteria2 comparisons; those require their own matched cohorts.
 
+TCP response discovery has a separate directional rule. One active sustained
+bulk response may spend the first bounded same-family startup sample. Once a
+measured response Subflow exists, a later cold candidate must project completion
+of its whole startup sample inside the current Service backlog reservoir; a
+sample already bound to an exact epoch may drain. The robust TCP calibration
+median becomes a typed path-capacity prior after exact drain. It is replaced,
+not blended, only after ten completed ordinary exact-ACK windows and a usable
+continuous per-flow sample. Fragmented callbacks do not count as windows, and
+QUIC continues to require native carrier evidence.
+
+Iterations 118 and 119 are the initial clean one-flow TCP download controls on
+five 500 Mbps, 180 ms, 1 ms-jitter, zero-loss paths. Multipath reached 273.437
+and 263.841 Mbps, or 1.182x and 1.139x the matched single-path rows; their late
+ratios were 1.477x and 1.488x. An exact detached-commit A/B put `7fa7789` at
+235.147 Mbps versus the current 231.579 Mbps single row under the same host
+conditions, so the historical absolute-rate drop was environmental rather than
+a code regression. Iteration 121 retained two-flow aggregation at 488.684 Mbps,
+2.078x that detached single control. Do not extrapolate these shaped TCP rows to
+QUIC, mixed carriers, heterogeneous paths, failover, real Internet, or external
+baseline superiority.
+
+The post-audit final binary adds a stricter calibration ownership bound. While
+an exact TCP calibration prefix is serialized, total ordered tail is limited to
+that prefix plus one Service feed reservoir, clamped to the product envelope;
+Service queue/native flight already included in ETA is not counted twice.
+Iteration 124 reaches 319.401 Mbps overall and 561.482 Mbps final-three-seconds
+against the adjacent 301.301/439.178 Mbps single control. The unsafe pre-cap A/B
+is 346.852/459.599 Mbps. Operators should therefore expect a current stability
+tradeoff: bounded calibration costs 7.9% overall in this run but improves late
+delivery 22.2%. This is an open performance issue, not permission to remove the
+ownership bound.
+
 A QUIC bulk stream advertises the configured product receive window, 64 MiB by
 default. This is receiver-memory authority, not the QUIC congestion window or
 path-capacity proof. Before exact feed evidence, response source and emission

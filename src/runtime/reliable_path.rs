@@ -19,6 +19,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 pub(in crate::runtime) const MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH: u8 = 2;
+// One sustained response stream is real demand. Same-family discovery stays
+// single-owner and bounded; requiring a second stream prevents large one-flow
+// transfers from ever measuring spare paths.
+pub(super) const MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY: u32 = 1;
 static NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
 const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
@@ -806,8 +810,8 @@ pub(super) struct ResponseAckClockCalibrationRequest {
     pub(super) service_pending_bytes: u64,
     pub(super) target_pending_bytes: u64,
     pub(super) limit_bytes: u64,
-    /// Two response flows are required to start, not to finish exact begun work.
-    pub(super) requires_multi_flow_start: bool,
+    /// Fresh work requires active response demand; exact begun work may finish.
+    pub(super) requires_active_response_start: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1054,6 +1058,7 @@ impl ResponseStreamBinding {
                     delivery_rate_bps: None,
                     tcp_ack_clock_rate_bps: None,
                     tcp_product_rate_evidence: None,
+                    tcp_calibration_prior: None,
                     srtt_ms: None,
                     delivery_samples: 0,
                     owner_data_acked_bytes: 0,
@@ -1194,6 +1199,7 @@ impl ResponseStreamBinding {
                         entry.delivery_rate_bps = None;
                         entry.tcp_ack_clock_rate_bps = None;
                         entry.tcp_product_rate_evidence = None;
+                        entry.tcp_calibration_prior = None;
                         entry.srtt_ms = None;
                         entry.delivery_samples = 0;
                         entry.owner_data_acked_bytes = 0;
@@ -1297,6 +1303,7 @@ impl ResponseStreamBinding {
                 entry.delivery_rate_bps = None;
                 entry.tcp_ack_clock_rate_bps = None;
                 entry.tcp_product_rate_evidence = None;
+                entry.tcp_calibration_prior = None;
                 entry.srtt_ms = None;
                 entry.delivery_samples = 0;
                 entry.owner_data_acked_bytes = 0;
@@ -1339,6 +1346,7 @@ impl ResponseStreamBinding {
                 delivery_rate_bps: None,
                 tcp_ack_clock_rate_bps: None,
                 tcp_product_rate_evidence: None,
+                tcp_calibration_prior: None,
                 srtt_ms: None,
                 delivery_samples: 0,
                 owner_data_acked_bytes: 0,
@@ -2038,32 +2046,54 @@ impl ResponseStreamBinding {
                 // dispatch. The first exact ACK establishes the clock; later
                 // binding-local OwnerData bytes use continuous ACK wall time so
                 // callback compression cannot discard the preceding silence.
-                let tcp_ack_clock_sample = if entry.key.underlay == UnderlayProtocol::Tcp {
-                    let evidence = entry
-                        .tcp_product_rate_evidence
-                        .get_or_insert_with(|| ResponseAckClockRateEvidence::new(first_sent_at));
-                    let _ = evidence.observe_with_fresh_bytes(
-                        bytes,
-                        bytes,
-                        first_sent_at,
-                        last_sent_at,
-                        now,
-                    );
-                    evidence.goodput_sample()
-                } else {
-                    None
-                };
+                let (tcp_ack_clock_sample, tcp_ack_clock_window_complete) =
+                    if entry.key.underlay == UnderlayProtocol::Tcp {
+                        let evidence = entry.tcp_product_rate_evidence.get_or_insert_with(|| {
+                            ResponseAckClockRateEvidence::new(first_sent_at)
+                        });
+                        let update = evidence.observe_with_fresh_bytes(
+                            bytes,
+                            bytes,
+                            first_sent_at,
+                            last_sent_at,
+                            now,
+                        );
+                        (
+                            evidence.goodput_sample(),
+                            matches!(update, ResponseAckClockRateEvidenceUpdate::Proven { .. }),
+                        )
+                    } else {
+                        (None, false)
+                    };
                 let carrier_app_limited = entry
                     .local_path_metrics
                     .is_some_and(|metrics| metrics.metrics.app_limited);
-                // The terminal ACK stays calibration-owned, but a no-rate
-                // tombstone must not freeze later ordinary TCP evidence.
+                let calibrated_rate_bps =
+                    calibration_snapshot.and_then(|calibration| calibration.calibrated_rate_bps);
+                let mut ordinary_tcp_rate_replaces_calibration = false;
+                if entry.key.underlay == UnderlayProtocol::Tcp
+                    && !calibration_identity_active
+                    && calibration_update.is_none()
+                    && tcp_ack_clock_window_complete
+                    && let Some(prior) = entry.tcp_calibration_prior.as_mut()
+                {
+                    prior.ordinary_windows = prior.ordinary_windows.saturating_add(1);
+                    ordinary_tcp_rate_replaces_calibration =
+                        product_delivery_samples_override_startup_prior(prior.ordinary_windows)
+                            && tcp_ack_clock_sample.is_some();
+                }
+                if ordinary_tcp_rate_replaces_calibration {
+                    entry.tcp_calibration_prior = None;
+                }
+                // The terminal ACK stays calibration-owned. A robust bounded
+                // result remains only a startup prior until a fresh ordinary
+                // exact-ACK epoch reaches the normal evidence threshold.
                 let tcp_calibration_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
                     && (calibration_identity_active
                         || calibration_update.is_some()
+                        || entry.tcp_calibration_prior.is_some()
                         || calibration_snapshot.is_some_and(|calibration| {
-                            calibration.calibrated_rate_bps.is_some()
-                                || (!calibration.proven && !calibration.retired)
+                            !calibration.proven && !calibration.retired
                         }));
                 if !tcp_calibration_owns_rate {
                     match (
@@ -2095,12 +2125,11 @@ impl ResponseStreamBinding {
                     }
                 }
                 if entry.key.underlay == UnderlayProtocol::Tcp
-                    && let Some(calibrated_rate_bps) =
-                        calibration_snapshot.and_then(|calibration| calibration.calibrated_rate_bps)
+                    && calibration_identity_active
+                    && let Some(calibrated_rate_bps) = calibrated_rate_bps
                 {
                     entry.product_progress_rate_bps = Some(calibrated_rate_bps);
                     entry.delivery_rate_bps = Some(calibrated_rate_bps);
-                    entry.tcp_ack_clock_rate_bps = Some(calibrated_rate_bps);
                 }
             }
             if let Some((
@@ -2314,6 +2343,26 @@ impl ResponseStreamBinding {
             };
             if clear_active {
                 outputs.active_ack_clock_calibration = None;
+                if let Some(entry) = outputs
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.key == identity.0 && entry.incarnation == identity.1)
+                {
+                    // Exclude bounded calibration traffic from the continuous
+                    // ACK clock that will eventually replace its startup prior.
+                    entry.tcp_product_rate_evidence = None;
+                    entry.tcp_ack_clock_rate_bps = None;
+                    entry.tcp_calibration_prior = transition_snapshot
+                        .and_then(|state| state.calibrated_rate_bps)
+                        .map(|rate_bps| TcpResponseCalibrationPrior {
+                            rate_bps,
+                            ordinary_windows: 0,
+                        });
+                    if let Some(prior) = entry.tcp_calibration_prior {
+                        entry.product_progress_rate_bps = Some(prior.rate_bps);
+                        entry.delivery_rate_bps = Some(prior.rate_bps);
+                    }
+                }
             }
         }
         for hole in ordering_update.newly_contiguous {
@@ -2983,7 +3032,7 @@ impl ResponseStreamBinding {
             .with_matching_generation_and_min_active_response_flows(
                 self.session_id,
                 request.expected_lane_generation,
-                2,
+                MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
                 || {
                     if self.response_model_generation.load(Ordering::Acquire)
                         != request.expected_model_generation
@@ -3187,7 +3236,11 @@ impl ResponseStreamBinding {
                 .with_matching_generation_and_min_active_response_flows(
                     self.session_id,
                     request.expected_lane_generation,
-                    if request.requires_multi_flow_start { 2 } else { 0 },
+                    if request.requires_active_response_start {
+                        MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY
+                    } else {
+                        0
+                    },
                     || {
                     {
                         if self.response_model_generation.load(Ordering::Acquire)
@@ -3867,6 +3920,18 @@ impl ResponseStreamBinding {
                             entry,
                             self.mux_limits,
                         ));
+                let endpoint_only_service_prior_eligible = entry.key.underlay
+                    == UnderlayProtocol::Tcp
+                    && !product_delivery_samples_override_startup_prior(entry.delivery_samples)
+                    && !entry.local_path_metrics.is_some_and(|metrics| {
+                        metrics.source == ServerPathMetricsSource::LocalSender
+                            && metrics.metrics.has_ack_derived_data_sample
+                    })
+                    && entry.peer_path_metrics.is_some_and(|metrics| {
+                        metrics.source == ServerPathMetricsSource::PeerHint
+                            && metrics.metrics.app_limited
+                            && !metrics.metrics.has_ack_derived_data_sample
+                    });
                 #[cfg(feature = "lab-diagnostics")]
                 self.lab_response_service_feed_state(
                     entry,
@@ -3903,6 +3968,7 @@ impl ResponseStreamBinding {
                     has_sender_evidence: server_output_has_sender_evidence(entry),
                     has_service_feed_evidence,
                     has_bulk_rate_evidence,
+                    endpoint_only_service_prior_eligible,
                     quic_capacity_proof: server_output_quic_capacity_proof_marker(entry),
                     quic_capacity_calibration_attempts: response_snapshot
                         .quic_capacity_calibration_attempts,
@@ -7557,6 +7623,9 @@ mod tests {
             "one compressed stage sample cannot replace the startup rate"
         );
         assert_eq!(outputs.active_ack_clock_calibration, None);
+        assert!(entry.tcp_product_rate_evidence.is_none());
+        assert!(entry.tcp_ack_clock_rate_bps.is_none());
+        assert!(entry.tcp_calibration_prior.is_none());
         drop(outputs);
 
         let next_offset = (2 * window_bytes) as u64;
@@ -7594,7 +7663,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_response_robust_calibration_replaces_poisoned_rate_without_fake_rtt() {
+    fn tcp_response_robust_calibration_yields_to_mature_ordinary_rate_without_fake_rtt() {
         let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
         let identity = {
             let mut outputs = binding.outputs.lock().expect("test response outputs lock");
@@ -7602,6 +7671,7 @@ mod tests {
             entry.product_progress_rate_bps = Some(7_000_000_000.0);
             entry.delivery_rate_bps = Some(7_000_000_000.0);
             entry.srtt_ms = Some(10.0);
+            entry.delivery_samples = u32::MAX;
             let identity = (entry.key, entry.incarnation);
             let initial = PATH_OPEN_SCORE_BYTES as u64;
             let mut calibration = ResponseAckClockCalibrationState::new(initial, 4 * initial);
@@ -7620,6 +7690,7 @@ mod tests {
             }
             assert_test_rate_close(calibration.calibrated_rate_bps, 110_000_000.0);
             outputs.ack_clock_calibrations.insert(identity, calibration);
+            outputs.active_ack_clock_calibration = Some(identity);
             identity
         };
         let sample_bytes = 4096;
@@ -7638,32 +7709,106 @@ mod tests {
             .expect("TCP output");
         assert_test_rate_close(entry.product_progress_rate_bps, 110_000_000.0);
         assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
-        assert_test_rate_close(entry.tcp_ack_clock_rate_bps, 110_000_000.0);
+        assert!(entry.tcp_ack_clock_rate_bps.is_none());
         assert_eq!(entry.srtt_ms, Some(10.0));
+        assert!(entry.tcp_product_rate_evidence.is_none());
+        let prior = entry
+            .tcp_calibration_prior
+            .expect("robust calibration prior");
+        assert_test_rate_close(Some(prior.rate_bps), 110_000_000.0);
+        assert_eq!(prior.ordinary_windows, 0);
+        assert_eq!(outputs.active_ack_clock_calibration, None);
         drop(outputs);
 
-        let rtt_sample_bytes = PATH_OPEN_SCORE_BYTES;
-        binding.record_owner_flight(
-            key,
-            &stream_data_frame_at(sample_bytes as u64, rtt_sample_bytes),
+        let prior_entry = first_output_entry(&binding);
+        let prior_snapshot = server_bulk_output_snapshot(
+            &prior_entry,
+            binding.session_id,
+            FlowLane::Throughput,
+            binding.lane_tracker.as_ref(),
+            binding.mux_limits,
+            Instant::now(),
         );
-        std::thread::sleep(Duration::from_millis(1));
-        binding.release_normalized_acked_ranges(&[OffsetRange {
-            start: sample_bytes as u64,
-            end: sample_bytes as u64 + rtt_sample_bytes as u64,
-        }]);
+        assert_test_rate_close(Some(prior_snapshot.delivery_rate_bps), 110_000_000.0);
+        assert_eq!(
+            prior_snapshot.rate_scope,
+            crate::scheduler::PathRateScope::PathCapacity
+        );
+
+        let fragment_bytes = (PATH_OPEN_SCORE_BYTES / (RELIABLE_INITIAL_WINDOW_PACKETS + 1)).max(1);
+        let fragmented_ack_start = Instant::now() + Duration::from_millis(1);
+        for fragment_index in 0..RELIABLE_INITIAL_WINDOW_PACKETS as u64 {
+            let offset = sample_bytes as u64 + fragment_index * fragment_bytes as u64;
+            binding.record_owner_flight(key, &stream_data_frame_at(offset, fragment_bytes));
+            binding.release_normalized_acked_ranges_at(
+                &[OffsetRange {
+                    start: offset,
+                    end: offset + fragment_bytes as u64,
+                }],
+                fragmented_ack_start + Duration::from_millis(fragment_index),
+            );
+        }
+        let entry = first_output_entry(&binding);
+        assert_eq!(
+            entry
+                .tcp_calibration_prior
+                .expect("fragmented ACKs retain calibration prior")
+                .ordinary_windows,
+            0,
+            "callbacks smaller than one exact ACK window are not evidence samples"
+        );
+
+        let ordinary_sample_bytes = PATH_OPEN_SCORE_BYTES;
+        let ordinary_ack_start = Instant::now() + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
+        for sample_index in 0..RELIABLE_INITIAL_WINDOW_PACKETS as u64 {
+            let offset = sample_bytes as u64
+                + RELIABLE_INITIAL_WINDOW_PACKETS as u64 * fragment_bytes as u64
+                + sample_index * ordinary_sample_bytes as u64;
+            binding.record_owner_flight(key, &stream_data_frame_at(offset, ordinary_sample_bytes));
+            binding.release_normalized_acked_ranges_at(
+                &[OffsetRange {
+                    start: offset,
+                    end: offset + ordinary_sample_bytes as u64,
+                }],
+                ordinary_ack_start
+                    + RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED.mul_f64(sample_index as f64),
+            );
+            if sample_index + 1 < RELIABLE_INITIAL_WINDOW_PACKETS as u64 {
+                let entry = first_output_entry(&binding);
+                assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
+            }
+        }
         let outputs = binding.outputs.lock().expect("test response outputs lock");
         let entry = outputs
             .entries
             .iter()
             .find(|entry| (entry.key, entry.incarnation) == identity)
             .expect("TCP output");
-        assert_test_rate_close(entry.product_progress_rate_bps, 110_000_000.0);
-        assert_test_rate_close(entry.delivery_rate_bps, 110_000_000.0);
+        assert!(entry.tcp_calibration_prior.is_none());
+        assert!(
+            entry
+                .delivery_rate_bps
+                .is_some_and(|rate_bps| rate_bps < 110_000_000.0),
+            "mature ordinary exact-ACK evidence must replace the bounded calibration prior"
+        );
+        assert_eq!(entry.product_progress_rate_bps, entry.delivery_rate_bps);
+        assert_eq!(entry.tcp_ack_clock_rate_bps, entry.delivery_rate_bps);
         assert_eq!(
             entry.srtt_ms,
             Some(10.0),
             "scheduler assignment time is not a TCP dispatch or RTT timestamp"
+        );
+        let ordinary_snapshot = server_bulk_output_snapshot(
+            entry,
+            binding.session_id,
+            FlowLane::Throughput,
+            binding.lane_tracker.as_ref(),
+            binding.mux_limits,
+            Instant::now(),
+        );
+        assert_eq!(
+            ordinary_snapshot.rate_scope,
+            crate::scheduler::PathRateScope::PerFlowGoodput
         );
     }
 
@@ -9319,7 +9464,7 @@ mod tests {
                 service_pending_bytes: 0,
                 target_pending_bytes: target.commands.pending_bytes(),
                 limit_bytes: reliable_ack_clock_calibration_limit_bytes(mux_limits),
-                requires_multi_flow_start: true,
+                requires_active_response_start: true,
             }
         };
         let frame = stream_data_frame(payload_bytes);
@@ -9955,7 +10100,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_commit_rechecks_multi_flow_lane_generation() {
+    fn startup_commit_rechecks_response_flow_generation() {
         let session_id = SessionId(92);
         let service = CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
@@ -10017,7 +10162,7 @@ mod tests {
         assert_eq!(
             admission.decision,
             PathAdmissionDecision::Standby,
-            "closing the second active flow must invalidate a planned startup sample before commit"
+            "response-flow churn must invalidate a planned startup sample before commit"
         );
     }
 

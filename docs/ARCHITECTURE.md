@@ -151,9 +151,13 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   `STREAM_MAX_DATA` advertise the configured product window independently of
   path proof; source staging and native carrier congestion control separately
   bound admitted and network flight. Latency QUIC retains its smaller window.
-- Bound same-family striping inside that envelope. Service owns the first
-  horizon; only a strictly measured same-underlay Subflow may use the remaining
-  feed reservoir, and TCP or QUIC still owns its per-path emission credit. The
+- Bound same-family striping inside the configured product, reorder, and stream
+  envelope. Service owns the first horizon; only a strictly measured
+  same-underlay Subflow may use the remaining ordered reservoir, and TCP or QUIC
+  still owns its per-path emission credit. Admission compares the candidate's
+  completion time with the complete Service backlog, while receiver reorder
+  exposure excludes bytes already assigned to Service. Queue and native carrier
+  flight already represented in Service ETA are not charged a second time. The
   weaker QUIC product-progress/carrier Service-feed predicates do not prove
   optional capacity or admit a Subflow; QUIC Subflow, handoff, and capacity
   decisions still require strict non-app-limited local carrier proof. A QUIC
@@ -191,7 +195,19 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   data-bearing upload while still giving kernel TCP enough bounded exploration
   credit to leave slow start. QUIC stays outside product-ACK calibration and
   requires attributable post-attachment native packet-ACK evidence. One-flow
-  optional-path aggregation remains unproven for both carrier families.
+  request optional-path aggregation remains unproven for both carrier families.
+- Response discovery is directional and permits one active sustained bulk
+  response to spend the first bounded same-family startup sample. That first
+  sample is the non-circular discovery bootstrap. After one measured Subflow
+  exists, every later fresh candidate must finish its whole startup sample
+  within the current Service completion reservoir; an already-started exact
+  epoch may finish. This prevents serial cold samples from inserting a slow
+  ordered prefix while retaining one-flow download aggregation.
+- A TCP calibration opportunity may borrow Service rate only for its bounded
+  projection. While the exact calibration prefix is serialized, Service owner
+  assignment stops when total ordered tail reaches that prefix plus one Service
+  feed reservoir, clamped to the product envelope, until ACK progress releases
+  credit. Offset-free raw staging does not weaken this ownership limit.
 - Encode large probe trains incrementally. Do not allocate a vector containing
   every frame or copy the complete train solely for queue admission.
 - Treat time sources explicitly. Carrier ACK timing, scheduler poll timing, and
@@ -199,7 +215,10 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
 - TCP response goodput counts only exact binding-local `OwnerData`. Its first
   product ACK establishes the clock; later bytes use a bounded ratio of bytes
   to continuous ACK wall time so callback bursts cannot discard their silence.
-  It remains per-flow evidence, not TCP carrier capacity.
+  A completed exclusive calibration may install its robust rate only as a typed
+  path-capacity prior. Ten completed ordinary exact-ACK windows plus a usable
+  continuous sample atomically replace that prior with per-flow goodput; ACK
+  callbacks alone do not advance the count. QUIC does not use either TCP clock.
 - Thresholds must be protocol/resource bounds or derived from live metrics.
   Lab-specific constants must not become steady-state product policy.
 

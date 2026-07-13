@@ -556,10 +556,12 @@ from the planning snapshot's three-PTO persistent-congestion horizon without era
 connection reachability; later RTT changes MUST NOT shorten it, and a later full
 ordinary timed window MAY lower the retained rate. Receipt releases the ordinary
 writer gate immediately. ACK attribution remains separate: callbacks for
-packets sent from probe start through the frozen proof deadline MUST be excluded
-from generic product evidence until that deadline, even after public probe
-metrics retire. A replacement probe on that connection MUST wait for the prior
-attribution quarantine to expire. The whole frozen proof contract and train MUST
+packets sent from probe start up to the peer receipt MUST be excluded from
+generic product evidence while the attribution quarantine remains alive.
+Ordinary packets sent at or after receipt are eligible immediately; the record
+survives until proof expiry only to reject delayed probe-era ACKs. A replacement
+probe on that connection MUST wait for the prior attribution quarantine to
+expire. The whole frozen proof contract and train MUST
 be admitted as one typed data-lane command, and the
 complete train MUST fit the remaining
 cumulative, non-refilling session capacity counter. That counter is separate
@@ -671,8 +673,25 @@ requires the stable request-side Service and fresh Validation-instance evidence
 defined in Section 18.1. Only a bounded epoch may
 bypass a completion-rate comparison polluted by underfeeding; ordinary measured
 Subflows remain subject to the completion horizon. QUIC request paths do not use
-this exception: optional ownership requires exact fresh post-attachment,
-non-app-limited native packet-ACK evidence. Ordinary measured admission remains
+the TCP product-sampling exception. After exact fresh post-attachment path proof,
+a sustained bulk request MAY reserve one session-serialized, non-refilling
+`PATH_CAPACITY_*` transaction on an idle UDP Validation instance. Its desired
+warmup target is the maximum of the candidate's native inflight limit, its
+current native flight, and twice the effective Service-rate BDP at the candidate
+SRTT. A carrier sample is preferred, but a product-derived rate or configured
+prior may conservatively size warmup and never becomes candidate proof. The
+preassigned session envelope may bound the rate-derived target, but MUST NOT
+bound warmup below the candidate's native flight. One fresh timed native window
+plus timing slack follows that warmup. Shared product flight,
+product queues, and ordering or reorder debt MUST NOT size this carrier-local
+transaction; they remain independent product-admission inputs. Exact receipt
+owns the token. The published rate is the greater of the full timed native
+measurement epoch and the full-train receipt lower bound. Exact product ACKs
+sent after acceptance on the same relay instance MUST then cover the frozen
+handoff floor before expiry; they grant durable ordered use but never become a
+QUIC rate sample. Outside that bounded transaction, optional ownership requires
+exact fresh post-attachment, non-app-limited native packet-ACK evidence.
+Ordinary measured admission remains
 path-metric and capability driven rather than TCP- or UDP-preferred. Mixed TCP+QUIC paths are
 deliberately stricter in production v1 because they do not share one
 carrier-family recovery model. A bulk-rate-proven mixed candidate that already
@@ -3936,31 +3955,38 @@ Even a fresh proof-byte-rate sample remains proof provenance only and MUST NOT
 initialize `delivery_rate`, `pacing_rate`, bulk-rate confidence, or graduation.
 
 `PATH_CAPACITY_DATA(path_id, calibration_id, payload)` is a different,
-QUIC-only response-capacity mechanism. It is sent only after ordinary path
-proof has established reachability, on one exact UDP Validation attachment
-reserved by a multi-flow imbalanced response session. Like `PATH_PROOF_DATA`,
+QUIC-only directional capacity mechanism. A response transaction is sent only
+after ordinary path proof has established reachability, on one exact UDP
+Validation attachment reserved by a multi-flow imbalanced response session. A
+request transaction instead requires a sustained bulk request, an exact live
+UDP Service with an effective delivery rate, and one idle, freshly proven UDP
+Validation attachment. Like `PATH_PROOF_DATA`,
 it has no product offset and never enters product ACK, flight, repair, or
 ordering ledgers. The sender gates ordinary connection writers, emits bounded
 Data records, then emits
 `PATH_CAPACITY_FINISH(path_id, calibration_id, payload_bytes)` on the same
-ordered QUIC stream. After consuming exactly that declared train, the client
+ordered QUIC stream. After consuming exactly that declared train, the receiver
 returns
 `PATH_CAPACITY_RECEIPT(path_id, calibration_id, received_payload_bytes)`.
 The full matching receipt is the local ownership proof. Quinn's
 connection-aggregate packet ACK bytes, pacing, loss, and timing remain
 provisional diagnostics and cannot identify the token. TCP rejects all three
 capacity records, and ordinary QUIC `SendFrame` admission rejects them; only
-the typed server command and the explicit client/server peer roles may emit
-them.
+the typed directional command and the explicit client/server peer roles may
+emit them.
 
-One typed command freezes the calibration ID, path instance, sample floor,
-accounting slack, warmup, required proof bytes, live carrier window, exact
-train, attempt deadline, proof-validity duration, and invalidatable ownership
-ticket.
-The train is the larger of the startup proof floor or the live carrier window
-plus one fresh strict-proof window. It MUST fit the remaining cumulative,
-non-refilling session resource envelope without clamping and be admitted
-atomically. Each exact
+One typed command freezes the direction, calibration ID, path instance, sample
+floor, accounting slack, warmup, required proof bytes, exact train, attempt
+deadline, proof-validity duration, and invalidatable ownership ticket. Response
+warmup uses the live candidate carrier window. The desired request warmup is the
+maximum of candidate native inflight limit, candidate native flight, and twice
+the effective Service-rate BDP at candidate SRTT. A native carrier sample is
+preferred; product goodput or a configured prior may conservatively size only
+the warmup. Shared product flight and queue or ordering debt are forbidden
+inputs. The preassigned envelope may bound the rate-derived target, but never
+below candidate native flight. One fresh strict-proof window follows the
+warmup. The whole train MUST fit the remaining cumulative, non-refilling
+session resource envelope and be admitted atomically. Each exact
 session/path/path-instance key permits at most two attempts, and an eligible
 never-attempted key precedes a retry. Reservation is provisional until the one
 typed command is admitted; only failure of that exact provisional admission
@@ -3973,16 +3999,23 @@ MUST NOT treat write-buffer acceptance or aggregate native ACK bytes as
 capacity proof. Ordinary optional-path capacity evidence retains
 non-app-limited filtering; the weaker current-Service feed predicates do not
 satisfy this capacity contract.
-Capacity rate uses the exact full-train byte count and the complete
-sender-to-receipt interval bounded by timer granularity; later native carrier
-timing never supplies or mutates its numerator, denominator, or completion. The exact token, path instance,
+Response capacity rate uses the exact full-train byte count and the complete
+sender-to-receipt interval bounded by timer granularity. Request capacity rate
+uses the greater of that conservative receipt lower bound and the full timed
+native measurement bytes divided by their send-time span. Because the typed
+epoch gates ordinary writers and accounts only its declared train, a generic
+application-limited flag does not invalidate those isolated bytes. The required
+byte count is only the proof floor; it MUST NOT truncate the native numerator.
+Scheduler poll time and product ACK timing are never rate clocks.
+The exact token, path instance,
 frozen geometry, full written/received byte count, and proof lifetime MUST match
 the live reservation, which remains held until the registry publishes the
 marker. Exact committed whole-train receipt releases the carrier writer gate;
 native BIF and send-watermark snapshots remain cleanup diagnostics because a
-receipt-triggered ACK-only send need not receive another ACK callback. The
-conservative interval is the maximum of one millisecond and the full
-sender-to-receipt elapsed time. The full train is the rate numerator. The attempt deadline
+receipt-triggered ACK-only send need not receive another ACK callback. For the
+receipt lower bound in either direction, the conservative interval is the
+maximum of one millisecond and the full sender-to-receipt elapsed time, and the
+full train is the rate numerator. The attempt deadline
 bounds command, write, and receipt completion. Candidate acceptance time is the
 carrier receipt time, and candidate expiry is that time plus the proof-validity
 interval frozen from the planning RTT snapshot; later polls and RTT changes
@@ -3992,7 +4025,10 @@ cancellation before start drops the command and aborts an admitted carrier
 epoch. Successful registry publication instead resolves the ticket as
 published and MUST NOT cancel the receipt-completed carrier. An indeterminate
 partial, cancelled, or expired write MUST fail-close the connection so its
-late native ACKs cannot become ordinary evidence.
+late native ACKs cannot become ordinary evidence. After exact receipt, ordinary
+packets sent at or after the receipt boundary become eligible immediately. The
+attribution record remains until proof expiry only to quarantine delayed ACKs
+for packets sent during the probe.
 
 Same-underlay validation is still subject to this rule. A path that uses the
 same underlay family as the lead path may be cheaper and safer to validate than a
@@ -4004,8 +4040,9 @@ candidate may receive unique owner ranges under the epoch cap and safety gates:
 the response candidate requires at least one active direction-relevant reliable
 response flow, while a TCP request candidate requires the sustained-demand,
 stable-Service, and fresh-instance proof predicate. A QUIC request candidate has
-no startup-sampling exception and needs exact fresh post-attachment,
-non-app-limited native packet-ACK evidence for ordinary optional ownership.
+no product startup-sampling exception: it needs exact fresh post-attachment
+native carrier proof followed by the exact post-proof product-ACK handoff before
+ordinary optional ownership becomes durable.
 Duplicate validation copies MUST be recorded as non-owners of the ordered
 frontier so they can release carrier/product flight on ACK without making the
 validation path the lower-frontier owner for later unique bytes.
@@ -6279,6 +6316,9 @@ number.
 * RFC 8684, "TCP Extensions for Multipath Operation with Multiple Addresses",
   especially data sequence mapping and reinjection concepts,
   https://www.rfc-editor.org/rfc/rfc8684
+* RFC 6182, "Architectural Guidelines for Multipath TCP Development",
+  especially aggregate bandwidth-delay-product buffer sizing,
+  https://www.rfc-editor.org/rfc/rfc6182
 * RFC 6356, "Coupled Congestion Control for Multipath Transport Protocols",
   especially independent subflow congestion state and aggregate resource
   pooling under sufficient offered load,

@@ -225,6 +225,11 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   one serialized carrier-only train establishes capacity, then exact
   post-proof product ACKs establish durable ownership. TCP and QUIC keep
   independent proof clocks below the shared product window.
+- Size request-side QUIC warmup from candidate-local native flight and the
+  effective competing rate/RTT pipe. Request snapshots carry total flight, so
+  subtract separately tracked product flight before applying the native floor.
+  Product flight is shared ordering state, possibly spanning several carriers,
+  and must not inflate one carrier proof.
 - Response discovery is directional and permits one active sustained bulk
   response to spend the first bounded same-family startup sample. That first
   sample is the non-circular discovery bootstrap. After one measured Subflow

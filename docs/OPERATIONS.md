@@ -252,12 +252,20 @@ fresh path proof. Sustained one-flow bulk demand may run one serialized,
 session-bounded carrier-only capacity train; the exact relay instance must then
 ACK the fixed post-proof product floor from bytes sent after acceptance and
 before expiry. The train's QUIC ACKs own rate and pacing, while product ACKs own
-only durable ordered admission. Probe packets are quarantined from ordinary
+only durable ordered admission. Because ordinary writers are gated, isolated
+timed train ACKs remain valid even if generic carrier telemetry reports
+application-limited. Probe packets are quarantined from ordinary
 capacity evidence by their send time through the peer receipt boundary;
 ordinary packets sent afterward are eligible immediately. A completed
 handoff's numeric rate prior expires independently of its durable ordered-use
 state so later native evidence can correct it. TCP and QUIC keep separate
 recovery, pacing, and flow-control loops below this unified product policy.
+The desired request train warmup uses the candidate's local native flight window
+and twice the effective Service-rate BDP at the candidate RTT. Its preassigned
+envelope may bound the rate-derived target, but not below native candidate
+flight. It deliberately excludes product flight, queued product bytes, and
+reorder debt; those remain bounded by the shared product window and are not one
+carrier's congestion state.
 
 For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
 `max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together

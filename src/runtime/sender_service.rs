@@ -1523,7 +1523,7 @@ struct RequestQuicCapacityCalibrationGeometry {
     warmup_carrier_bytes: u64,
     required_timed_carrier_bytes: u64,
     service_rate_bps: u64,
-    service_product_flight_bytes: u64,
+    candidate_carrier_flight_bytes: u64,
 }
 
 fn quic_capacity_timing_slack_bytes() -> u64 {
@@ -1533,7 +1533,6 @@ fn quic_capacity_timing_slack_bytes() -> u64 {
 }
 
 fn request_quic_capacity_calibration_geometry(
-    service: PathSnapshot,
     candidate: PathSnapshot,
     service_rate_bps: f64,
     mux_limits: MuxLimits,
@@ -1552,13 +1551,18 @@ fn request_quic_capacity_calibration_geometry(
     let competing_rate_bdp =
         (service_rate_bps / 8.0 * candidate.srtt_ms.max(1.0) / 1_000.0).ceil() as u64;
     let competing_rate_pipe = ((competing_rate_bdp as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64;
-    let competing_product_pipe =
-        ((service.product_bytes_in_flight as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64;
+    // Request snapshots expose total relay-plus-carrier flight. Subtract the
+    // separately tracked product flight before sizing this carrier epoch.
+    let candidate_carrier_flight_bytes = candidate
+        .bytes_in_flight
+        .saturating_sub(candidate.product_bytes_in_flight);
+    // Carrier warmup competes with the effective rate/RTT pipe. Product flight is
+    // shared ordering debt and may belong to other paths, so it cannot size one
+    // candidate's native congestion-control transaction.
     let desired_warmup_carrier_bytes = candidate
         .inflight_limit_bytes
-        .max(candidate.bytes_in_flight)
-        .max(competing_rate_pipe)
-        .max(competing_product_pipe);
+        .max(candidate_carrier_flight_bytes)
+        .max(competing_rate_pipe);
     let train_envelope_bytes = train_envelope_bytes.min(
         reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
     );
@@ -1567,7 +1571,7 @@ fn request_quic_capacity_calibration_geometry(
     if warmup_carrier_bytes
         < candidate
             .inflight_limit_bytes
-            .max(candidate.bytes_in_flight)
+            .max(candidate_carrier_flight_bytes)
     {
         return None;
     }
@@ -1587,7 +1591,7 @@ fn request_quic_capacity_calibration_geometry(
         warmup_carrier_bytes,
         required_timed_carrier_bytes,
         service_rate_bps: service_rate_bps.ceil() as u64,
-        service_product_flight_bytes: service.product_bytes_in_flight,
+        candidate_carrier_flight_bytes,
     })
 }
 
@@ -7200,7 +7204,6 @@ impl RelaySenderService {
             .checked_div(remaining_candidates)
             .unwrap_or(0);
         let Some(geometry) = request_quic_capacity_calibration_geometry(
-            service_snapshot,
             snapshot,
             service_snapshot.delivery_rate_bps,
             context.mux_limits,
@@ -7277,7 +7280,7 @@ impl RelaySenderService {
         lab_diagnostic(
             "request_quic_capacity_calibration",
             format_args!(
-                "phase=started stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_envelope_bytes={} sample_floor_bytes={} accounting_slack_bytes={} timing_slack_bytes={} desired_warmup_bytes={} warmup_bytes={} required_proof_bytes={} service_rate_bps={} service_product_flight_bytes={} slow_start_rounds={} lease_ms={}",
+                "phase=started stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_envelope_bytes={} sample_floor_bytes={} accounting_slack_bytes={} timing_slack_bytes={} desired_warmup_bytes={} warmup_bytes={} required_proof_bytes={} candidate_carrier_flight_bytes={} service_rate_bps={} service_rate_scope={:?} slow_start_rounds={} lease_ms={}",
                 self.stream_id.0,
                 instance.key.index,
                 instance.id,
@@ -7290,8 +7293,9 @@ impl RelaySenderService {
                 geometry.desired_warmup_carrier_bytes,
                 geometry.warmup_carrier_bytes,
                 geometry.required_timed_carrier_bytes,
+                geometry.candidate_carrier_flight_bytes,
                 geometry.service_rate_bps,
-                geometry.service_product_flight_bytes,
+                service_snapshot.rate_scope,
                 request_quic_capacity_slow_start_rounds(train_payload_bytes),
                 lease_duration.as_millis(),
             ),
@@ -21348,15 +21352,12 @@ mod tests {
     }
 
     #[test]
-    fn request_quic_capacity_geometry_models_the_competing_service_pipe() {
+    fn request_quic_capacity_geometry_models_the_competing_service_rate_pipe() {
         let mux_limits = MuxLimits::default();
-        let mut service = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 180.0, 100_000_000.0);
-        service.product_bytes_in_flight = 3_000_000;
         let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
         candidate.inflight_limit_bytes = 262_144;
 
         let geometry = request_quic_capacity_calibration_geometry(
-            service,
             candidate,
             100_000_000.0,
             mux_limits,
@@ -21364,10 +21365,10 @@ mod tests {
         )
         .expect("the competing pipe should fit the default session envelope");
 
-        assert_eq!(geometry.warmup_carrier_bytes, 6_000_000);
-        assert_eq!(geometry.desired_warmup_carrier_bytes, 6_000_000);
+        assert_eq!(geometry.warmup_carrier_bytes, 4_500_000);
+        assert_eq!(geometry.desired_warmup_carrier_bytes, 4_500_000);
         assert_eq!(geometry.service_rate_bps, 100_000_000);
-        assert_eq!(geometry.service_product_flight_bytes, 3_000_000);
+        assert_eq!(geometry.candidate_carrier_flight_bytes, 0);
         assert_eq!(
             geometry.train_bytes,
             geometry
@@ -21383,14 +21384,54 @@ mod tests {
     }
 
     #[test]
-    fn request_quic_capacity_geometry_requires_measured_rate_and_budget() {
+    fn request_quic_capacity_geometry_excludes_candidate_product_flight() {
         let mux_limits = MuxLimits::default();
-        let mut service = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 180.0, 100_000_000.0);
+        let envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+        let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
+        candidate.inflight_limit_bytes = 262_144;
+        candidate.product_bytes_in_flight = 3_000_000;
+        candidate.bytes_in_flight = 3_500_000;
+
+        let first = request_quic_capacity_calibration_geometry(
+            candidate,
+            1_000_000.0,
+            mux_limits,
+            envelope,
+        )
+        .expect("the native carrier flight should fit");
+        assert_eq!(first.candidate_carrier_flight_bytes, 500_000);
+        assert_eq!(first.warmup_carrier_bytes, 500_000);
+
+        candidate.product_bytes_in_flight = 7_000_000;
+        candidate.bytes_in_flight = 7_500_000;
+        let more_product = request_quic_capacity_calibration_geometry(
+            candidate,
+            1_000_000.0,
+            mux_limits,
+            envelope,
+        )
+        .expect("product debt must not alter carrier geometry");
+        assert_eq!(more_product, first);
+
+        candidate.bytes_in_flight = 7_750_000;
+        let more_carrier = request_quic_capacity_calibration_geometry(
+            candidate,
+            1_000_000.0,
+            mux_limits,
+            envelope,
+        )
+        .expect("the larger native carrier flight should fit");
+        assert_eq!(more_carrier.candidate_carrier_flight_bytes, 750_000);
+        assert_eq!(more_carrier.warmup_carrier_bytes, 750_000);
+    }
+
+    #[test]
+    fn request_quic_capacity_geometry_requires_valid_rate_and_budget() {
+        let mux_limits = MuxLimits::default();
         let candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
 
         assert!(
             request_quic_capacity_calibration_geometry(
-                service,
                 candidate,
                 f64::NAN,
                 mux_limits,
@@ -21400,12 +21441,9 @@ mod tests {
             "an invalid carrier rate must not size capacity traffic"
         );
 
-        service.product_bytes_in_flight =
-            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
         let bounded = request_quic_capacity_calibration_geometry(
-            service,
             candidate,
-            100_000_000.0,
+            2_000_000_000.0,
             mux_limits,
             reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
         )
@@ -21415,6 +21453,20 @@ mod tests {
             reliable_quic_capacity_calibration_session_limit_bytes(mux_limits)
         );
         assert!(bounded.desired_warmup_carrier_bytes > bounded.warmup_carrier_bytes);
+
+        let mut carrier_loaded = candidate;
+        carrier_loaded.bytes_in_flight =
+            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+        assert!(
+            request_quic_capacity_calibration_geometry(
+                carrier_loaded,
+                100_000_000.0,
+                mux_limits,
+                reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            )
+            .is_none(),
+            "the session envelope must not clamp below native carrier flight"
+        );
     }
 
     #[test]

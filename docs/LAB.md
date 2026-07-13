@@ -109,6 +109,15 @@ full timed carrier epoch rather than only the minimum proof floor. A successful
 upload must also carry ordinary bytes beyond the train on that path. Record the
 receipt, proof, first qualifying ACK, handoff, and old-quarantine-cutoff times
 so a throughput change has a causal accounting boundary.
+For request train geometry, set the desired target to
+`max(candidate native inflight limit, candidate native flight,
+2 * effective Service-rate BDP at candidate SRTT)`. A carrier rate sample is
+preferred, but a product or configured prior may size warmup only; it is not
+candidate proof. Then require
+`train = warmup + required timed bytes + timing slack`. The preassigned
+per-candidate envelope may bound the rate-derived target, but not below native
+candidate flight. Product flight, product queue, and ordering debt MUST NOT
+appear in this carrier-local geometry.
 
 Mixed response diagnostics emit `response_quic_capacity_calibration` for the
 bounded non-product QUIC train, `quic_capacity_receipt` for exact peer receipt,
@@ -122,9 +131,12 @@ session, token, path, and exact path instance. For every ordinary carrier
 sample, verify `raw_rate_bps ~= sample_bytes * 8_000_000 / sample_elapsed_us`
 and `sample_elapsed_us = max(carrier_elapsed_us, 1000)`. `poll_elapsed_us` is a
 control comparison and MUST NOT be the denominator. `published_rate_bps` is the
-bounded/smoothed model, not the raw observation. For optional UDP Subflow or
-capacity admission, only timed non-app-limited bytes and samples may reach the
-strict bulk floor. The current QUIC Service has a narrower feed-only exception:
+bounded/smoothed model, not the raw observation. For ordinary optional UDP
+Subflow or capacity admission, only timed non-app-limited bytes and samples may
+reach the strict bulk floor. The explicit capacity epoch is different: it gates
+ordinary writers and accounts only its typed train, so its isolated timed bytes
+remain valid when the generic carrier snapshot says application-limited. The
+current QUIC Service has a narrower feed-only exception:
 either substantial uniquely owned product `STREAM_ACK` progress or a durable
 local carrier ACK-derived DATA estimate may unlock source and emission staging;
 the latter may be app-limited. Neither authority publishes optional capacity,
@@ -441,6 +453,13 @@ Useful environment variables:
 - `MPTUNNEL_LAB_DIAG_EVENTS=event_a,event_b`: with diagnostic emission enabled, retain only the exact comma-separated event names. An unset, empty, or `*` value retains all events. Use a narrow allowlist for multi-gigabit lifecycle traces so per-frame candidate and dispatch formatting does not dominate the workload. `sender_service_conformance` explicitly enables the otherwise filtered per-frame conformance counters and assertion. Filtered runs remain instrumented causal evidence, never release-comparable measurements.
 - `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_PERF=1`: build the optimized `lab-diagnostics` binary and emit interval/cumulative per-component timing lines prefixed with `mptunnel_lab_perf`. `MPTUNNEL_LAB_PERF_INTERVAL_MS` controls the flush interval, default `1000`. `MPTUNNEL_LAB_LOG_TAIL_BYTES` and `MPTUNNEL_LAB_LOG_TAIL_LINES` control retained diagnostic log tails.
 - `MPTUNNEL_LAB_CONTAINER_STATS=0|1`: enable periodic Docker CPU, memory, and network-counter sampling, default `1`. `MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS` sets the cadence, default `1`. Per-case samples are written as `container-stats-<case>.jsonl`; case-boundary non-loopback counters are written separately and summarized into the result row.
+
+The interval is a requested lower bound, not proof of the observed cadence.
+Each sample currently serializes Compose discovery, one concurrent multi-ID
+`docker stats --no-stream` acquisition, per-container netdev reads, and then a
+full interval sleep. Always report sample timestamps and actual spacing.
+Iterations 186-189 requested one second but observed about 3.44-3.47 seconds,
+so their CPU and traffic rates are multi-second windows, not per-second samples.
 - `MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS=0|1`: enable periodic release management `/diagnostics` snapshots for the client and server, default `0`. `MPTUNNEL_LAB_MANAGEMENT_SNAPSHOT_INTERVAL_SECONDS` sets the cadence, default `1`, and `MPTUNNEL_LAB_MANAGEMENT_PORT` selects the loopback management port, default `17600`. Per-case records, including interface counters and management errors, are written as `management-snapshots-<case>.jsonl`.
 
 With a positive fat-TX trigger, the runner writes
@@ -688,13 +707,50 @@ Iteration 188 separately repeats the historical equal-fat geometry with every
 path explicitly set to 500 Mbps, 180 ms, 1 ms jitter, and zero loss. It reaches
 194.231 Mbps multipath versus 172.262 Mbps adjacent single (`1.128x`) and a
 0.841 versus 1.730 second gap. The single control's bounded Iteration 189 repeat
-reaches 192.112 Mbps, proving that the 172.262 Mbps row was not a persistent
-code downgrade. Report the same-build single range rather than averaging it
-away: multipath exceeds the strongest repeat by only `1.011x`, so stable
-single-flow superiority is not yet proven. A no-candidate topology guard and an
-inactive-token ACK guard remove optional-discovery health locks from the common
-single-path hot path; deterministic tests prove those paths do not acquire the
-health mutex.
+reaches 192.112 Mbps. More importantly, its fixed-load accepted bytes are
+365.560 MB versus 346.161 MB multipath in Iteration 188: the apparent `1.011x`
+goodput edge came from different drain duration and did not prove stable
+aggregation. A no-candidate topology guard and an inactive-token ACK guard
+remove optional-discovery health locks from the common single-path hot path;
+deterministic tests prove those paths do not acquire the health mutex.
+
+Diagnostic Iteration 190 rejects a permanent 4 MiB request-window theory: both
+streams grow through 8, 16, 32, and 64 MiB. It instead shows that shared Service
+product flight inflated the first two carrier-only trains to 8.571 and
+19.513 MB, with proof only at 4.073 and 8.894 seconds. The result is
+205.506 Mbps with a 3.019 second gap, but instrumentation makes that row causal
+evidence only. Request calibration now excludes product flight and derives its
+desired warmup from candidate native flight plus the effective Service-rate
+pipe. Product flight remains only a sustained-demand and product-debt input.
+
+Matched diagnostic Iteration 191 reduces the first two trains to 0.812 and
+11.257 MB and proves them at 1.390 and 5.625 seconds; a third 4.125 MB train is
+measurable by 11.083 seconds. It reaches 274.698 Mbps with a 0.567 second gap,
+respectively 33.7% higher and 81.2% lower than Iteration 190. Exact train bytes
+total 16.19 MB, 3.33% of accepted load; the case-boundary approximate overhead
+is not an exact calibration-cost measurement.
+
+Iteration 192 is a separate two-flow, one-second-drain release cohort. It proves
+same-run aggregation at 286.763 Mbps and 613.548 MB accepted multipath versus
+183.099 Mbps and 465.830 MB single, but both rows terminate with unconfirmed
+data. Its 1.918/1.640 second gaps and headline rates MUST NOT be compared with
+the completed one-flow Iterations 188/189.
+
+Exact historical repeat Iteration 193 restores one flow and an eight-second
+drain. Both rows complete: multipath reaches 221.569 Mbps and 390.005 MB versus
+190.024 Mbps and 348.455 MB single (`1.166x` goodput, `1.119x` accepted bytes),
+with a 0.582 versus 0.951 second maximum delivery gap. Against Iteration 188,
+multipath goodput improves 14.1%, accepted bytes improve 12.7%, and the maximum
+gap falls 30.8%. The current single result is 1.1% below the strongest
+192.112 Mbps Iteration 189 repeat and remains inside the prior range; the
+calibration branch has no candidate in a single-path topology. Preserve that
+strongest control: Iteration 193 multipath is still 15.3% higher. Three physical
+paths carry 59.7%, 30.4%, and 9.9% of client TX, so the gain is aggregation
+rather than a faster single carrier. Approximate
+client/target boundary overhead is 5.774% multipath versus 4.933% single. Client
+average CPU and peak memory rise 21.4% and 14.8%; server average CPU is flat and
+server peak memory rises 33.3%. The telemetry has only four samples per service
+at 3.47-3.49 second spacing, so these resource figures remain coarse.
 
 ## Interpreting Results
 

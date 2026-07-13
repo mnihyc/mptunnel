@@ -312,12 +312,12 @@ mptunnel --check-config \
   --max-ack-ranges 256 \
   --max-paths 64 \
   --max-streams 65536 \
-  --max-stream-window-bytes 16777216 \
-  --max-repair-bytes 16777216 \
-  --max-reorder-bytes 16777216 \
-  --max-datagram-queue-bytes 4194304 \
-  --max-path-flight-bytes 4194304 \
-  --max-reliable-relay-chunk-bytes 262144 \
+  --max-stream-window-bytes 67108864 \
+  --max-repair-bytes 67108864 \
+  --max-reorder-bytes 67108864 \
+  --max-datagram-queue-bytes 16777216 \
+  --max-path-flight-bytes 67108864 \
+  --max-reliable-relay-chunk-bytes 524288 \
   --tcp-path-heartbeat-interval-ms 10000 \
   --tcp-path-heartbeat-timeout-ms 30000 \
   client \
@@ -454,6 +454,11 @@ ordered receipt calibration, or TCP product-ACK rate proof. Instead, one
 session-serialized, non-refilling `PATH_CAPACITY_*` train measures the exact
 Validation carrier without product offsets. A fenced native tail or exact
 receipt lower bound grants bounded approximately `2 * BDP` product authority.
+The desired warmup target is the larger of the candidate's own native flight
+window and twice the effective Service-rate BDP at the candidate RTT. The
+preassigned session envelope may bound the rate-derived part, but never below
+the candidate's native flight. Product flight and ordering debt never enlarge
+this carrier transaction; they remain separate product admission inputs.
 The same stream-local relay instance must then ACK one fixed post-proof product
 floor before expiry; only bytes sent after proof acceptance qualify, and those
 ACK bytes confirm ordered ownership without estimating QUIC rate. Completed

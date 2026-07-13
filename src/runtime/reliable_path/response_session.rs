@@ -9,7 +9,7 @@ use super::{
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use crate::scheduler::FlowLane;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,7 @@ pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
     pub(in crate::runtime) generation: u64,
     pub(in crate::runtime) active_response_flows: u32,
     pub(in crate::runtime) service_family_loads: ResponseServiceFamilyLoads,
+    pub(in crate::runtime) tcp_capacity_probe_reserved: bool,
     pub(in crate::runtime) quic_capacity_calibration_reserved: bool,
     pub(in crate::runtime) quic_capacity_calibration_spent_bytes: u64,
     pub(in crate::runtime) response_service_handoff_drain:
@@ -306,6 +307,31 @@ pub(in crate::runtime) struct ServerPathLaneTracker {
     pub(super) state: Mutex<ServerPathLaneTrackerState>,
 }
 
+/// Holds the one session-wide TCP carrier-discovery slot until the typed
+/// command is dropped after receipt, failure, or cancellation.
+#[derive(Debug)]
+pub(in crate::runtime) struct TcpCapacityProbeSessionLease {
+    tracker: Arc<ServerPathLaneTracker>,
+    session_id: SessionId,
+}
+
+impl Drop for TcpCapacityProbeSessionLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .state
+            .lock()
+            .expect("server path lane tracker lock");
+        if state
+            .tcp_capacity_probe_reservations
+            .remove(&self.session_id)
+        {
+            state.bump_generation(self.session_id);
+            state.maybe_reclaim_session(self.session_id);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ServerPathLaneTrackerState {
     // Attachment load describes control-plane Active roles. Response Service
@@ -322,6 +348,7 @@ pub(super) struct ServerPathLaneTrackerState {
     pub(super) quic_capacity_calibration_attempts:
         HashMap<ServerQuicCapacityCalibrationPathKey, u8>,
     pub(super) quic_capacity_calibration_bytes: HashMap<SessionId, u64>,
+    pub(super) tcp_capacity_probe_reservations: HashSet<SessionId>,
     // A drain is only a session-wide intent: it pauses fresh data on the exact
     // binding but does not move Service ownership until clear-frontier commit.
     pub(super) response_service_handoff_drains:
@@ -489,16 +516,20 @@ impl ServerPathLaneTrackerState {
                     ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
                 )
             });
+        let tcp_capacity_probe_in_progress =
+            self.tcp_capacity_probe_reservations.contains(&session_id);
         if !has_references
             && !has_realtime
             && !has_active_response_flows
             && !has_loads
             && !proof_publication_in_progress
+            && !tcp_capacity_probe_in_progress
         {
             let capacity_reservation = self.quic_capacity_calibrations.remove(&session_id);
             self.quic_capacity_calibration_attempts
                 .retain(|key, _| key.session_id != session_id);
             self.quic_capacity_calibration_bytes.remove(&session_id);
+            self.tcp_capacity_probe_reservations.remove(&session_id);
             self.response_service_handoff_drains.remove(&session_id);
             self.response_service_session_loads.remove(&session_id);
             self.response_service_family_loads.remove(&session_id);
@@ -755,6 +786,9 @@ impl ServerPathLaneTracker {
             generation,
             active_response_flows,
             service_family_loads,
+            tcp_capacity_probe_reserved: state
+                .tcp_capacity_probe_reservations
+                .contains(&session_id),
             quic_capacity_calibration_reserved: state
                 .quic_capacity_calibrations
                 .contains_key(&session_id),
@@ -768,6 +802,34 @@ impl ServerPathLaneTracker {
                 .get(&session_id)
                 .copied(),
         }
+    }
+
+    pub(in crate::runtime) fn try_reserve_tcp_capacity_probe(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        expected_generation: u64,
+    ) -> Option<TcpCapacityProbeSessionLease> {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let generation = state
+            .session_generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if generation != expected_generation
+            || state.tcp_capacity_probe_reservations.contains(&session_id)
+            || state.quic_capacity_calibrations.contains_key(&session_id)
+            || state
+                .response_service_handoff_drains
+                .contains_key(&session_id)
+        {
+            return None;
+        }
+        state.tcp_capacity_probe_reservations.insert(session_id);
+        state.bump_generation(session_id);
+        Some(TcpCapacityProbeSessionLease {
+            tracker: Arc::clone(self),
+            session_id,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -808,6 +870,7 @@ impl ServerPathLaneTracker {
         // The tracker serializes a decision made from the matching generation;
         // family/rate policy belongs to the sender snapshot that ranked it.
         if generation != expected_generation
+            || state.tcp_capacity_probe_reservations.contains(&session_id)
             || state.quic_capacity_calibrations.contains_key(&session_id)
             || state
                 .response_service_handoff_drains
@@ -936,6 +999,7 @@ impl ServerPathLaneTracker {
             || active_response_flows < 2
             || attempts >= MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH
             || next_spent_bytes > session_byte_limit
+            || state.tcp_capacity_probe_reservations.contains(&session_id)
             || state.quic_capacity_calibrations.contains_key(&session_id)
             || state
                 .response_service_handoff_drains
@@ -1918,6 +1982,75 @@ mod tests {
             path,
             path_instance_id,
         ));
+    }
+
+    #[test]
+    fn tcp_capacity_probe_serializes_the_session_and_quic_discovery() {
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let session_id = SessionId(603);
+        let path = CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(4),
+        };
+        let path_instance_id = super::super::next_server_carrier_path_instance_id();
+        tracker.set_response_flow_active(session_id, true);
+        tracker.set_response_flow_active(session_id, true);
+
+        let lease = tracker
+            .try_reserve_tcp_capacity_probe(session_id, tracker.generation(session_id))
+            .expect("reserve first TCP probe");
+        assert!(
+            tracker
+                .response_scheduling_snapshot(session_id)
+                .tcp_capacity_probe_reserved
+        );
+        assert!(
+            tracker
+                .try_reserve_tcp_capacity_probe(session_id, tracker.generation(session_id))
+                .is_none(),
+            "a second TCP carrier must not overlap the session probe"
+        );
+        assert!(
+            !tracker.try_reserve_test_quic_capacity_calibration(
+                session_id,
+                tracker.generation(session_id),
+                1,
+                path,
+                path_instance_id,
+                1,
+                16,
+                1,
+            ),
+            "TCP and QUIC discovery share product-session serialization"
+        );
+
+        tracker.set_response_flow_active(session_id, false);
+        tracker.set_response_flow_active(session_id, false);
+        assert!(
+            tracker
+                .response_scheduling_snapshot(session_id)
+                .tcp_capacity_probe_reserved,
+            "session reclaim must retain the live typed lease"
+        );
+        assert!(
+            tracker
+                .try_reserve_tcp_capacity_probe(session_id, tracker.generation(session_id))
+                .is_none(),
+            "a detached session cannot replace a still-live reservation"
+        );
+
+        drop(lease);
+        assert!(
+            !tracker
+                .response_scheduling_snapshot(session_id)
+                .tcp_capacity_probe_reserved
+        );
+        assert!(
+            tracker
+                .try_reserve_tcp_capacity_probe(session_id, tracker.generation(session_id))
+                .is_some(),
+            "dropping the typed command lease reopens discovery"
+        );
     }
 
     #[test]

@@ -314,7 +314,7 @@ where
             .max(1),
     );
     let mut pending_validation_opens = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
-    let mut attempted_validation_paths = std::collections::HashSet::<RelayPathKey>::new();
+    let mut validation_open_attempts = HashMap::<RelayPathKey, u8>::new();
     let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
@@ -437,7 +437,7 @@ where
                 &remotes,
                 &send_stream,
                 &mut pending_validation_opens,
-                &mut attempted_validation_paths,
+                &mut validation_open_attempts,
                 &validation_open_tx,
             ) {
                 last_stream_progress_at = Instant::now();
@@ -467,7 +467,7 @@ where
                     &remotes,
                     &send_stream,
                     &mut pending_validation_opens,
-                    &mut attempted_validation_paths,
+                    &mut validation_open_attempts,
                     &validation_open_tx,
                 ) {
                     last_stream_progress_at = Instant::now();
@@ -2509,6 +2509,8 @@ async fn handle_validation_open_result(
             }
         }
         Err(err) if relay_path_open_error_is_retryable(validation_open.key.underlay, &err) => {
+            // Preserve global health fencing. The second stream-local attempt
+            // becomes eligible only after independent proof reactivates path.
             context
                 .mark_relay_path_failure(validation_open.key.underlay, validation_open.key.index);
             #[cfg(feature = "lab-diagnostics")]
@@ -2522,6 +2524,8 @@ async fn handle_validation_open_result(
             false
         }
         Err(err) => {
+            context
+                .mark_relay_path_failure(validation_open.key.underlay, validation_open.key.index);
             #[cfg(not(feature = "lab-diagnostics"))]
             let _ = &err;
             #[cfg(feature = "lab-diagnostics")]
@@ -2604,6 +2608,8 @@ struct RelayValidationOpenTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
+const MAX_RELIABLE_RELAY_VALIDATION_OPEN_ATTEMPTS_PER_PATH: u8 = 2;
+
 fn spawn_reliable_relay_validation_opens(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
@@ -2611,7 +2617,7 @@ fn spawn_reliable_relay_validation_opens(
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     pending: &mut HashMap<RelayPathKey, RelayValidationOpenTask>,
-    attempted: &mut std::collections::HashSet<RelayPathKey>,
+    attempts: &mut HashMap<RelayPathKey, u8>,
     result_tx: &mpsc::Sender<RelayValidationOpenResult>,
 ) -> bool {
     if !lane.is_bulk() {
@@ -2624,7 +2630,7 @@ fn spawn_reliable_relay_validation_opens(
     let payload_bytes =
         reliable_relay_bulk_validation_payload_bytes(send_stream, context.mux_limits);
     let candidates = reliable_relay_validation_open_candidates(context, remotes, payload_bytes);
-    let candidates = reliable_relay_validation_probe_candidates(candidates, pending, attempted);
+    let candidates = reliable_relay_validation_probe_candidates(candidates, pending, attempts);
     if candidates.is_empty() {
         return false;
     }
@@ -2635,7 +2641,8 @@ fn spawn_reliable_relay_validation_opens(
             UnderlayProtocol::Udp if context.udp_paths.get(key.index).is_some() => {}
             _ => continue,
         }
-        attempted.insert(key);
+        let attempt = attempts.entry(key).or_default();
+        *attempt = attempt.saturating_add(1);
         let context = context.clone();
         let target = spec.target.clone();
         let ingress = spec.ingress;
@@ -2772,18 +2779,23 @@ fn prefer_active_family_validation_open_candidate(
 fn reliable_relay_validation_probe_candidates(
     candidates: Vec<RelayPathKey>,
     pending: &HashMap<RelayPathKey, RelayValidationOpenTask>,
-    attempted: &std::collections::HashSet<RelayPathKey>,
+    attempts: &HashMap<RelayPathKey, u8>,
 ) -> Vec<RelayPathKey> {
     let mut selected = Vec::new();
+    let mut selected_underlay = None;
     for candidate in candidates {
         if pending.contains_key(&candidate)
-            || attempted.contains(&candidate)
+            || attempts.get(&candidate).copied().unwrap_or(0)
+                >= MAX_RELIABLE_RELAY_VALIDATION_OPEN_ATTEMPTS_PER_PATH
             || selected.contains(&candidate)
         {
             continue;
         }
+        let underlay = *selected_underlay.get_or_insert(candidate.underlay);
+        if candidate.underlay != underlay {
+            continue;
+        }
         selected.push(candidate);
-        break;
     }
     selected
 }
@@ -4195,31 +4207,42 @@ mod tests {
     }
 
     #[test]
-    fn validation_probe_candidates_are_one_shot_per_stream_path() {
+    fn validation_probe_candidates_group_one_family_with_bounded_retry() {
         let tcp0 = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
+        };
+        let tcp1 = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
         };
         let udp0 = RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
         };
-        let candidates = vec![tcp0, udp0, tcp0];
+        let candidates = vec![tcp0, tcp1, udp0, tcp0];
         let pending = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
-        let mut attempted = HashSet::from([tcp0]);
-        let selected = reliable_relay_validation_probe_candidates(candidates, &pending, &attempted);
+        let mut attempts = HashMap::from([(tcp0, 1)]);
+        let selected = reliable_relay_validation_probe_candidates(candidates, &pending, &attempts);
 
         assert_eq!(
             selected,
-            vec![udp0],
-            "validation/probe attachment is path-scoped and must not reopen a path already attempted for this product stream"
+            vec![tcp0, tcp1],
+            "current-family Validation opens should start together and one failed open may retry"
         );
 
-        attempted.insert(udp0);
+        attempts.insert(tcp0, 2);
+        attempts.insert(tcp1, 2);
+        assert_eq!(
+            reliable_relay_validation_probe_candidates(vec![tcp0, tcp1, udp0], &pending, &attempts,),
+            vec![udp0],
+            "a later invocation may move to the other carrier family"
+        );
+        attempts.insert(udp0, 2);
         assert!(
-            reliable_relay_validation_probe_candidates(vec![tcp0, udp0], &pending, &attempted)
+            reliable_relay_validation_probe_candidates(vec![tcp0, tcp1, udp0], &pending, &attempts)
                 .is_empty(),
-            "rebalance cannot turn a closed validation handle into repeated OPEN_STREAM churn"
+            "two attempts bound reconnect churn for every stream/path"
         );
     }
 
@@ -4412,7 +4435,7 @@ mod tests {
         };
         let (result_tx, _result_rx) = mpsc::channel(1);
         let mut pending = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();
-        let mut attempted = HashSet::<RelayPathKey>::new();
+        let mut attempts = HashMap::<RelayPathKey, u8>::new();
 
         assert!(!spawn_reliable_relay_validation_opens(
             &context,
@@ -4421,11 +4444,11 @@ mod tests {
             &remotes,
             &send_stream,
             &mut pending,
-            &mut attempted,
+            &mut attempts,
             &result_tx,
         ));
         assert!(
-            pending.is_empty() && attempted.is_empty(),
+            pending.is_empty() && attempts.is_empty(),
             "validation/probe opens are bulk-only; latency response stalls recover through path health and repair, not proactive per-stream standbys"
         );
     }

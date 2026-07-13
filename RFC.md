@@ -460,6 +460,12 @@ mechanics after the scheduler has found a safe subflow set. Mixed TCP/UDP candid
 remain stricter: a mixed candidate may be opened for validation proof, repair,
 or explicit frontier-safe migration, but a path opener MUST NOT turn a mixed ETA
 list into blind same-stream unique-byte striping.
+For sustained bulk prevalidation, configured candidates from the current
+Service family SHOULD begin their Validation opens together. A retryable open
+failure MAY receive one later retry after path health is independently
+revalidated; one unlucky handshake MUST NOT permanently remove a path from that
+product stream or bypass global failure fencing. Open concurrency and retry are
+path management only: neither grants product ownership or capacity evidence.
 
 Opening a same-underlay subflow set is not the same as immediately committing
 unique ordered bytes to every member. MPTCP and MPQUIC can coordinate packet
@@ -497,6 +503,17 @@ unique data, while every other unmeasured alternate remains Probe, Standby, or
 RepairOnly. Under latency-sensitive or realtime pressure, all unmeasured
 candidates likewise remain Probe or Standby and the Service remains
 preemptible.
+Once the persistent Service has direction-correct bulk evidence, offset-free
+carrier discovery is independent from product Subflow graduation. It MUST NOT
+wait for an optional path to own ordered product bytes: that serial dependency
+delays high-BDP discovery and makes the active set depend on attachment timing.
+Each exact carrier still has bounded exploration, and receipt-bound capacity
+only permits ordinary admission; it does not itself assign product offsets.
+The shared session MUST retain a live discovery reservation across binding
+retirement, release it before waking another planner, and apply one absolute
+deadline to train emission plus receipt. An already measured cross-family
+handoff that clears product placement MUST outrank optional same-family
+discovery.
 Response startup-slot graduation requires the sampled candidate's exact
 `OwnerData` flight to drain. For TCP, the completely ACKed sealed startup sample
 proves exact-path reachability. An eligible endpoint-only candidate installs a

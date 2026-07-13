@@ -55,8 +55,9 @@ use response_session::ServerResponseFlowRegistration;
 pub(in crate::runtime) use response_session::{
     QuicCapacityProofCandidate, ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation,
     ResponseSessionSchedulingSnapshot, ServerPathLaneTracker, ServerRealtimeFlowRegistration,
-    quic_capacity_proof_pin_matches_marker, quic_capacity_receipt_rate_bps,
-    valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
+    TcpCapacityProbeSessionLease, quic_capacity_proof_pin_matches_marker,
+    quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_candidate_at,
+    well_formed_quic_capacity_proof_candidate,
 };
 
 // Ownership boundary:
@@ -2648,6 +2649,14 @@ impl ResponseStreamBinding {
     pub(super) fn response_scheduling_snapshot(&self) -> ResponseSessionSchedulingSnapshot {
         self.lane_tracker
             .response_scheduling_snapshot(self.session_id)
+    }
+
+    pub(super) fn try_reserve_tcp_capacity_probe(
+        &self,
+        expected_generation: u64,
+    ) -> Option<TcpCapacityProbeSessionLease> {
+        self.lane_tracker
+            .try_reserve_tcp_capacity_probe(self.session_id, expected_generation)
     }
 
     #[cfg(test)]

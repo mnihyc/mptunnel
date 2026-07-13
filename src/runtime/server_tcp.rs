@@ -103,8 +103,35 @@ pub(super) async fn handle_server_path(
     let mut tcp_capacity_probe = None::<PendingTcpCapacityProbe>;
 
     loop {
-        let Some(event) = recv_server_tcp_path_event(&mut path_frames, &mut commands_rx).await?
-        else {
+        let event = if let Some(pending) = tcp_capacity_probe.as_ref() {
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(pending.probe.expires_at),
+                recv_server_tcp_path_event(&mut path_frames, &mut commands_rx),
+            )
+            .await
+            {
+                Ok(event) => event?,
+                Err(_) => {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "response_tcp_capacity_probe",
+                        format_args!(
+                            "phase=rejected reason=receipt_timeout session_id={} path_id={} path_instance_id={} calibration_id={}",
+                            session_id.0,
+                            path_id.0,
+                            path_registration.path_instance_id().as_u64(),
+                            pending.probe.calibration_id,
+                        ),
+                    );
+                    // A late receipt cannot be attributed after the lease is
+                    // released, so fail-close this exact carrier.
+                    return Ok(());
+                }
+            }
+        } else {
+            recv_server_tcp_path_event(&mut path_frames, &mut commands_rx).await?
+        };
+        let Some(event) = event else {
             return Ok(());
         };
         #[cfg(target_os = "linux")]
@@ -615,6 +642,9 @@ pub(super) async fn handle_server_path(
                                     .checked_add(validity)
                                     .unwrap_or(accepted_at),
                             };
+                            // Release carrier and session discovery ownership
+                            // before proof publication wakes the sender.
+                            drop(pending);
                             if !context.reliable_streams.record_local_tcp_capacity_proof(
                                 &path_registration,
                                 metrics,
@@ -819,12 +849,35 @@ async fn drain_server_tcp_path_commands(
                     return Ok(true);
                 }
                 let started_at = Instant::now();
-                let wrote = server_write_tcp_capacity_probe(
-                    writer,
-                    &probe,
-                    context.mux_limits.max_payload_bytes,
+                let wrote = match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(probe.expires_at),
+                    server_write_tcp_capacity_probe(
+                        writer,
+                        &probe,
+                        context.mux_limits.max_payload_bytes,
+                    ),
                 )
-                .await?;
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        commands_rx.release_pending_command_bytes(pending_bytes);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "response_tcp_capacity_probe",
+                            format_args!(
+                                "phase=rejected reason=send_timeout session_id={} path_id={} path_instance_id={} calibration_id={}",
+                                command_context.session_id.0,
+                                command_context.path_id.0,
+                                probe.path_instance_id.as_u64(),
+                                probe.calibration_id,
+                            ),
+                        );
+                        // Receipt cannot identify a partial train, so close the
+                        // exact carrier instead of releasing it for later work.
+                        return Ok(false);
+                    }
+                };
                 commands_rx.release_pending_command_bytes(pending_bytes);
                 if !wrote {
                     return Ok(false);

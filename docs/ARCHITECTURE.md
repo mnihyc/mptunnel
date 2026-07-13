@@ -203,6 +203,17 @@ full logical byte charge. Publication wakes cleanup with a distinct resolution.
   within the current Service completion reservoir; an already-started exact
   epoch may finish. This prevents serial cold samples from inserting a slow
   ordered prefix while retaining one-flow download aggregation.
+- Once Service has strict directional bulk evidence, offset-free carrier
+  discovery runs independently of product Subflow graduation. One session
+  serializes the typed trains; ordinary ETA, native credit, and ordering
+  admission still decide whether a proven carrier receives product.
+- A live discovery lease prevents session reclaim, releases before carrier
+  wake or proof publication, and bounds train send plus receipt with one
+  deadline. A measured cross-family handoff outranks optional TCP discovery.
+- Bulk prevalidation opens the current Service-family candidate set together
+  and permits at most two opens per stream/path, with retry after independent
+  path-health revalidation. Attachment is path management, not capacity proof
+  or permission to place ordered product bytes.
 - After exact response startup drain, endpoint-only TCP may retain the proven
   same-family Service opportunity as a temporary typed capacity prior and move
   directly to ordinary bounded Subflow work. Ten ordinary exact-ACK windows

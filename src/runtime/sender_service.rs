@@ -1819,6 +1819,7 @@ fn select_response_tcp_capacity_probe_target(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
     ordered_data_owner: Option<CarrierPathKey>,
+    service_family_loads: ResponseServiceFamilyLoads,
     mux_limits: MuxLimits,
 ) -> Option<(ResponseSenderPathTarget, u64)> {
     if !lane.is_bulk() {
@@ -1834,16 +1835,18 @@ fn select_response_tcp_capacity_probe_target(
     {
         return None;
     }
-    // Preserve the accepted first bounded product bootstrap. Carrier-only
-    // discovery begins only when one optional same-family path has graduated.
-    if !targets.iter().any(|target| {
-        target.key != service_key
-            && target.key.underlay == UnderlayProtocol::Tcp
-            && !target.is_active
+    if targets.iter().any(|target| {
+        target.key.underlay == UnderlayProtocol::Udp
             && target.has_bulk_rate_evidence
+            && response_service_handoff_mode_for_targets(service, target, service_family_loads)
+                .is_some()
     }) {
+        // A measured cross-family target that can take Service outranks
+        // optional same-family discovery on the shared product session.
         return None;
     }
+    // This train owns no product offset. Requiring a product Subflow first
+    // serializes two independent discovery mechanisms and delays cold paths.
     let envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
     let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
     let train_bytes = (2 * 1024 * 1024u64).min(envelope).max(sample_floor).max(1);
@@ -4182,25 +4185,33 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
                 #[cfg(target_os = "linux")]
-                if let Some((target, train_bytes)) = select_response_tcp_capacity_probe_target(
-                    &targets,
-                    relay_lane,
-                    ordered_data_owner,
-                    binding.mux_limits(),
-                ) && let Some(expires_at) = Instant::now().checked_add(Duration::from_secs(20))
-                    && let Ok(calibration_id) =
-                        target
-                            .commands
-                            .try_enqueue_tcp_capacity_probe(TcpCapacityProbeRequest {
-                                path_id: target.key.path_id,
-                                path_instance_id: target.path_instance_id,
-                                train_payload_bytes: train_bytes,
-                                sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(
-                                    binding.mux_limits(),
-                                ),
-                                expires_at,
-                            })
+                if !session_scheduling.tcp_capacity_probe_reserved
+                    && let Some((target, train_bytes)) = select_response_tcp_capacity_probe_target(
+                        &targets,
+                        relay_lane,
+                        ordered_data_owner,
+                        session_scheduling.service_family_loads,
+                        binding.mux_limits(),
+                    )
+                    && let Some(expires_at) = Instant::now().checked_add(Duration::from_secs(20))
+                    && let Some(session_lease) =
+                        binding.try_reserve_tcp_capacity_probe(lane_generation)
                 {
+                    let calibration_id = match target.commands.try_enqueue_tcp_capacity_probe(
+                        TcpCapacityProbeRequest {
+                            path_id: target.key.path_id,
+                            path_instance_id: target.path_instance_id,
+                            train_payload_bytes: train_bytes,
+                            sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(
+                                binding.mux_limits(),
+                            ),
+                            expires_at,
+                        },
+                        session_lease,
+                    ) {
+                        Ok(calibration_id) => calibration_id,
+                        Err(err) => return Err(err),
+                    };
                     #[cfg(not(feature = "lab-diagnostics"))]
                     let _ = calibration_id;
                     #[cfg(feature = "lab-diagnostics")]
@@ -4217,6 +4228,8 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
                             train_bytes,
                         ),
                     );
+                    // Reservation advances the shared generation; resnapshot
+                    // before any product decision.
                     continue;
                 }
                 let capacity_session_limit =
@@ -8840,56 +8853,49 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn tcp_capacity_probe_starts_only_after_first_optional_subflow_graduates() {
+    fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
         let mux_limits = MuxLimits::default();
-        let service = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 64 * 1024, true);
-        let mut measured = response_target(1, UnderlayProtocol::Tcp, 80.0, 0, 64 * 1024, false);
-        let mut cold = response_target(2, UnderlayProtocol::Tcp, 160.0, 0, 64 * 1024, false);
-        measured.has_bulk_rate_evidence = false;
+        let mut service = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 64 * 1024, true);
+        let mut cold = response_target(1, UnderlayProtocol::Tcp, 80.0, 0, 64 * 1024, false);
+        service.has_bulk_rate_evidence = false;
         cold.has_bulk_rate_evidence = false;
         let (cold_commands, _cold_receivers) = reliable_path_command_channels(4);
         cold.commands = cold_commands;
 
         assert!(
             select_response_tcp_capacity_probe_target(
-                &[service.clone(), measured.clone(), cold.clone()],
+                &[service.clone(), cold.clone()],
                 FlowLane::Throughput,
                 Some(service.key),
+                ResponseServiceFamilyLoads::default(),
                 mux_limits,
             )
             .is_none()
         );
 
-        measured.has_bulk_rate_evidence = true;
+        service.has_bulk_rate_evidence = true;
         let (selected, train_bytes) = select_response_tcp_capacity_probe_target(
-            &[service.clone(), measured.clone(), cold.clone()],
+            &[service.clone(), cold.clone()],
             FlowLane::Throughput,
             Some(service.key),
+            ResponseServiceFamilyLoads::default(),
             mux_limits,
         )
-        .expect("graduated optional path opens carrier-only discovery");
+        .expect("proven Service opens offset-free discovery");
         assert_eq!(selected.key, cold.key);
         assert_eq!(train_bytes, 2 * 1024 * 1024);
-        cold.commands
-            .try_enqueue_tcp_capacity_probe(TcpCapacityProbeRequest {
-                path_id: cold.key.path_id,
-                path_instance_id: cold.path_instance_id,
-                train_payload_bytes: train_bytes,
-                sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(mux_limits),
-                expires_at: Instant::now() + Duration::from_secs(1),
-            })
-            .expect("reserve cold carrier");
+
+        let udp = response_target(2, UnderlayProtocol::Udp, 10.0, 0, 64 * 1024, false);
         assert!(
             select_response_tcp_capacity_probe_target(
-                &[service, measured, cold],
+                &[service.clone(), cold, udp],
                 FlowLane::Throughput,
-                Some(CarrierPathKey {
-                    underlay: UnderlayProtocol::Tcp,
-                    path_id: PathId(0),
-                }),
+                Some(service.key),
+                ResponseServiceFamilyLoads::new(2, 0),
                 mux_limits,
             )
-            .is_none()
+            .is_none(),
+            "a measured cross-family handoff must outrank optional TCP discovery"
         );
     }
 

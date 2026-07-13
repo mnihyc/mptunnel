@@ -1,4 +1,4 @@
-use super::reliable_path::ReliablePathStream;
+use super::reliable_path::{ReliablePathStream, TcpCapacityProbeSessionLease};
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -331,6 +331,7 @@ impl ReliablePathCommandSender {
     pub(super) fn try_enqueue_tcp_capacity_probe(
         &self,
         request: TcpCapacityProbeRequest,
+        session_lease: TcpCapacityProbeSessionLease,
     ) -> Result<u64, RuntimeError> {
         let permit = match self.data.try_reserve() {
             Ok(permit) => permit,
@@ -353,6 +354,7 @@ impl ReliablePathCommandSender {
             sample_floor_bytes: request.sample_floor_bytes,
             expires_at: request.expires_at,
             _lease: lease,
+            _session_lease: session_lease,
         };
         self.metrics.add_pending_bytes(pending_bytes);
         permit.send(QueuedReliablePathCommand::new(
@@ -987,6 +989,8 @@ pub(super) struct TcpCapacityProbeCommand {
     pub(super) train_payload_bytes: u64,
     pub(super) sample_floor_bytes: u64,
     pub(super) expires_at: Instant,
+    // Drop session ownership before the carrier lease wakes blocked planners.
+    pub(super) _session_lease: TcpCapacityProbeSessionLease,
     // Dropping the command or completed epoch releases exact-carrier admission.
     pub(super) _lease: TcpCapacityProbeLease,
 }
@@ -1080,6 +1084,18 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
 mod tests {
     use super::*;
 
+    fn tcp_probe_tracker_and_lease() -> (Arc<ServerPathLaneTracker>, TcpCapacityProbeSessionLease) {
+        let tracker = Arc::new(ServerPathLaneTracker::default());
+        let lease = tracker
+            .try_reserve_tcp_capacity_probe(SessionId(1), 0)
+            .expect("reserve isolated test session");
+        (tracker, lease)
+    }
+
+    fn tcp_probe_session_lease() -> TcpCapacityProbeSessionLease {
+        tcp_probe_tracker_and_lease().1
+    }
+
     fn tcp_probe_request(path_id: PathId) -> TcpCapacityProbeRequest {
         TcpCapacityProbeRequest {
             path_id,
@@ -1105,7 +1121,10 @@ mod tests {
             )
             .expect("fill data queue");
         assert!(matches!(
-            commands.try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2))),
+            commands.try_enqueue_tcp_capacity_probe(
+                tcp_probe_request(PathId(2)),
+                tcp_probe_session_lease(),
+            ),
             Err(RuntimeError::SenderServiceBlocked)
         ));
         assert!(!commands.tcp_capacity_probe_attempted());
@@ -1113,15 +1132,25 @@ mod tests {
         let queued = try_recv_reliable_path_command(&mut receivers).expect("queued ping");
         receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&queued));
         drop(queued);
+        let (tracker, session_lease) = tcp_probe_tracker_and_lease();
         commands
-            .try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2)))
+            .try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2)), session_lease)
             .expect("admit exact carrier probe");
         assert!(commands.tcp_capacity_probe_attempted());
         assert!(commands.tcp_capacity_probe_active());
         drop(try_recv_reliable_path_command(&mut receivers).expect("queued probe"));
         assert!(!commands.tcp_capacity_probe_active());
+        assert!(
+            tracker
+                .try_reserve_tcp_capacity_probe(SessionId(1), 0)
+                .is_some(),
+            "command cancellation releases session ownership before carrier wake"
+        );
         assert!(matches!(
-            commands.try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2))),
+            commands.try_enqueue_tcp_capacity_probe(
+                tcp_probe_request(PathId(2)),
+                tcp_probe_session_lease(),
+            ),
             Err(RuntimeError::SenderServiceBlocked)
         ));
     }

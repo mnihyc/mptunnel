@@ -602,6 +602,51 @@ aggregation, not ideal stable five-path aggregation. These rows prove current
 Linux TCP download behavior, not QUIC, mixed-carrier, upload, failover, TUN,
 real-Internet, or external baseline superiority.
 
+Iterations 155-162 isolate and fix that recruitment variance. The 2 MiB TCP
+capacity receipt was still waiting for an optional product Subflow to graduate,
+so discovery timing depended on ordered-data admission. Removing that dependency
+exposed a second serialization bug: proof publication woke the sender before the
+session discovery lease was released. Releasing the lease first lets later
+offset-free probes run, but clean Iteration 160 still left fat control-only and
+had a 0.901 second gap. Its client had opened optional Validation paths one at a
+time and permanently suppressed each path after one attempt, so the server-side
+capacity mechanism could not repair a missing product attachment.
+
+Iteration 161 is the causal diagnostic. It starts the three same-family useful
+Validation opens together at time zero; all attach by 1.181 seconds. Lowlat,
+balanced, mild, and fat then carry 169.3, 165.2, 88.9, and 18.2 MB. Two TCP
+capacity trains remain session-serialized, and the poor path times out without
+receiving product authority. This instrumented row is not a throughput result.
+
+Clean Iteration 162 reaches 311.624 Mbps multipath versus the adjacent 100.531
+Mbps fat single (`3.100x`). First body is 0.170 versus 1.924 seconds, and the
+maximum read gap is 0.249 versus 0.667 seconds. Material server bytes are
+20.7/40.9/13.4/25.1% on lowlat/balanced/mild/fat; poor remains control-only.
+
+The final audit then fixed three failure-path defects without changing the
+successful product policy: a live TCP discovery lease now prevents session
+reclaim, the absolute deadline covers blocked train emission as well as receipt,
+and command cancellation releases session ownership before the carrier wake.
+A measured cross-family handoff also outranks optional TCP discovery, while
+enqueue failure returns backpressure instead of synchronously retrying.
+
+Iteration 163 is the matched slow-optional guard after concurrent attachment.
+With a 200 Mbps/20 ms/0.1% Service and every optional at 50 Mbps/420 ms/10%,
+multipath reaches 183.672 Mbps versus 183.694 Mbps single (`1.000x`) with
+0.249/0.170 second maximum gaps. The Service carries 99.92% of path bytes.
+
+Clean Iteration 164 repeats the default heterogeneous multipath row after the
+audit fixes at 317.299 Mbps with a 0.378 second gap. Lowlat, balanced, mild, and
+fat carry 165.2, 394.8, 114.9, and 186.4 MB, so it passes the predeclared repeat
+guards of at least 250 Mbps, at most 0.5 seconds, fat at least 10%, and all four
+useful paths material. Iterations 162/164 therefore close the observed
+attachment variance and stall regression for this cohort. They do not broaden
+the proof to upload, QUIC, mixed carriers, failover, TUN, real Internet, or
+external baselines. Resource efficiency remains non-ideal: Iteration 162 server
+CPU and peak memory are 9.870%/198.4 MB multipath versus 2.492%/119.2 MB single,
+and the Iteration 164 server peak rises to 299.5 MB, above the manual 256 MiB
+target.
+
 ## Interpreting Results
 
 The deterministic benchmark gates in `lab/benchmarks/` are useful manual regression checks, but they are model results. The Docker lab is the minimum comparison surface before claiming real performance improvement because it compares raw paths, single-path mptunnel, multipath mptunnel, UDP behavior, and a forced path failure under the same emulated network.

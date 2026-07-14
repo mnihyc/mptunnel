@@ -16,6 +16,7 @@ use crate::model::admission::{
 use crate::model::request::evidence::RequestPerFlowRateModel;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::stream::request::RequestFlightLedger;
+use crate::scheduler::cyclic_cursor_distance;
 
 pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
     lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
@@ -834,7 +835,7 @@ fn choose_request_ack_clock_calibration_with_rates(
                 path.instance(),
                 target(path.instance()),
                 spent > 0,
-                path_cursor_distance(position, cursor, paths.len()),
+                cyclic_cursor_distance(position, cursor, paths.len()),
                 score.eta_ms,
             ))
         })
@@ -1916,7 +1917,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         }
         #[cfg(feature = "lab-diagnostics")]
         if let Some(initial_gate) = flow_local_shadow_gate {
-            let cursor_distance = path_cursor_distance(position, cursor, paths.len());
+            let cursor_distance = cyclic_cursor_distance(position, cursor, paths.len());
             let diagnostics = candidate_diagnostics.unwrap_or(BulkRelayCandidateDiagnostics {
                 stream_id,
                 lane,
@@ -1969,7 +1970,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         if normal_bulk_send && lower_flight_owner.is_none() && Some(key) == ordered_data_owner {
             old_lead_candidate = Some((position, score.eta_ms, snapshot));
         }
-        let cursor_distance = path_cursor_distance(position, cursor, paths.len());
+        let cursor_distance = cyclic_cursor_distance(position, cursor, paths.len());
         match best {
             None => {
                 best = Some((position, score.eta_ms, cursor_distance, snapshot));
@@ -2354,13 +2355,6 @@ fn relay_path_snapshot_for_bulk_choice(
         snapshot.active_flows = snapshot.active_flows.saturating_add(1);
     }
     Some(snapshot)
-}
-
-fn path_cursor_distance(position: usize, cursor: usize, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    position.wrapping_add(len).wrapping_sub(cursor % len) % len
 }
 
 #[cfg(test)]

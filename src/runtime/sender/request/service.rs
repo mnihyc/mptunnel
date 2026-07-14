@@ -1,3 +1,4 @@
+use super::dispatch::{emit_request_frame, emit_request_frame_with_mode};
 use super::*;
 #[cfg(test)]
 use crate::model::ack_clock::{
@@ -20,6 +21,7 @@ use crate::model::request::evidence::{
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::runtime::stream::request::RequestFlightLedger;
+use crate::scheduler::cyclic_cursor_distance;
 
 // Ownership boundary:
 // Sender services own product work before it reaches carrier command queues.
@@ -889,7 +891,7 @@ impl RelaySenderService {
                 } else {
                     None
                 };
-            match emit_relay_path_frame_with_mode(
+            match emit_request_frame_with_mode(
                 &remotes.paths[position].stream,
                 frame.clone(),
                 lane,
@@ -2657,7 +2659,7 @@ impl RelaySenderService {
                     Some((
                         position,
                         score.eta_ms,
-                        relay_cursor_distance(position, self.next_send_index, remotes.paths.len()),
+                        cyclic_cursor_distance(position, self.next_send_index, remotes.paths.len()),
                     ))
                 })
                 .min_by(|left, right| {
@@ -3191,7 +3193,7 @@ impl RelaySenderService {
             demand: stream_demand_hint_for_lane(lane),
             role: StreamOpenRole::Active,
         };
-        match emit_relay_path_frame(&remotes.paths[position].stream, frame, FlowLane::Control) {
+        match emit_request_frame(&remotes.paths[position].stream, frame, FlowLane::Control) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.fail_client_path_instance(context, remotes, instance)
@@ -3232,7 +3234,7 @@ impl RelaySenderService {
         let emit_result = {
             let path = &mut remotes.paths[position];
             path.stream.lane = lane;
-            emit_relay_path_frame(&path.stream, frame, FlowLane::Control)
+            emit_request_frame(&path.stream, frame, FlowLane::Control)
         };
         match emit_result {
             Ok(()) => {
@@ -3267,7 +3269,7 @@ impl RelaySenderService {
         if !resend_fin {
             return Ok(false);
         }
-        emit_relay_path_frame_with_mode(
+        emit_request_frame_with_mode(
             &remotes.paths[position].stream,
             Frame::StreamFin {
                 stream_id: remotes.stream_id(),

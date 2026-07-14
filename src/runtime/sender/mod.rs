@@ -6,6 +6,7 @@
 
 use super::*;
 
+mod dispatch;
 mod queue;
 mod request;
 mod response;

@@ -6,8 +6,10 @@
 
 use super::*;
 
+mod dispatch;
 mod service;
 mod startup;
 
+pub(in crate::runtime) use dispatch::emit_request_control_frame;
 pub(in crate::runtime) use service::*;
 use startup::*;

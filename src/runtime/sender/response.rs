@@ -14,13 +14,10 @@ mod service;
 
 #[cfg(feature = "lab-diagnostics")]
 use diagnostics::lab_response_service_handoff_evaluation;
+pub(in crate::runtime) use dispatch::emit_response_control_frame;
 use dispatch::{
     emit_planned_response_data_frame, emit_response_frame_from_sender_service,
     response_frame_has_carrier_credit, response_repair_carrier_lane,
-};
-pub(in crate::runtime) use dispatch::{
-    emit_relay_path_frame, emit_relay_path_frame_with_mode, relay_cursor_distance,
-    send_sender_service_control_frame,
 };
 use planner::*;
 pub(in crate::runtime) use service::ServerResponseSenderService;

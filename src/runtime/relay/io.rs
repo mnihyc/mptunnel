@@ -12,6 +12,7 @@ use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::frame::{
     normalized_offset_ranges, reliable_stream_frame_extent, stream_ack_contiguous_frontier,
 };
+use crate::runtime::sender::emit_request_control_frame;
 
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.
@@ -22,7 +23,7 @@ pub(in crate::runtime) async fn send_sender_service_attach_control_frames(
     resend_fin: bool,
 ) -> Result<(), RuntimeError> {
     if resend_fin {
-        send_sender_service_control_frame(
+        emit_request_control_frame(
             path_stream,
             Frame::StreamFin {
                 stream_id: path_stream.stream_id,

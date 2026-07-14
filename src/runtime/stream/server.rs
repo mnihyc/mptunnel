@@ -11,7 +11,7 @@ use crate::runtime::RuntimeError;
 use crate::runtime::relay::{
     relay_reliable_stream, reliable_stream_initial_advertised_window_bytes,
 };
-use crate::runtime::sender::send_sender_service_control_frame;
+use crate::runtime::sender::emit_response_control_frame;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ pub(in crate::runtime) async fn run_server_reliable_stream(
         {
             Ok(stream) => stream,
             Err(err) => {
-                send_sender_service_control_frame(
+                emit_response_control_frame(
                     &stream,
                     Frame::StreamReset {
                         stream_id,
@@ -79,7 +79,7 @@ pub(in crate::runtime) async fn run_server_reliable_stream(
                 return Err(RuntimeError::OutboundConnect(err));
             }
         };
-        send_sender_service_control_frame(
+        emit_response_control_frame(
             &stream,
             Frame::StreamMaxData {
                 stream_id,

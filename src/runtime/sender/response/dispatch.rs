@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
+use crate::runtime::sender::dispatch::try_emit_carrier_frame;
 use crate::runtime::stream::response::{
     ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseServiceHandoffRequest,
     ResponseSubflowAdmissionRequest, record_server_sender_decision,
@@ -77,7 +78,7 @@ pub(super) fn emit_planned_response_data_frame(
     let ResponseDataDispatchPlan { primary } = planned;
     match primary {
         ResponseDataDispatchTarget::Fixed(fixed) => {
-            send_sender_service_frame_to_carrier(
+            try_emit_carrier_frame(
                 fixed.commands(),
                 frame.clone(),
                 lane,
@@ -213,7 +214,7 @@ pub(super) fn emit_response_frame_from_sender_service(
     };
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            send_sender_service_frame_to_carrier(fixed.commands(), frame.clone(), lane, emit_mode)?;
+            try_emit_carrier_frame(fixed.commands(), frame.clone(), lane, emit_mode)?;
             if matches!(frame, Frame::StreamData { .. }) {
                 if repair {
                     fixed.record_repair_flight(&frame);
@@ -272,13 +273,8 @@ pub(super) fn emit_response_frame_from_sender_service(
                         )
                     }
                 } else {
-                    send_sender_service_frame_to_carrier(
-                        &target.commands,
-                        frame.clone(),
-                        lane,
-                        emit_mode,
-                    )
-                    .map(|()| None)
+                    try_emit_carrier_frame(&target.commands, frame.clone(), lane, emit_mode)
+                        .map(|()| None)
                 };
                 match send_result {
                     Ok(_) => {
@@ -313,22 +309,7 @@ pub(super) fn emit_response_frame_from_sender_service(
     }
 }
 
-fn send_sender_service_frame_to_carrier(
-    commands: &ReliablePathCommandSender,
-    frame: Frame,
-    lane: FlowLane,
-    emit_mode: CarrierEmitMode,
-) -> Result<(), RuntimeError> {
-    // Sender-service dispatch must not await a path queue permit; queue-full is
-    // explicit backpressure so the owner can keep work queued and continue
-    // polling ACK/control/path feedback.
-    match emit_mode {
-        CarrierEmitMode::Classified => commands.try_enqueue_admitted_frame(frame, lane),
-        CarrierEmitMode::StreamOrdered => commands.try_enqueue_stream_ordered_frame(frame, lane),
-    }
-}
-
-pub(in crate::runtime) fn send_sender_service_control_frame(
+pub(in crate::runtime) fn emit_response_control_frame(
     stream: &ReliablePathStream,
     frame: Frame,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
@@ -344,39 +325,4 @@ pub(in crate::runtime) fn send_sender_service_control_frame(
         "control",
         None,
     )
-}
-
-pub(in crate::runtime) fn emit_relay_path_frame(
-    stream: &ReliablePathStreamHandle,
-    frame: Frame,
-    lane: FlowLane,
-) -> Result<(), RuntimeError> {
-    emit_relay_path_frame_with_mode(stream, frame, lane, CarrierEmitMode::Classified)
-}
-
-pub(in crate::runtime) fn emit_relay_path_frame_with_mode(
-    stream: &ReliablePathStreamHandle,
-    frame: Frame,
-    lane: FlowLane,
-    emit_mode: CarrierEmitMode,
-) -> Result<(), RuntimeError> {
-    match &stream.output {
-        ReliablePathStreamOutput::Fixed(fixed) => {
-            send_sender_service_frame_to_carrier(fixed.commands(), frame, lane, emit_mode)
-        }
-        ReliablePathStreamOutput::Switchable(_) => {
-            Err(RuntimeError::Protocol("request relay path is not fixed"))
-        }
-    }
-}
-
-pub(in crate::runtime) fn relay_cursor_distance(
-    position: usize,
-    cursor: usize,
-    len: usize,
-) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    position.wrapping_add(len).wrapping_sub(cursor % len) % len
 }

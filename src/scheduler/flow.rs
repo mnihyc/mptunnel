@@ -77,3 +77,15 @@ impl FlowDemand {
         }
     }
 }
+
+/// Stable round-robin tie break without indexing when the candidate set is empty.
+pub(crate) fn cyclic_cursor_distance(position: usize, cursor: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    position.wrapping_add(len).wrapping_sub(cursor % len) % len
+}
+
+#[cfg(test)]
+#[path = "flow_test.rs"]
+mod tests;

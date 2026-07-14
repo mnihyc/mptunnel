@@ -30,7 +30,7 @@ fn budgeted_critical_repair_preempts_owner_data_and_debits_budget() {
             extra_traffic_hint_percent: 1,
         },
     );
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
 
     sender.enqueue_data_for_lane(Bytes::from_static(b"owner"), FlowLane::Throughput);
     assert!(
@@ -5451,7 +5451,7 @@ fn response_repair_extra_budget_is_cumulative_not_per_event() {
             extra_traffic_hint_percent: 1,
         },
     );
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
     let repair_payload = Bytes::from(vec![0x55; startup_floor]);
 
     assert_eq!(
@@ -5845,8 +5845,8 @@ fn response_repair_extra_budget_accumulates_until_useful_attempt() {
             extra_traffic_hint_percent: 1,
         },
     );
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
-    let min_attempt = response_repair_minimum_useful_attempt_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
+    let min_attempt = sender_repair_minimum_useful_attempt_bytes(mux_limits);
 
     assert!(sender.repair_extra_event_budget_remaining(mux_limits) >= min_attempt);
     assert!(
@@ -5886,7 +5886,7 @@ fn response_repair_extra_budget_accumulates_until_useful_attempt() {
 async fn response_owner_dispatch_does_not_earn_repair_budget_before_ack_progress() {
     let mux_limits = MuxLimits::default();
     let stream_id = StreamId(96);
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
     let (commands, _receivers) = reliable_path_command_channels(8);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -5994,7 +5994,7 @@ fn response_critical_repair_closes_tail_after_optional_budget_exhaustion() {
             extra_traffic_hint_percent: 1,
         },
     );
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
@@ -6071,7 +6071,7 @@ fn client_repair_extra_budget_is_cumulative_not_per_event() {
         },
     );
     let mut sender_queue = ReliableRelaySenderQueue::default();
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
     let repair_payload = Bytes::from(vec![0x33; startup_floor]);
 
     assert!(sender.enqueue_repair_frame_with_priority(
@@ -6125,7 +6125,7 @@ fn client_critical_repair_closes_tail_after_optional_budget_exhaustion() {
         },
     );
     let mut sender_queue = ReliableRelaySenderQueue::default();
-    let startup_floor = response_extra_traffic_startup_floor_bytes(mux_limits);
+    let startup_floor = sender_extra_traffic_startup_floor_bytes(mux_limits);
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
@@ -6213,7 +6213,7 @@ fn response_lead_must_be_admissible_not_lowest_raw_eta() {
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0; 64 * 1024]),
         },
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         mux_limits,
         &[],
         &[],
@@ -6236,7 +6236,7 @@ fn response_stream_ordered_final_control_stays_on_active_lead() {
             stream_id: StreamId(7),
             final_offset: 2 * 1024 * 1024,
         },
-        ResponseCarrierEmitMode::StreamOrdered,
+        CarrierEmitMode::StreamOrdered,
         MuxLimits::default(),
         &[],
         &[],
@@ -6264,7 +6264,7 @@ fn response_stream_ack_prefers_request_active_over_response_owner() {
             complete: true,
             ranges: vec![OffsetRange { start: 0, end: 64 }],
         },
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         MuxLimits::default(),
         &[],
         &[],
@@ -6301,7 +6301,7 @@ fn response_stream_ordered_final_control_waits_for_backpressured_active_lead() {
             stream_id: StreamId(7),
             final_offset: 2 * 1024 * 1024,
         },
-        ResponseCarrierEmitMode::StreamOrdered,
+        CarrierEmitMode::StreamOrdered,
         MuxLimits::default(),
         &[],
         &[],
@@ -7349,7 +7349,7 @@ fn repair_prefers_bulk_proven_path_over_proof_only_low_eta_path() {
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0; payload_bytes]),
         },
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         mux_limits,
         &[],
         &[original_owner.key],
@@ -7394,7 +7394,7 @@ fn repair_does_not_use_proof_only_path_when_no_proven_repair_path_exists() {
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0; payload_bytes]),
         },
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         mux_limits,
         &[],
         &[original_owner.key],
@@ -7439,7 +7439,7 @@ fn path_failure_repair_can_use_live_liveness_survivor_without_path_proving_it() 
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0; payload_bytes]),
         },
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         mux_limits,
         &[],
         &[original_owner.key],
@@ -7499,7 +7499,7 @@ fn path_failure_repair_prefers_same_family_survivor_before_cross_family_low_eta(
             flags: StreamFlags::NONE,
             payload: Bytes::from(vec![0; payload_bytes]),
         },
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         mux_limits,
         &[],
         &[original_owner.key],
@@ -7579,7 +7579,7 @@ fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capaci
         &[survivor.clone()],
         FlowLane::Throughput,
         &repair_frame,
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         mux_limits,
         &[],
         &[],
@@ -7657,7 +7657,7 @@ fn path_failure_repair_stream_data_uses_data_queue_when_priority_is_full() {
             &path_stream,
             &repair_frame,
             FlowLane::Latency,
-            ResponseCarrierEmitMode::Classified,
+            CarrierEmitMode::Classified,
             Some(RelaySendCause::PathFailureRepair),
         ),
         "RepairData is product-critical stream data: carrier priority queues may be full, but an open stream-data queue must still admit failover repair"

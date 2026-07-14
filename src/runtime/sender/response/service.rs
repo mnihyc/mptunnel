@@ -71,7 +71,7 @@ impl ServerResponseSenderService {
             &targets,
             lane,
             &preview,
-            ResponseCarrierEmitMode::Classified,
+            CarrierEmitMode::Classified,
             binding.mux_limits(),
             &[],
             &avoid_keys,
@@ -140,7 +140,7 @@ impl ServerResponseSenderService {
     ) -> usize {
         self.extra_traffic
             .budget(
-                response_extra_traffic_startup_floor_bytes(mux_limits),
+                sender_extra_traffic_startup_floor_bytes(mux_limits),
                 self.performance,
             )
             .remaining_bytes()
@@ -155,7 +155,7 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
     ) -> usize {
         let remaining = self.repair_extra_budget_remaining(mux_limits);
-        if remaining < response_repair_minimum_useful_attempt_bytes(mux_limits) {
+        if remaining < sender_repair_minimum_useful_attempt_bytes(mux_limits) {
             0
         } else {
             remaining
@@ -209,9 +209,9 @@ impl ServerResponseSenderService {
         match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => {
                 let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
-                    (relay_lane, ResponseCarrierEmitMode::StreamOrdered)
+                    (relay_lane, CarrierEmitMode::StreamOrdered)
                 } else {
-                    (FlowLane::Control, ResponseCarrierEmitMode::Classified)
+                    (FlowLane::Control, CarrierEmitMode::Classified)
                 };
                 response_frame_has_carrier_credit(path_stream, frame, carrier_lane, emit_mode, None)
             }
@@ -237,7 +237,7 @@ impl ServerResponseSenderService {
                     path_stream,
                     frame,
                     response_repair_carrier_lane(frame),
-                    ResponseCarrierEmitMode::Classified,
+                    CarrierEmitMode::Classified,
                     Some(*cause),
                 )
             }
@@ -303,7 +303,7 @@ impl ServerResponseSenderService {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
         let budget = self.extra_traffic.budget(
-            response_extra_traffic_startup_floor_bytes(mux_limits),
+            sender_extra_traffic_startup_floor_bytes(mux_limits),
             self.performance,
         );
         if !budget.can_spend(payload_bytes) {
@@ -467,9 +467,9 @@ impl ServerResponseSenderService {
         let selected_path = match queued_lane {
             ReliableWorkClass::Control => {
                 let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
-                    (relay_lane, ResponseCarrierEmitMode::StreamOrdered)
+                    (relay_lane, CarrierEmitMode::StreamOrdered)
                 } else {
-                    (FlowLane::Control, ResponseCarrierEmitMode::Classified)
+                    (FlowLane::Control, CarrierEmitMode::Classified)
                 };
                 emit_response_frame_from_sender_service(
                     path_stream,
@@ -484,7 +484,7 @@ impl ServerResponseSenderService {
                 path_stream,
                 frame.clone(),
                 reliable_path_effective_frame_lane(&frame, relay_lane),
-                ResponseCarrierEmitMode::Classified,
+                CarrierEmitMode::Classified,
                 "data",
                 None,
             ) {
@@ -498,7 +498,7 @@ impl ServerResponseSenderService {
                 path_stream,
                 frame.clone(),
                 response_repair_carrier_lane(&frame),
-                ResponseCarrierEmitMode::Classified,
+                CarrierEmitMode::Classified,
                 "tail_repair",
                 repair_cause,
             )?,

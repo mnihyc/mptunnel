@@ -17,7 +17,7 @@ pub(super) fn response_frame_has_carrier_credit(
     stream: &ReliablePathStream,
     frame: &Frame,
     lane: FlowLane,
-    emit_mode: ResponseCarrierEmitMode,
+    emit_mode: CarrierEmitMode,
     repair_cause: Option<RelaySendCause>,
 ) -> bool {
     let repair = repair_cause.is_some();
@@ -28,10 +28,8 @@ pub(super) fn response_frame_has_carrier_credit(
     };
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => match emit_mode {
-            ResponseCarrierEmitMode::Classified => {
-                fixed.commands().can_enqueue_frame_now(frame, lane)
-            }
-            ResponseCarrierEmitMode::StreamOrdered => {
+            CarrierEmitMode::Classified => fixed.commands().can_enqueue_frame_now(frame, lane),
+            CarrierEmitMode::StreamOrdered => {
                 fixed.commands().can_enqueue_stream_ordered_frame_now(lane)
             }
         },
@@ -78,7 +76,7 @@ pub(super) fn emit_planned_response_data_frame(
                 fixed.commands(),
                 frame.clone(),
                 lane,
-                ResponseCarrierEmitMode::StreamOrdered,
+                CarrierEmitMode::StreamOrdered,
             )?;
             fixed.record_owner_flight(&frame);
             Ok(ResponseDataEmitOutcome {
@@ -193,7 +191,7 @@ pub(super) fn emit_response_frame_from_sender_service(
     stream: &ReliablePathStream,
     frame: Frame,
     lane: FlowLane,
-    emit_mode: ResponseCarrierEmitMode,
+    emit_mode: CarrierEmitMode,
     reason: &'static str,
     repair_cause: Option<RelaySendCause>,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
@@ -204,7 +202,7 @@ pub(super) fn emit_response_frame_from_sender_service(
         lane
     };
     let emit_mode = if matches!(frame, Frame::StreamData { .. }) && !repair {
-        ResponseCarrierEmitMode::StreamOrdered
+        CarrierEmitMode::StreamOrdered
     } else {
         emit_mode
     };
@@ -314,16 +312,14 @@ fn send_sender_service_frame_to_carrier(
     commands: &ReliablePathCommandSender,
     frame: Frame,
     lane: FlowLane,
-    emit_mode: ResponseCarrierEmitMode,
+    emit_mode: CarrierEmitMode,
 ) -> Result<(), RuntimeError> {
     // Sender-service dispatch must not await a path queue permit; queue-full is
     // explicit backpressure so the owner can keep work queued and continue
     // polling ACK/control/path feedback.
     match emit_mode {
-        ResponseCarrierEmitMode::Classified => commands.try_enqueue_admitted_frame(frame, lane),
-        ResponseCarrierEmitMode::StreamOrdered => {
-            commands.try_enqueue_stream_ordered_frame(frame, lane)
-        }
+        CarrierEmitMode::Classified => commands.try_enqueue_admitted_frame(frame, lane),
+        CarrierEmitMode::StreamOrdered => commands.try_enqueue_stream_ordered_frame(frame, lane),
     }
 }
 
@@ -339,7 +335,7 @@ pub(in crate::runtime) fn send_sender_service_control_frame(
         stream,
         frame,
         FlowLane::Control,
-        ResponseCarrierEmitMode::Classified,
+        CarrierEmitMode::Classified,
         "control",
         None,
     )
@@ -350,14 +346,14 @@ pub(in crate::runtime) fn emit_relay_path_frame(
     frame: Frame,
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
-    emit_relay_path_frame_with_mode(stream, frame, lane, ResponseCarrierEmitMode::Classified)
+    emit_relay_path_frame_with_mode(stream, frame, lane, CarrierEmitMode::Classified)
 }
 
 pub(in crate::runtime) fn emit_relay_path_frame_with_mode(
     stream: &ReliablePathStreamHandle,
     frame: Frame,
     lane: FlowLane,
-    emit_mode: ResponseCarrierEmitMode,
+    emit_mode: CarrierEmitMode,
 ) -> Result<(), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {

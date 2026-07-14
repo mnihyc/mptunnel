@@ -1,0 +1,11 @@
+//! Pure product-layer models.
+//!
+//! Modules here transform typed snapshots into decisions. They do not own
+//! sockets, tasks, channels, timers, or platform APIs; runtime services gather
+//! inputs and apply their outputs.
+
+mod response_ownership;
+
+pub(super) use response_ownership::{
+    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
+};

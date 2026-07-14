@@ -22,9 +22,7 @@ use super::bulk_admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
 };
-use super::response_ownership::{
-    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
-};
+use super::model::{ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir};
 use super::*;
 
 // Ownership boundary:

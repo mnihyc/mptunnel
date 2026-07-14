@@ -1,24 +1,29 @@
-use super::CarrierPathKey;
+//! Response-stream ordering debt and same-family reservoir arithmetic.
+
+use crate::runtime::reliable_path::CarrierPathKey;
 
 // Product offsets are shared across every response carrier, but carrier flight
 // is not. This module keeps that ownership arithmetic separate from path
 // ranking so a connection-level tail cannot silently become a per-path cwnd.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResponseOrderedTail {
+pub(in crate::runtime) struct ResponseOrderedTail {
     service_anchor: Option<CarrierPathKey>,
     bytes: u64,
 }
 
 impl ResponseOrderedTail {
-    pub(super) fn new(service_anchor: Option<CarrierPathKey>, bytes: usize) -> Self {
+    pub(in crate::runtime) fn new(service_anchor: Option<CarrierPathKey>, bytes: usize) -> Self {
         Self {
             service_anchor,
             bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
         }
     }
 
-    pub(super) fn for_candidate(self, candidate: CarrierPathKey) -> ResponseCandidateTailDebt {
+    pub(in crate::runtime) fn for_candidate(
+        self,
+        candidate: CarrierPathKey,
+    ) -> ResponseCandidateTailDebt {
         let external_bytes = if self.bytes > 0 && Some(candidate) != self.service_anchor {
             self.bytes
         } else {
@@ -38,32 +43,32 @@ impl ResponseOrderedTail {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResponseCandidateTailDebt {
+pub(in crate::runtime) struct ResponseCandidateTailDebt {
     global_bytes: u64,
     external_bytes: u64,
 }
 
 impl ResponseCandidateTailDebt {
-    pub(super) fn global_bytes(self) -> u64 {
+    pub(in crate::runtime) fn global_bytes(self) -> u64 {
         self.global_bytes
     }
 
     // Bulk admission adds the candidate's own product flight. This value must
     // therefore contain only exposure external to that candidate.
-    pub(super) fn external_bytes(self) -> u64 {
+    pub(in crate::runtime) fn external_bytes(self) -> u64 {
         self.external_bytes
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResponseSameFamilyReservoir {
+pub(in crate::runtime) struct ResponseSameFamilyReservoir {
     service: CarrierPathKey,
     tail: ResponseOrderedTail,
     service_assigned_bytes: u64,
 }
 
 impl ResponseSameFamilyReservoir {
-    pub(super) fn new(
+    pub(in crate::runtime) fn new(
         service: CarrierPathKey,
         tail: ResponseOrderedTail,
         service_assigned_bytes: u64,
@@ -85,11 +90,11 @@ impl ResponseSameFamilyReservoir {
         })
     }
 
-    pub(super) fn service(self) -> CarrierPathKey {
+    pub(in crate::runtime) fn service(self) -> CarrierPathKey {
         self.service
     }
 
-    pub(super) fn for_candidate(
+    pub(in crate::runtime) fn for_candidate(
         self,
         candidate: CarrierPathKey,
         candidate_owner_bytes: u64,

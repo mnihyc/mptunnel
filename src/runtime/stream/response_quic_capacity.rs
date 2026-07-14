@@ -1,11 +1,15 @@
 use super::response_admission::{
     ResponseSenderPathTarget, server_output_has_bulk_rate_evidence_with_limits,
 };
-use super::{CarrierPathKey, ResponseStreamBinding, ServerCarrierPathInstanceId};
+use super::{ResponseStreamBinding, ServerCarrierPathInstanceId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::model::path::CarrierPathKey;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
+use crate::runtime::path::commands::{
+    QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket, QuicCapacityProbeOwner,
+};
 use crate::scheduler::FlowLane;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -28,7 +32,7 @@ struct QuicCapacityAdmissionGuard<'a> {
     path: CarrierPathKey,
     path_instance_id: ServerCarrierPathInstanceId,
     token: u64,
-    ticket: super::QuicCapacityProbeCommandTicket,
+    ticket: QuicCapacityProbeCommandTicket,
     state: QuicCapacityAdmissionState,
 }
 
@@ -170,7 +174,7 @@ impl ResponseStreamBinding {
         }
         let calibration_id =
             NEXT_RESPONSE_QUIC_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
-        let command_ticket = super::QuicCapacityProbeCommandTicket::new();
+        let command_ticket = QuicCapacityProbeCommandTicket::new();
         #[cfg(feature = "lab-diagnostics")]
         let attempt_ordinal = target.quic_capacity_calibration_attempts.saturating_add(1);
         #[cfg(feature = "lab-diagnostics")]
@@ -213,8 +217,8 @@ impl ResponseStreamBinding {
         let Some(probe_expires_at) = Instant::now().checked_add(request.lease) else {
             return false;
         };
-        let probe = super::QuicCapacityProbeCommand {
-            owner: super::QuicCapacityProbeOwner::Response {
+        let probe = QuicCapacityProbeCommand {
+            owner: QuicCapacityProbeOwner::Response {
                 binding_instance_id: self.binding_instance_id,
                 path_instance_id: request.target_path_instance_id,
             },

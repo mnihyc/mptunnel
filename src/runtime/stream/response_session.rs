@@ -1,13 +1,14 @@
-#[cfg(test)]
-use super::QuicCapacityProbeCommandResolution;
 use super::{
-    CarrierPathKey, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
-    PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY, QuicCapacityProbeCommandTicket,
-    ServerCarrierPathInstanceId,
+    MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH, ServerCarrierPathInstanceId,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY};
+use crate::model::path::CarrierPathKey;
 use crate::protocol::{SessionId, UnderlayProtocol};
+#[cfg(test)]
+use crate::runtime::path::commands::QuicCapacityProbeCommandResolution;
+use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
 use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};

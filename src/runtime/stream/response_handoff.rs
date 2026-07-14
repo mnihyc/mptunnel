@@ -3,20 +3,22 @@ use super::response_admission::{
     server_bulk_output_snapshot_with_command_pending, server_output_fresh_quic_capacity_proof,
     server_output_has_bulk_rate_evidence_with_limits, server_output_quic_capacity_proof_marker,
 };
-use super::response_placement::{
-    ResponseRateScope, ResponseServiceHandoffMode, response_rate_fair_share_bps,
-    response_service_handoff_mode,
-};
-use super::{
-    CarrierPathKey, QuicCapacityProofCandidate, ResponseStreamBinding, ServerCarrierPathInstanceId,
+use super::response_session::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
+use super::{ResponseStreamBinding, ServerCarrierPathInstanceId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::multipath::FlowSubflowSet;
+use crate::model::path::CarrierPathKey;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
 use crate::runtime::relay_striping::reliable_stream_frame_extent;
+use crate::runtime::stream::response_placement::{
+    ResponseRateScope, ResponseServiceHandoffMode, response_rate_fair_share_bps,
+    response_service_handoff_mode,
+};
 use crate::scheduler::FlowLane;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

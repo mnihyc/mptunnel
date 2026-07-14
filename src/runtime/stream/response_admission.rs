@@ -1,9 +1,44 @@
-use super::response_placement::ResponseRateScope;
 use super::response_session::{
-    ServerResponsePathSchedulingSnapshot, valid_quic_capacity_proof_candidate_at,
+    ServerPathLaneTracker, ServerResponsePathSchedulingSnapshot,
+    valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
 };
-use super::*;
+use super::{
+    ResponseRelayReadSnapshot, ResponseSourceServiceSnapshot, ServerCarrierPathInstanceId,
+    response_live_ordered_data_owner, response_outputs_have_live_mixed_owner_underlays,
+};
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_sender_service_decision;
 use crate::model::admission::bulk_service_horizon_payload_bytes;
+use crate::model::capacity::{
+    MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, TRANSPORT_TIMER_GRANULARITY,
+    product_delivery_samples_override_startup_prior, reliable_subflow_startup_sample_limit_bytes,
+};
+use crate::model::path::CarrierPathKey;
+use crate::model::timing::{quic_bulk_proof_freshness_horizon, transport_pto_from_snapshot};
+use crate::model::work::CarrierWorkKind;
+use crate::mux::MuxLimits;
+use crate::protocol::{
+    Frame, OffsetRange, PathMetricDirection, PathMetrics, SessionId, StreamId, StreamOpenRole,
+    UnderlayProtocol,
+};
+use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::runtime::path::model::{
+    default_path_rate_bps, default_path_srtt_ms, udp_reliable_stream_loss_repair_penalty_ms,
+};
+use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
+use crate::runtime::path::tcp::capacity::{
+    TcpCapacityProofCandidate, valid_tcp_capacity_proof_candidate_at,
+};
+use crate::runtime::relay::io::adaptive_reliable_relay_inflight_bytes;
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::relay::io::frame_pacing_bytes;
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
+use crate::runtime::stream::response_placement::ResponseRateScope;
+use crate::scheduler::{FlowLane, PathSnapshot};
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 // Despite the historical filename, this module owns response path evidence,
 // TCP product-ACK calibration lifecycle, and immutable scheduler snapshots.
@@ -563,10 +598,36 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) evidence_eligible: bool,
 }
 
+impl CarrierPathFlight {
+    pub(in crate::runtime::stream) fn fixed_output(
+        key: CarrierPathKey,
+        end: u64,
+        bytes: usize,
+        sent_at: Instant,
+        kind: CarrierWorkKind,
+    ) -> Self {
+        Self {
+            key,
+            output_incarnation: 0,
+            end,
+            bytes,
+            sent_at,
+            kind,
+            evidence_eligible: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct CarrierPathReleasedFlight {
     pub(super) flight: CarrierPathFlight,
     pub(super) path_proving: bool,
+}
+
+impl CarrierPathReleasedFlight {
+    pub(in crate::runtime::stream) fn fixed_output_sample(self) -> (usize, Instant, bool) {
+        (self.flight.bytes, self.flight.sent_at, self.path_proving)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -982,7 +1043,7 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
             ResponseRateScope::PathCapacity,
         ),
         (UnderlayProtocol::Tcp, None, Some(rate), _)
-            if !super::product_delivery_samples_override_startup_prior(entry.delivery_samples) =>
+            if !product_delivery_samples_override_startup_prior(entry.delivery_samples) =>
         {
             if rate >= prior_rate_bps {
                 (rate, ResponseRateScope::PerFlowGoodput)

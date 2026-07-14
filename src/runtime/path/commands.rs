@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::stream::ReliablePathStream;
 use crate::runtime::stream::response::{ServerCarrierPathInstanceId, TcpCapacityProbeSessionLease};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -492,7 +493,7 @@ impl ReliablePathCommandSender {
                 "PATH_CAPACITY_* requires an explicit typed carrier command",
             ));
         }
-        let bytes = frame_pacing_bytes(&frame);
+        let bytes = reliable_path_frame_pacing_bytes(&frame);
         let effective_lane = effective_lane_override
             .unwrap_or_else(|| reliable_path_effective_frame_lane(&frame, lane));
         #[cfg(feature = "lab-diagnostics")]
@@ -889,7 +890,7 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
     command: &ReliablePathCommand,
 ) -> usize {
     match command {
-        ReliablePathCommand::SendFrame(frame) => frame_pacing_bytes(frame),
+        ReliablePathCommand::SendFrame(frame) => reliable_path_frame_pacing_bytes(frame),
         ReliablePathCommand::SendQuicCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }

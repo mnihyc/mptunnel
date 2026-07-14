@@ -1,6 +1,8 @@
 use super::*;
 use crate::model::admission::bulk_service_feed_reservoir_payload_bytes;
 use crate::protocol::frame::normalized_offset_ranges;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 
 fn reliable_relay_request_outstanding_resource_ceiling(mux_limits: MuxLimits) -> usize {
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
@@ -1495,7 +1497,11 @@ where
                 let result = remotes.recv_frame().await;
                 #[cfg(feature = "lab-diagnostics")]
                 if let Ok(ReliableRelayRemoteFrame { frame: Ok(frame), .. }) = &result {
-                    lab_perf_record("relay.path_recv_frame_wait", recv_started.elapsed(), frame_pacing_bytes(frame));
+                    lab_perf_record(
+                        "relay.path_recv_frame_wait",
+                        recv_started.elapsed(),
+                        reliable_path_frame_pacing_bytes(frame),
+                    );
                 }
                 result
             }, if remote_open || send_stream.repair_bytes() > 0 => {

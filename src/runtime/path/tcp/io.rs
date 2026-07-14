@@ -7,7 +7,7 @@
 use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::Frame;
 #[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::frame_pacing_bytes;
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::transport::encrypted::{
     EncryptedFramedReader, EncryptedFramedTransportError, EncryptedFramedWriter,
 };
@@ -33,7 +33,11 @@ pub(in crate::runtime) fn spawn_encrypted_tcp_reader(
             let frame = reader.read_frame().await;
             let done = frame.is_err();
             #[cfg(feature = "lab-diagnostics")]
-            let bytes = frame.as_ref().ok().map(frame_pacing_bytes).unwrap_or(0);
+            let bytes = frame
+                .as_ref()
+                .ok()
+                .map(reliable_path_frame_pacing_bytes)
+                .unwrap_or(0);
             #[cfg(feature = "lab-diagnostics")]
             let started = Instant::now();
             let send_result = frames_tx.send(frame).await;

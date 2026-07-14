@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
 use crate::runtime::stream::response::next_server_carrier_path_instance_id;
 
@@ -1521,7 +1522,7 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
         flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"queued-bytes"),
     };
-    let expected = frame_pacing_bytes(&frame) as u64;
+    let expected = reliable_path_frame_pacing_bytes(&frame) as u64;
 
     tx.try_enqueue_admitted_frame(frame, FlowLane::Throughput)
         .expect("queue frame");
@@ -1552,7 +1553,7 @@ async fn dropping_receiver_releases_already_dequeued_command_debt() {
         flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"held-by-writer"),
     };
-    let expected = frame_pacing_bytes(&frame) as u64;
+    let expected = reliable_path_frame_pacing_bytes(&frame) as u64;
     tx.try_enqueue_admitted_frame(frame, FlowLane::Throughput)
         .expect("queue frame");
     let _held = recv_reliable_path_command(&mut rx)

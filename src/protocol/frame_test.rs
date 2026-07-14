@@ -1,7 +1,11 @@
 use crate::protocol::frame::{
-    normalized_offset_ranges, reliable_stream_frame_extent, stream_ack_contiguous_frontier,
+    normalized_offset_ranges, reliable_path_frame_pacing_bytes,
+    reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent,
+    stream_ack_contiguous_frontier,
 };
-use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId};
+use crate::protocol::{
+    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, ResetReason, StreamFlags, StreamId,
+};
 use bytes::Bytes;
 
 #[test]
@@ -55,6 +59,150 @@ fn reliable_stream_extent_rejects_empty_and_non_stream_frames() {
         reliable_stream_frame_extent(&Frame::Ping { nonce: 7 }),
         None
     );
+}
+
+#[test]
+fn frame_accounting_and_pacing_cover_each_semantic_row() {
+    let stream_id = StreamId(7);
+    let path_id = PathId(3);
+    let cases = [
+        (
+            "stream data",
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"data"),
+            },
+            4,
+            4,
+        ),
+        (
+            "empty stream data",
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::new(),
+            },
+            1,
+            1,
+        ),
+        (
+            "capacity data",
+            Frame::PathCapacityData {
+                path_id,
+                calibration_id: 1,
+                payload: Bytes::from_static(b"probe"),
+            },
+            1,
+            5,
+        ),
+        (
+            "empty capacity data",
+            Frame::PathCapacityData {
+                path_id,
+                calibration_id: 1,
+                payload: Bytes::new(),
+            },
+            1,
+            1,
+        ),
+        (
+            "capacity finish",
+            Frame::PathCapacityFinish {
+                path_id,
+                calibration_id: 1,
+                payload_bytes: 5,
+            },
+            1,
+            0,
+        ),
+        (
+            "capacity receipt",
+            Frame::PathCapacityReceipt {
+                path_id,
+                calibration_id: 1,
+                received_payload_bytes: 5,
+            },
+            1,
+            0,
+        ),
+        (
+            "stream fin",
+            Frame::StreamFin {
+                stream_id,
+                final_offset: 4,
+            },
+            1,
+            1,
+        ),
+        (
+            "stream ack",
+            Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges: vec![OffsetRange { start: 0, end: 4 }],
+            },
+            1,
+            1,
+        ),
+        (
+            "stream max data",
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset: 4,
+            },
+            1,
+            1,
+        ),
+        (
+            "stream reset",
+            Frame::StreamReset {
+                stream_id,
+                reason: ResetReason::RemoteClosed,
+            },
+            1,
+            1,
+        ),
+        ("stream detach", Frame::StreamDetach { stream_id }, 1, 1),
+        (
+            "datagram data",
+            Frame::DatagramData {
+                flow_id: DatagramFlowId(9),
+                datagram_id: DatagramId(1),
+                ttl_ms: 100,
+                payload: Bytes::from_static(b"datagram"),
+            },
+            1,
+            0,
+        ),
+        (
+            "empty datagram data",
+            Frame::DatagramData {
+                flow_id: DatagramFlowId(9),
+                datagram_id: DatagramId(2),
+                ttl_ms: 100,
+                payload: Bytes::new(),
+            },
+            1,
+            0,
+        ),
+        ("other control", Frame::Ping { nonce: 11 }, 1, 0),
+    ];
+
+    for (label, frame, accounted_bytes, pacing_bytes) in cases {
+        assert_eq!(
+            reliable_stream_frame_accounted_bytes(&frame),
+            accounted_bytes,
+            "{label}: sender accounting"
+        );
+        assert_eq!(
+            reliable_path_frame_pacing_bytes(&frame),
+            pacing_bytes,
+            "{label}: path pacing"
+        );
+    }
 }
 
 #[test]

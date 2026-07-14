@@ -5,6 +5,8 @@
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
     Frame, IngressKind, OutboundPolicy, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
@@ -17,8 +19,6 @@ use crate::runtime::path::tcp::client_state::{
     ClientTcpPathConnection, ClientTcpPathSessionRuntime,
 };
 use crate::runtime::recent_ids::RecentIdCache;
-#[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::frame_pacing_bytes;
 use crate::runtime::relay::io::reliable_relay_buffer_len;
 use crate::runtime::stream::stream_demand_hint_for_lane;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
@@ -272,7 +272,7 @@ async fn route_client_tcp_stream_frame(
         return Ok(());
     };
     #[cfg(feature = "lab-diagnostics")]
-    let bytes = frame_pacing_bytes(&frame);
+    let bytes = reliable_path_frame_pacing_bytes(&frame);
     #[cfg(feature = "lab-diagnostics")]
     let started = Instant::now();
     if state.frames.send(Ok(frame)).await.is_err() {

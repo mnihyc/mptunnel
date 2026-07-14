@@ -7,6 +7,8 @@ use crate::model::admission::{
 use crate::model::admission::{
     bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
 };
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::frame::{
     normalized_offset_ranges, reliable_stream_frame_extent, stream_ack_contiguous_frontier,
 };
@@ -29,20 +31,6 @@ pub(in crate::runtime) async fn send_sender_service_attach_control_frames(
         )?;
     }
     Ok(())
-}
-
-pub(in crate::runtime) fn frame_pacing_bytes(frame: &Frame) -> usize {
-    match frame {
-        Frame::StreamData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
-            payload.len().max(1)
-        }
-        Frame::StreamFin { .. }
-        | Frame::StreamAck { .. }
-        | Frame::StreamMaxData { .. }
-        | Frame::StreamReset { .. }
-        | Frame::StreamDetach { .. } => 1,
-        _ => 0,
-    }
 }
 
 pub(in crate::runtime) fn reliable_relay_error_is_migratable(err: &RuntimeError) -> bool {
@@ -2334,7 +2322,11 @@ where
                 let result = path_stream.recv_frame().await;
                 #[cfg(feature = "lab-diagnostics")]
                 if let Ok(frame) = &result {
-                    lab_perf_record("relay.path_recv_frame_wait", recv_started.elapsed(), frame_pacing_bytes(frame));
+                    lab_perf_record(
+                        "relay.path_recv_frame_wait",
+                        recv_started.elapsed(),
+                        reliable_path_frame_pacing_bytes(frame),
+                    );
                 }
                 result
             }, if remote_open || send_stream.repair_bytes() > 0 => {

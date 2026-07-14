@@ -9,13 +9,13 @@ use crate::model::capacity::{
 };
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{OffsetRange, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_command,
 };
 use crate::runtime::relay::io::reliable_relay_buffer_len;
-use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
 use crate::scheduler::FlowLane;
 
 #[test]
@@ -72,7 +72,7 @@ fn udp_stream_ack_releases_product_flight_without_seeding_carrier_rate() {
     std::thread::sleep(Duration::from_millis(1));
     binding.release_normalized_acked_ranges(&[OffsetRange {
         start: 0,
-        end: reliable_stream_frame_payload_bytes(&frame) as u64,
+        end: reliable_stream_frame_accounted_bytes(&frame) as u64,
     }]);
 
     let entry = output_entry_for_key(&binding, key);

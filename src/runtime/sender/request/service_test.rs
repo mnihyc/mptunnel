@@ -6,7 +6,7 @@ use crate::lab_diagnostics::{
     lab_sender_service_counts_for_test,
 };
 use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::runtime::stream::response::{
     CarrierPathFlightDebt, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
@@ -997,7 +997,7 @@ fn response_owner_data_waits_for_missing_lower_owner_debt() {
         select_response_sender_data_target_with_ordered_debt_and_epoch(
             std::slice::from_ref(&survivor),
             FlowLane::Latency,
-            reliable_stream_frame_payload_bytes(&frame),
+            reliable_stream_frame_accounted_bytes(&frame),
             MuxLimits::default(),
             &lower_flights,
             None,
@@ -1011,7 +1011,7 @@ fn response_owner_data_waits_for_missing_lower_owner_debt() {
         select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[survivor],
             FlowLane::Latency,
-            reliable_stream_frame_payload_bytes(&frame),
+            reliable_stream_frame_accounted_bytes(&frame),
             MuxLimits::default(),
             &[],
             None,
@@ -11134,7 +11134,7 @@ fn tcp_ack_clock_calibration_retirement_ignores_repair_only_carrier_debt() {
     let plan = plan_response_data_dispatch(
         &fixture.stream,
         FlowLane::Throughput,
-        reliable_stream_frame_payload_bytes(&repair) as u64,
+        reliable_stream_frame_accounted_bytes(&repair) as u64,
         payload_bytes,
     )
     .expect("RepairData must not preserve a unique-owner calibration fence");

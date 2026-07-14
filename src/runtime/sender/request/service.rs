@@ -16,9 +16,9 @@ use crate::model::request::evidence::{
     RequestPerFlowRateModel, RequestTcpAckTurnoverModel, request_path_rate_coverage_floor_bytes,
     request_tcp_candidate_turnover_authorized,
 };
-use crate::protocol::frame::reliable_stream_frame_extent;
 #[cfg(feature = "lab-diagnostics")]
-use crate::protocol::frame::stream_ack_contiguous_frontier;
+use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
+use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 
 // Ownership boundary:
 // Sender services own product work before it reaches carrier command queues.
@@ -299,7 +299,7 @@ impl RelaySenderService {
         critical_priority: bool,
     ) -> bool {
         debug_assert!(cause.is_repair());
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         let budget = self.extra_traffic.budget(
             sender_extra_traffic_startup_floor_bytes(mux_limits),
             self.performance,
@@ -324,7 +324,7 @@ impl RelaySenderService {
         cause: RelaySendCause,
     ) {
         debug_assert!(cause.is_repair());
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
         sender_queue.push_critical_repair_with_cause(frame, cause);
@@ -914,7 +914,7 @@ impl RelaySenderService {
                         );
                     }
                     if matches!(frame, Frame::StreamData { .. }) {
-                        let sent_bytes = reliable_stream_frame_payload_bytes(&frame);
+                        let sent_bytes = reliable_stream_frame_accounted_bytes(&frame);
                         if data_role.is_some() && !claimed_load {
                             // Validation attachment is not demand. Its first
                             // unique OwnerData commits this flow's carrier load
@@ -1037,7 +1037,7 @@ impl RelaySenderService {
         if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
             self.try_start_request_tcp_capacity_calibration(context, remotes, lane);
             self.try_start_request_quic_capacity_calibration(context, remotes, lane);
-            let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+            let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
             let sealed_owner = self.request_startup.epoch.as_mut().and_then(|epoch| {
                 let owner = epoch.startup_owner_key()?;
                 epoch
@@ -1098,7 +1098,7 @@ impl RelaySenderService {
                     candidate,
                     load_expectation,
                 } => {
-                    let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+                    let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
                     let admission = self
                         .request_startup
                         .plan_admission(context.mux_limits, service, candidate, payload_bytes)
@@ -1117,7 +1117,7 @@ impl RelaySenderService {
                     candidate,
                     target_bytes,
                 } => {
-                    let payload_bytes = reliable_stream_frame_payload_bytes(frame) as u64;
+                    let payload_bytes = reliable_stream_frame_accounted_bytes(frame) as u64;
                     let entry_offset = reliable_stream_frame_extent(frame)
                         .map(|(offset, _, _)| offset)
                         .unwrap_or(0);
@@ -2603,7 +2603,7 @@ impl RelaySenderService {
             matches!(cause, RelaySendCause::PersistentServerAckGapRepair(_));
         let requires_distinct_output =
             cause == RelaySendCause::LiveOwnerTailRepair || persistent_ack_gap_repair;
-        let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
         if cause == RelaySendCause::RecvProgressRecovery
             && let Some(position) = choose_repair_recv_progress_path_position(remotes, frame, cause)
         {
@@ -3480,7 +3480,7 @@ impl RelaySenderService {
             if sender_queue.has_queued_repair_overlap(&frame) {
                 continue;
             }
-            let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+            let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
             self.enqueue_critical_repair_frame(
                 sender_queue,
                 frame,
@@ -3641,7 +3641,7 @@ impl RelaySenderService {
                     cause.as_str(),
                     path_key.underlay,
                     path_key.index,
-                    frame_pacing_bytes(frame),
+                    reliable_path_frame_pacing_bytes(frame),
                     cause.is_repair(),
                     frame_offset,
                     frame_end_offset,

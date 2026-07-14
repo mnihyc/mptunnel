@@ -18,13 +18,15 @@ use crate::model::admission::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::capacity::reliable_subflow_startup_sample_limit_bytes;
 use crate::model::path::CarrierPathKey;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::{
+    reliable_path_frame_pacing_bytes, reliable_stream_frame_accounted_bytes,
+};
 use crate::protocol::{Frame, SessionId, StreamId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 #[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::{frame_pacing_bytes, reliable_bulk_carrier_feed_quantum_bytes};
-#[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
+use crate::runtime::relay::io::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::scheduler::FlowLane;
 #[cfg(feature = "lab-diagnostics")]
 use crate::scheduler::PathSnapshot;
@@ -230,14 +232,14 @@ pub(in crate::runtime) fn record_server_sender_decision(
         stream_id.0,
         reason,
         sender_service_frame_kind(frame),
-        reliable_stream_frame_payload_bytes(frame),
+        reliable_stream_frame_accounted_bytes(frame),
         bulk_rate_evidence,
         format_args!(
             "path_underlay={:?} path_id={} lane={:?} pacing_bytes={}",
             key.underlay,
             key.path_id.0,
             lane,
-            frame_pacing_bytes(frame),
+            reliable_path_frame_pacing_bytes(frame),
         ),
     );
     #[cfg(not(feature = "lab-diagnostics"))]

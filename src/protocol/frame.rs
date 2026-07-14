@@ -1,7 +1,7 @@
-//! Intrinsic reliable-stream frame and offset-range semantics.
+//! Intrinsic frame, offset-range, and byte-accounting semantics.
 //!
 //! These operations belong to the wire model because their answers depend
-//! only on protocol fields, not on carrier state, scheduling, or accounting.
+//! only on protocol fields, not on carrier state or scheduling policy.
 
 use crate::protocol::{Frame, OffsetRange};
 
@@ -44,6 +44,29 @@ pub(crate) fn reliable_stream_frame_extent(frame: &Frame) -> Option<(u64, u64, u
     }
     let end = offset.saturating_add(bytes as u64);
     Some((*offset, end, bytes))
+}
+
+/// Charges reliable-stream sender queues for product data or one control unit.
+pub(crate) fn reliable_stream_frame_accounted_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::StreamData { payload, .. } if !payload.is_empty() => payload.len(),
+        _ => 1,
+    }
+}
+
+/// Returns the payload pressure a reliable carrier should use for pacing.
+pub(crate) fn reliable_path_frame_pacing_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::StreamData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
+            payload.len().max(1)
+        }
+        Frame::StreamFin { .. }
+        | Frame::StreamAck { .. }
+        | Frame::StreamMaxData { .. }
+        | Frame::StreamReset { .. }
+        | Frame::StreamDetach { .. } => 1,
+        _ => 0,
+    }
 }
 
 /// Returns the explicitly proven zero-based prefix of an ordered range set.

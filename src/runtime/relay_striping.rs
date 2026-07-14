@@ -522,10 +522,6 @@ struct RelayPathFlight {
     kind: CarrierWorkKind,
 }
 
-pub(super) fn reliable_stream_frame_payload_bytes(frame: &Frame) -> usize {
-    reliable_stream_frame_extent(frame).map_or(1, |(_, _, bytes)| bytes)
-}
-
 pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
     lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
 }

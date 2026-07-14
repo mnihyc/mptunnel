@@ -4,6 +4,9 @@
 //! separate so queue mutation cannot silently become path-selection policy.
 
 use super::*;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 
 #[derive(Debug)]
 /// Current server response sender-service boundary.
@@ -66,7 +69,7 @@ impl ServerResponseSenderService {
         let avoid_keys = binding.flight_keys_overlapping_frame(&preview);
         let lane = response_repair_carrier_lane(&preview);
         let targets =
-            binding.sender_path_targets(lane, reliable_stream_frame_payload_bytes(&preview));
+            binding.sender_path_targets(lane, reliable_stream_frame_accounted_bytes(&preview));
         choose_response_sender_target(
             &targets,
             lane,
@@ -300,7 +303,7 @@ impl ServerResponseSenderService {
         mux_limits: MuxLimits,
         critical_priority: bool,
     ) -> Option<u64> {
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
         let budget = self.extra_traffic.budget(
             sender_extra_traffic_startup_floor_bytes(mux_limits),
@@ -342,7 +345,7 @@ impl ServerResponseSenderService {
         cause: RelaySendCause,
     ) -> u64 {
         debug_assert!(cause.is_repair());
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
         self.extra_traffic
             .record_optional(ExtraTrafficKind::Repair, payload_bytes);
@@ -543,7 +546,7 @@ impl ServerResponseSenderService {
             ),
         };
         #[cfg(feature = "lab-diagnostics")]
-        let pacing_bytes = frame_pacing_bytes(&frame);
+        let pacing_bytes = reliable_path_frame_pacing_bytes(&frame);
         #[cfg(feature = "lab-diagnostics")]
         let stream_extent = match &frame {
             Frame::StreamData {

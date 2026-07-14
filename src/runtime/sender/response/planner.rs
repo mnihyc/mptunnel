@@ -23,6 +23,7 @@ use crate::model::admission::{
 };
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::{ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir};
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::stream::response::{
     CarrierPathFlightDebt, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
@@ -2025,7 +2026,7 @@ pub(super) fn choose_response_sender_target(
     let active_service_baseline = targets.iter().find(|target| target.is_active);
     let repair = repair_cause.is_some();
     let path_failure_repair = matches!(repair_cause, Some(RelaySendCause::PathFailureRepair));
-    let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+    let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
     if !repair
         && matches!(frame, Frame::StreamData { .. })
         && lower_flights

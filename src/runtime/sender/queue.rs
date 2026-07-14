@@ -7,10 +7,9 @@ use super::RelaySendCause;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamFlags};
 use crate::runtime::relay::io::reliable_relay_buffer_len;
-use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -77,7 +76,7 @@ impl ReliableRelaySenderQueue {
     }
 
     pub(in crate::runtime) fn push_control(&mut self, frame: Frame) -> u64 {
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         self.push_work(
             ReliableWorkClass::Control,
             ReliableRelayQueuedWorkKind::Control(frame),
@@ -88,7 +87,7 @@ impl ReliableRelaySenderQueue {
     }
 
     pub(in crate::runtime) fn push_final_control(&mut self, frame: Frame) -> u64 {
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         self.push_work(
             ReliableWorkClass::Control,
             ReliableRelayQueuedWorkKind::Control(frame),
@@ -140,7 +139,7 @@ impl ReliableRelaySenderQueue {
         critical: bool,
     ) -> u64 {
         debug_assert!(cause.is_repair());
-        let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         let enqueue_id = self.push_work(
             ReliableWorkClass::Repair,
             ReliableRelayQueuedWorkKind::Repair { frame, cause },
@@ -393,12 +392,12 @@ fn prune_acked_repair_queue(
         let slices = unacked_repair_frame_slices(frame, ranges);
         let retained_bytes = slices
             .iter()
-            .map(reliable_stream_frame_payload_bytes)
+            .map(reliable_stream_frame_accounted_bytes)
             .sum::<usize>();
         released = released.saturating_add(work.payload_bytes.saturating_sub(retained_bytes));
         for frame in slices {
             let mut retained_work = work.clone();
-            retained_work.payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+            retained_work.payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
             retained_work.kind = ReliableRelayQueuedWorkKind::Repair {
                 frame,
                 cause: *cause,

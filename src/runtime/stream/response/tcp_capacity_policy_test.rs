@@ -16,6 +16,7 @@ use crate::model::capacity::{
 use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{
     OffsetRange, PathId, PathMetricDirection, PathMetrics, SessionId, StreamOpenRole,
     UnderlayProtocol,
@@ -25,7 +26,6 @@ use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::relay::io::{
     adaptive_reliable_relay_chunk_bytes, bbr_min_send_quantum_bytes, reliable_relay_buffer_len,
 };
-use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
 use crate::scheduler::{FlowLane, PathRateScope};
 use std::time::{Duration, Instant};
 
@@ -423,7 +423,7 @@ fn tcp_local_sender_metrics_remain_send_quantum_prior_after_low_product_sample()
     binding.release_normalized_acked_ranges_at(
         &[OffsetRange {
             start: 0,
-            end: reliable_stream_frame_payload_bytes(&frame) as u64,
+            end: reliable_stream_frame_accounted_bytes(&frame) as u64,
         }],
         first_ack,
     );

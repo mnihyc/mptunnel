@@ -4,6 +4,7 @@
 //! binding to revalidate and commit, and enqueues one carrier command.
 
 use super::*;
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::stream::response::{
     ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseServiceHandoffRequest,
     ResponseSubflowAdmissionRequest, record_server_sender_decision,
@@ -38,7 +39,7 @@ pub(super) fn response_frame_has_carrier_credit(
             }
         },
         ReliablePathStreamOutput::Switchable(binding) => {
-            let payload_bytes = reliable_stream_frame_payload_bytes(frame);
+            let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
             let lower_flights = if matches!(frame, Frame::StreamData { .. }) && !repair {
                 binding.lower_flights_before_frame(frame)
             } else {
@@ -223,7 +224,7 @@ pub(super) fn emit_response_frame_from_sender_service(
             Ok(Some(fixed.key()))
         }
         ReliablePathStreamOutput::Switchable(binding) => {
-            let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
+            let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
             let lower_flights = if matches!(frame, Frame::StreamData { .. }) && !repair {
                 binding.lower_flights_before_frame(&frame)
             } else {

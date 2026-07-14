@@ -10,6 +10,8 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
     Frame, PathId, PathMetricDirection, PathMetrics, SessionId, StreamId, StreamOpenRole,
     TargetAddr, UnderlayProtocol,
@@ -22,8 +24,6 @@ use crate::runtime::path::tcp::capacity::{
     TcpCapacityProofCandidate, valid_tcp_capacity_proof_candidate_at,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
-#[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::frame_pacing_bytes;
 use crate::runtime::relay::io::reliable_stream_initial_advertised_window_bytes;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
@@ -835,7 +835,7 @@ impl ServerReliableStreamRegistry {
         frame: Frame,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
-        let bytes = frame_pacing_bytes(&frame);
+        let bytes = reliable_path_frame_pacing_bytes(&frame);
         let stream = {
             let streams = self
                 .streams

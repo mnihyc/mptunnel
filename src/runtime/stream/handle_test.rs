@@ -5,6 +5,7 @@ use crate::model::capacity::{
 };
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{
     Frame, OffsetRange, PathId, SessionId, StreamFlags, StreamId, UnderlayProtocol,
 };
@@ -14,7 +15,6 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::relay::io::reliable_stream_recv_progress_interval;
-use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
 use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -202,7 +202,7 @@ fn tcp_fixed_output_startup_prior_yields_after_persistent_local_delivery_samples
 
     for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
         let frame = stream_data_frame_at(offset, MIN_RATE_SAMPLE_BYTES as usize);
-        let end = offset + reliable_stream_frame_payload_bytes(&frame) as u64;
+        let end = offset + reliable_stream_frame_accounted_bytes(&frame) as u64;
         fixed.record_owner_flight(&frame);
         std::thread::sleep(Duration::from_millis(20));
         fixed.release_normalized_acked_ranges(&[OffsetRange { start: offset, end }]);

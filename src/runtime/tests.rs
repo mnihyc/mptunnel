@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
-use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
 use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
@@ -2456,7 +2456,10 @@ fn capacity_frames_require_explicit_typed_carrier_commands() {
             reliable_path_effective_frame_lane(&frame, FlowLane::Throughput),
             expected_lane
         );
-        assert_eq!(frame_pacing_bytes(&frame), expected_pacing_bytes);
+        assert_eq!(
+            reliable_path_frame_pacing_bytes(&frame),
+            expected_pacing_bytes
+        );
         assert_eq!(reliable_stream_frame_extent(&frame), None);
         assert!(matches!(
             commands.try_enqueue_admitted_frame(frame, FlowLane::Throughput),

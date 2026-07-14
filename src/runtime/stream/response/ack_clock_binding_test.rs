@@ -8,9 +8,9 @@ use super::{RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED, ResponseAckClockCalibrationS
 use crate::model::capacity::{
     MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
 };
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{OffsetRange, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::model::metric_epoch_now;
-use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
 use crate::scheduler::{FlowLane, PathRateScope};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ fn tcp_first_stream_ack_is_progress_but_not_a_capacity_clock() {
     std::thread::sleep(Duration::from_millis(1));
     binding.release_normalized_acked_ranges(&[OffsetRange {
         start: 0,
-        end: reliable_stream_frame_payload_bytes(&frame) as u64,
+        end: reliable_stream_frame_accounted_bytes(&frame) as u64,
     }]);
 
     let entry = output_entry_for_key(&binding, key);

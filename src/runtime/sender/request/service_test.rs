@@ -6393,188 +6393,6 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
 }
 
 #[test]
-fn active_quic_response_owner_emission_credit_uses_product_envelope_not_carrier_cwnd() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut active = response_target(0, UnderlayProtocol::Udp, 5.0, 0, payload_bytes as u64, true);
-    active.snapshot.inflight_limit_bytes = payload_bytes as u64;
-
-    let credit = response_target_emission_credit_bytes(
-        &active,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(
-        credit,
-        bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits)
-            as usize,
-        "active response owner must use the product envelope, not current carrier cwnd"
-    );
-    assert!(
-        credit > payload_bytes,
-        "the regression requires credit above one carrier quantum"
-    );
-}
-
-#[test]
-fn active_tcp_response_owner_without_bulk_evidence_uses_startup_credit_not_full_envelope() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut active = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    active.has_sender_evidence = false;
-    active.has_service_feed_evidence = false;
-    active.has_bulk_rate_evidence = false;
-
-    let credit = response_target_emission_credit_bytes(
-        &active,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(
-        credit,
-        bulk_service_horizon_payload_bytes(payload_bytes, mux_limits),
-        "unproven active Service startup must be bounded until path-scoped bulk-rate evidence exists"
-    );
-    assert!(
-        credit >= payload_bytes,
-        "startup Service credit must still admit at least one bulk quantum"
-    );
-
-    active.snapshot.product_bytes_in_flight = credit as u64;
-    assert!(
-        !response_service_has_assigned_owner_credit(
-            &active,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-        ),
-        "startup credit bounds cumulative assigned flight, not only the draining writer queue"
-    );
-}
-
-#[test]
-fn active_quic_response_owner_bootstraps_with_bounded_feed_reservoir() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut active = response_target(0, UnderlayProtocol::Udp, 360.0, 0, 16 * 1024 * 1024, true);
-    active.has_sender_evidence = true;
-    active.has_service_feed_evidence = false;
-    active.has_bulk_rate_evidence = false;
-
-    let credit = response_target_emission_credit_bytes(
-        &active,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(
-        credit,
-        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits),
-        "QUIC needs a durable ACK-derived sample before the full product envelope"
-    );
-    assert!(
-        credit
-            < bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits,)
-                as usize
-    );
-
-    active.has_service_feed_evidence = true;
-    let mature_feed_credit = response_target_emission_credit_bytes(
-        &active,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-    assert_eq!(
-        mature_feed_credit,
-        bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits)
-            as usize,
-        "durable current-Service QUIC ACK progress unlocks the product envelope"
-    );
-    assert!(
-        !active.has_bulk_rate_evidence,
-        "current-Service feed evidence must not grant optional Subflow or handoff authority"
-    );
-}
-
-#[test]
-fn response_quic_feed_credit_uses_live_carrier_debt_not_outdated_bdp() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = 64 * 1024usize;
-    let mut loaded_quic = response_target(0, UnderlayProtocol::Udp, 250.0, 0, 64 * 1024, true);
-    loaded_quic.snapshot.delivery_rate_bps = 351_000.0;
-    loaded_quic.snapshot.pacing_rate_bps = 351_000.0;
-    loaded_quic.snapshot.product_progress_rate_bps = Some(10_000_000.0);
-    loaded_quic.snapshot.bytes_in_flight = 8 * 1024 * 1024;
-    loaded_quic.snapshot.queue_bytes = 1024 * 1024;
-
-    let quic_credit = response_target_emission_credit_bytes(
-        &loaded_quic,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-    let outdated_bdp_credit = adaptive_reliable_relay_inflight_bytes(
-        Some(loaded_quic.snapshot),
-        FlowLane::Throughput,
-        mux_limits,
-    );
-
-    assert_eq!(
-        quic_credit,
-        bulk_active_service_product_envelope_bytes(loaded_quic.snapshot, payload_bytes, mux_limits,)
-            as usize,
-        "active QUIC Service feed credit must follow the product envelope, not live carrier debt"
-    );
-    assert!(
-        quic_credit > outdated_bdp_credit,
-        "app-limited BDP must not be the only active QUIC Service writer-feed ceiling"
-    );
-
-    let mut loaded_tcp = response_target(1, UnderlayProtocol::Tcp, 250.0, 0, 64 * 1024, true);
-    loaded_tcp.snapshot.delivery_rate_bps = 351_000.0;
-    loaded_tcp.snapshot.pacing_rate_bps = 351_000.0;
-    loaded_tcp.snapshot.bytes_in_flight = 8 * 1024 * 1024;
-    loaded_tcp.snapshot.queue_bytes = 1024 * 1024;
-    loaded_tcp.snapshot.product_progress_rate_bps = Some(351_000.0);
-    let tcp_credit = response_target_emission_credit_bytes(
-        &loaded_tcp,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(
-        tcp_credit,
-        bulk_active_service_product_envelope_bytes(loaded_tcp.snapshot, payload_bytes, mux_limits,)
-            as usize,
-        "active TCP owners use the same carrier-neutral product envelope as active QUIC owners"
-    );
-
-    let mut subflow_quic = response_target(2, UnderlayProtocol::Udp, 250.0, 0, 64 * 1024, false);
-    subflow_quic.snapshot.delivery_rate_bps = 351_000.0;
-    subflow_quic.snapshot.pacing_rate_bps = 351_000.0;
-    subflow_quic.snapshot.bytes_in_flight = 8 * 1024 * 1024;
-    subflow_quic.snapshot.queue_bytes = 1024 * 1024;
-    let subflow_credit = response_target_emission_credit_bytes(
-        &subflow_quic,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert!(
-        subflow_credit >= 8 * 1024 * 1024,
-        "Subflow QUIC paths remain carrier-debt gated rather than borrowing the active owner envelope"
-    );
-}
-
-#[test]
 fn quic_proof_success_path_gets_bounded_bulk_only_startup_sampling() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -6734,33 +6552,6 @@ fn measured_udp_bulk_path_does_not_steal_tcp_owner_under_lower_debt() {
 }
 
 #[test]
-fn active_tcp_response_owner_uses_product_envelope() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut target = response_target(
-        0,
-        UnderlayProtocol::Tcp,
-        50.0,
-        0,
-        payload_bytes as u64,
-        true,
-    );
-    target.snapshot.product_progress_rate_bps = Some(10_000_000_000.0);
-
-    assert_eq!(
-        response_target_emission_credit_bytes(
-            &target,
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits
-        ),
-        bulk_active_service_product_envelope_bytes(target.snapshot, payload_bytes, mux_limits)
-            as usize,
-        "active TCP and QUIC owners should use the same product envelope; transport pacing belongs below the sender service"
-    );
-}
-
-#[test]
 fn measured_udp_alternate_does_not_replace_active_service_at_clear_frontier() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -6803,44 +6594,6 @@ fn measured_udp_alternate_does_not_replace_active_service_at_clear_frontier() {
         },
         "a measured alternate must not steal Service ownership merely by existing"
     );
-}
-
-#[test]
-fn proof_only_fallback_lead_cannot_become_response_service_owner() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut proof_only = response_target(
-        1,
-        UnderlayProtocol::Udp,
-        5.0,
-        0,
-        4 * payload_bytes as u64,
-        false,
-    );
-    proof_only.has_sender_evidence = true;
-    proof_only.has_bulk_rate_evidence = false;
-    let lead = ResponseBulkLead {
-        key: proof_only.key,
-        snapshot: proof_only.snapshot,
-        eta_ms: proof_only.eta_ms,
-    };
-
-    let admission = response_target_unique_owner_admission(
-        &proof_only,
-        &[&proof_only],
-        lead,
-        None,
-        0,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(
-        admission.decision,
-        PathAdmissionDecision::ProbeOnly,
-        "sender/proof evidence is not Service ownership; only an active anchor or bulk-rate-proven failover may own the Service role"
-    );
-    assert_eq!(admission.role, PathRuntimeRole::Probe);
 }
 
 #[test]
@@ -8418,77 +8171,6 @@ fn bulk_rate_same_family_candidate_cannot_own_later_data_under_lower_owner_debt(
         selected.key, owner.key,
         "bulk-rate evidence proves the alternate path is eligible at a clear frontier, not that it may extend an existing ordered receive hole"
     );
-}
-
-#[test]
-fn proof_only_validation_candidate_gets_explicit_startup_admission() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut active = response_target(
-        0,
-        UnderlayProtocol::Udp,
-        100.0,
-        0,
-        4 * payload_bytes as u64,
-        true,
-    );
-    active.snapshot.active_flows = 2;
-    let mut proof_only = response_target(
-        1,
-        UnderlayProtocol::Udp,
-        50.0,
-        0,
-        4 * payload_bytes as u64,
-        false,
-    );
-    proof_only.has_bulk_rate_evidence = false;
-    proof_only.has_sender_evidence = true;
-    let candidates = vec![&active, &proof_only];
-    let lead = ResponseBulkLead {
-        key: active.key,
-        snapshot: active.snapshot,
-        eta_ms: active.eta_ms,
-    };
-
-    let admission = response_target_unique_owner_admission(
-        &proof_only,
-        &candidates,
-        lead,
-        None,
-        0,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-    assert_eq!(admission.role, PathRuntimeRole::Subflow);
-}
-
-#[test]
-fn frontier_clear_bulk_rate_candidate_is_subflow_not_service() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let active = response_target(0, UnderlayProtocol::Udp, 80.0, 0, 16 * 1024 * 1024, true);
-    let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    let candidates = vec![&active, &alternate];
-    let lead = ResponseBulkLead {
-        key: alternate.key,
-        snapshot: alternate.snapshot,
-        eta_ms: alternate.eta_ms,
-    };
-
-    let admission = response_target_unique_owner_admission(
-        &alternate,
-        &candidates,
-        lead,
-        None,
-        0,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-    assert_eq!(admission.role, PathRuntimeRole::Subflow);
 }
 
 #[tokio::test]
@@ -10251,55 +9933,6 @@ fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
 }
 
 #[test]
-fn tcp_reservoir_subtracts_only_unique_owner_not_queue_or_repair() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
-    let overflow = 1024 * 1024;
-    let candidate_owner_bytes = 128 * 1024;
-    let candidate_product_copies = 2 * 1024 * 1024;
-    let service = response_target(
-        0,
-        UnderlayProtocol::Tcp,
-        25.0,
-        service_horizon as u64,
-        mux_limits.max_path_flight_bytes as u64,
-        true,
-    );
-    let mut candidate = response_target(
-        1,
-        UnderlayProtocol::Tcp,
-        5.0,
-        candidate_product_copies,
-        mux_limits.max_path_flight_bytes as u64,
-        false,
-    );
-    candidate.owner_data_in_flight_bytes = candidate_owner_bytes;
-    candidate.snapshot.queue_bytes = (3 * 1024 * 1024) as u64;
-    let tail = ResponseOrderedTail::new(Some(service.key), service_horizon + overflow);
-    let reservoir = ResponseSameFamilyReservoir::new(
-        service.key,
-        tail,
-        service_horizon as u64,
-        service_horizon,
-        bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits),
-        payload_bytes,
-    )
-    .expect("global reservoir has credit");
-
-    let debt = response_same_family_reservoir_candidate_debt(reservoir, &candidate);
-    assert_eq!(
-        debt.external_bytes(),
-        (overflow - candidate_owner_bytes as usize) as u64
-    );
-    assert_eq!(
-        debt.external_bytes() + candidate.snapshot.product_bytes_in_flight,
-        (overflow + candidate_product_copies as usize - candidate_owner_bytes as usize) as u64,
-        "shared queue pressure and duplicate RepairData cannot erase unique tail exposure"
-    );
-}
-
-#[test]
 fn tcp_reservoir_requires_unique_service_owner_horizon() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -10639,37 +10272,6 @@ fn feedable_service_precedes_less_committed_app_limited_subflow() {
 
     assert_eq!(selected.target.key, service.key);
     assert_eq!(selected.admission.role, PathRuntimeRole::Service);
-}
-
-#[test]
-fn app_limited_bulk_proven_slow_subflow_still_requires_completion_gain() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut service = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(120_000_000.0);
-    let mut slow_subflow =
-        response_target(1, UnderlayProtocol::Udp, 500.0, 0, 16 * 1024 * 1024, false);
-    slow_subflow.snapshot.product_progress_rate_bps = Some(20_000_000.0);
-    slow_subflow.snapshot.app_limited = true;
-    slow_subflow.has_bulk_rate_evidence = true;
-    let candidates = [&service, &slow_subflow];
-    let lead = ResponseBulkLead {
-        key: service.key,
-        snapshot: service.snapshot,
-        eta_ms: service.eta_ms,
-    };
-
-    let admission = response_target_unique_owner_admission(
-        &slow_subflow,
-        &candidates,
-        lead,
-        None,
-        0,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(admission.decision, PathAdmissionDecision::Standby);
 }
 
 #[test]
@@ -11286,31 +10888,6 @@ fn tcp_response_calibration_does_not_double_count_global_ordered_tail() {
     );
 }
 
-#[test]
-fn tcp_response_startup_does_not_double_count_global_ordered_tail() {
-    let mut mux_limits = MuxLimits::default();
-    mux_limits.max_path_flight_bytes = 2 * 1024 * 1024;
-    mux_limits.max_repair_bytes = 2 * 1024 * 1024;
-    mux_limits.max_reorder_bytes = 2 * 1024 * 1024;
-    mux_limits.max_stream_window_bytes = 2 * 1024 * 1024;
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut service = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 2 * 1024 * 1024, true);
-    service.snapshot.active_flows = 1;
-    let mut candidate = response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 2 * 1024 * 1024, false);
-    let committed = 2 * 1024 * 1024 - payload_bytes as u64;
-    candidate.snapshot.product_bytes_in_flight = committed;
-    candidate.has_bulk_rate_evidence = false;
-
-    assert!(response_target_is_startup_same_underlay_subflow_candidate(
-        service.key,
-        &service,
-        &candidate,
-        committed,
-        payload_bytes,
-        mux_limits,
-    ));
-}
-
 #[tokio::test]
 async fn tcp_response_calibration_dispatch_restores_credit_after_exact_remainder() {
     let mux_limits = MuxLimits::default();
@@ -11734,37 +11311,6 @@ fn closed_active_calibration_drain_fence_blocks_next_startup_owner() {
 }
 
 #[test]
-fn app_limited_bulk_proven_fast_subflow_can_still_improve_completion() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut service = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(20_000_000.0);
-    let mut fast_subflow =
-        response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    fast_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
-    fast_subflow.snapshot.app_limited = true;
-    fast_subflow.has_bulk_rate_evidence = true;
-    let candidates = [&service, &fast_subflow];
-    let lead = ResponseBulkLead {
-        key: service.key,
-        snapshot: service.snapshot,
-        eta_ms: service.eta_ms,
-    };
-
-    let admission = response_target_unique_owner_admission(
-        &fast_subflow,
-        &candidates,
-        lead,
-        None,
-        0,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-}
-
-#[test]
 fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -11797,38 +11343,6 @@ fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
     assert!(
         selected.subflow_set_commit.is_some(),
         "Subflow OwnerData must be committed through the Subflow admission ledger"
-    );
-}
-
-#[test]
-fn active_attachment_without_bulk_evidence_remains_service_anchor_when_measured_subflow_exists() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut active_attachment =
-        response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    active_attachment.has_bulk_rate_evidence = false;
-    let measured_lead = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    let candidates = vec![&active_attachment, &measured_lead];
-    let lead = ResponseBulkLead {
-        key: measured_lead.key,
-        snapshot: measured_lead.snapshot,
-        eta_ms: measured_lead.eta_ms,
-    };
-
-    let admission = response_target_unique_owner_admission(
-        &active_attachment,
-        &candidates,
-        lead,
-        None,
-        0,
-        payload_bytes,
-        mux_limits,
-    );
-
-    assert_eq!(
-        admission.decision,
-        PathAdmissionDecision::Service,
-        "the active attachment remains the Service anchor; measured alternates are Subflows"
     );
 }
 
@@ -11910,59 +11424,6 @@ fn bulk_only_live_tcp_service_tail_admits_bounded_same_underlay_startup_sampling
             .subflow_set_commit
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "TCP startup sampling must be explicit and ledger-bounded"
-    );
-}
-
-#[test]
-fn measured_subflow_requires_later_startup_candidate_to_beat_service_reservoir() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let service = response_target(
-        0,
-        UnderlayProtocol::Tcp,
-        250.0,
-        0,
-        mux_limits.max_path_flight_bytes as u64,
-        true,
-    );
-    let mut measured = response_target(
-        1,
-        UnderlayProtocol::Tcp,
-        400.0,
-        0,
-        mux_limits.max_path_flight_bytes as u64,
-        false,
-    );
-    measured.snapshot.app_limited = false;
-    let mut cold = response_target(
-        2,
-        UnderlayProtocol::Tcp,
-        10_000.0,
-        0,
-        mux_limits.max_path_flight_bytes as u64,
-        false,
-    );
-    cold.has_bulk_rate_evidence = false;
-
-    assert!(
-        response_startup_sample_has_completion_opportunity(
-            &[&service, &cold],
-            &service,
-            &cold,
-            payload_bytes,
-            mux_limits,
-        ),
-        "the first bounded candidate remains the non-circular discovery bootstrap"
-    );
-    assert!(
-        !response_startup_sample_has_completion_opportunity(
-            &[&service, &measured, &cold],
-            &service,
-            &cold,
-            payload_bytes,
-            mux_limits,
-        ),
-        "after useful capacity exists, a cold candidate cannot create a much slower ordered prefix"
     );
 }
 
@@ -14021,56 +13482,6 @@ fn family_or_gain_diagnostic_ignores_shared_carrier_churn() {
     assert_eq!(
         before, after,
         "shared carrier pressure cannot change a family/gain policy decision"
-    );
-}
-
-#[test]
-fn response_fallback_preserves_lower_flight_completion_backlog() {
-    let payload_bytes = 64 * 1024;
-    let mux_limits = MuxLimits::default();
-    let mut service = response_target(0, UnderlayProtocol::Tcp, 400.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.srtt_ms = 360.0;
-    service.snapshot.delivery_rate_bps = 400_000_000.0;
-    service.snapshot.pacing_rate_bps = 400_000_000.0;
-    let mut candidate =
-        response_target(1, UnderlayProtocol::Tcp, 410.0, 0, 16 * 1024 * 1024, false);
-    candidate.snapshot.srtt_ms = 360.0;
-    candidate.snapshot.delivery_rate_bps = 200_000_000.0;
-    candidate.snapshot.pacing_rate_bps = 200_000_000.0;
-    candidate.snapshot.app_limited = false;
-    let lead = ResponseBulkLead {
-        key: service.key,
-        snapshot: service.snapshot,
-        eta_ms: service.eta_ms,
-    };
-    let lower_flight_bytes = 8 * 1024 * 1024;
-    let check = BulkAdmissionCheck {
-        best_snapshot: lead.snapshot,
-        best_eta_ms: lead.eta_ms,
-        candidate_snapshot: candidate.snapshot,
-        candidate_eta_ms: candidate.eta_ms,
-        payload_bytes,
-        mux_limits,
-        role: BulkAdmissionRole::AdditionalSameUnderlay,
-        stream_ordering_debt_bytes: lower_flight_bytes,
-    };
-
-    assert_eq!(
-        bulk_candidate_admission_suppression_with_ordering_debt(check),
-        Some("same_underlay_no_completion_gain"),
-        "request receive-hole policy must not infer Service backlog"
-    );
-    assert_eq!(
-        response_fallback_bulk_model_suppression(
-            &candidate,
-            lead,
-            lower_flight_bytes,
-            payload_bytes,
-            mux_limits,
-            BulkAdmissionRole::AdditionalSameUnderlay,
-        ),
-        None,
-        "response lower flight is real completion backlog and must retain the 8c response policy"
     );
 }
 

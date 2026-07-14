@@ -73,6 +73,10 @@ Use these balance checks during review:
 
 - A child containing more than about 60 percent of its aggregate is a split or
   collapse review trigger, not an automatic failure.
+- Line count is never a reason to create a production file. A file should own
+  a durable policy, state machine, transaction, or adapter boundary that can be
+  explained without referring to its size. Keep closely coupled phases in one
+  substantive owner when separating them would only add forwarding APIs.
 - Peer domains should have comparable granularity where responsibilities match.
   Honest TCP/QUIC or request/response asymmetry is allowed and documented.
 - Normal depth is two domain levels. A third level is reserved for an earned
@@ -83,9 +87,8 @@ Use these balance checks during review:
 
 Use the named facade convention: `foo.rs` declares children in `foo/`. Do not
 introduce repeated `foo/mod.rs` facades. Production modules must not depend on
-`#[path = ...]` in the final tree. The current response binding uses production
-`#[path]` declarations only as a transitional parity checkpoint; replace them
-with ordinary named modules after the owner split is stable.
+`#[path = ...]` in the final tree. Test-only sibling wiring may use `#[path]` as
+described below.
 
 ## Tests
 

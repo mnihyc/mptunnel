@@ -20,9 +20,11 @@ protocol asymmetry is expected.
 - Request product state is scattered across sender and relay while response
   product state has a real stream owner. That directional mismatch is a deeper
   imbalance than file count and must be corrected with peer stream owners.
-- Request sender `service.rs` still contains about 98 percent of its production
-  aggregate, and response sender `planner.rs` about 70 percent of its aggregate.
-  Both earn flat directional children divided by state and algorithm ownership.
+- Request sender `service.rs` still contains about 96 percent of its production
+  aggregate. Response admission is now a substantive peer, while response
+  `planner.rs` still mixes selection, handoff, ACK-clock calibration, and
+  orchestration. Both directional trees remain migration targets, but every
+  child must own a real policy or transaction rather than a line-count quota.
 - Thin facades, one-off helpers, and directories with no independent invariant
   are collapsed instead of being retained for visual symmetry.
 
@@ -108,9 +110,12 @@ verification targets.
 7. Split request observation, dispatch, progress, repair, diagnostics, and the
    separate TCP/QUIC capacity controllers. Move attach/fail orchestration to the
    remote-set owner, then retire `relay_striping.rs` and the request mega-files.
-8. Split response planning into coherent observe, decide, typed intent, and
-   atomic apply contracts. Make preview side-effect free and move pure capacity
-   and placement arithmetic to model/scheduler owners without changing values.
+8. Give response planning coherent observe, decide, typed-intent, and atomic
+   apply contracts. These are phase APIs, not mandatory files: keep them inside
+   admission, selection, handoff, or dispatch until one phase owns an
+   independently meaningful state machine. Make preview side-effect free and
+   move pure capacity and placement arithmetic to model/scheduler owners without
+   changing values.
 9. Split shared path state and command code by identity, health, capacity
    transactions, load, queue, and writer ownership without merging TCP and QUIC
    controllers.

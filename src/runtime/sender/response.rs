@@ -6,6 +6,7 @@
 
 use super::*;
 
+mod admission;
 #[cfg(feature = "lab-diagnostics")]
 mod diagnostics;
 mod dispatch;
@@ -16,6 +17,8 @@ mod tcp_capacity;
 #[cfg(test)]
 pub(super) mod test_support;
 
+#[cfg(test)]
+use admission::*;
 #[cfg(feature = "lab-diagnostics")]
 use diagnostics::lab_response_service_handoff_evaluation;
 pub(in crate::runtime) use dispatch::emit_response_control_frame;

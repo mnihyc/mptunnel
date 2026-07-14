@@ -9,13 +9,6 @@ use crate::scheduler::FlowLane;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-fn response_lane_is_latency_sensitive(lane: FlowLane) -> bool {
-    matches!(
-        lane,
-        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
-    )
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ServerPathLaneLoad {
     pub(super) active_flows: u32,
@@ -25,7 +18,7 @@ pub(super) struct ServerPathLaneLoad {
 impl ServerPathLaneLoad {
     fn add(&mut self, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_add(1);
-        if response_lane_is_latency_sensitive(lane) {
+        if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
@@ -33,7 +26,7 @@ impl ServerPathLaneLoad {
 
     fn remove(&mut self, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_sub(1);
-        if response_lane_is_latency_sensitive(lane) {
+        if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_sub(1);
         }

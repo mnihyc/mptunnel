@@ -169,7 +169,7 @@ pub(in crate::runtime) fn endpoint_only_reliable_startup_should_preserve_configu
     observations: &[ClientPathObservation],
     lane: FlowLane,
 ) -> bool {
-    reliable_relay_expects_interactive_response(lane)
+    lane.is_latency_sensitive()
         && paths.iter().all(path_is_endpoint_only)
         && !endpoint_only_startup_has_latency_sensitive_load(observations)
         && !endpoint_only_startup_has_bulk_load(observations)
@@ -180,7 +180,7 @@ pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_latency_l
     observations: &[ClientPathObservation],
     lane: FlowLane,
 ) -> bool {
-    reliable_relay_expects_interactive_response(lane)
+    lane.is_latency_sensitive()
         && paths.iter().all(path_is_endpoint_only)
         && endpoint_only_startup_has_latency_sensitive_load(observations)
         && !endpoint_only_startup_has_bulk_load(observations)
@@ -215,7 +215,7 @@ pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_bulk_load
     observations: &[ClientPathObservation],
     lane: FlowLane,
 ) -> bool {
-    reliable_relay_expects_interactive_response(lane)
+    lane.is_latency_sensitive()
         && paths.iter().all(path_is_endpoint_only)
         && endpoint_only_startup_has_any_load(observations)
         && endpoint_only_startup_has_bulk_load(observations)
@@ -1097,7 +1097,7 @@ pub(super) fn reliable_reservation_should_use_endpoint_only_startup_order(
     udp_observations: &[ClientPathObservation],
     lane: FlowLane,
 ) -> bool {
-    reliable_relay_expects_interactive_response(lane)
+    lane.is_latency_sensitive()
         && (!tcp_paths.is_empty() || !udp_paths.is_empty())
         && tcp_paths.iter().chain(udp_paths).all(path_is_endpoint_only)
         && !paths_have_sender_delivery_evidence(tcp_paths, tcp_observations)

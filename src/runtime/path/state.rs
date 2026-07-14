@@ -13,7 +13,6 @@ use crate::model::capacity::*;
 use crate::model::path::*;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::prelude::*;
-use crate::runtime::relay::control::reliable_relay_expects_interactive_response;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// One transaction owner for mutable client-path evidence and probe budgets.
@@ -1103,7 +1102,7 @@ impl ClientPathHealthRecord {
     pub(in crate::runtime) fn mark_open_success(&mut self, _elapsed: Duration, lane: FlowLane) {
         self.mark_liveness_success();
         self.active_flows = self.active_flows.saturating_add(1);
-        if reliable_relay_expects_interactive_response(lane) {
+        if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
@@ -1111,7 +1110,7 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn reserve_load(&mut self, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_add(1);
-        if reliable_relay_expects_interactive_response(lane) {
+        if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }
@@ -1123,21 +1122,17 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn release_load(&mut self, lane: FlowLane) {
         self.active_flows = self.active_flows.saturating_sub(1);
-        if reliable_relay_expects_interactive_response(lane) {
+        if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_sub(1);
         }
     }
 
     pub(in crate::runtime) fn change_lane_load(&mut self, from: FlowLane, to: FlowLane) {
-        if reliable_relay_expects_interactive_response(from)
-            && !reliable_relay_expects_interactive_response(to)
-        {
+        if from.is_latency_sensitive() && !to.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_sub(1);
-        } else if !reliable_relay_expects_interactive_response(from)
-            && reliable_relay_expects_interactive_response(to)
-        {
+        } else if !from.is_latency_sensitive() && to.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_add(1);
         }

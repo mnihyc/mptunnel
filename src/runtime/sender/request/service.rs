@@ -24,7 +24,7 @@ use crate::model::request::evidence::{
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::runtime::stream::request::RequestFlightLedger;
-use crate::scheduler::cyclic_cursor_distance;
+use crate::scheduler::{cyclic_cursor_distance, stream_demand_hint_for_lane};
 
 // Ownership boundary:
 // Sender services own product work before it reaches carrier command queues.

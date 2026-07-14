@@ -202,10 +202,7 @@ impl ClientTcpPathSessionHandle {
 }
 
 pub(in crate::runtime) fn tcp_path_lane_uses_latency_session(lane: FlowLane) -> bool {
-    matches!(
-        lane,
-        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
-    )
+    lane.is_latency_sensitive()
 }
 
 pub(in crate::runtime) fn tcp_session_command_queue(resources: ResourceLimits) -> usize {

@@ -1,3 +1,5 @@
+use crate::protocol::StreamDemandHint;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlowLane {
     Control,
@@ -8,10 +10,39 @@ pub enum FlowLane {
 }
 
 impl FlowLane {
+    /// Latency-sensitive work keeps priority queueing and avoids bulk-path
+    /// sharing penalties across every carrier implementation.
+    pub(crate) const fn is_latency_sensitive(self) -> bool {
+        matches!(self, Self::Control | Self::Latency | Self::RealtimeDatagram)
+    }
+
     /// Bulk lanes may trade latency for sustained carrier feeding; the
     /// transport-specific schedulers consume this product classification.
     pub(crate) const fn is_bulk(self) -> bool {
         matches!(self, Self::Throughput | Self::Background)
+    }
+}
+
+/// Converts local scheduling intent into the transport-neutral wire weights.
+pub(crate) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
+    match lane {
+        FlowLane::Control | FlowLane::Latency => StreamDemandHint::latency(),
+        FlowLane::Throughput | FlowLane::Background => StreamDemandHint::throughput(),
+        FlowLane::RealtimeDatagram => StreamDemandHint::realtime(),
+    }
+}
+
+/// Recovers the strongest local lane from peer-advertised wire weights.
+pub(crate) fn flow_lane_from_stream_demand_hint(demand: StreamDemandHint) -> FlowLane {
+    let latency = demand.latency_weight_ppm;
+    let throughput = demand.throughput_weight_ppm;
+    let realtime = demand.realtime_weight_ppm;
+    if realtime > 0 && realtime >= latency && realtime >= throughput {
+        FlowLane::RealtimeDatagram
+    } else if throughput > 0 && throughput >= latency {
+        FlowLane::Throughput
+    } else {
+        FlowLane::Latency
     }
 }
 

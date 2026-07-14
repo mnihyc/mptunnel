@@ -5,6 +5,7 @@ use super::estimator::UdpPathMetricTracker;
 use super::io::*;
 use super::metrics::*;
 use super::*;
+use crate::scheduler::stream_demand_hint_for_lane;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone)]

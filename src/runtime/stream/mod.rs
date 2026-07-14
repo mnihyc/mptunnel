@@ -4,16 +4,12 @@
 //! generations, and atomic commit. Sender modules rank snapshots and submit
 //! intents; carrier paths never own product byte ranges.
 
-mod demand;
 mod handle;
 mod registry;
 pub(in crate::runtime) mod request;
 pub(in crate::runtime) mod response;
 mod server;
 
-pub(in crate::runtime) use demand::{
-    flow_lane_from_stream_demand_hint, stream_demand_hint_for_lane,
-};
 pub(in crate::runtime) use handle::{
     FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamHandle,
     ReliablePathStreamOutput, reliable_work_lane_to_carrier_lane,

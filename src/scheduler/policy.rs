@@ -601,10 +601,7 @@ fn suspect_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
 }
 
 fn prefers_low_reorder(lane: FlowLane) -> bool {
-    matches!(
-        lane,
-        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
-    )
+    lane.is_latency_sensitive()
 }
 
 fn adaptive_loss_repair_penalty_ms(path: PathSnapshot) -> f64 {

@@ -20,7 +20,6 @@ use crate::protocol::codec::CodecLimits;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 use crate::runtime::recent_ids::reliable_closed_stream_cache_capacity;
-use crate::runtime::relay::control::relay_underlay_identity_order;
 use crate::transport::PathSpec;
 use std::sync::Arc;
 
@@ -216,6 +215,6 @@ impl ClientPathContext {
         self.relay_path_config_ordinal(left)
             .cmp(&self.relay_path_config_ordinal(right))
             .then_with(|| left.index.cmp(&right.index))
-            .then_with(|| relay_underlay_identity_order(left.underlay, right.underlay))
+            .then_with(|| left.underlay.cmp(&right.underlay))
     }
 }

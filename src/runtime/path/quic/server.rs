@@ -5,6 +5,7 @@ use super::io::*;
 use super::metrics::*;
 use super::server_stream::*;
 use super::*;
+use crate::scheduler::flow_lane_from_stream_demand_hint;
 
 pub(in crate::runtime) async fn bind_server_udp_endpoint(
     path: &PathSpec,

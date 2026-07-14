@@ -8,7 +8,6 @@ use crate::model::path::RelayPathKey;
 use crate::protocol::{TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::relay::control::relay_underlay_identity_order;
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::time::Duration;
@@ -399,7 +398,7 @@ fn datagram_underlay_candidates(
                     .cmp(&context.relay_path_config_ordinal(right.key))
             })
             .then_with(|| left.key.index.cmp(&right.key.index))
-            .then_with(|| relay_underlay_identity_order(left.key.underlay, right.key.underlay))
+            .then_with(|| left.key.underlay.cmp(&right.key.underlay))
     });
     candidates
 }

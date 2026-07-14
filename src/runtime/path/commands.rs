@@ -591,10 +591,7 @@ impl ReliablePathCommandSender {
 }
 
 pub(in crate::runtime) fn reliable_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
-    matches!(
-        lane,
-        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
-    )
+    lane.is_latency_sensitive()
 }
 
 pub(in crate::runtime) fn reliable_path_stream_ordered_queue_lane() -> FlowLane {

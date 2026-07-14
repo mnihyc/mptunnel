@@ -22,6 +22,7 @@ use crate::runtime::stream::{
     ServerCarrierPathRegistration, ServerReliablePathAttachment, ServerReliableStreamOpen,
     ServerReliableStreamOpenRequest, run_server_reliable_stream,
 };
+use crate::scheduler::flow_lane_from_stream_demand_hint;
 use std::collections::HashSet;
 
 pub(super) struct ServerTcpStreamState {
@@ -55,7 +56,7 @@ impl ServerTcpStreamState {
     ) -> Result<Option<Frame>, RuntimeError> {
         outbound::validate_target(&target)?;
         context.outbound.ensure_supports(TargetProtocol::Tcp)?;
-        let lane = crate::runtime::stream::flow_lane_from_stream_demand_hint(demand);
+        let lane = flow_lane_from_stream_demand_hint(demand);
         let response = match context.reliable_streams.open_or_attach(
             ServerReliableStreamOpenRequest {
                 session_id,

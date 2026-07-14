@@ -1422,7 +1422,7 @@ where
                     local_open = false;
                     pending_local_fin = true;
                 } else {
-                    if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
+                    if relay_lane.is_latency_sensitive() && remote_open {
                         interactive_response_pending = true;
                         last_response_stall_repair_at = Instant::now();
                     }
@@ -1475,7 +1475,7 @@ where
                             pending_local_fin = true;
                             break;
                         }
-                        if reliable_relay_expects_interactive_response(relay_lane) && remote_open {
+                        if relay_lane.is_latency_sensitive() && remote_open {
                             interactive_response_pending = true;
                             last_response_stall_repair_at = Instant::now();
                         }
@@ -3343,8 +3343,7 @@ pub(in crate::runtime) fn reliable_relay_should_race_repair(
     matches!(mode, ReliableRelayAttachMode::Any)
         && !resend_fin
         && (send_stream.repair_bytes() > 0
-            || (reliable_relay_expects_interactive_response(lane)
-                && send_stream.repair_bytes() <= PATH_OPEN_SCORE_BYTES))
+            || (lane.is_latency_sensitive() && send_stream.repair_bytes() <= PATH_OPEN_SCORE_BYTES))
 }
 
 pub(in crate::runtime) fn reliable_relay_attach_payload_bytes(
@@ -3352,7 +3351,7 @@ pub(in crate::runtime) fn reliable_relay_attach_payload_bytes(
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> usize {
-    let floor = if reliable_relay_expects_interactive_response(lane) {
+    let floor = if lane.is_latency_sensitive() {
         PATH_OPEN_SCORE_BYTES
     } else {
         reliable_relay_buffer_len(mux_limits)
@@ -3495,23 +3494,6 @@ pub(in crate::runtime) fn reliable_relay_delivery_path_should_become_active(
         .and_then(|key| context.reliable_relay_path_eta_ms(key, lane, payload_bytes))
         .unwrap_or(f64::INFINITY);
     delivered_eta < current_eta
-}
-
-pub(in crate::runtime) fn relay_underlay_identity_order(
-    left: UnderlayProtocol,
-    right: UnderlayProtocol,
-) -> std::cmp::Ordering {
-    // Stable identity tie-breaker only. Real scheduling order is decided before
-    // this by path metrics and original config ordinal; this must not become a
-    // TCP-vs-UDP preference.
-    (left as u8).cmp(&(right as u8))
-}
-
-pub(in crate::runtime) fn reliable_relay_expects_interactive_response(lane: FlowLane) -> bool {
-    matches!(
-        lane,
-        FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
-    )
 }
 
 pub(in crate::runtime) fn reliable_relay_response_stall_watch_bytes(mux_limits: MuxLimits) -> u64 {

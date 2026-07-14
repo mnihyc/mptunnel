@@ -20,9 +20,8 @@ use crate::runtime::path::tcp::client_state::{
     ClientTcpPathConnection, ClientTcpPathSessionRuntime,
 };
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::runtime::stream::stream_demand_hint_for_lane;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
-use crate::scheduler::FlowLane;
+use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "lab-diagnostics")]

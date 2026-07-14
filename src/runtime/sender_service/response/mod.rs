@@ -7,6 +7,8 @@
 mod diagnostics;
 mod dispatch;
 mod service;
+#[cfg(test)]
+mod tests;
 
 use super::*;
 #[cfg(feature = "lab-diagnostics")]
@@ -22,7 +24,7 @@ pub(in crate::runtime) use dispatch::{
 pub(in crate::runtime) use service::ServerResponseSenderService;
 
 fn carrier_path_key_order(left: CarrierPathKey, right: CarrierPathKey) -> std::cmp::Ordering {
-    left.path_id.0.cmp(&right.path_id.0)
+    (left.path_id, left.underlay).cmp(&(right.path_id, right.underlay))
 }
 
 fn response_ordering_debt_bytes(

@@ -25,7 +25,7 @@ pub struct AuthNonce(pub [u8; 16]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AuthTag(pub [u8; 32]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UnderlayProtocol {
     Tcp,
     Udp,

@@ -31,7 +31,7 @@ use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, RateHint, StreamId, UnderlayProtocol};
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::{path_startup_snapshot, path_within_adaptive_lead_hysteresis};
-use crate::runtime::relay::open::{RelayPathPlacement, ReliableRelayRemotePath};
+use crate::runtime::relay::remote::{RelayPathPlacement, ReliableRelayRemotePath};
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestSubflowState, RequestSubflows,
 };

@@ -92,11 +92,14 @@ Server target relay lifetime is now one flat `runtime/relay/server.rs` owner.
 Each server identity constructs one registry/service pair; TCP and QUIC carrier
 actors submit accepted leases through that pair instead of spawning detached
 target tasks. Shared receive/range primitives remain in `relay/io.rs`. The
-open owner classifies concrete TCP/QUIC retry failures, while carrier-derived
-PTO timing comes directly from `model/timing.rs`; relay I/O does not import the
-client control actor for either policy. The remaining relay work is
-client/control ownership and removal of lower-layer policy still embedded in
-those actors, not another server subdirectory.
+client side keeps two balanced flat owners: `relay/open.rs` reserves candidates
+and executes concrete TCP/QUIC open, deadline, acceptance, and retry contracts;
+`relay/remote.rs` owns successful attachment incarnation, placement ordering,
+load claims, frame fan-in, and teardown. Carrier-derived PTO timing comes
+directly from `model/timing.rs`; relay I/O does not import the client control
+actor for either policy. The remaining relay work is client/control ownership
+and removal of lower-layer policy still embedded in those actors, not another
+server subdirectory or small phase files.
 
 ### Platform
 

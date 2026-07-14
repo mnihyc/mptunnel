@@ -11,6 +11,7 @@ mod diagnostics;
 pub(super) mod flow;
 pub(super) mod io;
 pub(super) mod open;
+pub(super) mod remote;
 mod server;
 
 #[cfg(test)]
@@ -20,11 +21,10 @@ pub(in crate::runtime) use diagnostics::log_unexpected_stream_relay_frame;
 pub(super) use flow::*;
 #[cfg(test)]
 pub(super) use io::*;
+pub(in crate::runtime) use open::UdpStreamOpenOptions;
 #[cfg(any(test, feature = "lab-diagnostics"))]
-pub(in crate::runtime) use open::ReliableRelayRemotePath;
-pub(in crate::runtime) use open::{
-    RelayPathPlacement, ReliableRelayRemoteSet, UdpStreamOpenOptions,
-};
+pub(in crate::runtime) use remote::ReliableRelayRemotePath;
+pub(in crate::runtime) use remote::{RelayPathPlacement, ReliableRelayRemoteSet};
 pub(in crate::runtime) use server::ServerReliableRelayService;
 #[cfg(test)]
 pub(in crate::runtime) use server::relay_reliable_stream;

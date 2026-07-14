@@ -14,14 +14,16 @@ use super::io::{
     update_repair_authoritative_ack_snapshot, write_delivered_payloads,
 };
 use super::open::{
-    AcceptedRemoteStreamGuard, OpenedRemoteStream, ReliableRelayAttachMode,
-    ReliableRelayAttachOutcome, ReliableRelayOpenSpec, ReliableRelayRemoteFrame,
-    ReliableRelayRemotePath, ReliableRelayRemoteSet, UdpStreamOpenOptions,
+    ReliableRelayAttachMode, ReliableRelayOpenSpec, UdpStreamOpenOptions,
     no_schedulable_reliable_path_error, open_remote_stream_for_relay_path,
     open_remote_stream_on_reserved_path, open_remote_stream_on_reserved_udp_path,
     relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
     relay_path_open_with_deadline, reliable_relay_attach_open_timeouts,
     stream_open_error_is_path_retryable, udp_stream_open_error_is_path_retryable,
+};
+use super::remote::{
+    AcceptedRemoteStreamGuard, OpenedRemoteStream, ReliableRelayAttachOutcome,
+    ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
 };
 #[cfg(test)]
 use super::*;

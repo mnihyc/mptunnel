@@ -42,9 +42,9 @@ use crate::runtime::relay::io::{
     ReliableRecvProgress, reliable_critical_tail_repair_limit_bytes,
     reliable_relay_error_is_migratable, reliable_relay_tail_repair_delay,
 };
-use crate::runtime::relay::open::{
-    RelayPathPlacement, ReliableRelayAttachMode, ReliableRelayOpenSpec, ReliableRelayRemotePath,
-    ReliableRelayRemoteSet,
+use crate::runtime::relay::open::{ReliableRelayAttachMode, ReliableRelayOpenSpec};
+use crate::runtime::relay::remote::{
+    RelayPathPlacement, ReliableRelayRemotePath, ReliableRelayRemoteSet,
 };
 use crate::runtime::relay_striping::{
     BulkRelayFrameRequest, BulkRelayPathChoice, RequestSchedulingState,

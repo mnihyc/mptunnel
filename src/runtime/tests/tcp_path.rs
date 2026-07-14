@@ -458,7 +458,6 @@ fn stale_tcp_open_cancellation_cannot_remove_current_generation() {
             open_attempt_id: current_attempt,
             frames,
             pending_open: None,
-            local_close_pending: false,
         },
     )]);
 
@@ -1734,7 +1733,6 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
             open_attempt_id: ClientTcpOpenAttemptId(1),
             frames: frames_tx,
             pending_open: None,
-            local_close_pending: false,
         },
     );
     let mut closed_streams = RecentIdCache::new(8);
@@ -1783,7 +1781,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
 }
 
 #[tokio::test]
-async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
+async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
     let stream_id = StreamId(70);
     let (frames_tx, mut frames_rx) = mpsc::channel(4);
     let mut streams = HashMap::new();
@@ -1793,7 +1791,6 @@ async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
             open_attempt_id: ClientTcpOpenAttemptId(2),
             frames: frames_tx,
             pending_open: None,
-            local_close_pending: true,
         },
     );
     let mut closed_streams = RecentIdCache::new(8);
@@ -1810,7 +1807,7 @@ async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
         },
     )
     .await
-    .expect("locally closing path should still drain in-flight data");
+    .expect("live stream should route in-flight data");
 
     match frames_rx
         .recv()
@@ -1830,7 +1827,7 @@ async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
     }
     assert!(
         streams.contains_key(&stream_id),
-        "local close is a drain state, not receive-route deletion"
+        "routing a frame must preserve the live stream owner"
     );
 
     route_client_tcp_stream_frame(
@@ -3821,7 +3818,6 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
             open_attempt_id: ClientTcpOpenAttemptId(3),
             frames,
             pending_open: None,
-            local_close_pending: false,
         },
     )]);
     let mut closed_streams = RecentIdCache::new(4);

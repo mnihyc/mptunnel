@@ -22,8 +22,7 @@ pub(super) use crate::scheduler::{
 };
 pub(super) use crate::transport::PathSpec;
 pub(super) use crate::transport::encrypted::{
-    EncryptedFramedReader, EncryptedFramedStream, EncryptedFramedTransportError,
-    EncryptedFramedWriter, PeerRole,
+    EncryptedFramedStream, EncryptedFramedTransportError, PeerRole,
 };
 pub(super) use crate::transport::quic as quic_transport;
 pub(super) use crate::transport::tcp::{self, TcpConnectOptions};

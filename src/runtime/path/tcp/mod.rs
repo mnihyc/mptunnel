@@ -8,6 +8,8 @@ use super::*;
 
 pub(in crate::runtime) mod capacity;
 pub(in crate::runtime) mod client;
+pub(in crate::runtime) mod client_connection;
+pub(in crate::runtime) mod io;
 pub(in crate::runtime) mod metrics;
 pub(in crate::runtime) mod server;
 

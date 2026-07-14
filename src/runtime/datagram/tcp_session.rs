@@ -15,9 +15,8 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
-use crate::runtime::path::tcp::client::{
-    ClientTcpPathConnection, close_client_tcp_path, connect_client_tcp_path,
-    refresh_client_tcp_path_liveness, tick_client_tcp_path_heartbeat,
+use crate::runtime::path::tcp::client_connection::{
+    ClientTcpCarrierConnection, ClientTcpHeartbeatTimeoutDisposition, connect_client_tcp_carrier,
 };
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::scheduler::PathSnapshot;
@@ -29,7 +28,7 @@ use std::time::{Duration, Instant};
 use crate::lab_diagnostics::lab_diagnostic;
 
 pub(in crate::runtime) struct TcpDatagramClientSession {
-    connection: ClientTcpPathConnection,
+    connection: ClientTcpCarrierConnection,
     flows: Vec<DatagramClientFlow>,
     next_flow_id: u64,
     mux_limits: MuxLimits,
@@ -58,7 +57,7 @@ impl TcpDatagramClientSession {
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
         let session_id = random_session_id()?;
         let security = context.tcp_path_security(path_index)?;
-        let connection = connect_client_tcp_path(
+        let connection = connect_client_tcp_carrier(
             path,
             path_index,
             session_id,
@@ -97,7 +96,9 @@ impl TcpDatagramClientSession {
             });
         }
         let setup = async {
-            tick_client_tcp_path_heartbeat(&mut self.connection, self.mux_limits, true).await?;
+            self.connection
+                .tick_heartbeat(ClientTcpHeartbeatTimeoutDisposition::KeepCarrierAlive)
+                .await?;
             self.ensure_flow(target).await
         };
         let flow_id = match tokio::time::timeout_at(fallback_deadline, setup).await {
@@ -251,7 +252,7 @@ impl TcpDatagramClientSession {
                     });
                 }
             };
-            refresh_client_tcp_path_liveness(&mut self.connection, self.mux_limits);
+            self.connection.refresh_liveness();
             match received {
                 Frame::DatagramFeedback { flow_id, received } => {
                     if flow_id == request_key.0
@@ -372,13 +373,7 @@ impl TcpDatagramClientSession {
                     }
                 }
                 Frame::Pong { nonce } => {
-                    if self
-                        .connection
-                        .pending_heartbeat
-                        .is_some_and(|(pending_nonce, _)| pending_nonce == nonce)
-                    {
-                        self.connection.pending_heartbeat = None;
-                    }
+                    self.connection.clear_matching_heartbeat(nonce);
                 }
                 Frame::PathStatus { .. } | Frame::SessionReady => {}
                 Frame::PathClose { .. } => {
@@ -440,7 +435,7 @@ impl TcpDatagramClientSession {
                 .await?;
         }
         self.flows.clear();
-        close_client_tcp_path(&mut self.connection, self.path_id, false).await
+        self.connection.close(self.path_id).await
     }
 
     pub(in crate::runtime) fn response_timeout(&self, ttl_ms: u32) -> Duration {

@@ -1,3 +1,4 @@
+use super::io::{EncryptedTcpWriter, encrypted_framed_peer_closed, spawn_encrypted_tcp_reader};
 use super::*;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 
@@ -1176,22 +1177,6 @@ async fn server_flush_tcp_path_writer(
         Err(err) if encrypted_framed_peer_closed(&err) => Ok(false),
         Err(err) => Err(RuntimeError::Encrypted(err)),
     }
-}
-
-pub(in crate::runtime) fn encrypted_framed_peer_closed(
-    err: &EncryptedFramedTransportError,
-) -> bool {
-    matches!(
-        err,
-        EncryptedFramedTransportError::Io(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-    )
 }
 
 pub(in crate::runtime) fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {

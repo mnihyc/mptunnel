@@ -1,14 +1,17 @@
+//! Reliable-stream client actor over the authenticated TCP carrier.
+//!
+//! This owner multiplexes product streams, reliable path proofs, and TCP
+//! capacity transactions. Encrypted connection setup and liveness stop at
+//! `client_connection`; cross-carrier product placement stays above `path`.
+
+use super::client_connection::{
+    ClientTcpCarrierConnection, ClientTcpHeartbeatTimeoutDisposition, connect_client_tcp_carrier,
+};
+use super::io::EncryptedTcpWriter;
 use super::*;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
-use crate::transport::tcp as tcp_transport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// Ownership boundary:
-// This module owns TCP underlay carrier sessions only: encrypted framed TCP
-// connection setup, command queues, heartbeat/liveness, frame reads, and writer
-// shutdown. Product reliable stream identity, response path-flight ownership,
-// and cross-carrier scheduling live in `reliable_path`.
 
 pub(in crate::runtime) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
@@ -283,18 +286,18 @@ pub(in crate::runtime) fn tcp_path_lane_uses_latency_session(lane: FlowLane) -> 
 }
 
 pub(in crate::runtime) struct ClientTcpPathConnection {
-    pub(in crate::runtime) startup_snapshot: PathSnapshot,
-    pub(in crate::runtime) startup_metrics: PathMetrics,
-    pub(in crate::runtime) writer: EncryptedTcpWriter,
-    pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
-    pub(in crate::runtime) heartbeat_interval: Duration,
-    pub(in crate::runtime) next_heartbeat_at: tokio::time::Instant,
-    pub(in crate::runtime) pending_heartbeat: Option<(u64, tokio::time::Instant)>,
-    pub(in crate::runtime) path_proofs: PathProofTracker,
-    pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
-    pub(in crate::runtime) request_tcp_capacity_probe: Option<PendingClientTcpCapacityProbe>,
-    discarded_request_tcp_capacity_receipt: Option<DiscardedClientTcpCapacityReceipt>,
-    pub(in crate::runtime) capacity_receive: CapacityReceiveTracker,
+    startup_snapshot: PathSnapshot,
+    startup_metrics: PathMetrics,
+    carrier: ClientTcpCarrierConnection,
+    path_proofs: PathProofTracker,
+    capacity: ClientTcpCapacityState,
+}
+
+/// Reliable-only calibration state must not leak into datagram carrier users.
+struct ClientTcpCapacityState {
+    request_probe: Option<PendingClientTcpCapacityProbe>,
+    discarded_request_receipt: Option<DiscardedClientTcpCapacityReceipt>,
+    receive: CapacityReceiveTracker,
 }
 
 pub(in crate::runtime) struct PendingClientTcpCapacityProbe {
@@ -333,16 +336,10 @@ impl DiscardedClientTcpCapacityReceipt {
     }
 }
 
-pub(in crate::runtime) type EncryptedTcpReader =
-    EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
-pub(in crate::runtime) type EncryptedTcpWriter =
-    EncryptedFramedWriter<tokio::io::WriteHalf<TcpStream>>;
-
 pub(in crate::runtime) struct ClientTcpPathStreamState {
     pub(in crate::runtime) open_attempt_id: ClientTcpOpenAttemptId,
     pub(in crate::runtime) frames: mpsc::Sender<Result<Frame, RuntimeError>>,
     pub(in crate::runtime) pending_open: Option<ClientTcpPendingOpen>,
-    pub(in crate::runtime) local_close_pending: bool,
 }
 
 pub(in crate::runtime) struct ClientTcpPendingOpen {
@@ -414,17 +411,12 @@ async fn run_client_tcp_path_session(
             continue;
         }
 
-        let heartbeat_at = {
-            let connection_ref = state
-                .connection
-                .as_ref()
-                .expect("checked connected TCP path session");
-            connection_ref
-                .pending_heartbeat
-                .as_ref()
-                .map(|(_, deadline)| *deadline)
-                .unwrap_or(connection_ref.next_heartbeat_at)
-        };
+        let heartbeat_at = state
+            .connection
+            .as_ref()
+            .expect("checked connected TCP path session")
+            .carrier
+            .heartbeat_deadline();
         let heartbeat_timer = tokio::time::sleep_until(heartbeat_at);
         tokio::pin!(heartbeat_timer);
         let pending_open_deadline = next_client_tcp_pending_open_deadline(&state.streams);
@@ -447,7 +439,7 @@ async fn run_client_tcp_path_session(
         let request_probe_deadline = state
             .connection
             .as_ref()
-            .and_then(|connection| connection.request_tcp_capacity_probe.as_ref())
+            .and_then(|connection| connection.capacity.request_probe.as_ref())
             .map(|pending| tokio::time::Instant::from_std(pending.probe.expires_at));
         let request_probe_timer =
             tokio::time::sleep_until(request_probe_deadline.unwrap_or(heartbeat_at));
@@ -455,7 +447,7 @@ async fn run_client_tcp_path_session(
         let request_probe_lease = state
             .connection
             .as_ref()
-            .and_then(|connection| connection.request_tcp_capacity_probe.as_ref())
+            .and_then(|connection| connection.capacity.request_probe.as_ref())
             .and_then(|pending| pending.probe.request_lease())
             .cloned();
         let request_probe_cancelled = async move {
@@ -497,7 +489,6 @@ async fn run_client_tcp_path_session(
                     state.connection.as_mut().expect("checked connected TCP path session"),
                     &mut state.streams,
                     &mut state.closed_streams,
-                    runtime.mux_limits,
                 ).await {
                     carrier_generation.clear();
                     fail_client_tcp_streams(&mut state.streams, &err);
@@ -505,7 +496,7 @@ async fn run_client_tcp_path_session(
                     drop_connection = true;
                 }
             }
-            frame = state.connection.as_mut().expect("checked connected TCP path session").frames.recv() => {
+            frame = state.connection.as_mut().expect("checked connected TCP path session").carrier.frames.recv() => {
                 match frame {
                     Some(Ok(frame)) => {
                         if let Err(err) = handle_client_tcp_path_frame(
@@ -602,12 +593,18 @@ async fn run_client_tcp_path_session(
                 }
             }
             _ = &mut heartbeat_timer, if !request_probe_pending => {
-                if let Err(err) = tick_client_tcp_path_heartbeat(
-                    state.connection.as_mut().expect("checked connected TCP path session"),
-                    runtime.mux_limits,
-                    !state.streams.is_empty(),
-                )
-                .await
+                let timeout_disposition = if state.streams.is_empty() {
+                    ClientTcpHeartbeatTimeoutDisposition::FailCarrier
+                } else {
+                    ClientTcpHeartbeatTimeoutDisposition::KeepCarrierAlive
+                };
+                if let Err(err) = state
+                    .connection
+                    .as_mut()
+                    .expect("checked connected TCP path session")
+                    .carrier
+                    .tick_heartbeat(timeout_disposition)
+                    .await
                 {
                     carrier_generation.clear();
                     fail_client_tcp_streams(&mut state.streams, &err);
@@ -625,10 +622,10 @@ async fn run_client_tcp_path_session(
 }
 
 fn discard_pending_client_tcp_capacity_receipt(connection: &mut ClientTcpPathConnection) {
-    let Some(pending) = connection.request_tcp_capacity_probe.take() else {
+    let Some(pending) = connection.capacity.request_probe.take() else {
         return;
     };
-    connection.discarded_request_tcp_capacity_receipt = Some(
+    connection.capacity.discarded_request_receipt = Some(
         DiscardedClientTcpCapacityReceipt::from_probe(&pending.probe),
     );
 }
@@ -654,7 +651,6 @@ async fn expire_client_tcp_pending_opens(
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
-    mux_limits: MuxLimits,
 ) -> Result<(), RuntimeError> {
     let now = tokio::time::Instant::now();
     let expired = streams
@@ -682,13 +678,13 @@ async fn expire_client_tcp_pending_opens(
         }
         closed_streams.insert(stream_id);
         let detach = Frame::StreamDetach { stream_id };
-        connection.writer.write_frame(&detach).await?;
+        connection.carrier.writer.write_frame(&detach).await?;
         connection.path_proofs.record_sent_frame(&detach);
         detached = true;
     }
     if detached {
-        connection.writer.flush().await?;
-        record_client_tcp_path_outbound_activity(connection, mux_limits);
+        connection.carrier.writer.flush().await?;
+        record_client_tcp_path_outbound_activity(connection);
     }
     Ok(())
 }
@@ -820,7 +816,7 @@ async fn handle_connected_client_tcp_command_run(
                     || probe.train_payload_bytes
                         > reliable_capacity_calibration_session_limit_bytes(mux_limits)
                     || !probe.valid_request_tcp_train()
-                    || connection.request_tcp_capacity_probe.is_some()
+                    || connection.capacity.request_probe.is_some()
                 {
                     commands.release_pending_command_bytes(pending_bytes);
                     return Err(RuntimeError::Protocol(
@@ -857,7 +853,7 @@ async fn handle_connected_client_tcp_command_run(
                 .await;
                 commands.release_pending_command_bytes(pending_bytes);
                 let (write_outcome, deferred_frames) = measurement_result?;
-                record_client_tcp_path_outbound_activity(connection, mux_limits);
+                record_client_tcp_path_outbound_activity(connection);
                 match write_outcome {
                     ClientTcpCapacityProbeWriteOutcome::NoWire => {
                         if let Some(lease) = probe.request_lease() {
@@ -893,7 +889,7 @@ async fn handle_connected_client_tcp_command_run(
                                 probe.required_timed_carrier_bytes,
                             ),
                         );
-                        connection.request_tcp_capacity_probe =
+                        connection.capacity.request_probe =
                             Some(PendingClientTcpCapacityProbe { probe, measurement });
                     }
                 }
@@ -925,7 +921,6 @@ async fn handle_connected_client_tcp_command_run(
                     closed_streams,
                     carrier_generation,
                     stream_frame_queue,
-                    mux_limits,
                     false,
                 )
                 .await?;
@@ -957,7 +952,7 @@ async fn handle_connected_client_tcp_command_run(
         ),
     );
     if wrote_frame {
-        connection.writer.flush().await?;
+        connection.carrier.writer.flush().await?;
     }
     Ok(())
 }
@@ -975,7 +970,7 @@ async fn flush_client_tcp_frame_batch(
     let mut deferred_frame = None;
     let mut routed_frames = 0usize;
     {
-        let write = connection.writer.write_frames(frames);
+        let write = connection.carrier.writer.write_frames(frames);
         tokio::pin!(write);
         loop {
             tokio::select! {
@@ -984,7 +979,7 @@ async fn flush_client_tcp_frame_batch(
                     result?;
                     break;
                 }
-                incoming = connection.frames.recv(), if deferred_frame.is_none() => {
+                incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
                     match incoming {
                         Some(Ok(frame)) => {
                             match try_route_client_tcp_stream_frame_during_write(
@@ -1033,7 +1028,7 @@ async fn flush_client_tcp_frame_batch(
         connection.path_proofs.record_sent_frame(frame);
     }
     frames.clear();
-    record_client_tcp_path_outbound_activity(connection, runtime.mux_limits);
+    record_client_tcp_path_outbound_activity(connection);
     #[cfg(feature = "lab-diagnostics")]
     if routed_frames > 0 || deferred_frame.is_some() {
         lab_diagnostic(
@@ -1061,8 +1056,8 @@ async fn client_write_tcp_capacity_probe_interlocked(
     mux_limits: MuxLimits,
 ) -> Result<(ClientTcpCapacityProbeWriteOutcome, Vec<Frame>), RuntimeError> {
     let write = client_write_tcp_capacity_probe(
-        &mut connection.writer,
-        connection.tcp_metrics.as_ref(),
+        &mut connection.carrier.writer,
+        connection.carrier.tcp_metrics.as_ref(),
         probe,
         max_payload_bytes,
     );
@@ -1079,7 +1074,7 @@ async fn client_write_tcp_capacity_probe_interlocked(
             result = &mut write => {
                 break result;
             }
-            incoming = connection.frames.recv(), if reader_open => {
+            incoming = connection.carrier.frames.recv(), if reader_open => {
                 let frame = match incoming {
                     Some(Ok(frame)) => frame,
                     Some(Err(error)) => {
@@ -1452,7 +1447,6 @@ async fn handle_connected_client_tcp_command(
     closed_streams: &mut RecentIdCache<StreamId>,
     carrier_generation: u64,
     stream_frame_queue: usize,
-    mux_limits: MuxLimits,
     flush_after_frame: bool,
 ) -> Result<(), RuntimeError> {
     match command {
@@ -1483,7 +1477,7 @@ async fn handle_connected_client_tcp_command(
             };
             open_client_tcp_stream_on_connection(connection, open, streams, stream_frame_queue)
                 .await?;
-            record_client_tcp_path_outbound_activity(connection, mux_limits);
+            record_client_tcp_path_outbound_activity(connection);
             Ok(())
         }
         ReliablePathCommand::CancelTcpOpen {
@@ -1495,10 +1489,10 @@ async fn handle_connected_client_tcp_command(
             }
             closed_streams.insert(stream_id);
             let detach = Frame::StreamDetach { stream_id };
-            connection.writer.write_frame(&detach).await?;
+            connection.carrier.writer.write_frame(&detach).await?;
             connection.path_proofs.record_sent_frame(&detach);
-            connection.writer.flush().await?;
-            record_client_tcp_path_outbound_activity(connection, mux_limits);
+            connection.carrier.writer.flush().await?;
+            record_client_tcp_path_outbound_activity(connection);
             Ok(())
         }
         ReliablePathCommand::SendFrame(frame)
@@ -1509,12 +1503,12 @@ async fn handle_connected_client_tcp_command(
             ))
         }
         ReliablePathCommand::SendFrame(frame) => {
-            connection.writer.write_frame(&frame).await?;
+            connection.carrier.writer.write_frame(&frame).await?;
             connection.path_proofs.record_sent_frame(&frame);
             if flush_after_frame {
-                connection.writer.flush().await?;
+                connection.carrier.writer.flush().await?;
             }
-            record_client_tcp_path_outbound_activity(connection, mux_limits);
+            record_client_tcp_path_outbound_activity(connection);
             Ok(())
         }
         ReliablePathCommand::SendQuicCapacityProbe(probe) => {
@@ -1543,93 +1537,32 @@ pub(in crate::runtime) async fn connect_client_tcp_path(
     mux_limits: MuxLimits,
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
-    let connect = async {
-        let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let tcp_stream = tcp_transport::connect_path(
-            path,
-            TcpConnectOptions {
-                timeout: connect_timeout,
-                ..TcpConnectOptions::default()
-            },
-        )
-        .await?;
-        let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
-        let mut framed = EncryptedFramedStream::with_cipher_suite(
-            tcp_stream,
-            security.secret.as_bytes(),
-            PeerRole::Client,
-            codec_limits,
-            security.cipher,
-        )?;
-        let path_id = PathId(path_index as u16);
-        let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
-            security,
-            path,
-            path_id,
-            UnderlayProtocol::Tcp,
-            session_id,
-        )?;
-
-        framed
-            .write_frames(&[session_hello, session_auth, path_join])
-            .await?;
-        framed.flush().await?;
-
-        let mut session_ready = false;
-        let mut path_active = false;
-        while !session_ready || !path_active {
-            match framed.read_frame().await? {
-                Frame::SessionReady => session_ready = true,
-                Frame::PathStatus {
-                    status: crate::protocol::PathStatus::Active,
-                    ..
-                } => path_active = true,
-                Frame::PathStatus { .. } => {
-                    return Err(RuntimeError::Protocol(
-                        "TCP path session did not become active",
-                    ));
-                }
-                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-                _ => {
-                    return Err(RuntimeError::Protocol(
-                        "unexpected TCP path handshake frame",
-                    ));
-                }
-            }
-        }
-
-        if let Some(metrics) = tcp_metrics.as_mut() {
-            metrics.begin_epoch();
-        }
-
-        let (reader, writer) = framed.split()?;
-        let now = tokio::time::Instant::now();
-        let startup_snapshot = path_startup_snapshot(path, path_index);
-        let startup_metrics =
-            path_startup_metrics(path, path_index, PathMetricDirection::ClientToServer);
-        Ok(ClientTcpPathConnection {
-            startup_snapshot,
-            startup_metrics,
-            writer,
-            frames: spawn_encrypted_tcp_reader(
-                reader,
-                reliable_path_writer_frame_queue(mux_limits),
-            ),
-            heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
-            next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
-            pending_heartbeat: None,
-            path_proofs: PathProofTracker::default(),
-            tcp_metrics,
-            request_tcp_capacity_probe: None,
-            discarded_request_tcp_capacity_receipt: None,
-            capacity_receive: CapacityReceiveTracker::new(
+    let startup_snapshot = path_startup_snapshot(path, path_index);
+    let startup_metrics =
+        path_startup_metrics(path, path_index, PathMetricDirection::ClientToServer);
+    let carrier = connect_client_tcp_carrier(
+        path,
+        path_index,
+        session_id,
+        security,
+        codec_limits,
+        mux_limits,
+        open_deadline,
+    )
+    .await?;
+    Ok(ClientTcpPathConnection {
+        startup_snapshot,
+        startup_metrics,
+        carrier,
+        path_proofs: PathProofTracker::default(),
+        capacity: ClientTcpCapacityState {
+            request_probe: None,
+            discarded_request_receipt: None,
+            receive: CapacityReceiveTracker::new(
                 reliable_capacity_calibration_session_limit_bytes(mux_limits),
             ),
-        })
-    };
-    tokio::time::timeout_at(open_deadline, connect)
-        .await
-        .map_err(|_| RuntimeError::PathOpenTimedOut)?
+        },
+    })
 }
 
 async fn open_client_tcp_stream_on_connection(
@@ -1674,17 +1607,18 @@ async fn open_client_tcp_stream_on_connection(
                 lane,
                 open_deadline,
             }),
-            local_close_pending: false,
         },
     );
     let send_open = async {
         connection
+            .carrier
             .writer
             .write_frame(&Frame::PathMetrics {
                 metrics: connection.startup_metrics,
             })
             .await?;
         connection
+            .carrier
             .writer
             .write_frame(&Frame::OpenStream {
                 stream_id,
@@ -1695,12 +1629,12 @@ async fn open_client_tcp_stream_on_connection(
                 role,
             })
             .await?;
-        connection.writer.flush().await
+        connection.carrier.writer.flush().await
     };
     tokio::time::timeout_at(open_deadline, send_open)
         .await
         .map_err(|_| RuntimeError::PathOpenTimedOut)??;
-    connection.next_heartbeat_at = tokio::time::Instant::now() + connection.heartbeat_interval;
+    connection.carrier.schedule_next_heartbeat();
     Ok(())
 }
 
@@ -1723,9 +1657,8 @@ async fn handle_client_tcp_path_frame(
     closed_streams: &mut RecentIdCache<StreamId>,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
-    refresh_client_tcp_path_liveness(connection, runtime.mux_limits);
-    expire_client_tcp_pending_opens(connection, streams, closed_streams, runtime.mux_limits)
-        .await?;
+    connection.carrier.refresh_liveness();
+    expire_client_tcp_pending_opens(connection, streams, closed_streams).await?;
     let path_id = PathId(runtime.path_index as u16);
     match frame {
         Frame::StreamMaxData {
@@ -1735,9 +1668,6 @@ async fn handle_client_tcp_path_frame(
             if let Some(state) = streams.get_mut(&stream_id)
                 && state.pending_open.is_some()
             {
-                if state.local_close_pending {
-                    return Ok(());
-                }
                 if let Some(mut pending) = state.pending_open.take() {
                     let open_deadline = pending.open_deadline;
                     let frames = pending
@@ -1768,10 +1698,10 @@ async fn handle_client_tcp_path_frame(
                         streams.remove(&stream_id);
                         closed_streams.insert(stream_id);
                         let detach = Frame::StreamDetach { stream_id };
-                        connection.writer.write_frame(&detach).await?;
+                        connection.carrier.writer.write_frame(&detach).await?;
                         connection.path_proofs.record_sent_frame(&detach);
-                        connection.writer.flush().await?;
-                        record_client_tcp_path_outbound_activity(connection, runtime.mux_limits);
+                        connection.carrier.writer.flush().await?;
+                        record_client_tcp_path_outbound_activity(connection);
                     }
                     return Ok(());
                 }
@@ -1878,10 +1808,11 @@ async fn handle_client_tcp_path_frame(
         }
         Frame::Ping { nonce } => {
             connection
+                .carrier
                 .writer
                 .write_frame(&Frame::Pong { nonce })
                 .await?;
-            connection.writer.flush().await?;
+            connection.carrier.writer.flush().await?;
             Ok(())
         }
         Frame::PathProofData {
@@ -1890,10 +1821,11 @@ async fn handle_client_tcp_path_frame(
             payload,
         } if proof_path_id == path_id => {
             connection
+                .carrier
                 .writer
                 .write_frame(&path_proof_ack_frame(path_id, proof_id, payload.len()))
                 .await?;
-            connection.writer.flush().await?;
+            connection.carrier.writer.flush().await?;
             Ok(())
         }
         Frame::PathProofAck {
@@ -1906,9 +1838,18 @@ async fn handle_client_tcp_path_frame(
                     .path_proofs
                     .acknowledge(path_id, proof_id, payload_bytes)
             {
-                let transport_state = connection.tcp_metrics.as_mut().and_then(|publisher| {
-                    publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
-                });
+                let transport_state =
+                    connection
+                        .carrier
+                        .tcp_metrics
+                        .as_mut()
+                        .and_then(|publisher| {
+                            publisher.maybe_observe(
+                                path_id,
+                                PathMetricDirection::ClientToServer,
+                                true,
+                            )
+                        });
                 if let Some(record) = runtime
                     .state
                     .health()
@@ -1930,7 +1871,8 @@ async fn handle_client_tcp_path_frame(
             calibration_id,
             payload,
         } if capacity_path_id == path_id => connection
-            .capacity_receive
+            .capacity
+            .receive
             .record_data(calibration_id, payload.len())
             .map_err(Into::into),
         Frame::PathCapacityFinish {
@@ -1939,9 +1881,11 @@ async fn handle_client_tcp_path_frame(
             payload_bytes,
         } if capacity_path_id == path_id => {
             let received_payload_bytes = connection
-                .capacity_receive
+                .capacity
+                .receive
                 .finish(calibration_id, payload_bytes)?;
             connection
+                .carrier
                 .writer
                 .write_frame(&Frame::PathCapacityReceipt {
                     path_id,
@@ -1949,7 +1893,7 @@ async fn handle_client_tcp_path_frame(
                     received_payload_bytes,
                 })
                 .await?;
-            connection.writer.flush().await?;
+            connection.carrier.writer.flush().await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "tcp_capacity_receipt",
@@ -1965,14 +1909,15 @@ async fn handle_client_tcp_path_frame(
             calibration_id,
             received_payload_bytes,
         } if receipt_path_id == path_id => {
-            let Some(pending) = connection.request_tcp_capacity_probe.take() else {
+            let Some(pending) = connection.capacity.request_probe.take() else {
                 if connection
-                    .discarded_request_tcp_capacity_receipt
+                    .capacity
+                    .discarded_request_receipt
                     .is_some_and(|discarded| {
                         discarded.matches(calibration_id, received_payload_bytes)
                     })
                 {
-                    connection.discarded_request_tcp_capacity_receipt = None;
+                    connection.capacity.discarded_request_receipt = None;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "request_tcp_capacity_probe",
@@ -2027,9 +1972,13 @@ async fn handle_client_tcp_path_frame(
             else {
                 return Ok(());
             };
-            let native_metrics = connection.tcp_metrics.as_mut().and_then(|publisher| {
-                publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
-            });
+            let native_metrics = connection
+                .carrier
+                .tcp_metrics
+                .as_mut()
+                .and_then(|publisher| {
+                    publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
+                });
             #[cfg(feature = "lab-diagnostics")]
             let kernel_delivery_rate_bps =
                 native_metrics.map_or(0, |metrics| metrics.delivery_rate_bps);
@@ -2109,22 +2058,7 @@ async fn handle_client_tcp_path_frame(
             );
             Ok(())
         }
-        Frame::Pong { nonce } => {
-            let Some((pending_nonce, _)) = connection.pending_heartbeat.as_ref() else {
-                return Err(RuntimeError::Protocol(
-                    "unexpected TCP path heartbeat response",
-                ));
-            };
-            if *pending_nonce != nonce {
-                return Err(RuntimeError::Protocol(
-                    "unexpected TCP path heartbeat response",
-                ));
-            }
-            connection.pending_heartbeat = None;
-            connection.next_heartbeat_at =
-                tokio::time::Instant::now() + connection.heartbeat_interval;
-            Ok(())
-        }
+        Frame::Pong { nonce } => connection.carrier.complete_expected_heartbeat(nonce),
         Frame::PathStatus {
             status: crate::protocol::PathStatus::Draining | crate::protocol::PathStatus::Failed,
             ..
@@ -2138,36 +2072,8 @@ async fn handle_client_tcp_path_frame(
     }
 }
 
-pub(in crate::runtime) fn refresh_client_tcp_path_liveness(
-    connection: &mut ClientTcpPathConnection,
-    mux_limits: MuxLimits,
-) {
-    refresh_client_tcp_path_liveness_state(
-        &mut connection.next_heartbeat_at,
-        connection.heartbeat_interval,
-        &mut connection.pending_heartbeat,
-        mux_limits.tcp_path_heartbeat_timeout,
-    );
-}
-
-fn record_client_tcp_path_outbound_activity(
-    connection: &mut ClientTcpPathConnection,
-    mux_limits: MuxLimits,
-) {
-    refresh_client_tcp_path_liveness(connection, mux_limits);
-}
-
-pub(in crate::runtime) fn refresh_client_tcp_path_liveness_state(
-    next_heartbeat_at: &mut tokio::time::Instant,
-    heartbeat_interval: Duration,
-    pending_heartbeat: &mut Option<(u64, tokio::time::Instant)>,
-    heartbeat_timeout: Duration,
-) {
-    let now = tokio::time::Instant::now();
-    *next_heartbeat_at = now + heartbeat_interval;
-    if let Some((_, deadline)) = pending_heartbeat.as_mut() {
-        *deadline = now + heartbeat_timeout;
-    }
+fn record_client_tcp_path_outbound_activity(connection: &mut ClientTcpPathConnection) {
+    connection.carrier.refresh_liveness();
 }
 
 pub(in crate::runtime) async fn route_client_tcp_stream_frame(
@@ -2202,34 +2108,6 @@ pub(in crate::runtime) async fn route_client_tcp_stream_frame(
     Ok(())
 }
 
-pub(in crate::runtime) async fn tick_client_tcp_path_heartbeat(
-    connection: &mut ClientTcpPathConnection,
-    mux_limits: MuxLimits,
-    has_active_streams: bool,
-) -> Result<(), RuntimeError> {
-    let now = tokio::time::Instant::now();
-    if let Some((_, deadline)) = connection.pending_heartbeat.as_ref()
-        && now >= *deadline
-    {
-        if has_active_streams {
-            connection.pending_heartbeat = None;
-            connection.next_heartbeat_at = now + connection.heartbeat_interval;
-            return Ok(());
-        }
-        return Err(RuntimeError::PathHeartbeatTimeout);
-    }
-    if connection.pending_heartbeat.is_none() && now >= connection.next_heartbeat_at {
-        let nonce = random_u64()?;
-        connection
-            .writer
-            .write_frame(&Frame::Ping { nonce })
-            .await?;
-        connection.writer.flush().await?;
-        connection.pending_heartbeat = Some((nonce, now + mux_limits.tcp_path_heartbeat_timeout));
-    }
-    Ok(())
-}
-
 pub(in crate::runtime) async fn close_client_tcp_path(
     connection: &mut ClientTcpPathConnection,
     path_id: PathId,
@@ -2237,25 +2115,12 @@ pub(in crate::runtime) async fn close_client_tcp_path(
 ) -> Result<(), RuntimeError> {
     if drain {
         connection
+            .carrier
             .writer
             .write_frame(&Frame::PathDrain { path_id })
             .await?;
     }
-    connection
-        .writer
-        .write_frame(&Frame::PathClose {
-            path_id,
-            reason: CloseReason::Normal,
-        })
-        .await?;
-    connection
-        .writer
-        .write_frame(&Frame::SessionClose {
-            reason: CloseReason::Normal,
-        })
-        .await?;
-    connection.writer.flush().await?;
-    Ok(())
+    connection.carrier.close(path_id).await
 }
 
 fn fail_client_tcp_streams(
@@ -2287,33 +2152,10 @@ fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
     }
 }
 
-pub(in crate::runtime) fn spawn_encrypted_tcp_reader(
-    mut reader: EncryptedTcpReader,
-    queue_size: usize,
-) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>> {
-    let (frames_tx, frames_rx) = mpsc::channel(queue_size);
-    tokio::spawn(async move {
-        loop {
-            let frame = reader.read_frame().await;
-            let done = frame.is_err();
-            #[cfg(feature = "lab-diagnostics")]
-            let bytes = frame.as_ref().ok().map(frame_pacing_bytes).unwrap_or(0);
-            #[cfg(feature = "lab-diagnostics")]
-            let started = Instant::now();
-            let send_result = frames_tx.send(frame).await;
-            #[cfg(feature = "lab-diagnostics")]
-            lab_perf_record("runtime.tcp_reader.queue_send", started.elapsed(), bytes);
-            if send_result.is_err() || done {
-                break;
-            }
-        }
-    });
-    frames_rx
-}
-
 pub(in crate::runtime) fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
     reliable_path_command_queue(resources.into())
 }
 
 #[cfg(test)]
+#[path = "client_test.rs"]
 mod tests;

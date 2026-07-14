@@ -35,16 +35,17 @@ use node::probe_paths as probe_client_paths;
 use node::server::run as run_server;
 use path::quic::{client::*, io::*};
 #[cfg(test)]
+use path::tcp::client::*;
+#[cfg(test)]
+use path::tcp::client_connection::*;
+#[cfg(test)]
 use path::tcp::server::*;
 use path::{
     ClientPathContext, ClientPathHealthRecord, PathDeliveryStats, RelayPathLoadLease,
     ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
     RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
-    RequestTcpCapacityProbeLease, ServerPathContext,
-    commands::*,
-    model::*,
-    proof::*,
-    tcp::{capacity::*, client::*},
+    RequestTcpCapacityProbeLease, ServerPathContext, commands::*, model::*, proof::*,
+    tcp::capacity::*,
 };
 #[cfg(test)]
 use path::{ClientPathHealth, ClientPathState, UdpDatagramPathObservation};

@@ -181,6 +181,13 @@ pub(super) struct ServerQuicCapacityCalibrationPathKey {
     pub(super) path_instance_id: ServerCarrierPathInstanceId,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ServerQuicCapacityHistorySnapshot {
+    pub(super) attempt_entry_count: usize,
+    pub(super) spent_bytes: Option<u64>,
+}
+
 impl ServerPathLaneTrackerState {
     pub(super) fn quic_capacity_calibration_attempts_for_path(
         &self,
@@ -298,6 +305,61 @@ pub(super) fn finish_quic_capacity_session_reclamation(
 }
 
 impl ServerPathLaneTracker {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn set_quic_capacity_active_expiry_for_test(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        token: u64,
+        expires_at: Instant,
+    ) -> bool {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let Some(reservation) = state
+            .quic_capacity_calibrations
+            .get_mut(&session_id)
+            .filter(|reservation| {
+                reservation.binding_instance_id == binding_instance_id
+                    && reservation.path == path
+                    && reservation.path_instance_id == path_instance_id
+                    && reservation.token == token
+                    && matches!(
+                        reservation.phase,
+                        ServerQuicCapacityCalibrationPhase::Active { .. }
+                    )
+            })
+        else {
+            return false;
+        };
+        reservation.phase = ServerQuicCapacityCalibrationPhase::Active { expires_at };
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn quic_capacity_history_snapshot_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> Option<ServerQuicCapacityHistorySnapshot> {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let attempt_entry_count = state
+            .quic_capacity_calibration_attempts
+            .keys()
+            .filter(|key| key.session_id == session_id)
+            .count();
+        let spent_bytes = state
+            .quic_capacity_calibration_bytes
+            .get(&session_id)
+            .copied();
+        (attempt_entry_count > 0 || spent_bytes.is_some()).then_some(
+            ServerQuicCapacityHistorySnapshot {
+                attempt_entry_count,
+                spent_bytes,
+            },
+        )
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_reserve_test_quic_capacity_calibration(

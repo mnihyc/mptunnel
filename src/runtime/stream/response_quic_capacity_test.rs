@@ -1,5 +1,5 @@
 use super::super::response_session::ServerPathLaneTracker;
-use super::{ServerQuicCapacityCalibrationPhase, valid_quic_capacity_geometry};
+use super::valid_quic_capacity_geometry;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::{PathId, SessionId, UnderlayProtocol};
 use crate::runtime::path::commands::{
@@ -140,16 +140,22 @@ fn quic_capacity_evidence_after_active_lease_expires_instead_of_completing() {
         1_000,
         18,
     ));
-    tracker
-        .state
-        .lock()
-        .expect("server path lane tracker lock")
-        .quic_capacity_calibrations
-        .get_mut(&session_id)
-        .expect("capacity reservation")
-        .phase = ServerQuicCapacityCalibrationPhase::Active {
-        expires_at: Instant::now() - Duration::from_millis(1),
-    };
+    assert!(tracker.commit_test_quic_capacity_calibration(
+        session_id,
+        92,
+        path,
+        path_instance_id,
+        Duration::from_secs(1),
+        18,
+    ));
+    assert!(tracker.set_quic_capacity_active_expiry_for_test(
+        session_id,
+        92,
+        path,
+        path_instance_id,
+        18,
+        Instant::now() - Duration::from_millis(1),
+    ));
     let accepted_at = Instant::now();
     let candidate = QuicCapacityProofCandidate {
         token: 18,
@@ -219,7 +225,7 @@ fn quic_capacity_commit_rechecks_deadline_after_lane_lock_wait() {
         19,
     ));
 
-    let state = tracker.state.lock().expect("hold lane tracker lock");
+    let state = tracker.hold_state_lock_for_test();
     let blocked = tracker.clone();
     let expires_at = Instant::now() + Duration::from_millis(30);
     let (started_tx, started_rx) = std::sync::mpsc::channel();

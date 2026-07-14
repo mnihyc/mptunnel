@@ -9,6 +9,8 @@ use crate::model::path::CarrierPathKey;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::MutexGuard;
 use std::time::Instant;
 
 // Session coordination owns one state mutex, generations, and probe leases.
@@ -65,6 +67,22 @@ impl ResponseServiceFamilyLoads {
 /// and cannot reorder product frames after sender-service admission.
 pub(in crate::runtime) struct ServerPathLaneTracker {
     pub(super) state: Mutex<ServerPathLaneTrackerState>,
+}
+
+#[cfg(test)]
+pub(super) struct ServerPathLaneTrackerStateLockForTest<'a> {
+    _guard: MutexGuard<'a, ServerPathLaneTrackerState>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ServerSessionRetentionSnapshot {
+    pub(super) references: u32,
+    pub(super) generation: u64,
+    pub(super) attachment_path_count: usize,
+    pub(super) service_path_count: usize,
+    pub(super) realtime_flows: u32,
+    pub(super) active_response_flows: u32,
 }
 
 #[derive(Debug, Default)]
@@ -188,6 +206,49 @@ impl ServerPathLaneTracker {
             .get(&session_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_state_lock_for_test(&self) -> ServerPathLaneTrackerStateLockForTest<'_> {
+        ServerPathLaneTrackerStateLockForTest {
+            _guard: self.state.lock().expect("server path lane tracker lock"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn retention_snapshot_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> Option<ServerSessionRetentionSnapshot> {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let references = state.session_references.get(&session_id).copied();
+        let generation = state.session_generations.get(&session_id).copied();
+        let attachment_path_count = state
+            .loads
+            .keys()
+            .filter(|key| key.session_id == session_id)
+            .count();
+        let service_path_count = state
+            .response_service_loads
+            .keys()
+            .filter(|key| key.session_id == session_id)
+            .count();
+        let realtime_flows = state.realtime_flows.get(&session_id).copied();
+        let active_response_flows = state.active_response_flows.get(&session_id).copied();
+        let retained = references.is_some()
+            || generation.is_some()
+            || attachment_path_count > 0
+            || service_path_count > 0
+            || realtime_flows.is_some()
+            || active_response_flows.is_some();
+        retained.then_some(ServerSessionRetentionSnapshot {
+            references: references.unwrap_or(0),
+            generation: generation.unwrap_or(0),
+            attachment_path_count,
+            service_path_count,
+            realtime_flows: realtime_flows.unwrap_or(0),
+            active_response_flows: active_response_flows.unwrap_or(0),
+        })
     }
 
     pub(super) fn response_scheduling_snapshot(

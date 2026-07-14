@@ -379,6 +379,24 @@ impl ServerPathLaneTrackerState {
 }
 
 impl ServerPathLaneTracker {
+    #[cfg(test)]
+    pub(super) fn set_response_service_handoff_drain_expiry_for_test(
+        &self,
+        session_id: SessionId,
+        current: ResponseServiceHandoffDrainReservation,
+        expires_at: Instant,
+    ) -> bool {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let Some(reservation) = state.response_service_handoff_drains.get_mut(&session_id) else {
+            return false;
+        };
+        if *reservation != current {
+            return false;
+        }
+        reservation.expires_at = expires_at;
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_reserve_response_service_handoff_drain(
         &self,

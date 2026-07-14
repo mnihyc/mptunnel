@@ -4,8 +4,9 @@ use super::response_ack_clock::RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
 use super::response_evidence::server_output_fresh_quic_capacity_proof;
 use super::response_handoff::ResponseServiceHandoffDrainRequest;
 use super::response_handoff_commit::ResponseServiceHandoffRequest;
-use super::response_quic_capacity::ServerQuicCapacityCalibrationPhase;
+use super::response_quic_capacity::ServerQuicCapacityHistorySnapshot;
 use super::response_quic_probe::ResponseQuicCapacityCalibrationRequest;
+use super::response_session::ServerSessionRetentionSnapshot;
 use super::*;
 use crate::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
@@ -534,6 +535,14 @@ fn quic_capacity_reservation_expires_and_completion_releases_probe_slot() {
         session_byte_limit,
         1,
     ));
+    assert!(tracker.commit_test_quic_capacity_calibration(
+        session_id,
+        binding_instance_id,
+        path,
+        path_instance_id,
+        Duration::from_secs(1),
+        1,
+    ));
     tracker.clear_quic_capacity_calibration(
         session_id,
         binding_instance_id + 1,
@@ -546,16 +555,14 @@ fn quic_capacity_reservation_expires_and_completion_releases_probe_slot() {
             .quic_capacity_calibration_reserved,
         "an unrelated binding on the shared carrier path cannot clear the lease"
     );
-    tracker
-        .state
-        .lock()
-        .expect("test lane tracker lock")
-        .quic_capacity_calibrations
-        .get_mut(&session_id)
-        .expect("first reservation")
-        .phase = ServerQuicCapacityCalibrationPhase::Active {
-        expires_at: Instant::now() - Duration::from_millis(1),
-    };
+    assert!(tracker.set_quic_capacity_active_expiry_for_test(
+        session_id,
+        binding_instance_id,
+        path,
+        path_instance_id,
+        1,
+        Instant::now() - Duration::from_millis(1),
+    ));
     let expired = tracker.response_scheduling_snapshot(session_id);
     assert!(!expired.quic_capacity_calibration_reserved);
 
@@ -786,16 +793,12 @@ fn quic_capacity_retirement_bounds_flapping_attempt_keys_without_refunding_spend
         );
     }
 
-    let state = tracker.state.lock().expect("test lane tracker lock");
-    assert!(
-        state
-            .quic_capacity_calibration_attempts
-            .keys()
-            .all(|key| key.session_id != session_id)
-    );
     assert_eq!(
-        state.quic_capacity_calibration_bytes.get(&session_id),
-        Some(&320),
+        tracker.quic_capacity_history_snapshot_for_test(session_id),
+        Some(ServerQuicCapacityHistorySnapshot {
+            attempt_entry_count: 0,
+            spent_bytes: Some(320),
+        }),
         "carrier-instance retirement cannot refill the session envelope"
     );
 }
@@ -1028,17 +1031,10 @@ fn quic_capacity_rollback_is_provisional_token_exact_and_reclaim_clears_ledgers(
     tracker.set_response_flow_active(session_id, false);
     tracker.set_response_flow_active(session_id, false);
     tracker.detach_session(session_id);
-    let state = tracker.state.lock().expect("test lane tracker lock");
-    assert!(
-        !state
-            .quic_capacity_calibration_bytes
-            .contains_key(&session_id)
-    );
-    assert!(
-        state
-            .quic_capacity_calibration_attempts
-            .keys()
-            .all(|key| key.session_id != session_id)
+    assert_eq!(
+        tracker.quic_capacity_history_snapshot_for_test(session_id),
+        None,
+        "session reclamation removes all QUIC capacity history"
     );
 }
 
@@ -1125,15 +1121,17 @@ fn expired_response_service_handoff_drain_rejects_move_without_changing_loads() 
         None,
         Instant::now() + Duration::from_secs(1),
     ));
-    let move_generation = tracker.generation(session_id);
-    tracker
-        .state
-        .lock()
-        .expect("test lane tracker lock")
-        .response_service_handoff_drains
-        .get_mut(&session_id)
-        .expect("reserved handoff drain")
-        .expires_at = Instant::now() - Duration::from_millis(1);
+    let reserved = tracker.response_scheduling_snapshot(session_id);
+    let move_generation = reserved.generation;
+    assert!(
+        tracker.set_response_service_handoff_drain_expiry_for_test(
+            session_id,
+            reserved
+                .response_service_handoff_drain
+                .expect("reserved handoff drain"),
+            Instant::now() - Duration::from_millis(1),
+        )
+    );
 
     assert!(!tracker.try_move_response_service_handoff(
         session_id,
@@ -5817,28 +5815,21 @@ fn lane_tracker_reclaims_session_state_when_last_binding_drops() {
         lane_tracker.clone(),
     );
 
-    {
-        let state = lane_tracker
-            .state
-            .lock()
-            .expect("server path lane tracker lock");
-        assert_eq!(state.session_references.get(&session_id), Some(&1));
-        assert_eq!(state.active_response_flows.get(&session_id), Some(&1));
-        assert!(state.session_generations.contains_key(&session_id));
-        assert!(state.loads.keys().any(|key| key.session_id == session_id));
-    }
+    assert_eq!(
+        lane_tracker.retention_snapshot_for_test(session_id),
+        Some(ServerSessionRetentionSnapshot {
+            references: 1,
+            generation: binding.lane_generation(),
+            attachment_path_count: 1,
+            service_path_count: 1,
+            realtime_flows: 0,
+            active_response_flows: 1,
+        })
+    );
 
     drop(binding);
 
-    let state = lane_tracker
-        .state
-        .lock()
-        .expect("server path lane tracker lock");
-    assert!(!state.session_references.contains_key(&session_id));
-    assert!(!state.session_generations.contains_key(&session_id));
-    assert!(!state.realtime_flows.contains_key(&session_id));
-    assert!(!state.active_response_flows.contains_key(&session_id));
-    assert!(!state.loads.keys().any(|key| key.session_id == session_id));
+    assert_eq!(lane_tracker.retention_snapshot_for_test(session_id), None);
 }
 
 #[test]

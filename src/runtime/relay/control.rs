@@ -2706,7 +2706,6 @@ async fn attach_relay_path_candidates(
 ) -> Result<RelayPathAttachResult, RuntimeError> {
     let stream_id = remotes.stream_id();
     let mut last_retryable_error = None;
-    let mut attached = 0usize;
     let candidates = request.candidates;
 
     for key in candidates {
@@ -2758,9 +2757,8 @@ async fn attach_relay_path_candidates(
                         };
                         match attach_outcome {
                             ReliableRelayAttachOutcome::Attached => {
-                                attached += 1;
                                 return Ok(RelayPathAttachResult {
-                                    attached,
+                                    attached: 1,
                                     key: Some(key),
                                 });
                             }
@@ -2796,12 +2794,7 @@ async fn attach_relay_path_candidates(
             Err(err) => return Err(err),
         }
     }
-    if attached > 0 {
-        Ok(RelayPathAttachResult {
-            attached,
-            key: None,
-        })
-    } else if remotes.is_empty() {
+    if remotes.is_empty() {
         Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
     } else {
         Ok(RelayPathAttachResult {

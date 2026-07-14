@@ -1106,7 +1106,7 @@ fn reserve_request_quic_capacity_calibration_for_test(
             target,
             token,
             train_bytes,
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
             sender.request_quic_capacity_campaign.clone(),
             valid_after,
             train_deadline,
@@ -3637,7 +3637,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
                 service_instance,
                 9_000,
                 PATH_OPEN_SCORE_BYTES as u64,
-                reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
                 Arc::new(RequestCapacityProbeCampaignBudget::default()),
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
@@ -3661,7 +3661,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
             service_instance,
             9_001,
             PATH_OPEN_SCORE_BYTES as u64,
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
             Arc::new(RequestCapacityProbeCampaignBudget::default()),
             service_attached_at,
             Instant::now() + Duration::from_secs(1),
@@ -3692,7 +3692,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
                 service_instance,
                 9_002,
                 PATH_OPEN_SCORE_BYTES as u64,
-                reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
                 Arc::new(RequestCapacityProbeCampaignBudget::default()),
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
@@ -3711,7 +3711,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
                 service_instance,
                 9_002,
                 PATH_OPEN_SCORE_BYTES as u64,
-                reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
                 Arc::new(RequestCapacityProbeCampaignBudget::default()),
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
@@ -3761,7 +3761,7 @@ fn dropping_request_quic_owner_revokes_pending_handoff() {
                 target,
                 9_003,
                 PATH_OPEN_SCORE_BYTES as u64,
-                reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
                 Arc::new(RequestCapacityProbeCampaignBudget::default()),
                 Instant::now() - Duration::from_millis(1),
                 Instant::now() + Duration::from_secs(1),
@@ -4035,7 +4035,7 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
     );
     assert_eq!(
         context.request_tcp_capacity_probe_remaining_bytes(),
-        reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits)
+        reliable_capacity_calibration_session_limit_bytes(context.mux_limits)
             - geometries[0].train_bytes
             - geometries[1].train_bytes,
         "rejected flow work must preserve the session envelope for later streams"
@@ -4121,7 +4121,7 @@ async fn request_tcp_stable_share_rejects_oversized_train_without_retiring_candi
             .expect("candidate snapshot"),
         service_model,
         context.mux_limits,
-        reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
     )
     .expect("candidate train fits the session envelope");
     let eligible_candidates =
@@ -4405,7 +4405,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
             service_instance,
             9_004,
             PATH_OPEN_SCORE_BYTES as u64,
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
             Arc::new(RequestCapacityProbeCampaignBudget::default()),
             service_attached_at,
             Instant::now() + Duration::from_secs(1),
@@ -4433,7 +4433,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
                 service_instance,
                 9_005,
                 PATH_OPEN_SCORE_BYTES as u64,
-                reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
                 Arc::new(RequestCapacityProbeCampaignBudget::default()),
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
@@ -4451,7 +4451,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
                 service_instance,
                 9_005,
                 PATH_OPEN_SCORE_BYTES as u64,
-                reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
                 Arc::new(RequestCapacityProbeCampaignBudget::default()),
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
@@ -13165,7 +13165,7 @@ fn quic_capacity_calibration_requires_reachable_underloaded_family() {
             Some(service.key),
             ResponseServiceFamilyLoads::new(2, 0),
             MuxLimits::default(),
-            reliable_quic_capacity_calibration_session_limit_bytes(MuxLimits::default()),
+            reliable_capacity_calibration_session_limit_bytes(MuxLimits::default()),
         )
         .map(|target| target.key),
         Some(udp.key),
@@ -13178,7 +13178,7 @@ fn quic_capacity_calibration_requires_reachable_underloaded_family() {
             Some(service.key),
             ResponseServiceFamilyLoads::new(1, 1),
             MuxLimits::default(),
-            reliable_quic_capacity_calibration_session_limit_bytes(MuxLimits::default()),
+            reliable_capacity_calibration_session_limit_bytes(MuxLimits::default()),
         )
         .is_none(),
         "balanced Service families need no optional carrier calibration"
@@ -13194,7 +13194,7 @@ fn quic_capacity_calibration_requires_reachable_underloaded_family() {
             }),
             ResponseServiceFamilyLoads::new(2, 0),
             MuxLimits::default(),
-            reliable_quic_capacity_calibration_session_limit_bytes(MuxLimits::default()),
+            reliable_capacity_calibration_session_limit_bytes(MuxLimits::default()),
         )
         .is_none(),
         "capacity traffic must not replace path reachability proof"
@@ -13211,7 +13211,7 @@ fn request_quic_capacity_geometry_models_the_competing_service_rate_pipe() {
         candidate,
         100_000_000.0,
         mux_limits,
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(mux_limits),
     )
     .expect("the competing pipe should fit the default session envelope");
 
@@ -13243,7 +13243,7 @@ fn request_tcp_capacity_geometry_requires_mature_service_and_full_pipe() {
         rate_bps: 100_000_000.0,
         delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
     };
-    let envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    let envelope = reliable_capacity_calibration_session_limit_bytes(mux_limits);
 
     let geometry =
         request_tcp_capacity_calibration_geometry(candidate, mature_service, mux_limits, envelope)
@@ -13295,7 +13295,7 @@ fn request_tcp_capacity_geometry_requires_mature_service_and_full_pipe() {
 #[test]
 fn request_capacity_candidate_share_is_fixed_by_eligible_topology() {
     let mux_limits = MuxLimits::default();
-    let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    let session_limit = reliable_capacity_calibration_session_limit_bytes(mux_limits);
 
     assert_eq!(
         request_capacity_stable_candidate_share_bytes(mux_limits, 4),
@@ -13357,7 +13357,7 @@ fn request_tcp_capacity_lease_is_derived_from_growth_service_and_recovery() {
 #[test]
 fn request_quic_capacity_geometry_excludes_candidate_product_flight() {
     let mux_limits = MuxLimits::default();
-    let envelope = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    let envelope = reliable_capacity_calibration_session_limit_bytes(mux_limits);
     let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
     candidate.inflight_limit_bytes = 262_144;
     candidate.product_bytes_in_flight = 3_000_000;
@@ -13394,7 +13394,7 @@ fn request_quic_capacity_geometry_requires_valid_rate_and_budget() {
             candidate,
             f64::NAN,
             mux_limits,
-            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(mux_limits),
         )
         .is_none(),
         "an invalid carrier rate must not size capacity traffic"
@@ -13404,24 +13404,23 @@ fn request_quic_capacity_geometry_requires_valid_rate_and_budget() {
         candidate,
         2_000_000_000.0,
         mux_limits,
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(mux_limits),
     )
     .expect("a bounded train can still test capacity below a larger competing pipe");
     assert_eq!(
         bounded.train_bytes,
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits)
+        reliable_capacity_calibration_session_limit_bytes(mux_limits)
     );
     assert!(bounded.desired_warmup_carrier_bytes > bounded.warmup_carrier_bytes);
 
     let mut carrier_loaded = candidate;
-    carrier_loaded.bytes_in_flight =
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    carrier_loaded.bytes_in_flight = reliable_capacity_calibration_session_limit_bytes(mux_limits);
     assert!(
         request_quic_capacity_calibration_geometry(
             carrier_loaded,
             100_000_000.0,
             mux_limits,
-            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(mux_limits),
         )
         .is_none(),
         "the session envelope must not clamp below native carrier flight"
@@ -13463,7 +13462,7 @@ fn quic_capacity_calibration_prefers_fresh_path_before_retry() {
         Some(service.key),
         ResponseServiceFamilyLoads::new(2, 0),
         mux_limits,
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(mux_limits),
     )
     .expect("at least one reachable UDP path should remain probeable");
 
@@ -13489,7 +13488,7 @@ fn quic_capacity_calibration_filters_path_at_attempt_limit() {
             Some(service.key),
             ResponseServiceFamilyLoads::new(2, 0),
             mux_limits,
-            reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(mux_limits),
         )
         .is_none(),
         "a path must not exceed its exact-path calibration attempt limit"
@@ -13499,7 +13498,7 @@ fn quic_capacity_calibration_filters_path_at_attempt_limit() {
 #[test]
 fn quic_capacity_calibration_uses_smaller_retry_when_fresh_train_does_not_fit() {
     let mux_limits = MuxLimits::default();
-    let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(mux_limits);
+    let session_limit = reliable_capacity_calibration_session_limit_bytes(mux_limits);
     let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
     let mut retry = response_target(1, UnderlayProtocol::Udp, 50.0, 0, 1, false);
     retry.has_bulk_rate_evidence = false;
@@ -13559,7 +13558,7 @@ fn quic_capacity_retry_fills_live_window_plus_fresh_proof_window() {
     );
     assert_eq!(
         response_quic_capacity_calibration_train_bytes(&udp, mux_limits) as u64,
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(mux_limits),
         "a single train cannot exceed the session carrier envelope"
     );
 }

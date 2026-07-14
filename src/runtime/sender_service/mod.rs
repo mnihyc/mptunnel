@@ -19,6 +19,12 @@ use super::model::admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
 };
+use super::model::request::capacity::{
+    request_capacity_stable_candidate_share_bytes, request_quic_capacity_calibration_geometry,
+    request_quic_capacity_calibration_lease, request_quic_capacity_slow_start_rounds,
+    request_tcp_capacity_calibration_geometry, request_tcp_capacity_calibration_lease,
+    request_tcp_capacity_candidate_can_start_receipt,
+};
 use super::model::request::evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidence, RequestPathRateEvidenceUpdate,
     RequestPerFlowRateModel, RequestTcpAckTurnoverModel, request_path_rate_coverage_floor_bytes,

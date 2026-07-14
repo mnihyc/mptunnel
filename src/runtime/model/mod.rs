@@ -10,6 +10,7 @@ pub(in crate::runtime) mod capacity;
 pub(in crate::runtime) mod multipath;
 pub(in crate::runtime) mod request;
 mod response_ownership;
+pub(in crate::runtime) mod timing;
 pub(in crate::runtime) mod work;
 
 pub(super) use response_ownership::{

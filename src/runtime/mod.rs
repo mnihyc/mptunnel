@@ -24,9 +24,6 @@ mod tun_l4;
 mod udp_metrics;
 mod udp_path;
 
-pub(super) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
-pub(super) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
-
 pub use core::run;
 pub use datagram::client_udp_datagram_round_trip;
 pub use error::RuntimeError;
@@ -39,6 +36,7 @@ use ingress_runtime::*;
 use management::*;
 use model::capacity::*;
 use model::multipath::*;
+use model::timing::*;
 use model::work::*;
 use path_commands::*;
 use path_common::*;

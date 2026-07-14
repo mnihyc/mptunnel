@@ -333,12 +333,6 @@ struct FixedReliablePathModel {
     flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
 }
 
-pub(in crate::runtime) fn product_delivery_samples_override_startup_prior(
-    delivery_samples: u32,
-) -> bool {
-    delivery_samples >= RELIABLE_INITIAL_WINDOW_PACKETS as u32
-}
-
 impl FixedReliablePathOutput {
     #[cfg(test)]
     pub(super) fn new(

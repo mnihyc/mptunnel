@@ -5,7 +5,7 @@ use super::management::*;
 use super::model::admission::*;
 use super::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
-    QUIC_PERSISTENT_CONGESTION_THRESHOLD,
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD, reliable_capacity_calibration_session_limit_bytes,
 };
 use super::path_commands::*;
 use super::path_model::*;
@@ -1157,7 +1157,7 @@ mod request_quic_capacity_product_handoff_tests {
             path_index,
             token,
             train_bytes,
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
         )
     }
 
@@ -1315,8 +1315,7 @@ mod request_quic_capacity_product_handoff_tests {
     #[test]
     fn request_tcp_capacity_path_share_is_cumulative_and_cannot_expand() {
         let context = request_tcp_capacity_test_context(2);
-        let session_limit =
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
         let path_share = 8 * 1024 * 1024;
         let half_share = path_share / 2;
 
@@ -1395,8 +1394,7 @@ mod request_quic_capacity_product_handoff_tests {
     #[test]
     fn request_quic_capacity_refund_and_replacement_preserve_frozen_share() {
         let context = request_quic_capacity_test_context(1);
-        let session_limit =
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
         let path_share = 8 * 1024 * 1024;
         let provisional_bytes = 1024 * 1024;
         let now = Instant::now();
@@ -1498,8 +1496,7 @@ mod request_quic_capacity_product_handoff_tests {
         );
         let context = ClientPathContext::new(paths, security, ResourceLimits::default())
             .expect("mixed capacity test context");
-        let session_limit =
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
         let train_bytes = 1024 * 1024;
         let path_share = 8 * 1024 * 1024;
         let tcp_campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
@@ -1546,8 +1543,7 @@ mod request_quic_capacity_product_handoff_tests {
     #[test]
     fn request_tcp_capacity_reservations_are_path_parallel_and_session_bounded() {
         let context = request_tcp_capacity_test_context(3);
-        let session_limit =
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
         let first_bytes = session_limit / 2;
         let second_bytes = session_limit - first_bytes;
 
@@ -1602,8 +1598,7 @@ mod request_quic_capacity_product_handoff_tests {
     #[test]
     fn request_tcp_capacity_unwritten_refund_is_terminal_and_path_local() {
         let context = request_tcp_capacity_test_context(3);
-        let session_limit =
-            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
         let train_bytes = 1024 * 1024;
         let before = context.request_tcp_capacity_probe_remaining_bytes();
         assert_eq!(before, session_limit);
@@ -2743,13 +2738,13 @@ impl ClientPathContext {
 
     pub(super) fn request_quic_capacity_probe_remaining_bytes(&self) -> u64 {
         self.request_quic_capacity_probe.budget.remaining_bytes(
-            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
         )
     }
 
     pub(super) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
         self.request_tcp_capacity_probe.budget.remaining_bytes(
-            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
         )
     }
 
@@ -2761,7 +2756,7 @@ impl ClientPathContext {
             .budget
             .effective_candidate_share_bytes(
                 proposed_path_limit,
-                reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
             )
     }
 
@@ -2773,7 +2768,7 @@ impl ClientPathContext {
             .budget
             .effective_candidate_share_bytes(
                 proposed_path_limit,
-                reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
             )
     }
 
@@ -2787,7 +2782,7 @@ impl ClientPathContext {
             .path_remaining_bytes(
                 path_index,
                 path_limit,
-                reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
             )
     }
 
@@ -2799,7 +2794,7 @@ impl ClientPathContext {
         self.request_tcp_capacity_probe.budget.path_remaining_bytes(
             path_index,
             path_limit,
-            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
         )
     }
 
@@ -2840,7 +2835,7 @@ impl ClientPathContext {
         if record.request_tcp_capacity_probe.is_some() || record.tcp_capacity_proof.is_some() {
             return None;
         }
-        let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(self.mux_limits);
         let campaign_limit = self
             .request_tcp_capacity_probe
             .budget
@@ -2973,7 +2968,7 @@ impl ClientPathContext {
         {
             return None;
         }
-        let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits);
+        let session_limit = reliable_capacity_calibration_session_limit_bytes(self.mux_limits);
         let campaign_limit = self
             .request_quic_capacity_probe
             .budget

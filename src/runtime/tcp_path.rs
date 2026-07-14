@@ -816,7 +816,7 @@ async fn handle_connected_client_tcp_command_run(
                     || path_instance.key.index != runtime.path_index
                     || probe.train_payload_bytes < probe.sample_floor_bytes
                     || probe.train_payload_bytes
-                        > reliable_quic_capacity_calibration_session_limit_bytes(mux_limits)
+                        > reliable_capacity_calibration_session_limit_bytes(mux_limits)
                     || !probe.valid_request_tcp_train()
                     || connection.request_tcp_capacity_probe.is_some()
                 {
@@ -1619,7 +1619,7 @@ pub(super) async fn connect_client_tcp_path(
             request_tcp_capacity_probe: None,
             discarded_request_tcp_capacity_receipt: None,
             capacity_receive: CapacityReceiveTracker::new(
-                reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+                reliable_capacity_calibration_session_limit_bytes(mux_limits),
             ),
         })
     };

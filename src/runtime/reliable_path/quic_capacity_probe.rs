@@ -1,11 +1,11 @@
 use super::response_admission::{
-    ResponseSenderPathTarget, reliable_quic_capacity_calibration_session_limit_bytes,
-    server_output_has_bulk_rate_evidence_with_limits,
+    ResponseSenderPathTarget, server_output_has_bulk_rate_evidence_with_limits,
 };
 use super::{CarrierPathKey, ResponseStreamBinding, ServerCarrierPathInstanceId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
+use crate::runtime::model::capacity::reliable_capacity_calibration_session_limit_bytes;
 use crate::scheduler::FlowLane;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -114,9 +114,9 @@ impl ResponseStreamBinding {
         request: ResponseQuicCapacityCalibrationRequest,
         lease_after_admission: impl FnOnce(Duration) -> Duration,
     ) -> bool {
-        let session_envelope = usize::try_from(
-            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
-        )
+        let session_envelope = usize::try_from(reliable_capacity_calibration_session_limit_bytes(
+            self.mux_limits,
+        ))
         .unwrap_or(usize::MAX);
         if !self.response_stream_open.load(Ordering::Acquire)
             || request.target != target.key

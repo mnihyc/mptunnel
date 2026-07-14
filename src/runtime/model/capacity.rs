@@ -3,6 +3,7 @@
 //! These constants describe protocol/model geometry. Runtime services measure
 //! paths and apply decisions; they do not own these values.
 
+use crate::mux::MuxLimits;
 use std::time::Duration;
 
 pub(in crate::runtime) const TRANSPORT_MSS_BYTES: usize = 1460;
@@ -25,6 +26,39 @@ pub(in crate::runtime) const RELIABLE_INITIAL_RTT: Duration = Duration::from_mil
 pub(in crate::runtime) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 pub(in crate::runtime) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 pub(in crate::runtime) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
+pub(in crate::runtime) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
+pub(in crate::runtime) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
+pub(in crate::runtime) const CAPACITY_TIMING_SLACK_BYTES: u64 = BBR_MAX_SEND_QUANTUM_BYTES as u64;
+
+pub(in crate::runtime) fn product_delivery_samples_override_startup_prior(
+    delivery_samples: u32,
+) -> bool {
+    delivery_samples >= RELIABLE_INITIAL_WINDOW_PACKETS as u32
+}
+
+pub(in crate::runtime) fn reliable_subflow_startup_sample_limit_bytes(
+    mux_limits: MuxLimits,
+) -> u64 {
+    let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
+        .min(mux_limits.max_repair_bytes as u64)
+        .min(mux_limits.max_reorder_bytes as u64)
+        .min(mux_limits.max_stream_window_bytes)
+        .max(1);
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
+        .saturating_div(2)
+        .max(PATH_OPEN_SCORE_BYTES as u64)
+        .min(configured_envelope)
+}
+
+pub(in crate::runtime) fn reliable_capacity_calibration_session_limit_bytes(
+    mux_limits: MuxLimits,
+) -> u64 {
+    (mux_limits.max_path_flight_bytes as u64)
+        .min(mux_limits.max_repair_bytes as u64)
+        .min(mux_limits.max_reorder_bytes as u64)
+        .min(mux_limits.max_stream_window_bytes)
+        .max(1)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct PathRateSample {

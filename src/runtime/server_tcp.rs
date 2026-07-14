@@ -102,7 +102,7 @@ pub(super) async fn handle_server_path(
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
     let mut request_capacity_receive = CapacityReceiveTracker::new(
-        reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
     );
     let mut tcp_capacity_probe = None::<PendingTcpCapacityProbe>;
 

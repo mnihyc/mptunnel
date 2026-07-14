@@ -1295,30 +1295,6 @@ fn server_path_metrics_has_sender_evidence(path_metrics: ServerPathMetricsEntry)
             || path_metrics.metrics.confidence_ppm > 0)
 }
 
-pub(in crate::runtime) fn reliable_subflow_startup_sample_limit_bytes(
-    mux_limits: MuxLimits,
-) -> u64 {
-    let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
-        .min(mux_limits.max_repair_bytes as u64)
-        .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
-        .max(1);
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
-        .saturating_div(2)
-        .max(PATH_OPEN_SCORE_BYTES as u64)
-        .min(configured_envelope)
-}
-
-pub(in crate::runtime) fn reliable_quic_capacity_calibration_session_limit_bytes(
-    mux_limits: MuxLimits,
-) -> u64 {
-    (mux_limits.max_path_flight_bytes as u64)
-        .min(mux_limits.max_repair_bytes as u64)
-        .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
-        .max(1)
-}
-
 pub(in crate::runtime) fn server_output_has_sender_evidence(
     entry: &ResponseStreamOutputEntry,
 ) -> bool {

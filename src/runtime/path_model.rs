@@ -1,4 +1,5 @@
 use super::model::admission::BulkPathCandidate;
+use super::model::timing::*;
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -68,70 +69,6 @@ fn path_bdp_floor_bytes(path: PathSnapshot) -> f64 {
 
 fn adaptive_transport_byte_floor_factor(minimum_bytes: f64, model_bytes: f64) -> f64 {
     minimum_bytes.max(1.0) / model_bytes.max(minimum_bytes).max(1.0)
-}
-
-pub(super) fn transport_pto_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
-    let srtt = Duration::from_secs_f64(srtt_ms.max(0.0) / 1000.0);
-    let rttvar = Duration::from_secs_f64(rttvar_ms.max(0.0) / 1000.0);
-    srtt + (rttvar * 4).max(QUIC_TIMER_GRANULARITY) + QUIC_MAX_ACK_DELAY
-}
-
-pub(super) fn quic_bulk_proof_freshness_horizon(srtt: Duration, rttvar: Duration) -> Duration {
-    // A rate proof loses placement rights at the same three-PTO boundary where
-    // QUIC declares persistent congestion; reachability evidence is separate.
-    transport_pto_from_ms(srtt.as_secs_f64() * 1000.0, rttvar.as_secs_f64() * 1000.0)
-        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
-}
-
-pub(super) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
-    path.map(|path| {
-        let srtt_ms = path.srtt_ms.max(1.0);
-        let rttvar_ms = path.jitter_ms.max(srtt_ms / 8.0);
-        transport_pto_from_ms(srtt_ms, rttvar_ms)
-    })
-    .unwrap_or_else(default_transport_pto)
-}
-
-pub(super) fn path_open_pto(path: Option<PathSnapshot>, rtt_is_observed: bool) -> Duration {
-    let path_pto = transport_pto_from_snapshot(path);
-    if rtt_is_observed {
-        path_pto
-    } else {
-        path_pto.max(default_transport_pto())
-    }
-}
-
-pub(super) fn active_path_open_timeout(
-    path: Option<PathSnapshot>,
-    rtt_is_observed: bool,
-) -> Duration {
-    path_open_pto(path, rtt_is_observed).saturating_mul(active_path_open_pto_multiplier(path))
-}
-
-pub(super) fn active_path_open_pto_multiplier(path: Option<PathSnapshot>) -> u32 {
-    active_path_open_serialized_exchanges(path)
-        .saturating_sub(1)
-        .saturating_add(persistent_congestion_pto_backoff_multiplier())
-}
-
-pub(super) fn persistent_congestion_pto_backoff_multiplier() -> u32 {
-    (0..QUIC_PERSISTENT_CONGESTION_THRESHOLD).fold(0_u32, |total, exponent| {
-        total.saturating_add(1_u32.checked_shl(exponent).unwrap_or(u32::MAX))
-    })
-}
-
-pub(super) fn active_path_open_serialized_exchanges(path: Option<PathSnapshot>) -> u32 {
-    match path.map(|snapshot| snapshot.underlay) {
-        Some(UnderlayProtocol::Udp) => 2,
-        Some(UnderlayProtocol::Tcp) | None => 3,
-    }
-}
-
-pub(super) fn default_transport_pto() -> Duration {
-    transport_pto_from_ms(
-        RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0,
-        RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0 / 2.0,
-    )
 }
 
 pub(super) fn path_record_failure_cooldown(record: &ClientPathHealthRecord) -> Duration {

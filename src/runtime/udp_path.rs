@@ -1262,7 +1262,7 @@ async fn run_client_udp_stream(
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
     let mut capacity_receive = CapacityReceiveTracker::new(
-        reliable_quic_capacity_calibration_session_limit_bytes(mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(mux_limits),
     );
     let path_id = PathId(path_index as u16);
     loop {
@@ -2600,7 +2600,7 @@ async fn run_server_udp_reliable_stream_loop(
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
     let mut capacity_receive = CapacityReceiveTracker::new(
-        reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+        reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
     );
 
     loop {

@@ -4,15 +4,16 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
+source "$script_dir/result-paths.sh"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-result_root="${RESULT_ROOT:-lab/results/perf-diagnostics-${timestamp}}"
+result_root="$(normalize_lab_result_path "${RESULT_ROOT:-lab/results/perf-diagnostics-${timestamp}}")"
 mkdir -p "$result_root"
 
 compose_file="${COMPOSE_FILE:-lab/docker-compose.yml}"
-result_file="${RESULT_FILE:-${result_root}/results.jsonl}"
-summary_file="${PERF_SUMMARY_FILE:-${result_root}/component-summary.json}"
-stats_file="${DOCKER_STATS_FILE:-${result_root}/docker-stats.jsonl}"
+result_file="$(normalize_lab_result_path "${RESULT_FILE:-${result_root}/results.jsonl}")"
+summary_file="$(normalize_lab_result_path "${PERF_SUMMARY_FILE:-${result_root}/component-summary.json}")"
+stats_file="$(normalize_lab_result_path "${DOCKER_STATS_FILE:-${result_root}/docker-stats.jsonl}")"
 stats_interval="${MPTUNNEL_PERF_STATS_INTERVAL_SECONDS:-1}"
 stop_file="${result_root}/.stop-sampler"
 

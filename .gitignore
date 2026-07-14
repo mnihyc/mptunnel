@@ -2,7 +2,13 @@
 /lab/benchmarks/target/
 /dist/
 /lab/results/
-/lab/__pycache__/
+**/__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.ruff_cache/
+/.bisect-target/
+/.worktrees/
+/iteration*/
 /AGENTS.md
 /DESIGN.md
 /PROGRESS.md

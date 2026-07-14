@@ -4,10 +4,11 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
+source "$script_dir/result-paths.sh"
 
 profile="${EXPERIMENT_PROFILE:-standard}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-result_root="${RESULT_ROOT:-lab/results/exhaustive-${timestamp}}"
+result_root="$(normalize_lab_result_path "${RESULT_ROOT:-lab/results/exhaustive-${timestamp}}")"
 
 case "$profile" in
   smoke)

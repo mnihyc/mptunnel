@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
+source "$script_dir/result-paths.sh"
 
 flag_enabled() {
   case "${1,,}" in
@@ -34,9 +35,9 @@ if ! flock -n "$lab_lock_fd"; then
 fi
 
 compose_file="${COMPOSE_FILE:-lab/docker-compose.yml}"
-result_dir="${RESULT_DIR:-lab/results}"
+result_dir="$(normalize_lab_result_path "${RESULT_DIR:-lab/results}")"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-result_file="${RESULT_FILE:-$result_dir/heterogeneous-$timestamp.jsonl}"
+result_file="$(normalize_lab_result_path "${RESULT_FILE:-$result_dir/heterogeneous-$timestamp.jsonl}")"
 object_mib="${MPTUNNEL_LAB_OBJECT_MIB:-1024}"
 large_http_path="${MPTUNNEL_LAB_LARGE_HTTP_PATH:-/large.bin}"
 small_http_path="${MPTUNNEL_LAB_SMALL_HTTP_PATH:-/small.bin}"

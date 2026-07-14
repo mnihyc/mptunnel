@@ -446,8 +446,12 @@ Useful environment variables:
 - `MPTUNNEL_LAB_FLAP_MIN_SECONDS`, `MPTUNNEL_LAB_FLAP_MAX_SECONDS`, `MPTUNNEL_LAB_FLAP_MODES`: link-flapping cadence and supported netem mode list for unstable-link cases.
 - `MPTUNNEL_LAB_FLAP_SEED`: optional decimal or text seed for the versioned flapping schedule generator. The same seed, ordered mode list, and hold bounds reproduce the same intended mode/hold sequence. Each hold begins after both client and server netem commands finish so slow control commands cannot compress a configured dwell. If omitted, the lab generates and records a 64-bit seed.
 - `KEEP_LAB=1`: keep containers running after the script exits.
-- `RESULT_FILE`: explicit JSONL output path.
-- `RESULT_ROOT`: output directory for matrix runs.
+- `RESULT_FILE`: explicit JSONL output path. Relative paths are rooted under
+  `lab/results/`; use an absolute path for external storage.
+- `RESULT_DIR`: heterogeneous-run output directory. A relative label such as
+  `tcp-recruitment-r1` becomes `lab/results/tcp-recruitment-r1`.
+- `RESULT_ROOT`: output directory for matrix runs, with the same relative-label
+  behavior as `RESULT_DIR`.
 - `CASE_FILTER`: comma-separated case names or shell globs for targeted reruns, for example `mptunnel_tcp_single_*,mptunnel_tcp_multipath_all`.
 - `MPTUNNEL_LAB_DIAGNOSTICS=1 MPTUNNEL_LAB_DIAG=1`: build the optimized `lab-diagnostics` binary and emit internal diagnostic lines into the client/server `/tmp/mptunnel-*.log` files, including reliable-stream path open attempts/successes and UDP stream congestion state. Successful download rows also keep bounded client/server log tails when this is enabled. Use this only for investigation; release comparisons should run without diagnostic instrumentation.
 - `MPTUNNEL_LAB_DIAG_EVENTS=event_a,event_b`: with diagnostic emission enabled, retain only the exact comma-separated event names. An unset, empty, or `*` value retains all events. Use a narrow allowlist for multi-gigabit lifecycle traces so per-frame candidate and dispatch formatting does not dominate the workload. `sender_service_conformance` explicitly enables the otherwise filtered per-frame conformance counters and assertion. Filtered runs remain instrumented causal evidence, never release-comparable measurements.

@@ -887,3 +887,7 @@ impl ServerPathLaneTracker {
         let _ = retired_reservation;
     }
 }
+
+#[cfg(test)]
+#[path = "response_quic_capacity_test.rs"]
+mod tests;

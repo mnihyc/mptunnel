@@ -9,7 +9,10 @@ fn system_udp_socket_is_bound_for_quic_handoff() {
     let path = path("udp://192.0.2.1:443");
     let carrier = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
-        config_ordinal: 0,
+        identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
         remote_addr: "192.0.2.1:443".parse().expect("remote address"),
     })
     .expect("carrier socket");
@@ -25,7 +28,10 @@ fn system_socket_defers_source_family_check_until_resolution() {
     let path = path("tcp://example.test:443?source-ip=192.0.2.10");
     let error = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
-        config_ordinal: 0,
+        identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
         remote_addr: "[2001:db8::1]:443".parse().expect("remote address"),
     })
     .expect_err("source family mismatch");
@@ -38,7 +44,10 @@ fn carrier_conversion_rejects_the_wrong_transport() {
     let path = path("udp://192.0.2.1:443");
     let carrier = CarrierSocket::system(CarrierSocketRequest {
         path: &path,
-        config_ordinal: 0,
+        identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
         remote_addr: "192.0.2.1:443".parse().expect("remote address"),
     })
     .expect("carrier socket");

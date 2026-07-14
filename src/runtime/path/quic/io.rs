@@ -51,7 +51,7 @@ impl UdpPathEndpoint {
         path: &PathSpec,
         context: &ServerPathContext,
     ) -> Result<Self, RuntimeError> {
-        let addrs = resolve_udp_path_socket_addrs(path).await?;
+        let addrs = resolve_udp_server_path_socket_addrs(path).await?;
         let mut last_error = None;
         for addr in addrs {
             match quic_transport::Endpoint::bind_server(
@@ -323,14 +323,21 @@ pub(super) fn udp_path_command_queue(mux_limits: MuxLimits, _codec_limits: Codec
     reliable_path_command_queue(mux_limits)
 }
 
-/// Resolves every address the configured source binding can actually use.
-/// Address order remains resolver-owned; connection setup decides retry timing.
-pub(super) async fn resolve_udp_path_socket_addrs(
+/// Server listeners use local host resolution; client carriers resolve through
+/// their host-selected network before applying QUIC's address-attempt policy.
+async fn resolve_udp_server_path_socket_addrs(
     path: &PathSpec,
 ) -> Result<Vec<SocketAddr>, RuntimeError> {
     let resolved = lookup_host((path.endpoint.host.as_str(), path.endpoint.port))
         .await?
         .collect::<Vec<_>>();
+    usable_udp_path_socket_addrs(path, resolved)
+}
+
+pub(super) fn usable_udp_path_socket_addrs(
+    path: &PathSpec,
+    resolved: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, RuntimeError> {
     if resolved.is_empty() {
         return Err(RuntimeError::Udp(UdpTransportError::ResolutionEmpty(
             path.endpoint.authority(),

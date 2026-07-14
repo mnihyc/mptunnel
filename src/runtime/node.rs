@@ -13,7 +13,7 @@ pub(in crate::runtime) use client::probe_paths;
 use crate::config::{AppConfig, CommandConfig};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::packet_device::{PacketDeviceProvider, SystemPacketDeviceProvider};
-use crate::transport::{CarrierSocketProvider, SystemCarrierSocketProvider};
+use crate::transport::{CarrierNetworkProvider, SystemCarrierNetworkProvider};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -21,7 +21,7 @@ pub async fn run(config: AppConfig) -> Result<(), RuntimeError> {
     run_with_host_providers(
         config,
         Arc::new(SystemPacketDeviceProvider),
-        Arc::new(SystemCarrierSocketProvider),
+        Arc::new(SystemCarrierNetworkProvider),
     )
     .await
 }
@@ -38,7 +38,7 @@ pub async fn run_with_packet_device_provider(
     run_with_host_providers(
         config,
         packet_devices,
-        Arc::new(SystemCarrierSocketProvider),
+        Arc::new(SystemCarrierNetworkProvider),
     )
     .await
 }
@@ -47,7 +47,7 @@ pub async fn run_with_packet_device_provider(
 pub async fn run_with_host_providers(
     config: AppConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
-    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
 ) -> Result<(), RuntimeError> {
     match config.command {
         CommandConfig::Client(client) => {
@@ -56,7 +56,7 @@ pub async fn run_with_host_providers(
                 config.resources,
                 config.management,
                 packet_devices,
-                carrier_sockets,
+                carrier_network,
             )
             .await
         }
@@ -79,7 +79,7 @@ pub async fn run_with_host_providers(
                 config.resources,
                 config.management,
                 packet_devices,
-                carrier_sockets,
+                carrier_network,
             )
             .await
         }

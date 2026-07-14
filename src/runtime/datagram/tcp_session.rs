@@ -60,17 +60,15 @@ impl TcpDatagramClientSession {
             ClientTcpCarrierConnect {
                 path,
                 path_index,
-                config_ordinal: context.relay_path_config_ordinal(
-                    crate::model::path::RelayPathKey {
-                        underlay: crate::protocol::UnderlayProtocol::Tcp,
-                        index: path_index,
-                    },
-                ),
+                carrier_identity: context.carrier_path_identity(crate::model::path::RelayPathKey {
+                    underlay: crate::protocol::UnderlayProtocol::Tcp,
+                    index: path_index,
+                }),
                 session_id,
                 security,
                 codec_limits: context.codec_limits,
                 mux_limits: context.mux_limits,
-                carrier_sockets: context.carrier_sockets.as_ref(),
+                carrier_network: context.carrier_network.as_ref(),
             },
             open_deadline,
         )

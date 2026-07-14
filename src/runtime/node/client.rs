@@ -12,7 +12,7 @@ use crate::runtime::management::spawn_client_management_services;
 use crate::runtime::packet_device::PacketDeviceProvider;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::tun_l4::run_tun_l4_client;
-use crate::transport::CarrierSocketProvider;
+use crate::transport::CarrierNetworkProvider;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +21,11 @@ pub(super) async fn run(
     resources: ResourceLimits,
     management: ManagementConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
-    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
-    let context = new_path_context(&client, resources, carrier_sockets)?;
+    let context = new_path_context(&client, resources, 0, carrier_network)?;
     let mut services = tokio::task::JoinSet::new();
     if management.enabled() {
         spawn_client_management_services(management, context.clone(), &mut services);
@@ -56,15 +56,17 @@ pub(super) async fn run(
 pub(super) fn new_path_context(
     client: &ClientConfig,
     resources: ResourceLimits,
-    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    path_group_ordinal: usize,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
 ) -> Result<ClientPathContext, RuntimeError> {
-    ClientPathContext::new_with_carrier_sockets(
+    ClientPathContext::new_with_carrier_network(
         client.paths.clone(),
         resources,
         ProxyAuthConfig::disabled(),
         client.route_target.clone(),
         client.ingresses.clone(),
-        carrier_sockets,
+        path_group_ordinal,
+        carrier_network,
     )
 }
 

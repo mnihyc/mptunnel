@@ -421,12 +421,12 @@ async fn connect_client_tcp_path(
         ClientTcpCarrierConnect {
             path: &runtime.path,
             path_index: runtime.path_index,
-            config_ordinal: runtime.config_ordinal,
+            carrier_identity: runtime.carrier_identity,
             session_id: runtime.session_id,
             security: &runtime.security,
             codec_limits: runtime.codec_limits,
             mux_limits: runtime.mux_limits,
-            carrier_sockets: runtime.carrier_sockets.as_ref(),
+            carrier_network: runtime.carrier_network.as_ref(),
         },
         open_deadline,
     )
@@ -453,12 +453,15 @@ pub(in crate::runtime) async fn connect_client_tcp_path_for_test(
         ClientTcpCarrierConnect {
             path,
             path_index,
-            config_ordinal: path_index,
+            carrier_identity: crate::transport::CarrierPathIdentity {
+                group_ordinal: 0,
+                path_ordinal: path_index,
+            },
             session_id,
             security,
             codec_limits,
             mux_limits,
-            carrier_sockets: &crate::transport::SystemCarrierSocketProvider,
+            carrier_network: &crate::transport::SystemCarrierNetworkProvider,
         },
         open_deadline,
     )

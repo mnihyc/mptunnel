@@ -2,7 +2,7 @@ use super::*;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
 use crate::runtime::stream::response::next_server_carrier_path_instance_id;
-use crate::transport::{PathBinding, SystemCarrierSocketProvider};
+use crate::transport::{CarrierPathIdentity, PathBinding, SystemCarrierNetworkProvider};
 
 fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
     ClientTcpPathSessionRuntime {
@@ -13,7 +13,10 @@ fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
             metadata: crate::transport::PathMetadata::default(),
         },
         path_index: 0,
-        config_ordinal: 0,
+        carrier_identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
         session_id: SessionId(7),
         security: security(),
         codec_limits: CodecLimits::default(),
@@ -25,7 +28,7 @@ fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
         }),
-        carrier_sockets: Arc::new(SystemCarrierSocketProvider),
+        carrier_network: Arc::new(SystemCarrierNetworkProvider),
     }
 }
 

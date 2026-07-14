@@ -447,7 +447,7 @@ pub(super) async fn probe_tcp_client_path(
     let probe_rtt = tokio::time::timeout(timeout, async {
         let tcp_stream = tcp::connect_path_with_provider(
             path,
-            context.relay_path_config_ordinal(RelayPathKey {
+            context.carrier_path_identity(RelayPathKey {
                 underlay: UnderlayProtocol::Tcp,
                 index: path_index,
             }),
@@ -455,7 +455,7 @@ pub(super) async fn probe_tcp_client_path(
                 timeout,
                 ..TcpConnectOptions::default()
             },
-            context.carrier_sockets.as_ref(),
+            context.carrier_network.as_ref(),
         )
         .await?;
         let mut framed = EncryptedFramedStream::with_cipher_suite(

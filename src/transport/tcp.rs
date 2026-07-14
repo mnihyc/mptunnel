@@ -1,6 +1,12 @@
+//! TCP listener and connection establishment.
+//!
+//! Configured client paths resolve and create sockets through the host carrier
+//! network; TCP alone owns its sequential address attempts and connect timeout.
+
 use crate::protocol::UnderlayProtocol;
 use crate::transport::{
-    CarrierSocketProvider, CarrierSocketRequest, Endpoint, PathSpec, SystemCarrierSocketProvider,
+    CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
+    Endpoint, PathSpec, SystemCarrierNetworkProvider,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -28,15 +34,24 @@ pub async fn connect_path(
     path: &PathSpec,
     options: TcpConnectOptions,
 ) -> Result<TcpStream, TcpTransportError> {
-    connect_path_with_provider(path, 0, options, &SystemCarrierSocketProvider).await
+    connect_path_with_provider(
+        path,
+        CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
+        options,
+        &SystemCarrierNetworkProvider,
+    )
+    .await
 }
 
-/// Connects a configured carrier through the host socket boundary.
+/// Connects a configured carrier through its host-selected network.
 pub async fn connect_path_with_provider(
     path: &PathSpec,
-    config_ordinal: usize,
+    identity: CarrierPathIdentity,
     options: TcpConnectOptions,
-    provider: &dyn CarrierSocketProvider,
+    provider: &dyn CarrierNetworkProvider,
 ) -> Result<TcpStream, TcpTransportError> {
     if path.underlay != UnderlayProtocol::Tcp {
         return Err(TcpTransportError::WrongUnderlay(path.underlay));
@@ -48,7 +63,17 @@ pub async fn connect_path_with_provider(
         }
         (configured, requested) => configured.or(requested),
     };
-    let addrs = resolve_endpoint(&effective_path.endpoint).await?;
+    let addrs = provider
+        .resolve(CarrierResolutionRequest {
+            path: &effective_path,
+            identity,
+        })
+        .await?;
+    if addrs.is_empty() {
+        return Err(TcpTransportError::ResolutionEmpty(
+            effective_path.endpoint.authority(),
+        ));
+    }
     let mut last_error = None;
     for addr in addrs {
         if effective_path
@@ -58,7 +83,7 @@ pub async fn connect_path_with_provider(
         {
             continue;
         }
-        match connect_carrier_addr(&effective_path, config_ordinal, addr, options, provider).await {
+        match connect_carrier_addr(&effective_path, identity, addr, options, provider).await {
             Ok(stream) => return Ok(stream),
             Err(err) => last_error = Some(err),
         }
@@ -133,14 +158,14 @@ pub async fn connect_addr(
 
 async fn connect_carrier_addr(
     path: &PathSpec,
-    config_ordinal: usize,
+    identity: CarrierPathIdentity,
     addr: SocketAddr,
     options: TcpConnectOptions,
-    provider: &dyn CarrierSocketProvider,
+    provider: &dyn CarrierNetworkProvider,
 ) -> Result<TcpStream, TcpTransportError> {
-    let carrier = provider.create(CarrierSocketRequest {
+    let carrier = provider.create_socket(CarrierSocketRequest {
         path,
-        config_ordinal,
+        identity,
         remote_addr: addr,
     })?;
     let socket = TcpSocket::from_std_stream(carrier.into_tcp_socket()?);

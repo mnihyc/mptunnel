@@ -21,8 +21,8 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 use crate::runtime::recent_ids::reliable_closed_stream_cache_capacity;
 #[cfg(test)]
-use crate::transport::SystemCarrierSocketProvider;
-use crate::transport::{CarrierSocketProvider, PathSpec};
+use crate::transport::SystemCarrierNetworkProvider;
+use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -37,10 +37,11 @@ pub struct ClientPathContext {
     pub(in crate::runtime) udp_paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) tcp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
+    pub(in crate::runtime) path_group_ordinal: usize,
     pub(in crate::runtime) tcp_security: Arc<Vec<SecurityConfig>>,
     pub(in crate::runtime) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(in crate::runtime) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
-    pub(in crate::runtime) carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(super) state: Arc<ClientPathState>,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
@@ -83,23 +84,25 @@ impl ClientPathContext {
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_carrier_sockets(
+        Self::new_with_carrier_network(
             paths,
             resources,
             proxy_auth,
             route_target,
             ingresses,
-            Arc::new(SystemCarrierSocketProvider),
+            0,
+            Arc::new(SystemCarrierNetworkProvider),
         )
     }
 
-    pub fn new_with_carrier_sockets(
+    pub fn new_with_carrier_network(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
         proxy_auth: ProxyAuthConfig,
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
-        carrier_sockets: Arc<dyn CarrierSocketProvider>,
+        path_group_ordinal: usize,
+        carrier_network: Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
@@ -162,7 +165,10 @@ impl ClientPathContext {
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
                     path,
                     path_index,
-                    config_ordinal: tcp_path_ordinals[path_index],
+                    carrier_identity: CarrierPathIdentity {
+                        group_ordinal: path_group_ordinal,
+                        path_ordinal: tcp_path_ordinals[path_index],
+                    },
                     session_id,
                     security: tcp_security[path_index].clone(),
                     codec_limits,
@@ -173,7 +179,7 @@ impl ClientPathContext {
                         resources.max_streams,
                     ),
                     state: state.clone(),
-                    carrier_sockets: carrier_sockets.clone(),
+                    carrier_network: carrier_network.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -185,14 +191,17 @@ impl ClientPathContext {
                 ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
                     path,
                     path_index,
-                    config_ordinal: udp_path_ordinals[path_index],
+                    carrier_identity: CarrierPathIdentity {
+                        group_ordinal: path_group_ordinal,
+                        path_ordinal: udp_path_ordinals[path_index],
+                    },
                     session_id,
                     security: udp_security[path_index].clone(),
                     codec_limits,
                     mux_limits,
                     stream_frame_queue: reliable_stream_frame_queue(mux_limits),
                     state: state.clone(),
-                    carrier_sockets: carrier_sockets.clone(),
+                    carrier_network: carrier_network.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -205,10 +214,11 @@ impl ClientPathContext {
             udp_paths: Arc::new(udp_paths),
             tcp_path_ordinals: Arc::new(tcp_path_ordinals),
             udp_path_ordinals: Arc::new(udp_path_ordinals),
+            path_group_ordinal,
             tcp_security: Arc::new(tcp_security),
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
-            carrier_sockets,
+            carrier_network,
             state,
             codec_limits,
             mux_limits,
@@ -232,6 +242,16 @@ impl ClientPathContext {
             UnderlayProtocol::Udp => self.udp_path_ordinals.get(key.index).copied(),
         }
         .unwrap_or(usize::MAX)
+    }
+
+    pub(in crate::runtime) fn carrier_path_identity(
+        &self,
+        key: RelayPathKey,
+    ) -> CarrierPathIdentity {
+        CarrierPathIdentity {
+            group_ordinal: self.path_group_ordinal,
+            path_ordinal: self.relay_path_config_ordinal(key),
+        }
     }
 
     pub(in crate::runtime) fn relay_path_key_order(

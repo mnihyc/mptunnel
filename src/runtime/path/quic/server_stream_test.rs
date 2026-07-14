@@ -14,8 +14,8 @@ use crate::runtime::path::{ClientPathHealth, ClientPathState};
 use crate::runtime::relay::ServerReliableRelayService;
 use crate::runtime::stream::AcceptedServerReliableStream;
 use crate::transport::{
-    CarrierSocket, CarrierSocketRequest, Endpoint as PathEndpoint, PathBinding, PathMetadata,
-    PathSpec, SystemCarrierSocketProvider,
+    CarrierPathIdentity, CarrierSocket, CarrierSocketRequest, Endpoint as PathEndpoint,
+    PathBinding, PathMetadata, PathSpec, SystemCarrierNetworkProvider,
 };
 use std::time::Duration;
 
@@ -118,7 +118,10 @@ impl ServerUdpTerminalWriterFixture {
         let client_runtime = ClientUdpPathSessionRuntime {
             path: client_path.clone(),
             path_index: 0,
-            config_ordinal: 0,
+            carrier_identity: CarrierPathIdentity {
+                group_ordinal: 0,
+                path_ordinal: 0,
+            },
             session_id,
             security: context.security.clone(),
             codec_limits: context.codec_limits,
@@ -128,11 +131,14 @@ impl ServerUdpTerminalWriterFixture {
                 tcp: Vec::new(),
                 udp: Vec::new(),
             }),
-            carrier_sockets: Arc::new(SystemCarrierSocketProvider),
+            carrier_network: Arc::new(SystemCarrierNetworkProvider),
         };
         let client_carrier = CarrierSocket::system(CarrierSocketRequest {
             path: &client_path,
-            config_ordinal: 0,
+            identity: CarrierPathIdentity {
+                group_ordinal: 0,
+                path_ordinal: 0,
+            },
             remote_addr: server_addr,
         })
         .expect("create client QUIC carrier");

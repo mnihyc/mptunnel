@@ -5,7 +5,7 @@ use crate::config::{ManagementConfig, NodeConfig, ResourceLimits};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::management::spawn_node_management_services;
 use crate::runtime::packet_device::PacketDeviceProvider;
-use crate::transport::CarrierSocketProvider;
+use crate::transport::CarrierNetworkProvider;
 use std::sync::Arc;
 
 pub(super) async fn run(
@@ -13,14 +13,19 @@ pub(super) async fn run(
     resources: ResourceLimits,
     management: ManagementConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
-    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
 ) -> Result<(), RuntimeError> {
     let mut services = tokio::task::JoinSet::new();
     let mut path_probe_services = Vec::with_capacity(node.clients.len());
 
     let mut client_contexts = Vec::with_capacity(node.clients.len());
-    for client_config in node.clients {
-        let context = client::new_path_context(&client_config, resources, carrier_sockets.clone())?;
+    for (path_group_ordinal, client_config) in node.clients.into_iter().enumerate() {
+        let context = client::new_path_context(
+            &client_config,
+            resources,
+            path_group_ordinal,
+            carrier_network.clone(),
+        )?;
         path_probe_services.push((
             context.clone(),
             client_config.path_probe_interval,

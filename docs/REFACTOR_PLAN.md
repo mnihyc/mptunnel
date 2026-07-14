@@ -103,14 +103,12 @@ it must not gate TCP eligibility. Windows client/Linux server is the primary
 cross-platform role pair, while macOS and Android remain explicit design and
 verification targets.
 
-The remaining deployment boundary is carrier socket creation. `PathSpec`
-currently cannot select a source network, and an Android VPN host cannot protect
-internally-created TCP/QUIC sockets from its own full-tunnel route. Introduce a
-narrow carrier-socket provider beside, not inside, packet-device ownership:
-TCP and QUIC request raw sockets from it before bind/connect, while platform
-hosts apply source binding, interface/network selection, or Android
-`VpnService.protect`/`Network.bindSocket`. No OS type or branch enters model or
-scheduler state.
+Carrier network access is a narrow host provider beside, not inside,
+packet-device ownership. It receives the configured path and typed client-group
+and path ordinals for both endpoint resolution and raw socket construction,
+allowing platform hosts to keep DNS and connect on one source network or Android
+`Network`. TCP and QUIC retain separate address-attempt and handshake algorithms
+after that shared boundary. No OS type or branch enters model or scheduler state.
 
 ## Migration order
 

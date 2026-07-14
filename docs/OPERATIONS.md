@@ -43,7 +43,7 @@ Windows:
 Android embedding:
 
 - `VpnService.Builder.establish()` creates the TUN; the standalone mptunnel binary does not create an Android device.
-- The host implements `runtime::PacketDeviceProvider`, consumes the service's owned descriptor with `runtime::PacketDevice::from_owned_fd`, and also implements `transport::CarrierSocketProvider` so every TCP/QUIC carrier socket is protected or bound outside the VPN before connection. Pass both providers to `runtime::run_with_host_providers`; the packet-device-only entry point uses system carrier sockets and is not valid for a catch-all Android VPN.
+- The host implements `runtime::PacketDeviceProvider`, consumes the service's owned descriptor with `runtime::PacketDevice::from_owned_fd`, and also implements `transport::CarrierNetworkProvider`. Its resolver must use the selected Android `Network`, and each TCP/QUIC carrier socket must be protected or bound to that same network before connection. Pass both providers to `runtime::run_with_host_providers`; the packet-device-only entry point uses the system carrier network and is not valid for a catch-all Android VPN.
 - One descriptor is supplied for each configured TUN ingress. The provider transfers descriptor ownership to the runtime, which closes it when the packet device is dropped.
 - VPN permission, addresses, routes, MTU, descriptor revocation, JNI bindings, and application/service lifecycle remain host-owned. The host configuration must agree with the `TunL4Config` used by mptunnel's user-space stack.
 - The Android platform report describes this embedding requirement; it cannot inspect a future or application-owned descriptor.

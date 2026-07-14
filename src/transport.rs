@@ -1,5 +1,5 @@
 pub(crate) mod aead;
-mod carrier_socket;
+mod carrier_network;
 pub mod encrypted;
 pub mod framed;
 pub mod quic;
@@ -8,8 +8,9 @@ pub mod tcp;
 pub(crate) mod tcp_telemetry;
 pub mod udp;
 
-pub use carrier_socket::{
-    CarrierSocket, CarrierSocketProvider, CarrierSocketRequest, SystemCarrierSocketProvider,
+pub use carrier_network::{
+    CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionFuture, CarrierResolutionRequest,
+    CarrierSocket, CarrierSocketRequest, SystemCarrierNetworkProvider,
 };
 pub use spec::{
     Endpoint, EndpointParseError, PathBinding, PathMetadata, PathSpec, PathSpecParseError,

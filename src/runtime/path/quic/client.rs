@@ -5,9 +5,9 @@ use super::estimator::UdpPathMetricTracker;
 use super::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
     interleave_udp_path_socket_addr_families, quic_path_open_error_is_retryable,
-    resolve_udp_path_socket_addrs, spawn_quic_path_reader, udp_path_command_queue,
-    udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_read_frame,
-    udp_path_write_frame, udp_reliable_stream_frame_queue,
+    spawn_quic_path_reader, udp_path_command_queue, udp_path_finish_stream,
+    udp_path_max_stream_payload_bytes, udp_path_read_frame, udp_path_write_frame,
+    udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
@@ -29,7 +29,10 @@ use crate::runtime::path::state::ClientPathState;
 use crate::runtime::relay::UdpStreamOpenOptions;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
-use crate::transport::{CarrierSocketProvider, CarrierSocketRequest, PathSpec};
+use crate::transport::{
+    CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
+    PathSpec,
+};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
@@ -175,14 +178,14 @@ impl ClientUdpPathSessionHandle {
 pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) path: PathSpec,
     pub(in crate::runtime) path_index: usize,
-    pub(in crate::runtime) config_ordinal: usize,
+    pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: SecurityConfig,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
-    pub(in crate::runtime) carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
 }
 
 struct ClientUdpPathConnection {
@@ -296,7 +299,14 @@ async fn connect_client_udp_path(
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientUdpPathConnection, RuntimeError> {
     let connect = async {
-        let resolved = resolve_udp_path_socket_addrs(&runtime.path).await?;
+        let resolved = runtime
+            .carrier_network
+            .resolve(CarrierResolutionRequest {
+                path: &runtime.path,
+                identity: runtime.carrier_identity,
+            })
+            .await?;
+        let resolved = usable_udp_path_socket_addrs(&runtime.path, resolved)?;
         let mut remote_addrs = interleave_udp_path_socket_addr_families(resolved)
             .into_iter()
             .take(MAX_QUIC_ADDRESS_ATTEMPTS)
@@ -384,11 +394,13 @@ async fn connect_client_udp_addr(
     remote_addr: std::net::SocketAddr,
 ) -> Result<(UdpPathEndpoint, UdpPathConnection), RuntimeError> {
     // Each attempt needs its own family-correct, host-protected socket.
-    let carrier = runtime.carrier_sockets.create(CarrierSocketRequest {
-        path: &runtime.path,
-        config_ordinal: runtime.config_ordinal,
-        remote_addr,
-    })?;
+    let carrier = runtime
+        .carrier_network
+        .create_socket(CarrierSocketRequest {
+            path: &runtime.path,
+            identity: runtime.carrier_identity,
+            remote_addr,
+        })?;
     let endpoint = UdpPathEndpoint::bind_client(carrier, runtime).await?;
     let connection = endpoint.connect(remote_addr).await?;
     Ok((endpoint, connection))

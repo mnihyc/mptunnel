@@ -24,10 +24,9 @@ use crate::runtime::path::quic::io::{udp_path_finish_stream, udp_path_write_fram
 use crate::runtime::path::{
     ClientPathContext, ClientPathHealth, ClientPathHealthRecord, ClientPathState,
 };
-use crate::transport::CarrierSocketProvider;
-use crate::transport::PathSpec;
 #[cfg(test)]
-use crate::transport::SystemCarrierSocketProvider;
+use crate::transport::SystemCarrierNetworkProvider;
+use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -69,7 +68,7 @@ impl UdpDatagramClientSession {
             codec_limits,
             mux_limits,
             open_deadline,
-            std::sync::Arc::new(SystemCarrierSocketProvider),
+            std::sync::Arc::new(SystemCarrierNetworkProvider),
         )
         .await
     }
@@ -81,7 +80,7 @@ impl UdpDatagramClientSession {
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
         open_deadline: tokio::time::Instant,
-        carrier_sockets: std::sync::Arc<dyn CarrierSocketProvider>,
+        carrier_network: std::sync::Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
         let session_id = random_session_id()?;
         Self::open_for_session_with_provider(
@@ -92,7 +91,7 @@ impl UdpDatagramClientSession {
             codec_limits,
             mux_limits,
             open_deadline,
-            carrier_sockets,
+            carrier_network,
         )
         .await
     }
@@ -116,7 +115,7 @@ impl UdpDatagramClientSession {
             codec_limits,
             mux_limits,
             open_deadline,
-            std::sync::Arc::new(SystemCarrierSocketProvider),
+            std::sync::Arc::new(SystemCarrierNetworkProvider),
         )
         .await
     }
@@ -129,7 +128,7 @@ impl UdpDatagramClientSession {
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
         open_deadline: tokio::time::Instant,
-        carrier_sockets: std::sync::Arc<dyn CarrierSocketProvider>,
+        carrier_network: std::sync::Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
         let state = ClientPathState::new(ClientPathHealth {
             tcp: Vec::new(),
@@ -138,14 +137,17 @@ impl UdpDatagramClientSession {
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
             path: path.clone(),
             path_index,
-            config_ordinal: path_index,
+            carrier_identity: CarrierPathIdentity {
+                group_ordinal: 0,
+                path_ordinal: path_index,
+            },
             session_id,
             security,
             codec_limits,
             mux_limits,
             stream_frame_queue: reliable_stream_frame_queue(mux_limits),
             state,
-            carrier_sockets,
+            carrier_network,
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, open_deadline).await
     }

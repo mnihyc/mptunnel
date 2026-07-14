@@ -7,7 +7,7 @@ use crate::mux::MuxLimits;
 use crate::mux::datagram::{DatagramError, DatagramFlow};
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{DatagramFlowId, DatagramId, OffsetRange, TargetAddr};
-use crate::transport::{CarrierSocketProvider, PathSpec, SystemCarrierSocketProvider};
+use crate::transport::{CarrierNetworkProvider, PathSpec, SystemCarrierNetworkProvider};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,12 +94,12 @@ pub async fn client_udp_datagram_round_trip(
         target,
         payload,
         ttl_ms,
-        Arc::new(SystemCarrierSocketProvider),
+        Arc::new(SystemCarrierNetworkProvider),
     )
     .await
 }
 
-/// Runs a standalone QUIC datagram flow through a host-provided carrier socket.
+/// Runs a standalone QUIC datagram flow through a host-provided carrier network.
 pub async fn client_udp_datagram_round_trip_with_provider(
     path: &PathSpec,
     security: SecurityConfig,
@@ -107,7 +107,7 @@ pub async fn client_udp_datagram_round_trip_with_provider(
     target: TargetAddr,
     payload: Bytes,
     ttl_ms: u32,
-    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
 ) -> Result<Bytes, RuntimeError> {
     client_udp_datagram_round_trip_with_limits(
         path,
@@ -117,7 +117,7 @@ pub async fn client_udp_datagram_round_trip_with_provider(
         target,
         payload,
         ttl_ms,
-        carrier_sockets,
+        carrier_network,
     )
     .await
 }
@@ -130,7 +130,7 @@ async fn client_udp_datagram_round_trip_with_limits(
     target: TargetAddr,
     payload: Bytes,
     ttl_ms: u32,
-    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+    carrier_network: Arc<dyn CarrierNetworkProvider>,
 ) -> Result<Bytes, RuntimeError> {
     let payload_len = payload.len();
     let setup_started_at = tokio::time::Instant::now();
@@ -146,7 +146,7 @@ async fn client_udp_datagram_round_trip_with_limits(
         codec_limits,
         mux_limits,
         open_deadline,
-        carrier_sockets,
+        carrier_network,
     )
     .await;
     let mut session = match open {

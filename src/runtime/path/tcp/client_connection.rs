@@ -16,7 +16,7 @@ use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
-use crate::transport::{CarrierSocketProvider, PathSpec};
+use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -40,12 +40,12 @@ pub(in crate::runtime) enum ClientTcpHeartbeatTimeoutDisposition {
 pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) path: &'a PathSpec,
     pub(in crate::runtime) path_index: usize,
-    pub(in crate::runtime) config_ordinal: usize,
+    pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: &'a SecurityConfig,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
-    pub(in crate::runtime) carrier_sockets: &'a dyn CarrierSocketProvider,
+    pub(in crate::runtime) carrier_network: &'a dyn CarrierNetworkProvider,
 }
 
 impl ClientTcpCarrierConnection {
@@ -154,23 +154,23 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
     let ClientTcpCarrierConnect {
         path,
         path_index,
-        config_ordinal,
+        carrier_identity,
         session_id,
         security,
         codec_limits,
         mux_limits,
-        carrier_sockets,
+        carrier_network,
     } = request;
     let connect = async {
         let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
         let tcp_stream = tcp_transport::connect_path_with_provider(
             path,
-            config_ordinal,
+            carrier_identity,
             TcpConnectOptions {
                 timeout: connect_timeout,
                 ..TcpConnectOptions::default()
             },
-            carrier_sockets,
+            carrier_network,
         )
         .await?;
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);

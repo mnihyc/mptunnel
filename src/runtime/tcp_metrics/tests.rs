@@ -1,8 +1,8 @@
 use super::*;
 
 #[cfg(target_os = "linux")]
-fn snapshot() -> TcpInfoSnapshot {
-    TcpInfoSnapshot {
+fn snapshot() -> TcpTelemetrySnapshot {
+    TcpTelemetrySnapshot {
         app_limited: true,
         retransmits: 10,
         min_rtt_us: 18_000,
@@ -45,7 +45,7 @@ fn tcp_receipt_baseline_waits_only_for_unsent_bytes() {
 fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
     let baseline = snapshot();
     let tracker = TcpSenderMetricTracker::new(baseline);
-    let current = TcpInfoSnapshot {
+    let current = TcpTelemetrySnapshot {
         app_limited: false,
         retransmits: 12,
         unacked_packets: 3,

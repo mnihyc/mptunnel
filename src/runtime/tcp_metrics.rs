@@ -1,6 +1,6 @@
 use super::*;
 #[cfg(target_os = "linux")]
-use crate::transport::tcp_info::{TcpInfoSnapshot, TcpInfoSocket};
+use crate::transport::tcp_telemetry::{TcpTelemetrySnapshot, TcpTelemetrySocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 
@@ -91,8 +91,8 @@ impl TcpSenderQueueSnapshot {
 }
 
 #[cfg(target_os = "linux")]
-impl From<TcpInfoSnapshot> for TcpSenderQueueSnapshot {
-    fn from(snapshot: TcpInfoSnapshot) -> Self {
+impl From<TcpTelemetrySnapshot> for TcpSenderQueueSnapshot {
+    fn from(snapshot: TcpTelemetrySnapshot) -> Self {
         Self {
             unacked_packets: snapshot.unacked_packets,
             notsent_bytes: snapshot.notsent_bytes,
@@ -105,7 +105,7 @@ impl From<TcpInfoSnapshot> for TcpSenderQueueSnapshot {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(super) struct TcpMetricPublisher {
-    socket: TcpInfoSocket,
+    socket: TcpTelemetrySocket,
     tracker: Option<TcpSenderMetricTracker>,
     next_sample_at: Instant,
 }
@@ -114,7 +114,7 @@ pub(super) struct TcpMetricPublisher {
 impl TcpMetricPublisher {
     pub(super) fn capture(socket: &impl AsFd) -> Option<Self> {
         Some(Self {
-            socket: TcpInfoSocket::capture(socket).ok()?,
+            socket: TcpTelemetrySocket::capture(socket).ok()?,
             tracker: None,
             next_sample_at: Instant::now(),
         })
@@ -162,12 +162,12 @@ impl TcpMetricPublisher {
 #[derive(Debug)]
 #[cfg(target_os = "linux")]
 pub(super) struct TcpSenderMetricTracker {
-    baseline: TcpInfoSnapshot,
+    baseline: TcpTelemetrySnapshot,
 }
 
 #[cfg(target_os = "linux")]
 impl TcpSenderMetricTracker {
-    pub(super) fn new(baseline: TcpInfoSnapshot) -> Self {
+    pub(super) fn new(baseline: TcpTelemetrySnapshot) -> Self {
         Self { baseline }
     }
 
@@ -175,7 +175,7 @@ impl TcpSenderMetricTracker {
         &self,
         path_id: PathId,
         direction: PathMetricDirection,
-        current: TcpInfoSnapshot,
+        current: TcpTelemetrySnapshot,
     ) -> PathMetrics {
         let acknowledged_bytes = current
             .bytes_acked

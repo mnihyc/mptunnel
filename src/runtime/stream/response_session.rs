@@ -13,7 +13,7 @@ use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
 use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // Session coordination owns one state mutex, generations, and probe leases.
@@ -248,31 +248,6 @@ impl ResponseServiceFamilyLoads {
 /// and cannot reorder product frames after sender-service admission.
 pub(in crate::runtime) struct ServerPathLaneTracker {
     pub(super) state: Mutex<ServerPathLaneTrackerState>,
-}
-
-/// Holds the one session-wide TCP carrier-discovery slot until the typed
-/// command is dropped after receipt, failure, or cancellation.
-#[derive(Debug)]
-pub(in crate::runtime) struct TcpCapacityProbeSessionLease {
-    tracker: Arc<ServerPathLaneTracker>,
-    session_id: SessionId,
-}
-
-impl Drop for TcpCapacityProbeSessionLease {
-    fn drop(&mut self) {
-        let mut state = self
-            .tracker
-            .state
-            .lock()
-            .expect("server path lane tracker lock");
-        if state
-            .tcp_capacity_probe_reservations
-            .remove(&self.session_id)
-        {
-            state.bump_generation(self.session_id);
-            state.maybe_reclaim_session(self.session_id);
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -633,34 +608,6 @@ impl ServerPathLaneTracker {
                 .get(&session_id)
                 .copied(),
         }
-    }
-
-    pub(in crate::runtime) fn try_reserve_tcp_capacity_probe(
-        self: &Arc<Self>,
-        session_id: SessionId,
-        expected_generation: u64,
-    ) -> Option<TcpCapacityProbeSessionLease> {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        if generation != expected_generation
-            || state.tcp_capacity_probe_reservations.contains(&session_id)
-            || state.quic_capacity_calibrations.contains_key(&session_id)
-            || state
-                .response_service_handoff_drains
-                .contains_key(&session_id)
-        {
-            return None;
-        }
-        state.tcp_capacity_probe_reservations.insert(session_id);
-        state.bump_generation(session_id);
-        Some(TcpCapacityProbeSessionLease {
-            tracker: Arc::clone(self),
-            session_id,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]

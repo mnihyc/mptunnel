@@ -20,6 +20,8 @@ mod response_quic_capacity;
 pub(super) mod response_session;
 #[path = "response_snapshot.rs"]
 mod response_snapshot;
+#[path = "response_tcp_capacity.rs"]
+mod response_tcp_capacity;
 #[path = "response_topology.rs"]
 mod response_topology;
 #[path = "response_transaction.rs"]
@@ -68,14 +70,15 @@ pub(in crate::runtime) use response_session::ResponseSessionSchedulingSnapshot;
 pub(in crate::runtime) use response_session::well_formed_quic_capacity_proof_candidate;
 pub(in crate::runtime) use response_session::{
     ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation, ServerPathLaneTracker,
-    TcpCapacityProbeSessionLease, quic_capacity_proof_pin_matches_marker,
-    quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_candidate_at,
+    quic_capacity_proof_pin_matches_marker, quic_capacity_receipt_rate_bps,
+    valid_quic_capacity_proof_candidate_at,
 };
 pub(in crate::runtime) use response_snapshot::server_bulk_output_eta_ms;
 #[cfg(test)]
 pub(in crate::runtime) use response_snapshot::{
     ResponseRelayReadSnapshot, ResponseSourceServiceSnapshot,
 };
+pub(in crate::runtime) use response_tcp_capacity::TcpCapacityProbeSessionLease;
 pub(in crate::runtime) use response_topology::{
     ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
     ResponseStreamOutputs, ServerCarrierPathInstanceId, next_server_carrier_path_instance_id,

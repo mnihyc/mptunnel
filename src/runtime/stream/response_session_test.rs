@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::PathId;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn consume_capacity_attempt(

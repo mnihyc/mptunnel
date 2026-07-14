@@ -1,299 +1,891 @@
-use super::response_admission::server_output_has_bulk_rate_evidence_with_limits;
-use super::response_topology::ResponseSenderPathTarget;
-use super::{ResponseStreamBinding, ServerCarrierPathInstanceId};
+//! Session-wide QUIC capacity reservation and proof lifecycle.
+//!
+//! This owner serializes one carrier-discovery transaction through receipt and
+//! publication. Binding validation and carrier-queue admission live in
+//! `response_quic_probe`; all mutations still use the central session mutex.
+
+use super::response_session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
+use super::{
+    MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH, ServerCarrierPathInstanceId,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY};
 use crate::model::path::CarrierPathKey;
-use crate::protocol::{StreamOpenRole, UnderlayProtocol};
-use crate::runtime::path::commands::{
-    QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket, QuicCapacityProbeOwner,
-};
-use crate::scheduler::FlowLane;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::protocol::SessionId;
+use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
+use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
 use std::time::{Duration, Instant};
 
-// Owns admission of carrier-only QUIC receipt probes. Product offsets and TCP
-// ACK-clock calibration stay outside because they produce different proof.
-static NEXT_RESPONSE_QUIC_CAPACITY_CALIBRATION_ID: AtomicU64 = AtomicU64::new(1);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServerQuicCapacityCalibrationPhase {
+    Provisional,
+    Active {
+        expires_at: Instant,
+    },
+    // Publication is synchronous but crosses registry and binding locks. Keep
+    // serialization held until the accepted marker is visible everywhere.
+    ProofAccepted {
+        candidate: QuicCapacityProofCandidate,
+    },
+    // Once committed, carrier proof is irrevocable. Keep session serialization
+    // until the registry has published it to every current response binding.
+    ProofPublishing {
+        candidate: QuicCapacityProofCandidate,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ServerQuicCapacityCalibrationReservation {
+    pub(super) binding_instance_id: u64,
+    pub(super) path: CarrierPathKey,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) phase: ServerQuicCapacityCalibrationPhase,
+    pub(super) train_bytes: u64,
+    pub(super) sample_floor_bytes: u64,
+    pub(super) accounting_slack_bytes: u64,
+    pub(super) warmup_bytes: u64,
+    pub(super) required_proof_bytes: u64,
+    pub(super) proof_validity: Duration,
+    pub(super) token: u64,
+    pub(super) command_ticket: QuicCapacityProbeCommandTicket,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuicCapacityAdmissionState {
-    Provisional,
-    Admitted,
-    Committed,
+pub(in crate::runtime::stream) struct ServerQuicCapacityProofTicket {
+    pub(super) session_id: SessionId,
+    pub(super) binding_instance_id: u64,
+    pub(super) path: CarrierPathKey,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) candidate: QuicCapacityProofCandidate,
 }
 
-/// Rolls back only before carrier admission. Once frames own queue capacity,
-/// cleanup may release serialization but must never refill discovery budget.
-struct QuicCapacityAdmissionGuard<'a> {
-    binding: &'a ResponseStreamBinding,
-    path: CarrierPathKey,
-    path_instance_id: ServerCarrierPathInstanceId,
-    token: u64,
-    ticket: QuicCapacityProbeCommandTicket,
-    state: QuicCapacityAdmissionState,
+pub(super) fn valid_quic_capacity_geometry(
+    train_bytes: u64,
+    sample_floor_bytes: u64,
+    accounting_slack_bytes: u64,
+    warmup_bytes: u64,
+    required_proof_bytes: u64,
+) -> bool {
+    let expected_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
+    let expected_required = sample_floor_bytes.checked_sub(accounting_slack_bytes);
+    let expected_train = warmup_bytes
+        .checked_add(required_proof_bytes)
+        .map(|bytes| bytes.max(sample_floor_bytes));
+    train_bytes > 0
+        && sample_floor_bytes > 0
+        && required_proof_bytes > 0
+        && accounting_slack_bytes == expected_slack
+        && expected_required == Some(required_proof_bytes)
+        && expected_train == Some(train_bytes)
 }
 
-impl QuicCapacityAdmissionGuard<'_> {
-    fn mark_admitted(&mut self) {
-        self.state = QuicCapacityAdmissionState::Admitted;
+pub(in crate::runtime) fn quic_capacity_receipt_rate_bps(
+    train_bytes: u64,
+    proof_elapsed: Duration,
+) -> Option<u64> {
+    if train_bytes == 0 || proof_elapsed.is_zero() {
+        return None;
+    }
+    let rate = train_bytes as f64 * 8.0 / proof_elapsed.max(QUIC_TIMER_GRANULARITY).as_secs_f64();
+    rate.is_finite()
+        .then_some(rate.round().max(1.0).min(u64::MAX as f64) as u64)
+}
+
+pub(in crate::runtime) fn well_formed_quic_capacity_proof_candidate(
+    proof: QuicCapacityProofCandidate,
+) -> bool {
+    valid_quic_capacity_geometry(
+        proof.train_bytes,
+        proof.sample_floor_bytes,
+        proof.accounting_slack_bytes,
+        proof.warmup_bytes,
+        proof.required_proof_bytes,
+    ) && proof.receipt_confirmed
+        && proof.written_bytes == proof.train_bytes
+        && proof.written_data_frame_count > 0
+        && proof.received_bytes == proof.train_bytes
+        && !proof.proof_elapsed.is_zero()
+        && quic_capacity_receipt_rate_bps(proof.train_bytes, proof.proof_elapsed)
+            .is_some_and(|raw_rate| proof.rate_bps > 0 && proof.rate_bps <= raw_rate)
+        && !proof.proof_validity.is_zero()
+        && proof.accepted_at.checked_add(proof.proof_validity) == Some(proof.expires_at)
+}
+
+pub(in crate::runtime) fn valid_quic_capacity_proof_candidate_at(
+    proof: QuicCapacityProofCandidate,
+    now: Instant,
+) -> bool {
+    well_formed_quic_capacity_proof_candidate(proof) && proof.expires_at > now
+}
+
+pub(in crate::runtime) fn quic_capacity_proof_pin_matches_marker(
+    pinned: QuicCapacityProofCandidate,
+    marker: Option<QuicCapacityProofCandidate>,
+    now: Instant,
+) -> bool {
+    match marker {
+        Some(marker) => marker == pinned,
+        // A generic metric refresh may prune an expired marker. Absence before
+        // its fixed deadline is invalidation, not ordinary expiry.
+        None => now >= pinned.expires_at,
+    }
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn record_quic_capacity_lifecycle(
+    phase: &'static str,
+    reason: &'static str,
+    session_id: SessionId,
+    reservation: ServerQuicCapacityCalibrationReservation,
+    candidate: Option<QuicCapacityProofCandidate>,
+) {
+    let candidate = candidate.or(match reservation.phase {
+        ServerQuicCapacityCalibrationPhase::ProofAccepted { candidate }
+        | ServerQuicCapacityCalibrationPhase::ProofPublishing { candidate } => Some(candidate),
+        _ => None,
+    });
+    let candidate_value = |value: Option<String>| value.unwrap_or_else(|| "unknown".to_string());
+    lab_diagnostic(
+        "response_quic_capacity_calibration",
+        format_args!(
+            "phase={} reason={} session_id={} binding_instance_id={} underlay={:?} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={} accounting_slack_bytes={} warmup_bytes={} required_proof_bytes={} proof_validity_ms={} written_bytes={} written_data_frame_count={} receipt_confirmed={} received_bytes={} proof_elapsed_us={} rate_bps={}",
+            phase,
+            reason,
+            session_id.0,
+            reservation.binding_instance_id,
+            reservation.path.underlay,
+            reservation.path.path_id.0,
+            reservation.path_instance_id.0,
+            reservation.token,
+            reservation.train_bytes,
+            reservation.sample_floor_bytes,
+            reservation.accounting_slack_bytes,
+            reservation.warmup_bytes,
+            reservation.required_proof_bytes,
+            reservation.proof_validity.as_millis(),
+            candidate_value(candidate.map(|proof| proof.written_bytes.to_string())),
+            candidate_value(candidate.map(|proof| proof.written_data_frame_count.to_string())),
+            candidate_value(candidate.map(|proof| proof.receipt_confirmed.to_string())),
+            candidate_value(candidate.map(|proof| proof.received_bytes.to_string())),
+            candidate_value(candidate.map(|proof| proof.proof_elapsed.as_micros().to_string())),
+            candidate_value(candidate.map(|proof| proof.rate_bps.to_string())),
+        ),
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ServerQuicCapacityCalibrationPathKey {
+    pub(super) session_id: SessionId,
+    pub(super) path: CarrierPathKey,
+    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+}
+
+impl ServerPathLaneTrackerState {
+    pub(super) fn quic_capacity_calibration_attempts_for_path(
+        &self,
+        session_id: SessionId,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) -> u8 {
+        self.quic_capacity_calibration_attempts
+            .get(&ServerQuicCapacityCalibrationPathKey {
+                session_id,
+                path,
+                path_instance_id,
+            })
+            .copied()
+            .unwrap_or(0)
     }
 
-    fn mark_committed(&mut self) {
-        self.state = QuicCapacityAdmissionState::Committed;
+    pub(super) fn quic_capacity_calibration_reserved(&self, session_id: SessionId) -> bool {
+        self.quic_capacity_calibrations.contains_key(&session_id)
     }
-}
 
-impl Drop for QuicCapacityAdmissionGuard<'_> {
-    fn drop(&mut self) {
-        match self.state {
-            QuicCapacityAdmissionState::Provisional => {
-                self.ticket.cancel();
-                self.binding
-                    .lane_tracker
-                    .rollback_quic_capacity_calibration(
-                        self.binding.session_id,
-                        self.binding.binding_instance_id,
-                        self.path,
-                        self.path_instance_id,
-                        self.token,
-                    );
+    pub(super) fn quic_capacity_calibration_spent_bytes(&self, session_id: SessionId) -> u64 {
+        self.quic_capacity_calibration_bytes
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn quic_capacity_proof_publication_in_progress(
+        &self,
+        session_id: SessionId,
+    ) -> bool {
+        self.quic_capacity_calibrations
+            .get(&session_id)
+            .is_some_and(|reservation| {
+                matches!(
+                    reservation.phase,
+                    ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                )
+            })
+    }
+
+    pub(super) fn expire_quic_capacity_calibration_at(
+        &mut self,
+        session_id: SessionId,
+        now: Instant,
+    ) {
+        let capacity_removal =
+            self.quic_capacity_calibrations
+                .get(&session_id)
+                .and_then(|reservation| {
+                    if !reservation.command_ticket.is_current()
+                        && !matches!(
+                            reservation.phase,
+                            ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                        )
+                    {
+                        return Some(("cancelled", "command_invalidated"));
+                    }
+                    match reservation.phase {
+                        ServerQuicCapacityCalibrationPhase::Active { expires_at }
+                            if now >= expires_at =>
+                        {
+                            Some(("expired", "lease_elapsed"))
+                        }
+                        _ => None,
+                    }
+                });
+        if let Some((phase, reason)) = capacity_removal {
+            let reservation = self.quic_capacity_calibrations.remove(&session_id);
+            if let Some(reservation) = reservation.as_ref() {
+                reservation.command_ticket.cancel();
             }
-            QuicCapacityAdmissionState::Admitted => {
-                // The queue item remains charged, but a failed ownership lease
-                // must prevent it from starting a now-unpublishable epoch.
-                self.ticket.cancel();
-                self.binding.lane_tracker.cancel_quic_capacity_calibration(
-                    self.binding.session_id,
-                    self.binding.binding_instance_id,
-                    self.path,
-                    self.path_instance_id,
-                    "lease_commit_failed",
+            self.bump_generation(session_id);
+            #[cfg(feature = "lab-diagnostics")]
+            if let Some(reservation) = reservation {
+                record_quic_capacity_lifecycle(phase, reason, session_id, reservation, None);
+            }
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = (reservation, phase, reason);
+        }
+    }
+
+    pub(super) fn take_quic_capacity_session_reclamation(
+        &mut self,
+        session_id: SessionId,
+    ) -> Option<ServerQuicCapacityCalibrationReservation> {
+        let reservation = self.quic_capacity_calibrations.remove(&session_id);
+        self.quic_capacity_calibration_attempts
+            .retain(|key, _| key.session_id != session_id);
+        self.quic_capacity_calibration_bytes.remove(&session_id);
+        reservation
+    }
+}
+
+pub(super) fn finish_quic_capacity_session_reclamation(
+    session_id: SessionId,
+    reservation: Option<ServerQuicCapacityCalibrationReservation>,
+) {
+    if let Some(reservation) = reservation.as_ref() {
+        reservation.command_ticket.cancel();
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    if let Some(reservation) = reservation {
+        record_quic_capacity_lifecycle(
+            "cancelled",
+            "session_reclaimed",
+            session_id,
+            reservation,
+            None,
+        );
+    }
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = (session_id, reservation);
+}
+
+impl ServerPathLaneTracker {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_reserve_test_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        expected_generation: u64,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        train_bytes: u64,
+        session_byte_limit: u64,
+        token: u64,
+    ) -> bool {
+        self.try_reserve_quic_capacity_calibration(
+            session_id,
+            expected_generation,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            train_bytes,
+            train_bytes,
+            (PATH_OPEN_SCORE_BYTES as u64).min(train_bytes / 8),
+            0,
+            train_bytes.saturating_sub((PATH_OPEN_SCORE_BYTES as u64).min(train_bytes / 8)),
+            Duration::from_secs(1),
+            session_byte_limit,
+            token,
+            QuicCapacityProbeCommandTicket::new(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_test_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        lease: Duration,
+        token: u64,
+    ) -> bool {
+        Instant::now().checked_add(lease).is_some_and(|expires_at| {
+            self.commit_quic_capacity_calibration(
+                session_id,
+                binding_instance_id,
+                path,
+                path_instance_id,
+                expires_at,
+                token,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn complete_test_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) -> bool {
+        let reservation = self
+            .state
+            .lock()
+            .expect("server path lane tracker lock")
+            .quic_capacity_calibrations
+            .get(&session_id)
+            .cloned();
+        let Some(reservation) = reservation.filter(|reservation| {
+            reservation.binding_instance_id == binding_instance_id
+                && reservation.path == path
+                && reservation.path_instance_id == path_instance_id
+        }) else {
+            return false;
+        };
+        let accepted_at = Instant::now();
+        let candidate = QuicCapacityProofCandidate {
+            token: reservation.token,
+            train_bytes: reservation.train_bytes,
+            sample_floor_bytes: reservation.sample_floor_bytes,
+            accounting_slack_bytes: reservation.accounting_slack_bytes,
+            warmup_bytes: reservation.warmup_bytes,
+            required_proof_bytes: reservation.required_proof_bytes,
+            written_bytes: reservation.train_bytes,
+            written_data_frame_count: 1,
+            receipt_confirmed: true,
+            received_bytes: reservation.train_bytes,
+            proof_elapsed: Duration::from_millis(1),
+            rate_bps: reservation.train_bytes.saturating_mul(8_000),
+            accepted_at,
+            expires_at: accepted_at + Duration::from_secs(1),
+            proof_validity: reservation.proof_validity,
+        };
+        let Some(ticket) =
+            self.try_accept_quic_capacity_proof(session_id, path, path_instance_id, candidate)
+        else {
+            return false;
+        };
+        self.commit_quic_capacity_proof(ticket)
+            .and_then(|_| self.finish_quic_capacity_proof_publication(ticket))
+            .is_some()
+    }
+
+    pub(super) fn try_reserve_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        expected_generation: u64,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        train_bytes: u64,
+        sample_floor_bytes: u64,
+        accounting_slack_bytes: u64,
+        warmup_bytes: u64,
+        required_proof_bytes: u64,
+        proof_validity: Duration,
+        session_byte_limit: u64,
+        token: u64,
+        command_ticket: QuicCapacityProbeCommandTicket,
+    ) -> bool {
+        if proof_validity.is_zero()
+            || !valid_quic_capacity_geometry(
+                train_bytes,
+                sample_floor_bytes,
+                accounting_slack_bytes,
+                warmup_bytes,
+                required_proof_bytes,
+            )
+        {
+            return false;
+        }
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let generation = state
+            .session_generations
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let active_response_flows = state
+            .active_response_flows
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let attempt_key = ServerQuicCapacityCalibrationPathKey {
+            session_id,
+            path,
+            path_instance_id,
+        };
+        let attempts = state
+            .quic_capacity_calibration_attempts
+            .get(&attempt_key)
+            .copied()
+            .unwrap_or(0);
+        let spent_bytes = state
+            .quic_capacity_calibration_bytes
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let Some(next_spent_bytes) = spent_bytes.checked_add(train_bytes) else {
+            return false;
+        };
+        if generation != expected_generation
+            || active_response_flows < 2
+            || attempts >= MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH
+            || next_spent_bytes > session_byte_limit
+            || state.tcp_capacity_probe_reservations.contains(&session_id)
+            || state.quic_capacity_calibrations.contains_key(&session_id)
+            || state
+                .response_service_handoff_drains
+                .contains_key(&session_id)
+        {
+            return false;
+        }
+        state.quic_capacity_calibrations.insert(
+            session_id,
+            ServerQuicCapacityCalibrationReservation {
+                binding_instance_id,
+                path,
+                path_instance_id,
+                phase: ServerQuicCapacityCalibrationPhase::Provisional,
+                train_bytes,
+                sample_floor_bytes,
+                accounting_slack_bytes,
+                warmup_bytes,
+                required_proof_bytes,
+                proof_validity,
+                token,
+                command_ticket,
+            },
+        );
+        state
+            .quic_capacity_calibration_attempts
+            .insert(attempt_key, attempts.saturating_add(1));
+        state
+            .quic_capacity_calibration_bytes
+            .insert(session_id, next_spent_bytes);
+        state.bump_generation(session_id);
+        true
+    }
+
+    pub(super) fn rollback_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        token: u64,
+    ) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let matches = state
+            .quic_capacity_calibrations
+            .get(&session_id)
+            .is_some_and(|reservation| {
+                reservation.binding_instance_id == binding_instance_id
+                    && reservation.path == path
+                    && reservation.path_instance_id == path_instance_id
+                    && reservation.token == token
+                    && reservation.phase == ServerQuicCapacityCalibrationPhase::Provisional
+            });
+        if matches {
+            let reservation = state
+                .quic_capacity_calibrations
+                .remove(&session_id)
+                .expect("matching QUIC capacity reservation");
+            reservation.command_ticket.cancel();
+            let attempt_key = ServerQuicCapacityCalibrationPathKey {
+                session_id,
+                path,
+                path_instance_id,
+            };
+            if let Some(attempts) = state
+                .quic_capacity_calibration_attempts
+                .get_mut(&attempt_key)
+            {
+                *attempts = attempts.saturating_sub(1);
+                if *attempts == 0 {
+                    state
+                        .quic_capacity_calibration_attempts
+                        .remove(&attempt_key);
+                }
+            }
+            if let Some(spent_bytes) = state.quic_capacity_calibration_bytes.get_mut(&session_id) {
+                debug_assert!(*spent_bytes >= reservation.train_bytes);
+                *spent_bytes -= reservation.train_bytes.min(*spent_bytes);
+                if *spent_bytes == 0 {
+                    state.quic_capacity_calibration_bytes.remove(&session_id);
+                }
+            }
+            state.bump_generation(session_id);
+            #[cfg(feature = "lab-diagnostics")]
+            record_quic_capacity_lifecycle(
+                "cancelled",
+                "provisional_rollback",
+                session_id,
+                reservation,
+                None,
+            );
+        }
+    }
+
+    pub(in crate::runtime::stream) fn try_accept_quic_capacity_proof(
+        &self,
+        session_id: SessionId,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        candidate: QuicCapacityProofCandidate,
+    ) -> Option<ServerQuicCapacityProofTicket> {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        // Deadlines must be sampled after lock acquisition; otherwise mutex
+        // contention can make stale carrier evidence appear lease-valid.
+        let now = Instant::now();
+        let removal = state
+            .quic_capacity_calibrations
+            .get(&session_id)
+            .and_then(|reservation| {
+                if !reservation.command_ticket.is_current()
+                    && !matches!(
+                        reservation.phase,
+                        ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                    )
+                {
+                    return Some(("cancelled", "command_invalidated"));
+                }
+                match reservation.phase {
+                    ServerQuicCapacityCalibrationPhase::Active { expires_at }
+                        if now >= expires_at =>
+                    {
+                        Some(("expired", "lease_elapsed_before_proof"))
+                    }
+                    _ => None,
+                }
+            });
+        if let Some((phase, reason)) = removal {
+            let reservation = state
+                .quic_capacity_calibrations
+                .remove(&session_id)
+                .expect("expired QUIC capacity calibration");
+            reservation.command_ticket.cancel();
+            state.bump_generation(session_id);
+            #[cfg(feature = "lab-diagnostics")]
+            record_quic_capacity_lifecycle(phase, reason, session_id, reservation, Some(candidate));
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = (reservation, phase, reason);
+            return None;
+        }
+
+        let reservation = state.quic_capacity_calibrations.get_mut(&session_id)?;
+        let active_expires_at = match reservation.phase {
+            ServerQuicCapacityCalibrationPhase::Active { expires_at } => expires_at,
+            ServerQuicCapacityCalibrationPhase::Provisional
+            | ServerQuicCapacityCalibrationPhase::ProofAccepted { .. }
+            | ServerQuicCapacityCalibrationPhase::ProofPublishing { .. } => return None,
+        };
+        let specification_matches = reservation.command_ticket.is_current()
+            && reservation.path == path
+            && reservation.path_instance_id == path_instance_id
+            && reservation.token == candidate.token
+            && reservation.train_bytes == candidate.train_bytes
+            && reservation.sample_floor_bytes == candidate.sample_floor_bytes
+            && reservation.accounting_slack_bytes == candidate.accounting_slack_bytes
+            && reservation.warmup_bytes == candidate.warmup_bytes
+            && reservation.required_proof_bytes == candidate.required_proof_bytes
+            && reservation.proof_validity == candidate.proof_validity;
+        let evidence_is_complete = well_formed_quic_capacity_proof_candidate(candidate)
+            && candidate.accepted_at <= now
+            && candidate.accepted_at < active_expires_at
+            && candidate.expires_at > now;
+        if !specification_matches || !evidence_is_complete {
+            return None;
+        }
+
+        reservation.phase = ServerQuicCapacityCalibrationPhase::ProofAccepted { candidate };
+        Some(ServerQuicCapacityProofTicket {
+            session_id,
+            binding_instance_id: reservation.binding_instance_id,
+            path,
+            path_instance_id,
+            candidate,
+        })
+    }
+
+    pub(in crate::runtime::stream) fn commit_quic_capacity_proof(
+        &self,
+        ticket: ServerQuicCapacityProofTicket,
+    ) -> Option<u64> {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let reservation = state
+            .quic_capacity_calibrations
+            .get_mut(&ticket.session_id)
+            .filter(|reservation| {
+                reservation.command_ticket.is_current()
+                    && reservation.binding_instance_id == ticket.binding_instance_id
+                    && reservation.path == ticket.path
+                    && reservation.path_instance_id == ticket.path_instance_id
+                    && reservation.token == ticket.candidate.token
+                    && reservation.phase
+                        == ServerQuicCapacityCalibrationPhase::ProofAccepted {
+                            candidate: ticket.candidate,
+                        }
+            })?;
+        // The evidence transaction is now irrevocable, but its reservation
+        // remains the session barrier until registry publication is complete.
+        reservation.phase = ServerQuicCapacityCalibrationPhase::ProofPublishing {
+            candidate: ticket.candidate,
+        };
+        Some(ticket.binding_instance_id)
+    }
+
+    pub(in crate::runtime::stream) fn finish_quic_capacity_proof_publication(
+        &self,
+        ticket: ServerQuicCapacityProofTicket,
+    ) -> Option<u64> {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let matches = state
+            .quic_capacity_calibrations
+            .get(&ticket.session_id)
+            .is_some_and(|reservation| {
+                reservation.binding_instance_id == ticket.binding_instance_id
+                    && reservation.path == ticket.path
+                    && reservation.path_instance_id == ticket.path_instance_id
+                    && reservation.token == ticket.candidate.token
+                    && reservation.phase
+                        == ServerQuicCapacityCalibrationPhase::ProofPublishing {
+                            candidate: ticket.candidate,
+                        }
+            });
+        if !matches {
+            return None;
+        }
+        let reservation = state
+            .quic_capacity_calibrations
+            .remove(&ticket.session_id)
+            .expect("matching published QUIC capacity proof");
+        reservation.command_ticket.publish();
+        // Publication releases serialization but never refunds attempts or bytes.
+        state.bump_generation(ticket.session_id);
+        #[cfg(feature = "lab-diagnostics")]
+        record_quic_capacity_lifecycle(
+            "completed",
+            "exact_carrier_proof",
+            ticket.session_id,
+            reservation,
+            Some(ticket.candidate),
+        );
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = reservation;
+        state.maybe_reclaim_session(ticket.session_id);
+        Some(ticket.binding_instance_id)
+    }
+
+    pub(super) fn commit_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        expires_at: Instant,
+        token: u64,
+    ) -> bool {
+        if expires_at <= Instant::now() {
+            return false;
+        }
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        if expires_at <= Instant::now() {
+            return false;
+        }
+        if let Some(reservation) = state
+            .quic_capacity_calibrations
+            .get_mut(&session_id)
+            .filter(|reservation| {
+                reservation.command_ticket.is_current()
+                    && reservation.binding_instance_id == binding_instance_id
+                    && reservation.path == path
+                    && reservation.path_instance_id == path_instance_id
+                    && reservation.token == token
+                    && reservation.phase == ServerQuicCapacityCalibrationPhase::Provisional
+            })
+        {
+            // The provisional lease serialized admission. Start the effective
+            // lease only after the complete carrier train owns queue capacity.
+            reservation.phase = ServerQuicCapacityCalibrationPhase::Active { expires_at };
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn clear_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) {
+        self.cancel_quic_capacity_calibration(
+            session_id,
+            binding_instance_id,
+            path,
+            path_instance_id,
+            "path_output_removed",
+        );
+    }
+
+    pub(super) fn cancel_quic_capacity_calibration(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        reason: &'static str,
+    ) -> bool {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let matches = state
+            .quic_capacity_calibrations
+            .get(&session_id)
+            .is_some_and(|reservation| {
+                reservation.binding_instance_id == binding_instance_id
+                    && reservation.path == path
+                    && reservation.path_instance_id == path_instance_id
+                    && !matches!(
+                        reservation.phase,
+                        ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                    )
+            });
+        if matches {
+            let reservation = state.quic_capacity_calibrations.remove(&session_id);
+            if let Some(reservation) = reservation.as_ref() {
+                reservation.command_ticket.cancel();
+            }
+            state.bump_generation(session_id);
+            #[cfg(feature = "lab-diagnostics")]
+            if let Some(reservation) = reservation {
+                record_quic_capacity_lifecycle("cancelled", reason, session_id, reservation, None);
+            }
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = (reservation, reason);
+        }
+        matches
+    }
+
+    pub(super) fn clear_quic_capacity_calibration_for_binding(
+        &self,
+        session_id: SessionId,
+        binding_instance_id: u64,
+    ) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let matches = state
+            .quic_capacity_calibrations
+            .get(&session_id)
+            .is_some_and(|reservation| {
+                reservation.binding_instance_id == binding_instance_id
+                    && !matches!(
+                        reservation.phase,
+                        ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                    )
+            });
+        if matches {
+            // Close may race carrier dequeue, so transmitted-byte and attempt
+            // charges remain consumed even though session serialization clears.
+            let reservation = state.quic_capacity_calibrations.remove(&session_id);
+            if let Some(reservation) = reservation.as_ref() {
+                reservation.command_ticket.cancel();
+            }
+            state.bump_generation(session_id);
+            #[cfg(feature = "lab-diagnostics")]
+            if let Some(reservation) = reservation {
+                record_quic_capacity_lifecycle(
+                    "cancelled",
+                    "binding_closed",
+                    session_id,
+                    reservation,
+                    None,
                 );
             }
-            QuicCapacityAdmissionState::Committed => {}
+            #[cfg(not(feature = "lab-diagnostics"))]
+            let _ = reservation;
         }
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-/// QUIC capacity calibration consumes carrier bandwidth but no product offset.
-/// Receiver-confirmed token receipt is authority; native carrier ACK telemetry
-/// remains diagnostic timing evidence.
-pub(in crate::runtime) struct ResponseQuicCapacityCalibrationRequest {
-    pub(in crate::runtime) expected_planner_generation: u64,
-    pub(in crate::runtime) expected_lane_generation: u64,
-    pub(in crate::runtime) expected_model_generation: u64,
-    pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: ServerCarrierPathInstanceId,
-    pub(in crate::runtime) target_incarnation: u64,
-    pub(in crate::runtime) target_pending_bytes: u64,
-    pub(in crate::runtime) train_bytes: usize,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) sample_floor_bytes: u64,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) accounting_slack_bytes: u64,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) fresh_strict_window_bytes: u64,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) carrier_window_bytes: u64,
-    pub(in crate::runtime) proof_validity: Duration,
-    pub(in crate::runtime) lease: Duration,
-}
-
-impl ResponseStreamBinding {
-    pub(in crate::runtime) fn try_start_quic_capacity_calibration(
+    pub(in crate::runtime::stream) fn retire_quic_capacity_calibration_path_instance(
         &self,
-        target: &ResponseSenderPathTarget,
-        request: ResponseQuicCapacityCalibrationRequest,
-    ) -> bool {
-        self.try_start_quic_capacity_calibration_with_lease(target, request, |lease| lease)
-    }
-
-    pub(super) fn try_start_quic_capacity_calibration_with_lease(
-        &self,
-        target: &ResponseSenderPathTarget,
-        request: ResponseQuicCapacityCalibrationRequest,
-        lease_after_admission: impl FnOnce(Duration) -> Duration,
-    ) -> bool {
-        let session_envelope = usize::try_from(reliable_capacity_calibration_session_limit_bytes(
-            self.mux_limits,
-        ))
-        .unwrap_or(usize::MAX);
-        if !self.response_stream_open.load(Ordering::Acquire)
-            || request.target != target.key
-            || request.target_path_instance_id != target.path_instance_id
-            || request.target_incarnation != target.incarnation
-            || request.train_bytes == 0
-            || request.train_bytes > session_envelope
-            || request.proof_validity.is_zero()
-            || request.lease.is_zero()
-        {
-            return false;
-        }
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        if !self.response_stream_open.load(Ordering::Acquire)
-            || self.response_model_generation.load(Ordering::Acquire)
-                != request.expected_model_generation
-        {
-            return false;
-        }
-        {
-            let state = self
-                .subflow_set
-                .lock()
-                .expect("server reliable stream subflow set lock");
-            if state.planner_generation != request.expected_planner_generation {
-                return false;
-            }
-        }
-        // A QUIC train is connection-wide optional traffic. Exact Validation
-        // identity plus the captured idle queue value isolates one carrier
-        // epoch and fences stale proposals; neither is product-byte ownership.
-        let target_is_exact_udp_validation = outputs.entries.iter().any(|entry| {
-            entry.key == request.target
-                && entry.path_instance_id == request.target_path_instance_id
-                && entry.incarnation == request.target_incarnation
-                && entry.commands.same_channel(&target.commands)
-                && entry.role == StreamOpenRole::Validation
-                && entry.key.underlay == UnderlayProtocol::Udp
-                && !entry.commands.is_closed()
-                && entry.commands.pending_bytes() == request.target_pending_bytes
-                && !server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits)
-        });
-        if !target_is_exact_udp_validation {
-            return false;
-        }
-        if !target.commands.can_enqueue_lane_now(FlowLane::Throughput) {
-            return false;
-        }
-        let calibration_id =
-            NEXT_RESPONSE_QUIC_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
-        let command_ticket = QuicCapacityProbeCommandTicket::new();
-        #[cfg(feature = "lab-diagnostics")]
-        let attempt_ordinal = target.quic_capacity_calibration_attempts.saturating_add(1);
-        #[cfg(feature = "lab-diagnostics")]
-        let selection = if attempt_ordinal == 1 {
-            "fresh"
+        session_id: SessionId,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let reservation_matches = state
+            .quic_capacity_calibrations
+            .get(&session_id)
+            .is_some_and(|reservation| {
+                reservation.path == path
+                    && reservation.path_instance_id == path_instance_id
+                    && !matches!(
+                        reservation.phase,
+                        ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                    )
+            });
+        let retired_reservation = if reservation_matches {
+            // An admitted train may already be on the retired carrier queue;
+            // retirement releases serialization but never refunds session spend.
+            state.quic_capacity_calibrations.remove(&session_id)
         } else {
-            "retry"
+            None
         };
-        #[cfg(feature = "lab-diagnostics")]
-        let frame_count = request
-            .train_bytes
-            .div_ceil(self.mux_limits.max_payload_bytes.max(1));
-        if !self.lane_tracker.try_reserve_quic_capacity_calibration(
-            self.session_id,
-            request.expected_lane_generation,
-            self.binding_instance_id,
-            request.target,
-            request.target_path_instance_id,
-            request.train_bytes as u64,
-            request.sample_floor_bytes,
-            request.accounting_slack_bytes,
-            request.carrier_window_bytes,
-            request.fresh_strict_window_bytes,
-            request.proof_validity,
-            session_envelope as u64,
-            calibration_id,
-            command_ticket.clone(),
-        ) {
-            return false;
+        if let Some(reservation) = retired_reservation.as_ref() {
+            reservation.command_ticket.cancel();
         }
-        let mut admission = QuicCapacityAdmissionGuard {
-            binding: self,
-            path: request.target,
-            path_instance_id: request.target_path_instance_id,
-            token: calibration_id,
-            ticket: command_ticket.clone(),
-            state: QuicCapacityAdmissionState::Provisional,
-        };
-
-        let Some(probe_expires_at) = Instant::now().checked_add(request.lease) else {
-            return false;
-        };
-        let probe = QuicCapacityProbeCommand {
-            owner: QuicCapacityProbeOwner::Response {
-                binding_instance_id: self.binding_instance_id,
-                path_instance_id: request.target_path_instance_id,
-            },
-            path_id: request.target.path_id,
-            calibration_id,
-            train_payload_bytes: request.train_bytes as u64,
-            sample_floor_bytes: request.sample_floor_bytes,
-            warmup_carrier_bytes: request.carrier_window_bytes,
-            required_timed_carrier_bytes: request.fresh_strict_window_bytes,
-            proof_validity: request.proof_validity,
-            expires_at: probe_expires_at,
-            ticket: command_ticket,
-            cancel_on_drop: true,
-        };
-        if target
-            .commands
-            .try_enqueue_quic_capacity_probe(probe)
-            .is_err()
-        {
-            return false;
+        let attempts_removed = state
+            .quic_capacity_calibration_attempts
+            .remove(&ServerQuicCapacityCalibrationPathKey {
+                session_id,
+                path,
+                path_instance_id,
+            })
+            .is_some();
+        if reservation_matches || attempts_removed {
+            state.bump_generation(session_id);
         }
-        admission.mark_admitted();
-        // The carrier allocates and encodes only after this one typed command is
-        // admitted, so failed reservations no longer build a throwaway train.
-        let lease = lease_after_admission(request.lease);
-        let Some(expires_at) = Instant::now().checked_add(lease) else {
-            return false;
-        };
-        if !self.lane_tracker.commit_quic_capacity_calibration(
-            self.session_id,
-            self.binding_instance_id,
-            request.target,
-            request.target_path_instance_id,
-            expires_at,
-            calibration_id,
-        ) {
-            return false;
+        #[cfg(feature = "lab-diagnostics")]
+        if let Some(reservation) = retired_reservation {
+            record_quic_capacity_lifecycle(
+                "retired",
+                "carrier_instance_retired",
+                session_id,
+                reservation,
+                None,
+            );
         }
-        admission.mark_committed();
-        // Publish after command admission so a new planner cannot reuse the
-        // pre-calibration pending-byte/model snapshot.
-        self.response_model_generation
-            .fetch_add(1, Ordering::AcqRel);
-        #[cfg(feature = "lab-diagnostics")]
-        let session_spent_bytes = self
-            .lane_tracker
-            .response_scheduling_snapshot(self.session_id)
-            .quic_capacity_calibration_spent_bytes;
-        drop(outputs);
-        #[cfg(feature = "lab-diagnostics")]
-        lab_diagnostic(
-            "response_quic_capacity_calibration",
-            format_args!(
-                "phase=started session_id={} binding_instance_id={} path_id={} path_instance_id={} incarnation={} calibration_id={} attempt_ordinal={} selection={} train_bytes={} sample_floor_bytes={} accounting_slack_bytes={} fresh_strict_window_bytes={} carrier_window_bytes={} frame_count={} proof_validity_ms={} lease_ms={} lease_committed={} session_spent_bytes={} session_limit_bytes={}",
-                self.session_id.0,
-                self.binding_instance_id,
-                request.target.path_id.0,
-                request.target_path_instance_id.0,
-                request.target_incarnation,
-                calibration_id,
-                attempt_ordinal,
-                selection,
-                request.train_bytes,
-                request.sample_floor_bytes,
-                request.accounting_slack_bytes,
-                request.fresh_strict_window_bytes,
-                request.carrier_window_bytes,
-                frame_count,
-                request.proof_validity.as_millis(),
-                request.lease.as_millis(),
-                true,
-                session_spent_bytes,
-                session_envelope,
-            ),
-        );
-        self.notify_update();
-        true
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = retired_reservation;
     }
 }

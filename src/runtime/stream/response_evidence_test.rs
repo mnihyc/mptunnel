@@ -3,7 +3,8 @@ use super::super::response_admission::{
     server_output_has_bulk_rate_evidence, server_output_has_sender_evidence,
     server_output_has_service_feed_evidence_with_limits,
 };
-use super::super::response_session::{ServerPathLaneTracker, quic_capacity_receipt_rate_bps};
+use super::super::response_quic_capacity::quic_capacity_receipt_rate_bps;
+use super::super::response_session::ServerPathLaneTracker;
 use super::super::response_snapshot::{server_bulk_output_snapshot, server_output_confidence};
 use super::super::response_topology::ResponseStreamOutputEntry;
 use super::{

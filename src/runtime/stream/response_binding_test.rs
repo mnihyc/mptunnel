@@ -3,7 +3,8 @@ use super::super::response_placement::ResponseServiceHandoffMode;
 use super::response_ack_clock::RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
 use super::response_evidence::server_output_fresh_quic_capacity_proof;
 use super::response_handoff::{ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest};
-use super::response_quic_capacity::ResponseQuicCapacityCalibrationRequest;
+use super::response_quic_capacity::ServerQuicCapacityCalibrationPhase;
+use super::response_quic_probe::ResponseQuicCapacityCalibrationRequest;
 use super::*;
 use crate::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,

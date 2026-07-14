@@ -4,7 +4,7 @@
 use super::ResponseStreamBinding;
 #[cfg(test)]
 use super::response_ack_clock::ResponseAckClockCalibrationState;
-use super::response_session::{
+use super::response_quic_capacity::{
     valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
 };
 use super::response_topology::{ResponseStreamOutputEntry, ServerCarrierPathInstanceId};

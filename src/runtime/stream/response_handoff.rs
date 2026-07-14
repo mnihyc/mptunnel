@@ -2,7 +2,7 @@ use super::response_admission::server_output_has_bulk_rate_evidence_with_limits;
 use super::response_evidence::{
     server_output_fresh_quic_capacity_proof, server_output_quic_capacity_proof_marker,
 };
-use super::response_session::{
+use super::response_quic_capacity::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
 use super::response_snapshot::server_bulk_output_snapshot_with_command_pending;

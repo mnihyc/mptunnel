@@ -16,6 +16,8 @@ mod response_lifecycle;
 mod response_load;
 #[path = "response_quic_capacity.rs"]
 mod response_quic_capacity;
+#[path = "response_quic_probe.rs"]
+mod response_quic_probe;
 #[path = "response_session.rs"]
 pub(super) mod response_session;
 #[path = "response_snapshot.rs"]
@@ -63,15 +65,17 @@ pub(in crate::runtime) use response_handoff::{
     ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest,
 };
 pub(in crate::runtime) use response_load::ServerRealtimeFlowRegistration;
-pub(in crate::runtime) use response_quic_capacity::ResponseQuicCapacityCalibrationRequest;
-#[cfg(test)]
-pub(in crate::runtime) use response_session::ResponseSessionSchedulingSnapshot;
 #[cfg(any(test, feature = "lab-diagnostics"))]
-pub(in crate::runtime) use response_session::well_formed_quic_capacity_proof_candidate;
-pub(in crate::runtime) use response_session::{
-    ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation, ServerPathLaneTracker,
+pub(in crate::runtime) use response_quic_capacity::well_formed_quic_capacity_proof_candidate;
+pub(in crate::runtime) use response_quic_capacity::{
     quic_capacity_proof_pin_matches_marker, quic_capacity_receipt_rate_bps,
     valid_quic_capacity_proof_candidate_at,
+};
+pub(in crate::runtime) use response_quic_probe::ResponseQuicCapacityCalibrationRequest;
+#[cfg(test)]
+pub(in crate::runtime) use response_session::ResponseSessionSchedulingSnapshot;
+pub(in crate::runtime) use response_session::{
+    ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation, ServerPathLaneTracker,
 };
 pub(in crate::runtime) use response_snapshot::server_bulk_output_eta_ms;
 #[cfg(test)]
@@ -94,8 +98,6 @@ pub(in crate::runtime) use response_transaction::{
 #[cfg(test)]
 use self::response_evidence::server_output_quic_capacity_proof_marker;
 use self::response_load::ServerResponseFlowRegistration;
-#[cfg(test)]
-use self::response_session::ServerQuicCapacityCalibrationPhase;
 #[cfg(test)]
 use self::response_snapshot::server_bulk_output_snapshot;
 #[cfg(test)]

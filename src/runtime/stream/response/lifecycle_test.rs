@@ -1,10 +1,16 @@
 use super::super::ResponseStreamBinding;
 use super::super::session::{ServerPathLaneTracker, ServerSessionRetentionSnapshot};
+use super::super::topology::ResponseStreamAttachOutcome;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponseServiceFamilyLoads;
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, SessionId, StreamId, UnderlayProtocol};
-use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::protocol::{
+    Frame, PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol,
+};
+use crate::runtime::path::commands::{
+    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
+    reliable_path_command_pending_bytes,
+};
 use crate::scheduler::FlowLane;
 use std::sync::Arc;
 
@@ -107,4 +113,68 @@ async fn close_command_detaches_shared_lane_load_exactly_once() {
     assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 1);
     drop(second);
     assert_eq!(lane_tracker.snapshot(session_id, key).active_flows, 0);
+}
+
+#[tokio::test]
+async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
+    let stream_id = StreamId(97);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(97),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        first_commands,
+        FlowLane::Throughput,
+    );
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Udp,
+            PathId(1),
+            second_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            64 * 1024,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let proof = recv_reliable_path_command(&mut second_receivers)
+        .await
+        .expect("attached output path proof");
+    second_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+
+    binding
+        .reset_and_close_stream_ordered(stream_id, ResetReason::Refused, FlowLane::Throughput)
+        .await;
+
+    for receivers in [&mut first_receivers, &mut second_receivers] {
+        let reset = recv_reliable_path_command(receivers)
+            .await
+            .expect("terminal reset");
+        assert!(matches!(
+            &reset,
+            ReliablePathCommand::SendFrame(Frame::StreamReset {
+                stream_id: reset_stream_id,
+                reason: ResetReason::Refused,
+            }) if *reset_stream_id == stream_id
+        ));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&reset));
+        assert!(matches!(
+            recv_reliable_path_command(receivers).await,
+            Some(ReliablePathCommand::CloseStream(close_stream_id)) if close_stream_id == stream_id
+        ));
+    }
+
+    let (late_commands, _late_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Udp,
+            PathId(2),
+            late_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            64 * 1024,
+        ),
+        ResponseStreamAttachOutcome::RejectedClosedStream,
+    );
 }

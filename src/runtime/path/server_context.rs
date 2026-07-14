@@ -1,6 +1,6 @@
 //! Shared server configuration and carrier-path registries.
 
-use crate::config::{MppPerformanceConfig, RouteTarget, SecurityConfig};
+use crate::config::{RouteTarget, SecurityConfig};
 use crate::mux::MuxLimits;
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
@@ -9,7 +9,7 @@ use crate::protocol::{
 };
 use crate::runtime::path::model::path_startup_metrics;
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::runtime::stream::{ServerReliableStreamRegistry, ServerStreamContext};
+use crate::runtime::stream::ServerReliableStreamRegistry;
 use crate::transport::PathSpec;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,29 +23,15 @@ pub(in crate::runtime) struct ServerPathContext {
     pub(in crate::runtime) outbound: OutboundConfig,
     pub(in crate::runtime) outbound_dns: DnsConfig,
     pub(in crate::runtime) outbound_connect_timeout: Duration,
-    pub(in crate::runtime) performance: MppPerformanceConfig,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) security: SecurityConfig,
     pub(in crate::runtime) reliable_streams: Arc<ServerReliableStreamRegistry>,
     pub(in crate::runtime) path_join_replay: Arc<Mutex<RecentIdCache<PathJoinReplayKey>>>,
-    pub(in crate::runtime) max_reliable_streams: usize,
     pub(in crate::runtime) max_udp_flows_per_session: usize,
 }
 
 impl ServerPathContext {
-    /// Gives a product stream only the policy and registry it must retain.
-    pub(in crate::runtime) fn reliable_stream_context(&self) -> ServerStreamContext {
-        ServerStreamContext::new(
-            self.outbound.clone(),
-            self.outbound_dns.clone(),
-            self.outbound_connect_timeout,
-            self.performance,
-            self.mux_limits,
-            self.reliable_streams.clone(),
-        )
-    }
-
     pub(in crate::runtime) fn local_path_startup_metrics(
         &self,
         underlay: UnderlayProtocol,

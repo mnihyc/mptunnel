@@ -20,7 +20,7 @@ use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::stream::{
     ServerCarrierPathRegistration, ServerReliablePathAttachment, ServerReliableStreamOpen,
-    ServerReliableStreamOpenRequest, run_server_reliable_stream,
+    ServerReliableStreamOpenRequest,
 };
 use crate::scheduler::flow_lane_from_stream_demand_hint;
 use std::collections::HashSet;
@@ -72,18 +72,15 @@ impl ServerTcpStreamState {
                 },
             },
             context.mux_limits,
-            context.max_reliable_streams,
         )? {
-            ServerReliableStreamOpen::New(stream) => {
+            ServerReliableStreamOpen::New(accepted) => {
                 self.attached.insert(stream_id);
-                let stream_context = context.reliable_stream_context();
-                tokio::spawn(async move {
-                    if let Err(err) =
-                        run_server_reliable_stream(stream_context, session_id, stream, target).await
-                    {
-                        eprintln!("warning: server reliable stream failed: {err}");
-                    }
-                });
+                if let Err(accepted) = context.reliable_streams.submit_accepted(accepted) {
+                    accepted.close().await;
+                    return Err(RuntimeError::Protocol(
+                        "server reliable stream service closed",
+                    ));
+                }
                 None
             }
             ServerReliableStreamOpen::Existing => {

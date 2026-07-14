@@ -4,6 +4,7 @@ use super::response::{
     ServerPathMetricsEntry, ServerPathMetricsSource, ServerRealtimeFlowRegistration,
     next_server_carrier_path_instance_id,
 };
+#[cfg(test)]
 use crate::config::ResourceLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
@@ -15,8 +16,8 @@ use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
-    Frame, PathId, PathMetricDirection, PathMetrics, SessionId, StreamId, StreamOpenRole,
-    TargetAddr, UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, PathMetrics, ResetReason, SessionId, StreamId,
+    StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
@@ -28,9 +29,10 @@ use crate::runtime::path::tcp::capacity::{
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 /// Session-wide registry for server-side product reliable streams.
 ///
@@ -38,6 +40,8 @@ use tokio::sync::mpsc;
 /// filtering, and peer/local path metrics for response scheduling. It does not
 /// own target sockets or carrier packet state.
 pub(in crate::runtime) struct ServerReliableStreamRegistry {
+    max_streams: usize,
+    accepted: mpsc::UnboundedSender<AcceptedServerReliableStream>,
     streams: Mutex<HashMap<(SessionId, StreamId), ServerReliableStreamEntry>>,
     path_metrics: Mutex<
         HashMap<
@@ -86,10 +90,193 @@ pub(in crate::runtime) struct ServerReliableStreamOpenRequest<'a> {
 }
 
 pub(in crate::runtime) enum ServerReliableStreamOpen {
-    New(ReliablePathStream),
+    New(AcceptedServerReliableStream),
     Existing,
     DuplicateLiveIgnored,
     Rejected,
+}
+
+/// One registry-admitted product stream awaiting or running its target relay.
+///
+/// Its retirement lease keeps registry membership alive until carrier output
+/// has closed. The relay supervisor retains that lease across task aborts.
+pub(in crate::runtime) struct AcceptedServerReliableStream {
+    session_id: SessionId,
+    target: TargetAddr,
+    stream: Option<ReliablePathStream>,
+    retirement: Arc<AcceptedServerReliableStreamRetirementInner>,
+    supervised: bool,
+}
+
+struct AcceptedServerReliableStreamRetirementInner {
+    registry: Arc<ServerReliableStreamRegistry>,
+    session_id: SessionId,
+    stream_id: StreamId,
+    close_output: ReliablePathStreamOutput,
+    state: AsyncMutex<AcceptedServerReliableStreamRetirementState>,
+    registry_retired: AtomicBool,
+}
+
+struct AcceptedServerReliableStreamRetirementState {
+    close_required: bool,
+    mode: AcceptedServerReliableStreamCloseMode,
+}
+
+#[derive(Clone, Copy)]
+enum AcceptedServerReliableStreamCloseMode {
+    Unordered,
+    Reset { reason: ResetReason, lane: FlowLane },
+}
+
+/// Supervisor-owned retirement for one accepted relay task.
+pub(in crate::runtime) struct AcceptedServerReliableStreamRetirement {
+    inner: Arc<AcceptedServerReliableStreamRetirementInner>,
+    armed: bool,
+}
+
+struct ScheduledAcceptedServerReliableStreamRetirement {
+    inner: Arc<AcceptedServerReliableStreamRetirementInner>,
+}
+
+impl AcceptedServerReliableStreamRetirementInner {
+    async fn close_output(&self, state: &mut AcceptedServerReliableStreamRetirementState) {
+        if !state.close_required {
+            return;
+        }
+        match state.mode {
+            AcceptedServerReliableStreamCloseMode::Unordered => {
+                self.close_output.close_stream(self.stream_id).await;
+            }
+            AcceptedServerReliableStreamCloseMode::Reset { reason, lane } => {
+                self.close_output
+                    .reset_and_close_stream_ordered(self.stream_id, reason, lane)
+                    .await;
+            }
+        }
+        state.close_required = false;
+    }
+
+    async fn retire(&self, mode: AcceptedServerReliableStreamCloseMode) {
+        // This lifecycle mutex may span the close await: cancellation drops
+        // the guard with close_required intact, allowing the supervisor retry.
+        let mut state = self.state.lock().await;
+        if self.registry_retired.load(Ordering::Acquire) {
+            return;
+        }
+        if matches!(mode, AcceptedServerReliableStreamCloseMode::Reset { .. }) {
+            // Preserve terminal delivery across cancellation so a supervisor
+            // retry cannot replace ordered Reset+Close with control-only close.
+            state.mode = mode;
+        }
+        self.close_output(&mut state).await;
+        self.retire_registry();
+    }
+
+    async fn mark_output_closed(&self) {
+        self.state.lock().await.close_required = false;
+    }
+
+    fn retire_registry(&self) {
+        if !self.registry_retired.swap(true, Ordering::AcqRel) {
+            self.registry.close(self.session_id, self.stream_id);
+        }
+    }
+}
+
+impl Drop for ScheduledAcceptedServerReliableStreamRetirement {
+    fn drop(&mut self) {
+        // A runtime may discard a just-spawned future without polling it. The
+        // carrier close is then impossible, but registry membership must not leak.
+        self.inner.retire_registry();
+    }
+}
+
+fn schedule_accepted_stream_retirement(
+    retirement: Arc<AcceptedServerReliableStreamRetirementInner>,
+) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let scheduled = ScheduledAcceptedServerReliableStreamRetirement { inner: retirement };
+        runtime.spawn(async move {
+            scheduled
+                .inner
+                .retire(AcceptedServerReliableStreamCloseMode::Unordered)
+                .await;
+        });
+    } else {
+        // No async executor remains to close carrier output. Removing registry
+        // membership is the only teardown still possible at process/runtime drop.
+        retirement.retire_registry();
+    }
+}
+
+impl AcceptedServerReliableStream {
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(in crate::runtime) fn target(&self) -> &TargetAddr {
+        &self.target
+    }
+
+    pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
+        self.stream.as_ref().expect("accepted reliable stream")
+    }
+
+    pub(in crate::runtime) fn take_stream(&mut self) -> ReliablePathStream {
+        self.stream.take().expect("accepted reliable stream")
+    }
+
+    pub(in crate::runtime) fn supervise(&mut self) -> AcceptedServerReliableStreamRetirement {
+        debug_assert!(!self.supervised, "accepted stream already supervised");
+        self.supervised = true;
+        AcceptedServerReliableStreamRetirement {
+            inner: self.retirement.clone(),
+            armed: true,
+        }
+    }
+
+    pub(in crate::runtime) async fn mark_closed(&mut self) {
+        self.retirement.mark_output_closed().await;
+    }
+
+    pub(in crate::runtime) async fn close(mut self) {
+        self.retirement
+            .retire(AcceptedServerReliableStreamCloseMode::Unordered)
+            .await;
+        self.supervised = true;
+    }
+
+    pub(in crate::runtime) async fn reject(mut self, reason: ResetReason, lane: FlowLane) {
+        self.retirement
+            .retire(AcceptedServerReliableStreamCloseMode::Reset { reason, lane })
+            .await;
+        self.supervised = true;
+    }
+}
+
+impl Drop for AcceptedServerReliableStream {
+    fn drop(&mut self) {
+        if !self.supervised {
+            schedule_accepted_stream_retirement(self.retirement.clone());
+        }
+    }
+}
+
+impl AcceptedServerReliableStreamRetirement {
+    pub(in crate::runtime) async fn retire(mut self) {
+        self.inner
+            .retire(AcceptedServerReliableStreamCloseMode::Unordered)
+            .await;
+        self.armed = false;
+    }
+}
+
+impl Drop for AcceptedServerReliableStreamRetirement {
+    fn drop(&mut self) {
+        if self.armed {
+            schedule_accepted_stream_retirement(self.inner.clone());
+        }
+    }
 }
 
 pub(in crate::runtime) struct ServerReliableRegistryManagementSnapshot {
@@ -153,8 +340,33 @@ impl Drop for ServerCarrierPathRegistrationInner {
 }
 
 impl ServerReliableStreamRegistry {
+    #[cfg(test)]
     pub(in crate::runtime) fn new(max_streams: usize) -> Self {
+        let (accepted, _receiver) = mpsc::unbounded_channel();
+        Self::with_accept_sender(max_streams, accepted)
+    }
+
+    /// Creates the registry and its uniquely paired relay receiver together.
+    pub(in crate::runtime) fn new_accepting(
+        max_streams: usize,
+    ) -> (
+        Arc<Self>,
+        mpsc::UnboundedReceiver<AcceptedServerReliableStream>,
+    ) {
+        let (accepted, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self::with_accept_sender(max_streams, accepted)),
+            receiver,
+        )
+    }
+
+    fn with_accept_sender(
+        max_streams: usize,
+        accepted: mpsc::UnboundedSender<AcceptedServerReliableStream>,
+    ) -> Self {
         Self {
+            max_streams,
+            accepted,
             streams: Mutex::new(HashMap::new()),
             path_metrics: Mutex::new(HashMap::new()),
             active_path_instances: Mutex::new(HashSet::new()),
@@ -163,6 +375,14 @@ impl ServerReliableStreamRegistry {
             ))),
             lane_tracker: Arc::new(ServerPathLaneTracker::default()),
         }
+    }
+
+    /// Hands an admitted stream to this registry's paired target-relay service.
+    pub(in crate::runtime) fn submit_accepted(
+        &self,
+        accepted: AcceptedServerReliableStream,
+    ) -> Result<(), AcceptedServerReliableStream> {
+        self.accepted.send(accepted).map_err(|error| error.0)
     }
 
     pub(in crate::runtime) fn management_snapshot(
@@ -200,6 +420,33 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
     ) -> ServerRealtimeFlowRegistration {
         ServerRealtimeFlowRegistration::new(self.lane_tracker.clone(), session_id)
+    }
+
+    fn accepted_stream(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        target: TargetAddr,
+        stream: ReliablePathStream,
+    ) -> AcceptedServerReliableStream {
+        let stream_id = stream.stream_id;
+        let close_output = stream.output.clone();
+        AcceptedServerReliableStream {
+            session_id,
+            target,
+            stream: Some(stream),
+            retirement: Arc::new(AcceptedServerReliableStreamRetirementInner {
+                registry: self.clone(),
+                session_id,
+                stream_id,
+                close_output,
+                state: AsyncMutex::new(AcceptedServerReliableStreamRetirementState {
+                    close_required: true,
+                    mode: AcceptedServerReliableStreamCloseMode::Unordered,
+                }),
+                registry_retired: AtomicBool::new(false),
+            }),
+            supervised: false,
+        }
     }
 
     pub(in crate::runtime) fn register_carrier_path(
@@ -265,10 +512,9 @@ impl ServerReliableStreamRegistry {
     }
 
     pub(in crate::runtime) fn open_or_attach(
-        &self,
+        self: &Arc<Self>,
         request: ServerReliableStreamOpenRequest<'_>,
         mux_limits: MuxLimits,
-        max_streams: usize,
     ) -> Result<ServerReliableStreamOpen, RuntimeError> {
         let ServerReliableStreamOpenRequest {
             session_id,
@@ -312,7 +558,6 @@ impl ServerReliableStreamRegistry {
                     "reliable stream migration target does not match original stream",
                 ));
             }
-            entry.lane = lane;
             let attach_outcome = entry.binding.attach_with_path_instance(
                 underlay,
                 path_id,
@@ -322,6 +567,20 @@ impl ServerReliableStreamRegistry {
                 role,
                 max_frame_payload_bytes,
             );
+            if matches!(
+                attach_outcome,
+                ResponseStreamAttachOutcome::RejectedClosedStream
+            ) {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_stream_open",
+                    format_args!(
+                        "session_id={} stream_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=rejected_closing_stream",
+                        session_id.0, stream_id.0, underlay, path_id.0, role, lane,
+                    ),
+                );
+                return Ok(ServerReliableStreamOpen::Rejected);
+            }
             if matches!(
                 attach_outcome,
                 ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
@@ -334,6 +593,7 @@ impl ServerReliableStreamRegistry {
                     ResponseStreamAttachOutcome::Attached => "attached",
                     ResponseStreamAttachOutcome::RoleChanged => "role_changed",
                     ResponseStreamAttachOutcome::ReplacedClosedOutput => "replaced_closed_output",
+                    ResponseStreamAttachOutcome::RejectedClosedStream => "rejected_closed_stream",
                 };
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -345,9 +605,11 @@ impl ServerReliableStreamRegistry {
                 );
                 return Ok(ServerReliableStreamOpen::DuplicateLiveIgnored);
             }
+            entry.lane = lane;
             if !matches!(
                 attach_outcome,
                 ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
+                    | ResponseStreamAttachOutcome::RejectedClosedStream
             ) && let Some(metrics) = initial_metrics
             {
                 entry.binding.install_stored_path_metrics_for_instance(
@@ -396,7 +658,7 @@ impl ServerReliableStreamRegistry {
             return Ok(ServerReliableStreamOpen::Rejected);
         }
 
-        if streams.len() >= max_streams {
+        if streams.len() >= self.max_streams {
             return Err(RuntimeError::Protocol(
                 "server reliable stream limit reached",
             ));
@@ -442,7 +704,7 @@ impl ServerReliableStreamRegistry {
         );
         let initial_max_offset =
             reliable_stream_initial_advertised_window_bytes(underlay, lane, mux_limits);
-        Ok(ServerReliableStreamOpen::New(ReliablePathStream {
+        let stream = ReliablePathStream {
             stream_id,
             max_offset: initial_max_offset,
             lane,
@@ -450,7 +712,12 @@ impl ServerReliableStreamRegistry {
             max_frame_payload_bytes,
             output: ReliablePathStreamOutput::Switchable(binding),
             frames: frames_rx,
-        }))
+        };
+        Ok(ServerReliableStreamOpen::New(self.accepted_stream(
+            session_id,
+            target.clone(),
+            stream,
+        )))
     }
 
     pub(in crate::runtime) fn record_path_metrics(
@@ -879,6 +1146,7 @@ impl ServerReliableStreamRegistry {
     }
 }
 
+#[cfg(test)]
 impl Default for ServerReliableStreamRegistry {
     fn default() -> Self {
         Self::new(ResourceLimits::default().max_streams)

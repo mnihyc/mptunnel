@@ -8,7 +8,6 @@ mod handle;
 mod registry;
 pub(in crate::runtime) mod request;
 pub(in crate::runtime) mod response;
-mod server;
 
 pub(in crate::runtime) use handle::{
     FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamHandle,
@@ -16,8 +15,8 @@ pub(in crate::runtime) use handle::{
     wait_for_carrier_capacity_notifies,
 };
 pub(in crate::runtime) use registry::{
+    AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement,
     ServerCarrierPathRegistration, ServerReliablePathAttachment,
     ServerReliableRegistryManagementSnapshot, ServerReliableStreamOpen,
     ServerReliableStreamOpenRequest, ServerReliableStreamRegistry,
 };
-pub(in crate::runtime) use server::{ServerStreamContext, run_server_reliable_stream};

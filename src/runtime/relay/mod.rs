@@ -10,9 +10,13 @@ mod diagnostics;
 pub(super) mod flow;
 pub(super) mod io;
 pub(super) mod open;
+mod server;
 
 pub(super) use control::*;
 pub(super) use diagnostics::*;
 pub(super) use flow::*;
 pub(super) use io::*;
 pub(super) use open::*;
+pub(in crate::runtime) use server::ServerReliableRelayService;
+#[cfg(test)]
+pub(in crate::runtime) use server::relay_reliable_stream;

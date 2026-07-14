@@ -253,21 +253,44 @@ impl ReliablePathCommandSender {
         result
     }
 
+    pub(in crate::runtime) async fn send_stream_ordered_frame(
+        &self,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
+        self.send_stream_ordered_command(ReliablePathCommand::SendFrame(frame), lane)
+            .await
+    }
+
     pub(in crate::runtime) async fn send_stream_ordered_close(
         &self,
         stream_id: StreamId,
+        lane: FlowLane,
+    ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
+        self.send_stream_ordered_command(ReliablePathCommand::CloseStream(stream_id), lane)
+            .await
+    }
+
+    async fn send_stream_ordered_command(
+        &self,
+        command: ReliablePathCommand,
         _lane: FlowLane,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
-        let command = ReliablePathCommand::CloseStream(stream_id);
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
+        #[cfg(feature = "lab-diagnostics")]
+        let command_kind = reliable_path_command_kind(&command);
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_id = reliable_path_command_stream_id(&command);
         #[cfg(feature = "lab-diagnostics")]
         let ordered_lane = reliable_path_stream_ordered_queue_lane();
         let queue = &self.data;
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
+        self.metrics.add_pending_bytes(pending_bytes);
         let result = queue
             .send(QueuedReliablePathCommand::new(
                 command,
-                0,
+                pending_bytes,
                 self.metrics.clone(),
             ))
             .await
@@ -278,10 +301,12 @@ impl ReliablePathCommandSender {
             lab_diagnostic(
                 "path_command_queue_send",
                 format_args!(
-                    "queue=data command_kind=close_stream stream_id={} lane={:?} effective_lane={:?} pacing_bytes=0 wait_ms={} result={}",
+                    "queue=data command_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms={} result={}",
+                    command_kind,
                     stream_id.0,
                     _lane,
                     ordered_lane,
+                    pending_bytes,
                     elapsed.as_millis(),
                     if result.is_ok() { "queued" } else { "closed" },
                 ),

@@ -12,11 +12,17 @@ use crate::runtime::path::quic::io::UdpPathEndpoint;
 use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
 use crate::runtime::path::tcp::server::handle_server_path;
 use crate::runtime::recent_ids::{RecentIdCache, path_join_replay_cache_capacity};
-use crate::runtime::stream::ServerReliableStreamRegistry;
+use crate::runtime::relay::ServerReliableRelayService;
 use crate::transport::{PathSpec, tcp};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+
+/// Per-identity server services and the carrier context they compose.
+pub(in crate::runtime) struct ServerIdentityRuntime {
+    pub(in crate::runtime) paths: ServerPathContext,
+    pub(in crate::runtime) reliable_relay: ServerReliableRelayService,
+}
 
 pub(super) async fn run(
     path_specs: Vec<PathSpec>,
@@ -28,7 +34,7 @@ pub(super) async fn run(
     resources: ResourceLimits,
     management: ManagementConfig,
 ) -> Result<(), RuntimeError> {
-    let context = new_path_context(
+    let runtime = new_identity_runtime(
         path_specs.clone(),
         outbound,
         outbound_dns,
@@ -37,17 +43,22 @@ pub(super) async fn run(
         performance,
         resources,
     );
-    let bound = bind_paths(path_specs, &context).await?;
-    let mut listeners = tokio::task::JoinSet::new();
+    let bound = bind_paths(path_specs, &runtime.paths).await?;
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay,
+    } = runtime;
+    let mut services = tokio::task::JoinSet::new();
+    services.spawn(reliable_relay.run());
     if management.enabled() {
-        let context = context.clone();
-        listeners.spawn(async move { run_server_management_api(management, context).await });
+        let paths = paths.clone();
+        services.spawn(async move { run_server_management_api(management, paths).await });
     }
-    spawn_listeners(bound, context, &mut listeners);
-    wait_for_listener(listeners, "server listener exited").await
+    spawn_listeners(bound, paths, &mut services);
+    wait_for_service(services, "server service exited").await
 }
 
-pub(super) fn new_path_context(
+pub(in crate::runtime) fn new_identity_runtime(
     server_paths: Vec<PathSpec>,
     outbound: OutboundConfig,
     outbound_dns: DnsConfig,
@@ -55,8 +66,8 @@ pub(super) fn new_path_context(
     security: SecurityConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
-) -> ServerPathContext {
-    new_path_context_with_identity(
+) -> ServerIdentityRuntime {
+    new_identity_runtime_with_metadata(
         None,
         None,
         server_paths,
@@ -69,7 +80,7 @@ pub(super) fn new_path_context(
     )
 }
 
-pub(super) fn new_path_context_with_identity(
+pub(super) fn new_identity_runtime_with_metadata(
     tag: Option<String>,
     route_target: Option<RouteTarget>,
     server_paths: Vec<PathSpec>,
@@ -79,24 +90,34 @@ pub(super) fn new_path_context_with_identity(
     security: SecurityConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
-) -> ServerPathContext {
-    ServerPathContext {
+) -> ServerIdentityRuntime {
+    let mux_limits = resources.into();
+    let (reliable_streams, reliable_relay) = ServerReliableRelayService::new(
+        outbound.clone(),
+        outbound_dns.clone(),
+        outbound_connect_timeout,
+        performance,
+        mux_limits,
+    );
+    let paths = ServerPathContext {
         tag,
         route_target,
         server_paths: Arc::new(server_paths),
         outbound,
         outbound_dns,
         outbound_connect_timeout,
-        performance,
         codec_limits: resources.into(),
-        mux_limits: resources.into(),
+        mux_limits,
         security,
-        reliable_streams: Arc::new(ServerReliableStreamRegistry::new(resources.max_streams)),
+        reliable_streams,
         path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),
-        max_reliable_streams: resources.max_streams,
         max_udp_flows_per_session: resources.max_streams,
+    };
+    ServerIdentityRuntime {
+        paths,
+        reliable_relay,
     }
 }
 
@@ -139,18 +160,18 @@ pub(super) fn spawn_listeners(
     }
 }
 
-async fn wait_for_listener(
-    mut listeners: tokio::task::JoinSet<Result<(), RuntimeError>>,
+async fn wait_for_service(
+    mut services: tokio::task::JoinSet<Result<(), RuntimeError>>,
     exited_message: &'static str,
 ) -> Result<(), RuntimeError> {
-    if let Some(result) = listeners.join_next().await {
+    if let Some(result) = services.join_next().await {
         match result {
             Ok(Ok(())) => Err(RuntimeError::Protocol(exited_message)),
             Ok(Err(err)) => Err(err),
             Err(err) => Err(RuntimeError::TaskJoin(err)),
         }
     } else {
-        Err(RuntimeError::Protocol("server has no listener tasks"))
+        Err(RuntimeError::Protocol("server has no runtime services"))
     }
 }
 

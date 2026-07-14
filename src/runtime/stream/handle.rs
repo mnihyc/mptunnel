@@ -13,7 +13,7 @@ use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::protocol::PathId;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::RequestTcpCapacityProbeLease;
 use crate::runtime::path::commands::{
@@ -575,7 +575,10 @@ impl ReliablePathStreamOutput {
 
     pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         match self {
-            Self::Fixed(fixed) => vec![fixed.commands().capacity_notify()],
+            Self::Fixed(fixed) if !fixed.commands().is_closed() => {
+                vec![fixed.commands().capacity_notify()]
+            }
+            Self::Fixed(_) => Vec::new(),
             Self::Switchable(binding) => binding.capacity_notifies(),
         }
     }
@@ -616,6 +619,31 @@ impl ReliablePathStreamOutput {
                     .await;
             }
             Self::Switchable(binding) => binding.close_stream_ordered(stream_id, lane).await,
+        }
+    }
+
+    pub(in crate::runtime) async fn reset_and_close_stream_ordered(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+        lane: FlowLane,
+    ) {
+        match self {
+            Self::Fixed(fixed) => {
+                let _ = fixed
+                    .commands()
+                    .send_stream_ordered_frame(Frame::StreamReset { stream_id, reason }, lane)
+                    .await;
+                let _ = fixed
+                    .commands()
+                    .send_stream_ordered_close(stream_id, lane)
+                    .await;
+            }
+            Self::Switchable(binding) => {
+                binding
+                    .reset_and_close_stream_ordered(stream_id, reason, lane)
+                    .await;
+            }
         }
     }
 

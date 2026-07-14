@@ -87,18 +87,14 @@ pub(super) async fn handle_server_udp_reliable_stream(
             },
         },
         context.mux_limits,
-        context.max_reliable_streams,
     )? {
-        ServerReliableStreamOpen::New(stream) => {
-            let stream_context = context.reliable_stream_context();
-            let target = target.clone();
-            tokio::spawn(async move {
-                if let Err(err) =
-                    run_server_reliable_stream(stream_context, session_id, stream, target).await
-                {
-                    eprintln!("warning: server reliable stream failed: {err}");
-                }
-            });
+        ServerReliableStreamOpen::New(accepted) => {
+            if let Err(accepted) = context.reliable_streams.submit_accepted(accepted) {
+                accepted.close().await;
+                return Err(RuntimeError::Protocol(
+                    "server reliable stream service closed",
+                ));
+            }
         }
         ServerReliableStreamOpen::Existing => {
             context
@@ -385,7 +381,6 @@ async fn run_server_udp_reliable_stream_loop(
                                 },
                             },
                             context.mux_limits,
-                            context.max_reliable_streams,
                         )? {
                             ServerReliableStreamOpen::Existing => {
                                 context
@@ -414,7 +409,8 @@ async fn run_server_udp_reliable_stream_loop(
                                 )
                                 .await?;
                             }
-                            ServerReliableStreamOpen::New(_) => {
+                            ServerReliableStreamOpen::New(accepted) => {
+                                accepted.close().await;
                                 return Err(RuntimeError::Protocol(
                                     "QUIC UDP path reannouncement opened duplicate stream",
                                 ));

@@ -34,7 +34,7 @@ pub(super) async fn run(
 
     let mut server_contexts = Vec::with_capacity(node.servers.len());
     for server_config in node.servers {
-        let context = server::new_path_context_with_identity(
+        let runtime = server::new_identity_runtime_with_metadata(
             server_config.tag.clone(),
             server_config.route_target.clone(),
             server_config.bind_paths.clone(),
@@ -45,9 +45,14 @@ pub(super) async fn run(
             server_config.performance,
             resources,
         );
-        let bound = server::bind_paths(server_config.bind_paths, &context).await?;
-        server::spawn_listeners(bound, context.clone(), &mut services);
-        server_contexts.push(context);
+        let bound = server::bind_paths(server_config.bind_paths, &runtime.paths).await?;
+        let server::ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = runtime;
+        services.spawn(reliable_relay.run());
+        server::spawn_listeners(bound, paths.clone(), &mut services);
+        server_contexts.push(paths);
     }
 
     if management.enabled() {

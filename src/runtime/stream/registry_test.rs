@@ -79,7 +79,7 @@ fn late_open_and_closed_output_replacement_inherit_capacity_receipt() {
 
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, first_receivers) = reliable_path_command_channels(8);
-    let stream = match registry
+    let accepted = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
                 session_id,
@@ -95,13 +95,13 @@ fn late_open_and_closed_output_replacement_inherit_capacity_receipt() {
                 },
             },
             MuxLimits::default(),
-            16,
         )
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::New(accepted) => accepted,
         _ => panic!("expected new response stream"),
     };
+    let stream = accepted.stream();
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable response binding");
     };
@@ -132,7 +132,6 @@ fn late_open_and_closed_output_replacement_inherit_capacity_receipt() {
                     },
                 },
                 MuxLimits::default(),
-                16,
             )
             .expect("replace closed response output"),
         ServerReliableStreamOpen::Existing

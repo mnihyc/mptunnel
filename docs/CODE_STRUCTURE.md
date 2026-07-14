@@ -25,6 +25,12 @@ must not import a later one.
 7. **Runtime and node composition** construct services, connect ports, and own
    process lifetime.
 
+On the server, one identity owns one uniquely paired stream registry and target
+relay service. Carrier actors may admit or attach streams, but they do not spawn
+target relays. An accepted-stream lease keeps registry membership alive until
+carrier output has closed; close and late attachment linearize under the
+response binding's output lock.
+
 When a lower actor must notify a higher service, define a narrow typed port at
 the lower boundary and inject its implementation from composition. Do not solve
 the dependency by a root re-export, a global prelude, or `use super::*`.

@@ -13,7 +13,7 @@ fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _receivers) = reliable_path_command_channels(8);
     let commands_for_guard = commands.clone();
-    let stream = match registry
+    let accepted = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
                 session_id,
@@ -32,13 +32,13 @@ fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("open UDP response stream")
     {
-        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::New(accepted) => accepted,
         _ => panic!("expected new UDP response stream"),
     };
+    let stream = accepted.stream();
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable response output");
     };

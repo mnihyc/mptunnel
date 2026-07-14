@@ -2,6 +2,7 @@ use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
+use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
@@ -65,26 +66,16 @@ fn udp_stream_path_indices(
     ordered_reliable_path_indices(&context.udp_paths, &observations, lane, payload_bytes)
 }
 
-fn server_context(outbound: OutboundConfig) -> ServerPathContext {
-    let resources = ResourceLimits::default();
-    ServerPathContext {
-        tag: None,
-        route_target: None,
-        server_paths: Arc::new(Vec::new()),
+fn server_runtime(outbound: OutboundConfig) -> ServerIdentityRuntime {
+    new_identity_runtime(
+        Vec::new(),
         outbound,
-        outbound_dns: DnsConfig::default(),
-        outbound_connect_timeout: DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        performance: MppPerformanceConfig::default(),
-        codec_limits: resources.into(),
-        mux_limits: resources.into(),
-        security: security(),
-        reliable_streams: Arc::new(ServerReliableStreamRegistry::default()),
-        path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
-            path_join_replay_cache_capacity(resources.max_streams),
-        ))),
-        max_reliable_streams: resources.max_streams,
-        max_udp_flows_per_session: resources.max_streams,
-    }
+        DnsConfig::default(),
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        security(),
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+    )
 }
 
 #[test]
@@ -317,17 +308,27 @@ async fn spawn_server_path_count(
     let path = reserve_tcp_path().await;
     let listener = bind_listener(&path).await.expect("bind");
     let handle = tokio::spawn(async move {
-        let context = server_context(outbound);
-        let mut sessions = tokio::task::JoinSet::new();
-        for _ in 0..count {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let session_context = context.clone();
-            sessions.spawn(async move { handle_server_path(stream, session_context).await });
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = server_runtime(outbound);
+        let relay = tokio::spawn(reliable_relay.run());
+        let result = async {
+            let mut sessions = tokio::task::JoinSet::new();
+            for _ in 0..count {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let session_context = paths.clone();
+                sessions.spawn(async move { handle_server_path(stream, session_context).await });
+            }
+            while let Some(session) = sessions.join_next().await {
+                session.map_err(RuntimeError::TaskJoin)??;
+            }
+            Ok(())
         }
-        while let Some(session) = sessions.join_next().await {
-            session.map_err(RuntimeError::TaskJoin)??;
-        }
-        Ok(())
+        .await;
+        relay.abort();
+        let _ = relay.await;
+        result
     });
     (path, handle)
 }
@@ -458,9 +459,17 @@ async fn spawn_notified_server_path(
 ) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
     let listener = bind_listener(&path).await.expect("bind");
     tokio::spawn(async move {
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = server_runtime(outbound);
+        let relay = tokio::spawn(reliable_relay.run());
         let (stream, _) = listener.accept().await.expect("accept");
         let _ = accepted.send(marker).await;
-        handle_server_path(stream, server_context(outbound)).await
+        let result = handle_server_path(stream, paths).await;
+        relay.abort();
+        let _ = relay.await;
+        result
     })
 }
 
@@ -473,23 +482,39 @@ async fn spawn_udp_server_path(
     outbound: OutboundConfig,
 ) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
     let path = reserve_udp_path().await;
-    let context = server_context(outbound);
-    let endpoint = bind_server_udp_endpoint(&path, &context)
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay,
+    } = server_runtime(outbound);
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
         .await
         .expect("bind udp path");
-    let server = tokio::spawn(run_server_udp_listener(endpoint, context));
+    let server = tokio::spawn(async move {
+        tokio::select! {
+            result = run_server_udp_listener(endpoint, paths) => result,
+            result = reliable_relay.run() => result,
+        }
+    });
     (path, server)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn server_udp_listener_accepts_probe_after_noise() {
     let bind_path = reserve_udp_path().await;
-    let context = server_context(OutboundConfig::Direct);
-    let endpoint = bind_server_udp_endpoint(&bind_path, &context)
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let endpoint = bind_server_udp_endpoint(&bind_path, &paths)
         .await
         .expect("bind udp");
     let server_addr = endpoint.local_addr().expect("udp server addr");
-    let server = tokio::spawn(run_server_udp_listener(endpoint, context));
+    let server = tokio::spawn(async move {
+        tokio::select! {
+            result = run_server_udp_listener(endpoint, paths) => result,
+            result = reliable_relay.run() => result,
+        }
+    });
 
     let noise = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -1662,7 +1687,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     let old_path_registration =
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
     let (old_commands, old_receivers) = reliable_path_command_channels(8);
-    let stream = match registry
+    let accepted = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
                 session_id,
@@ -1678,13 +1703,13 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("open response stream")
     {
-        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::New(accepted) => accepted,
         _ => panic!("expected a new response stream"),
     };
+    let stream = accepted.stream();
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable output");
     };
@@ -1721,7 +1746,6 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                     },
                 },
                 MuxLimits::default(),
-                ResourceLimits::default().max_streams,
             )
             .expect("replace closed response output"),
         ServerReliableStreamOpen::Existing
@@ -2511,81 +2535,6 @@ fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
 }
 
 #[test]
-fn reliable_recv_progress_sends_exact_tcp_sparse_deltas_without_delaying_feedback() {
-    let mux_limits = MuxLimits {
-        max_ack_ranges: 16,
-        max_stream_window_bytes: 64 * 1024,
-        max_repair_bytes: 64 * 1024,
-        max_reorder_bytes: 64 * 1024,
-        max_path_flight_bytes: 64 * 1024,
-        max_reliable_relay_chunk_bytes: 64 * 1024,
-        ..MuxLimits::default()
-    };
-    let tcp = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 180.0, 500_000_000.0);
-    let udp = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 500_000_000.0);
-
-    for (path, request_sparse, compact) in
-        [(tcp, true, true), (tcp, false, false), (udp, true, false)]
-    {
-        let mut recv_stream = ReliableRecvStream::new(StreamId(24), mux_limits);
-        let mut progress = ReliableRecvProgress::default();
-        let mut sparse_progress = RequestTcpSparseAckProgress::default();
-        recv_stream
-            .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
-            .expect("contiguous prefix");
-        assert!(progress.should_send_ack(
-            &recv_stream,
-            Some(path),
-            FlowLane::Throughput,
-            mux_limits,
-            false,
-        ));
-        assert_eq!(sparse_progress.ack_frames(&recv_stream, false).len(), 1);
-
-        let mut frames = Vec::new();
-        for offset in [8192, 32768, 16384, 12288] {
-            recv_stream
-                .receive_data(offset, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
-                .expect("sparse range");
-            assert!(
-                progress.should_send_ack(
-                    &recv_stream,
-                    Some(path),
-                    FlowLane::Throughput,
-                    mux_limits,
-                    false,
-                ),
-                "range-shape feedback cadence must not be weakened"
-            );
-            frames = sparse_progress.ack_frames(
-                &recv_stream,
-                request_sparse && path.underlay == UnderlayProtocol::Tcp,
-            );
-        }
-        assert_eq!(frames.len(), 1);
-        let Frame::StreamAck {
-            complete, ranges, ..
-        } = &frames[0]
-        else {
-            panic!("receive progress must emit STREAM_ACK");
-        };
-        assert_eq!(*complete, !compact);
-        assert_eq!(ranges.len(), if compact { 1 } else { 5 });
-        assert_eq!(
-            ranges.first().map(|range| range.start),
-            Some(if compact { 12288 } else { 0 })
-        );
-        assert_eq!(
-            ranges.last().map(|range| range.start),
-            Some(if compact { 12288 } else { 32768 })
-        );
-        if compact {
-            assert_eq!(ranges[0], OffsetRange::new(12288, 13312).unwrap());
-        }
-    }
-}
-
-#[test]
 fn reliable_recv_progress_acks_repair_horizon_advancement() {
     let mux_limits = MuxLimits {
         max_ack_ranges: 16,
@@ -2857,69 +2806,6 @@ fn ack_gap_repair_ignores_contiguous_unacked_owner_tail() {
 }
 
 #[test]
-fn tail_stall_repair_retransmits_same_frontier_only_after_stall_evidence() {
-    let stream_id = StreamId(34);
-    let (commands, _receivers) = reliable_path_command_channels(4);
-    let binding = ResponseStreamBinding::new(
-        SessionId(34),
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        commands,
-        FlowLane::Throughput,
-    );
-    let (_frame_tx, frame_rx) = mpsc::channel(1);
-    let path_stream = ReliablePathStream {
-        stream_id,
-        max_offset: 1024,
-        lane: FlowLane::Throughput,
-        underlay: UnderlayProtocol::Tcp,
-        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-        output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
-    };
-    let frame = Frame::StreamData {
-        stream_id,
-        offset: 128,
-        flags: StreamFlags::NONE,
-        payload: Bytes::from_static(b"frontier"),
-    };
-    binding.record_owner_flight(
-        CarrierPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            path_id: PathId(0),
-        },
-        &frame,
-    );
-    let later_frame = Frame::StreamData {
-        stream_id,
-        offset: 136,
-        flags: StreamFlags::NONE,
-        payload: Bytes::from_static(b"later"),
-    };
-
-    let (without_stall, blocked_offset) = prefix_repair_frames_with_available_output(
-        &path_stream,
-        vec![frame.clone(), later_frame.clone()],
-        false,
-    );
-    assert!(without_stall.is_empty());
-    assert_eq!(blocked_offset, Some(128));
-
-    let (with_stall, blocked_offset) =
-        prefix_repair_frames_with_available_output(&path_stream, vec![frame, later_frame], true);
-    assert_eq!(blocked_offset, None);
-    assert_eq!(with_stall.len(), 1);
-    assert!(matches!(
-        &with_stall[0],
-        Frame::StreamData {
-            offset: 128,
-            payload,
-            ..
-        } if payload.as_ref() == b"frontier"
-    ));
-}
-
-#[test]
 fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
     let mux_limits = MuxLimits::default();
     let mut recv_stream = ReliableRecvStream::new(StreamId(12), mux_limits);
@@ -3135,7 +3021,7 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
     let path_registration =
         registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(0));
     let (commands, _rx) = reliable_path_command_channels(4);
-    let mut stream = match registry
+    let mut accepted = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
                 session_id: SessionId(1),
@@ -3151,17 +3037,17 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("open stream")
     {
-        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::New(accepted) => accepted,
         ServerReliableStreamOpen::Existing => panic!("expected new stream"),
         ServerReliableStreamOpen::DuplicateLiveIgnored => {
             panic!("new active stream must not be treated as duplicate")
         }
         ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
     };
+    let mut stream = accepted.take_stream();
     assert_eq!(stream.current_lane(), FlowLane::Latency);
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable binding");
@@ -3201,10 +3087,12 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("open stream");
-    assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new stream"),
+    };
 
     let (duplicate_commands, _duplicate_rx) = reliable_path_command_channels(4);
     let duplicate_path_registration =
@@ -3225,7 +3113,6 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("duplicate live attach should be handled");
 
@@ -3253,7 +3140,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         !initial_metrics.app_limited,
         "configured startup rate hints are advisory priors, not app-limited samples"
     );
-    let stream = match registry
+    let accepted = match registry
         .open_or_attach(
             ServerReliableStreamOpenRequest {
                 session_id: SessionId(1),
@@ -3269,17 +3156,17 @@ fn server_response_output_inherits_open_path_startup_metrics() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("open stream")
     {
-        ServerReliableStreamOpen::New(stream) => stream,
+        ServerReliableStreamOpen::New(accepted) => accepted,
         ServerReliableStreamOpen::Existing => panic!("expected new stream"),
         ServerReliableStreamOpen::DuplicateLiveIgnored => {
             panic!("new active stream must not be treated as duplicate")
         }
         ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
     };
+    let stream = accepted.stream();
     let snapshot = stream
         .send_path_snapshot(FlowLane::Throughput, 1)
         .expect("switchable output exposes seeded path model");
@@ -3356,7 +3243,6 @@ fn server_reliable_registry_rejects_attach_only_unknown_stream() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("attach-only open should be handled");
     assert!(matches!(opened, ServerReliableStreamOpen::Rejected));
@@ -3390,10 +3276,12 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("active open should be handled");
-    assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected active stream open"),
+    };
     registry.close(session_id, stream_id);
 
     let (commands, _rx) = reliable_path_command_channels(4);
@@ -3415,7 +3303,6 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
                 },
             },
             MuxLimits::default(),
-            ResourceLimits::default().max_streams,
         )
         .expect("closed-stream reopen should be handled");
     assert!(matches!(reopened, ServerReliableStreamOpen::Rejected));

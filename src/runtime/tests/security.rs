@@ -2,7 +2,8 @@ use super::*;
 
 #[test]
 fn server_path_context_rejects_replayed_path_join_nonce() {
-    let context = server_context(OutboundConfig::Direct);
+    let runtime = server_runtime(OutboundConfig::Direct);
+    let context = &runtime.paths;
     let session_id = SessionId(42);
     let path_id = PathId(3);
     let nonce = AuthNonce([9; 16]);

@@ -87,6 +87,13 @@ product I/O. Frame ranges, BDP calculations, ordering predicates, and other
 pure protocol/model functions move to lower owners so carrier and stream code
 do not depend on relay as a utility facade.
 
+Server target relay lifetime is now one flat `runtime/relay/server.rs` owner.
+Each server identity constructs one registry/service pair; TCP and QUIC carrier
+actors submit accepted leases through that pair instead of spawning detached
+target tasks. Shared receive/range primitives remain in `relay/io.rs`. The
+remaining relay work is client/control ownership and removal of lower-layer
+policy still embedded in those actors, not another server subdirectory.
+
 ### Platform
 
 OS conditionals stay at packet-device, platform-reporting, or native telemetry
@@ -122,7 +129,8 @@ verification targets.
 9. Split shared path state and command code by identity, health, capacity
    transactions, load, queue, and writer ownership without merging TCP and QUIC
    controllers.
-10. Split relay orchestration after its lower-level utilities have moved out.
+10. Complete client/control relay orchestration after its lower-level utilities
+    have moved out; the server target-relay lifecycle is already owned.
 11. Replace repeated `mod.rs` facades, production glob imports, runtime prelude
     leakage, and broad re-exports with named contracts.
 12. Move remaining inline tests, update `ARCHITECTURE.md` to the final paths,

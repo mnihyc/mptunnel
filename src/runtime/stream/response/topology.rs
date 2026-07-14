@@ -41,6 +41,7 @@ pub(in crate::runtime) enum ResponseStreamAttachOutcome {
     RoleChanged,
     ReplacedClosedOutput,
     RejectedDuplicateLiveOutput,
+    RejectedClosedStream,
 }
 
 /// One carrier output attached to a response stream.
@@ -163,6 +164,11 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        // Close snapshots outputs under this lock after publishing the closed
+        // flag. An attach either enters that snapshot or observes closure.
+        if !self.response_stream_open.load(Ordering::Acquire) {
+            return ResponseStreamAttachOutcome::RejectedClosedStream;
+        }
         let response_flow_was_active = Self::response_flow_is_active(&outputs);
         let key = CarrierPathKey { underlay, path_id };
         let mut was_active = false;

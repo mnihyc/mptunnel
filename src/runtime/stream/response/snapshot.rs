@@ -96,6 +96,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock")
             .entries
             .iter()
+            .filter(|entry| !entry.commands.is_closed())
             .map(|entry| entry.commands.capacity_notify())
             .collect()
     }

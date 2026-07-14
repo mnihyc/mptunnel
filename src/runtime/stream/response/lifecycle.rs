@@ -12,7 +12,9 @@ use super::topology::{
 use super::{NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID, ResponseStreamBinding};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
+use crate::protocol::{
+    Frame, PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol,
+};
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::FlowLane;
 use std::collections::{BTreeMap, HashMap};
@@ -182,7 +184,7 @@ impl ResponseStreamBinding {
         self.version.subscribe()
     }
 
-    pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
+    fn begin_close(&self) -> Vec<ResponseStreamOutputEntry> {
         let outputs = {
             let outputs = self
                 .outputs
@@ -199,12 +201,10 @@ impl ResponseStreamBinding {
                 self.session_id,
                 self.binding_instance_id,
             );
-        for entry in outputs {
-            let _ = entry
-                .commands
-                .send_control(ReliablePathCommand::CloseStream(stream_id))
-                .await;
-        }
+        outputs
+    }
+
+    fn finish_close(&self) {
         let mut lead = self
             .ordered_data_owner
             .lock()
@@ -213,39 +213,53 @@ impl ResponseStreamBinding {
         self.response_flow_registration.set_service(None);
     }
 
+    pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
+        let outputs = self.begin_close();
+        for entry in outputs {
+            let _ = entry
+                .commands
+                .send_control(ReliablePathCommand::CloseStream(stream_id))
+                .await;
+        }
+        self.finish_close();
+    }
+
     pub(in crate::runtime) async fn close_stream_ordered(
         &self,
         stream_id: StreamId,
         lane: FlowLane,
     ) {
-        let outputs = {
-            let outputs = self
-                .outputs
-                .lock()
-                .expect("server reliable stream binding lock");
-            self.response_stream_open.store(false, Ordering::Release);
-            outputs.entries.clone()
-        };
-        self.response_flow_registration.set_active(false);
-        self.lane_tracker
-            .clear_quic_capacity_calibration_for_binding(self.session_id, self.binding_instance_id);
-        self.lane_tracker
-            .clear_response_service_handoff_drain_for_binding(
-                self.session_id,
-                self.binding_instance_id,
-            );
+        let outputs = self.begin_close();
         for entry in outputs {
             let _ = entry
                 .commands
                 .send_stream_ordered_close(stream_id, lane)
                 .await;
         }
-        let mut lead = self
-            .ordered_data_owner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *lead = None;
-        self.response_flow_registration.set_service(None);
+        self.finish_close();
+    }
+
+    /// Publishes terminal refusal and snapshots every affected output in one
+    /// transaction, so an attachment cannot miss both the reset and closure.
+    pub(in crate::runtime) async fn reset_and_close_stream_ordered(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+        lane: FlowLane,
+    ) {
+        let outputs = self.begin_close();
+        futures::future::join_all(outputs.into_iter().map(|entry| async move {
+            let _ = entry
+                .commands
+                .send_stream_ordered_frame(Frame::StreamReset { stream_id, reason }, lane)
+                .await;
+            let _ = entry
+                .commands
+                .send_stream_ordered_close(stream_id, lane)
+                .await;
+        }))
+        .await;
+        self.finish_close();
     }
 
     pub(super) fn notify_update(&self) {

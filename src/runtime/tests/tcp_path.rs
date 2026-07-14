@@ -1704,10 +1704,12 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
                 },
             },
             MuxLimits::default(),
-            8,
         )
         .expect("server stream open");
-    assert!(matches!(opened, ServerReliableStreamOpen::New(_)));
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new server stream"),
+    };
 
     registry.close(session_id, stream_id);
     registry
@@ -1754,13 +1756,14 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
                 },
             },
             MuxLimits::default(),
-            8,
         )
         .expect("unknown-frame drop must not poison active open");
-    assert!(
-        matches!(opened, ServerReliableStreamOpen::New(_)),
-        "unknown stream data is a product reordering/drop event, not terminal close state"
-    );
+    let _unknown_accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!(
+            "unknown stream data is a product reordering/drop event, not terminal close state"
+        ),
+    };
 }
 
 #[tokio::test]

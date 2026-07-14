@@ -373,7 +373,11 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     let high_bandwidth_listener = bind_listener(&high_bandwidth_path)
         .await
         .expect("high-bandwidth bind");
-    let server_context = server_context(OutboundConfig::Direct);
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_relay = tokio::spawn(reliable_relay.run());
     let (accepted_tx, mut accepted_rx) = mpsc::channel(8);
     let (stop_servers_tx, stop_servers_rx) = tokio::sync::watch::channel(false);
     let low_latency_context = server_context.clone();
@@ -525,6 +529,8 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         .await
         .expect("high-bandwidth server join")
         .expect("high-bandwidth server");
+    server_relay.abort();
+    let _ = server_relay.await;
     target.await.expect("target join");
 }
 
@@ -556,7 +562,11 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     let second_path = reserve_tcp_path().await;
     let first_listener = bind_listener(&first_path).await.expect("first bind");
     let second_listener = bind_listener(&second_path).await.expect("second bind");
-    let server_context = server_context(OutboundConfig::Direct);
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_relay = tokio::spawn(reliable_relay.run());
     let first_server_context = server_context.clone();
     let first_server = tokio::spawn(async move {
         let (stream, _) = first_listener.accept().await.expect("first accept");
@@ -637,6 +647,8 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
         .await
         .expect("second server join")
         .expect("second server");
+    server_relay.abort();
+    let _ = server_relay.await;
     target.await.expect("target join");
 }
 
@@ -1700,31 +1712,21 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
-        handle_server_path(
-            stream,
-            ServerPathContext {
-                tag: None,
-                route_target: None,
-                server_paths: Arc::new(vec![server_path]),
-                outbound: OutboundConfig::Direct,
-                outbound_dns: DnsConfig::default(),
-                outbound_connect_timeout: DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-                performance: MppPerformanceConfig::default(),
-                codec_limits: CodecLimits::default(),
-                mux_limits: ResourceLimits::default().into(),
-                security: SecurityConfig::encrypted(
-                    SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec())
-                        .expect("secret"),
-                ),
-                reliable_streams: Arc::new(ServerReliableStreamRegistry::default()),
-                path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
-                    path_join_replay_cache_capacity(ResourceLimits::default().max_streams),
-                ))),
-                max_reliable_streams: ResourceLimits::default().max_streams,
-                max_udp_flows_per_session: ResourceLimits::default().max_streams,
-            },
-        )
-        .await
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay: _reliable_relay,
+        } = new_identity_runtime(
+            vec![server_path],
+            OutboundConfig::Direct,
+            DnsConfig::default(),
+            DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+            SecurityConfig::encrypted(
+                SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec()).expect("secret"),
+            ),
+            MppPerformanceConfig::default(),
+            ResourceLimits::default(),
+        );
+        handle_server_path(stream, paths).await
     });
 
     let stream = tcp::connect_path(&path, TcpConnectOptions::default())

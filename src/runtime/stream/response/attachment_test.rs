@@ -164,11 +164,8 @@ fn response_repair_output_requires_explicit_active_reannounce() {
     assert_eq!(response_service_snapshot.id, active.path_id);
     assert_eq!(response_service_snapshot.underlay, UnderlayProtocol::Tcp);
     assert!(
-        reliable_stream_recv_progress_interval(Some(request_active_snapshot), FlowLane::Throughput,)
-            < reliable_stream_recv_progress_interval(
-                Some(response_service_snapshot),
-                FlowLane::Throughput,
-            ),
+        reliable_stream_recv_progress_interval(Some(request_active_snapshot))
+            < reliable_stream_recv_progress_interval(Some(response_service_snapshot)),
         "receive-progress cadence must follow the request Active PTO rather than the response Service PTO"
     );
     assert_eq!(

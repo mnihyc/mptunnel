@@ -2304,26 +2304,6 @@ fn capacity_frames_require_explicit_typed_carrier_commands() {
 }
 
 #[test]
-fn reliable_relay_stall_timeout_is_transport_pto_derived() {
-    let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, 30_000_000.0);
-    let mut cross_continent =
-        PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 900.0, 300_000_000.0);
-    cross_continent.jitter_ms = 400.0;
-
-    assert_eq!(
-        reliable_relay_stall_timeout(Some(low_latency), FlowLane::Latency),
-        transport_pto_from_snapshot(Some(low_latency))
-    );
-    assert_eq!(
-        reliable_relay_stall_timeout(Some(cross_continent), FlowLane::Throughput),
-        transport_pto_from_snapshot(Some(cross_continent))
-    );
-    assert!(
-        reliable_relay_stall_timeout(Some(low_latency), FlowLane::Latency) < Duration::from_secs(5)
-    );
-}
-
-#[test]
 fn reliable_stream_recv_progress_resend_tracks_received_state() {
     let mux_limits = MuxLimits::default();
     let mut recv_stream = ReliableRecvStream::new(StreamId(21), mux_limits);
@@ -2370,9 +2350,8 @@ fn reliable_stream_recv_progress_resend_tracks_received_state() {
         Some(UnderlayProtocol::Tcp),
     ));
 
-    let low_interval = reliable_stream_recv_progress_interval(Some(low_latency), FlowLane::Latency);
-    let high_interval =
-        reliable_stream_recv_progress_interval(Some(cross_continent), FlowLane::Throughput);
+    let low_interval = reliable_stream_recv_progress_interval(Some(low_latency));
+    let high_interval = reliable_stream_recv_progress_interval(Some(cross_continent));
     assert_eq!(
         low_interval,
         (transport_pto_from_snapshot(Some(low_latency)) / 2).max(QUIC_TIMER_GRANULARITY)
@@ -2390,11 +2369,10 @@ fn sender_service_retry_delay_is_ack_paced_not_one_millisecond_spin() {
     let cross_continent = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 900.0, 300_000_000.0);
 
     assert!(
-        reliable_stream_recv_progress_interval(Some(cross_continent), FlowLane::Throughput)
-            > Duration::from_millis(100)
+        reliable_stream_recv_progress_interval(Some(cross_continent)) > Duration::from_millis(100)
     );
-    let low_retry = sender_service_retry_delay(Some(low_latency), FlowLane::Throughput);
-    let high_retry = sender_service_retry_delay(Some(cross_continent), FlowLane::Throughput);
+    let low_retry = sender_service_retry_delay(Some(low_latency));
+    let high_retry = sender_service_retry_delay(Some(cross_continent));
     assert!(
         low_retry > QUIC_TIMER_GRANULARITY,
         "blocked sender retry must not spin at timer granularity"
@@ -2912,12 +2890,8 @@ fn tcp_receive_hole_repair_deadline_is_progress_signal_not_path_victim_policy() 
     path.jitter_ms = 5.0;
     path.inflight_limit_bytes = 1_000_000;
 
-    let deadline = reliable_relay_receive_hole_repair_deadline(
-        now,
-        now - Duration::from_secs(1),
-        Some(path),
-        FlowLane::Throughput,
-    );
+    let deadline =
+        reliable_relay_receive_hole_repair_deadline(now, now - Duration::from_secs(1), Some(path));
 
     assert!(
         deadline > tokio::time::Instant::from_std(now),

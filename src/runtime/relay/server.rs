@@ -295,9 +295,8 @@ fn reliable_relay_tail_repair_deadline(
     last_progress_at: Instant,
     last_repair_at: Instant,
     path: Option<PathSnapshot>,
-    lane: FlowLane,
 ) -> tokio::time::Instant {
-    let stall_timeout = reliable_relay_tail_repair_delay(path, lane);
+    let stall_timeout = reliable_relay_tail_repair_delay(path);
     if last_repair_at > last_progress_at {
         return tokio::time::Instant::from_std(
             last_repair_at + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
@@ -310,17 +309,16 @@ fn reliable_relay_effective_tail_repair_deadline(
     last_progress_at: Instant,
     last_repair_at: Instant,
     path: Option<PathSnapshot>,
-    lane: FlowLane,
     failed_owner_tail_repair_ready: bool,
 ) -> tokio::time::Instant {
     if failed_owner_tail_repair_ready {
-        let stall_timeout = reliable_relay_tail_repair_delay(None, lane);
+        let stall_timeout = reliable_relay_tail_repair_delay(None);
         if last_repair_at <= last_progress_at {
             return tokio::time::Instant::from_std(last_progress_at);
         }
         return tokio::time::Instant::from_std(last_repair_at + stall_timeout);
     }
-    reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, path, lane)
+    reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, path)
 }
 
 // Server receive-hole diagnostics
@@ -949,8 +947,7 @@ fn enqueue_reliable_tail_repair(
     );
     let mut repair_count = 0usize;
     let mut repair_pending = false;
-    let live_repair_retry_after =
-        reliable_relay_tail_repair_delay(tail_repair_path_snapshot, relay_lane);
+    let live_repair_retry_after = reliable_relay_tail_repair_delay(tail_repair_path_snapshot);
     for frame in repair_frames {
         if response_sender.has_queued_repair_overlap(&frame)
             || path_stream.has_recent_live_repair_flight_overlap(&frame, live_repair_retry_after)
@@ -1290,7 +1287,7 @@ where
             .unwrap_or(path_stream.underlay);
         let recv_progress_deadline = tokio::time::Instant::from_std(
             last_recv_progress_sent_at
-                + reliable_stream_recv_progress_interval(request_active_path_snapshot, relay_lane),
+                + reliable_stream_recv_progress_interval(request_active_path_snapshot),
         );
         let has_tail_repair_alternative = path_stream.has_multipath_repair_alternative();
         let failed_owner_tail_repair_candidate = path_stream.can_attempt_failed_owner_tail_repair()
@@ -1326,7 +1323,6 @@ where
             last_send_ack_progress_at,
             last_tail_repair_at,
             tail_repair_path_snapshot,
-            relay_lane,
             failed_owner_tail_repair_ready,
         );
         let adaptive_chunk = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
@@ -1460,7 +1456,7 @@ where
             queued_front_has_carrier_credit,
             response_sender_retry_at,
             now,
-            sender_service_retry_delay(send_path_snapshot, relay_lane),
+            sender_service_retry_delay(send_path_snapshot),
         );
         response_sender_retry_at = sender_wait.retry_at;
         let queued_send_blocked = sender_wait.blocked;
@@ -1541,7 +1537,7 @@ where
             .await?
             {
                 response_sender_retry_at =
-                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
             }
             continue;
         }
@@ -1685,7 +1681,6 @@ where
                         repair_owner_underlay,
                         has_multipath_repair_alternative,
                         tail_repair_path_snapshot,
-                        relay_lane,
                     );
                     let repair_target = ack_gap_repair_ready
                         .then(|| {
@@ -1717,7 +1712,6 @@ where
                         RelaySendCause::persistent_server_ack_gap_repair(
                             target,
                             snapshot,
-                            relay_lane,
                         )
                     } else {
                         RelaySendCause::AckGapRepair
@@ -1789,7 +1783,7 @@ where
                     #[cfg(not(feature = "lab-diagnostics"))]
                     let _ = repair_kind;
                     let live_repair_retry_after =
-                        reliable_relay_tail_repair_delay(tail_repair_path_snapshot, relay_lane);
+                        reliable_relay_tail_repair_delay(tail_repair_path_snapshot);
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "stream_ack_received",
@@ -1964,7 +1958,7 @@ where
                 .await?
                 {
                     response_sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
                 }
             }
         }
@@ -2050,7 +2044,7 @@ where
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = same_output_frontier_retransmit;
                 let live_repair_retry_after =
-                    reliable_relay_tail_repair_delay(tail_repair_path_snapshot, relay_lane);
+                    reliable_relay_tail_repair_delay(tail_repair_path_snapshot);
                 let mut repair_count = 0usize;
                 for frame in repair_frames {
                     let queued = if path_stream.has_recent_live_repair_flight_overlap(
@@ -2119,7 +2113,7 @@ where
                 .await?
                 {
                     response_sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
                 }
             }
             continue;
@@ -2176,7 +2170,7 @@ where
                 .await?
                 {
                     response_sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                        Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
                 }
             }
         }
@@ -2210,7 +2204,7 @@ where
             .await?
             {
                 response_sender_retry_at =
-                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
             }
         }
         _ = std::future::ready(()), if queued_send_ready => {
@@ -2235,7 +2229,7 @@ where
             .await?
             {
                 response_sender_retry_at =
-                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                    Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
             }
             tokio::task::yield_now().await;
         }
@@ -2361,7 +2355,7 @@ where
                     .await?
                     {
                         response_sender_retry_at =
-                            Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot, relay_lane));
+                            Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
                     }
                 }
             }
@@ -2401,10 +2395,7 @@ where
                     let capacity_notifies = path_stream.capacity_notifies();
                     let has_capacity_notify = !capacity_notifies.is_empty();
                     let retry_at = tokio::time::Instant::now()
-                        + sender_service_retry_delay(
-                            path_stream.send_path_snapshot(close.lane, 0),
-                            close.lane,
-                        );
+                        + sender_service_retry_delay(path_stream.send_path_snapshot(close.lane, 0));
                     let wake_at = response_sender
                         .persistent_ack_gap_repair_deadline()
                         .map(tokio::time::Instant::from_std)

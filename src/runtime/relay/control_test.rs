@@ -229,20 +229,15 @@ fn pending_response_stall_anchor_ignores_local_send_progress_before_first_byte()
 #[test]
 fn upload_only_stall_attempt_uses_a_future_retry_deadline() {
     let started = Instant::now();
-    let stall_timeout = reliable_relay_stall_timeout(None, FlowLane::Throughput);
+    let stall_timeout = transport_pto_from_snapshot(None);
     assert_eq!(
-        reliable_relay_product_stall_deadline(started, None, None, FlowLane::Throughput,),
+        reliable_relay_product_stall_deadline(started, None, None),
         tokio::time::Instant::from_std(started + stall_timeout),
     );
 
     let last_attempt = started + stall_timeout;
     assert_eq!(
-        reliable_relay_product_stall_deadline(
-            started,
-            Some(last_attempt),
-            None,
-            FlowLane::Throughput,
-        ),
+        reliable_relay_product_stall_deadline(started, Some(last_attempt), None,),
         tokio::time::Instant::from_std(
             last_attempt + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
         ),
@@ -251,12 +246,7 @@ fn upload_only_stall_attempt_uses_a_future_retry_deadline() {
 
     let later_product_progress = last_attempt + Duration::from_secs(1);
     assert_eq!(
-        reliable_relay_product_stall_deadline(
-            later_product_progress,
-            Some(last_attempt),
-            None,
-            FlowLane::Throughput,
-        ),
+        reliable_relay_product_stall_deadline(later_product_progress, Some(last_attempt), None,),
         tokio::time::Instant::from_std(later_product_progress + stall_timeout),
         "real product progress starts a fresh first-attempt interval",
     );

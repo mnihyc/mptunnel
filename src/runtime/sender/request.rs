@@ -2838,9 +2838,7 @@ impl RequestSenderService {
             }
             let first_repair_after = expected_owner_keys
                 .iter()
-                .map(|key| {
-                    reliable_relay_tail_repair_delay(context.reliable_path_snapshot(*key), lane)
-                })
+                .map(|key| reliable_relay_tail_repair_delay(context.reliable_path_snapshot(*key)))
                 .max()
                 .unwrap_or_default();
             let repeat_repair_after =

@@ -1,7 +1,3 @@
-use super::control::{
-    no_schedulable_reliable_path_error, relay_path_open_error_is_retryable,
-    reliable_relay_stall_timeout,
-};
 #[cfg(test)]
 use super::*;
 #[cfg(feature = "lab-diagnostics")]
@@ -10,6 +6,7 @@ use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_relay_buffer_len};
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::{
     active_path_open_serialized_exchanges, active_path_open_timeout, path_open_pto,
+    transport_pto_from_snapshot,
 };
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
@@ -646,12 +643,8 @@ async fn open_reliable_initial_active_attempt(
     let ReliableInitialOpenAttempt { key, stream_id } = attempt;
     match key.underlay {
         UnderlayProtocol::Tcp => {
-            let open_timeout = reliable_initial_active_open_timeout(
-                context,
-                key,
-                lane,
-                has_unattempted_alternative,
-            );
+            let open_timeout =
+                reliable_initial_active_open_timeout(context, key, has_unattempted_alternative);
             let open_deadlines =
                 ClientTcpOpenDeadlines::fixed(tokio::time::Instant::now() + open_timeout);
             match open_remote_stream_on_reserved_path(
@@ -686,12 +679,8 @@ async fn open_reliable_initial_active_attempt(
             }
         }
         UnderlayProtocol::Udp => {
-            let open_timeout = reliable_initial_active_open_timeout(
-                context,
-                key,
-                lane,
-                has_unattempted_alternative,
-            );
+            let open_timeout =
+                reliable_initial_active_open_timeout(context, key, has_unattempted_alternative);
             let open_deadline = tokio::time::Instant::now() + open_timeout;
             match relay_path_open_with_deadline(
                 open_deadline,
@@ -786,7 +775,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
             underlay: UnderlayProtocol::Tcp,
             index: path_index,
         },
-        lane,
     );
     let open_deadlines = ClientTcpOpenDeadlines::from_timeouts(
         tokio::time::Instant::now(),
@@ -844,10 +832,9 @@ pub(in crate::runtime) struct ReliableRelayAttachOpenTimeouts {
 pub(in crate::runtime) fn reliable_relay_attach_open_timeouts(
     context: &ClientPathContext,
     key: RelayPathKey,
-    lane: FlowLane,
 ) -> ReliableRelayAttachOpenTimeouts {
     let snapshot = context.reliable_path_snapshot(key);
-    let live = reliable_relay_stall_timeout(snapshot, lane);
+    let live = transport_pto_from_snapshot(snapshot);
     let setup = match key.underlay {
         UnderlayProtocol::Tcp => {
             // A cold lane-class actor owns carrier dial, authenticated path
@@ -866,10 +853,8 @@ pub(in crate::runtime) fn reliable_relay_attach_open_timeouts(
 pub(in crate::runtime) fn reliable_initial_active_open_timeout(
     context: &ClientPathContext,
     key: RelayPathKey,
-    lane: FlowLane,
     has_unattempted_alternative: bool,
 ) -> Duration {
-    let _ = lane;
     let snapshot = context.reliable_path_snapshot(key);
     let rtt_is_observed =
         key.underlay == UnderlayProtocol::Udp && context.reliable_path_rtt_is_observed(key);
@@ -962,7 +947,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
             underlay: UnderlayProtocol::Udp,
             index: path_index,
         },
-        lane,
     )
     .setup;
     let open_deadline = tokio::time::Instant::now() + open_timeout;
@@ -985,6 +969,37 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
         Err(err) => {
             context.release_udp_stream_path_load(path_index, lane);
             Err(err)
+        }
+    }
+}
+
+/// Selects the concrete carrier open transaction after attachment policy has
+/// chosen an exact path. Retry and membership decisions remain with the caller.
+pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    target: TargetAddr,
+    ingress: IngressKind,
+    lane: FlowLane,
+    key: RelayPathKey,
+    role: StreamOpenRole,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    match key.underlay {
+        UnderlayProtocol::Tcp => {
+            open_remote_stream_on_path(context, stream_id, target, ingress, lane, key.index, role)
+                .await
+        }
+        UnderlayProtocol::Udp => {
+            open_remote_stream_on_udp_path(
+                context,
+                stream_id,
+                target,
+                ingress,
+                lane,
+                key.index,
+                udp_relay_attachment_open_options(role),
+            )
+            .await
         }
     }
 }
@@ -1108,6 +1123,29 @@ pub(in crate::runtime) fn udp_stream_open_error_is_path_retryable(err: &RuntimeE
             | RuntimeError::PathOpenTimedOut
             | RuntimeError::Protocol(_)
     )
+}
+
+/// Classifies retryability beside the concrete TCP and QUIC open contracts.
+pub(in crate::runtime) fn relay_path_open_error_is_retryable(
+    underlay: UnderlayProtocol,
+    err: &RuntimeError,
+) -> bool {
+    match underlay {
+        UnderlayProtocol::Tcp => stream_open_error_is_path_retryable(err),
+        UnderlayProtocol::Udp => udp_stream_open_error_is_path_retryable(err),
+    }
+}
+
+pub(in crate::runtime) fn no_schedulable_reliable_path_error(
+    context: &ClientPathContext,
+) -> RuntimeError {
+    if !context.tcp_paths.is_empty() && !context.udp_paths.is_empty() {
+        RuntimeError::NoSchedulableReliablePath
+    } else if !context.tcp_paths.is_empty() {
+        RuntimeError::NoSchedulableTcpPath
+    } else {
+        RuntimeError::NoSchedulableUdpPath
+    }
 }
 
 pub(in crate::runtime) fn relay_error_is_tcp_path_failure<T>(

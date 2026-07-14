@@ -699,8 +699,8 @@ fn ack_gap_repair_progress_keeps_growing_hole_identity() {
         },
     ];
     let now = Instant::now();
-    let interval = reliable_stream_recv_progress_interval(None, FlowLane::Throughput);
-    let repair_delay = reliable_ack_gap_repair_delay(None, FlowLane::Throughput);
+    let interval = reliable_stream_recv_progress_interval(None);
+    let repair_delay = reliable_ack_gap_repair_delay(None);
 
     assert!(!progress.repair_ready_at(
         true,
@@ -775,7 +775,7 @@ fn ack_gap_repair_progress_resets_when_frontier_advances() {
         },
     ];
     let now = Instant::now();
-    let repair_delay = reliable_ack_gap_repair_delay(None, FlowLane::Throughput);
+    let repair_delay = reliable_ack_gap_repair_delay(None);
 
     assert!(!progress.repair_ready_at(
         true,
@@ -816,8 +816,8 @@ fn ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
         },
     ];
     let now = Instant::now();
-    let repair_delay = reliable_relay_stall_timeout(None, FlowLane::Throughput)
-        .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+    let repair_delay =
+        transport_pto_from_snapshot(None).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
 
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let mut progress = ReliableAckGapRepairProgress::default();

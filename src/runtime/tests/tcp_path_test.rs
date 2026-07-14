@@ -1,6 +1,11 @@
 use super::*;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
+use crate::runtime::relay::open::{
+    relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
+    reliable_initial_active_open_timeout, reliable_relay_attach_open_timeouts,
+    stream_open_error_is_path_retryable, udp_stream_open_error_is_path_retryable,
+};
 use crate::runtime::stream::response::next_server_carrier_path_instance_id;
 use crate::transport::{CarrierPathIdentity, PathBinding, SystemCarrierNetworkProvider};
 
@@ -2170,13 +2175,13 @@ fn tcp_attach_open_timeouts_separate_live_and_cold_carrier_phases() {
     )
     .expect("context");
 
-    for (index, lane) in [(0, FlowLane::Latency), (1, FlowLane::Throughput)] {
+    for index in [0, 1] {
         let key = RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index,
         };
         let snapshot = context.tcp_path_snapshot(index);
-        let timeouts = reliable_relay_attach_open_timeouts(&context, key, lane);
+        let timeouts = reliable_relay_attach_open_timeouts(&context, key);
         assert_eq!(timeouts.live, transport_pto_from_snapshot(snapshot));
         assert_eq!(
             timeouts.setup,
@@ -2246,17 +2251,15 @@ fn initial_active_open_timeout_uses_persistent_handshake_budget() {
     assert_eq!(active_path_open_pto_multiplier(Some(udp_snapshot)), 8);
 
     assert_eq!(
-        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false),
+        reliable_initial_active_open_timeout(&context, tcp_key, false),
         active_path_open_timeout(context.reliable_path_snapshot(tcp_key), false),
         "initial Active TCP opens own product streams and must survive more than one lost open/accept exchange"
     );
     assert!(!context.reliable_path_rtt_is_observed(tcp_key));
-    let cold_timeout =
-        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false);
+    let cold_timeout = reliable_initial_active_open_timeout(&context, tcp_key, false);
     context.mark_tcp_path_probe_success(0, Duration::from_millis(20));
     assert!(context.reliable_path_rtt_is_observed(tcp_key));
-    let live_timeout =
-        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, false);
+    let live_timeout = reliable_initial_active_open_timeout(&context, tcp_key, false);
     assert_eq!(
         live_timeout,
         active_path_open_timeout(context.reliable_path_snapshot(tcp_key), false),
@@ -2264,14 +2267,14 @@ fn initial_active_open_timeout_uses_persistent_handshake_budget() {
     );
     assert_eq!(live_timeout, cold_timeout);
     assert_eq!(
-        reliable_initial_active_open_timeout(&context, tcp_key, FlowLane::Latency, true),
+        reliable_initial_active_open_timeout(&context, tcp_key, true),
         path_open_pto(context.reliable_path_snapshot(tcp_key), false).saturating_mul(
             active_path_open_serialized_exchanges(context.reliable_path_snapshot(tcp_key))
         ),
         "a viable alternate gets enough PTOs for serialized carrier, MPP, and product-open exchanges"
     );
     assert_eq!(
-        reliable_initial_active_open_timeout(&context, high_rtt_tcp_key, FlowLane::Latency, false,),
+        reliable_initial_active_open_timeout(&context, high_rtt_tcp_key, false),
         active_path_open_timeout(context.reliable_path_snapshot(high_rtt_tcp_key), false),
         "initial Active opens use the candidate path's persistent-congestion budget"
     );
@@ -2283,7 +2286,7 @@ fn initial_active_open_timeout_uses_persistent_handshake_budget() {
         "configured startup priors must not shrink the RFC initial PTO before live RTT evidence exists"
     );
     assert!(
-        reliable_initial_active_open_timeout(&context, high_rtt_tcp_key, FlowLane::Latency, false,)
+        reliable_initial_active_open_timeout(&context, high_rtt_tcp_key, false)
             > crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
         "an idle probe timeout must not cap a demand-bearing high-RTT path open"
     );

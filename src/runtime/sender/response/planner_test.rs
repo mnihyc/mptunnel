@@ -379,7 +379,6 @@ fn persistent_response_repair_stays_bound_to_modeled_output() {
             incarnation: modeled.incarnation,
         },
         modeled.snapshot,
-        FlowLane::Throughput,
     );
 
     let selected = choose_response_repair_target(&[modeled.clone(), alternate.clone()], &[], cause)

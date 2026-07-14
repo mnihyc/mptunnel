@@ -244,8 +244,8 @@ fn fixed_output_request_active_snapshot_preserves_send_path_timing() {
     assert_eq!(request_active_snapshot.underlay, send_snapshot.underlay);
     assert_eq!(request_active_snapshot.srtt_ms, send_snapshot.srtt_ms);
     assert_eq!(
-        reliable_stream_recv_progress_interval(Some(request_active_snapshot), FlowLane::Latency,),
-        reliable_stream_recv_progress_interval(Some(send_snapshot), FlowLane::Latency),
+        reliable_stream_recv_progress_interval(Some(request_active_snapshot)),
+        reliable_stream_recv_progress_interval(Some(send_snapshot)),
         "fixed-path replay cadence must remain unchanged"
     );
 }

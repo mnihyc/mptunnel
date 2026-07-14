@@ -9,7 +9,6 @@ use crate::runtime::path::commands::{
     try_recv_reliable_path_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
-use crate::runtime::relay::control::reliable_relay_stall_timeout;
 use crate::runtime::relay::io::{
     reliable_ack_gap_repair_delay, stream_ack_ranges_expose_authoritative_gap,
 };
@@ -269,11 +268,9 @@ fn contiguous_ack_frontier_lag_is_tail_guard_not_repair_debt() {
 fn tail_repair_uses_single_pto_stall_timeout() {
     let last_progress = Instant::now();
     let last_repair = last_progress - Duration::from_secs(1);
-    let deadline =
-        reliable_relay_tail_repair_deadline(last_progress, last_repair, None, FlowLane::Throughput);
-    let expected = tokio::time::Instant::from_std(
-        last_progress + reliable_relay_stall_timeout(None, FlowLane::Throughput),
-    );
+    let deadline = reliable_relay_tail_repair_deadline(last_progress, last_repair, None);
+    let expected =
+        tokio::time::Instant::from_std(last_progress + transport_pto_from_snapshot(None));
 
     assert_eq!(deadline, expected);
 }
@@ -418,7 +415,7 @@ async fn latency_live_owner_tail_repair_dispatches_suffix_on_distinct_repair_wit
     assert_eq!(binding.ordered_data_owner(), Some(owner_key));
     assert!(path_stream.has_recent_live_repair_flight_overlap(
         &repair_frame,
-        reliable_relay_tail_repair_delay(None, FlowLane::Latency),
+        reliable_relay_tail_repair_delay(None),
     ));
 }
 
@@ -630,12 +627,11 @@ async fn sparse_ack_failed_owner_repair_starts_at_lowest_hole() {
 #[test]
 fn tail_repair_repeats_after_persistent_delay_without_progress() {
     let last_progress = Instant::now();
-    let last_repair = last_progress + reliable_relay_stall_timeout(None, FlowLane::Throughput);
-    let deadline =
-        reliable_relay_tail_repair_deadline(last_progress, last_repair, None, FlowLane::Throughput);
+    let last_repair = last_progress + transport_pto_from_snapshot(None);
+    let deadline = reliable_relay_tail_repair_deadline(last_progress, last_repair, None);
     let expected = tokio::time::Instant::from_std(
         last_repair
-            + reliable_relay_stall_timeout(None, FlowLane::Throughput)
+            + transport_pto_from_snapshot(None)
                 .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
     );
 
@@ -817,13 +813,11 @@ fn failed_owner_tail_repair_deadline_is_immediate_for_repairable_detached_owner(
 
     let last_progress = Instant::now();
     let last_repair = last_progress - Duration::from_secs(1);
-    let generic_deadline =
-        reliable_relay_tail_repair_deadline(last_progress, last_repair, None, FlowLane::Throughput);
+    let generic_deadline = reliable_relay_tail_repair_deadline(last_progress, last_repair, None);
     let failover_deadline = reliable_relay_effective_tail_repair_deadline(
         last_progress,
         last_repair,
         None,
-        FlowLane::Throughput,
         reliable_failed_owner_tail_repair_ready(
             &path_stream,
             &send_stream,
@@ -855,12 +849,9 @@ fn failed_owner_tail_repair_retry_uses_single_pto_not_persistent_backoff() {
         last_progress,
         last_repair,
         Some(slow_stale_owner),
-        FlowLane::Throughput,
         true,
     );
-    let expected = tokio::time::Instant::from_std(
-        last_repair + reliable_relay_stall_timeout(None, FlowLane::Throughput),
-    );
+    let expected = tokio::time::Instant::from_std(last_repair + transport_pto_from_snapshot(None));
 
     assert_eq!(
         deadline, expected,
@@ -1990,8 +1981,7 @@ fn stale_live_repair_flight_does_not_block_terminal_tail_retry() {
         .expect("expected frontier repair frame");
     binding.record_repair_flight(repair_key, &inflight_repair);
     binding.age_repair_flights_for_test(
-        reliable_relay_tail_repair_delay(None, FlowLane::Throughput)
-            .saturating_add(Duration::from_millis(1)),
+        reliable_relay_tail_repair_delay(None).saturating_add(Duration::from_millis(1)),
     );
 
     let mut response_sender = ServerResponseSenderService::new_with_performance(
@@ -2914,7 +2904,7 @@ fn tcp_multipath_progress_timer_keeps_persistent_gap_repair_live() {
         },
     ];
     let now = Instant::now();
-    let repair_delay = reliable_ack_gap_repair_delay(None, FlowLane::Throughput);
+    let repair_delay = reliable_ack_gap_repair_delay(None);
     let mut progress = ReliableAckGapRepairProgress::default();
     assert!(!progress.repair_ready_at(
         true,

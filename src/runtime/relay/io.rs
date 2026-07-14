@@ -1,4 +1,3 @@
-use super::control::reliable_relay_stall_timeout;
 #[cfg(test)]
 use super::*;
 #[cfg(test)]
@@ -116,18 +115,12 @@ pub(in crate::runtime) fn update_repair_authoritative_ack_snapshot(
     *stored_complete = true;
 }
 
-pub(in crate::runtime) fn reliable_relay_tail_repair_delay(
-    path: Option<PathSnapshot>,
-    lane: FlowLane,
-) -> Duration {
-    reliable_relay_stall_timeout(path, lane)
+pub(in crate::runtime) fn reliable_relay_tail_repair_delay(path: Option<PathSnapshot>) -> Duration {
+    transport_pto_from_snapshot(path)
 }
 
-pub(in crate::runtime) fn reliable_ack_gap_repair_delay(
-    path: Option<PathSnapshot>,
-    lane: FlowLane,
-) -> Duration {
-    reliable_relay_stall_timeout(path, lane).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+pub(in crate::runtime) fn reliable_ack_gap_repair_delay(path: Option<PathSnapshot>) -> Duration {
+    transport_pto_from_snapshot(path).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
 }
 
 #[cfg(test)]
@@ -214,14 +207,13 @@ impl ReliableAckGapRepairProgress {
         active_underlay: Option<UnderlayProtocol>,
         has_multipath_repair_alternative: bool,
         path: Option<PathSnapshot>,
-        lane: FlowLane,
     ) -> bool {
         self.repair_ready_at(
             complete,
             normalized_ranges,
             active_underlay,
             has_multipath_repair_alternative,
-            reliable_ack_gap_repair_delay(path, lane),
+            reliable_ack_gap_repair_delay(path),
             Instant::now(),
         )
     }
@@ -356,7 +348,7 @@ impl ReliableRecvProgress {
         let enough_delivered = delivered_since_ack >= ack_step;
         let ack_timer_elapsed = self.last_ack_at.is_some_and(|last_ack_at| {
             now.saturating_duration_since(last_ack_at)
-                >= reliable_stream_recv_progress_interval(path, lane)
+                >= reliable_stream_recv_progress_interval(path)
         });
         if force
             || first_ack
@@ -419,18 +411,13 @@ pub(in crate::runtime) fn reliable_relay_recv_progress_resend_active(
 
 pub(in crate::runtime) fn reliable_stream_recv_progress_interval(
     path: Option<PathSnapshot>,
-    lane: FlowLane,
 ) -> Duration {
-    reliable_relay_stall_timeout(path, lane)
+    transport_pto_from_snapshot(path)
         .div_f64(2.0)
         .max(QUIC_TIMER_GRANULARITY)
 }
 
-pub(in crate::runtime) fn sender_service_retry_delay(
-    path: Option<PathSnapshot>,
-    lane: FlowLane,
-) -> Duration {
-    let _ = lane;
+pub(in crate::runtime) fn sender_service_retry_delay(path: Option<PathSnapshot>) -> Duration {
     (transport_pto_from_snapshot(path) / 16)
         .max(Duration::from_millis(5))
         .min(QUIC_MAX_ACK_DELAY)

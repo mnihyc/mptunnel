@@ -979,8 +979,9 @@ same repair/path-flight caps. A sparse ACK set MUST repair its lowest explicit
 gap first; the sender MUST NOT use its largest acknowledged end as a tail
 frontier and skip a lower hole. Ownership is evaluated for the range being
 repaired, not from the path that happened to carry the latest later
-`OwnerData`. This correctness rule applies to every reliable flow lane; the
-lane changes its PTO-derived delay and bounded quantum, not whether a proven
+`OwnerData`. This correctness rule applies to every reliable flow lane.
+Carrier evidence fixes the PTO-derived delay; the lane changes product
+admission and the bounded quantum, not the carrier clock or whether a proven
 blocked suffix can use a distinct repair output. The first tail probe
 deliberately uses one product stall timeout, not the persistent-congestion
 multiplier used for authoritative ACK-gap repair, because the repair is a

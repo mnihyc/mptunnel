@@ -907,11 +907,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_repair_output() {
             FlowLane::Throughput,
         )
         .expect("fill the modeled repair output after sizing");
-    let bound_cause = RelaySendCause::persistent_client_ack_gap_repair(
-        repair_target,
-        repair_path,
-        FlowLane::Throughput,
-    );
+    let bound_cause = RelaySendCause::persistent_client_ack_gap_repair(repair_target, repair_path);
     assert!(matches!(
         sender
             .send_repair_frame(&context, &mut remotes, blocked.clone(), bound_cause,)

@@ -17,11 +17,11 @@ use super::open::{
     AcceptedRemoteStreamGuard, OpenedRemoteStream, ReliableRelayAttachMode,
     ReliableRelayAttachOutcome, ReliableRelayOpenSpec, ReliableRelayRemoteFrame,
     ReliableRelayRemotePath, ReliableRelayRemoteSet, UdpStreamOpenOptions,
-    open_remote_stream_on_path, open_remote_stream_on_reserved_path,
-    open_remote_stream_on_reserved_udp_path, open_remote_stream_on_udp_path,
-    relay_error_is_tcp_path_failure, relay_path_open_with_deadline,
-    reliable_relay_attach_open_timeouts, stream_open_error_is_path_retryable,
-    udp_relay_attachment_open_options, udp_stream_open_error_is_path_retryable,
+    no_schedulable_reliable_path_error, open_remote_stream_for_relay_path,
+    open_remote_stream_on_reserved_path, open_remote_stream_on_reserved_udp_path,
+    relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
+    relay_path_open_with_deadline, reliable_relay_attach_open_timeouts,
+    stream_open_error_is_path_retryable, udp_stream_open_error_is_path_retryable,
 };
 #[cfg(test)]
 use super::*;
@@ -41,9 +41,7 @@ use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::frame::normalized_offset_ranges;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{
-    Frame, IngressKind, OffsetRange, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
-};
+use crate::protocol::{Frame, OffsetRange, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{ClientTcpOpenDeadlines, reliable_stream_frame_queue};
 use crate::runtime::path::{
@@ -253,7 +251,7 @@ where
         );
         for failed_instance in sender.unreported_missing_owner_instances(
             &remotes,
-            reliable_relay_stall_timeout(path_snapshot, relay_lane),
+            transport_pto_from_snapshot(path_snapshot),
         ) {
             if sender.enqueue_failed_path_instance_gap_repairs(
                 &mut sender_queue,
@@ -438,17 +436,14 @@ where
             last_delivery_progress_at,
             last_receive_hole_repair_at,
             path_snapshot,
-            relay_lane,
         );
         let stall_deadline = reliable_relay_product_stall_deadline(
             stall_progress_anchor,
             last_product_stall_attempt_at,
             path_snapshot,
-            relay_lane,
         );
         let recv_progress_deadline = tokio::time::Instant::from_std(
-            last_recv_progress_sent_at
-                + reliable_stream_recv_progress_interval(path_snapshot, relay_lane),
+            last_recv_progress_sent_at + reliable_stream_recv_progress_interval(path_snapshot),
         );
         if sender_retry_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
             sender_retry_at = None;
@@ -1174,7 +1169,7 @@ where
                 }
                 if blocked_by_carrier {
                     sender_retry_at =
-                        Some(tokio::time::Instant::now() + sender_service_retry_delay(path_snapshot, relay_lane));
+                        Some(tokio::time::Instant::now() + sender_service_retry_delay(path_snapshot));
                 }
                 if let Some(err) = dispatch_error {
                     break Err(err);
@@ -1843,7 +1838,6 @@ where
                                 .or(remotes.active_path_underlay()),
                             has_multipath_repair_alternative,
                             owner_timing_path,
-                            relay_lane,
                         );
                         let repair_path = repair_target.map(|(_, snapshot)| snapshot);
                         let repair_limit = if ack_gap_repair_ready {
@@ -1865,7 +1859,6 @@ where
                             RelaySendCause::persistent_client_ack_gap_repair(
                                 target,
                                 snapshot,
-                                relay_lane,
                             )
                         } else {
                             RelaySendCause::AckGapRepair
@@ -2580,7 +2573,7 @@ fn spawn_reliable_relay_validation_opens(
         let ingress = spec.ingress;
         let result_tx = result_tx.clone();
         let handle = tokio::spawn(async move {
-            let open_timeouts = reliable_relay_attach_open_timeouts(&context, key, lane);
+            let open_timeouts = reliable_relay_attach_open_timeouts(&context, key);
             let open_started_at = tokio::time::Instant::now();
             let result = match key.underlay {
                 UnderlayProtocol::Tcp => {
@@ -2856,57 +2849,6 @@ async fn attach_relay_path_candidates(
             attached: 0,
             key: None,
         })
-    }
-}
-
-pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
-    context: &ClientPathContext,
-    stream_id: StreamId,
-    target: TargetAddr,
-    ingress: IngressKind,
-    lane: FlowLane,
-    key: RelayPathKey,
-    role: StreamOpenRole,
-) -> Result<OpenedRemoteStream, RuntimeError> {
-    match key.underlay {
-        UnderlayProtocol::Tcp => {
-            open_remote_stream_on_path(context, stream_id, target, ingress, lane, key.index, role)
-                .await
-        }
-        UnderlayProtocol::Udp => {
-            open_remote_stream_on_udp_path(
-                context,
-                stream_id,
-                target,
-                ingress,
-                lane,
-                key.index,
-                udp_relay_attachment_open_options(role),
-            )
-            .await
-        }
-    }
-}
-
-pub(in crate::runtime) fn relay_path_open_error_is_retryable(
-    underlay: UnderlayProtocol,
-    err: &RuntimeError,
-) -> bool {
-    match underlay {
-        UnderlayProtocol::Tcp => stream_open_error_is_path_retryable(err),
-        UnderlayProtocol::Udp => udp_stream_open_error_is_path_retryable(err),
-    }
-}
-
-pub(in crate::runtime) fn no_schedulable_reliable_path_error(
-    context: &ClientPathContext,
-) -> RuntimeError {
-    if !context.tcp_paths.is_empty() && !context.udp_paths.is_empty() {
-        RuntimeError::NoSchedulableReliablePath
-    } else if !context.tcp_paths.is_empty() {
-        RuntimeError::NoSchedulableTcpPath
-    } else {
-        RuntimeError::NoSchedulableUdpPath
     }
 }
 
@@ -3268,14 +3210,13 @@ pub(in crate::runtime) fn reliable_relay_receive_hole_repair_deadline(
     last_delivery_progress_at: Instant,
     last_receive_hole_repair_at: Instant,
     path: Option<PathSnapshot>,
-    lane: FlowLane,
 ) -> tokio::time::Instant {
     let anchor = if last_delivery_progress_at > last_receive_hole_repair_at {
         last_delivery_progress_at
     } else {
         last_receive_hole_repair_at
     };
-    tokio::time::Instant::from_std(anchor + reliable_relay_stall_timeout(path, lane))
+    tokio::time::Instant::from_std(anchor + transport_pto_from_snapshot(path))
 }
 
 pub(in crate::runtime) fn reliable_relay_product_stall_preserves_attached_path_set(
@@ -3323,32 +3264,22 @@ pub(in crate::runtime) fn reliable_relay_response_stall_watch_bytes(mux_limits: 
 pub(in crate::runtime) fn reliable_relay_stall_deadline(
     last_progress_at: Instant,
     path: Option<PathSnapshot>,
-    lane: FlowLane,
 ) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(last_progress_at + reliable_relay_stall_timeout(path, lane))
+    tokio::time::Instant::from_std(last_progress_at + transport_pto_from_snapshot(path))
 }
 
 pub(in crate::runtime) fn reliable_relay_product_stall_deadline(
     last_progress_at: Instant,
     last_attempt_at: Option<Instant>,
     path: Option<PathSnapshot>,
-    lane: FlowLane,
 ) -> tokio::time::Instant {
-    let stall_timeout = reliable_relay_stall_timeout(path, lane);
+    let stall_timeout = transport_pto_from_snapshot(path);
     match last_attempt_at.filter(|attempt| *attempt >= last_progress_at) {
         Some(last_attempt_at) => tokio::time::Instant::from_std(
             last_attempt_at + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
         ),
-        None => reliable_relay_stall_deadline(last_progress_at, path, lane),
+        None => reliable_relay_stall_deadline(last_progress_at, path),
     }
-}
-
-pub(in crate::runtime) fn reliable_relay_stall_timeout(
-    path: Option<PathSnapshot>,
-    lane: FlowLane,
-) -> Duration {
-    let _ = lane;
-    transport_pto_from_snapshot(path)
 }
 
 #[cfg(test)]

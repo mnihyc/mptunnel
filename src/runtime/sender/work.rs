@@ -179,22 +179,20 @@ impl RelaySendCause {
     pub(in crate::runtime) fn persistent_client_ack_gap_repair(
         target: ClientRepairOutputIdentity,
         snapshot: PathSnapshot,
-        lane: FlowLane,
     ) -> Self {
         Self::PersistentClientAckGapRepair(PersistentClientAckGapBatch {
             target,
-            expires_at: Instant::now() + reliable_ack_gap_repair_delay(Some(snapshot), lane),
+            expires_at: Instant::now() + reliable_ack_gap_repair_delay(Some(snapshot)),
         })
     }
 
     pub(in crate::runtime) fn persistent_server_ack_gap_repair(
         target: ServerRepairOutputIdentity,
         snapshot: PathSnapshot,
-        lane: FlowLane,
     ) -> Self {
         Self::PersistentServerAckGapRepair(PersistentServerAckGapBatch {
             target,
-            expires_at: Instant::now() + reliable_ack_gap_repair_delay(Some(snapshot), lane),
+            expires_at: Instant::now() + reliable_ack_gap_repair_delay(Some(snapshot)),
         })
     }
 }

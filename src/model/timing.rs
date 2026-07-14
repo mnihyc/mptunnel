@@ -25,6 +25,8 @@ pub(crate) fn quic_bulk_proof_freshness_horizon(srtt: Duration, rttvar: Duration
 }
 
 pub(crate) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
+    // PTO follows carrier evidence, not product priority. Lane policy may gate
+    // or size product repair, but does not rewrite this timing basis.
     path.map(|path| {
         let srtt_ms = path.srtt_ms.max(1.0);
         let rttvar_ms = path.jitter_ms.max(srtt_ms / 8.0);

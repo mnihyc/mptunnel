@@ -49,7 +49,6 @@ fn persistent_response_repair_is_cancelled_when_output_incarnation_detaches() {
                 incarnation: target.incarnation,
             },
             target.snapshot,
-            FlowLane::Throughput,
         ),
     );
 

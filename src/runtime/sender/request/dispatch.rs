@@ -3,7 +3,6 @@
 //! Client request streams bind to one carrier attachment. A switchable output
 //! is a server response contract and is rejected before command enqueue.
 
-use super::super::dispatch::try_emit_carrier_frame;
 use super::super::work::CarrierEmitMode;
 use crate::protocol::Frame;
 use crate::runtime::RuntimeError;
@@ -49,7 +48,7 @@ fn emit_fixed_request_output(
 ) -> Result<(), RuntimeError> {
     match output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            try_emit_carrier_frame(fixed.commands(), frame, lane, emit_mode)
+            emit_mode.try_enqueue_frame(fixed.commands(), frame, lane)
         }
         ReliablePathStreamOutput::Switchable(_) => {
             Err(RuntimeError::Protocol("request relay path is not fixed"))

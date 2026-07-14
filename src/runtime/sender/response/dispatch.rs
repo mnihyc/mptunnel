@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
-use crate::runtime::sender::dispatch::try_emit_carrier_frame;
 use crate::runtime::stream::response::{
     ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseServiceHandoffRequest,
     ResponseSubflowAdmissionRequest, record_server_sender_decision,
@@ -78,11 +77,10 @@ pub(super) fn emit_planned_response_data_frame(
     let ResponseDataDispatchPlan { primary } = planned;
     match primary {
         ResponseDataDispatchTarget::Fixed(fixed) => {
-            try_emit_carrier_frame(
+            CarrierEmitMode::StreamOrdered.try_enqueue_frame(
                 fixed.commands(),
                 frame.clone(),
                 lane,
-                CarrierEmitMode::StreamOrdered,
             )?;
             fixed.record_owner_flight(&frame);
             Ok(ResponseDataEmitOutcome {
@@ -214,7 +212,7 @@ pub(super) fn emit_response_frame_from_sender_service(
     };
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            try_emit_carrier_frame(fixed.commands(), frame.clone(), lane, emit_mode)?;
+            emit_mode.try_enqueue_frame(fixed.commands(), frame.clone(), lane)?;
             if matches!(frame, Frame::StreamData { .. }) {
                 if repair {
                     fixed.record_repair_flight(&frame);
@@ -273,7 +271,8 @@ pub(super) fn emit_response_frame_from_sender_service(
                         )
                     }
                 } else {
-                    try_emit_carrier_frame(&target.commands, frame.clone(), lane, emit_mode)
+                    emit_mode
+                        .try_enqueue_frame(&target.commands, frame.clone(), lane)
                         .map(|()| None)
                 };
                 match send_result {

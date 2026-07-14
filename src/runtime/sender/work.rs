@@ -20,6 +20,18 @@ impl CarrierEmitMode {
             Self::StreamOrdered => reliable_path_stream_ordered_queue_lane(),
         }
     }
+
+    pub(in crate::runtime::sender) fn try_enqueue_frame(
+        self,
+        commands: &ReliablePathCommandSender,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Self::Classified => commands.try_enqueue_admitted_frame(frame, lane),
+            Self::StreamOrdered => commands.try_enqueue_stream_ordered_frame(frame, lane),
+        }
+    }
 }
 
 pub(in crate::runtime) fn sender_extra_traffic_startup_floor_bytes(mux_limits: MuxLimits) -> usize {

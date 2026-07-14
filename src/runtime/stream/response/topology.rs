@@ -707,6 +707,7 @@ impl ResponseStreamBinding {
         self.commit_ordered_data_owner_for_dispatch_target(&target.into())
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn commit_ordered_data_owner_for_dispatch_target(
         &self,
         target: &ResponseDispatchTarget,

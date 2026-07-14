@@ -1,6 +1,8 @@
 //! Optimistic response owner apply and ACK-clock retirement transaction.
 //! Outputs is the primary lock; validation and reservation precede carrier
 //! enqueue, which must precede exact flight commit.
+//! Ordinary Service admission orders locks as lane, outputs, ordered owner,
+//! flights, Subflow state, Service registration, then the session lane tracker.
 
 use super::admission::{
     ResponseSubflowAdmissionRequest, server_output_has_bulk_rate_evidence_with_limits,
@@ -49,6 +51,17 @@ pub(in crate::runtime) struct ResponseAckClockCalibrationRetirementRequest {
     pub(in crate::runtime) target_incarnation: u64,
     pub(in crate::runtime) target_pending_bytes: u64,
     pub(in crate::runtime) limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Exact ownership transition authorized for one OwnerData enqueue. Keeping
+/// Service, established Subflow, new Subflow, and calibration distinct makes
+/// impossible combinations unrepresentable at the binding commit boundary.
+pub(in crate::runtime) enum ResponseOwnerEnqueueAdmission {
+    Service,
+    ExistingSubflow,
+    NewSubflow(ResponseSubflowAdmissionRequest),
+    AckClockCalibration(ResponseAckClockCalibrationRequest),
 }
 
 impl ResponseStreamBinding {
@@ -191,16 +204,9 @@ impl ResponseStreamBinding {
         target: &ResponseSenderPathTarget,
         frame: &Frame,
         lane: FlowLane,
-        subflow_request: Option<ResponseSubflowAdmissionRequest>,
-        calibration_request: Option<ResponseAckClockCalibrationRequest>,
+        admission: ResponseOwnerEnqueueAdmission,
     ) -> Result<Option<u64>, RuntimeError> {
-        self.try_enqueue_owner_frame_for_dispatch_target(
-            &target.into(),
-            frame,
-            lane,
-            subflow_request,
-            calibration_request,
-        )
+        self.try_enqueue_owner_frame_for_dispatch_target(&target.into(), frame, lane, admission)
     }
 
     pub(in crate::runtime) fn try_enqueue_owner_frame_for_dispatch_target(
@@ -208,17 +214,9 @@ impl ResponseStreamBinding {
         target: &ResponseDispatchTarget,
         frame: &Frame,
         lane: FlowLane,
-        subflow_request: Option<ResponseSubflowAdmissionRequest>,
-        calibration_request: Option<ResponseAckClockCalibrationRequest>,
+        admission: ResponseOwnerEnqueueAdmission,
     ) -> Result<Option<u64>, RuntimeError> {
-        self.try_enqueue_owner_frame_for_target_inner(
-            target,
-            frame,
-            lane,
-            subflow_request,
-            calibration_request,
-            || {},
-        )
+        self.try_enqueue_owner_frame_for_target_inner(target, frame, lane, admission, || {})
     }
 
     pub(super) fn try_enqueue_owner_frame_for_target_inner(
@@ -226,13 +224,24 @@ impl ResponseStreamBinding {
         target: &ResponseDispatchTarget,
         frame: &Frame,
         lane: FlowLane,
-        subflow_request: Option<ResponseSubflowAdmissionRequest>,
-        calibration_request: Option<ResponseAckClockCalibrationRequest>,
+        admission: ResponseOwnerEnqueueAdmission,
         after_subflow_reservation: impl FnOnce(),
     ) -> Result<Option<u64>, RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
         }
+        let Some((_, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
+        // Service registration follows the binding's flow lane, not the
+        // command's effective carrier queue lane. Keep this guard through the
+        // outputs transaction so a concurrent lane change cannot make it stale.
+        let service_lane = match admission {
+            ResponseOwnerEnqueueAdmission::Service => {
+                Some(self.lane.lock().expect("server reliable stream lane lock"))
+            }
+            _ => None,
+        };
         let mut outputs = self
             .outputs
             .lock()
@@ -242,6 +251,7 @@ impl ResponseStreamBinding {
         }
         let target_matches = |entry: &ResponseStreamOutputEntry| {
             entry.key == target.key
+                && entry.path_instance_id == target.path_instance_id
                 && entry.incarnation == target.incarnation
                 && entry.commands.same_channel(&target.commands)
                 && entry.role == target.attachment_role
@@ -256,13 +266,7 @@ impl ResponseStreamBinding {
         let Some(target_index) = target_index else {
             return Err(RuntimeError::SenderServiceBlocked);
         };
-        if subflow_request.is_some() && calibration_request.is_some() {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        if let Some(request) = calibration_request {
-            let Some((_, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
-                return Err(RuntimeError::SenderServiceBlocked);
-            };
+        if let ResponseOwnerEnqueueAdmission::AckClockCalibration(request) = admission {
             let calibration_ceiling = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
             let calibration_limit = request.limit_bytes.min(calibration_ceiling);
             return self
@@ -403,7 +407,7 @@ impl ResponseStreamBinding {
                 )
                 .unwrap_or(Err(RuntimeError::SenderServiceBlocked));
         }
-        if let Some(request) = subflow_request {
+        if let ResponseOwnerEnqueueAdmission::NewSubflow(request) = admission {
             return self
                 .lane_tracker
                 .with_matching_generation(self.session_id, request.expected_lane_generation, || {
@@ -433,11 +437,62 @@ impl ResponseStreamBinding {
                 })
                 .unwrap_or(Err(RuntimeError::SenderServiceBlocked));
         }
-        target
-            .commands
-            .try_enqueue_stream_ordered_frame(frame.clone(), lane)?;
-        self.record_validated_owner_flight_with_outputs(&mut outputs, target_index, frame);
-        Ok(None)
+        match admission {
+            ResponseOwnerEnqueueAdmission::Service => {
+                let mut service = self
+                    .ordered_data_owner
+                    .lock()
+                    .expect("server reliable stream ordered data owner lock");
+                if !self.response_stream_open.load(Ordering::Acquire) {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+                let changed = *service != Some(target.key);
+
+                // Slot reservation is the only fallible operation. Publish
+                // the command only after its owner and exact flight exist, so
+                // the carrier cannot dequeue work ahead of response metadata.
+                let command = target
+                    .commands
+                    .try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+                self.record_validated_owner_flight_with_outputs(&mut outputs, target_index, frame);
+                if changed {
+                    *service = Some(target.key);
+                    outputs
+                        .ack_clock_calibrations
+                        .remove(&(target.key, target.incarnation));
+                    if outputs.active_ack_clock_calibration
+                        == Some((target.key, target.incarnation))
+                    {
+                        outputs.active_ack_clock_calibration = None;
+                    }
+                    self.reset_subflow_set_with_outputs(&mut outputs);
+                    self.response_flow_registration.set_service(Some((
+                        target.key,
+                        **service_lane
+                            .as_ref()
+                            .expect("Service admission holds the binding lane"),
+                    )));
+                }
+                command.commit();
+                drop(service);
+                drop(outputs);
+                if changed {
+                    self.notify_update();
+                }
+                Ok(None)
+            }
+            ResponseOwnerEnqueueAdmission::ExistingSubflow => {
+                target
+                    .commands
+                    .try_enqueue_stream_ordered_frame(frame.clone(), lane)?;
+                self.record_validated_owner_flight_with_outputs(&mut outputs, target_index, frame);
+                Ok(None)
+            }
+            ResponseOwnerEnqueueAdmission::NewSubflow(_)
+            | ResponseOwnerEnqueueAdmission::AckClockCalibration(_) => {
+                unreachable!("typed response admission was handled above")
+            }
+        }
     }
 }
 

@@ -6,8 +6,8 @@
 use super::*;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::stream::response::{
-    ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseServiceHandoffRequest,
-    ResponseSubflowAdmissionRequest, record_server_sender_decision,
+    ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseOwnerEnqueueAdmission,
+    ResponseServiceHandoffRequest, ResponseSubflowAdmissionRequest, record_server_sender_decision,
 };
 
 pub(super) fn response_repair_carrier_lane(frame: &Frame) -> FlowLane {
@@ -144,13 +144,23 @@ pub(super) fn emit_planned_response_data_frame(
                     )
                     .map(|()| None)
             } else {
-                binding.try_enqueue_owner_frame_for_dispatch_target(
-                    &target,
-                    &frame,
-                    lane,
-                    subflow_request,
-                    calibration_request,
-                )
+                let admission = match (role, subflow_request, calibration_request) {
+                    (PathRuntimeRole::Service, None, None) => {
+                        ResponseOwnerEnqueueAdmission::Service
+                    }
+                    (PathRuntimeRole::Subflow, None, None) => {
+                        ResponseOwnerEnqueueAdmission::ExistingSubflow
+                    }
+                    (PathRuntimeRole::Subflow, Some(request), None) => {
+                        ResponseOwnerEnqueueAdmission::NewSubflow(request)
+                    }
+                    (PathRuntimeRole::Subflow, None, Some(request)) => {
+                        ResponseOwnerEnqueueAdmission::AckClockCalibration(request)
+                    }
+                    _ => return Err(RuntimeError::SenderServiceBlocked),
+                };
+                binding
+                    .try_enqueue_owner_frame_for_dispatch_target(&target, &frame, lane, admission)
             };
             match enqueue_result {
                 Ok(_) => {}
@@ -161,9 +171,6 @@ pub(super) fn emit_planned_response_data_frame(
                     binding.detach(target.key, &target.commands);
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
-            }
-            if role == PathRuntimeRole::Service {
-                let _ = binding.commit_ordered_data_owner_for_dispatch_target(&target);
             }
             let decision_reason = match role {
                 PathRuntimeRole::Service if handoff => "data_service_handoff",
@@ -266,8 +273,7 @@ pub(super) fn emit_response_frame_from_sender_service(
                             &dispatch_target,
                             &frame,
                             lane,
-                            None,
-                            None,
+                            ResponseOwnerEnqueueAdmission::Service,
                         )
                     }
                 } else {
@@ -277,13 +283,6 @@ pub(super) fn emit_response_frame_from_sender_service(
                 };
                 match send_result {
                     Ok(_) => {
-                        if matches!(frame, Frame::StreamData { .. }) {
-                            if !repair {
-                                let _ = binding.commit_ordered_data_owner_for_dispatch_target(
-                                    &dispatch_target,
-                                );
-                            }
-                        }
                         record_server_sender_decision(
                             binding.session_id(),
                             stream.stream_id,

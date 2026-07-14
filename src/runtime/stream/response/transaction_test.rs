@@ -7,7 +7,7 @@ use super::super::test_support::{
     test_ack_clock_rate_sample,
 };
 use super::super::topology::{ResponseDispatchTarget, ResponseStreamAttachOutcome};
-use super::ResponseAckClockCalibrationRequest;
+use super::{ResponseAckClockCalibrationRequest, ResponseOwnerEnqueueAdmission};
 use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };
@@ -24,6 +24,213 @@ use crate::runtime::path::commands::{
 use crate::scheduler::FlowLane;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
+
+#[test]
+fn service_admission_publishes_queue_flight_and_owner_as_one_transaction() {
+    let mux_limits = MuxLimits::default();
+    let payload_bytes = PATH_OPEN_SCORE_BYTES;
+    let session_id = SessionId(189);
+    let tracker = Arc::new(ServerPathLaneTracker::default());
+    let service = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let candidate = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+        session_id,
+        service.underlay,
+        service.path_id,
+        service_commands.clone(),
+        FlowLane::Throughput,
+        mux_limits,
+        tracker.clone(),
+    );
+    let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(1);
+    assert_eq!(
+        binding.attach(
+            candidate.underlay,
+            candidate.path_id,
+            candidate_commands.clone(),
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            payload_bytes,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let proof = try_recv_reliable_path_command(&mut candidate_receivers)
+        .expect("candidate path proof is queued");
+    assert!(matches!(
+        &proof,
+        ReliablePathCommand::SendFrame(Frame::PathProofData { .. })
+    ));
+    candidate_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
+
+    binding.detach(service, &service_commands);
+    assert_eq!(binding.ordered_data_owner(), None);
+    assert_eq!(
+        tracker
+            .response_service_snapshot(session_id, service)
+            .active_flows,
+        0
+    );
+    assert_eq!(
+        tracker
+            .response_service_snapshot(session_id, candidate)
+            .active_flows,
+        0
+    );
+
+    let target = binding
+        .sender_path_targets(FlowLane::Throughput, payload_bytes)
+        .into_iter()
+        .find(|target| target.key == candidate)
+        .expect("candidate target remains attached");
+    let identity = (target.key, target.incarnation);
+    {
+        let mut outputs = binding.outputs.lock().expect("test response outputs lock");
+        outputs.ack_clock_calibrations.insert(
+            identity,
+            ResponseAckClockCalibrationState::new(
+                reliable_ack_clock_calibration_limit_bytes(mux_limits),
+                reliable_ack_clock_calibration_ceiling_bytes(mux_limits),
+            ),
+        );
+        outputs.active_ack_clock_calibration = Some(identity);
+    }
+    let frame = stream_data_frame(payload_bytes);
+    let unchanged_planner_generation = binding.subflow_state_snapshot().0;
+    let unchanged_lane_generation = binding.lane_generation();
+
+    let mut stale_target = target.clone();
+    stale_target.incarnation = stale_target.incarnation.wrapping_add(1);
+    assert!(matches!(
+        binding.try_enqueue_owner_frame_for_target(
+            &stale_target,
+            &frame,
+            FlowLane::Throughput,
+            ResponseOwnerEnqueueAdmission::Service,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(binding.ordered_data_owner(), None);
+    assert_eq!(
+        binding.subflow_state_snapshot().0,
+        unchanged_planner_generation
+    );
+    assert_eq!(binding.lane_generation(), unchanged_lane_generation);
+    assert!(
+        binding
+            .owner_flight_keys_overlapping_frame(&frame)
+            .is_empty()
+    );
+    {
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        assert_eq!(outputs.active_ack_clock_calibration, Some(identity));
+        assert_eq!(
+            outputs
+                .ack_clock_calibrations
+                .get(&identity)
+                .expect("stale target preserves calibration")
+                .spent_bytes,
+            0
+        );
+    }
+    assert!(try_recv_reliable_path_command(&mut candidate_receivers).is_none());
+
+    candidate_commands
+        .try_enqueue_stream_ordered_frame(
+            stream_data_frame_at(payload_bytes as u64, payload_bytes),
+            FlowLane::Throughput,
+        )
+        .expect("fill candidate command queue");
+    assert!(matches!(
+        binding.try_enqueue_owner_frame_for_target(
+            &target,
+            &frame,
+            FlowLane::Throughput,
+            ResponseOwnerEnqueueAdmission::Service,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert_eq!(binding.ordered_data_owner(), None);
+    assert_eq!(
+        binding.subflow_state_snapshot().0,
+        unchanged_planner_generation
+    );
+    assert_eq!(binding.lane_generation(), unchanged_lane_generation);
+    assert!(
+        binding
+            .owner_flight_keys_overlapping_frame(&frame)
+            .is_empty()
+    );
+    {
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == candidate)
+            .expect("candidate output remains attached");
+        assert_eq!(entry.owner_data_in_flight_bytes, 0);
+        assert_eq!(entry.bytes_in_flight, 0);
+        assert_eq!(outputs.active_ack_clock_calibration, Some(identity));
+        assert!(outputs.ack_clock_calibrations.contains_key(&identity));
+    }
+    assert_eq!(
+        tracker
+            .response_service_snapshot(session_id, candidate)
+            .active_flows,
+        0
+    );
+    let filler = try_recv_reliable_path_command(&mut candidate_receivers)
+        .expect("only the queue filler remains after blocked admission");
+    candidate_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+    assert!(try_recv_reliable_path_command(&mut candidate_receivers).is_none());
+
+    binding
+        .try_enqueue_owner_frame_for_target(
+            &target,
+            &frame,
+            FlowLane::Throughput,
+            ResponseOwnerEnqueueAdmission::Service,
+        )
+        .expect("live Service target commits");
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut candidate_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
+    ));
+    assert_eq!(binding.ordered_data_owner(), Some(candidate));
+    assert_ne!(
+        binding.subflow_state_snapshot().0,
+        unchanged_planner_generation
+    );
+    assert_ne!(binding.lane_generation(), unchanged_lane_generation);
+    assert_eq!(
+        tracker
+            .response_service_snapshot(session_id, candidate)
+            .active_flows,
+        1
+    );
+    assert_eq!(
+        binding.owner_flight_keys_overlapping_frame(&frame),
+        vec![candidate]
+    );
+    {
+        let outputs = binding.outputs.lock().expect("test response outputs lock");
+        let entry = outputs
+            .entries
+            .iter()
+            .find(|entry| entry.key == candidate)
+            .expect("candidate output remains attached");
+        assert_eq!(entry.owner_data_in_flight_bytes, payload_bytes as u64);
+        assert_eq!(entry.bytes_in_flight, payload_bytes as u64);
+        assert_eq!(outputs.active_ack_clock_calibration, None);
+        assert!(!outputs.ack_clock_calibrations.contains_key(&identity));
+    }
+}
 
 #[test]
 fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
@@ -161,8 +368,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(stale_model),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(stale_model),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -174,8 +380,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(stale),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(stale),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -188,8 +393,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(stale_lane),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(stale_lane),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -227,8 +431,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(stale_stage),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(stale_stage),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -258,8 +461,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(stale_target_pending),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(stale_target_pending),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -281,8 +483,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(stale_service_pending),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(stale_service_pending),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -300,8 +501,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(fresh),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(fresh),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -325,8 +525,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(request_for(&binding)),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(request_for(&binding)),
         )
         .expect("fresh exact calibration reservation enqueues");
     {
@@ -351,8 +550,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             &target,
             &frame,
             FlowLane::Throughput,
-            None,
-            Some(request_for(&binding)),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(request_for(&binding)),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -462,8 +660,7 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
             &ResponseDispatchTarget::from(&target),
             &frame_for_sender,
             FlowLane::Throughput,
-            Some(request),
-            None,
+            ResponseOwnerEnqueueAdmission::NewSubflow(request),
             || {
                 reserved_tx
                     .send(())

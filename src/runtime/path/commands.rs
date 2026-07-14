@@ -33,6 +33,51 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     dequeued_unreleased_bytes: AtomicU64,
 }
 
+/// Holds queue capacity without publishing a frame. Response transactions use
+/// this to make their metadata visible before the carrier can dequeue work.
+pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
+    permit: mpsc::Permit<'a, QueuedReliablePathCommand>,
+    frame: Frame,
+    bytes: usize,
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+    #[cfg(feature = "lab-diagnostics")]
+    lane: FlowLane,
+    #[cfg(feature = "lab-diagnostics")]
+    effective_lane: FlowLane,
+}
+
+impl ReliablePathFrameReservation<'_> {
+    pub(in crate::runtime) fn commit(self) {
+        #[cfg(feature = "lab-diagnostics")]
+        let frame_kind = reliable_path_frame_kind(&self.frame);
+        #[cfg(feature = "lab-diagnostics")]
+        let stream_id = reliable_path_frame_stream_id(&self.frame);
+        self.metrics.add_pending_bytes(self.bytes);
+        self.permit.send(QueuedReliablePathCommand::new(
+            ReliablePathCommand::SendFrame(self.frame),
+            self.bytes,
+            self.metrics,
+        ));
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_command_queue_send",
+            format_args!(
+                "queue={} frame_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued",
+                if reliable_path_frame_uses_priority_queue(self.effective_lane) {
+                    "priority"
+                } else {
+                    "data"
+                },
+                frame_kind,
+                stream_id.0,
+                self.lane,
+                self.effective_lane,
+                self.bytes,
+            ),
+        );
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
@@ -515,7 +560,21 @@ impl ReliablePathCommandSender {
         frame: Frame,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
-        self.try_enqueue_admitted_frame_with_effective_lane(
+        let reservation = self.try_reserve_admitted_frame_with_effective_lane(
+            frame,
+            lane,
+            Some(reliable_path_stream_ordered_queue_lane()),
+        )?;
+        reservation.commit();
+        Ok(())
+    }
+
+    pub(in crate::runtime) fn try_reserve_stream_ordered_frame(
+        &self,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<ReliablePathFrameReservation<'_>, RuntimeError> {
+        self.try_reserve_admitted_frame_with_effective_lane(
             frame,
             lane,
             Some(reliable_path_stream_ordered_queue_lane()),
@@ -528,6 +587,21 @@ impl ReliablePathCommandSender {
         lane: FlowLane,
         effective_lane_override: Option<FlowLane>,
     ) -> Result<(), RuntimeError> {
+        let reservation = self.try_reserve_admitted_frame_with_effective_lane(
+            frame,
+            lane,
+            effective_lane_override,
+        )?;
+        reservation.commit();
+        Ok(())
+    }
+
+    fn try_reserve_admitted_frame_with_effective_lane(
+        &self,
+        frame: Frame,
+        lane: FlowLane,
+        effective_lane_override: Option<FlowLane>,
+    ) -> Result<ReliablePathFrameReservation<'_>, RuntimeError> {
         if reliable_path_frame_requires_capacity_command(&frame) {
             return Err(RuntimeError::Protocol(
                 "PATH_CAPACITY_* requires an explicit typed carrier command",
@@ -545,49 +619,52 @@ impl ReliablePathCommandSender {
         } else {
             &self.data
         };
-        let result = match queue.try_reserve() {
-            Ok(permit) => {
-                self.metrics.add_pending_bytes(bytes);
-                permit.send(QueuedReliablePathCommand::new(
-                    ReliablePathCommand::SendFrame(frame),
-                    bytes,
-                    self.metrics.clone(),
-                ));
-                Ok(())
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                Err(RuntimeError::SenderServiceBlocked)
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                Err(RuntimeError::ReliablePathSessionClosed)
+        let permit = match queue.try_reserve() {
+            Ok(permit) => permit,
+            Err(err) => {
+                let error = match err {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        RuntimeError::SenderServiceBlocked
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        RuntimeError::ReliablePathSessionClosed
+                    }
+                };
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "path_command_queue_send",
+                    format_args!(
+                        "queue={} frame_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result={}",
+                        if reliable_path_frame_uses_priority_queue(effective_lane) {
+                            "priority"
+                        } else {
+                            "data"
+                        },
+                        frame_kind,
+                        stream_id.0,
+                        lane,
+                        effective_lane,
+                        bytes,
+                        if matches!(&error, RuntimeError::SenderServiceBlocked) {
+                            "blocked"
+                        } else {
+                            "closed"
+                        },
+                    ),
+                );
+                return Err(error);
             }
         };
-        #[cfg(feature = "lab-diagnostics")]
-        {
-            let queue_name = if reliable_path_frame_uses_priority_queue(effective_lane) {
-                "priority"
-            } else {
-                "data"
-            };
-            lab_diagnostic(
-                "path_command_queue_send",
-                format_args!(
-                    "queue={} frame_kind={} stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result={}",
-                    queue_name,
-                    frame_kind,
-                    stream_id.0,
-                    lane,
-                    effective_lane,
-                    bytes,
-                    match &result {
-                        Ok(()) => "queued",
-                        Err(RuntimeError::SenderServiceBlocked) => "blocked",
-                        Err(_) => "closed",
-                    },
-                ),
-            );
-        }
-        result
+        Ok(ReliablePathFrameReservation {
+            permit,
+            frame,
+            bytes,
+            metrics: self.metrics.clone(),
+            #[cfg(feature = "lab-diagnostics")]
+            lane,
+            #[cfg(feature = "lab-diagnostics")]
+            effective_lane,
+        })
     }
 
     pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {

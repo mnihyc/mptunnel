@@ -1,5 +1,7 @@
 use super::*;
 
+const TUN_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(super) async fn run_tun_l4_client(
     tun: TunL4Config,
     context: ClientPathContext,

@@ -8,6 +8,7 @@ use super::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{SessionId, UnderlayProtocol};
+use crate::runtime::path::udp::metrics::QuicCapacityProofCandidate;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -52,29 +53,6 @@ pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
     pub(in crate::runtime) quic_capacity_calibration_spent_bytes: u64,
     pub(in crate::runtime) response_service_handoff_drain:
         Option<ResponseServiceHandoffDrainReservation>,
-}
-
-/// Carrier-local proof for one exact QUIC capacity train.
-///
-/// Geometry is repeated intentionally: accepting evidence with a different
-/// warmup or floor would let a later transport snapshot reinterpret the train.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct QuicCapacityProofCandidate {
-    pub(in crate::runtime) token: u64,
-    pub(in crate::runtime) train_bytes: u64,
-    pub(in crate::runtime) sample_floor_bytes: u64,
-    pub(in crate::runtime) accounting_slack_bytes: u64,
-    pub(in crate::runtime) warmup_bytes: u64,
-    pub(in crate::runtime) required_proof_bytes: u64,
-    pub(in crate::runtime) written_bytes: u64,
-    pub(in crate::runtime) written_data_frame_count: u64,
-    pub(in crate::runtime) receipt_confirmed: bool,
-    pub(in crate::runtime) received_bytes: u64,
-    pub(in crate::runtime) proof_elapsed: Duration,
-    pub(in crate::runtime) rate_bps: u64,
-    pub(in crate::runtime) accepted_at: Instant,
-    pub(in crate::runtime) expires_at: Instant,
-    pub(in crate::runtime) proof_validity: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

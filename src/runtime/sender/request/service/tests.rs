@@ -7,16 +7,16 @@ use crate::lab_diagnostics::{
 };
 
 fn poison_client_path_health_for_test(context: &ClientPathContext) {
-    let health = Arc::clone(&context.health);
+    let poisoned_context = context.clone();
     assert!(
         std::thread::spawn(move || {
-            let _guard = health.lock().expect("path health lock");
+            let _guard = poisoned_context.health().lock().expect("path health lock");
             panic!("poison path health for a no-lock fast-path assertion");
         })
         .join()
         .is_err()
     );
-    assert!(context.health.is_poisoned());
+    assert!(context.health().is_poisoned());
 }
 
 #[test]
@@ -235,7 +235,8 @@ fn sub_coverage_stream_ack_does_not_publish_a_path_rate_sample() {
         &[OffsetRange::new(0, (4 * BBR_MAX_SEND_QUANTUM_BYTES) as u64)
             .expect("cumulative ACK range")],
     );
-    let delivery_samples = context.health.lock().expect("path health lock").tcp[0].delivery_samples;
+    let delivery_samples =
+        context.health().lock().expect("path health lock").tcp[0].delivery_samples;
 
     assert_eq!(
         context
@@ -278,7 +279,7 @@ fn fragmented_service_acks_establish_provenance_without_publishing_rate() {
     );
     assert!(!sender.request_rate_proven_subflows.contains(&instance));
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[0].delivery_samples,
+        context.health().lock().expect("path health lock").tcp[0].delivery_samples,
         0
     );
 
@@ -286,7 +287,7 @@ fn fragmented_service_acks_establish_provenance_without_publishing_rate() {
         &context,
         &[OffsetRange::new(chunk as u64, (2 * chunk) as u64).expect("second ACK range")],
     );
-    let health = context.health.lock().expect("path health lock");
+    let health = context.health().lock().expect("path health lock");
     assert!(sender.request_rate_proven_subflows.contains(&instance));
     assert_eq!(health.tcp[0].delivery_samples, 0);
     assert_eq!(health.tcp[0].product_delivery_sample_bytes, 0);
@@ -357,7 +358,7 @@ fn tcp_request_first_window_only_establishes_the_ack_clock() {
     assert!(!sender.request_ack_clock_proven_subflows.contains(&instance));
     assert!(!sender.request_per_flow_rate_bps.contains_key(&instance));
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[0].delivery_samples,
+        context.health().lock().expect("path health lock").tcp[0].delivery_samples,
         0,
         "the RTT-bearing first window establishes the clock but is not a rate sample"
     );
@@ -373,7 +374,7 @@ fn tcp_request_first_window_only_establishes_the_ack_clock() {
                 .expect("second window"),
         ],
     );
-    let health = context.health.lock().expect("path health lock");
+    let health = context.health().lock().expect("path health lock");
     assert!(sender.request_ack_clock_proven_subflows.contains(&instance));
     assert!(sender.request_per_flow_rate_bps.contains_key(&instance));
     assert_eq!(health.tcp[0].delivery_samples, 1);
@@ -1186,7 +1187,7 @@ fn publish_request_quic_capacity_calibration_for_test(
     candidate: QuicCapacityProofCandidate,
     probe: crate::transport::quic_carrier::CapacityProbeMetrics,
 ) {
-    context.health.lock().expect("path health lock").udp[target.key.index]
+    context.health().lock().expect("path health lock").udp[target.key.index]
         .accept_request_quic_capacity_proof(candidate, probe, Instant::now())
         .expect("accept request QUIC capacity proof");
     assert_eq!(
@@ -1295,7 +1296,7 @@ fn seed_client_bulk_evidence_for_test(context: &ClientPathContext, key: RelayPat
 }
 
 fn seed_client_quic_native_bulk_evidence_for_test(context: &ClientPathContext, index: usize) {
-    context.health.lock().expect("path health lock").udp[index].mark_quic_path_metrics(
+    context.health().lock().expect("path health lock").udp[index].mark_quic_path_metrics(
         UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(20),
@@ -2334,7 +2335,7 @@ async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
     tokio::task::yield_now().await;
 
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[1].active_flows,
+        context.health().lock().expect("path health lock").tcp[1].active_flows,
         0,
         "a removed optional path must release load before detach can block"
     );
@@ -2480,7 +2481,7 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
     ));
 
     let (delivery_samples, delivery_bytes) = {
-        let health = context.health.lock().expect("path health lock");
+        let health = context.health().lock().expect("path health lock");
         let candidate = &health.tcp[candidate_key.index];
         (
             candidate.delivery_samples,
@@ -2488,7 +2489,7 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
         )
     };
     sender.release_normalized_acked_ranges(&context, &[]);
-    let health = context.health.lock().expect("path health lock");
+    let health = context.health().lock().expect("path health lock");
     assert_eq!(
         health.tcp[candidate_key.index].delivery_samples,
         delivery_samples
@@ -2674,7 +2675,7 @@ async fn near_cap_startup_sample_seals_when_next_frame_cannot_fit() {
             .previous_window_acked_at
             .is_some()
     );
-    let health = context.health.lock().expect("path health lock");
+    let health = context.health().lock().expect("path health lock");
     assert_eq!(
         health.tcp[candidate_key.index].product_delivery_sample_bytes, admitted_bytes as u64,
         "receipt goodput must use only the bytes actually admitted before sealing"
@@ -4243,8 +4244,8 @@ async fn request_quic_capacity_skips_an_earlier_exhausted_path_share() {
         );
     }
     seed_client_bulk_evidence_for_test(&context, service.key);
-    context.health.lock().expect("path health lock").udp[service.key.index].relay_bytes_in_flight =
-        reliable_subflow_startup_sample_limit_bytes(context.mux_limits);
+    context.health().lock().expect("path health lock").udp[service.key.index]
+        .relay_bytes_in_flight = reliable_subflow_startup_sample_limit_bytes(context.mux_limits);
 
     let eligible_candidates =
         context.automatic_bulk_path_count(UnderlayProtocol::Udp, Some(service.key.index));
@@ -4329,9 +4330,9 @@ async fn request_quic_train_waits_for_candidate_latency_pressure_to_clear() {
         Duration::from_millis(10),
     );
     seed_client_bulk_evidence_for_test(&context, service.key);
-    context.health.lock().expect("path health lock").udp[service.key.index].relay_bytes_in_flight =
-        reliable_subflow_startup_sample_limit_bytes(context.mux_limits);
-    context.health.lock().expect("path health lock").udp[candidate.key.index]
+    context.health().lock().expect("path health lock").udp[service.key.index]
+        .relay_bytes_in_flight = reliable_subflow_startup_sample_limit_bytes(context.mux_limits);
+    context.health().lock().expect("path health lock").udp[candidate.key.index]
         .reserve_load(FlowLane::Latency);
 
     let mut sender = RelaySenderService::new(stream_id);
@@ -4341,7 +4342,7 @@ async fn request_quic_train_waits_for_candidate_latency_pressure_to_clear() {
     assert!(sender.request_quic_capacity_calibration.is_none());
     assert!(sender.request_quic_capacity_attempted_paths.is_empty());
 
-    context.health.lock().expect("path health lock").udp[candidate.key.index]
+    context.health().lock().expect("path health lock").udp[candidate.key.index]
         .release_load(FlowLane::Latency);
     sender.try_start_request_quic_capacity_calibration(&context, &remotes, FlowLane::Throughput);
     assert!(sender.request_quic_capacity_calibration.is_some());
@@ -4408,7 +4409,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
             .request_graduated_subflows
             .contains(&candidate_instance)
     );
-    let _ = context.health.lock().expect("path health lock").udp[1].observe(proof.expires_at);
+    let _ = context.health().lock().expect("path health lock").udp[1].observe(proof.expires_at);
     let next_lease = context
         .try_reserve_request_quic_capacity_probe(
             StreamId(208),
@@ -4602,8 +4603,8 @@ async fn udp_service_evidence_does_not_bootstrap_validation_with_product_bytes()
         underlay: UnderlayProtocol::Udp,
         index: 1,
     };
-    context.health.lock().expect("path health lock").udp[service_key.index].mark_quic_path_metrics(
-        UdpPathMetrics {
+    context.health().lock().expect("path health lock").udp[service_key.index]
+        .mark_quic_path_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(20),
             rttvar: Duration::from_millis(2),
@@ -4630,8 +4631,7 @@ async fn udp_service_evidence_does_not_bootstrap_validation_with_product_bytes()
             capacity_probe: None,
             #[cfg(feature = "lab-diagnostics")]
             ack_poll: QuicAckPollDiagnostics::default(),
-        },
-    );
+        });
     let (service_commands, mut service_rx) = reliable_path_command_channels(16);
     let mut remotes = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
@@ -4869,14 +4869,14 @@ async fn startup_candidate_can_progress_when_service_command_queue_is_full() {
         "first optional OwnerData commits this logical flow's path load"
     );
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[1].active_flows,
+        context.health().lock().expect("path health lock").tcp[1].active_flows,
         1,
         "concurrent flows must see that this Subflow already consumes carrier capacity"
     );
 
     drop(remotes);
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[1].active_flows,
+        context.health().lock().expect("path health lock").tcp[1].active_flows,
         0,
         "dropping the remote set must release a committed startup load lease"
     );
@@ -4901,13 +4901,13 @@ fn stale_shared_load_snapshot_has_only_one_claim_winner() {
         "a stale contender must rescore instead of sharing the same idle candidate"
     );
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[0].active_flows,
+        context.health().lock().expect("path health lock").tcp[0].active_flows,
         1
     );
 
     drop(first);
     assert_eq!(
-        context.health.lock().expect("path health lock").tcp[0].active_flows,
+        context.health().lock().expect("path health lock").tcp[0].active_flows,
         0
     );
 }
@@ -4960,7 +4960,7 @@ async fn queued_path_proof_keeps_one_identity_until_ack_or_path_failure() {
     assert_eq!(remotes.paths[0].path_proof_id, Some(41));
     assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
 
-    context.health.lock().expect("path health lock").tcp[0].invalidate_path_proofs();
+    context.health().lock().expect("path health lock").tcp[0].invalidate_path_proofs();
     remotes.retry_pending_path_proofs(&context);
     assert_ne!(remotes.paths[0].path_proof_id, Some(41));
     assert!(matches!(
@@ -5026,7 +5026,7 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
     ));
     let stale_sent_at = Instant::now();
 
-    context.health.lock().expect("path health lock").tcp[1].invalidate_path_proofs();
+    context.health().lock().expect("path health lock").tcp[1].invalidate_path_proofs();
     context.mark_relay_path_proof_observation(
         candidate.key.underlay,
         candidate.key.index,

@@ -40,6 +40,7 @@ mod response_admission;
 mod response_service_handoff;
 pub(super) mod response_session;
 
+pub(in crate::runtime) use crate::runtime::path::udp::metrics::QuicCapacityProofCandidate;
 pub(in crate::runtime) use quic_capacity_probe::ResponseQuicCapacityCalibrationRequest;
 pub(in crate::runtime) use response_admission::*;
 pub(in crate::runtime) use response_service_handoff::{
@@ -49,7 +50,7 @@ pub(in crate::runtime) use response_service_handoff::{
 use response_session::ServerQuicCapacityCalibrationPhase;
 use response_session::ServerResponseFlowRegistration;
 pub(in crate::runtime) use response_session::{
-    QuicCapacityProofCandidate, ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation,
+    ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation,
     ResponseSessionSchedulingSnapshot, ServerPathLaneTracker, ServerRealtimeFlowRegistration,
     TcpCapacityProbeSessionLease, quic_capacity_proof_pin_matches_marker,
     quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_candidate_at,

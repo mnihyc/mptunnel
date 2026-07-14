@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
+
 pub(super) async fn run_socks5_client_ingress(
     listen: Vec<SocketAddr>,
     context: ClientPathContext,

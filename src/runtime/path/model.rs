@@ -1016,5 +1016,139 @@ pub(in crate::runtime) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f
     PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ClientPathObservation {
+    pub(in crate::runtime) state: SchedulerPathState,
+    pub(in crate::runtime) manual_disabled: bool,
+    pub(in crate::runtime) measured_srtt_ms: Option<f64>,
+    pub(in crate::runtime) measured_jitter_ms: Option<f64>,
+    pub(in crate::runtime) measured_rate_bps: Option<f64>,
+    pub(in crate::runtime) measured_loss_rate: Option<f64>,
+    pub(in crate::runtime) measured_mtu_payload_bytes: Option<usize>,
+    pub(in crate::runtime) delivery_samples: u32,
+    pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
+    pub(in crate::runtime) product_delivery_sample_bytes: u64,
+    pub(in crate::runtime) datagram_feedback_samples: u32,
+    pub(in crate::runtime) last_delivery_at: Option<Instant>,
+    pub(in crate::runtime) active_flows: u32,
+    pub(in crate::runtime) active_latency_sensitive_flows: u32,
+    pub(in crate::runtime) relay_bytes_in_flight: u64,
+    pub(in crate::runtime) relay_queue_bytes: u64,
+    pub(in crate::runtime) carrier_srtt_ms: Option<f64>,
+    pub(in crate::runtime) carrier_rttvar_ms: Option<f64>,
+    pub(in crate::runtime) carrier_delivery_rate_bps: Option<f64>,
+    pub(in crate::runtime) carrier_bytes_in_flight: u64,
+    pub(in crate::runtime) carrier_queue_bytes: u64,
+    pub(in crate::runtime) carrier_inflight_limit_bytes: u64,
+    pub(in crate::runtime) carrier_delivery_samples: u32,
+    pub(in crate::runtime) carrier_delivery_sample_bytes: u64,
+    pub(in crate::runtime) carrier_last_delivery_at: Option<Instant>,
+    pub(in crate::runtime) carrier_app_limited: bool,
+    pub(in crate::runtime) carrier_ack_derived_data_seen: bool,
+    pub(in crate::runtime) explicit_carrier_capacity_proof: bool,
+    pub(in crate::runtime) quic_capacity_product_handoff_complete: bool,
+    pub(in crate::runtime) quic_capacity_rate_prior_fresh: bool,
+    pub(in crate::runtime) path_proof_success: bool,
+}
+
+impl Default for ClientPathObservation {
+    fn default() -> Self {
+        Self {
+            state: SchedulerPathState::Suspect,
+            manual_disabled: false,
+            measured_srtt_ms: None,
+            measured_jitter_ms: None,
+            measured_rate_bps: None,
+            measured_loss_rate: None,
+            measured_mtu_payload_bytes: None,
+            delivery_samples: 0,
+            product_delivery_rate_bps: None,
+            product_delivery_sample_bytes: 0,
+            datagram_feedback_samples: 0,
+            last_delivery_at: None,
+            active_flows: 0,
+            active_latency_sensitive_flows: 0,
+            relay_bytes_in_flight: 0,
+            relay_queue_bytes: 0,
+            carrier_srtt_ms: None,
+            carrier_rttvar_ms: None,
+            carrier_delivery_rate_bps: None,
+            carrier_bytes_in_flight: 0,
+            carrier_queue_bytes: 0,
+            carrier_inflight_limit_bytes: 0,
+            carrier_delivery_samples: 0,
+            carrier_delivery_sample_bytes: 0,
+            carrier_last_delivery_at: None,
+            carrier_app_limited: true,
+            carrier_ack_derived_data_seen: false,
+            explicit_carrier_capacity_proof: false,
+            quic_capacity_product_handoff_complete: false,
+            quic_capacity_rate_prior_fresh: false,
+            path_proof_success: false,
+        }
+    }
+}
+
+pub(super) fn reliable_reservation_should_use_endpoint_only_startup_order(
+    tcp_paths: &[PathSpec],
+    tcp_observations: &[ClientPathObservation],
+    udp_paths: &[PathSpec],
+    udp_observations: &[ClientPathObservation],
+    lane: FlowLane,
+) -> bool {
+    reliable_relay_expects_interactive_response(lane)
+        && (!tcp_paths.is_empty() || !udp_paths.is_empty())
+        && tcp_paths.iter().chain(udp_paths).all(path_is_endpoint_only)
+        && !paths_have_sender_delivery_evidence(tcp_paths, tcp_observations)
+        && !paths_have_sender_delivery_evidence(udp_paths, udp_observations)
+}
+
+fn paths_have_sender_delivery_evidence(
+    paths: &[PathSpec],
+    observations: &[ClientPathObservation],
+) -> bool {
+    paths.iter().enumerate().any(|(index, path)| {
+        bulk_candidate_has_sender_delivery_evidence(
+            path,
+            observations.get(index).copied().unwrap_or_default(),
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct UdpDatagramPathObservation {
+    pub(in crate::runtime) rtt: Duration,
+    pub(in crate::runtime) jitter: Duration,
+    pub(in crate::runtime) loss_rate: f64,
+    pub(in crate::runtime) rate_sample: Option<PathRateSample>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::runtime) struct PathDeliveryStats {
+    pub(in crate::runtime) payload_bytes: u64,
+    pub(in crate::runtime) first_payload_at: Option<Instant>,
+    pub(in crate::runtime) last_payload_at: Option<Instant>,
+}
+
+impl PathDeliveryStats {
+    pub(in crate::runtime) fn record_payload_bytes(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = Instant::now();
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes as u64);
+        if self.first_payload_at.is_none() {
+            self.first_payload_at = Some(now);
+        }
+        self.last_payload_at = Some(now);
+    }
+
+    pub(in crate::runtime) fn rate_sample(self) -> Option<PathRateSample> {
+        let first = self.first_payload_at?;
+        let last = self.last_payload_at.unwrap_or(first);
+        PathRateSample::new(self.payload_bytes, last.duration_since(first))
+    }
+}
+
 #[cfg(test)]
 mod tests;

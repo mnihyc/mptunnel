@@ -117,7 +117,7 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) stream_frame_queue: usize,
-    pub(in crate::runtime) health: Arc<Mutex<ClientPathHealth>>,
+    pub(in crate::runtime) state: Arc<ClientPathState>,
 }
 
 struct ClientUdpPathConnection {
@@ -938,7 +938,8 @@ fn spawn_client_udp_path_metrics(
                 poll_elapsed,
             );
             let published_proof = if let Some(record) = runtime
-                .health
+                .state
+                .health()
                 .lock()
                 .expect("client QUIC UDP path health lock")
                 .udp
@@ -1150,7 +1151,7 @@ async fn open_client_udp_stream_on_connection(
         runtime.codec_limits,
         runtime.mux_limits,
         stream_frame_queue,
-        runtime.health.clone(),
+        runtime.state.clone(),
         receivers,
         frames_tx,
     ));
@@ -1255,7 +1256,7 @@ async fn run_client_udp_stream(
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     reader_queue_size: usize,
-    health: Arc<Mutex<ClientPathHealth>>,
+    state: Arc<ClientPathState>,
     mut commands: ReliablePathCommandReceivers,
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
@@ -1433,7 +1434,8 @@ async fn run_client_udp_stream(
                     })) if proof_path_id == path_id => {
                         if let Some(observation) =
                             path_proofs.acknowledge(path_id, proof_id, payload_bytes)
-                            && let Some(record) = health
+                            && let Some(record) = state
+                                .health()
                                 .lock()
                                 .expect("client path health lock")
                                 .udp

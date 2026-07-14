@@ -15,10 +15,10 @@ fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     }
 }
 
@@ -162,10 +162,10 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
     let now = tokio::time::Instant::now();
     let deadlines = ClientTcpOpenDeadlines {
@@ -255,10 +255,10 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let first_handle = handle.clone();
@@ -369,10 +369,10 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let first_handle = handle.clone();
@@ -660,10 +660,10 @@ async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
 
     let first_handle = handle.clone();
@@ -800,10 +800,10 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
 
     let mut first = handle
@@ -917,10 +917,10 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
     let first = handle
         .open_stream(
@@ -1016,10 +1016,10 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
         command_queue: 4,
         stream_frame_queue: 4,
         closed_stream_cache_capacity: 8,
-        health: Arc::new(Mutex::new(ClientPathHealth {
+        state: ClientPathState::new(ClientPathHealth {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
-        })),
+        }),
     });
     let stream = handle
         .open_stream(
@@ -2072,7 +2072,7 @@ fn client_path_health_suppresses_failed_paths_until_cooldown() {
     assert_eq!(failed_order, vec![1]);
 
     {
-        let mut health = context.health.lock().expect("health lock");
+        let mut health = context.health().lock().expect("health lock");
         health.tcp[0].failed_until = Some(Instant::now() - Duration::from_millis(1));
     }
     let recovered_order = context.ordered_tcp_path_indices(FlowLane::Latency, 512);
@@ -2357,7 +2357,7 @@ fn data_plane_failure_requires_probe_success_before_bulk_readmission() {
 
     context.mark_relay_path_data_plane_failure(UnderlayProtocol::Tcp, 0);
     {
-        let mut health = context.health.lock().expect("path health");
+        let mut health = context.health().lock().expect("path health");
         health.tcp[0].failed_until = Some(Instant::now() - Duration::from_millis(1));
     }
 
@@ -2805,7 +2805,7 @@ fn path_proof_observation_does_not_promote_tcp_candidate_without_delivery_eviden
         "proof-success path remains eligible for validation until ACK-data evidence arrives"
     );
     {
-        let health = context.health.lock().expect("client path health lock");
+        let health = context.health().lock().expect("client path health lock");
         let record = &health.tcp[1];
         assert!(record.path_proof_success);
         assert_eq!(
@@ -2898,7 +2898,7 @@ fn bulk_promotion_changes_active_path_lane_load_without_leaking_flow_accounting(
 
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Latency);
     {
-        let health = context.health.lock().expect("client path health lock");
+        let health = context.health().lock().expect("client path health lock");
         assert_eq!(health.tcp[0].active_flows, 1);
         assert_eq!(health.tcp[0].active_latency_sensitive_flows, 1);
         assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
@@ -2911,14 +2911,14 @@ fn bulk_promotion_changes_active_path_lane_load_without_leaking_flow_accounting(
         FlowLane::Throughput,
     );
     {
-        let health = context.health.lock().expect("client path health lock");
+        let health = context.health().lock().expect("client path health lock");
         assert_eq!(health.tcp[0].active_flows, 1);
         assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
         assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
     }
 
     context.release_relay_path_load(UnderlayProtocol::Tcp, 0, FlowLane::Throughput);
-    let health = context.health.lock().expect("client path health lock");
+    let health = context.health().lock().expect("client path health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
     assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
     assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
@@ -4556,7 +4556,12 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
         "a passive Repair attachment must not reserve an ordinary flow share"
     );
     assert_eq!(
-        context.health.lock().expect("client path health lock").udp[0].active_flows,
+        context
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .udp[0]
+            .active_flows,
         0
     );
 
@@ -4592,7 +4597,7 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
             .load_reserved
     );
     {
-        let health = context.health.lock().expect("client path health lock");
+        let health = context.health().lock().expect("client path health lock");
         assert_eq!(health.udp[0].active_flows, 1);
         assert_eq!(health.udp[0].active_latency_sensitive_flows, 1);
     }
@@ -4610,7 +4615,12 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
         "the already-current Active path must not be promoted twice"
     );
     assert_eq!(
-        context.health.lock().expect("client path health lock").udp[0].active_flows,
+        context
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .udp[0]
+            .active_flows,
         1
     );
 }

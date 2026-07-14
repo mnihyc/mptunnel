@@ -12,7 +12,7 @@ async fn path_probe_refreshes_tcp_health_without_stream_load() {
     probe_client_paths(&context, Duration::from_secs(1)).await;
 
     server.await.expect("server join").expect("server probe");
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
     assert!(health.tcp[0].measured_srtt_ms.is_some());
     assert_eq!(health.tcp[0].active_flows, 0);
@@ -29,7 +29,7 @@ async fn path_probe_refreshes_udp_health_without_association_load() {
 
     server.abort();
     let _ = server.await;
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.udp[0].state, SchedulerPathState::Active);
     assert!(health.udp[0].measured_srtt_ms.is_some());
     assert_eq!(health.udp[0].active_flows, 0);
@@ -45,7 +45,7 @@ async fn path_probe_skips_tcp_path_with_active_stream() {
 
     probe_client_paths(&context, Duration::from_millis(20)).await;
 
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
     assert_eq!(health.tcp[0].consecutive_failures, 0);
     assert_eq!(health.tcp[0].active_flows, 1);
@@ -61,7 +61,7 @@ async fn path_probe_skips_udp_path_with_active_session() {
 
     probe_client_paths(&context, Duration::from_millis(20)).await;
 
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.udp[0].state, SchedulerPathState::Active);
     assert_eq!(health.udp[0].consecutive_failures, 0);
     assert_eq!(health.udp[0].active_flows, 1);
@@ -77,7 +77,7 @@ async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     probe_client_paths(&context, Duration::from_millis(50)).await;
 
     {
-        let health = context.health.lock().expect("health lock");
+        let health = context.health().lock().expect("health lock");
         assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
         assert_eq!(health.tcp[0].consecutive_failures, 1);
         assert!(health.tcp[0].failed_until.is_none());
@@ -93,7 +93,7 @@ async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     probe_client_paths(&context, Duration::from_millis(50)).await;
 
     {
-        let health = context.health.lock().expect("health lock");
+        let health = context.health().lock().expect("health lock");
         assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
         assert_eq!(health.tcp[0].consecutive_failures, 2);
         assert!(health.tcp[0].failed_until.is_none());
@@ -511,7 +511,7 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
 
     handler.await.expect("handler join").expect("handler");
     {
-        let health = health_context.health.lock().expect("health lock");
+        let health = health_context.health().lock().expect("health lock");
         assert_eq!(health.tcp[0].active_flows, 0);
         assert_eq!(health.tcp[1].active_flows, 0);
     }
@@ -624,7 +624,7 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     client.shutdown().await.expect("client shutdown");
     handler.await.expect("handler join").expect("handler");
     {
-        let health = health_context.health.lock().expect("health lock");
+        let health = health_context.health().lock().expect("health lock");
         assert!(matches!(
             health.tcp[0].state,
             SchedulerPathState::Suspect | SchedulerPathState::Failed
@@ -1328,7 +1328,7 @@ async fn socks5_udp_associate_relays_datagram_over_udp_path() {
 
     handler.await.expect("handler join").expect("handler");
     {
-        let health = health_context.health.lock().expect("health lock");
+        let health = health_context.health().lock().expect("health lock");
         assert_eq!(health.udp[0].state, SchedulerPathState::Active);
         assert!(health.udp[0].measured_srtt_ms.is_some());
         assert!(health.udp[0].measured_jitter_ms.is_some());
@@ -1357,7 +1357,7 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_tcp_path() {
 
     handler.await.expect("handler join").expect("handler");
     {
-        let health = health_context.health.lock().expect("health lock");
+        let health = health_context.health().lock().expect("health lock");
         assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
         assert!(health.udp.is_empty());
     }

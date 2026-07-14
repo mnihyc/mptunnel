@@ -66,8 +66,12 @@ fn measured_udp_delivery_rate_updates_next_datagram_order() {
             .copied(),
         Some(0)
     );
-    let observation =
-        context.health.lock().expect("client path health lock").udp[0].observe(Instant::now());
+    let observation = context
+        .health()
+        .lock()
+        .expect("client path health lock")
+        .udp[0]
+        .observe(Instant::now());
     let reliable_snapshot = path_snapshot(&context.udp_paths[0], 0, observation);
     assert!(observation.measured_rate_bps.is_some());
     assert!(observation.product_delivery_rate_bps.is_none());
@@ -107,7 +111,7 @@ fn udp_datagram_feedback_updates_scheduler_health() {
             .copied(),
         Some(1)
     );
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.udp[1].state, SchedulerPathState::Active);
     assert!(health.udp[1].measured_srtt_ms.is_some());
     assert!(health.udp[1].measured_jitter_ms.is_some());
@@ -856,7 +860,7 @@ fn active_tcp_load_spreads_new_streams_and_releases_on_close() {
             .copied(),
         Some(0)
     );
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
     assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
 }
@@ -1050,7 +1054,7 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     context.release_relay_path_load(first.underlay, first.index, FlowLane::Latency);
     context.release_relay_path_load(second.underlay, second.index, FlowLane::Latency);
 
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
     assert_eq!(health.tcp[1].active_flows, 0);
     assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
@@ -1186,7 +1190,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     let now = Instant::now();
 
     {
-        let mut health = context.health.lock().expect("health lock");
+        let mut health = context.health().lock().expect("health lock");
         health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(42),
@@ -1229,7 +1233,7 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     );
 
     {
-        let mut health = context.health.lock().expect("health lock");
+        let mut health = context.health().lock().expect("health lock");
         health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
             direction: 1,
             srtt: Duration::from_millis(42),
@@ -1294,7 +1298,7 @@ fn active_udp_load_spreads_new_associations_and_releases_on_close() {
 
     context.release_udp_path_load(0);
     assert!(udp_candidate_indices(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS).contains(&0));
-    let health = context.health.lock().expect("health lock");
+    let health = context.health().lock().expect("health lock");
     assert_eq!(health.udp[0].active_flows, 0);
     assert_eq!(health.udp[0].relay_bytes_in_flight, 0);
 }

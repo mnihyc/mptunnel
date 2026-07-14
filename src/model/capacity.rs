@@ -7,6 +7,9 @@ use crate::mux::MuxLimits;
 use std::time::Duration;
 
 pub(crate) const TRANSPORT_MSS_BYTES: usize = 1460;
+pub(crate) const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
+pub(crate) const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
+pub(crate) const UDP_MAX_MTU_PAYLOAD_BYTES: usize = 65_000;
 pub(crate) const RELIABLE_INITIAL_WINDOW_PACKETS: usize = 10;
 pub(crate) const QUIC_INITIAL_WINDOW_PACKETS: usize = RELIABLE_INITIAL_WINDOW_PACKETS;
 pub(crate) const PATH_OPEN_SCORE_BYTES: usize =

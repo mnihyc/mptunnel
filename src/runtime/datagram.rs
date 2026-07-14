@@ -1,5 +1,7 @@
 use super::*;
 
+pub(in crate::runtime) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub async fn client_udp_datagram_round_trip(
     path: &PathSpec,
     security: SecurityConfig,
@@ -1498,7 +1500,7 @@ impl UdpDatagramClientAssociation {
                 let now = Instant::now();
                 let observations = self
                     .context
-                    .health
+                    .health()
                     .lock()
                     .expect("client path health lock")
                     .udp
@@ -1861,7 +1863,7 @@ impl UdpDatagramClientAssociation {
         };
         let Some(observation) = self
             .context
-            .health
+            .health()
             .lock()
             .expect("client path health lock")
             .udp
@@ -2165,10 +2167,10 @@ impl UdpDatagramClientSession {
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
-        let health = Arc::new(Mutex::new(ClientPathHealth {
+        let state = ClientPathState::new(ClientPathHealth {
             tcp: Vec::new(),
             udp: vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
-        }));
+        });
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
             path: path.clone(),
             path_index,
@@ -2177,7 +2179,7 @@ impl UdpDatagramClientSession {
             codec_limits,
             mux_limits,
             stream_frame_queue: reliable_stream_frame_queue(mux_limits),
-            health,
+            state,
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, handshake_timeout).await
     }

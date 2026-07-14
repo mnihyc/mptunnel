@@ -603,7 +603,7 @@ fn set_client_path_state(
     state: PathControlState,
 ) -> Result<(), ManagementHttpError> {
     let mut health = context
-        .health
+        .health()
         .lock()
         .expect("client path health management lock");
     let records = match underlay {
@@ -901,7 +901,7 @@ fn client_path_statuses(
 ) -> (Vec<ManagementPathStatus>, ManagementSummary) {
     let now = Instant::now();
     let mut summary = ManagementSummary::default();
-    let mut health = context.health.lock().expect("client path health lock");
+    let mut health = context.health().lock().expect("client path health lock");
     let mut paths = Vec::with_capacity(context.tcp_paths.len() + context.udp_paths.len());
     paths.extend(client_path_status_set(
         &context.tcp_paths,

@@ -364,7 +364,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) command_queue: usize,
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) closed_stream_cache_capacity: usize,
-    pub(in crate::runtime) health: Arc<Mutex<ClientPathHealth>>,
+    pub(in crate::runtime) state: Arc<ClientPathState>,
 }
 
 struct ClientTcpPathSessionState {
@@ -1910,7 +1910,8 @@ async fn handle_client_tcp_path_frame(
                     publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
                 });
                 if let Some(record) = runtime
-                    .health
+                    .state
+                    .health()
                     .lock()
                     .expect("client path health lock")
                     .tcp
@@ -2060,7 +2061,8 @@ async fn handle_client_tcp_path_frame(
                 expires_at: accepted_at.checked_add(validity).unwrap_or(accepted_at),
             };
             let accepted = runtime
-                .health
+                .state
+                .health()
                 .lock()
                 .expect("client path health lock")
                 .tcp

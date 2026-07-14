@@ -50,7 +50,7 @@ fn node_path_control_can_select_client_by_route_target_tag() {
         )
         .expect("control path");
 
-    let health = context.health.lock().expect("health");
+    let health = context.health().lock().expect("health");
     assert!(health.tcp[0].manual_disabled);
     assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
 }

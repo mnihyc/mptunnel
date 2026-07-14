@@ -78,8 +78,13 @@ fn udp_stream_path_indices(
     lane: FlowLane,
     payload_bytes: usize,
 ) -> Vec<usize> {
-    let observations =
-        health_observations(&mut context.health.lock().expect("client path health lock").udp);
+    let observations = health_observations(
+        &mut context
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .udp,
+    );
     ordered_reliable_path_indices(&context.udp_paths, &observations, lane, payload_bytes)
 }
 

@@ -19,6 +19,7 @@ use crate::model::request::evidence::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
+use crate::runtime::stream::request::RequestFlightLedger;
 
 // Ownership boundary:
 // Sender services own product work before it reaches carrier command queues.
@@ -138,7 +139,7 @@ pub(in crate::runtime) enum ClientQueuedDispatch {
 pub(in crate::runtime) struct RelaySenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     stream_id: StreamId,
-    flights: RelayPathFlightLedger,
+    flights: RequestFlightLedger,
     ordered_data_owner: Option<RelayPathKey>,
     ordered_data_owner_instance: Option<RelayPathInstance>,
     request_startup: RequestStartupState,
@@ -210,7 +211,7 @@ impl RelaySenderService {
     ) -> Self {
         Self {
             stream_id,
-            flights: RelayPathFlightLedger::default(),
+            flights: RequestFlightLedger::default(),
             ordered_data_owner: None,
             ordered_data_owner_instance: None,
             request_startup: RequestStartupState::default(),

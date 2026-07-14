@@ -384,7 +384,7 @@ fn request_startup_needs_contention_but_existing_owner_drains_after_two_to_one()
     let candidate = paths[1].instance();
     mark_bulk_service(&context, service.key);
     mark_path_proof(&context, candidate.key, Duration::from_millis(8));
-    let flights = RelayPathFlightLedger::default();
+    let flights = RequestFlightLedger::default();
     let choose = |epoch: Option<&FlowSubflowSet<RelayPathInstance>>| {
         choose_request_startup_subflow(
             &context,
@@ -480,7 +480,7 @@ fn request_startup_prefers_idle_candidate_owned_by_no_other_flow() {
             0,
             64 * 1024,
             Some(service.key),
-            Some(&RelayPathFlightLedger::default()),
+            Some(&RequestFlightLedger::default()),
             None,
             Some(&HashSet::from([service])),
             None,
@@ -502,7 +502,7 @@ fn request_startup_prefers_idle_candidate_owned_by_no_other_flow() {
             0,
             64 * 1024,
             Some(service.key),
-            Some(&RelayPathFlightLedger::default()),
+            Some(&RequestFlightLedger::default()),
             None,
             Some(&HashSet::from([service])),
             None,
@@ -534,7 +534,7 @@ fn request_startup_subflow_requires_proof_from_current_attachment() {
         relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active),
         relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation),
     ];
-    let ledger = RelayPathFlightLedger::default();
+    let ledger = RequestFlightLedger::default();
 
     assert!(
         choose_request_startup_subflow(
@@ -648,7 +648,7 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
     let mut spent = HashMap::new();
-    let flights = RelayPathFlightLedger::default();
+    let flights = RequestFlightLedger::default();
     let request = |spent: &HashMap<RelayPathInstance, u64>,
                    ack_clock_proven: &HashSet<RelayPathInstance>| {
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
@@ -778,7 +778,7 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
     let ack_clock_proven = HashSet::new();
     let receipt_boundaries = HashSet::from([candidate]);
     let carrier_proven = HashSet::from([candidate]);
-    let flights = RelayPathFlightLedger::default();
+    let flights = RequestFlightLedger::default();
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
     let service_snapshot = relay_path_snapshot_for_bulk_choice(
@@ -930,7 +930,7 @@ fn parallel_tcp_carrier_proofs_keep_one_product_calibration_owner() {
     let rate_proven = HashSet::from([service, first, second]);
     let graduated = HashSet::from([first, second]);
     let carrier_proven = HashSet::from([first, second]);
-    let flights = RelayPathFlightLedger::default();
+    let flights = RequestFlightLedger::default();
     let spent = HashMap::new();
     let target = reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
     let choose = |owner: Option<RequestAckClockCalibrationOwner>,
@@ -1026,10 +1026,10 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
     let target = reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
     let payload_bytes = BBR_MAX_SEND_QUANTUM_BYTES;
     let lower_frame = data_frame(0, payload_bytes);
-    let mut prior_debt = RelayPathFlightLedger::default();
+    let mut prior_debt = RequestFlightLedger::default();
     prior_debt.record_owner_frame_instance(previous, &lower_frame);
     let empty_spend = HashMap::new();
-    let choose = |flights: &RelayPathFlightLedger,
+    let choose = |flights: &RequestFlightLedger,
                   offset: u64,
                   owner: Option<RequestAckClockCalibrationOwner>,
                   pending: Option<RequestAckClockCalibrationPending>,
@@ -1087,7 +1087,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
     );
     assert_ne!(candidate, ungraduated);
 
-    let drained = RelayPathFlightLedger::default();
+    let drained = RequestFlightLedger::default();
     assert!(matches!(
         choose(&drained, payload_bytes as u64, None, pending, &empty_spend),
         BulkRelayPathChoice::SelectedAckClockCalibration {
@@ -1120,7 +1120,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
         Some(candidate),
         "a sealed target must outlive its ephemeral carrier-entry proof"
     );
-    let mut own_debt = RelayPathFlightLedger::default();
+    let mut own_debt = RequestFlightLedger::default();
     own_debt.record_owner_frame_instance(candidate, &lower_frame);
     assert!(matches!(
         choose(
@@ -1148,7 +1148,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
 
     let product_envelope =
         bulk_service_product_envelope_payload_bytes(payload_bytes, context.mux_limits);
-    let mut saturated = RelayPathFlightLedger::default();
+    let mut saturated = RequestFlightLedger::default();
     saturated.record_owner_frame_instance(previous, &data_frame(0, product_envelope));
     assert_eq!(
         choose(
@@ -1190,10 +1190,10 @@ fn request_tcp_carrier_calibration_uses_exact_debt_not_logical_flight_age() {
     let first_window_acked = HashSet::new();
     let carrier_proven = HashSet::from([candidate]);
     let spent = HashMap::new();
-    let mut flights = RelayPathFlightLedger::default();
+    let mut flights = RequestFlightLedger::default();
     flights.record_owner_frame_instance(service, &data_frame(0, 64 * 1024));
     flights.age_product_flights_for_test(Duration::from_secs(10));
-    let choose = |flights: &RelayPathFlightLedger| {
+    let choose = |flights: &RequestFlightLedger| {
         choose_request_ack_clock_calibration(
             &context,
             &paths,
@@ -1266,7 +1266,7 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
     let spent = HashMap::from([(first, calibration_target)]);
-    let choose = |flights: &RelayPathFlightLedger| {
+    let choose = |flights: &RequestFlightLedger| {
         choose_request_ack_clock_calibration(
             &context,
             &paths,
@@ -1294,7 +1294,7 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
         )
     };
 
-    let mut outstanding = RelayPathFlightLedger::default();
+    let mut outstanding = RequestFlightLedger::default();
     outstanding.record_owner_frame_instance(first, &data_frame(0, BBR_MAX_SEND_QUANTUM_BYTES));
     assert_eq!(
         choose(&outstanding),
@@ -1338,7 +1338,7 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
         "an exhausted unproven owner must drain through Service before any ordinary owner bypasses it"
     );
     assert_eq!(
-        choose(&RelayPathFlightLedger::default()),
+        choose(&RequestFlightLedger::default()),
         None,
         "an exact exhausted owner remains authoritative until its ACK evidence proves or its lifecycle ends"
     );
@@ -1383,7 +1383,7 @@ fn ineligible_spent_instance_does_not_block_live_validation_calibration() {
                 BBR_MAX_SEND_QUANTUM_BYTES,
                 2,
                 Some(service_key),
-                Some(&RelayPathFlightLedger::default()),
+                Some(&RequestFlightLedger::default()),
                 None,
                 Some(&proven),
                 Some(&graduated),
@@ -1427,7 +1427,7 @@ fn request_startup_subflow_rejects_cross_family_repair_and_latency_pressure() {
         relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Validation),
     ];
     mark_path_proof(&context, candidate_key, Duration::from_millis(8));
-    let ledger = RelayPathFlightLedger::default();
+    let ledger = RequestFlightLedger::default();
     assert!(
         choose_request_startup_subflow(
             &context,
@@ -1516,7 +1516,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
         relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation),
     ];
     mark_path_proof(&context, candidate_key, Duration::from_millis(8));
-    let empty = RelayPathFlightLedger::default();
+    let empty = RequestFlightLedger::default();
     let exact_state = HashSet::new();
 
     assert_eq!(
@@ -1543,7 +1543,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
         "offset zero must establish Service before any Validation path can own data"
     );
 
-    let mut foreign = RelayPathFlightLedger::default();
+    let mut foreign = RequestFlightLedger::default();
     foreign.record_owner_frame(candidate_key, &data_frame(0, 64 * 1024));
     assert!(
         choose_request_startup_subflow(
@@ -1564,7 +1564,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
         "a foreign lower OwnerData range is authoritative and cannot be crossed"
     );
 
-    let mut repaired = RelayPathFlightLedger::default();
+    let mut repaired = RequestFlightLedger::default();
     repaired.record_owner_frame(service_key, &data_frame(0, 64 * 1024));
     repaired.record_repair_frame(candidate_key, &data_frame(0, 64 * 1024));
     assert!(
@@ -1612,7 +1612,7 @@ fn request_startup_allows_aged_ordinary_service_flight_within_envelope() {
         relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation),
     ];
     mark_path_proof(&context, candidate_key, Duration::from_millis(8));
-    let mut ledger = RelayPathFlightLedger::default();
+    let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(service_key, &data_frame(0, 64 * 1024));
     assert!(
         choose_request_startup_subflow(
@@ -1711,7 +1711,7 @@ fn request_startup_does_not_use_ordered_product_bytes_to_probe_quic_capacity() {
             64 * 1024,
             64 * 1024,
             Some(service_key),
-            Some(&RelayPathFlightLedger::default()),
+            Some(&RequestFlightLedger::default()),
             None,
             None,
             None,
@@ -1764,7 +1764,7 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
             .decision,
         PathAdmissionDecision::AdmitSubflow
     );
-    let mut ledger = RelayPathFlightLedger::default();
+    let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(candidate_key, &data_frame(0, 64 * 1024));
     let mut graduated = HashSet::new();
     let attempted = HashSet::from([paths[1].instance()]);
@@ -2010,7 +2010,7 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
             payload_bytes: 64 * 1024,
             cursor: 1,
             avoid_keys: &[],
-            path_flights: Some(&RelayPathFlightLedger::default()),
+            path_flights: Some(&RequestFlightLedger::default()),
             ordered_data_owner: Some(service.key),
             subflow_set: None,
             proven_subflows: None,
@@ -2022,218 +2022,6 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
         BulkRelayPathChoice::Selected(1),
         "exact per-flow TCP proof must not be revoked by another flow's session-global model"
     );
-}
-
-#[test]
-fn ordering_debt_counts_lower_bytes_owned_by_other_paths() {
-    let path0 = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let path1 = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 1,
-    };
-    let path2 = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let mut ledger = RelayPathFlightLedger::default();
-    ledger.record_owner_frame(path0, &data_frame(0, 4096));
-    ledger.record_owner_frame(path1, &data_frame(4096, 4096));
-
-    assert_eq!(ledger.ordering_debt_bytes_before_offset(path0, 8192), 4096);
-    assert_eq!(ledger.ordering_debt_bytes_before_offset(path1, 8192), 4096);
-    assert_eq!(ledger.ordering_debt_bytes_before_offset(path2, 8192), 8192);
-    assert_eq!(
-        ledger.oldest_lower_flight_owner_before_offset(8192),
-        Some(path0)
-    );
-}
-
-#[test]
-fn missing_later_owner_is_detected_even_when_oldest_owner_is_live() {
-    let live_owner = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let missing_owner = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let mut ledger = RelayPathFlightLedger::default();
-    ledger.record_owner_frame(live_owner, &data_frame(0, 4096));
-    ledger.record_owner_frame(missing_owner, &data_frame(4096, 4096));
-    let live_instance = RelayPathInstance {
-        key: live_owner,
-        id: 0,
-    };
-    let missing_instance = RelayPathInstance {
-        key: missing_owner,
-        id: 0,
-    };
-
-    assert!(ledger.has_missing_ordering_owner_before_offset(8192, &[live_instance]));
-    assert!(
-        !ledger.has_missing_ordering_owner_before_offset(8192, &[live_instance, missing_instance],)
-    );
-}
-
-#[test]
-fn same_key_replacement_does_not_mask_stale_instance_owner_flight() {
-    let key = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let stale = RelayPathInstance { key, id: 7 };
-    let replacement = RelayPathInstance { key, id: 8 };
-    let frame = data_frame(0, 4096);
-    let mut ledger = RelayPathFlightLedger::default();
-    ledger.record_owner_frame_instance(stale, &frame);
-
-    assert!(ledger.has_missing_ordering_owner_before_offset(4097, &[replacement]));
-    assert!(
-        ledger
-            .ordering_owner_keys_for_frame(&frame, &[replacement])
-            .is_empty()
-    );
-    assert_eq!(
-        ledger.ordering_owner_underlay_for_frame(&frame),
-        Some(UnderlayProtocol::Tcp),
-        "repair policy must retain the stale OwnerData transport family after same-key replacement"
-    );
-    assert_eq!(
-        ledger.latest_unacked_ranges_for_path_instance(stale),
-        vec![OffsetRange {
-            start: 0,
-            end: 4096,
-        }]
-    );
-    assert!(
-        ledger
-            .latest_unacked_ranges_for_path_instance(replacement)
-            .is_empty()
-    );
-}
-
-#[test]
-fn repair_copy_does_not_become_ordering_owner() {
-    let owner = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let duplicate = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 1,
-    };
-    let frame = data_frame(0, 4096);
-    let mut ledger = RelayPathFlightLedger::default();
-    ledger.record_owner_frame(owner, &frame);
-    ledger.record_repair_frame(duplicate, &frame);
-
-    assert_eq!(
-        ledger.oldest_lower_flight_owner_before_offset(4096),
-        Some(owner)
-    );
-    assert_eq!(ledger.ordering_debt_bytes_before_offset(owner, 4096), 0);
-    assert_eq!(
-        ledger.ordering_debt_bytes_before_offset(duplicate, 4096),
-        4096
-    );
-
-    let released = ledger.release_normalized_acked_ranges(&[OffsetRange {
-        start: 0,
-        end: 4096,
-    }]);
-    assert_eq!(released.len(), 2);
-    assert!(released.iter().any(|release| release.key == owner));
-    assert!(released.iter().any(|release| release.key == duplicate));
-    assert!(
-        released.iter().all(|release| !release.path_proving),
-        "ACK of duplicated request bytes releases inflight state but is not path-scoped proof"
-    );
-}
-
-#[test]
-fn owner_only_ack_release_is_path_proving() {
-    let owner = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let frame = data_frame(0, 4096);
-    let mut ledger = RelayPathFlightLedger::default();
-    ledger.record_owner_frame(owner, &frame);
-
-    let released = ledger.release_normalized_acked_ranges(&[OffsetRange {
-        start: 0,
-        end: 4096,
-    }]);
-
-    assert_eq!(released.len(), 1);
-    assert_eq!(released[0].key, owner);
-    assert!(
-        released[0].path_proving,
-        "a single outstanding owner copy is path-scoped STREAM_ACK evidence"
-    );
-}
-
-#[test]
-fn partial_same_start_duplicate_ack_retains_owner_suffix() {
-    let owner = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let repair = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let mut ledger = RelayPathFlightLedger::default();
-    ledger.record_owner_frame(owner, &data_frame(0, 4096));
-    ledger.record_repair_frame(repair, &data_frame(0, 1024));
-
-    let prefix_releases = ledger.release_normalized_acked_ranges(&[OffsetRange {
-        start: 0,
-        end: 1024,
-    }]);
-    assert_eq!(prefix_releases.len(), 2);
-    assert!(prefix_releases.iter().all(|release| release.bytes == 1024));
-    assert!(
-        prefix_releases.iter().all(|release| !release.path_proving),
-        "an ACK shared by OwnerData and RepairData cannot identify a delivery path"
-    );
-    assert_eq!(
-        ledger.latest_unacked_ranges_for_path(owner),
-        vec![OffsetRange {
-            start: 1024,
-            end: 4096,
-        }],
-        "releasing the shorter same-start RepairData copy must retain the OwnerData suffix"
-    );
-    assert!(ledger.latest_unacked_ranges_for_path(repair).is_empty());
-    assert_eq!(
-        ledger.ordering_owner_keys_for_frame(
-            &data_frame(1024, 3072),
-            &[
-                RelayPathInstance { key: owner, id: 0 },
-                RelayPathInstance { key: repair, id: 0 },
-            ],
-        ),
-        vec![owner],
-        "the trimmed suffix retains OwnerData identity without retaining the RepairData key"
-    );
-
-    let suffix_releases = ledger.release_normalized_acked_ranges(&[OffsetRange {
-        start: 1024,
-        end: 4096,
-    }]);
-    assert_eq!(suffix_releases.len(), 1);
-    assert_eq!(suffix_releases[0].key, owner);
-    assert_eq!(suffix_releases[0].bytes, 3072);
-    assert!(
-        suffix_releases[0].path_proving,
-        "the retained owner-only suffix is unambiguous when it is acknowledged later"
-    );
-    assert!(ledger.latest_unacked_ranges_for_path(owner).is_empty());
 }
 
 #[test]
@@ -2250,7 +2038,7 @@ fn bulk_ready_blocks_when_no_attached_path_can_advance_ordered_frontier() {
         underlay: UnderlayProtocol::Tcp,
         index: 1,
     };
-    let mut ledger = RelayPathFlightLedger::default();
+    let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(missing_owner, &data_frame(0, 64 * 1024));
 
     assert_eq!(
@@ -2291,7 +2079,7 @@ fn relay_lower_frontier_owner_can_lead_from_validation_attachment() {
         relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Validation),
         relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
     ];
-    let mut ledger = RelayPathFlightLedger::default();
+    let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(lower_owner, &data_frame(0, 64 * 1024));
 
     assert_eq!(
@@ -2426,7 +2214,7 @@ fn ack_clock_proven_tcp_subflow_can_join_across_service_bdp_debt() {
     mark_bulk_service(&context, service.key);
     mark_bulk_service(&context, candidate.key);
 
-    let mut flights = RelayPathFlightLedger::default();
+    let mut flights = RequestFlightLedger::default();
     let payload_bytes = 64 * 1024;
     let service_debt_bytes = 40 * 1024 * 1024;
     for offset in (0..service_debt_bytes).step_by(payload_bytes) {
@@ -2512,7 +2300,7 @@ fn relay_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
             payload_bytes: 64 * 1024,
             cursor: 1,
             avoid_keys: &[],
-            path_flights: Some(&RelayPathFlightLedger::default()),
+            path_flights: Some(&RequestFlightLedger::default()),
             ordered_data_owner: Some(lead_key),
             subflow_set: None,
             proven_subflows: None,

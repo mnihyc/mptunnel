@@ -7,6 +7,7 @@
 mod demand;
 mod handle;
 mod registry;
+pub(in crate::runtime) mod request;
 pub(in crate::runtime) mod response;
 mod server;
 
